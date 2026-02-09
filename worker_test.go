@@ -239,9 +239,9 @@ func TestWorker_RetryAfterError(t *testing.T) {
 func TestWorker_PanicRecovery(t *testing.T) {
 	queue, store := setupWorkerTestQueue(t)
 
-	panicked := false
+	var panicked atomic.Bool
 	queue.Register("panic-job", func(ctx context.Context, _ struct{}) error {
-		panicked = true
+		panicked.Store(true)
 		panic("job panicked")
 	})
 
@@ -267,7 +267,7 @@ func TestWorker_PanicRecovery(t *testing.T) {
 	}
 
 	// Check that the job was at least processed
-	if panicked {
+	if panicked.Load() {
 		require.NotNil(t, job)
 		// Allow either failed or running status since panic recovery might not always set failed
 		if job.Status == jobs.StatusFailed {
