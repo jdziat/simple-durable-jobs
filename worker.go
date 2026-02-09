@@ -171,6 +171,13 @@ func (w *Worker) executeHandler(ctx context.Context, job *Job, handler *jobHandl
 	// Create job context
 	jobCtx := withJobContext(ctx, job, w.queue)
 
+	// Load checkpoints for replay
+	checkpoints, err := w.queue.storage.GetCheckpoints(ctx, job.ID)
+	if err != nil {
+		return fmt.Errorf("failed to load checkpoints: %w", err)
+	}
+	jobCtx = withCallState(jobCtx, checkpoints)
+
 	var args []reflect.Value
 
 	if handler.hasContext {
