@@ -211,3 +211,31 @@ func getJobContext(ctx context.Context) *jobContext {
 	}
 	return nil
 }
+
+// OnJobStart registers a callback for when a job starts.
+func (q *Queue) OnJobStart(fn func(context.Context, *Job)) {
+	q.mu.Lock()
+	q.onStart = append(q.onStart, fn)
+	q.mu.Unlock()
+}
+
+// OnJobComplete registers a callback for when a job completes successfully.
+func (q *Queue) OnJobComplete(fn func(context.Context, *Job)) {
+	q.mu.Lock()
+	q.onComplete = append(q.onComplete, fn)
+	q.mu.Unlock()
+}
+
+// OnJobFail registers a callback for when a job fails permanently.
+func (q *Queue) OnJobFail(fn func(context.Context, *Job, error)) {
+	q.mu.Lock()
+	q.onFail = append(q.onFail, fn)
+	q.mu.Unlock()
+}
+
+// OnRetry registers a callback for when a job is retried.
+func (q *Queue) OnRetry(fn func(context.Context, *Job, int, error)) {
+	q.mu.Lock()
+	q.onRetry = append(q.onRetry, fn)
+	q.mu.Unlock()
+}
