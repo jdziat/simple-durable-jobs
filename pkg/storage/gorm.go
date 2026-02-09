@@ -76,7 +76,7 @@ func (s *GormStorage) EnqueueUnique(ctx context.Context, job *core.Job, uniqueKe
 func (s *GormStorage) Dequeue(ctx context.Context, queues []string, workerID string) (*core.Job, error) {
 	var job core.Job
 	now := time.Now()
-	lockUntil := now.Add(5 * time.Minute)
+	lockUntil := now.Add(45 * time.Minute) // Extended to support long-running scans
 
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		result := tx.
@@ -215,7 +215,7 @@ func (s *GormStorage) GetDueJobs(ctx context.Context, queues []string, limit int
 
 // Heartbeat extends the lock on a running job.
 func (s *GormStorage) Heartbeat(ctx context.Context, jobID string, workerID string) error {
-	lockUntil := time.Now().Add(5 * time.Minute)
+	lockUntil := time.Now().Add(45 * time.Minute)
 	return s.db.WithContext(ctx).
 		Model(&core.Job{}).
 		Where("id = ? AND locked_by = ?", jobID, workerID).
