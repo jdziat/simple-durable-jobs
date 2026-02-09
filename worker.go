@@ -70,13 +70,18 @@ type Worker struct {
 // NewWorker creates a new worker.
 func (q *Queue) NewWorker(opts ...WorkerOption) *Worker {
 	config := WorkerConfig{
-		Queues:       map[string]int{"default": 10},
+		Queues:       nil, // Will be set to default if no queue options provided
 		PollInterval: 100 * time.Millisecond,
 		WorkerID:     uuid.New().String(),
 	}
 
 	for _, opt := range opts {
 		opt.ApplyWorker(&config)
+	}
+
+	// If no queues configured, use default
+	if config.Queues == nil {
+		config.Queues = map[string]int{"default": 10}
 	}
 
 	return &Worker{
