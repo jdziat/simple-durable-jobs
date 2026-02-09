@@ -25,3 +25,17 @@ func TestJob_HasRequiredFields(t *testing.T) {
 	assert.Equal(t, "send-email", job.Type)
 	assert.Equal(t, jobs.StatusPending, job.Status)
 }
+
+func TestCheckpoint_HasRequiredFields(t *testing.T) {
+	cp := jobs.Checkpoint{
+		ID:        "cp-123",
+		JobID:     "job-456",
+		CallIndex: 0,
+		CallType:  "charge-card",
+		Result:    []byte(`{"receipt":"abc"}`),
+	}
+
+	assert.Equal(t, "cp-123", cp.ID)
+	assert.Equal(t, "job-456", cp.JobID)
+	assert.Equal(t, 0, cp.CallIndex)
+}
