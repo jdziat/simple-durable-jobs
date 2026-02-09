@@ -215,11 +215,15 @@ func (s *GormStorage) GetDueJobs(ctx context.Context, queues []string, limit int
 
 // Heartbeat extends the lock on a running job.
 func (s *GormStorage) Heartbeat(ctx context.Context, jobID string, workerID string) error {
-	lockUntil := time.Now().Add(45 * time.Minute)
+	now := time.Now()
+	lockUntil := now.Add(45 * time.Minute)
 	return s.db.WithContext(ctx).
 		Model(&core.Job{}).
 		Where("id = ? AND locked_by = ?", jobID, workerID).
-		Update("locked_until", lockUntil).Error
+		Updates(map[string]any{
+			"locked_until":      lockUntil,
+			"last_heartbeat_at": now,
+		}).Error
 }
 
 // ReleaseStaleLocks releases locks on jobs that haven't had a heartbeat.
