@@ -120,11 +120,9 @@ func TestHooks_OnJobFail(t *testing.T) {
 func TestHooks_OnRetry(t *testing.T) {
 	queue, _ := setupHooksTestQueue(t)
 
-	var retried atomic.Bool
-	var retryAttempt int
+	var retryAttempt atomic.Int32
 	queue.OnRetry(func(ctx context.Context, j *jobs.Job, attempt int, err error) {
-		retried.Store(true)
-		retryAttempt = attempt
+		retryAttempt.Store(int32(attempt))
 	})
 
 	var attempts atomic.Int32
@@ -146,14 +144,13 @@ func TestHooks_OnRetry(t *testing.T) {
 
 	// Wait for retry
 	for i := 0; i < 50; i++ {
-		if retried.Load() {
+		if retryAttempt.Load() > 0 {
 			break
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
 
-	assert.True(t, retried.Load())
-	assert.Equal(t, 1, retryAttempt)
+	assert.Equal(t, int32(1), retryAttempt.Load())
 }
 
 func TestHooks_MultipleHooks(t *testing.T) {
@@ -197,12 +194,14 @@ func TestHooks_MultipleHooks(t *testing.T) {
 func TestHooks_JobDataInHook(t *testing.T) {
 	queue, _ := setupHooksTestQueue(t)
 
-	var capturedType string
-	var capturedQueue string
+	type captured struct {
+		jobType  string
+		jobQueue string
+	}
+	var result atomic.Pointer[captured]
 
 	queue.OnJobStart(func(ctx context.Context, j *jobs.Job) {
-		capturedType = j.Type
-		capturedQueue = j.Queue
+		result.Store(&captured{jobType: j.Type, jobQueue: j.Queue})
 	})
 
 	queue.Register("data-hook-test", func(ctx context.Context, _ struct{}) error {
@@ -218,8 +217,17 @@ func TestHooks_JobDataInHook(t *testing.T) {
 	worker := queue.NewWorker(jobs.WorkerQueue("special", jobs.Concurrency(1)))
 	go worker.Start(ctx)
 
-	time.Sleep(300 * time.Millisecond)
+	// Poll for hook to be called
+	var cap *captured
+	for i := 0; i < 30; i++ {
+		cap = result.Load()
+		if cap != nil {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 
-	assert.Equal(t, "data-hook-test", capturedType)
-	assert.Equal(t, "special", capturedQueue)
+	require.NotNil(t, cap)
+	assert.Equal(t, "data-hook-test", cap.jobType)
+	assert.Equal(t, "special", cap.jobQueue)
 }
