@@ -146,6 +146,8 @@ func (w *Worker) processLoop(ctx context.Context, jobs <-chan *Job) {
 }
 
 func (w *Worker) processJob(ctx context.Context, job *Job) {
+	startTime := time.Now()
+
 	w.queue.mu.RLock()
 	handler, ok := w.queue.handlers[job.Type]
 	w.queue.mu.RUnlock()
@@ -161,6 +163,9 @@ func (w *Worker) processJob(ctx context.Context, job *Job) {
 		fn(ctx, job)
 	}
 
+	// Emit start event
+	w.queue.emit(&JobStarted{Job: job, Timestamp: startTime})
+
 	err := w.executeHandler(ctx, job, handler)
 
 	if err != nil {
@@ -170,6 +175,8 @@ func (w *Worker) processJob(ctx context.Context, job *Job) {
 		for _, fn := range w.queue.onComplete {
 			fn(ctx, job)
 		}
+		// Emit completion event
+		w.queue.emit(&JobCompleted{Job: job, Duration: time.Since(startTime), Timestamp: time.Now()})
 	}
 }
 
@@ -228,6 +235,8 @@ func (w *Worker) handleError(ctx context.Context, job *Job, err error) {
 		for _, fn := range w.queue.onFail {
 			fn(ctx, job, err)
 		}
+		// Emit failure event
+		w.queue.emit(&JobFailed{Job: job, Error: err, Timestamp: time.Now()})
 		return
 	}
 
@@ -240,6 +249,8 @@ func (w *Worker) handleError(ctx context.Context, job *Job, err error) {
 			for _, fn := range w.queue.onRetry {
 				fn(ctx, job, job.Attempt, err)
 			}
+			// Emit retry event
+			w.queue.emit(&JobRetrying{Job: job, Attempt: job.Attempt, Error: err, NextRunAt: retryAt, Timestamp: time.Now()})
 			return
 		}
 	}
@@ -252,11 +263,15 @@ func (w *Worker) handleError(ctx context.Context, job *Job, err error) {
 		for _, fn := range w.queue.onRetry {
 			fn(ctx, job, job.Attempt, err)
 		}
+		// Emit retry event
+		w.queue.emit(&JobRetrying{Job: job, Attempt: job.Attempt, Error: err, NextRunAt: retryAt, Timestamp: time.Now()})
 	} else {
 		w.queue.storage.Fail(ctx, job.ID, err.Error(), nil)
 		for _, fn := range w.queue.onFail {
 			fn(ctx, job, err)
 		}
+		// Emit failure event
+		w.queue.emit(&JobFailed{Job: job, Error: err, Timestamp: time.Now()})
 	}
 }
 
