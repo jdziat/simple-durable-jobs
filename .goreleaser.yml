@@ -1,0 +1,38 @@
+version: 2
+
+before:
+  hooks:
+    - go mod tidy
+    - go generate ./...
+
+builds:
+  - skip: true  # This is a library, no binaries to build
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+      - '^chore:'
+      - Merge pull request
+      - Merge branch
+
+release:
+  github:
+    owner: jdziat
+    name: simple-durable-jobs
+  draft: false
+  prerelease: auto
+  mode: replace
+  header: |
+    ## What's Changed
+
+    See the [documentation](https://jdziat.github.io/simple-durable-jobs/) for usage instructions.
+  footer: |
+    ---
+
+    **Full Changelog**: https://github.com/jdziat/simple-durable-jobs/compare/{{ .PreviousTag }}...{{ .Tag }}
+
+announce:
+  skip: true

@@ -1,6 +1,11 @@
-package jobs
+// Package queue provides the Queue orchestrator for the jobs package.
+package queue
 
-import "time"
+import (
+	"time"
+
+	"github.com/jdziat/simple-durable-jobs/pkg/security"
+)
 
 // Options holds configuration for job enqueueing and registration.
 type Options struct {
@@ -47,9 +52,10 @@ func Priority(p int) Option {
 }
 
 // Retries sets the maximum retry count.
+// Values are clamped to [0, MaxRetries] (100).
 func Retries(n int) Option {
 	return optionFunc(func(o *Options) {
-		o.MaxRetries = n
+		o.MaxRetries = security.ClampRetries(n)
 	})
 }
 

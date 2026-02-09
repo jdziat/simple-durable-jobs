@@ -325,3 +325,301 @@ func TestIntegration_DelayedJob(t *testing.T) {
 		assert.True(t, job.StartedAt.Sub(startTime) >= 400*time.Millisecond, "Job should have run after delay")
 	}
 }
+
+func TestIntegration_CrashRecoveryReplay(t *testing.T) {
+	// This test simulates a crash during a multi-step workflow
+	// and verifies that the job resumes from the last checkpoint
+	queue, store := setupIntegrationQueue(t)
+
+	var step1Count, step2Count, step3Count atomic.Int32
+
+	queue.Register("step1", func(ctx context.Context, _ struct{}) (string, error) {
+		step1Count.Add(1)
+		return "step1-result", nil
+	})
+
+	queue.Register("step2", func(ctx context.Context, _ struct{}) (string, error) {
+		step2Count.Add(1)
+		return "step2-result", nil
+	})
+
+	queue.Register("step3", func(ctx context.Context, _ struct{}) (string, error) {
+		step3Count.Add(1)
+		return "step3-result", nil
+	})
+
+	// Create a workflow that will "crash" after step2
+	var crashOnce sync.Once
+	var shouldCrash atomic.Bool
+	shouldCrash.Store(true)
+
+	queue.Register("crash-workflow", func(ctx context.Context, _ struct{}) error {
+		_, err := jobs.Call[string](ctx, "step1", struct{}{})
+		if err != nil {
+			return err
+		}
+
+		_, err = jobs.Call[string](ctx, "step2", struct{}{})
+		if err != nil {
+			return err
+		}
+
+		// Simulate crash after step2 (only once)
+		if shouldCrash.Load() {
+			crashOnce.Do(func() {
+				shouldCrash.Store(false)
+			})
+			return errors.New("simulated crash")
+		}
+
+		_, err = jobs.Call[string](ctx, "step3", struct{}{})
+		return err
+	})
+
+	ctx := context.Background()
+
+	jobID, err := queue.Enqueue(ctx, "crash-workflow", struct{}{}, jobs.Retries(3))
+	require.NoError(t, err)
+
+	workerCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	worker := queue.NewWorker()
+	go worker.Start(workerCtx)
+
+	// Wait for job to complete (after retry)
+	for i := 0; i < 100; i++ {
+		job, _ := store.GetJob(context.Background(), jobID)
+		if job != nil && job.Status == jobs.StatusCompleted {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	job, err := store.GetJob(context.Background(), jobID)
+	require.NoError(t, err)
+	assert.Equal(t, jobs.StatusCompleted, job.Status)
+
+	// Step1 and Step2 should only be called once (checkpointed)
+	// Step3 should be called once (on retry, after checkpoint replay)
+	assert.Equal(t, int32(1), step1Count.Load(), "step1 should only execute once due to checkpoint")
+	assert.Equal(t, int32(1), step2Count.Load(), "step2 should only execute once due to checkpoint")
+	assert.Equal(t, int32(1), step3Count.Load(), "step3 should execute on retry")
+}
+
+func TestIntegration_SchedulerRecurringJobs(t *testing.T) {
+	queue, _ := setupIntegrationQueue(t)
+
+	var executionCount atomic.Int32
+	var executionTimes []time.Time
+	var mu sync.Mutex
+
+	queue.Register("recurring-task", func(ctx context.Context, _ struct{}) error {
+		executionCount.Add(1)
+		mu.Lock()
+		executionTimes = append(executionTimes, time.Now())
+		mu.Unlock()
+		return nil
+	})
+
+	// Schedule job to run every 200ms
+	queue.Schedule("recurring-task", jobs.Every(200*time.Millisecond))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	// Start worker with scheduler enabled
+	worker := queue.NewWorker(jobs.WithScheduler(true))
+	go worker.Start(ctx)
+
+	// Wait for multiple executions
+	time.Sleep(1 * time.Second)
+
+	count := executionCount.Load()
+	// Should have executed at least 3 times in 1 second with 200ms interval
+	assert.GreaterOrEqual(t, count, int32(3), "Should have multiple executions")
+
+	// Verify executions are spaced apart
+	mu.Lock()
+	times := make([]time.Time, len(executionTimes))
+	copy(times, executionTimes)
+	mu.Unlock()
+
+	if len(times) >= 2 {
+		gap := times[1].Sub(times[0])
+		assert.GreaterOrEqual(t, gap, 150*time.Millisecond, "Executions should be spaced by ~200ms")
+	}
+}
+
+func TestIntegration_ConcurrentWorkers(t *testing.T) {
+	queue, store := setupIntegrationQueue(t)
+
+	var processedJobs sync.Map
+	var processingCount atomic.Int32
+
+	queue.Register("concurrent-task", func(ctx context.Context, id int) error {
+		processingCount.Add(1)
+		// Simulate some work
+		time.Sleep(50 * time.Millisecond)
+		processedJobs.Store(id, true)
+		processingCount.Add(-1)
+		return nil
+	})
+
+	ctx := context.Background()
+
+	// Enqueue 20 jobs
+	for i := 0; i < 20; i++ {
+		_, err := queue.Enqueue(ctx, "concurrent-task", i)
+		require.NoError(t, err)
+	}
+
+	workerCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	// Start 3 workers with concurrency 2 each (6 total concurrent processors)
+	for i := 0; i < 3; i++ {
+		worker := queue.NewWorker(jobs.WorkerQueue("default", jobs.Concurrency(2)))
+		go worker.Start(workerCtx)
+	}
+
+	// Wait for all jobs to complete
+	for i := 0; i < 100; i++ {
+		completed := 0
+		for j := 0; j < 20; j++ {
+			if _, ok := processedJobs.Load(j); ok {
+				completed++
+			}
+		}
+		if completed == 20 {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	// Verify all jobs were processed
+	for i := 0; i < 20; i++ {
+		_, ok := processedJobs.Load(i)
+		assert.True(t, ok, "Job %d should have been processed", i)
+	}
+
+	// Verify jobs in storage are completed
+	completedJobs, err := store.GetJobsByStatus(context.Background(), jobs.StatusCompleted, 100)
+	require.NoError(t, err)
+	assert.Len(t, completedJobs, 20, "All 20 jobs should be completed")
+}
+
+func TestIntegration_StaleLockCleanup(t *testing.T) {
+	queue, store := setupIntegrationQueue(t)
+
+	var executed atomic.Bool
+	queue.Register("stale-lock-task", func(ctx context.Context, _ struct{}) error {
+		executed.Store(true)
+		return nil
+	})
+
+	ctx := context.Background()
+
+	// Create a job that appears to be locked by a dead worker
+	staleLockTime := time.Now().Add(-10 * time.Minute)
+	job := &jobs.Job{
+		ID:          "stale-job",
+		Type:        "stale-lock-task",
+		Args:        []byte(`{}`),
+		Queue:       "default",
+		Status:      jobs.StatusRunning, // Appears to be running
+		LockedBy:    "dead-worker",
+		LockedUntil: &staleLockTime, // Locked 10 minutes ago (expired)
+	}
+	err := store.Enqueue(ctx, job)
+	require.NoError(t, err)
+
+	// Release stale locks (older than 5 minutes)
+	released, err := store.ReleaseStaleLocks(ctx, 5*time.Minute)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), released, "Should release 1 stale lock")
+
+	// Verify job is now pending
+	updatedJob, err := store.GetJob(ctx, "stale-job")
+	require.NoError(t, err)
+	assert.Equal(t, jobs.StatusPending, updatedJob.Status)
+	assert.Empty(t, updatedJob.LockedBy)
+	assert.Nil(t, updatedJob.LockedUntil)
+
+	// Now a worker should be able to pick it up
+	workerCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+
+	worker := queue.NewWorker()
+	go worker.Start(workerCtx)
+
+	// Wait for execution
+	for i := 0; i < 30; i++ {
+		if executed.Load() {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	assert.True(t, executed.Load(), "Job should have executed after lock release")
+}
+
+func TestIntegration_ExponentialBackoffRetries(t *testing.T) {
+	queue, store := setupIntegrationQueue(t)
+
+	var attempts atomic.Int32
+	var attemptTimes []time.Time
+	var mu sync.Mutex
+
+	queue.Register("backoff-task", func(ctx context.Context, _ struct{}) error {
+		count := attempts.Add(1)
+		mu.Lock()
+		attemptTimes = append(attemptTimes, time.Now())
+		mu.Unlock()
+		if count < 3 {
+			return errors.New("temporary failure")
+		}
+		return nil
+	})
+
+	ctx := context.Background()
+
+	// Create job that will fail twice then succeed
+	jobID, err := queue.Enqueue(ctx, "backoff-task", struct{}{}, jobs.Retries(5))
+	require.NoError(t, err)
+
+	workerCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+
+	worker := queue.NewWorker()
+	go worker.Start(workerCtx)
+
+	// Wait for completion
+	for i := 0; i < 150; i++ {
+		job, _ := store.GetJob(context.Background(), jobID)
+		if job != nil && job.Status == jobs.StatusCompleted {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	job, err := store.GetJob(context.Background(), jobID)
+	require.NoError(t, err)
+	assert.Equal(t, jobs.StatusCompleted, job.Status)
+	assert.Equal(t, int32(3), attempts.Load(), "Should have 3 attempts (2 failures + 1 success)")
+
+	// Verify backoff is exponential (each gap should be larger than the previous)
+	mu.Lock()
+	times := make([]time.Time, len(attemptTimes))
+	copy(times, attemptTimes)
+	mu.Unlock()
+
+	if len(times) >= 3 {
+		gap1 := times[1].Sub(times[0])
+		gap2 := times[2].Sub(times[1])
+		// Second gap should be approximately 2x the first (exponential backoff)
+		// Allow some tolerance for timing variations
+		assert.Greater(t, gap2, gap1, "Backoff should be exponential (gap2 > gap1)")
+	}
+}
+

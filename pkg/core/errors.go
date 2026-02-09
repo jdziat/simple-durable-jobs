@@ -1,8 +1,20 @@
-package jobs
+package core
 
 import (
+	"errors"
 	"fmt"
 	"time"
+)
+
+// Validation errors
+var (
+	ErrInvalidJobTypeName = errors.New("jobs: invalid job type name (must be alphanumeric, start with letter)")
+	ErrJobTypeNameTooLong = errors.New("jobs: job type name too long")
+	ErrInvalidQueueName   = errors.New("jobs: invalid queue name")
+	ErrQueueNameTooLong   = errors.New("jobs: queue name too long")
+	ErrJobArgsTooLarge    = errors.New("jobs: job arguments exceed size limit")
+	ErrJobNotOwned        = errors.New("jobs: job not owned by this worker")
+	ErrDuplicateJob       = errors.New("jobs: duplicate job with same unique key")
 )
 
 // NoRetryError indicates an error that should not be retried.

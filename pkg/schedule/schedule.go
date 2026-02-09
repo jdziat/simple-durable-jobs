@@ -1,10 +1,16 @@
-package jobs
+// Package schedule provides scheduling implementations for the jobs package.
+package schedule
 
 import (
 	"time"
 
 	"github.com/robfig/cron/v3"
 )
+
+// Schedule defines when a job should run next.
+type Schedule interface {
+	Next(from time.Time) time.Time
+}
 
 // everySchedule runs at fixed intervals.
 type everySchedule struct {
