@@ -4,8 +4,7 @@ import (
 	"context"
 	"testing"
 
-	jobs "github.com/jdziat/simple-durable-jobs"
-	"github.com/jdziat/simple-durable-jobs/storage"
+	"github.com/jdziat/simple-durable-jobs"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/driver/sqlite"
@@ -19,7 +18,7 @@ func setupTestQueue(t *testing.T) (*jobs.Queue, *gorm.DB) {
 	})
 	require.NoError(t, err)
 
-	store := storage.NewGormStorage(db)
+	store := jobs.NewGormStorage(db)
 	store.Migrate(context.Background())
 
 	queue := jobs.New(store)
