@@ -35,3 +35,14 @@ type Job struct {
 	LockedBy    string     `gorm:"size:255"`
 	LockedUntil *time.Time `gorm:"index"`
 }
+
+// Checkpoint stores the result of a durable Call() for replay.
+type Checkpoint struct {
+	ID        string    `gorm:"primaryKey;size:36"`
+	JobID     string    `gorm:"index;size:36;not null"`
+	CallIndex int       `gorm:"not null"`
+	CallType  string    `gorm:"size:255;not null"`
+	Result    []byte    `gorm:"type:bytes"`
+	Error     string    `gorm:"type:text"`
+	CreatedAt time.Time `gorm:"autoCreateTime"`
+}
