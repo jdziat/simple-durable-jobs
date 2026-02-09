@@ -123,7 +123,17 @@ func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 	// Emit start event
 	w.queue.Emit(&core.JobStarted{Job: job, Timestamp: startTime})
 
+	// Create a cancellable context for the heartbeat goroutine
+	heartbeatCtx, cancelHeartbeat := context.WithCancel(ctx)
+	defer cancelHeartbeat()
+
+	// Start heartbeat goroutine to extend lock during long-running jobs
+	go w.runHeartbeat(heartbeatCtx, job)
+
 	err := w.executeHandler(ctx, job, h)
+
+	// Stop heartbeat before completing/failing the job
+	cancelHeartbeat()
 
 	if err != nil {
 		w.handleError(ctx, job, err)
@@ -135,6 +145,27 @@ func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 		w.queue.CallCompleteHooks(ctx, job)
 		// Emit completion event
 		w.queue.Emit(&core.JobCompleted{Job: job, Duration: time.Since(startTime), Timestamp: time.Now()})
+	}
+}
+
+// runHeartbeat periodically extends the job lock during execution.
+// This prevents long-running jobs from being reclaimed as stale.
+func (w *Worker) runHeartbeat(ctx context.Context, job *core.Job) {
+	// Heartbeat every 2 minutes (lock is 5 minutes, so plenty of buffer)
+	ticker := time.NewTicker(2 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := w.queue.Storage().Heartbeat(ctx, job.ID, w.config.WorkerID); err != nil {
+				w.logger.Warn("heartbeat failed", "job_id", job.ID, "error", err)
+			} else {
+				w.logger.Debug("heartbeat sent", "job_id", job.ID)
+			}
+		}
 	}
 }
 
