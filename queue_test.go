@@ -2,7 +2,9 @@ package jobs_test
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/jdziat/simple-durable-jobs"
 	"github.com/stretchr/testify/assert"
@@ -13,13 +15,19 @@ import (
 )
 
 func setupTestQueue(t *testing.T) (*jobs.Queue, *gorm.DB) {
-	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{
+	// Use shared memory database with WAL mode for concurrent access
+	db, err := gorm.Open(sqlite.Open("file::memory:?cache=shared&mode=memory"), &gorm.Config{
 		Logger: logger.Default.LogMode(logger.Silent),
 	})
 	require.NoError(t, err)
 
+	// Enable WAL mode for better concurrency
+	db.Exec("PRAGMA journal_mode=WAL;")
+	db.Exec("PRAGMA busy_timeout=5000;")
+
 	store := jobs.NewGormStorage(db)
-	store.Migrate(context.Background())
+	err = store.Migrate(context.Background())
+	require.NoError(t, err)
 
 	queue := jobs.New(store)
 	return queue, db
@@ -92,4 +100,28 @@ func TestQueue_EnqueueWithOptions(t *testing.T) {
 	assert.Equal(t, "critical", job.Queue)
 	assert.Equal(t, 100, job.Priority)
 	assert.Equal(t, 5, job.MaxRetries)
+}
+
+func TestQueue_Schedule(t *testing.T) {
+	queue, _ := setupTestQueue(t)
+	ctx := context.Background()
+
+	var runCount atomic.Int32
+	queue.Register("scheduled-task", func(ctx context.Context, _ struct{}) error {
+		runCount.Add(1)
+		return nil
+	})
+
+	queue.Schedule("scheduled-task", jobs.Every(100*time.Millisecond))
+
+	worker := queue.NewWorker(jobs.WithScheduler(true))
+	workerCtx, cancel := context.WithTimeout(ctx, 600*time.Millisecond)
+	defer cancel()
+
+	go worker.Start(workerCtx)
+
+	time.Sleep(550 * time.Millisecond)
+
+	// Should have run multiple times
+	assert.GreaterOrEqual(t, runCount.Load(), int32(2))
 }

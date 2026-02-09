@@ -39,6 +39,13 @@ func Concurrency(n int) WorkerOption {
 	})
 }
 
+// WithScheduler enables the scheduler in the worker.
+func WithScheduler(enabled bool) WorkerOption {
+	return workerOptionFunc(func(c *WorkerConfig) {
+		c.EnableScheduler = enabled
+	})
+}
+
 // WorkerQueue adds a queue to process with optional concurrency.
 func WorkerQueue(name string, opts ...WorkerOption) WorkerOption {
 	return workerOptionFunc(func(c *WorkerConfig) {
@@ -92,6 +99,11 @@ func (w *Worker) Start(ctx context.Context) error {
 	}
 
 	jobsChan := make(chan *Job, totalConcurrency)
+
+	// Start scheduler if enabled
+	if w.config.EnableScheduler {
+		go w.runScheduler(ctx)
+	}
 
 	for i := 0; i < totalConcurrency; i++ {
 		w.wg.Add(1)
@@ -255,4 +267,42 @@ func (w *Worker) calculateBackoff(attempt int) time.Duration {
 		backoff = time.Minute
 	}
 	return backoff
+}
+
+func (w *Worker) runScheduler(ctx context.Context) {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	lastRun := make(map[string]time.Time)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			w.queue.mu.RLock()
+			scheduled := w.queue.scheduledJobs
+			w.queue.mu.RUnlock()
+
+			if scheduled == nil {
+				continue
+			}
+
+			now := time.Now()
+			for name, sj := range scheduled {
+				nextRun := sj.Schedule.Next(lastRun[name])
+				if now.After(nextRun) || now.Equal(nextRun) {
+					_, err := w.queue.Enqueue(ctx, sj.Name, sj.Args,
+						QueueOpt(sj.Options.Queue),
+						Priority(sj.Options.Priority),
+					)
+					if err != nil {
+						w.logger.Error("failed to enqueue scheduled job", "name", name, "error", err)
+					} else {
+						lastRun[name] = now
+					}
+				}
+			}
+		}
+	}
 }
