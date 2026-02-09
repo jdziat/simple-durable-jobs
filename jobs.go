@@ -32,6 +32,7 @@ import (
 
 	"github.com/jdziat/simple-durable-jobs/pkg/call"
 	"github.com/jdziat/simple-durable-jobs/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/pkg/jobctx"
 	"github.com/jdziat/simple-durable-jobs/pkg/queue"
 	"github.com/jdziat/simple-durable-jobs/pkg/schedule"
 	"github.com/jdziat/simple-durable-jobs/pkg/security"
@@ -300,4 +301,15 @@ func Weekly(day time.Weekday, hour, minute int) Schedule {
 // Cron creates a schedule from a cron expression.
 func Cron(expr string) Schedule {
 	return schedule.Cron(expr)
+}
+
+// JobFromContext returns the current Job from context, or nil if not in a job handler.
+// Use this to get the job ID for logging or progress tracking.
+func JobFromContext(ctx context.Context) *Job {
+	return jobctx.JobFromContext(ctx)
+}
+
+// JobIDFromContext returns the current job ID from context, or empty string if not in a job handler.
+func JobIDFromContext(ctx context.Context) string {
+	return jobctx.JobIDFromContext(ctx)
 }
