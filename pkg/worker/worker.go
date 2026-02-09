@@ -41,6 +41,23 @@ func NewWorker(q *queue.Queue, opts ...WorkerOption) *Worker {
 		config.Queues = map[string]int{"default": 10}
 	}
 
+	// Set default retry configs if not specified
+	if config.StorageRetry == nil {
+		defaultCfg := DefaultRetryConfig()
+		config.StorageRetry = &defaultCfg
+	}
+	if config.DequeueRetry == nil {
+		// Use longer backoff for dequeue to avoid hammering DB during outages
+		dequeueCfg := RetryConfig{
+			MaxAttempts:       3,
+			InitialBackoff:    500 * time.Millisecond,
+			MaxBackoff:        10 * time.Second,
+			BackoffMultiplier: 2.0,
+			JitterFraction:    0.2,
+		}
+		config.DequeueRetry = &dequeueCfg
+	}
+
 	return &Worker{
 		queue:  q,
 		config: config,
@@ -82,10 +99,10 @@ func (w *Worker) Start(ctx context.Context) error {
 			w.wg.Wait()
 			return ctx.Err()
 		case <-ticker.C:
-			job, err := w.queue.Storage().Dequeue(ctx, queues, w.config.WorkerID)
+			job, err := w.dequeueWithRetry(ctx, queues)
 			if err != nil {
-				if !errors.Is(err, context.Canceled) {
-					w.logger.Error("failed to dequeue", "error", err)
+				if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+					w.logger.Error("failed to dequeue after retries", "error", err)
 				}
 				continue
 			}
@@ -97,6 +114,17 @@ func (w *Worker) Start(ctx context.Context) error {
 			}
 		}
 	}
+}
+
+// dequeueWithRetry attempts to dequeue a job with exponential backoff on failure.
+func (w *Worker) dequeueWithRetry(ctx context.Context, queues []string) (*core.Job, error) {
+	var job *core.Job
+	err := retryWithBackoff(ctx, *w.config.DequeueRetry, func() error {
+		var dequeueErr error
+		job, dequeueErr = w.queue.Storage().Dequeue(ctx, queues, w.config.WorkerID)
+		return dequeueErr
+	})
+	return job, err
 }
 
 func (w *Worker) processLoop(ctx context.Context, jobs <-chan *core.Job) {
@@ -113,7 +141,7 @@ func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 	h, ok := w.queue.GetHandler(job.Type)
 	if !ok {
 		w.logger.Error("no handler for job", "type", job.Type)
-		w.queue.Storage().Fail(ctx, job.ID, w.config.WorkerID, fmt.Sprintf("no handler for %s", job.Type), nil)
+		w.failWithRetry(ctx, job.ID, fmt.Sprintf("no handler for %s", job.Type), nil)
 		return
 	}
 
@@ -138,8 +166,9 @@ func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 	if err != nil {
 		w.handleError(ctx, job, err)
 	} else {
-		if completeErr := w.queue.Storage().Complete(ctx, job.ID, w.config.WorkerID); completeErr != nil {
-			w.logger.Error("failed to complete job", "job_id", job.ID, "error", completeErr)
+		completeErr := w.completeWithRetry(ctx, job.ID)
+		if completeErr != nil {
+			w.logger.Error("failed to complete job after retries", "job_id", job.ID, "error", completeErr)
 			return
 		}
 		w.queue.CallCompleteHooks(ctx, job)
@@ -148,10 +177,17 @@ func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 	}
 }
 
+// completeWithRetry marks a job complete with retry on transient failures.
+func (w *Worker) completeWithRetry(ctx context.Context, jobID string) error {
+	return retryWithBackoff(ctx, *w.config.StorageRetry, func() error {
+		return w.queue.Storage().Complete(ctx, jobID, w.config.WorkerID)
+	})
+}
+
 // runHeartbeat periodically extends the job lock during execution.
 // This prevents long-running jobs from being reclaimed as stale.
 func (w *Worker) runHeartbeat(ctx context.Context, job *core.Job) {
-	// Heartbeat every 2 minutes (lock is 5 minutes, so plenty of buffer)
+	// Heartbeat every 2 minutes (lock is 45 minutes, so plenty of buffer)
 	ticker := time.NewTicker(2 * time.Minute)
 	defer ticker.Stop()
 
@@ -160,8 +196,11 @@ func (w *Worker) runHeartbeat(ctx context.Context, job *core.Job) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := w.queue.Storage().Heartbeat(ctx, job.ID, w.config.WorkerID); err != nil {
-				w.logger.Warn("heartbeat failed", "job_id", job.ID, "error", err)
+			err := retryWithBackoff(ctx, *w.config.StorageRetry, func() error {
+				return w.queue.Storage().Heartbeat(ctx, job.ID, w.config.WorkerID)
+			})
+			if err != nil {
+				w.logger.Warn("heartbeat failed after retries", "job_id", job.ID, "error", err)
 			} else {
 				w.logger.Debug("heartbeat sent", "job_id", job.ID)
 			}
@@ -200,12 +239,10 @@ func (w *Worker) executeHandler(ctx context.Context, job *core.Job, h *handler.H
 }
 
 func (w *Worker) handleError(ctx context.Context, job *core.Job, err error) {
-	workerID := w.config.WorkerID
-
 	// Check for NoRetry
 	var noRetry *core.NoRetryError
 	if errors.As(err, &noRetry) {
-		w.queue.Storage().Fail(ctx, job.ID, workerID, err.Error(), nil)
+		w.failWithRetry(ctx, job.ID, err.Error(), nil)
 		w.queue.CallFailHooks(ctx, job, err)
 		// Emit failure event
 		w.queue.Emit(&core.JobFailed{Job: job, Error: err, Timestamp: time.Now()})
@@ -217,7 +254,7 @@ func (w *Worker) handleError(ctx context.Context, job *core.Job, err error) {
 	if errors.As(err, &retryAfter) {
 		if job.Attempt < job.MaxRetries {
 			retryAt := time.Now().Add(retryAfter.Delay)
-			w.queue.Storage().Fail(ctx, job.ID, workerID, err.Error(), &retryAt)
+			w.failWithRetry(ctx, job.ID, err.Error(), &retryAt)
 			w.queue.CallRetryHooks(ctx, job, job.Attempt, err)
 			// Emit retry event
 			w.queue.Emit(&core.JobRetrying{Job: job, Attempt: job.Attempt, Error: err, NextRunAt: retryAt, Timestamp: time.Now()})
@@ -229,15 +266,25 @@ func (w *Worker) handleError(ctx context.Context, job *core.Job, err error) {
 	if job.Attempt < job.MaxRetries {
 		backoff := w.calculateBackoff(job.Attempt)
 		retryAt := time.Now().Add(backoff)
-		w.queue.Storage().Fail(ctx, job.ID, workerID, err.Error(), &retryAt)
+		w.failWithRetry(ctx, job.ID, err.Error(), &retryAt)
 		w.queue.CallRetryHooks(ctx, job, job.Attempt, err)
 		// Emit retry event
 		w.queue.Emit(&core.JobRetrying{Job: job, Attempt: job.Attempt, Error: err, NextRunAt: retryAt, Timestamp: time.Now()})
 	} else {
-		w.queue.Storage().Fail(ctx, job.ID, workerID, err.Error(), nil)
+		w.failWithRetry(ctx, job.ID, err.Error(), nil)
 		w.queue.CallFailHooks(ctx, job, err)
 		// Emit failure event
 		w.queue.Emit(&core.JobFailed{Job: job, Error: err, Timestamp: time.Now()})
+	}
+}
+
+// failWithRetry marks a job as failed with retry on transient storage failures.
+func (w *Worker) failWithRetry(ctx context.Context, jobID string, errMsg string, retryAt *time.Time) {
+	err := retryWithBackoff(ctx, *w.config.StorageRetry, func() error {
+		return w.queue.Storage().Fail(ctx, jobID, w.config.WorkerID, errMsg, retryAt)
+	})
+	if err != nil {
+		w.logger.Error("failed to mark job as failed after retries", "job_id", jobID, "error", err)
 	}
 }
 

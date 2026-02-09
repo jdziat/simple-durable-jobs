@@ -115,11 +115,20 @@ type (
 	// WorkerConfig holds worker configuration.
 	WorkerConfig = worker.WorkerConfig
 
+	// RetryConfig holds configuration for retry with backoff.
+	RetryConfig = worker.RetryConfig
+
 	// Schedule defines when a job should run next.
 	Schedule = schedule.Schedule
 
 	// GormStorage implements Storage using GORM.
 	GormStorage = storage.GormStorage
+
+	// PoolConfig holds connection pool configuration.
+	PoolConfig = storage.PoolConfig
+
+	// PoolOption configures connection pool settings.
+	PoolOption = storage.PoolOption
 )
 
 // Status constants
@@ -176,6 +185,57 @@ func NewGormStorage(db *gorm.DB) *GormStorage {
 	return storage.NewGormStorage(db)
 }
 
+// NewGormStorageWithPool creates storage with connection pool configuration.
+// Uses sensible defaults that can be overridden with PoolOption arguments.
+func NewGormStorageWithPool(db *gorm.DB, opts ...PoolOption) (*GormStorage, error) {
+	return storage.NewGormStorageWithPool(db, opts...)
+}
+
+// ConfigurePool applies pool configuration to a GORM database connection.
+func ConfigurePool(db *gorm.DB, opts ...PoolOption) error {
+	return storage.ConfigurePool(db, opts...)
+}
+
+// DefaultPoolConfig returns sensible defaults for connection pooling.
+func DefaultPoolConfig() PoolConfig {
+	return storage.DefaultPoolConfig()
+}
+
+// HighConcurrencyPoolConfig returns pool settings for high-concurrency workloads.
+func HighConcurrencyPoolConfig() PoolConfig {
+	return storage.HighConcurrencyPoolConfig()
+}
+
+// LowLatencyPoolConfig returns pool settings optimized for low-latency processing.
+func LowLatencyPoolConfig() PoolConfig {
+	return storage.LowLatencyPoolConfig()
+}
+
+// ResourceConstrainedPoolConfig returns pool settings for limited database resources.
+func ResourceConstrainedPoolConfig() PoolConfig {
+	return storage.ResourceConstrainedPoolConfig()
+}
+
+// MaxOpenConns sets the maximum number of open database connections.
+func MaxOpenConns(n int) PoolOption {
+	return storage.MaxOpenConns(n)
+}
+
+// MaxIdleConns sets the maximum number of idle connections in the pool.
+func MaxIdleConns(n int) PoolOption {
+	return storage.MaxIdleConns(n)
+}
+
+// ConnMaxLifetime sets the maximum lifetime of database connections.
+func ConnMaxLifetime(d time.Duration) PoolOption {
+	return storage.ConnMaxLifetime(d)
+}
+
+// ConnMaxIdleTime sets the maximum idle time for connections.
+func ConnMaxIdleTime(d time.Duration) PoolOption {
+	return storage.ConnMaxIdleTime(d)
+}
+
 // NewOptions creates Options with defaults.
 func NewOptions() *Options {
 	return queue.NewOptions()
@@ -190,6 +250,18 @@ func NewWorker(q *Queue, opts ...WorkerOption) *Worker {
 // Results are checkpointed; on replay, cached results are returned without re-execution.
 func Call[T any](ctx context.Context, name string, args any) (T, error) {
 	return call.Call[T](ctx, name, args)
+}
+
+// SavePhaseCheckpoint saves a phase result to the checkpoint store.
+// Use this to checkpoint expensive operations so they can be skipped on job retry.
+func SavePhaseCheckpoint(ctx context.Context, phaseName string, result any) error {
+	return jobctx.SavePhaseCheckpoint(ctx, phaseName, result)
+}
+
+// LoadPhaseCheckpoint loads a previously saved phase result from the checkpoint store.
+// Returns (result, true) if found, (zero, false) if not found or not in job context.
+func LoadPhaseCheckpoint[T any](ctx context.Context, phaseName string) (T, bool) {
+	return jobctx.LoadPhaseCheckpoint[T](ctx, phaseName)
 }
 
 // NoRetry wraps an error to indicate it should not be retried.
@@ -279,6 +351,31 @@ func WithScheduler(enabled bool) WorkerOption {
 // WorkerQueue adds a queue to process with optional concurrency.
 func WorkerQueue(name string, opts ...WorkerOption) WorkerOption {
 	return worker.WorkerQueue(name, opts...)
+}
+
+// WithStorageRetry configures retry behavior for storage operations.
+func WithStorageRetry(config RetryConfig) WorkerOption {
+	return worker.WithStorageRetry(config)
+}
+
+// WithDequeueRetry configures retry behavior for dequeue operations.
+func WithDequeueRetry(config RetryConfig) WorkerOption {
+	return worker.WithDequeueRetry(config)
+}
+
+// WithRetryAttempts sets the max retry attempts for storage operations.
+func WithRetryAttempts(attempts int) WorkerOption {
+	return worker.WithRetryAttempts(attempts)
+}
+
+// DisableRetry disables retry for storage operations.
+func DisableRetry() WorkerOption {
+	return worker.DisableRetry()
+}
+
+// DefaultRetryConfig returns the default retry configuration.
+func DefaultRetryConfig() RetryConfig {
+	return worker.DefaultRetryConfig()
 }
 
 // Schedule functions
