@@ -149,6 +149,25 @@ func (q *Queue) Enqueue(ctx context.Context, name string, args any, opts ...Opti
 	return job.ID, nil
 }
 
+// Schedule registers a recurring job.
+func (q *Queue) Schedule(name string, schedule Schedule, opts ...Option) {
+	options := NewOptions()
+	for _, opt := range opts {
+		opt.Apply(options)
+	}
+
+	q.mu.Lock()
+	if q.scheduledJobs == nil {
+		q.scheduledJobs = make(map[string]*ScheduledJob)
+	}
+	q.scheduledJobs[name] = &ScheduledJob{
+		Name:     name,
+		Schedule: schedule,
+		Options:  options,
+	}
+	q.mu.Unlock()
+}
+
 // Storage returns the underlying storage.
 func (q *Queue) Storage() Storage {
 	return q.storage
