@@ -3,6 +3,8 @@ package jobs_test
 import (
 	"context"
 	"errors"
+	"fmt"
+	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -16,14 +18,19 @@ import (
 	"gorm.io/gorm/logger"
 )
 
+var integrationTestCounter int
+
 func setupIntegrationQueue(t *testing.T) (*jobs.Queue, jobs.Storage) {
-	db, err := gorm.Open(sqlite.Open("file::memory:?cache=shared&mode=memory"), &gorm.Config{
+	integrationTestCounter++
+	dbPath := fmt.Sprintf("/tmp/jobs_integration_test_%d_%d.db", os.Getpid(), integrationTestCounter)
+	t.Cleanup(func() {
+		os.Remove(dbPath)
+	})
+
+	db, err := gorm.Open(sqlite.Open(dbPath), &gorm.Config{
 		Logger: logger.Default.LogMode(logger.Silent),
 	})
 	require.NoError(t, err)
-
-	db.Exec("PRAGMA journal_mode=WAL;")
-	db.Exec("PRAGMA busy_timeout=5000;")
 
 	store := jobs.NewGormStorage(db)
 	err = store.Migrate(context.Background())
