@@ -239,3 +239,26 @@ func (q *Queue) OnRetry(fn func(context.Context, *Job, int, error)) {
 	q.onRetry = append(q.onRetry, fn)
 	q.mu.Unlock()
 }
+
+// Events returns a channel for receiving queue events.
+func (q *Queue) Events() <-chan Event {
+	ch := make(chan Event, 100)
+	q.mu.Lock()
+	q.eventSubs = append(q.eventSubs, ch)
+	q.mu.Unlock()
+	return ch
+}
+
+func (q *Queue) emit(e Event) {
+	q.mu.RLock()
+	subs := q.eventSubs
+	q.mu.RUnlock()
+
+	for _, ch := range subs {
+		select {
+		case ch <- e:
+		default:
+			// Drop if full
+		}
+	}
+}
