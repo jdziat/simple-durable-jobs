@@ -460,3 +460,14 @@ func TestCall_CheckpointedErrorReturned(t *testing.T) {
 	assert.NotNil(t, capturedErr)
 	assert.Contains(t, capturedErr.Error(), "checkpointed error")
 }
+
+func TestCall_OutsideJobHandler(t *testing.T) {
+	// Calling jobs.Call outside of a job handler should return an error
+	// This tests the getJobContext() nil return path
+	ctx := context.Background()
+
+	_, err := jobs.Call[string](ctx, "any-handler", "args")
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "must be used within a job handler")
+}

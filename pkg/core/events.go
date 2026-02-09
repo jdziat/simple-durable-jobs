@@ -1,6 +1,11 @@
-package jobs
+package core
 
 import "time"
+
+// Event is the interface for all queue events.
+type Event interface {
+	eventMarker()
+}
 
 // JobStarted is emitted when a job starts processing.
 type JobStarted struct {

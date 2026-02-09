@@ -217,12 +217,12 @@ func TestGormStorage_Complete(t *testing.T) {
 	err := store.Enqueue(ctx, job)
 	require.NoError(t, err)
 
-	// Dequeue
+	// Dequeue (locks the job to worker-1)
 	dequeued, _ := store.Dequeue(ctx, []string{"default"}, "worker-1")
 	require.NotNil(t, dequeued)
 
-	// Complete
-	err = store.Complete(ctx, job.ID, []byte(`{"result":"success"}`))
+	// Complete (must use same workerID)
+	err = store.Complete(ctx, job.ID, "worker-1")
 	require.NoError(t, err)
 
 	// Verify
@@ -245,8 +245,12 @@ func TestGormStorage_Fail_NoRetry(t *testing.T) {
 	err := store.Enqueue(ctx, job)
 	require.NoError(t, err)
 
+	// Dequeue to lock the job
+	dequeued, _ := store.Dequeue(ctx, []string{"default"}, "worker-1")
+	require.NotNil(t, dequeued)
+
 	// Fail without retry
-	err = store.Fail(ctx, job.ID, "something went wrong", nil)
+	err = store.Fail(ctx, job.ID, "worker-1", "something went wrong", nil)
 	require.NoError(t, err)
 
 	// Verify
@@ -268,9 +272,13 @@ func TestGormStorage_Fail_WithRetry(t *testing.T) {
 	err := store.Enqueue(ctx, job)
 	require.NoError(t, err)
 
+	// Dequeue to lock the job
+	dequeued, _ := store.Dequeue(ctx, []string{"default"}, "worker-1")
+	require.NotNil(t, dequeued)
+
 	// Fail with retry
 	retryAt := time.Now().Add(5 * time.Minute)
-	err = store.Fail(ctx, job.ID, "temporary error", &retryAt)
+	err = store.Fail(ctx, job.ID, "worker-1", "temporary error", &retryAt)
 	require.NoError(t, err)
 
 	// Verify
