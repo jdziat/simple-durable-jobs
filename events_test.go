@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -198,10 +199,9 @@ loop:
 func TestEvents_JobRetrying(t *testing.T) {
 	queue, _ := setupEventsTestQueue(t)
 
-	attempts := 0
+	var attempts atomic.Int32
 	queue.Register("retrying-test", func(ctx context.Context, _ struct{}) error {
-		attempts++
-		if attempts < 2 {
+		if attempts.Add(1) < 2 {
 			return errors.New("retry")
 		}
 		return nil

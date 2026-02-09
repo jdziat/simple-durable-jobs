@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -339,19 +340,27 @@ func TestCall_VoidReturn(t *testing.T) {
 func TestCall_NestedCallsInSequence(t *testing.T) {
 	queue, store := setupCallTestQueue(t)
 
-	callOrder := []string{}
+	var mu sync.Mutex
+	var callOrder []string
+
 	queue.Register("step1", func(ctx context.Context, _ struct{}) (string, error) {
+		mu.Lock()
 		callOrder = append(callOrder, "step1")
+		mu.Unlock()
 		return "one", nil
 	})
 
 	queue.Register("step2", func(ctx context.Context, _ struct{}) (string, error) {
+		mu.Lock()
 		callOrder = append(callOrder, "step2")
+		mu.Unlock()
 		return "two", nil
 	})
 
 	queue.Register("step3", func(ctx context.Context, _ struct{}) (string, error) {
+		mu.Lock()
 		callOrder = append(callOrder, "step3")
+		mu.Unlock()
 		return "three", nil
 	})
 
@@ -386,6 +395,8 @@ func TestCall_NestedCallsInSequence(t *testing.T) {
 		time.Sleep(100 * time.Millisecond)
 	}
 
+	mu.Lock()
+	defer mu.Unlock()
 	assert.Equal(t, []string{"step1", "step2", "step3"}, callOrder)
 }
 
