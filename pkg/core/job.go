@@ -14,6 +14,8 @@ const (
 	StatusCompleted JobStatus = "completed"
 	StatusFailed    JobStatus = "failed"
 	StatusRetrying  JobStatus = "retrying"
+	StatusWaiting   JobStatus = "waiting"   // Suspended waiting for sub-jobs
+	StatusCancelled JobStatus = "cancelled" // Terminated before completion
 )
 
 // Job represents a unit of work to be processed.
