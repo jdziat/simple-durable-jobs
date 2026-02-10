@@ -38,6 +38,17 @@ type Job struct {
 	LockedUntil     *time.Time `gorm:"index"`
 	LastHeartbeatAt *time.Time // Tracks when the last heartbeat was received
 	UniqueKey       string     `gorm:"index;size:255"` // For job deduplication
+
+	// Parent-child relationship
+	ParentJobID *string `gorm:"index;size:36"`
+	RootJobID   *string `gorm:"index;size:36"` // Top-level workflow job
+
+	// Fan-out tracking
+	FanOutID    *string `gorm:"index;size:36"` // Groups sibling sub-jobs
+	FanOutIndex int     `gorm:"default:0"`     // Position in fan-out batch
+
+	// Result storage for parent retrieval
+	Result []byte `gorm:"type:bytes"` // Serialized return value
 }
 
 // Checkpoint stores the result of a durable Call() for replay.
