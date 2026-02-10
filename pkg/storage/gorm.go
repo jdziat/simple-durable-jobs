@@ -4,6 +4,7 @@ package storage
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -16,12 +17,25 @@ import (
 
 // GormStorage implements Storage using GORM.
 type GormStorage struct {
-	db *gorm.DB
+	db       *gorm.DB
+	isSQLite bool
 }
 
 // NewGormStorage creates a new GORM-backed storage.
 func NewGormStorage(db *gorm.DB) *GormStorage {
-	return &GormStorage{db: db}
+	// Detect SQLite by checking the dialect name
+	isSQLite := false
+	if db != nil {
+		dialector := db.Dialector.Name()
+		isSQLite = strings.Contains(strings.ToLower(dialector), "sqlite")
+	}
+	return &GormStorage{db: db, isSQLite: isSQLite}
+}
+
+// IsSQLite returns true if the storage is using SQLite.
+// SQLite doesn't support FOR UPDATE SKIP LOCKED and uses a fallback strategy.
+func (s *GormStorage) IsSQLite() bool {
+	return s.isSQLite
 }
 
 // Migrate creates the necessary tables.
@@ -45,6 +59,7 @@ func (s *GormStorage) Enqueue(ctx context.Context, job *core.Job) error {
 
 // EnqueueUnique adds a job only if no job with the same unique key exists in pending/running state.
 // Uses SELECT FOR UPDATE to prevent TOCTOU race conditions in concurrent scenarios.
+// For SQLite, relies on serializable transaction isolation (SQLite's default).
 func (s *GormStorage) EnqueueUnique(ctx context.Context, job *core.Job, uniqueKey string) error {
 	if job.ID == "" {
 		job.ID = uuid.New().String()
@@ -59,12 +74,17 @@ func (s *GormStorage) EnqueueUnique(ctx context.Context, job *core.Job, uniqueKe
 
 	// Use transaction with row-level locking to prevent race conditions
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		// SELECT FOR UPDATE locks any matching rows, preventing concurrent inserts
+		query := tx.Where("unique_key = ?", uniqueKey).
+			Where("status IN ?", []core.JobStatus{core.StatusPending, core.StatusRunning})
+
+		// SQLite doesn't support FOR UPDATE, but its serializable transactions
+		// provide equivalent protection for single-process scenarios
+		if !s.isSQLite {
+			query = query.Clauses(clause.Locking{Strength: "UPDATE"})
+		}
+
 		var existing core.Job
-		err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-			Where("unique_key = ?", uniqueKey).
-			Where("status IN ?", []core.JobStatus{core.StatusPending, core.StatusRunning}).
-			First(&existing).Error
+		err := query.First(&existing).Error
 
 		if err == nil {
 			// Found existing job with same unique key
@@ -82,11 +102,18 @@ func (s *GormStorage) EnqueueUnique(ctx context.Context, job *core.Job, uniqueKe
 
 // Dequeue fetches and locks the next available job.
 // Uses FOR UPDATE SKIP LOCKED to prevent multiple workers from selecting the same job.
+// For SQLite, uses optimistic locking with atomic update (suitable for dev/testing).
 func (s *GormStorage) Dequeue(ctx context.Context, queues []string, workerID string) (*core.Job, error) {
 	var job core.Job
 	now := time.Now()
 	lockUntil := now.Add(45 * time.Minute) // Extended to support long-running scans
 
+	// SQLite uses optimistic locking - no row-level locks available
+	if s.isSQLite {
+		return s.dequeueSQLite(ctx, queues, workerID, now, lockUntil)
+	}
+
+	// PostgreSQL/MySQL: Use FOR UPDATE SKIP LOCKED for proper distributed locking
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		// FOR UPDATE SKIP LOCKED ensures:
 		// 1. The selected row is locked for this transaction
@@ -114,6 +141,70 @@ func (s *GormStorage) Dequeue(ctx context.Context, queues []string, workerID str
 		job.Attempt++
 
 		return tx.Save(&job).Error
+	})
+
+	if err != nil {
+		return nil, err
+	}
+	if job.ID == "" {
+		return nil, nil
+	}
+	return &job, nil
+}
+
+// dequeueSQLite uses optimistic locking for SQLite (dev/testing only).
+// This is NOT safe for multiple concurrent workers - use PostgreSQL for production.
+func (s *GormStorage) dequeueSQLite(ctx context.Context, queues []string, workerID string, now time.Time, lockUntil time.Time) (*core.Job, error) {
+	var job core.Job
+
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// Find a candidate job
+		result := tx.
+			Where("queue IN ?", queues).
+			Where("status = ?", core.StatusPending).
+			Where("(run_at IS NULL OR run_at <= ?)", now).
+			Where("(locked_until IS NULL OR locked_until < ?)", now).
+			Order("priority DESC, created_at ASC").
+			First(&job)
+
+		if result.Error != nil {
+			if errors.Is(result.Error, gorm.ErrRecordNotFound) {
+				return nil
+			}
+			return result.Error
+		}
+
+		// Optimistic lock: Update only if still pending (atomic check-and-set)
+		// If another worker grabbed it, RowsAffected will be 0
+		updateResult := tx.Model(&core.Job{}).
+			Where("id = ?", job.ID).
+			Where("status = ?", core.StatusPending). // Must still be pending
+			Updates(map[string]any{
+				"status":       core.StatusRunning,
+				"locked_by":    workerID,
+				"locked_until": lockUntil,
+				"started_at":   now,
+				"attempt":      job.Attempt + 1,
+			})
+
+		if updateResult.Error != nil {
+			return updateResult.Error
+		}
+
+		if updateResult.RowsAffected == 0 {
+			// Another worker got it first - reset job so caller sees no job found
+			job = core.Job{}
+			return nil
+		}
+
+		// Update the job struct with the new values
+		job.Status = core.StatusRunning
+		job.LockedBy = workerID
+		job.LockedUntil = &lockUntil
+		job.StartedAt = &now
+		job.Attempt++
+
+		return nil
 	})
 
 	if err != nil {
