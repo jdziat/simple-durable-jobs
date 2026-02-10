@@ -114,6 +114,118 @@ queue.Register("workflow", func(ctx context.Context, input Input) error {
 
 ---
 
+## Fan-Out/Fan-In
+
+### `Sub(jobType string, args any, opts ...Option) SubJob`
+
+Creates a sub-job definition for use with FanOut.
+
+```go
+subJobs := []jobs.SubJob{
+    jobs.Sub("process-item", item1),
+    jobs.Sub("process-item", item2, jobs.Priority(10)),
+}
+```
+
+### `FanOut[T any](ctx context.Context, subJobs []SubJob, opts ...FanOutOption) ([]Result[T], error)`
+
+Spawns sub-jobs in parallel and waits for all results. Must be called from within a job handler.
+
+```go
+results, err := jobs.FanOut[ProcessedItem](ctx, subJobs, jobs.FailFast())
+if err != nil {
+    return err
+}
+```
+
+### `Values[T any](results []Result[T]) []T`
+
+Extracts successful values from fan-out results.
+
+```go
+items := jobs.Values(results)
+```
+
+### `Partition[T any](results []Result[T]) ([]T, []error)`
+
+Splits results into successes and failures.
+
+```go
+successes, failures := jobs.Partition(results)
+```
+
+### `AllSucceeded[T any](results []Result[T]) bool`
+
+Returns true if all results succeeded.
+
+```go
+if jobs.AllSucceeded(results) {
+    // All sub-jobs completed successfully
+}
+```
+
+---
+
+## Fan-Out Options
+
+### `FailFast() FanOutOption`
+
+Fails the parent job on first sub-job failure.
+
+```go
+jobs.FanOut[T](ctx, subJobs, jobs.FailFast())
+```
+
+### `CollectAll() FanOutOption`
+
+Waits for all sub-jobs and returns partial results.
+
+```go
+jobs.FanOut[T](ctx, subJobs, jobs.CollectAll())
+```
+
+### `Threshold(pct float64) FanOutOption`
+
+Succeeds if at least pct% of sub-jobs complete successfully.
+
+```go
+jobs.FanOut[T](ctx, subJobs, jobs.Threshold(0.8))  // 80% success required
+```
+
+### `WithFanOutQueue(name string) FanOutOption`
+
+Sets the queue for sub-jobs.
+
+```go
+jobs.FanOut[T](ctx, subJobs, jobs.WithFanOutQueue("batch"))
+```
+
+### `WithFanOutRetries(n int) FanOutOption`
+
+Sets the retry count for sub-jobs.
+
+```go
+jobs.FanOut[T](ctx, subJobs, jobs.WithFanOutRetries(5))
+```
+
+### `WithFanOutTimeout(d time.Duration) FanOutOption`
+
+Sets timeout for entire fan-out operation.
+
+```go
+jobs.FanOut[T](ctx, subJobs, jobs.WithFanOutTimeout(1*time.Hour))
+```
+
+### `CancelOnParentFailure() FanOutOption`
+
+Cancels remaining sub-jobs if parent fails.
+
+```go
+jobs.FanOut[T](ctx, subJobs, jobs.CancelOnParentFailure())
+```
+
+---
+
 ## Job Options
 
 ### `Priority(p int) Option`
@@ -327,7 +439,31 @@ const (
     StatusCompleted JobStatus = "completed"
     StatusFailed    JobStatus = "failed"
     StatusRetrying  JobStatus = "retrying"
+    StatusWaiting   JobStatus = "waiting"    // Suspended waiting for sub-jobs
+    StatusCancelled JobStatus = "cancelled"  // Terminated before completion
 )
+```
+
+### `SubJob`
+
+```go
+type SubJob struct {
+    Type     string
+    Args     any
+    Queue    string
+    Priority int
+    Retries  int
+}
+```
+
+### `Result[T]`
+
+```go
+type Result[T any] struct {
+    Index int   // Position in original subJobs slice
+    Value T     // Result if successful
+    Err   error // Error if failed
+}
 ```
 
 ### `Checkpoint`

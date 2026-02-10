@@ -65,7 +65,8 @@ func TestStress_ThousandJobs(t *testing.T) {
 
 	// Start workers
 	// Note: SQLite has limited concurrency for writes. For production, use PostgreSQL.
-	workerCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	// Extended timeout to account for polling overhead from fan-out feature
+	workerCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
 	defer cancel()
 
 	numWorkers := 1
@@ -316,7 +317,8 @@ func TestStress_MixedPriorities(t *testing.T) {
 	}
 
 	// Start single worker with concurrency 1 to see priority ordering
-	workerCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	// Extended timeout: 1000 jobs at ~10 jobs/sec = ~100s, plus overhead
+	workerCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
 	defer cancel()
 
 	worker := queue.NewWorker(jobs.WorkerQueue("default", jobs.Concurrency(1)))

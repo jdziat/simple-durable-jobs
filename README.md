@@ -11,6 +11,7 @@ A Go library for durable job queues with checkpointed workflows, inspired by [Ri
 
 - **Background Jobs** - Fire-and-forget task processing
 - **Durable Workflows** - Multi-step workflows with automatic checkpointing
+- **Fan-Out/Fan-In** - Spawn parallel sub-jobs, wait for results, aggregate
 - **Crash Recovery** - Jobs resume from the last successful checkpoint
 - **Scheduled Jobs** - Cron, daily, weekly, and interval-based scheduling
 - **Priority Queues** - Higher priority jobs run first
@@ -100,6 +101,80 @@ queue.Register("process-order", func(ctx context.Context, order Order) error {
     _, err = jobs.Call[any](ctx, "ship-order", order.Items)
     return err
 })
+```
+
+## Fan-Out/Fan-In
+
+Process items in parallel using sub-jobs, then aggregate results:
+
+```go
+// Register sub-job handler
+queue.Register("process-item", func(ctx context.Context, item Item) (Result, error) {
+    // Process individual item...
+    return Result{ID: item.ID, Status: "done"}, nil
+})
+
+// Register parent job that fans out
+queue.Register("batch-process", func(ctx context.Context, items []Item) error {
+    // Create sub-jobs for each item
+    subJobs := make([]jobs.SubJob, len(items))
+    for i, item := range items {
+        subJobs[i] = jobs.Sub("process-item", item)
+    }
+
+    // Fan-out: spawn all sub-jobs in parallel, wait for results
+    results, err := jobs.FanOut[Result](ctx, subJobs, jobs.FailFast())
+    if err != nil {
+        return err
+    }
+
+    // Aggregate successful results
+    processed := jobs.Values(results)
+    fmt.Printf("Processed %d items\n", len(processed))
+    return nil
+})
+```
+
+### Fan-Out Strategies
+
+```go
+// Fail immediately on first sub-job failure
+jobs.FanOut[T](ctx, subJobs, jobs.FailFast())
+
+// Wait for all sub-jobs, return partial results
+jobs.FanOut[T](ctx, subJobs, jobs.CollectAll())
+
+// Succeed if at least 80% of sub-jobs complete
+jobs.FanOut[T](ctx, subJobs, jobs.Threshold(0.8))
+```
+
+### Fan-Out Options
+
+```go
+jobs.FanOut[T](ctx, subJobs,
+    jobs.FailFast(),                      // Strategy
+    jobs.WithFanOutQueue("batch"),        // Run sub-jobs on specific queue
+    jobs.WithFanOutRetries(5),            // Sub-job retry count
+    jobs.WithFanOutTimeout(1*time.Hour),  // Total fan-out timeout
+    jobs.CancelOnParentFailure(),         // Cancel sub-jobs if parent fails
+)
+```
+
+### Result Helpers
+
+```go
+results, _ := jobs.FanOut[T](ctx, subJobs, jobs.CollectAll())
+
+// Extract successful values
+values := jobs.Values(results)
+
+// Split into successes and failures
+successes, failures := jobs.Partition(results)
+
+// Check if all succeeded
+if jobs.AllSucceeded(results) {
+    // ...
+}
 ```
 
 ## Scheduled Jobs
@@ -198,14 +273,16 @@ The library is organized into a layered architecture with a clean facade:
 simple-durable-jobs/
 ├── jobs.go                    # Root facade - import this package
 ├── pkg/
-│   ├── core/                  # Domain models (Job, Storage, Event, errors)
+│   ├── core/                  # Domain models (Job, FanOut, Storage, Event, errors)
 │   ├── storage/               # GormStorage implementation
 │   ├── queue/                 # Queue orchestration and options
 │   ├── worker/                # Worker processing and configuration
 │   ├── schedule/              # Schedule implementations (Every, Daily, Cron)
 │   ├── call/                  # Durable Call[T] function
+│   ├── fanout/                # Fan-out/fan-in patterns (Sub, FanOut, helpers)
 │   ├── security/              # Validation and sanitization
 │   └── internal/              # Private implementation details
+├── ui/                        # Embeddable web UI for monitoring
 └── examples/                  # Usage examples
 ```
 
