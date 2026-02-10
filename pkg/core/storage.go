@@ -39,4 +39,26 @@ type Storage interface {
 	// Queries
 	GetJob(ctx context.Context, jobID string) (*Job, error)
 	GetJobsByStatus(ctx context.Context, status JobStatus, limit int) ([]*Job, error)
+
+	// Fan-out operations
+	CreateFanOut(ctx context.Context, fanOut *FanOut) error
+	GetFanOut(ctx context.Context, fanOutID string) (*FanOut, error)
+	IncrementFanOutCompleted(ctx context.Context, fanOutID string) (*FanOut, error)
+	IncrementFanOutFailed(ctx context.Context, fanOutID string) (*FanOut, error)
+	UpdateFanOutStatus(ctx context.Context, fanOutID string, status FanOutStatus) error
+	GetFanOutsByParent(ctx context.Context, parentJobID string) ([]*FanOut, error)
+
+	// Sub-job operations
+	EnqueueBatch(ctx context.Context, jobs []*Job) error
+	GetSubJobs(ctx context.Context, fanOutID string) ([]*Job, error)
+	GetSubJobResults(ctx context.Context, fanOutID string) ([]*Job, error)
+	CancelSubJobs(ctx context.Context, fanOutID string) (int64, error)
+
+	// Waiting job operations
+	SuspendJob(ctx context.Context, jobID string, workerID string) error
+	ResumeJob(ctx context.Context, jobID string) error
+	GetWaitingJobsToResume(ctx context.Context) ([]*Job, error)
+
+	// Result storage
+	SaveJobResult(ctx context.Context, jobID string, workerID string, result []byte) error
 }
