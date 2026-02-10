@@ -15,6 +15,7 @@ var (
 	ErrJobArgsTooLarge    = errors.New("jobs: job arguments exceed size limit")
 	ErrJobNotOwned        = errors.New("jobs: job not owned by this worker")
 	ErrDuplicateJob       = errors.New("jobs: duplicate job with same unique key")
+	ErrUniqueKeyTooLong   = errors.New("jobs: unique key exceeds maximum length")
 )
 
 // NoRetryError indicates an error that should not be retried.

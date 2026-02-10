@@ -143,6 +143,10 @@ func (q *Queue) Enqueue(ctx context.Context, name string, args any, opts ...Opti
 
 	// Use unique enqueue if a unique key is specified
 	if options.UniqueKey != "" {
+		// Validate unique key length to prevent database errors
+		if err := security.ValidateUniqueKey(options.UniqueKey); err != nil {
+			return "", err
+		}
 		if err := q.storage.EnqueueUnique(ctx, job, options.UniqueKey); err != nil {
 			if errors.Is(err, core.ErrDuplicateJob) {
 				return "", err

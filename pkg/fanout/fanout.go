@@ -10,6 +10,7 @@ import (
 
 	"github.com/jdziat/simple-durable-jobs/pkg/core"
 	intctx "github.com/jdziat/simple-durable-jobs/pkg/internal/context"
+	"github.com/jdziat/simple-durable-jobs/pkg/security"
 )
 
 // FanOut spawns sub-jobs in parallel and waits for all results.
@@ -100,6 +101,7 @@ func FanOut[T any](ctx context.Context, subJobs []SubJob, opts ...Option) ([]Res
 			return nil, fmt.Errorf("failed to marshal sub-job args: %w", err)
 		}
 
+		// Determine queue name with fallback chain
 		queue := sj.Queue
 		if queue == "" {
 			queue = cfg.queue
@@ -108,15 +110,22 @@ func FanOut[T any](ctx context.Context, subJobs []SubJob, opts ...Option) ([]Res
 			queue = jc.Job.Queue
 		}
 
+		// Validate queue name to prevent invalid sub-job queues
+		if err := security.ValidateQueueName(queue); err != nil {
+			return nil, fmt.Errorf("invalid sub-job queue name %q: %w", queue, err)
+		}
+
 		priority := sj.Priority
 		if priority == 0 {
 			priority = cfg.priority
 		}
 
+		// Determine retries with fallback, then clamp to security limits
 		retries := sj.Retries
 		if retries == 0 {
 			retries = cfg.retries
 		}
+		retries = security.ClampRetries(retries)
 
 		parentID := jc.Job.ID
 		rootID := jc.Job.RootJobID
