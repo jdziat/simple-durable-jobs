@@ -260,3 +260,171 @@ func (s *GormStorage) GetJobsByStatus(ctx context.Context, status core.JobStatus
 		Find(&jobList).Error
 	return jobList, err
 }
+
+// --- Fan-out operations ---
+
+// CreateFanOut creates a new fan-out record.
+func (s *GormStorage) CreateFanOut(ctx context.Context, fanOut *core.FanOut) error {
+	if fanOut.ID == "" {
+		fanOut.ID = uuid.New().String()
+	}
+	return s.db.WithContext(ctx).Create(fanOut).Error
+}
+
+// GetFanOut retrieves a fan-out by ID.
+func (s *GormStorage) GetFanOut(ctx context.Context, fanOutID string) (*core.FanOut, error) {
+	var fanOut core.FanOut
+	err := s.db.WithContext(ctx).First(&fanOut, "id = ?", fanOutID).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, nil
+	}
+	return &fanOut, err
+}
+
+// IncrementFanOutCompleted atomically increments the completed count.
+func (s *GormStorage) IncrementFanOutCompleted(ctx context.Context, fanOutID string) (*core.FanOut, error) {
+	var fanOut core.FanOut
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Exec(
+			"UPDATE fan_outs SET completed_count = completed_count + 1, updated_at = ? WHERE id = ?",
+			time.Now(), fanOutID,
+		).Error; err != nil {
+			return err
+		}
+		return tx.First(&fanOut, "id = ?", fanOutID).Error
+	})
+	return &fanOut, err
+}
+
+// IncrementFanOutFailed atomically increments the failed count.
+func (s *GormStorage) IncrementFanOutFailed(ctx context.Context, fanOutID string) (*core.FanOut, error) {
+	var fanOut core.FanOut
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Exec(
+			"UPDATE fan_outs SET failed_count = failed_count + 1, updated_at = ? WHERE id = ?",
+			time.Now(), fanOutID,
+		).Error; err != nil {
+			return err
+		}
+		return tx.First(&fanOut, "id = ?", fanOutID).Error
+	})
+	return &fanOut, err
+}
+
+// UpdateFanOutStatus updates the status of a fan-out.
+func (s *GormStorage) UpdateFanOutStatus(ctx context.Context, fanOutID string, status core.FanOutStatus) error {
+	return s.db.WithContext(ctx).
+		Model(&core.FanOut{}).
+		Where("id = ?", fanOutID).
+		Update("status", status).Error
+}
+
+// GetFanOutsByParent retrieves all fan-outs for a parent job.
+func (s *GormStorage) GetFanOutsByParent(ctx context.Context, parentJobID string) ([]*core.FanOut, error) {
+	var fanOuts []*core.FanOut
+	err := s.db.WithContext(ctx).
+		Where("parent_job_id = ?", parentJobID).
+		Order("created_at ASC").
+		Find(&fanOuts).Error
+	return fanOuts, err
+}
+
+// --- Sub-job operations ---
+
+// EnqueueBatch inserts multiple jobs in a single operation.
+func (s *GormStorage) EnqueueBatch(ctx context.Context, jobs []*core.Job) error {
+	if len(jobs) == 0 {
+		return nil
+	}
+	for _, job := range jobs {
+		if job.ID == "" {
+			job.ID = uuid.New().String()
+		}
+		if job.Status == "" {
+			job.Status = core.StatusPending
+		}
+		if job.Queue == "" {
+			job.Queue = "default"
+		}
+	}
+	return s.db.WithContext(ctx).Create(jobs).Error
+}
+
+// GetSubJobs retrieves all sub-jobs for a fan-out.
+func (s *GormStorage) GetSubJobs(ctx context.Context, fanOutID string) ([]*core.Job, error) {
+	var jobs []*core.Job
+	err := s.db.WithContext(ctx).
+		Where("fan_out_id = ?", fanOutID).
+		Order("fan_out_index ASC").
+		Find(&jobs).Error
+	return jobs, err
+}
+
+// GetSubJobResults retrieves completed/failed sub-jobs for result collection.
+func (s *GormStorage) GetSubJobResults(ctx context.Context, fanOutID string) ([]*core.Job, error) {
+	var jobs []*core.Job
+	err := s.db.WithContext(ctx).
+		Where("fan_out_id = ? AND status IN ?", fanOutID, []core.JobStatus{core.StatusCompleted, core.StatusFailed}).
+		Order("fan_out_index ASC").
+		Find(&jobs).Error
+	return jobs, err
+}
+
+// CancelSubJobs cancels pending/running sub-jobs for a fan-out.
+func (s *GormStorage) CancelSubJobs(ctx context.Context, fanOutID string) (int64, error) {
+	result := s.db.WithContext(ctx).
+		Model(&core.Job{}).
+		Where("fan_out_id = ? AND status IN ?", fanOutID, []core.JobStatus{core.StatusPending, core.StatusRunning}).
+		Updates(map[string]any{
+			"status":     core.StatusCancelled,
+			"updated_at": time.Now(),
+		})
+	return result.RowsAffected, result.Error
+}
+
+// --- Waiting job operations ---
+
+// SuspendJob suspends a job to waiting status.
+func (s *GormStorage) SuspendJob(ctx context.Context, jobID string, workerID string) error {
+	return s.db.WithContext(ctx).
+		Model(&core.Job{}).
+		Where("id = ? AND locked_by = ?", jobID, workerID).
+		Updates(map[string]any{
+			"status":       core.StatusWaiting,
+			"locked_by":    "",
+			"locked_until": nil,
+			"updated_at":   time.Now(),
+		}).Error
+}
+
+// ResumeJob resumes a waiting job to pending status.
+func (s *GormStorage) ResumeJob(ctx context.Context, jobID string) error {
+	return s.db.WithContext(ctx).
+		Model(&core.Job{}).
+		Where("id = ? AND status = ?", jobID, core.StatusWaiting).
+		Updates(map[string]any{
+			"status":     core.StatusPending,
+			"updated_at": time.Now(),
+		}).Error
+}
+
+// GetWaitingJobsToResume finds waiting jobs whose fan-out is complete.
+func (s *GormStorage) GetWaitingJobsToResume(ctx context.Context) ([]*core.Job, error) {
+	var jobs []*core.Job
+	// Find waiting jobs where their fan-out is complete
+	err := s.db.WithContext(ctx).Raw(`
+		SELECT j.* FROM jobs j
+		INNER JOIN fan_outs f ON j.id = f.parent_job_id
+		WHERE j.status = ?
+		AND f.status IN (?, ?)
+	`, core.StatusWaiting, core.FanOutCompleted, core.FanOutFailed).Scan(&jobs).Error
+	return jobs, err
+}
+
+// SaveJobResult stores the serialized result for a job.
+func (s *GormStorage) SaveJobResult(ctx context.Context, jobID string, workerID string, result []byte) error {
+	return s.db.WithContext(ctx).
+		Model(&core.Job{}).
+		Where("id = ? AND locked_by = ?", jobID, workerID).
+		Update("result", result).Error
+}
