@@ -61,3 +61,9 @@ type Checkpoint struct {
 	Error     string    `gorm:"type:text"`
 	CreatedAt time.Time `gorm:"autoCreateTime"`
 }
+
+// FanOutCheckpoint stores fan-out state for job replay.
+type FanOutCheckpoint struct {
+	FanOutID  string `json:"fan_out_id"`
+	CallIndex int    `json:"call_index"`
+}
