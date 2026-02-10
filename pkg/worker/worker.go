@@ -223,8 +223,9 @@ func (w *Worker) executeHandler(ctx context.Context, job *core.Job, h *handler.H
 
 	// Create job context with all necessary references
 	jc := &intctx.JobContext{
-		Job:     job,
-		Storage: w.queue.Storage(),
+		Job:      job,
+		Storage:  w.queue.Storage(),
+		WorkerID: w.config.WorkerID,
 		HandlerLookup: func(name string) (any, bool) {
 			return w.queue.GetHandler(name)
 		},
