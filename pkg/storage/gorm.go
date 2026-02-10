@@ -25,7 +25,7 @@ func NewGormStorage(db *gorm.DB) *GormStorage {
 
 // Migrate creates the necessary tables.
 func (s *GormStorage) Migrate(ctx context.Context) error {
-	return s.db.WithContext(ctx).AutoMigrate(&core.Job{}, &core.Checkpoint{})
+	return s.db.WithContext(ctx).AutoMigrate(&core.Job{}, &core.Checkpoint{}, &core.FanOut{})
 }
 
 // Enqueue adds a job to the queue.
