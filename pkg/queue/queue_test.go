@@ -81,6 +81,66 @@ func (m *mockStorage) GetJobsByStatus(ctx context.Context, status core.JobStatus
 	return nil, nil
 }
 
+// Fan-out methods
+func (m *mockStorage) CreateFanOut(ctx context.Context, fanOut *core.FanOut) error {
+	return nil
+}
+
+func (m *mockStorage) GetFanOut(ctx context.Context, fanOutID string) (*core.FanOut, error) {
+	return nil, nil
+}
+
+func (m *mockStorage) IncrementFanOutCompleted(ctx context.Context, fanOutID string) (*core.FanOut, error) {
+	return nil, nil
+}
+
+func (m *mockStorage) IncrementFanOutFailed(ctx context.Context, fanOutID string) (*core.FanOut, error) {
+	return nil, nil
+}
+
+func (m *mockStorage) UpdateFanOutStatus(ctx context.Context, fanOutID string, status core.FanOutStatus) error {
+	return nil
+}
+
+func (m *mockStorage) GetFanOutsByParent(ctx context.Context, parentJobID string) ([]*core.FanOut, error) {
+	return nil, nil
+}
+
+func (m *mockStorage) EnqueueBatch(ctx context.Context, jobs []*core.Job) error {
+	for _, job := range jobs {
+		m.jobs[job.ID] = job
+	}
+	return nil
+}
+
+func (m *mockStorage) GetSubJobs(ctx context.Context, fanOutID string) ([]*core.Job, error) {
+	return nil, nil
+}
+
+func (m *mockStorage) GetSubJobResults(ctx context.Context, fanOutID string) ([]*core.Job, error) {
+	return nil, nil
+}
+
+func (m *mockStorage) CancelSubJobs(ctx context.Context, fanOutID string) (int64, error) {
+	return 0, nil
+}
+
+func (m *mockStorage) SuspendJob(ctx context.Context, jobID string, workerID string) error {
+	return nil
+}
+
+func (m *mockStorage) ResumeJob(ctx context.Context, jobID string) error {
+	return nil
+}
+
+func (m *mockStorage) GetWaitingJobsToResume(ctx context.Context) ([]*core.Job, error) {
+	return nil, nil
+}
+
+func (m *mockStorage) SaveJobResult(ctx context.Context, jobID string, workerID string, result []byte) error {
+	return nil
+}
+
 func TestNew_CreatesQueue(t *testing.T) {
 	store := newMockStorage()
 	q := New(store)

@@ -32,6 +32,7 @@ import (
 
 	"github.com/jdziat/simple-durable-jobs/pkg/call"
 	"github.com/jdziat/simple-durable-jobs/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/pkg/fanout"
 	"github.com/jdziat/simple-durable-jobs/pkg/jobctx"
 	"github.com/jdziat/simple-durable-jobs/pkg/queue"
 	"github.com/jdziat/simple-durable-jobs/pkg/schedule"
@@ -129,6 +130,31 @@ type (
 
 	// PoolOption configures connection pool settings.
 	PoolOption = storage.PoolOption
+
+	// Fan-out types
+
+	// SubJob represents a sub-job to be spawned in a fan-out.
+	SubJob = fanout.SubJob
+
+	// FanOutOption configures fan-out behavior.
+	FanOutOption = fanout.Option
+
+	// FanOutError contains details about fan-out failures.
+	FanOutError = fanout.Error
+
+	// SubJobFailure contains details about a single sub-job failure.
+	SubJobFailure = fanout.SubJobFailure
+
+	// FanOut tracking types
+
+	// FanOut tracks a batch of sub-jobs spawned by a parent job.
+	FanOutRecord = core.FanOut
+
+	// FanOutStrategy defines how sub-job failures affect the parent.
+	FanOutStrategy = core.FanOutStrategy
+
+	// FanOutStatus represents the state of a fan-out batch.
+	FanOutStatus = core.FanOutStatus
 )
 
 // Status constants
@@ -138,6 +164,22 @@ const (
 	StatusCompleted = core.StatusCompleted
 	StatusFailed    = core.StatusFailed
 	StatusRetrying  = core.StatusRetrying
+	StatusWaiting   = core.StatusWaiting
+	StatusCancelled = core.StatusCancelled
+)
+
+// Fan-out strategy constants
+const (
+	StrategyFailFast   = core.StrategyFailFast
+	StrategyCollectAll = core.StrategyCollectAll
+	StrategyThreshold  = core.StrategyThreshold
+)
+
+// Fan-out status constants
+const (
+	FanOutPending   = core.FanOutPending
+	FanOutCompleted = core.FanOutCompleted
+	FanOutFailed    = core.FanOutFailed
 )
 
 // Determinism mode constants
@@ -409,4 +451,97 @@ func JobFromContext(ctx context.Context) *Job {
 // JobIDFromContext returns the current job ID from context, or empty string if not in a job handler.
 func JobIDFromContext(ctx context.Context) string {
 	return jobctx.JobIDFromContext(ctx)
+}
+
+// Fan-out functions
+
+// Sub creates a sub-job definition for use with FanOut.
+func Sub(jobType string, args any, opts ...Option) SubJob {
+	return fanout.Sub(jobType, args, opts...)
+}
+
+// FanOut spawns sub-jobs in parallel and waits for all results.
+// Checkpoints progress - safe to retry if parent crashes.
+// Returns a slice of Result[T] with success/failure for each sub-job.
+func FanOut[T any](ctx context.Context, subJobs []SubJob, opts ...FanOutOption) ([]fanout.Result[T], error) {
+	return fanout.FanOut[T](ctx, subJobs, opts...)
+}
+
+// FanOutResult wraps a sub-job result with its index and potential error.
+type FanOutResult[T any] struct {
+	Index int
+	Value T
+	Err   error
+}
+
+// Values extracts values from successful fan-out results.
+func Values[T any](results []fanout.Result[T]) []T {
+	return fanout.Values(results)
+}
+
+// Partition splits fan-out results into successes and failures.
+func Partition[T any](results []fanout.Result[T]) ([]T, []error) {
+	return fanout.Partition(results)
+}
+
+// AllSucceeded checks if all fan-out results succeeded.
+func AllSucceeded[T any](results []fanout.Result[T]) bool {
+	return fanout.AllSucceeded(results)
+}
+
+// SuccessCount returns the number of successful fan-out results.
+func SuccessCount[T any](results []fanout.Result[T]) int {
+	return fanout.SuccessCount(results)
+}
+
+// Fan-out option functions
+
+// FailFast fails the parent on first sub-job failure.
+func FailFast() FanOutOption {
+	return fanout.FailFast()
+}
+
+// CollectAll waits for all sub-jobs, returns partial results.
+func CollectAll() FanOutOption {
+	return fanout.CollectAll()
+}
+
+// Threshold succeeds if at least pct% of sub-jobs succeed.
+func Threshold(pct float64) FanOutOption {
+	return fanout.Threshold(pct)
+}
+
+// WithFanOutQueue sets the queue for sub-jobs.
+func WithFanOutQueue(q string) FanOutOption {
+	return fanout.WithQueue(q)
+}
+
+// WithFanOutPriority sets the priority for sub-jobs.
+func WithFanOutPriority(p int) FanOutOption {
+	return fanout.WithPriority(p)
+}
+
+// WithFanOutRetries sets the retry count for sub-jobs.
+func WithFanOutRetries(n int) FanOutOption {
+	return fanout.WithRetries(n)
+}
+
+// WithSubJobTimeout sets timeout for each sub-job.
+func WithSubJobTimeout(d time.Duration) FanOutOption {
+	return fanout.WithSubJobTimeout(d)
+}
+
+// WithFanOutTimeout sets timeout for entire fan-out.
+func WithFanOutTimeout(d time.Duration) FanOutOption {
+	return fanout.WithTimeout(d)
+}
+
+// CancelOnParentFailure cancels sub-jobs if parent fails.
+func CancelOnParentFailure() FanOutOption {
+	return fanout.CancelOnParentFailure()
+}
+
+// IsSuspendError checks if an error indicates a fan-out suspend.
+func IsSuspendError(err error) bool {
+	return fanout.IsSuspendError(err)
 }
