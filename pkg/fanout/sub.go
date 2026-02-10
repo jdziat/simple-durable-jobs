@@ -9,23 +9,25 @@ func Sub(jobType string, args any, opts ...queue.Option) SubJob {
 	sj := SubJob{
 		Type:    jobType,
 		Args:    args,
-		Retries: 3, // default
+		Retries: queue.DefaultJobRetries,
 	}
 
 	// Apply queue options to extract values
-	queueOpts := queue.NewOptions()
-	for _, opt := range opts {
-		opt.Apply(queueOpts)
-	}
+	if len(opts) > 0 {
+		queueOpts := &queue.Options{} // Start with zero values to detect explicit settings
+		for _, opt := range opts {
+			opt.Apply(queueOpts)
+		}
 
-	if queueOpts.Queue != "" && queueOpts.Queue != "default" {
-		sj.Queue = queueOpts.Queue
-	}
-	if queueOpts.Priority != 0 {
-		sj.Priority = queueOpts.Priority
-	}
-	if queueOpts.MaxRetries > 0 {
-		sj.Retries = queueOpts.MaxRetries
+		if queueOpts.Queue != "" {
+			sj.Queue = queueOpts.Queue
+		}
+		if queueOpts.Priority != 0 {
+			sj.Priority = queueOpts.Priority
+		}
+		if queueOpts.MaxRetries > 0 {
+			sj.Retries = queueOpts.MaxRetries
+		}
 	}
 
 	return sj
