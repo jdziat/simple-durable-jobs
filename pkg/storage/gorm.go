@@ -8,6 +8,7 @@ import (
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 
 	"github.com/jdziat/simple-durable-jobs/pkg/core"
 	"github.com/jdziat/simple-durable-jobs/pkg/security"
@@ -43,6 +44,7 @@ func (s *GormStorage) Enqueue(ctx context.Context, job *core.Job) error {
 }
 
 // EnqueueUnique adds a job only if no job with the same unique key exists in pending/running state.
+// Uses SELECT FOR UPDATE to prevent TOCTOU race conditions in concurrent scenarios.
 func (s *GormStorage) EnqueueUnique(ctx context.Context, job *core.Job, uniqueKey string) error {
 	if job.ID == "" {
 		job.ID = uuid.New().String()
@@ -55,31 +57,42 @@ func (s *GormStorage) EnqueueUnique(ctx context.Context, job *core.Job, uniqueKe
 	}
 	job.UniqueKey = uniqueKey
 
-	// Check for existing job with same unique key that's pending or running
-	var count int64
-	err := s.db.WithContext(ctx).
-		Model(&core.Job{}).
-		Where("unique_key = ?", uniqueKey).
-		Where("status IN ?", []core.JobStatus{core.StatusPending, core.StatusRunning}).
-		Count(&count).Error
-	if err != nil {
-		return err
-	}
-	if count > 0 {
-		return core.ErrDuplicateJob
-	}
+	// Use transaction with row-level locking to prevent race conditions
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// SELECT FOR UPDATE locks any matching rows, preventing concurrent inserts
+		var existing core.Job
+		err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("unique_key = ?", uniqueKey).
+			Where("status IN ?", []core.JobStatus{core.StatusPending, core.StatusRunning}).
+			First(&existing).Error
 
-	return s.db.WithContext(ctx).Create(job).Error
+		if err == nil {
+			// Found existing job with same unique key
+			return core.ErrDuplicateJob
+		}
+		if !errors.Is(err, gorm.ErrRecordNotFound) {
+			// Unexpected error
+			return err
+		}
+
+		// No existing job found, safe to create
+		return tx.Create(job).Error
+	})
 }
 
 // Dequeue fetches and locks the next available job.
+// Uses FOR UPDATE SKIP LOCKED to prevent multiple workers from selecting the same job.
 func (s *GormStorage) Dequeue(ctx context.Context, queues []string, workerID string) (*core.Job, error) {
 	var job core.Job
 	now := time.Now()
 	lockUntil := now.Add(45 * time.Minute) // Extended to support long-running scans
 
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		result := tx.
+		// FOR UPDATE SKIP LOCKED ensures:
+		// 1. The selected row is locked for this transaction
+		// 2. Other workers skip locked rows instead of waiting
+		// This prevents duplicate job execution in distributed scenarios
+		result := tx.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).
 			Where("queue IN ?", queues).
 			Where("status = ?", core.StatusPending).
 			Where("(run_at IS NULL OR run_at <= ?)", now).

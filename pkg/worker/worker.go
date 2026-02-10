@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -226,6 +227,13 @@ func (w *Worker) runHeartbeat(ctx context.Context, job *core.Job) {
 func (w *Worker) executeHandler(ctx context.Context, job *core.Job, h *handler.Handler) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
+			// Capture stack trace for debugging - critical for production troubleshooting
+			stack := debug.Stack()
+			w.logger.Error("job handler panicked",
+				"job_id", job.ID,
+				"job_type", job.Type,
+				"panic", r,
+				"stack", string(stack))
 			err = fmt.Errorf("panic: %v", r)
 		}
 	}()
