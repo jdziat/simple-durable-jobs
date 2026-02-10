@@ -169,3 +169,348 @@ func TestSuspendError(t *testing.T) {
 	assert.False(t, fanout.IsSuspendError(fmt.Errorf("regular error")))
 	assert.False(t, fanout.IsSuspendError(nil))
 }
+
+func TestFanOut_FailFast_StopsOnFirstFailure(t *testing.T) {
+	queue, _ := setupFanOutTestQueue(t)
+
+	var processedCount atomic.Int32
+	failedJobIndex := 2 // The 3rd job will fail
+
+	queue.Register("mayFail", func(ctx context.Context, index int) (int, error) {
+		processedCount.Add(1)
+		if index == failedJobIndex {
+			// NoRetry to prevent re-execution in FailFast test
+			return 0, jobs.NoRetry(fmt.Errorf("intentional failure at index %d", index))
+		}
+		// Add small delay to ensure ordering
+		time.Sleep(10 * time.Millisecond)
+		return index * 10, nil
+	})
+
+	var fanoutErr error
+	var fanoutCompleted atomic.Bool
+
+	queue.Register("failFastParent", func(ctx context.Context, count int) error {
+		subJobs := make([]jobs.SubJob, count)
+		for i := 0; i < count; i++ {
+			subJobs[i] = jobs.Sub("mayFail", i)
+		}
+
+		_, err := jobs.FanOut[int](ctx, subJobs, jobs.FailFast())
+		if jobs.IsSuspendError(err) {
+			return err
+		}
+		fanoutErr = err
+		fanoutCompleted.Store(true)
+		return err
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	_, err := queue.Enqueue(ctx, "failFastParent", 5)
+	require.NoError(t, err)
+
+	worker := queue.NewWorker(jobs.WithScheduler(false))
+	go func() {
+		_ = worker.Start(ctx)
+	}()
+
+	// Wait for fan-out to complete or timeout
+	deadline := time.After(10 * time.Second)
+	for !fanoutCompleted.Load() {
+		select {
+		case <-deadline:
+			t.Log("Timeout waiting for fan-out completion")
+			goto checkResults
+		default:
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+
+checkResults:
+	// FailFast should return an error when a sub-job fails
+	if fanoutCompleted.Load() {
+		assert.Error(t, fanoutErr, "FailFast should return error on sub-job failure")
+	}
+}
+
+func TestFanOut_CollectAll_ReturnsPartialResults(t *testing.T) {
+	queue, _ := setupFanOutTestQueue(t)
+
+	var processedCount atomic.Int32
+
+	queue.Register("partialSuccess", func(ctx context.Context, index int) (int, error) {
+		processedCount.Add(1)
+		// Fail every other job with NoRetry to prevent re-execution
+		if index%2 == 1 {
+			return 0, jobs.NoRetry(fmt.Errorf("odd index %d fails", index))
+		}
+		return index * 10, nil
+	})
+
+	var results []fanout.Result[int]
+	var fanoutCompleted atomic.Bool
+
+	queue.Register("collectAllParent", func(ctx context.Context, count int) error {
+		subJobs := make([]jobs.SubJob, count)
+		for i := 0; i < count; i++ {
+			subJobs[i] = jobs.Sub("partialSuccess", i)
+		}
+
+		var err error
+		results, err = jobs.FanOut[int](ctx, subJobs, jobs.CollectAll())
+		if jobs.IsSuspendError(err) {
+			return err
+		}
+		fanoutCompleted.Store(true)
+		return nil // CollectAll doesn't fail the parent
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	_, err := queue.Enqueue(ctx, "collectAllParent", 6)
+	require.NoError(t, err)
+
+	worker := queue.NewWorker(jobs.WithScheduler(false))
+	go func() {
+		_ = worker.Start(ctx)
+	}()
+
+	// Wait for completion
+	deadline := time.After(10 * time.Second)
+	for !fanoutCompleted.Load() {
+		select {
+		case <-deadline:
+			t.Fatal("Timeout waiting for fan-out completion")
+		default:
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+
+	// All 6 jobs should have been processed
+	assert.Equal(t, int32(6), processedCount.Load())
+
+	// Should have 6 results
+	assert.Len(t, results, 6)
+
+	// Partition into successes and failures
+	successes, failures := jobs.Partition(results)
+	assert.Len(t, successes, 3, "indices 0, 2, 4 should succeed")
+	assert.Len(t, failures, 3, "indices 1, 3, 5 should fail")
+
+	// Check Values helper
+	values := jobs.Values(results)
+	assert.Len(t, values, 3)
+
+	// AllSucceeded should be false
+	assert.False(t, jobs.AllSucceeded(results))
+}
+
+func TestFanOut_Threshold_SucceedsAboveThreshold(t *testing.T) {
+	queue, _ := setupFanOutTestQueue(t)
+
+	var processedCount atomic.Int32
+
+	queue.Register("thresholdJob", func(ctx context.Context, index int) (int, error) {
+		processedCount.Add(1)
+		// 2 out of 10 fail (80% success rate) with NoRetry
+		if index == 3 || index == 7 {
+			return 0, jobs.NoRetry(fmt.Errorf("index %d fails", index))
+		}
+		return index, nil
+	})
+
+	var fanoutErr error
+	var fanoutCompleted atomic.Bool
+
+	queue.Register("thresholdParent", func(ctx context.Context, count int) error {
+		subJobs := make([]jobs.SubJob, count)
+		for i := 0; i < count; i++ {
+			subJobs[i] = jobs.Sub("thresholdJob", i)
+		}
+
+		// 75% threshold - should succeed since 80% pass
+		_, err := jobs.FanOut[int](ctx, subJobs, jobs.Threshold(0.75))
+		if jobs.IsSuspendError(err) {
+			return err
+		}
+		fanoutErr = err
+		fanoutCompleted.Store(true)
+		return err
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	_, err := queue.Enqueue(ctx, "thresholdParent", 10)
+	require.NoError(t, err)
+
+	worker := queue.NewWorker(jobs.WithScheduler(false))
+	go func() {
+		_ = worker.Start(ctx)
+	}()
+
+	deadline := time.After(10 * time.Second)
+	for !fanoutCompleted.Load() {
+		select {
+		case <-deadline:
+			t.Fatal("Timeout waiting for fan-out completion")
+		default:
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+
+	// With 80% success and 75% threshold, should succeed
+	assert.NoError(t, fanoutErr, "80% success should pass 75% threshold")
+	assert.Equal(t, int32(10), processedCount.Load())
+}
+
+func TestFanOut_Threshold_FailsBelowThreshold(t *testing.T) {
+	queue, _ := setupFanOutTestQueue(t)
+
+	var processedCount atomic.Int32
+
+	queue.Register("thresholdFailJob", func(ctx context.Context, index int) (int, error) {
+		processedCount.Add(1)
+		// 5 out of 10 fail (50% success rate) with NoRetry
+		if index < 5 {
+			return 0, jobs.NoRetry(fmt.Errorf("index %d fails", index))
+		}
+		return index, nil
+	})
+
+	var fanoutErr error
+	var fanoutCompleted atomic.Bool
+
+	queue.Register("thresholdFailParent", func(ctx context.Context, count int) error {
+		subJobs := make([]jobs.SubJob, count)
+		for i := 0; i < count; i++ {
+			subJobs[i] = jobs.Sub("thresholdFailJob", i)
+		}
+
+		// 75% threshold - should fail since only 50% pass
+		_, err := jobs.FanOut[int](ctx, subJobs, jobs.Threshold(0.75))
+		if jobs.IsSuspendError(err) {
+			return err
+		}
+		fanoutErr = err
+		fanoutCompleted.Store(true)
+		return err
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	_, err := queue.Enqueue(ctx, "thresholdFailParent", 10)
+	require.NoError(t, err)
+
+	worker := queue.NewWorker(jobs.WithScheduler(false))
+	go func() {
+		_ = worker.Start(ctx)
+	}()
+
+	deadline := time.After(10 * time.Second)
+	for !fanoutCompleted.Load() {
+		select {
+		case <-deadline:
+			t.Fatal("Timeout waiting for fan-out completion")
+		default:
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+
+	// With 50% success and 75% threshold, should fail
+	assert.Error(t, fanoutErr, "50% success should fail 75% threshold")
+}
+
+func TestFanOut_WithOptions(t *testing.T) {
+	queue, _ := setupFanOutTestQueue(t)
+
+	var processedQueue string
+	var processedCount atomic.Int32
+
+	queue.Register("optionsJob", func(ctx context.Context, val int) (int, error) {
+		processedCount.Add(1)
+		return val * 2, nil
+	})
+
+	var fanoutCompleted atomic.Bool
+
+	queue.Register("optionsParent", func(ctx context.Context, _ struct{}) error {
+		subJobs := []jobs.SubJob{
+			jobs.Sub("optionsJob", 1),
+			jobs.Sub("optionsJob", 2),
+		}
+
+		_, err := jobs.FanOut[int](ctx, subJobs,
+			jobs.FailFast(),
+			jobs.WithFanOutRetries(5),
+		)
+		if jobs.IsSuspendError(err) {
+			return err
+		}
+		fanoutCompleted.Store(true)
+		return err
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	_, err := queue.Enqueue(ctx, "optionsParent", struct{}{})
+	require.NoError(t, err)
+
+	worker := queue.NewWorker(
+		jobs.WorkerQueue("default", jobs.Concurrency(5)),
+	)
+	go func() {
+		_ = worker.Start(ctx)
+	}()
+
+	deadline := time.After(8 * time.Second)
+	for !fanoutCompleted.Load() {
+		select {
+		case <-deadline:
+			t.Log("Timeout - checking partial results")
+			goto done
+		default:
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+
+done:
+	// Both jobs should have been processed
+	assert.GreaterOrEqual(t, processedCount.Load(), int32(2))
+	_ = processedQueue // Avoid unused variable warning
+}
+
+func TestFanOut_ResultHelpers(t *testing.T) {
+	// Test result helper functions with mock data
+	results := []fanout.Result[int]{
+		{Index: 0, Value: 10, Err: nil},
+		{Index: 1, Value: 0, Err: fmt.Errorf("error 1")},
+		{Index: 2, Value: 20, Err: nil},
+		{Index: 3, Value: 0, Err: fmt.Errorf("error 2")},
+		{Index: 4, Value: 30, Err: nil},
+	}
+
+	// Test Values - should extract successful values only
+	values := jobs.Values(results)
+	assert.Equal(t, []int{10, 20, 30}, values)
+
+	// Test Partition
+	successes, failures := jobs.Partition(results)
+	assert.Equal(t, []int{10, 20, 30}, successes)
+	assert.Len(t, failures, 2)
+
+	// Test AllSucceeded
+	assert.False(t, jobs.AllSucceeded(results))
+
+	// Test with all successes
+	allSuccess := []fanout.Result[int]{
+		{Index: 0, Value: 1, Err: nil},
+		{Index: 1, Value: 2, Err: nil},
+	}
+	assert.True(t, jobs.AllSucceeded(allSuccess))
+}

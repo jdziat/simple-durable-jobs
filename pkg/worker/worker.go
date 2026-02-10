@@ -262,6 +262,10 @@ func (w *Worker) handleError(ctx context.Context, job *core.Job, err error) {
 		w.queue.CallFailHooks(ctx, job, err)
 		// Emit failure event
 		w.queue.Emit(&core.JobFailed{Job: job, Error: err, Timestamp: time.Now()})
+		// Handle sub-job failure (resume parent if needed)
+		if handleErr := w.handleSubJobCompletion(ctx, job, false); handleErr != nil {
+			w.logger.Error("failed to handle sub-job failure", "job_id", job.ID, "error", handleErr)
+		}
 		return
 	}
 
