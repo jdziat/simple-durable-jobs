@@ -209,6 +209,7 @@ var (
 	ErrJobArgsTooLarge    = core.ErrJobArgsTooLarge
 	ErrJobNotOwned        = core.ErrJobNotOwned
 	ErrDuplicateJob       = core.ErrDuplicateJob
+	ErrUniqueKeyTooLong   = core.ErrUniqueKeyTooLong
 )
 
 // Default values

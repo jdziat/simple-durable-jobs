@@ -112,3 +112,11 @@ func ClampConcurrency(n int) int {
 	}
 	return n
 }
+
+// ValidateUniqueKey validates a unique key length
+func ValidateUniqueKey(key string) error {
+	if len(key) > MaxUniqueKeyLength {
+		return core.ErrUniqueKeyTooLong
+	}
+	return nil
+}
