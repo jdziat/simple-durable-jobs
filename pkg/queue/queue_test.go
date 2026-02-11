@@ -12,8 +12,9 @@ import (
 
 // mockStorage implements core.Storage for testing
 type mockStorage struct {
-	jobs        map[string]*core.Job
-	checkpoints map[string][]core.Checkpoint
+	jobs         map[string]*core.Job
+	checkpoints  map[string][]core.Checkpoint
+	pausedQueues map[string]bool
 }
 
 func newMockStorage() *mockStorage {
@@ -98,8 +99,8 @@ func (m *mockStorage) IncrementFanOutFailed(ctx context.Context, fanOutID string
 	return nil, nil
 }
 
-func (m *mockStorage) UpdateFanOutStatus(ctx context.Context, fanOutID string, status core.FanOutStatus) error {
-	return nil
+func (m *mockStorage) UpdateFanOutStatus(ctx context.Context, fanOutID string, status core.FanOutStatus) (bool, error) {
+	return true, nil
 }
 
 func (m *mockStorage) GetFanOutsByParent(ctx context.Context, parentJobID string) ([]*core.FanOut, error) {
@@ -129,8 +130,8 @@ func (m *mockStorage) SuspendJob(ctx context.Context, jobID string, workerID str
 	return nil
 }
 
-func (m *mockStorage) ResumeJob(ctx context.Context, jobID string) error {
-	return nil
+func (m *mockStorage) ResumeJob(ctx context.Context, jobID string) (bool, error) {
+	return true, nil
 }
 
 func (m *mockStorage) GetWaitingJobsToResume(ctx context.Context) ([]*core.Job, error) {
@@ -378,6 +379,79 @@ func (m *mockStarter) Start(ctx context.Context) error {
 	return nil
 }
 
+// Pause operation methods for mock storage
+func (m *mockStorage) PauseJob(ctx context.Context, jobID string) error {
+	if job, ok := m.jobs[jobID]; ok {
+		job.Status = core.StatusPaused
+	}
+	return nil
+}
+
+func (m *mockStorage) UnpauseJob(ctx context.Context, jobID string) error {
+	if job, ok := m.jobs[jobID]; ok {
+		job.Status = core.StatusPending
+	}
+	return nil
+}
+
+func (m *mockStorage) IsJobPaused(ctx context.Context, jobID string) (bool, error) {
+	if job, ok := m.jobs[jobID]; ok {
+		return job.Status == core.StatusPaused, nil
+	}
+	return false, nil
+}
+
+func (m *mockStorage) GetPausedJobs(ctx context.Context, queue string) ([]*core.Job, error) {
+	var result []*core.Job
+	for _, job := range m.jobs {
+		if job.Queue == queue && job.Status == core.StatusPaused {
+			result = append(result, job)
+		}
+	}
+	return result, nil
+}
+
+func (m *mockStorage) PauseQueue(ctx context.Context, queue string) error {
+	if m.pausedQueues == nil {
+		m.pausedQueues = make(map[string]bool)
+	}
+	m.pausedQueues[queue] = true
+	return nil
+}
+
+func (m *mockStorage) UnpauseQueue(ctx context.Context, queue string) error {
+	if m.pausedQueues != nil {
+		delete(m.pausedQueues, queue)
+	}
+	return nil
+}
+
+func (m *mockStorage) IsQueuePaused(ctx context.Context, queue string) (bool, error) {
+	if m.pausedQueues == nil {
+		return false, nil
+	}
+	return m.pausedQueues[queue], nil
+}
+
+func (m *mockStorage) GetPausedQueues(ctx context.Context) ([]string, error) {
+	var result []string
+	for queue := range m.pausedQueues {
+		result = append(result, queue)
+	}
+	return result, nil
+}
+
+func (m *mockStorage) RefreshQueueStates(ctx context.Context) (map[string]bool, error) {
+	if m.pausedQueues == nil {
+		return make(map[string]bool), nil
+	}
+	result := make(map[string]bool)
+	for k, v := range m.pausedQueues {
+		result[k] = v
+	}
+	return result, nil
+}
+
 func TestQueue_Hooks(t *testing.T) {
 	store := newMockStorage()
 	q := New(store)
@@ -411,4 +485,116 @@ func TestQueue_Hooks(t *testing.T) {
 
 	q.CallRetryHooks(ctx, job, 1, nil)
 	assert.True(t, retryCalled)
+}
+
+func TestQueue_PauseJob(t *testing.T) {
+	store := newMockStorage()
+	q := New(store)
+	ctx := context.Background()
+
+	q.Register("test-job", func(ctx context.Context, args struct{}) error {
+		return nil
+	})
+
+	jobID, err := q.Enqueue(ctx, "test-job", struct{}{})
+	require.NoError(t, err)
+
+	err = q.PauseJob(ctx, jobID)
+	require.NoError(t, err)
+
+	paused, err := q.IsJobPaused(ctx, jobID)
+	require.NoError(t, err)
+	assert.True(t, paused)
+}
+
+func TestQueue_ResumeJob(t *testing.T) {
+	store := newMockStorage()
+	q := New(store)
+	ctx := context.Background()
+
+	q.Register("test-job", func(ctx context.Context, args struct{}) error {
+		return nil
+	})
+
+	jobID, err := q.Enqueue(ctx, "test-job", struct{}{})
+	require.NoError(t, err)
+
+	// Pause then resume
+	err = q.PauseJob(ctx, jobID)
+	require.NoError(t, err)
+
+	err = q.ResumeJob(ctx, jobID)
+	require.NoError(t, err)
+
+	paused, err := q.IsJobPaused(ctx, jobID)
+	require.NoError(t, err)
+	assert.False(t, paused)
+}
+
+func TestQueue_PauseQueue(t *testing.T) {
+	store := newMockStorage()
+	q := New(store)
+	ctx := context.Background()
+
+	err := q.PauseQueue(ctx, "emails")
+	require.NoError(t, err)
+
+	paused, err := q.IsQueuePaused(ctx, "emails")
+	require.NoError(t, err)
+	assert.True(t, paused)
+}
+
+func TestQueue_ResumeQueue(t *testing.T) {
+	store := newMockStorage()
+	q := New(store)
+	ctx := context.Background()
+
+	// Pause then resume
+	err := q.PauseQueue(ctx, "emails")
+	require.NoError(t, err)
+
+	err = q.ResumeQueue(ctx, "emails")
+	require.NoError(t, err)
+
+	paused, err := q.IsQueuePaused(ctx, "emails")
+	require.NoError(t, err)
+	assert.False(t, paused)
+}
+
+func TestQueue_GetPausedJobs(t *testing.T) {
+	store := newMockStorage()
+	q := New(store)
+	ctx := context.Background()
+
+	q.Register("test-job", func(ctx context.Context, args struct{}) error {
+		return nil
+	})
+
+	// Create and pause jobs
+	job1, _ := q.Enqueue(ctx, "test-job", struct{}{}, QueueOpt("emails"))
+	job2, _ := q.Enqueue(ctx, "test-job", struct{}{}, QueueOpt("emails"))
+
+	q.PauseJob(ctx, job1)
+
+	paused, err := q.GetPausedJobs(ctx, "emails")
+	require.NoError(t, err)
+	assert.Len(t, paused, 1)
+	assert.Equal(t, job1, paused[0].ID)
+	_ = job2 // unused
+}
+
+func TestQueue_GetPausedQueues(t *testing.T) {
+	store := newMockStorage()
+	q := New(store)
+	ctx := context.Background()
+
+	// Pause some queues
+	q.PauseQueue(ctx, "emails")
+	q.PauseQueue(ctx, "notifications")
+
+	paused, err := q.GetPausedQueues(ctx)
+	require.NoError(t, err)
+	assert.Len(t, paused, 2)
+	assert.Contains(t, paused, "emails")
+	assert.Contains(t, paused, "notifications")
 }
