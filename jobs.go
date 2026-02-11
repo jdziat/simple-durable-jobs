@@ -68,6 +68,9 @@ type (
 	// Storage defines the persistence layer for jobs.
 	Storage = core.Storage
 
+	// Starter is an interface for types that can be started with a context.
+	Starter = core.Starter
+
 	// Event is the interface for all queue events.
 	Event = core.Event
 
@@ -166,6 +169,7 @@ const (
 	StatusRetrying  = core.StatusRetrying
 	StatusWaiting   = core.StatusWaiting
 	StatusCancelled = core.StatusCancelled
+	StatusPaused    = core.StatusPaused
 )
 
 // Fan-out strategy constants
@@ -210,6 +214,11 @@ var (
 	ErrJobNotOwned        = core.ErrJobNotOwned
 	ErrDuplicateJob       = core.ErrDuplicateJob
 	ErrUniqueKeyTooLong   = core.ErrUniqueKeyTooLong
+	ErrJobAlreadyPaused   = core.ErrJobAlreadyPaused
+	ErrJobNotPaused       = core.ErrJobNotPaused
+	ErrQueueAlreadyPaused = core.ErrQueueAlreadyPaused
+	ErrQueueNotPaused     = core.ErrQueueNotPaused
+	ErrCannotPauseStatus  = core.ErrCannotPauseStatus
 )
 
 // Default values
@@ -534,12 +543,10 @@ func WithFanOutRetries(n int) FanOutOption {
 	return fanout.WithRetries(n)
 }
 
-// WithSubJobTimeout sets timeout for each sub-job.
-func WithSubJobTimeout(d time.Duration) FanOutOption {
-	return fanout.WithSubJobTimeout(d)
-}
-
-// WithFanOutTimeout sets timeout for entire fan-out.
+// WithFanOutTimeout sets a deadline for the entire fan-out operation.
+// The deadline is stored on the fan-out record (TimeoutAt field) but is not
+// automatically enforced. Applications can query fan-outs by TimeoutAt to
+// implement custom timeout handling.
 func WithFanOutTimeout(d time.Duration) FanOutOption {
 	return fanout.WithTimeout(d)
 }
