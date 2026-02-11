@@ -54,3 +54,48 @@ func TestCheckpointSaved_ImplementsEvent(t *testing.T) {
 	}
 	assert.NotNil(t, e)
 }
+
+func TestJobPausedEvent(t *testing.T) {
+	job := &Job{ID: "test-123"}
+	e := &JobPaused{
+		Job:       job,
+		Mode:      PauseModeGraceful,
+		Timestamp: time.Now(),
+	}
+
+	// Verify it implements Event interface
+	var _ Event = e
+	assert.Equal(t, "test-123", e.Job.ID)
+	assert.Equal(t, PauseModeGraceful, e.Mode)
+}
+
+func TestJobResumedEvent(t *testing.T) {
+	job := &Job{ID: "test-123"}
+	e := &JobResumed{
+		Job:       job,
+		Timestamp: time.Now(),
+	}
+
+	var _ Event = e
+	assert.Equal(t, "test-123", e.Job.ID)
+}
+
+func TestQueuePausedEvent(t *testing.T) {
+	e := &QueuePaused{
+		Queue:     "emails",
+		Timestamp: time.Now(),
+	}
+
+	var _ Event = e
+	assert.Equal(t, "emails", e.Queue)
+}
+
+func TestQueueResumedEvent(t *testing.T) {
+	e := &QueueResumed{
+		Queue:     "emails",
+		Timestamp: time.Now(),
+	}
+
+	var _ Event = e
+	assert.Equal(t, "emails", e.Queue)
+}
