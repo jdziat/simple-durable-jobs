@@ -223,3 +223,50 @@ func TestWorker_PausedDoesNotDequeue(t *testing.T) {
 		// Expected - no job processed
 	}
 }
+
+func TestWorker_AggressivePauseCancelsRunningJobs(t *testing.T) {
+	db, _ := gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{
+		Logger: logger.Default.LogMode(logger.Silent),
+	})
+	store := storage.NewGormStorage(db)
+	store.Migrate(context.Background())
+	q := queue.New(store)
+
+	started := make(chan struct{})
+	cancelled := make(chan struct{})
+
+	q.Register("long-job", func(ctx context.Context, args struct{}) error {
+		close(started)
+		<-ctx.Done() // Wait for cancellation
+		close(cancelled)
+		return ctx.Err()
+	})
+
+	_, err := q.Enqueue(context.Background(), "long-job", struct{}{})
+	require.NoError(t, err)
+
+	w := NewWorker(q)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	go w.Start(ctx)
+
+	// Wait for job to start
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("job did not start")
+	}
+
+	// Aggressive pause should cancel the job
+	w.Pause(core.PauseModeAggressive)
+
+	// Job should be cancelled
+	select {
+	case <-cancelled:
+		// Success
+	case <-time.After(2 * time.Second):
+		t.Fatal("job was not cancelled")
+	}
+}
