@@ -344,13 +344,35 @@ func WithPauseMode(mode core.PauseMode) PauseOption {
 
 // PauseJob pauses a specific job.
 func (q *Queue) PauseJob(ctx context.Context, jobID string, opts ...PauseOption) error {
-	// Mode is not used at storage level but provided for future extensibility
-	return q.storage.PauseJob(ctx, jobID)
+	po := &PauseOptions{Mode: core.PauseModeGraceful}
+	for _, opt := range opts {
+		opt.ApplyPause(po)
+	}
+
+	if err := q.storage.PauseJob(ctx, jobID); err != nil {
+		return err
+	}
+
+	// Emit event
+	job, err := q.storage.GetJob(ctx, jobID)
+	if err == nil && job != nil {
+		q.Emit(&core.JobPaused{Job: job, Mode: po.Mode, Timestamp: time.Now()})
+	}
+	return nil
 }
 
 // ResumeJob resumes a paused job.
 func (q *Queue) ResumeJob(ctx context.Context, jobID string) error {
-	return q.storage.UnpauseJob(ctx, jobID)
+	if err := q.storage.UnpauseJob(ctx, jobID); err != nil {
+		return err
+	}
+
+	// Emit event
+	job, err := q.storage.GetJob(ctx, jobID)
+	if err == nil && job != nil {
+		q.Emit(&core.JobResumed{Job: job, Timestamp: time.Now()})
+	}
+	return nil
 }
 
 // IsJobPaused checks if a job is paused.
@@ -360,6 +382,9 @@ func (q *Queue) IsJobPaused(ctx context.Context, jobID string) (bool, error) {
 
 // GetPausedJobs returns all paused jobs in a queue.
 func (q *Queue) GetPausedJobs(ctx context.Context, queueName string) ([]*core.Job, error) {
+	if err := security.ValidateQueueName(queueName); err != nil {
+		return nil, err
+	}
 	return q.storage.GetPausedJobs(ctx, queueName)
 }
 
@@ -367,16 +392,33 @@ func (q *Queue) GetPausedJobs(ctx context.Context, queueName string) ([]*core.Jo
 
 // PauseQueue pauses an entire queue.
 func (q *Queue) PauseQueue(ctx context.Context, queueName string) error {
-	return q.storage.PauseQueue(ctx, queueName)
+	if err := security.ValidateQueueName(queueName); err != nil {
+		return err
+	}
+	if err := q.storage.PauseQueue(ctx, queueName); err != nil {
+		return err
+	}
+	q.Emit(&core.QueuePaused{Queue: queueName, Timestamp: time.Now()})
+	return nil
 }
 
 // ResumeQueue resumes a paused queue.
 func (q *Queue) ResumeQueue(ctx context.Context, queueName string) error {
-	return q.storage.UnpauseQueue(ctx, queueName)
+	if err := security.ValidateQueueName(queueName); err != nil {
+		return err
+	}
+	if err := q.storage.UnpauseQueue(ctx, queueName); err != nil {
+		return err
+	}
+	q.Emit(&core.QueueResumed{Queue: queueName, Timestamp: time.Now()})
+	return nil
 }
 
 // IsQueuePaused checks if a queue is paused.
 func (q *Queue) IsQueuePaused(ctx context.Context, queueName string) (bool, error) {
+	if err := security.ValidateQueueName(queueName); err != nil {
+		return false, err
+	}
 	return q.storage.IsQueuePaused(ctx, queueName)
 }
 

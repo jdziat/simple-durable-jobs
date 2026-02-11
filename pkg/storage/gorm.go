@@ -163,6 +163,16 @@ func (s *GormStorage) Dequeue(ctx context.Context, queues []string, workerID str
 			return result.Error
 		}
 
+		// Re-check if queue was paused between initial check and now (race condition fix)
+		var queueState core.QueueState
+		if err := tx.First(&queueState, "queue = ?", job.Queue).Error; err == nil {
+			if queueState.Paused {
+				// Queue was paused after our initial check, skip this job
+				job = core.Job{} // Clear to indicate no job found
+				return nil
+			}
+		}
+
 		job.Status = core.StatusRunning
 		job.LockedBy = workerID
 		job.LockedUntil = &lockUntil
@@ -201,6 +211,16 @@ func (s *GormStorage) dequeueSQLite(ctx context.Context, queues []string, worker
 				return nil
 			}
 			return result.Error
+		}
+
+		// Re-check if queue was paused between initial check and now (race condition fix)
+		var queueState core.QueueState
+		if err := tx.First(&queueState, "queue = ?", job.Queue).Error; err == nil {
+			if queueState.Paused {
+				// Queue was paused after our initial check, skip this job
+				job = core.Job{}
+				return nil
+			}
 		}
 
 		// Optimistic lock: Update only if still pending (atomic check-and-set)
@@ -334,8 +354,30 @@ func (s *GormStorage) GetDueJobs(ctx context.Context, queues []string, limit int
 	var jobList []*core.Job
 	now := time.Now()
 
-	err := s.db.WithContext(ctx).
-		Where("queue IN ?", queues).
+	// Get paused queues to filter out
+	pausedQueues, err := s.GetPausedQueues(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// Filter out paused queues
+	activeQueues := make([]string, 0, len(queues))
+	pausedSet := make(map[string]bool)
+	for _, q := range pausedQueues {
+		pausedSet[q] = true
+	}
+	for _, q := range queues {
+		if !pausedSet[q] {
+			activeQueues = append(activeQueues, q)
+		}
+	}
+
+	if len(activeQueues) == 0 {
+		return nil, nil // All queues are paused
+	}
+
+	err = s.db.WithContext(ctx).
+		Where("queue IN ?", activeQueues).
 		Where("status = ?", core.StatusPending).
 		Where("(run_at IS NULL OR run_at <= ?)", now).
 		Where("(locked_until IS NULL OR locked_until < ?)", now).
@@ -594,7 +636,8 @@ func (s *GormStorage) SaveJobResult(ctx context.Context, jobID string, workerID 
 // --- Job pause operations ---
 
 // PauseJob pauses a job, preventing it from being picked up.
-// Only pending, running, and waiting jobs can be paused.
+// Only pending and waiting jobs can be paused. Running jobs cannot be paused
+// because the worker holds the lock and clearing it would corrupt state.
 func (s *GormStorage) PauseJob(ctx context.Context, jobID string) error {
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var job core.Job
@@ -610,42 +653,55 @@ func (s *GormStorage) PauseJob(ctx context.Context, jobID string) error {
 			return core.ErrJobAlreadyPaused
 		}
 
-		// Only allow pausing pending, running, or waiting jobs
+		// Only allow pausing pending or waiting jobs.
+		// Running jobs cannot be paused - use worker.Pause() for that.
 		switch job.Status {
-		case core.StatusPending, core.StatusRunning, core.StatusWaiting:
+		case core.StatusPending, core.StatusWaiting:
 			// OK to pause
 		default:
 			return core.ErrCannotPauseStatus
 		}
 
+		// Store previous status for restoration on unpause
 		return tx.Model(&core.Job{}).
 			Where("id = ?", jobID).
 			Updates(map[string]any{
-				"status":       core.StatusPaused,
-				"locked_by":    "",
-				"locked_until": nil,
-				"updated_at":   time.Now(),
+				"status":          core.StatusPaused,
+				"previous_status": job.Status,
+				"updated_at":      time.Now(),
 			}).Error
 	})
 }
 
-// UnpauseJob resumes a paused job back to pending status.
+// UnpauseJob resumes a paused job back to its previous status.
 func (s *GormStorage) UnpauseJob(ctx context.Context, jobID string) error {
-	result := s.db.WithContext(ctx).
-		Model(&core.Job{}).
-		Where("id = ? AND status = ?", jobID, core.StatusPaused).
-		Updates(map[string]any{
-			"status":     core.StatusPending,
-			"updated_at": time.Now(),
-		})
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var job core.Job
+		if err := tx.First(&job, "id = ?", jobID).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return fmt.Errorf("job not found: %s", jobID)
+			}
+			return err
+		}
 
-	if result.Error != nil {
-		return result.Error
-	}
-	if result.RowsAffected == 0 {
-		return core.ErrJobNotPaused
-	}
-	return nil
+		if job.Status != core.StatusPaused {
+			return core.ErrJobNotPaused
+		}
+
+		// Restore to previous status, default to pending if not set
+		restoreStatus := job.PreviousStatus
+		if restoreStatus == "" {
+			restoreStatus = core.StatusPending
+		}
+
+		return tx.Model(&core.Job{}).
+			Where("id = ?", jobID).
+			Updates(map[string]any{
+				"status":          restoreStatus,
+				"previous_status": "",
+				"updated_at":      time.Now(),
+			}).Error
+	})
 }
 
 // GetPausedJobs returns all paused jobs in a queue.

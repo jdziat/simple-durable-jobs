@@ -27,6 +27,7 @@ type Job struct {
 	Queue           string     `gorm:"index;size:255;default:'default'"`
 	Priority        int        `gorm:"index;default:0"`
 	Status          JobStatus  `gorm:"index;size:20;default:'pending'"`
+	PreviousStatus  JobStatus  `gorm:"size:20"` // Status before pause, for restoration
 	Attempt         int        `gorm:"default:0"`
 	MaxRetries      int        `gorm:"default:3"`
 	LastError       string     `gorm:"type:text"`
