@@ -47,3 +47,11 @@ func TestErrorVariables(t *testing.T) {
 	assert.Contains(t, ErrJobNotOwned.Error(), "not owned")
 	assert.Contains(t, ErrDuplicateJob.Error(), "duplicate")
 }
+
+func TestPauseErrors(t *testing.T) {
+	assert.Error(t, ErrJobAlreadyPaused)
+	assert.Error(t, ErrJobNotPaused)
+	assert.Error(t, ErrQueueAlreadyPaused)
+	assert.Error(t, ErrQueueNotPaused)
+	assert.Error(t, ErrCannotPauseStatus)
+}

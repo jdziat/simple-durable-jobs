@@ -16,6 +16,11 @@ var (
 	ErrJobNotOwned        = errors.New("jobs: job not owned by this worker")
 	ErrDuplicateJob       = errors.New("jobs: duplicate job with same unique key")
 	ErrUniqueKeyTooLong   = errors.New("jobs: unique key exceeds maximum length")
+	ErrJobAlreadyPaused   = errors.New("jobs: job is already paused")
+	ErrJobNotPaused       = errors.New("jobs: job is not paused")
+	ErrQueueAlreadyPaused = errors.New("jobs: queue is already paused")
+	ErrQueueNotPaused     = errors.New("jobs: queue is not paused")
+	ErrCannotPauseStatus  = errors.New("jobs: cannot pause job in current status")
 )
 
 // NoRetryError indicates an error that should not be retried.
