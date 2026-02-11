@@ -1,11 +1,19 @@
 package worker
 
 import (
+	"context"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/driver/sqlite"
+	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
+
+	"github.com/jdziat/simple-durable-jobs/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/pkg/queue"
+	"github.com/jdziat/simple-durable-jobs/pkg/storage"
 )
 
 func TestWorkerConfig_Defaults(t *testing.T) {
@@ -134,4 +142,46 @@ func TestWorkerOptionFunc_ImplementsInterface(t *testing.T) {
 	opt.ApplyWorker(&config)
 
 	assert.Equal(t, "custom-id", config.WorkerID)
+}
+
+func TestWorker_Pause(t *testing.T) {
+	// Create a minimal queue for testing
+	db, _ := gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{
+		Logger: logger.Default.LogMode(logger.Silent),
+	})
+	store := storage.NewGormStorage(db)
+	store.Migrate(context.Background())
+	q := queue.New(store)
+
+	w := NewWorker(q)
+
+	// Not paused initially
+	assert.False(t, w.IsPaused())
+
+	// Pause
+	w.Pause(core.PauseModeGraceful)
+	assert.True(t, w.IsPaused())
+
+	// Resume
+	w.Resume()
+	assert.False(t, w.IsPaused())
+}
+
+func TestWorker_PauseMode(t *testing.T) {
+	db, _ := gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{
+		Logger: logger.Default.LogMode(logger.Silent),
+	})
+	store := storage.NewGormStorage(db)
+	store.Migrate(context.Background())
+	q := queue.New(store)
+
+	w := NewWorker(q)
+
+	// Default mode
+	assert.Equal(t, core.PauseModeGraceful, w.PauseMode())
+
+	// Set aggressive mode
+	w.Pause(core.PauseModeAggressive)
+	assert.True(t, w.IsPaused())
+	assert.Equal(t, core.PauseModeAggressive, w.PauseMode())
 }

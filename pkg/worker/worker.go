@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"runtime/debug"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -24,6 +25,14 @@ type Worker struct {
 	config WorkerConfig
 	logger *slog.Logger
 	wg     sync.WaitGroup
+
+	// Pause state
+	paused    atomic.Bool
+	pauseMode atomic.Value // stores core.PauseMode
+
+	// Running job cancellation (for aggressive pause)
+	runningJobs   map[string]context.CancelFunc
+	runningJobsMu sync.Mutex
 }
 
 // NewWorker creates a new worker for the given queue.
@@ -61,9 +70,10 @@ func NewWorker(q *queue.Queue, opts ...WorkerOption) *Worker {
 	}
 
 	return &Worker{
-		queue:  q,
-		config: config,
-		logger: slog.Default(),
+		queue:       q,
+		config:      config,
+		logger:      slog.Default(),
+		runningJobs: make(map[string]context.CancelFunc),
 	}
 }
 
@@ -227,14 +237,36 @@ func (w *Worker) runHeartbeat(ctx context.Context, job *core.Job) {
 func (w *Worker) executeHandler(ctx context.Context, job *core.Job, h *handler.Handler) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
-			// Capture stack trace for debugging - critical for production troubleshooting
-			stack := debug.Stack()
-			w.logger.Error("job handler panicked",
-				"job_id", job.ID,
-				"job_type", job.Type,
-				"panic", r,
-				"stack", string(stack))
-			err = fmt.Errorf("panic: %v", r)
+			// Check if the panicked value is an error - preserve type for special errors
+			// like SuspendError that need type-based detection
+			if e, ok := r.(error); ok {
+				// Check if this is a suspend error (expected behavior from fan-out)
+				if fanout.IsSuspendError(e) {
+					// Don't log as panic - this is expected behavior
+					w.logger.Debug("job handler signaled suspend via panic",
+						"job_id", job.ID,
+						"job_type", job.Type)
+					err = e
+					return
+				}
+				// Capture stack trace for debugging - critical for production troubleshooting
+				stack := debug.Stack()
+				w.logger.Error("job handler panicked with error",
+					"job_id", job.ID,
+					"job_type", job.Type,
+					"error", e,
+					"stack", string(stack))
+				err = e
+			} else {
+				// Capture stack trace for debugging - critical for production troubleshooting
+				stack := debug.Stack()
+				w.logger.Error("job handler panicked",
+					"job_id", job.ID,
+					"job_type", job.Type,
+					"panic", r,
+					"stack", string(stack))
+				err = fmt.Errorf("panic: %v", r)
+			}
 		}
 	}()
 
@@ -384,9 +416,19 @@ func (w *Worker) checkFanOutCompletion(ctx context.Context, fo *core.FanOut) err
 }
 
 // completeFanOut marks a fan-out as complete and resumes the parent job.
+// Uses atomic status update to prevent race conditions when multiple workers
+// complete the last sub-jobs simultaneously.
 func (w *Worker) completeFanOut(ctx context.Context, fo *core.FanOut, status core.FanOutStatus) error {
-	if err := w.queue.Storage().UpdateFanOutStatus(ctx, fo.ID, status); err != nil {
+	// Atomic update: only succeeds if status is still 'pending'
+	// This prevents race where two workers both try to complete
+	updated, err := w.queue.Storage().UpdateFanOutStatus(ctx, fo.ID, status)
+	if err != nil {
 		return err
+	}
+	if !updated {
+		// Another worker already completed this fan-out
+		w.logger.Debug("fan-out already completed by another worker", "fan_out_id", fo.ID)
+		return nil
 	}
 
 	// Cancel remaining sub-jobs if needed
@@ -397,8 +439,12 @@ func (w *Worker) completeFanOut(ctx context.Context, fo *core.FanOut, status cor
 	}
 
 	// Resume parent job
-	if err := w.queue.Storage().ResumeJob(ctx, fo.ParentJobID); err != nil {
+	resumed, err := w.queue.Storage().ResumeJob(ctx, fo.ParentJobID)
+	if err != nil {
 		return fmt.Errorf("failed to resume parent job: %w", err)
+	}
+	if !resumed {
+		w.logger.Warn("parent job was not in waiting status", "parent_job_id", fo.ParentJobID)
 	}
 
 	w.logger.Info("resumed parent job after fan-out completion",
@@ -412,10 +458,7 @@ func (w *Worker) completeFanOut(ctx context.Context, fo *core.FanOut, status cor
 func (w *Worker) calculateBackoff(attempt int) time.Duration {
 	base := time.Second
 	backoff := base * (1 << attempt)
-	if backoff > time.Minute {
-		backoff = time.Minute
-	}
-	return backoff
+	return min(backoff, time.Minute)
 }
 
 func (w *Worker) runScheduler(ctx context.Context) {
@@ -465,18 +508,63 @@ func (w *Worker) pollWaitingJobs(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			jobs, err := w.queue.Storage().GetWaitingJobsToResume(ctx)
+			var jobs []*core.Job
+			err := retryWithBackoff(ctx, *w.config.StorageRetry, func() error {
+				var queryErr error
+				jobs, queryErr = w.queue.Storage().GetWaitingJobsToResume(ctx)
+				return queryErr
+			})
 			if err != nil {
-				w.logger.Error("failed to get waiting jobs", "error", err)
+				if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+					w.logger.Error("failed to get waiting jobs after retries", "error", err)
+				}
 				continue
 			}
 			for _, job := range jobs {
-				if err := w.queue.Storage().ResumeJob(ctx, job.ID); err != nil {
-					w.logger.Error("failed to resume waiting job", "job_id", job.ID, "error", err)
+				resumeErr := retryWithBackoff(ctx, *w.config.StorageRetry, func() error {
+					_, err := w.queue.Storage().ResumeJob(ctx, job.ID)
+					return err
+				})
+				if resumeErr != nil {
+					w.logger.Error("failed to resume waiting job after retries", "job_id", job.ID, "error", resumeErr)
 				} else {
 					w.logger.Info("resumed waiting job via polling fallback", "job_id", job.ID)
 				}
 			}
 		}
 	}
+}
+
+// Pause pauses the worker.
+func (w *Worker) Pause(mode core.PauseMode) {
+	w.pauseMode.Store(mode)
+	w.paused.Store(true)
+
+	if mode == core.PauseModeAggressive {
+		// Cancel all running jobs
+		w.runningJobsMu.Lock()
+		for _, cancel := range w.runningJobs {
+			cancel()
+		}
+		w.runningJobsMu.Unlock()
+	}
+}
+
+// Resume resumes the worker.
+func (w *Worker) Resume() {
+	w.paused.Store(false)
+}
+
+// IsPaused returns true if the worker is paused.
+func (w *Worker) IsPaused() bool {
+	return w.paused.Load()
+}
+
+// PauseMode returns the current pause mode.
+func (w *Worker) PauseMode() core.PauseMode {
+	mode := w.pauseMode.Load()
+	if mode == nil {
+		return core.PauseModeGraceful
+	}
+	return mode.(core.PauseMode)
 }
