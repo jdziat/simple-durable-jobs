@@ -165,20 +165,34 @@ func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 		return
 	}
 
+	// Create cancellable context for this job
+	jobCtx, cancelJob := context.WithCancel(ctx)
+	defer cancelJob()
+
+	// Track this running job for aggressive pause
+	w.runningJobsMu.Lock()
+	w.runningJobs[job.ID] = cancelJob
+	w.runningJobsMu.Unlock()
+	defer func() {
+		w.runningJobsMu.Lock()
+		delete(w.runningJobs, job.ID)
+		w.runningJobsMu.Unlock()
+	}()
+
 	// Call start hooks
-	w.queue.CallStartHooks(ctx, job)
+	w.queue.CallStartHooks(jobCtx, job)
 
 	// Emit start event
 	w.queue.Emit(&core.JobStarted{Job: job, Timestamp: startTime})
 
 	// Create a cancellable context for the heartbeat goroutine
-	heartbeatCtx, cancelHeartbeat := context.WithCancel(ctx)
+	heartbeatCtx, cancelHeartbeat := context.WithCancel(jobCtx)
 	defer cancelHeartbeat()
 
 	// Start heartbeat goroutine to extend lock during long-running jobs
 	go w.runHeartbeat(heartbeatCtx, job)
 
-	err := w.executeHandler(ctx, job, h)
+	err := w.executeHandler(jobCtx, job, h)
 
 	// Stop heartbeat before completing/failing the job
 	cancelHeartbeat()
