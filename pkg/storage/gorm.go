@@ -115,19 +115,41 @@ func (s *GormStorage) Dequeue(ctx context.Context, queues []string, workerID str
 	now := time.Now()
 	lockUntil := now.Add(45 * time.Minute) // Extended to support long-running scans
 
+	// Get paused queues
+	pausedQueues, err := s.GetPausedQueues(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// Filter out paused queues
+	activeQueues := make([]string, 0, len(queues))
+	pausedSet := make(map[string]bool)
+	for _, q := range pausedQueues {
+		pausedSet[q] = true
+	}
+	for _, q := range queues {
+		if !pausedSet[q] {
+			activeQueues = append(activeQueues, q)
+		}
+	}
+
+	if len(activeQueues) == 0 {
+		return nil, nil // All queues are paused
+	}
+
 	// SQLite uses optimistic locking - no row-level locks available
 	if s.isSQLite {
-		return s.dequeueSQLite(ctx, queues, workerID, now, lockUntil)
+		return s.dequeueSQLite(ctx, activeQueues, workerID, now, lockUntil)
 	}
 
 	// PostgreSQL/MySQL: Use FOR UPDATE SKIP LOCKED for proper distributed locking
-	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		// FOR UPDATE SKIP LOCKED ensures:
 		// 1. The selected row is locked for this transaction
 		// 2. Other workers skip locked rows instead of waiting
 		// This prevents duplicate job execution in distributed scenarios
 		result := tx.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).
-			Where("queue IN ?", queues).
+			Where("queue IN ?", activeQueues).
 			Where("status = ?", core.StatusPending).
 			Where("(run_at IS NULL OR run_at <= ?)", now).
 			Where("(locked_until IS NULL OR locked_until < ?)", now).
