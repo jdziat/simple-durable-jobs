@@ -185,3 +185,41 @@ func TestWorker_PauseMode(t *testing.T) {
 	assert.True(t, w.IsPaused())
 	assert.Equal(t, core.PauseModeAggressive, w.PauseMode())
 }
+
+func TestWorker_PausedDoesNotDequeue(t *testing.T) {
+	db, _ := gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{
+		Logger: logger.Default.LogMode(logger.Silent),
+	})
+	store := storage.NewGormStorage(db)
+	store.Migrate(context.Background())
+	q := queue.New(store)
+
+	// Register a handler
+	processed := make(chan string, 10)
+	q.Register("test-job", func(ctx context.Context, args struct{}) error {
+		processed <- "processed"
+		return nil
+	})
+
+	// Enqueue a job
+	_, err := q.Enqueue(context.Background(), "test-job", struct{}{})
+	require.NoError(t, err)
+
+	// Create and immediately pause the worker
+	w := NewWorker(q)
+	w.Pause(core.PauseModeGraceful)
+
+	// Start worker in background
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+
+	go w.Start(ctx)
+
+	// Wait a bit - job should NOT be processed
+	select {
+	case <-processed:
+		t.Fatal("job should not be processed while paused")
+	case <-time.After(300 * time.Millisecond):
+		// Expected - no job processed
+	}
+}

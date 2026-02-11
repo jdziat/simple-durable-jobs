@@ -114,6 +114,11 @@ func (w *Worker) Start(ctx context.Context) error {
 			w.wg.Wait()
 			return ctx.Err()
 		case <-ticker.C:
+			// Skip dequeue if paused
+			if w.IsPaused() {
+				continue
+			}
+
 			job, err := w.dequeueWithRetry(ctx, queues)
 			if err != nil {
 				if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
@@ -222,6 +227,11 @@ func (w *Worker) runHeartbeat(ctx context.Context, job *core.Job) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			// Stop heartbeat if aggressively paused
+			if w.IsPaused() && w.PauseMode() == core.PauseModeAggressive {
+				return
+			}
+
 			err := retryWithBackoff(ctx, *w.config.StorageRetry, func() error {
 				return w.queue.Storage().Heartbeat(ctx, job.ID, w.config.WorkerID)
 			})
