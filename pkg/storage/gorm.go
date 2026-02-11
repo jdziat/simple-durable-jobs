@@ -4,6 +4,7 @@ package storage
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -38,9 +39,15 @@ func (s *GormStorage) IsSQLite() bool {
 	return s.isSQLite
 }
 
+// DB returns the underlying GORM database connection.
+// This is useful for running custom queries or accessing the database directly.
+func (s *GormStorage) DB() *gorm.DB {
+	return s.db
+}
+
 // Migrate creates the necessary tables.
 func (s *GormStorage) Migrate(ctx context.Context) error {
-	return s.db.WithContext(ctx).AutoMigrate(&core.Job{}, &core.Checkpoint{}, &core.FanOut{})
+	return s.db.WithContext(ctx).AutoMigrate(&core.Job{}, &core.Checkpoint{}, &core.FanOut{}, &core.QueueState{})
 }
 
 // Enqueue adds a job to the queue.
@@ -318,16 +325,24 @@ func (s *GormStorage) GetDueJobs(ctx context.Context, queues []string, limit int
 }
 
 // Heartbeat extends the lock on a running job.
+// Returns ErrJobNotOwned if the job is no longer owned by this worker.
 func (s *GormStorage) Heartbeat(ctx context.Context, jobID string, workerID string) error {
 	now := time.Now()
 	lockUntil := now.Add(45 * time.Minute)
-	return s.db.WithContext(ctx).
+	result := s.db.WithContext(ctx).
 		Model(&core.Job{}).
 		Where("id = ? AND locked_by = ?", jobID, workerID).
 		Updates(map[string]any{
 			"locked_until":      lockUntil,
 			"last_heartbeat_at": now,
-		}).Error
+		})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		return core.ErrJobNotOwned
+	}
+	return nil
 }
 
 // ReleaseStaleLocks releases locks on jobs that haven't had a heartbeat.
@@ -415,12 +430,20 @@ func (s *GormStorage) IncrementFanOutFailed(ctx context.Context, fanOutID string
 	return &fanOut, err
 }
 
-// UpdateFanOutStatus updates the status of a fan-out.
-func (s *GormStorage) UpdateFanOutStatus(ctx context.Context, fanOutID string, status core.FanOutStatus) error {
-	return s.db.WithContext(ctx).
+// UpdateFanOutStatus atomically updates the status of a fan-out from pending.
+// Returns (true, nil) if the status was updated, (false, nil) if already completed
+// by another worker, or (false, error) on database error.
+// This prevents race conditions where multiple workers try to complete the same fan-out.
+func (s *GormStorage) UpdateFanOutStatus(ctx context.Context, fanOutID string, status core.FanOutStatus) (bool, error) {
+	result := s.db.WithContext(ctx).
 		Model(&core.FanOut{}).
-		Where("id = ?", fanOutID).
-		Update("status", status).Error
+		Where("id = ? AND status = ?", fanOutID, core.FanOutPending).
+		Update("status", status)
+	if result.Error != nil {
+		return false, result.Error
+	}
+	// RowsAffected == 0 means another worker already completed this fan-out
+	return result.RowsAffected > 0, nil
 }
 
 // GetFanOutsByParent retrieves all fan-outs for a parent job.
@@ -489,8 +512,9 @@ func (s *GormStorage) CancelSubJobs(ctx context.Context, fanOutID string) (int64
 // --- Waiting job operations ---
 
 // SuspendJob suspends a job to waiting status.
+// Returns ErrJobNotOwned if the job is no longer owned by this worker.
 func (s *GormStorage) SuspendJob(ctx context.Context, jobID string, workerID string) error {
-	return s.db.WithContext(ctx).
+	result := s.db.WithContext(ctx).
 		Model(&core.Job{}).
 		Where("id = ? AND locked_by = ?", jobID, workerID).
 		Updates(map[string]any{
@@ -498,18 +522,30 @@ func (s *GormStorage) SuspendJob(ctx context.Context, jobID string, workerID str
 			"locked_by":    "",
 			"locked_until": nil,
 			"updated_at":   time.Now(),
-		}).Error
+		})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		return core.ErrJobNotOwned
+	}
+	return nil
 }
 
 // ResumeJob resumes a waiting job to pending status.
-func (s *GormStorage) ResumeJob(ctx context.Context, jobID string) error {
-	return s.db.WithContext(ctx).
+// Returns (true, nil) if resumed, (false, nil) if job was not in waiting status.
+func (s *GormStorage) ResumeJob(ctx context.Context, jobID string) (bool, error) {
+	result := s.db.WithContext(ctx).
 		Model(&core.Job{}).
 		Where("id = ? AND status = ?", jobID, core.StatusWaiting).
 		Updates(map[string]any{
 			"status":     core.StatusPending,
 			"updated_at": time.Now(),
-		}).Error
+		})
+	if result.Error != nil {
+		return false, result.Error
+	}
+	return result.RowsAffected > 0, nil
 }
 
 // GetWaitingJobsToResume finds waiting jobs whose fan-out is complete.
@@ -531,4 +567,183 @@ func (s *GormStorage) SaveJobResult(ctx context.Context, jobID string, workerID 
 		Model(&core.Job{}).
 		Where("id = ? AND locked_by = ?", jobID, workerID).
 		Update("result", result).Error
+}
+
+// --- Job pause operations ---
+
+// PauseJob pauses a job, preventing it from being picked up.
+// Only pending, running, and waiting jobs can be paused.
+func (s *GormStorage) PauseJob(ctx context.Context, jobID string) error {
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var job core.Job
+		if err := tx.First(&job, "id = ?", jobID).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return fmt.Errorf("job not found: %s", jobID)
+			}
+			return err
+		}
+
+		// Check if already paused
+		if job.Status == core.StatusPaused {
+			return core.ErrJobAlreadyPaused
+		}
+
+		// Only allow pausing pending, running, or waiting jobs
+		switch job.Status {
+		case core.StatusPending, core.StatusRunning, core.StatusWaiting:
+			// OK to pause
+		default:
+			return core.ErrCannotPauseStatus
+		}
+
+		return tx.Model(&core.Job{}).
+			Where("id = ?", jobID).
+			Updates(map[string]any{
+				"status":       core.StatusPaused,
+				"locked_by":    "",
+				"locked_until": nil,
+				"updated_at":   time.Now(),
+			}).Error
+	})
+}
+
+// UnpauseJob resumes a paused job back to pending status.
+func (s *GormStorage) UnpauseJob(ctx context.Context, jobID string) error {
+	result := s.db.WithContext(ctx).
+		Model(&core.Job{}).
+		Where("id = ? AND status = ?", jobID, core.StatusPaused).
+		Updates(map[string]any{
+			"status":     core.StatusPending,
+			"updated_at": time.Now(),
+		})
+
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		return core.ErrJobNotPaused
+	}
+	return nil
+}
+
+// GetPausedJobs returns all paused jobs in a queue.
+func (s *GormStorage) GetPausedJobs(ctx context.Context, queue string) ([]*core.Job, error) {
+	var jobs []*core.Job
+	err := s.db.WithContext(ctx).
+		Where("queue = ? AND status = ?", queue, core.StatusPaused).
+		Order("created_at ASC").
+		Find(&jobs).Error
+	return jobs, err
+}
+
+// IsJobPaused checks if a job is paused.
+func (s *GormStorage) IsJobPaused(ctx context.Context, jobID string) (bool, error) {
+	var job core.Job
+	err := s.db.WithContext(ctx).
+		Select("status").
+		First(&job, "id = ?", jobID).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	return job.Status == core.StatusPaused, nil
+}
+
+// --- Queue pause operations ---
+
+// PauseQueue marks a queue as paused.
+func (s *GormStorage) PauseQueue(ctx context.Context, queue string) error {
+	now := time.Now()
+
+	var existing core.QueueState
+	err := s.db.WithContext(ctx).First(&existing, "queue = ?", queue).Error
+
+	if err == nil {
+		if existing.Paused {
+			return core.ErrQueueAlreadyPaused
+		}
+		return s.db.WithContext(ctx).
+			Model(&core.QueueState{}).
+			Where("queue = ?", queue).
+			Updates(map[string]any{
+				"paused":    true,
+				"paused_at": now,
+			}).Error
+	}
+
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return err
+	}
+
+	return s.db.WithContext(ctx).Create(&core.QueueState{
+		Queue:    queue,
+		Paused:   true,
+		PausedAt: &now,
+	}).Error
+}
+
+// UnpauseQueue unpauses a queue.
+func (s *GormStorage) UnpauseQueue(ctx context.Context, queue string) error {
+	result := s.db.WithContext(ctx).
+		Model(&core.QueueState{}).
+		Where("queue = ? AND paused = ?", queue, true).
+		Updates(map[string]any{
+			"paused":    false,
+			"paused_at": nil,
+		})
+
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		return core.ErrQueueNotPaused
+	}
+	return nil
+}
+
+// GetPausedQueues returns all paused queue names.
+func (s *GormStorage) GetPausedQueues(ctx context.Context) ([]string, error) {
+	var states []core.QueueState
+	err := s.db.WithContext(ctx).
+		Where("paused = ?", true).
+		Find(&states).Error
+	if err != nil {
+		return nil, err
+	}
+
+	queues := make([]string, len(states))
+	for i, state := range states {
+		queues[i] = state.Queue
+	}
+	return queues, nil
+}
+
+// IsQueuePaused checks if a queue is paused.
+func (s *GormStorage) IsQueuePaused(ctx context.Context, queue string) (bool, error) {
+	var state core.QueueState
+	err := s.db.WithContext(ctx).First(&state, "queue = ?", queue).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	return state.Paused, nil
+}
+
+// RefreshQueueStates returns a map of queue names to their paused state.
+func (s *GormStorage) RefreshQueueStates(ctx context.Context) (map[string]bool, error) {
+	var states []core.QueueState
+	err := s.db.WithContext(ctx).Find(&states).Error
+	if err != nil {
+		return nil, err
+	}
+
+	result := make(map[string]bool)
+	for _, state := range states {
+		result[state.Queue] = state.Paused
+	}
+	return result, nil
 }
