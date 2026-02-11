@@ -314,3 +314,73 @@ func (q *Queue) NewWorker(opts ...any) core.Starter {
 	}
 	return WorkerFactory(q, opts...)
 }
+
+// --- Pause Options ---
+
+// PauseOptions configures pause behavior.
+type PauseOptions struct {
+	Mode core.PauseMode
+}
+
+// PauseOption configures pause operations.
+type PauseOption interface {
+	ApplyPause(*PauseOptions)
+}
+
+type pauseModeOption struct {
+	mode core.PauseMode
+}
+
+func (o pauseModeOption) ApplyPause(opts *PauseOptions) {
+	opts.Mode = o.mode
+}
+
+// WithPauseMode sets the pause mode.
+func WithPauseMode(mode core.PauseMode) PauseOption {
+	return pauseModeOption{mode: mode}
+}
+
+// --- Job Pause Operations ---
+
+// PauseJob pauses a specific job.
+func (q *Queue) PauseJob(ctx context.Context, jobID string, opts ...PauseOption) error {
+	// Mode is not used at storage level but provided for future extensibility
+	return q.storage.PauseJob(ctx, jobID)
+}
+
+// ResumeJob resumes a paused job.
+func (q *Queue) ResumeJob(ctx context.Context, jobID string) error {
+	return q.storage.UnpauseJob(ctx, jobID)
+}
+
+// IsJobPaused checks if a job is paused.
+func (q *Queue) IsJobPaused(ctx context.Context, jobID string) (bool, error) {
+	return q.storage.IsJobPaused(ctx, jobID)
+}
+
+// GetPausedJobs returns all paused jobs in a queue.
+func (q *Queue) GetPausedJobs(ctx context.Context, queueName string) ([]*core.Job, error) {
+	return q.storage.GetPausedJobs(ctx, queueName)
+}
+
+// --- Queue Pause Operations ---
+
+// PauseQueue pauses an entire queue.
+func (q *Queue) PauseQueue(ctx context.Context, queueName string) error {
+	return q.storage.PauseQueue(ctx, queueName)
+}
+
+// ResumeQueue resumes a paused queue.
+func (q *Queue) ResumeQueue(ctx context.Context, queueName string) error {
+	return q.storage.UnpauseQueue(ctx, queueName)
+}
+
+// IsQueuePaused checks if a queue is paused.
+func (q *Queue) IsQueuePaused(ctx context.Context, queueName string) (bool, error) {
+	return q.storage.IsQueuePaused(ctx, queueName)
+}
+
+// GetPausedQueues returns all paused queue names.
+func (q *Queue) GetPausedQueues(ctx context.Context) ([]string, error) {
+	return q.storage.GetPausedQueues(ctx)
+}
