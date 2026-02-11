@@ -572,11 +572,24 @@ func (w *Worker) Pause(mode core.PauseMode) {
 		}
 		w.runningJobsMu.Unlock()
 	}
+
+	// Emit event
+	w.queue.Emit(&core.WorkerPaused{
+		WorkerID:  w.config.WorkerID,
+		Mode:      mode,
+		Timestamp: time.Now(),
+	})
 }
 
 // Resume resumes the worker.
 func (w *Worker) Resume() {
 	w.paused.Store(false)
+
+	// Emit event
+	w.queue.Emit(&core.WorkerResumed{
+		WorkerID:  w.config.WorkerID,
+		Timestamp: time.Now(),
+	})
 }
 
 // IsPaused returns true if the worker is paused.
@@ -591,4 +604,39 @@ func (w *Worker) PauseMode() core.PauseMode {
 		return core.PauseModeGraceful
 	}
 	return mode.(core.PauseMode)
+}
+
+// RunningJobCount returns the number of currently running jobs.
+func (w *Worker) RunningJobCount() int {
+	w.runningJobsMu.Lock()
+	defer w.runningJobsMu.Unlock()
+	return len(w.runningJobs)
+}
+
+// WaitForPause blocks until all running jobs complete or the timeout expires.
+// Returns nil if all jobs completed, or an error if timeout was reached.
+// The worker must be paused before calling this method.
+func (w *Worker) WaitForPause(timeout time.Duration) error {
+	if !w.IsPaused() {
+		return errors.New("worker is not paused")
+	}
+
+	deadline := time.Now().Add(timeout)
+	pollInterval := 50 * time.Millisecond
+
+	for {
+		w.runningJobsMu.Lock()
+		count := len(w.runningJobs)
+		w.runningJobsMu.Unlock()
+
+		if count == 0 {
+			return nil
+		}
+
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timeout waiting for %d running jobs to complete", count)
+		}
+
+		time.Sleep(pollInterval)
+	}
 }

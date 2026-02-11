@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/jdziat/simple-durable-jobs/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/pkg/security"
 )
 
 // PauseMode determines how pause operations behave.
@@ -34,21 +35,33 @@ func IsJobPaused(ctx context.Context, storage Storage, jobID string) (bool, erro
 
 // GetPausedJobs returns all paused jobs in a queue.
 func GetPausedJobs(ctx context.Context, storage Storage, queue string) ([]*Job, error) {
+	if err := security.ValidateQueueName(queue); err != nil {
+		return nil, err
+	}
 	return storage.GetPausedJobs(ctx, queue)
 }
 
 // PauseQueue pauses an entire queue.
 func PauseQueue(ctx context.Context, storage Storage, queue string) error {
+	if err := security.ValidateQueueName(queue); err != nil {
+		return err
+	}
 	return storage.PauseQueue(ctx, queue)
 }
 
 // ResumeQueue resumes a paused queue.
 func ResumeQueue(ctx context.Context, storage Storage, queue string) error {
+	if err := security.ValidateQueueName(queue); err != nil {
+		return err
+	}
 	return storage.UnpauseQueue(ctx, queue)
 }
 
 // IsQueuePaused checks if a queue is paused.
 func IsQueuePaused(ctx context.Context, storage Storage, queue string) (bool, error) {
+	if err := security.ValidateQueueName(queue); err != nil {
+		return false, err
+	}
 	return storage.IsQueuePaused(ctx, queue)
 }
 
