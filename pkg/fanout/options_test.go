@@ -45,12 +45,6 @@ func TestWithRetries(t *testing.T) {
 	assert.Equal(t, 5, cfg.retries)
 }
 
-func TestWithSubJobTimeout(t *testing.T) {
-	cfg := defaultConfig()
-	WithSubJobTimeout(5 * time.Minute).apply(cfg)
-	assert.Equal(t, 5*time.Minute, cfg.subJobTimeout)
-}
-
 func TestWithTimeout(t *testing.T) {
 	cfg := defaultConfig()
 	WithTimeout(1 * time.Hour).apply(cfg)

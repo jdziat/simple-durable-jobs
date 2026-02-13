@@ -50,3 +50,10 @@ dist/
 # Temporary files
 tmp/
 temp/
+
+# UI frontend
+ui/frontend/node_modules/
+ui/frontend/dist/
+
+# Compiled binaries
+jobsui

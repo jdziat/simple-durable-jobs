@@ -21,7 +21,6 @@ type config struct {
 	queue           string
 	priority        int
 	retries         int
-	subJobTimeout   time.Duration
 	totalTimeout    time.Duration
 	cancelOnFailure bool
 }
@@ -77,14 +76,10 @@ func WithRetries(n int) Option {
 	})
 }
 
-// WithSubJobTimeout sets timeout for each sub-job.
-func WithSubJobTimeout(d time.Duration) Option {
-	return optionFunc(func(c *config) {
-		c.subJobTimeout = d
-	})
-}
-
-// WithTimeout sets timeout for entire fan-out.
+// WithTimeout sets a deadline for the entire fan-out operation.
+// The deadline is stored on the fan-out record (TimeoutAt field) but is not
+// automatically enforced. Applications can query fan-outs by TimeoutAt to
+// implement custom timeout handling (e.g., canceling timed-out fan-outs).
 func WithTimeout(d time.Duration) Option {
 	return optionFunc(func(c *config) {
 		c.totalTimeout = d
