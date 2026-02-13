@@ -33,6 +33,11 @@ type Worker struct {
 	// Running job cancellation (for aggressive pause)
 	runningJobs   map[string]context.CancelFunc
 	runningJobsMu sync.Mutex
+
+	// Per-queue concurrency tracking
+	queueRunning   map[string]*atomic.Int32 // queue name -> active count
+	queueJobID     map[string]string        // job ID -> queue name (for decrement on completion)
+	queueJobIDMu   sync.Mutex
 }
 
 // NewWorker creates a new worker for the given queue.
@@ -69,21 +74,26 @@ func NewWorker(q *queue.Queue, opts ...WorkerOption) *Worker {
 		config.DequeueRetry = &dequeueCfg
 	}
 
+	// Initialize per-queue concurrency counters
+	queueRunning := make(map[string]*atomic.Int32, len(config.Queues))
+	for name := range config.Queues {
+		queueRunning[name] = &atomic.Int32{}
+	}
+
 	return &Worker{
-		queue:       q,
-		config:      config,
-		logger:      slog.Default(),
-		runningJobs: make(map[string]context.CancelFunc),
+		queue:        q,
+		config:       config,
+		logger:       slog.Default(),
+		runningJobs:  make(map[string]context.CancelFunc),
+		queueRunning: queueRunning,
+		queueJobID:   make(map[string]string),
 	}
 }
 
 // Start begins processing jobs. Blocks until context is cancelled.
+// Per-queue concurrency is enforced: each queue only dequeues up to its
+// configured concurrency limit.
 func (w *Worker) Start(ctx context.Context) error {
-	queues := make([]string, 0, len(w.config.Queues))
-	for q := range w.config.Queues {
-		queues = append(queues, q)
-	}
-
 	totalConcurrency := 0
 	for _, c := range w.config.Queues {
 		totalConcurrency += c
@@ -119,7 +129,13 @@ func (w *Worker) Start(ctx context.Context) error {
 				continue
 			}
 
-			job, err := w.dequeueWithRetry(ctx, queues)
+			// Build list of queues that have available capacity
+			availableQueues := w.queuesWithCapacity()
+			if len(availableQueues) == 0 {
+				continue
+			}
+
+			job, err := w.dequeueWithRetry(ctx, availableQueues)
 			if err != nil {
 				if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 					w.logger.Error("failed to dequeue after retries", "error", err)
@@ -127,11 +143,56 @@ func (w *Worker) Start(ctx context.Context) error {
 				continue
 			}
 			if job != nil {
+				// Track this job against its queue's concurrency
+				w.trackQueueJob(job.ID, job.Queue)
+
 				select {
 				case jobsChan <- job:
 				case <-ctx.Done():
 				}
 			}
+		}
+	}
+}
+
+// queuesWithCapacity returns queue names that haven't reached their concurrency limit.
+func (w *Worker) queuesWithCapacity() []string {
+	available := make([]string, 0, len(w.config.Queues))
+	for name, maxConcurrency := range w.config.Queues {
+		counter, ok := w.queueRunning[name]
+		if !ok {
+			available = append(available, name)
+			continue
+		}
+		if int(counter.Load()) < maxConcurrency {
+			available = append(available, name)
+		}
+	}
+	return available
+}
+
+// trackQueueJob increments the running counter for a queue and records the job→queue mapping.
+func (w *Worker) trackQueueJob(jobID, queueName string) {
+	if counter, ok := w.queueRunning[queueName]; ok {
+		counter.Add(1)
+	}
+	w.queueJobIDMu.Lock()
+	w.queueJobID[jobID] = queueName
+	w.queueJobIDMu.Unlock()
+}
+
+// untrackQueueJob decrements the running counter for a job's queue.
+func (w *Worker) untrackQueueJob(jobID string) {
+	w.queueJobIDMu.Lock()
+	queueName, ok := w.queueJobID[jobID]
+	if ok {
+		delete(w.queueJobID, jobID)
+	}
+	w.queueJobIDMu.Unlock()
+
+	if ok {
+		if counter, exists := w.queueRunning[queueName]; exists {
+			counter.Add(-1)
 		}
 	}
 }
@@ -156,6 +217,9 @@ func (w *Worker) processLoop(ctx context.Context, jobs <-chan *core.Job) {
 }
 
 func (w *Worker) processJob(ctx context.Context, job *core.Job) {
+	// Ensure per-queue concurrency counter is decremented when job finishes
+	defer w.untrackQueueJob(job.ID)
+
 	startTime := time.Now()
 
 	h, ok := w.queue.GetHandler(job.Type)
@@ -579,6 +643,18 @@ func (w *Worker) Pause(mode core.PauseMode) {
 		Mode:      mode,
 		Timestamp: time.Now(),
 	})
+}
+
+// CancelJob cancels a specific running job's context.
+// Returns true if the job was found and cancelled.
+func (w *Worker) CancelJob(jobID string) bool {
+	w.runningJobsMu.Lock()
+	cancel, ok := w.runningJobs[jobID]
+	w.runningJobsMu.Unlock()
+	if ok {
+		cancel()
+	}
+	return ok
 }
 
 // Resume resumes the worker.

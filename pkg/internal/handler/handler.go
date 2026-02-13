@@ -19,7 +19,17 @@ type Handler struct {
 // The function must have signature: func(ctx context.Context, args T) error
 // or func(ctx context.Context, args T) (T, error)
 func NewHandler(fn any) (*Handler, error) {
+	if fn == nil {
+		return nil, fmt.Errorf("handler cannot be nil")
+	}
+
 	fnVal := reflect.ValueOf(fn)
+
+	// Check for typed nil (e.g., var fn func() = nil)
+	if !fnVal.IsValid() || (fnVal.Kind() == reflect.Func && fnVal.IsNil()) {
+		return nil, fmt.Errorf("handler function cannot be nil")
+	}
+
 	fnType := fnVal.Type()
 
 	if fnType.Kind() != reflect.Func {
@@ -63,6 +73,11 @@ func NewHandler(fn any) (*Handler, error) {
 
 // Execute runs the handler with the given context and arguments.
 func (h *Handler) Execute(ctx context.Context, argsJSON []byte) error {
+	// Defensive check: ensure handler function is valid
+	if !h.Fn.IsValid() || h.Fn.IsNil() {
+		return fmt.Errorf("handler function is nil or invalid")
+	}
+
 	var args []reflect.Value
 
 	if h.HasContext {
@@ -96,6 +111,11 @@ func (h *Handler) Execute(ctx context.Context, argsJSON []byte) error {
 // ExecuteCall runs the handler for a nested Call, returning the result.
 func ExecuteCall[T any](ctx context.Context, h *Handler, args any) (T, error) {
 	var zero T
+
+	// Defensive check: ensure handler function is valid
+	if !h.Fn.IsValid() || h.Fn.IsNil() {
+		return zero, fmt.Errorf("handler function is nil or invalid")
+	}
 
 	var callArgs []reflect.Value
 

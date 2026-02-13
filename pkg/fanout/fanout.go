@@ -75,6 +75,15 @@ func FanOut[T any](ctx context.Context, subJobs []SubJob, opts ...Option) ([]Res
 	// First execution: create fan-out and sub-jobs
 	fanOutID = uuid.New().String()
 
+	// Validate all sub-job types have registered handlers before creating anything
+	if jc.HandlerLookup != nil {
+		for _, sj := range subJobs {
+			if _, found := jc.HandlerLookup(sj.Type); !found {
+				return nil, fmt.Errorf("no handler registered for sub-job type %q", sj.Type)
+			}
+		}
+	}
+
 	// Create FanOut record
 	fanOut := &core.FanOut{
 		ID:           fanOutID,

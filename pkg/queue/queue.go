@@ -254,6 +254,18 @@ func (q *Queue) Emit(e core.Event) {
 	}
 }
 
+// EmitCustomEvent emits a CustomEvent for a specific job with arbitrary data.
+// Custom events are ephemeral — they are broadcast to Events() subscribers
+// but not persisted. Callers should persist to their own storage if needed.
+func (q *Queue) EmitCustomEvent(jobID, kind string, data map[string]any) {
+	q.Emit(&core.CustomEvent{
+		JobID:     jobID,
+		Kind:      kind,
+		Data:      data,
+		Timestamp: time.Now(),
+	})
+}
+
 // CallStartHooks calls all registered start hooks.
 func (q *Queue) CallStartHooks(ctx context.Context, job *core.Job) {
 	q.mu.RLock()
