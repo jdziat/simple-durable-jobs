@@ -29,6 +29,7 @@ type FanOut struct {
 	TotalCount     int            `gorm:"not null"`
 	CompletedCount int            `gorm:"default:0"`
 	FailedCount    int            `gorm:"default:0"`
+	CancelledCount int            `gorm:"default:0"`
 	Strategy       FanOutStrategy `gorm:"size:20;default:'fail_fast'"`
 	Threshold      float64        `gorm:"default:1.0"`
 	Status         FanOutStatus   `gorm:"size:20;default:'pending'"`
