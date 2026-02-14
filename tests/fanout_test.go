@@ -514,3 +514,113 @@ func TestFanOut_ResultHelpers(t *testing.T) {
 	}
 	assert.True(t, jobs.AllSucceeded(allSuccess))
 }
+
+func TestFanOut_CancelledSubJobsCountTowardCompletion(t *testing.T) {
+	queue, store := setupFanOutTestQueue(t)
+
+	var processedCount atomic.Int32
+
+	// Register sub-job handler - sleeps to give time for cancellation
+	queue.Register("slowJob", func(ctx context.Context, index int) (int, error) {
+		processedCount.Add(1)
+		// First job completes fast, rest sleep to allow cancellation
+		if index > 0 {
+			select {
+			case <-ctx.Done():
+				return 0, ctx.Err()
+			case <-time.After(30 * time.Second):
+				return index, nil
+			}
+		}
+		return index * 10, nil
+	})
+
+	var fanoutCompleted atomic.Bool
+
+	queue.Register("cancelTestParent", func(ctx context.Context, count int) error {
+		subJobs := make([]jobs.SubJob, count)
+		for i := 0; i < count; i++ {
+			subJobs[i] = jobs.Sub("slowJob", i, jobs.Retries(0))
+		}
+
+		_, err := jobs.FanOut[int](ctx, subJobs, jobs.CollectAll())
+		if jobs.IsSuspendError(err) {
+			return err
+		}
+		fanoutCompleted.Store(true)
+		return err
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	jobID, err := queue.Enqueue(ctx, "cancelTestParent", 5)
+	require.NoError(t, err)
+
+	worker := queue.NewWorker(jobs.WithScheduler(false))
+	go func() {
+		_ = worker.Start(ctx)
+	}()
+
+	// Wait for the parent to be suspended (fan-out created)
+	time.Sleep(1 * time.Second)
+
+	// Find the fan-out for this parent
+	fanOuts, err := store.GetFanOutsByParent(ctx, jobID)
+	require.NoError(t, err)
+	require.Len(t, fanOuts, 1, "should have one fan-out")
+
+	// Get all child jobs
+	subJobs, err := store.GetSubJobs(ctx, fanOuts[0].ID)
+	require.NoError(t, err)
+	require.Len(t, subJobs, 5, "should have 5 sub-jobs")
+
+	// Wait for at least 1 sub-job to complete
+	time.Sleep(500 * time.Millisecond)
+
+	// Cancel remaining pending sub-jobs using queue.CancelSubJob (simulates external cancel)
+	// This uses the queue-level method which checks for fan-out completion and resumes parent.
+	cancelledCount := 0
+	for _, subJob := range subJobs {
+		fo, err := queue.CancelSubJob(ctx, subJob.ID)
+		if err == nil && fo != nil {
+			cancelledCount++
+			// Check if this cancellation completed the fan-out
+			if fo.CompletedCount+fo.FailedCount+fo.CancelledCount >= fo.TotalCount {
+				// Fan-out should now be complete - check if parent resumed
+				t.Logf("Fan-out counts: completed=%d failed=%d cancelled=%d total=%d",
+					fo.CompletedCount, fo.FailedCount, fo.CancelledCount, fo.TotalCount)
+			}
+		}
+	}
+
+	t.Logf("Cancelled %d sub-jobs externally", cancelledCount)
+
+	// Wait for parent to be resumed and completed
+	deadline := time.After(10 * time.Second)
+	for !fanoutCompleted.Load() {
+		select {
+		case <-deadline:
+			// Check the fan-out state for debugging
+			fo, _ := store.GetFanOut(ctx, fanOuts[0].ID)
+			if fo != nil {
+				t.Logf("Fan-out state: status=%s completed=%d failed=%d cancelled=%d total=%d",
+					fo.Status, fo.CompletedCount, fo.FailedCount, fo.CancelledCount, fo.TotalCount)
+			}
+			parentJob, _ := store.GetJob(ctx, jobID)
+			if parentJob != nil {
+				t.Logf("Parent job status: %s", parentJob.Status)
+			}
+			t.Fatal("Timeout - parent job was not resumed after sub-jobs were cancelled")
+		default:
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+
+	// Verify the fan-out properly accounted for cancelled jobs
+	fo, err := store.GetFanOut(ctx, fanOuts[0].ID)
+	require.NoError(t, err)
+	assert.Greater(t, fo.CancelledCount, 0, "should have cancelled jobs counted")
+	assert.Equal(t, fo.TotalCount, fo.CompletedCount+fo.FailedCount+fo.CancelledCount,
+		"completed + failed + cancelled should equal total")
+}

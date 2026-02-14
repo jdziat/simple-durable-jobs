@@ -228,12 +228,27 @@ func (q *Queue) OnRetry(fn func(context.Context, *core.Job, int, error)) {
 }
 
 // Events returns a channel for receiving queue events.
+// The caller must call Unsubscribe when done to prevent resource leaks.
 func (q *Queue) Events() <-chan core.Event {
 	ch := make(chan core.Event, 100)
 	q.mu.Lock()
 	q.eventSubs = append(q.eventSubs, ch)
 	q.mu.Unlock()
 	return ch
+}
+
+// Unsubscribe removes a subscriber channel created by Events().
+// The channel is not closed — callers must stop reading before calling Unsubscribe.
+// After Unsubscribe returns, no further events will be sent to the channel.
+func (q *Queue) Unsubscribe(ch <-chan core.Event) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for i, sub := range q.eventSubs {
+		if sub == ch {
+			q.eventSubs = append(q.eventSubs[:i], q.eventSubs[i+1:]...)
+			return
+		}
+	}
 }
 
 // Emit emits an event to all subscribers.
@@ -437,4 +452,40 @@ func (q *Queue) IsQueuePaused(ctx context.Context, queueName string) (bool, erro
 // GetPausedQueues returns all paused queue names.
 func (q *Queue) GetPausedQueues(ctx context.Context) ([]string, error) {
 	return q.storage.GetPausedQueues(ctx)
+}
+
+// CancelSubJob cancels a single sub-job and checks if its fan-out is now complete.
+// If all sub-jobs are accounted for (completed + failed + cancelled = total), the parent
+// job is automatically resumed. Returns the updated FanOut, or nil if the job is not a sub-job.
+func (q *Queue) CancelSubJob(ctx context.Context, jobID string) (*core.FanOut, error) {
+	fo, err := q.storage.CancelSubJob(ctx, jobID)
+	if err != nil {
+		return nil, err
+	}
+	if fo == nil {
+		return nil, nil // Not a sub-job
+	}
+
+	// Check if all sub-jobs are now accounted for
+	total := fo.CompletedCount + fo.FailedCount + fo.CancelledCount
+	if total >= fo.TotalCount && fo.Status == core.FanOutPending {
+		// Mark fan-out as completed/failed
+		status := core.FanOutCompleted
+		if fo.FailedCount > 0 || (fo.CancelledCount > 0 && fo.CompletedCount == 0) {
+			status = core.FanOutFailed
+		}
+
+		updated, err := q.storage.UpdateFanOutStatus(ctx, fo.ID, status)
+		if err != nil {
+			return fo, fmt.Errorf("update fan-out status: %w", err)
+		}
+		if updated {
+			// Resume the parent job
+			if _, err := q.storage.ResumeJob(ctx, fo.ParentJobID); err != nil {
+				return fo, fmt.Errorf("resume parent job: %w", err)
+			}
+		}
+	}
+
+	return fo, nil
 }

@@ -494,6 +494,21 @@ func (s *GormStorage) IncrementFanOutFailed(ctx context.Context, fanOutID string
 	return &fanOut, err
 }
 
+// IncrementFanOutCancelled atomically increments the cancelled count.
+func (s *GormStorage) IncrementFanOutCancelled(ctx context.Context, fanOutID string) (*core.FanOut, error) {
+	var fanOut core.FanOut
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Exec(
+			"UPDATE fan_outs SET cancelled_count = cancelled_count + 1, updated_at = ? WHERE id = ?",
+			time.Now(), fanOutID,
+		).Error; err != nil {
+			return err
+		}
+		return tx.First(&fanOut, "id = ?", fanOutID).Error
+	})
+	return &fanOut, err
+}
+
 // UpdateFanOutStatus atomically updates the status of a fan-out from pending.
 // Returns (true, nil) if the status was updated, (false, nil) if already completed
 // by another worker, or (false, error) on database error.
@@ -562,15 +577,94 @@ func (s *GormStorage) GetSubJobResults(ctx context.Context, fanOutID string) ([]
 }
 
 // CancelSubJobs cancels pending/running sub-jobs for a fan-out.
+// Updates the fan-out's cancelled_count to reflect the number of cancelled jobs.
 func (s *GormStorage) CancelSubJobs(ctx context.Context, fanOutID string) (int64, error) {
-	result := s.db.WithContext(ctx).
-		Model(&core.Job{}).
-		Where("fan_out_id = ? AND status IN ?", fanOutID, []core.JobStatus{core.StatusPending, core.StatusRunning}).
-		Updates(map[string]any{
-			"status":     core.StatusCancelled,
-			"updated_at": time.Now(),
-		})
-	return result.RowsAffected, result.Error
+	var rowsAffected int64
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		result := tx.
+			Model(&core.Job{}).
+			Where("fan_out_id = ? AND status IN ?", fanOutID, []core.JobStatus{core.StatusPending, core.StatusRunning}).
+			Updates(map[string]any{
+				"status":     core.StatusCancelled,
+				"updated_at": time.Now(),
+			})
+		if result.Error != nil {
+			return result.Error
+		}
+		rowsAffected = result.RowsAffected
+
+		// Update the fan-out's cancelled count to match
+		if rowsAffected > 0 {
+			if err := tx.Exec(
+				"UPDATE fan_outs SET cancelled_count = cancelled_count + ?, updated_at = ? WHERE id = ?",
+				rowsAffected, time.Now(), fanOutID,
+			).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	return rowsAffected, err
+}
+
+// CancelSubJob cancels a single sub-job and updates its fan-out's cancelled count.
+// Returns the updated FanOut record so the caller can check for completion.
+// Returns (nil, nil) if the job has no fan-out ID (not a sub-job).
+func (s *GormStorage) CancelSubJob(ctx context.Context, jobID string) (*core.FanOut, error) {
+	var fanOut core.FanOut
+	var hasFanOut bool
+
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// Get the job to find its fan-out ID
+		var job core.Job
+		if err := tx.First(&job, "id = ?", jobID).Error; err != nil {
+			return err
+		}
+
+		// Not a sub-job
+		if job.FanOutID == nil || *job.FanOutID == "" {
+			return nil
+		}
+
+		// Only cancel if in a cancellable state
+		if job.Status == core.StatusCompleted || job.Status == core.StatusFailed || job.Status == core.StatusCancelled {
+			return nil
+		}
+
+		// Cancel the job
+		now := time.Now()
+		if err := tx.Model(&core.Job{}).
+			Where("id = ? AND status NOT IN ?", jobID, []core.JobStatus{core.StatusCompleted, core.StatusFailed, core.StatusCancelled}).
+			Updates(map[string]any{
+				"status":       core.StatusCancelled,
+				"completed_at": now,
+				"updated_at":   now,
+			}).Error; err != nil {
+			return err
+		}
+
+		// Increment cancelled count on the fan-out
+		if err := tx.Exec(
+			"UPDATE fan_outs SET cancelled_count = cancelled_count + 1, updated_at = ? WHERE id = ?",
+			now, *job.FanOutID,
+		).Error; err != nil {
+			return err
+		}
+
+		if err := tx.First(&fanOut, "id = ?", *job.FanOutID).Error; err != nil {
+			return err
+		}
+		hasFanOut = true
+		return nil
+	})
+
+	if err != nil {
+		return nil, err
+	}
+	if !hasFanOut {
+		return nil, nil
+	}
+	return &fanOut, nil
 }
 
 // --- Waiting job operations ---

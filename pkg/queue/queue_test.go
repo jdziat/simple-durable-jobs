@@ -99,6 +99,10 @@ func (m *mockStorage) IncrementFanOutFailed(ctx context.Context, fanOutID string
 	return nil, nil
 }
 
+func (m *mockStorage) IncrementFanOutCancelled(ctx context.Context, fanOutID string) (*core.FanOut, error) {
+	return nil, nil
+}
+
 func (m *mockStorage) UpdateFanOutStatus(ctx context.Context, fanOutID string, status core.FanOutStatus) (bool, error) {
 	return true, nil
 }
@@ -124,6 +128,10 @@ func (m *mockStorage) GetSubJobResults(ctx context.Context, fanOutID string) ([]
 
 func (m *mockStorage) CancelSubJobs(ctx context.Context, fanOutID string) (int64, error) {
 	return 0, nil
+}
+
+func (m *mockStorage) CancelSubJob(ctx context.Context, jobID string) (*core.FanOut, error) {
+	return nil, nil
 }
 
 func (m *mockStorage) SuspendJob(ctx context.Context, jobID string, workerID string) error {
@@ -298,6 +306,69 @@ func TestQueue_Emit_DropsWhenFull(t *testing.T) {
 
 	// Verify channel is full
 	assert.Len(t, ch, 100)
+}
+
+func TestQueue_Unsubscribe_StopsDelivery(t *testing.T) {
+	store := newMockStorage()
+	q := New(store)
+
+	ch := q.Events()
+
+	// Emit before unsubscribe — should be delivered
+	q.Emit(&core.JobStarted{Job: &core.Job{ID: "before"}})
+	select {
+	case e := <-ch:
+		assert.Equal(t, "before", e.(*core.JobStarted).Job.ID)
+	default:
+		t.Fatal("expected event before unsubscribe")
+	}
+
+	q.Unsubscribe(ch)
+
+	// Emit after unsubscribe — should NOT be delivered
+	q.Emit(&core.JobStarted{Job: &core.Job{ID: "after"}})
+	select {
+	case <-ch:
+		t.Fatal("should not receive events after unsubscribe")
+	default:
+		// expected
+	}
+}
+
+func TestQueue_Unsubscribe_UnknownChannel_IsNoop(t *testing.T) {
+	store := newMockStorage()
+	q := New(store)
+
+	// Create a channel that was never subscribed
+	foreign := make(chan core.Event, 100)
+
+	// Should not panic
+	q.Unsubscribe(foreign)
+}
+
+func TestQueue_Unsubscribe_ConcurrentWithEmit(t *testing.T) {
+	store := newMockStorage()
+	q := New(store)
+
+	const subscribers = 10
+	channels := make([]<-chan core.Event, subscribers)
+	for i := range channels {
+		channels[i] = q.Events()
+	}
+
+	// Concurrently emit and unsubscribe — must not panic or race
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 100; i++ {
+			q.Emit(&core.JobStarted{Job: &core.Job{ID: "concurrent"}})
+		}
+	}()
+
+	for _, ch := range channels {
+		q.Unsubscribe(ch)
+	}
+	<-done
 }
 
 // TestWorkerFactory_NotInitialized tests that NewWorker panics when factory is nil

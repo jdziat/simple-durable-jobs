@@ -45,6 +45,7 @@ type Storage interface {
 	GetFanOut(ctx context.Context, fanOutID string) (*FanOut, error)
 	IncrementFanOutCompleted(ctx context.Context, fanOutID string) (*FanOut, error)
 	IncrementFanOutFailed(ctx context.Context, fanOutID string) (*FanOut, error)
+	IncrementFanOutCancelled(ctx context.Context, fanOutID string) (*FanOut, error)
 	UpdateFanOutStatus(ctx context.Context, fanOutID string, status FanOutStatus) (bool, error)
 	GetFanOutsByParent(ctx context.Context, parentJobID string) ([]*FanOut, error)
 
@@ -53,6 +54,7 @@ type Storage interface {
 	GetSubJobs(ctx context.Context, fanOutID string) ([]*Job, error)
 	GetSubJobResults(ctx context.Context, fanOutID string) ([]*Job, error)
 	CancelSubJobs(ctx context.Context, fanOutID string) (int64, error)
+	CancelSubJob(ctx context.Context, jobID string) (*FanOut, error)
 
 	// Waiting job operations
 	SuspendJob(ctx context.Context, jobID string, workerID string) error

@@ -442,6 +442,7 @@ func (w *Worker) failWithRetry(ctx context.Context, jobID string, errMsg string,
 }
 
 // handleSubJobCompletion updates fan-out counters and resumes parent if needed.
+// Uses retry to prevent lost increments that would leave parent jobs stuck forever.
 func (w *Worker) handleSubJobCompletion(ctx context.Context, job *core.Job, succeeded bool) error {
 	if job.FanOutID == nil {
 		return nil // Not a sub-job
@@ -450,13 +451,18 @@ func (w *Worker) handleSubJobCompletion(ctx context.Context, job *core.Job, succ
 	var fo *core.FanOut
 	var err error
 
-	if succeeded {
-		fo, err = w.queue.Storage().IncrementFanOutCompleted(ctx, *job.FanOutID)
-	} else {
-		fo, err = w.queue.Storage().IncrementFanOutFailed(ctx, *job.FanOutID)
-	}
+	// Retry the increment to prevent lost counts (which cause stuck parents).
+	err = retryWithBackoff(ctx, *w.config.StorageRetry, func() error {
+		var incrementErr error
+		if succeeded {
+			fo, incrementErr = w.queue.Storage().IncrementFanOutCompleted(ctx, *job.FanOutID)
+		} else {
+			fo, incrementErr = w.queue.Storage().IncrementFanOutFailed(ctx, *job.FanOutID)
+		}
+		return incrementErr
+	})
 	if err != nil {
-		return fmt.Errorf("failed to update fan-out: %w", err)
+		return fmt.Errorf("failed to update fan-out after retries: %w", err)
 	}
 	if fo == nil {
 		return nil
@@ -468,7 +474,7 @@ func (w *Worker) handleSubJobCompletion(ctx context.Context, job *core.Job, succ
 
 // checkFanOutCompletion checks if a fan-out is complete and resumes parent.
 func (w *Worker) checkFanOutCompletion(ctx context.Context, fo *core.FanOut) error {
-	total := fo.CompletedCount + fo.FailedCount
+	total := fo.CompletedCount + fo.FailedCount + fo.CancelledCount
 	if total < fo.TotalCount {
 		// Not all sub-jobs done yet
 
@@ -488,15 +494,24 @@ func (w *Worker) checkFanOutCompletion(ctx context.Context, fo *core.FanOut) err
 		return nil
 	}
 
-	// All sub-jobs done
+	// All sub-jobs done (completed + failed + cancelled = total)
 	status := core.FanOutCompleted
-	if fo.Strategy == core.StrategyFailFast && fo.FailedCount > 0 {
+	if fo.Strategy == core.StrategyFailFast && (fo.FailedCount > 0 || fo.CancelledCount > 0) {
 		status = core.FanOutFailed
 	} else if fo.Strategy == core.StrategyThreshold {
-		successRate := float64(fo.CompletedCount) / float64(fo.TotalCount)
-		if successRate < fo.Threshold {
+		activeTotal := fo.CompletedCount + fo.FailedCount
+		if activeTotal > 0 {
+			successRate := float64(fo.CompletedCount) / float64(activeTotal)
+			if successRate < fo.Threshold {
+				status = core.FanOutFailed
+			}
+		} else {
+			// All jobs cancelled, no successes
 			status = core.FanOutFailed
 		}
+	} else if fo.CancelledCount > 0 && fo.CompletedCount == 0 {
+		// All jobs cancelled with no completions
+		status = core.FanOutFailed
 	}
 	// CollectAll always marks as completed - error is returned to parent
 
