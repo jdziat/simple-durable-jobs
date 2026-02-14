@@ -57,3 +57,4 @@ ui/frontend/dist/
 
 # Compiled binaries
 jobsui
+ui/cmd/jobsui/jobsui

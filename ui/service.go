@@ -2,8 +2,10 @@ package ui
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"connectrpc.com/connect"
@@ -15,12 +17,16 @@ import (
 	"github.com/jdziat/simple-durable-jobs/ui/gen/jobs/v1/jobsv1connect"
 )
 
+const maxWatchStreams = 50
+
 // jobsService implements the JobsService Connect-RPC service.
 type jobsService struct {
 	jobsv1connect.UnimplementedJobsServiceHandler
 	storage      core.Storage
 	queue        *queue.Queue
 	statsStorage StatsStorage
+
+	activeStreams atomic.Int32
 }
 
 func newJobsService(storage core.Storage, q *queue.Queue, statsStorage StatsStorage) *jobsService {
@@ -256,8 +262,23 @@ func (s *jobsService) WatchEvents(ctx context.Context, req *connect.Request[jobs
 		return ctx.Err()
 	}
 
+	// NOTE: This uses atomic Add rather than CAS, so the counter can transiently
+	// exceed maxWatchStreams under burst conditions before the rejection decrements
+	// it back. This is an acceptable tradeoff — the window is tiny and the worst
+	// case is a few extra rejections, not over-admission.
+	if s.activeStreams.Add(1) > maxWatchStreams {
+		s.activeStreams.Add(-1)
+		return connect.NewError(connect.CodeResourceExhausted, fmt.Errorf("too many active watch streams"))
+	}
+	defer s.activeStreams.Add(-1)
+
 	events := s.queue.Events()
-	filterQueues := req.Msg.Queues
+	defer s.queue.Unsubscribe(events)
+
+	filterSet := make(map[string]struct{}, len(req.Msg.Queues))
+	for _, q := range req.Msg.Queues {
+		filterSet[q] = struct{}{}
+	}
 
 	for {
 		select {
@@ -269,12 +290,12 @@ func (s *jobsService) WatchEvents(ctx context.Context, req *connect.Request[jobs
 				continue
 			}
 
-			if len(filterQueues) > 0 {
+			if len(filterSet) > 0 {
 				eventQueue := ""
 				if pbEvent.Job != nil {
 					eventQueue = pbEvent.Job.Queue
 				}
-				if !containsString(filterQueues, eventQueue) {
+				if _, ok := filterSet[eventQueue]; !ok {
 					continue
 				}
 			}
@@ -294,11 +315,12 @@ func (s *jobsService) getQueueStats(ctx context.Context) ([]*jobsv1.QueueStats, 
 		return ui.GetQueueStats(ctx)
 	}
 
-	// Fallback: query all jobs and aggregate
+	// Fallback: query all jobs and aggregate (capped to prevent OOM)
+	const maxFallbackJobs = 1000
 	stats := make(map[string]*jobsv1.QueueStats)
 
 	for _, status := range []core.JobStatus{core.StatusPending, core.StatusRunning, core.StatusCompleted, core.StatusFailed} {
-		jobs, err := s.storage.GetJobsByStatus(ctx, status, 10000)
+		jobs, err := s.storage.GetJobsByStatus(ctx, status, maxFallbackJobs)
 		if err != nil {
 			return nil, err
 		}
@@ -341,12 +363,18 @@ func (s *jobsService) searchJobs(ctx context.Context, req *jobsv1.ListJobsReques
 		})
 	}
 
-	// Fallback: basic implementation - fetch jobs from all statuses
+	// Fallback: basic implementation - fetch jobs from all statuses (capped)
+	const maxFetchPerStatus = 1000
 	var allJobs []*core.Job
+
+	fetchLimit := limit * page
+	if fetchLimit > maxFetchPerStatus {
+		fetchLimit = maxFetchPerStatus
+	}
 
 	if req.Status != "" {
 		// Filter by specific status
-		jobs, err := s.storage.GetJobsByStatus(ctx, core.JobStatus(req.Status), limit*page)
+		jobs, err := s.storage.GetJobsByStatus(ctx, core.JobStatus(req.Status), fetchLimit)
 		if err != nil {
 			return nil, 0, err
 		}
@@ -354,7 +382,7 @@ func (s *jobsService) searchJobs(ctx context.Context, req *jobsv1.ListJobsReques
 	} else {
 		// No status filter - fetch from all statuses
 		for _, status := range []core.JobStatus{core.StatusPending, core.StatusRunning, core.StatusCompleted, core.StatusFailed} {
-			jobs, err := s.storage.GetJobsByStatus(ctx, status, limit*page)
+			jobs, err := s.storage.GetJobsByStatus(ctx, status, fetchLimit)
 			if err != nil {
 				return nil, 0, err
 			}
@@ -520,15 +548,6 @@ func coreEventToProto(e core.Event) *jobsv1.Event {
 	default:
 		return nil
 	}
-}
-
-func containsString(slice []string, s string) bool {
-	for _, v := range slice {
-		if v == s {
-			return true
-		}
-	}
-	return false
 }
 
 func parsePeriod(period string) (since, until time.Time) {
