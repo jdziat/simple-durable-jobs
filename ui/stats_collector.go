@@ -17,6 +17,10 @@ type StatsCollector struct {
 
 	mu       sync.Mutex
 	counters map[string]*statCounters
+
+	// ready is closed once the collector has subscribed to events and is processing.
+	ready     chan struct{}
+	readyOnce sync.Once
 }
 
 type statCounters struct {
@@ -48,6 +52,7 @@ func NewStatsCollector(q *queue.Queue, stats StatsStorage, opts ...StatsCollecto
 		stats:     stats,
 		retention: 7 * 24 * time.Hour,
 		counters:  make(map[string]*statCounters),
+		ready:     make(chan struct{}),
 	}
 	for _, opt := range opts {
 		opt.apply(sc)
@@ -55,17 +60,28 @@ func NewStatsCollector(q *queue.Queue, stats StatsStorage, opts ...StatsCollecto
 	return sc
 }
 
+// WaitReady blocks until the collector has subscribed to events.
+func (sc *StatsCollector) WaitReady() {
+	<-sc.ready
+}
+
 // Start begins the event listener and periodic snapshot ticker.
 // Blocks until ctx is cancelled.
 func (sc *StatsCollector) Start(ctx context.Context) {
 	events := sc.queue.Events()
+	defer sc.queue.Unsubscribe(events)
+
+	sc.readyOnce.Do(func() { close(sc.ready) })
+
 	ticker := time.NewTicker(1 * time.Minute)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
-			sc.Flush(context.Background())
+			flushCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			sc.Flush(flushCtx)
+			cancel()
 			return
 		case e := <-events:
 			sc.handleEvent(e)
@@ -123,7 +139,7 @@ func (sc *StatsCollector) snapshot(ctx context.Context) {
 	queueDepth := make(map[string]*[2]int64) // [pending, running]
 
 	for _, status := range []core.JobStatus{core.StatusPending, core.StatusRunning} {
-		jobs, err := storage.GetJobsByStatus(ctx, status, 100000)
+		jobs, err := storage.GetJobsByStatus(ctx, status, 10000)
 		if err != nil {
 			continue
 		}

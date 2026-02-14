@@ -39,7 +39,7 @@ func TestStatsCollector_EventDrivenCounters(t *testing.T) {
 	defer cancel()
 
 	go collector.Start(ctx)
-	time.Sleep(50 * time.Millisecond) // Let collector subscribe to events
+	collector.WaitReady()
 
 	// Emit events
 	job := &core.Job{ID: "test-1", Queue: "default", Type: "test"}
@@ -70,7 +70,7 @@ func TestStatsCollector_IgnoresIrrelevantEvents(t *testing.T) {
 	defer cancel()
 
 	go collector.Start(ctx)
-	time.Sleep(50 * time.Millisecond)
+	collector.WaitReady()
 
 	// Emit events that shouldn't create counters
 	job := &core.Job{ID: "test-1", Queue: "default", Type: "test"}
@@ -94,7 +94,7 @@ func TestStatsCollector_MultipleQueues(t *testing.T) {
 	defer cancel()
 
 	go collector.Start(ctx)
-	time.Sleep(50 * time.Millisecond)
+	collector.WaitReady()
 
 	q.Emit(&core.JobCompleted{Job: &core.Job{ID: "1", Queue: "emails", Type: "send"}, Timestamp: time.Now()})
 	q.Emit(&core.JobCompleted{Job: &core.Job{ID: "2", Queue: "payments", Type: "charge"}, Timestamp: time.Now()})

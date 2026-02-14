@@ -13,11 +13,7 @@
   let canvas: HTMLCanvasElement
   let chart: Chart | null = null
 
-  function buildChart() {
-    if (chart) chart.destroy()
-    if (!canvas) return
-
-    // Merge all timestamps and sort
+  function computeChartData() {
     const allTimestamps = new Set<number>()
     completed.forEach(d => allTimestamps.add(d.timestamp.getTime()))
     failed.forEach(d => allTimestamps.add(d.timestamp.getTime()))
@@ -27,10 +23,29 @@
     const completedMap = new Map(completed.map(d => [d.timestamp.getTime(), d.value]))
     const failedMap = new Map(failed.map(d => [d.timestamp.getTime(), d.value]))
 
-    const labels = sortedTimes.map(t => {
-      const d = new Date(t)
-      return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-    })
+    return {
+      labels: sortedTimes.map(t => {
+        const d = new Date(t)
+        return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+      }),
+      completedData: sortedTimes.map(t => completedMap.get(t) ?? 0),
+      failedData: sortedTimes.map(t => failedMap.get(t) ?? 0),
+    }
+  }
+
+  function buildChart() {
+    if (!canvas) return
+
+    const { labels, completedData, failedData } = computeChartData()
+
+    if (chart) {
+      // Update existing chart in-place
+      chart.data.labels = labels
+      chart.data.datasets[0].data = completedData
+      chart.data.datasets[1].data = failedData
+      chart.update()
+      return
+    }
 
     chart = new Chart(canvas, {
       type: 'line',
@@ -39,7 +54,7 @@
         datasets: [
           {
             label: 'Completed',
-            data: sortedTimes.map(t => completedMap.get(t) ?? 0),
+            data: completedData,
             borderColor: '#10b981',
             backgroundColor: 'rgba(16, 185, 129, 0.1)',
             fill: true,
@@ -49,7 +64,7 @@
           },
           {
             label: 'Failed',
-            data: sortedTimes.map(t => failedMap.get(t) ?? 0),
+            data: failedData,
             borderColor: '#ef4444',
             backgroundColor: 'rgba(239, 68, 68, 0.1)',
             fill: true,
@@ -101,7 +116,7 @@
   }
 
   $effect(() => {
-    // Re-build when data or period changes
+    // Update chart when data or period changes
     completed; failed; period;
     if (canvas) buildChart()
   })

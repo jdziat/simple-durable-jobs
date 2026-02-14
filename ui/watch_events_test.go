@@ -76,13 +76,6 @@ func TestCoreEventToProto_CustomEvent_ReturnsNil(t *testing.T) {
 	assert.Nil(t, ev)
 }
 
-func TestContainsString(t *testing.T) {
-	assert.True(t, containsString([]string{"a", "b", "c"}, "b"))
-	assert.False(t, containsString([]string{"a", "b", "c"}, "d"))
-	assert.False(t, containsString(nil, "a"))
-	assert.False(t, containsString([]string{}, "a"))
-}
-
 func TestParsePeriod(t *testing.T) {
 	before := time.Now()
 

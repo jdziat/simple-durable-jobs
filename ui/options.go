@@ -2,6 +2,7 @@
 package ui
 
 import (
+	"context"
 	"net/http"
 	"time"
 
@@ -18,6 +19,7 @@ type optionFunc func(*config)
 func (f optionFunc) apply(c *config) { f(c) }
 
 type config struct {
+	ctx            context.Context
 	middleware     func(http.Handler) http.Handler
 	queue          *queue.Queue
 	statsRetention time.Duration
@@ -41,5 +43,14 @@ func WithQueue(q *queue.Queue) Option {
 func WithStatsRetention(d time.Duration) Option {
 	return optionFunc(func(c *config) {
 		c.statsRetention = d
+	})
+}
+
+// WithContext provides a lifecycle context for background goroutines (e.g. stats collector).
+// When cancelled, background workers flush and exit gracefully.
+// If not provided, context.Background() is used (goroutines run until process exit).
+func WithContext(ctx context.Context) Option {
+	return optionFunc(func(c *config) {
+		c.ctx = ctx
 	})
 }

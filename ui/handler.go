@@ -22,7 +22,9 @@ import (
 //
 //	mux.Handle("/jobs/", http.StripPrefix("/jobs", ui.Handler(storage)))
 func Handler(storage core.Storage, opts ...Option) http.Handler {
-	cfg := &config{}
+	cfg := &config{
+		ctx: context.Background(),
+	}
 	for _, opt := range opts {
 		opt.apply(cfg)
 	}
@@ -40,7 +42,7 @@ func Handler(storage core.Storage, opts ...Option) http.Handler {
 				collectorOpts = append(collectorOpts, WithStatsCollectorRetention(cfg.statsRetention))
 			}
 			collector := NewStatsCollector(cfg.queue, statsStorage, collectorOpts...)
-			go collector.Start(context.Background())
+			go collector.Start(cfg.ctx)
 		}
 	}
 
