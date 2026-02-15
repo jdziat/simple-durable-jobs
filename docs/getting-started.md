@@ -211,10 +211,53 @@ queue.OnJobFail(func(ctx context.Context, job *jobs.Job, err error) {
     log.Printf("Job %s failed: %v", job.ID, err)
 })
 
-queue.OnRetry(func(ctx context.Context, job *jobs.Job, err error) {
-    log.Printf("Job %s retrying (attempt %d)", job.ID, job.Attempt)
+queue.OnRetry(func(ctx context.Context, job *jobs.Job, attempt int, err error) {
+    log.Printf("Job %s retrying (attempt %d): %v", job.ID, attempt, err)
 })
+
+// Event stream (remember to unsubscribe to prevent leaks)
+events := queue.Events()
+defer queue.Unsubscribe(events)
 ```
+
+## Pause/Resume
+
+Pause and resume at the job, queue, or worker level:
+
+```go
+// Pause a specific job
+queue.PauseJob(ctx, jobID)
+queue.ResumeJob(ctx, jobID)
+
+// Pause an entire queue
+queue.PauseQueue(ctx, "emails")
+queue.ResumeQueue(ctx, "emails")
+
+// Pause a worker (graceful: finish running jobs, stop picking new ones)
+worker.Pause(jobs.PauseModeGraceful)
+worker.Resume()
+
+// Aggressive: cancel running jobs immediately
+worker.Pause(jobs.PauseModeAggressive)
+```
+
+## Embedded Web UI
+
+Mount a monitoring dashboard into your HTTP server:
+
+```go
+import "github.com/jdziat/simple-durable-jobs/ui"
+
+ctx, cancel := context.WithCancel(context.Background())
+defer cancel()
+
+mux.Handle("/jobs/", http.StripPrefix("/jobs", ui.Handler(storage,
+    ui.WithQueue(queue),      // Enable event streaming
+    ui.WithContext(ctx),      // Lifecycle context for graceful shutdown
+)))
+```
+
+The dashboard shows real-time queue stats, historical charts, live event streaming, and job management controls.
 
 ## Error Handling
 
