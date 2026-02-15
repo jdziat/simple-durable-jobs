@@ -24,11 +24,13 @@ Building reliable background job processing is hard. Jobs fail, servers crash, a
 | Durable Workflows | Multi-step workflows with automatic checkpointing |
 | Fan-Out/Fan-In | Spawn parallel sub-jobs, wait for results, aggregate |
 | Crash Recovery | Jobs resume from the last successful checkpoint |
+| Pause/Resume | Pause and resume jobs, queues, or workers (graceful or aggressive) |
 | Scheduled Jobs | Cron, daily, weekly, and interval scheduling |
 | Priority Queues | Higher priority jobs run first |
 | Retries | Configurable retry logic with exponential backoff |
-| Observability | Hooks and event streams for monitoring |
-| Web UI | Embeddable dashboard for job monitoring |
+| Observability | Hooks, event streams, and custom events |
+| Web UI | Embeddable real-time monitoring dashboard |
+| Unique Jobs | Deduplicate jobs by key |
 
 ## Installation
 
