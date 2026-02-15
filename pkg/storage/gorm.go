@@ -691,6 +691,10 @@ func (s *GormStorage) SuspendJob(ctx context.Context, jobID string, workerID str
 }
 
 // ResumeJob resumes a waiting job to pending status.
+// Decrements the attempt counter so that the next Dequeue (which always
+// increments attempt) doesn't count the fan-out suspend/resume cycle as
+// a real retry. Without this, each fan-out round eats one retry attempt
+// and the job exhausts max_retries before completing.
 // Returns (true, nil) if resumed, (false, nil) if job was not in waiting status.
 func (s *GormStorage) ResumeJob(ctx context.Context, jobID string) (bool, error) {
 	result := s.db.WithContext(ctx).
@@ -698,6 +702,7 @@ func (s *GormStorage) ResumeJob(ctx context.Context, jobID string) (bool, error)
 		Where("id = ? AND status = ?", jobID, core.StatusWaiting).
 		Updates(map[string]any{
 			"status":     core.StatusPending,
+			"attempt":    gorm.Expr("CASE WHEN attempt > 0 THEN attempt - 1 ELSE 0 END"),
 			"updated_at": time.Now(),
 		})
 	if result.Error != nil {

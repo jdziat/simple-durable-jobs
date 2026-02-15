@@ -33,6 +33,10 @@ type Queue struct {
 	events    chan core.Event
 	eventSubs []chan core.Event
 
+	// Running job cancellation registry (used by workers to register cancel funcs)
+	runningJobs   map[string]context.CancelFunc
+	runningJobsMu sync.Mutex
+
 	// Config
 	determinism DeterminismMode
 }
@@ -52,6 +56,7 @@ func New(s core.Storage) *Queue {
 		handlers:    make(map[string]*handler.Handler),
 		determinism: ExplicitCheckpoints,
 		events:      make(chan core.Event, 1000),
+		runningJobs: make(map[string]context.CancelFunc),
 	}
 }
 
@@ -367,22 +372,69 @@ func WithPauseMode(mode core.PauseMode) PauseOption {
 	return pauseModeOption{mode: mode}
 }
 
+// --- Running Job Registry ---
+
+// RegisterRunningJob registers a cancel function for a running job.
+// Workers call this when they start executing a job so that PauseJob
+// can cancel running jobs via context cancellation.
+func (q *Queue) RegisterRunningJob(jobID string, cancel context.CancelFunc) {
+	q.runningJobsMu.Lock()
+	q.runningJobs[jobID] = cancel
+	q.runningJobsMu.Unlock()
+}
+
+// UnregisterRunningJob removes a job from the running registry.
+// Workers call this when a job finishes executing.
+func (q *Queue) UnregisterRunningJob(jobID string) {
+	q.runningJobsMu.Lock()
+	delete(q.runningJobs, jobID)
+	q.runningJobsMu.Unlock()
+}
+
 // --- Job Pause Operations ---
 
-// PauseJob pauses a specific job.
+// PauseJob pauses a specific job. For pending/waiting jobs, the status is set
+// to paused in storage. For running jobs in aggressive mode, the job's context
+// is cancelled via the running job registry. In graceful mode for running jobs,
+// the pause flag is set so the job stops after the current phase completes.
 func (q *Queue) PauseJob(ctx context.Context, jobID string, opts ...PauseOption) error {
 	po := &PauseOptions{Mode: core.PauseModeGraceful}
 	for _, opt := range opts {
 		opt.ApplyPause(po)
 	}
 
-	if err := q.storage.PauseJob(ctx, jobID); err != nil {
+	err := q.storage.PauseJob(ctx, jobID)
+	if err == nil {
+		// Pending/waiting job paused successfully in storage
+		job, getErr := q.storage.GetJob(ctx, jobID)
+		if getErr == nil && job != nil {
+			q.Emit(&core.JobPaused{Job: job, Mode: po.Mode, Timestamp: time.Now()})
+		}
+		return nil
+	}
+
+	// If the error is ErrCannotPauseStatus, the job might be running.
+	// Try to cancel it via the running job registry.
+	if !errors.Is(err, core.ErrCannotPauseStatus) {
 		return err
 	}
 
+	// Check if the job is actually running and we have a cancel for it
+	q.runningJobsMu.Lock()
+	cancel, found := q.runningJobs[jobID]
+	q.runningJobsMu.Unlock()
+
+	if !found {
+		// Job is in a status we can't pause and it's not in the running registry
+		return err
+	}
+
+	// Cancel the running job's context
+	cancel()
+
 	// Emit event
-	job, err := q.storage.GetJob(ctx, jobID)
-	if err == nil && job != nil {
+	job, getErr := q.storage.GetJob(ctx, jobID)
+	if getErr == nil && job != nil {
 		q.Emit(&core.JobPaused{Job: job, Mode: po.Mode, Timestamp: time.Now()})
 	}
 	return nil

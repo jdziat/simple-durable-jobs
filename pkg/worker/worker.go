@@ -233,14 +233,16 @@ func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 	jobCtx, cancelJob := context.WithCancel(ctx)
 	defer cancelJob()
 
-	// Track this running job for aggressive pause
+	// Track this running job for aggressive pause (worker-local + queue-level registry)
 	w.runningJobsMu.Lock()
 	w.runningJobs[job.ID] = cancelJob
 	w.runningJobsMu.Unlock()
+	w.queue.RegisterRunningJob(job.ID, cancelJob)
 	defer func() {
 		w.runningJobsMu.Lock()
 		delete(w.runningJobs, job.ID)
 		w.runningJobsMu.Unlock()
+		w.queue.UnregisterRunningJob(job.ID)
 	}()
 
 	// Call start hooks
