@@ -22,6 +22,7 @@ type WorkerConfig struct {
 	PollInterval    time.Duration
 	WorkerID        string
 	EnableScheduler bool
+	currentQueue    string // internal: scopes Concurrency to this queue
 
 	// StorageRetry configures retry behavior for storage operations.
 	// If nil, uses DefaultRetryConfig().
@@ -38,8 +39,12 @@ type WorkerConfig struct {
 func Concurrency(n int) WorkerOption {
 	return workerOptionFunc(func(c *WorkerConfig) {
 		clamped := security.ClampConcurrency(n)
-		for k := range c.Queues {
-			c.Queues[k] = clamped
+		if c.currentQueue != "" {
+			c.Queues[c.currentQueue] = clamped
+		} else {
+			for k := range c.Queues {
+				c.Queues[k] = clamped
+			}
 		}
 	})
 }
@@ -58,9 +63,12 @@ func WorkerQueue(name string, opts ...WorkerOption) WorkerOption {
 			c.Queues = make(map[string]int)
 		}
 		c.Queues[name] = 10 // default concurrency
+		prev := c.currentQueue
+		c.currentQueue = name
 		for _, opt := range opts {
 			opt.ApplyWorker(c)
 		}
+		c.currentQueue = prev
 	})
 }
 
