@@ -74,6 +74,14 @@ func NewWorker(q *queue.Queue, opts ...WorkerOption) *Worker {
 		config.DequeueRetry = &dequeueCfg
 	}
 
+	// Set default stale lock reaper config
+	if config.StaleLockInterval == 0 {
+		config.StaleLockInterval = 5 * time.Minute
+	}
+	if config.StaleLockAge == 0 {
+		config.StaleLockAge = 45 * time.Minute
+	}
+
 	// Initialize per-queue concurrency counters
 	queueRunning := make(map[string]*atomic.Int32, len(config.Queues))
 	for name := range config.Queues {
@@ -108,6 +116,11 @@ func (w *Worker) Start(ctx context.Context) error {
 
 	// Start polling for waiting jobs (fan-out fallback)
 	go w.pollWaitingJobs(ctx)
+
+	// Start stale lock reaper to reclaim stuck running jobs
+	if w.config.StaleLockInterval > 0 {
+		go w.reapStaleLocks(ctx)
+	}
 
 	for i := 0; i < totalConcurrency; i++ {
 		w.wg.Add(1)
@@ -635,6 +648,34 @@ func (w *Worker) pollWaitingJobs(ctx context.Context) {
 				} else {
 					w.logger.Info("resumed waiting job via polling fallback", "job_id", job.ID)
 				}
+			}
+		}
+	}
+}
+
+// reapStaleLocks periodically releases locks on jobs that are stuck in running
+// status with expired locks. This handles cases where:
+// - A worker crashed without properly completing/failing the job
+// - Complete/Fail failed due to ErrJobNotOwned (lock expired during processing)
+// - A handler hung and the heartbeat eventually stopped
+func (w *Worker) reapStaleLocks(ctx context.Context) {
+	ticker := time.NewTicker(w.config.StaleLockInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			released, err := w.queue.Storage().ReleaseStaleLocks(ctx, w.config.StaleLockAge)
+			if err != nil {
+				if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+					w.logger.Error("failed to release stale locks", "error", err)
+				}
+				continue
+			}
+			if released > 0 {
+				w.logger.Info("released stale running jobs", "count", released)
 			}
 		}
 	}

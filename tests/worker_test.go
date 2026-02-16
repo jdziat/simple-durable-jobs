@@ -483,3 +483,52 @@ func TestWorkerQueue_ConcurrencyIsolation(t *testing.T) {
 		}
 	}
 }
+
+func TestWorker_ReleasesStaleRunningJobs(t *testing.T) {
+	queue, store := setupWorkerTestQueue(t)
+
+	var processed atomic.Int32
+	queue.Register("stale-test", func(ctx context.Context, _ struct{}) error {
+		processed.Add(1)
+		return nil
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	// Enqueue a job normally first
+	jobID, err := queue.Enqueue(ctx, "stale-test", struct{}{})
+	require.NoError(t, err)
+
+	// Manually set it to running with an expired lock,
+	// simulating a job that got stuck (e.g., worker crashed, Complete failed).
+	expiredLock := time.Now().Add(-1 * time.Hour)
+	gormStore := store.(*jobs.GormStorage)
+	err = gormStore.DB().Model(&jobs.Job{}).Where("id = ?", jobID).Updates(map[string]any{
+		"status":       jobs.StatusRunning,
+		"locked_by":    "dead-worker",
+		"locked_until": expiredLock,
+	}).Error
+	require.NoError(t, err)
+
+	// Verify it's stuck in running
+	job, _ := store.GetJob(ctx, jobID)
+	require.Equal(t, jobs.StatusRunning, job.Status)
+
+	// Start worker with a short stale lock check interval
+	worker := jobs.NewWorker(queue,
+		jobs.WithStaleLockInterval(1*time.Second),
+		jobs.WithStaleLockAge(30*time.Minute),
+	)
+	go worker.Start(ctx)
+
+	// The reaper should detect the stale lock, reset to pending, and the worker should process it
+	for i := 0; i < 100; i++ {
+		if processed.Load() >= 1 {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	assert.GreaterOrEqual(t, processed.Load(), int32(1), "stale job should have been reclaimed and processed")
+}
