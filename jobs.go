@@ -432,6 +432,16 @@ func WithPollInterval(d time.Duration) WorkerOption {
 	return worker.WithPollInterval(d)
 }
 
+// WithStaleLockInterval sets how often the worker checks for stale running jobs.
+func WithStaleLockInterval(d time.Duration) WorkerOption {
+	return worker.WithStaleLockInterval(d)
+}
+
+// WithStaleLockAge sets how long a lock must be expired before reclaim.
+func WithStaleLockAge(d time.Duration) WorkerOption {
+	return worker.WithStaleLockAge(d)
+}
+
 // DefaultRetryConfig returns the default retry configuration.
 func DefaultRetryConfig() RetryConfig {
 	return worker.DefaultRetryConfig()

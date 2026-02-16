@@ -32,6 +32,14 @@ type WorkerConfig struct {
 	// Dequeue failures use backoff to prevent hammering the database.
 	// If nil, uses a longer backoff config suitable for polling.
 	DequeueRetry *RetryConfig
+
+	// StaleLockInterval is how often to check for stale running jobs.
+	// Default: 5 minutes. Set to 0 to disable.
+	StaleLockInterval time.Duration
+
+	// StaleLockAge is how long a running job's lock must be expired before
+	// it is reclaimed (reset to pending). Default: 45 minutes (matches lock duration).
+	StaleLockAge time.Duration
 }
 
 // Concurrency sets the concurrency for a queue.
@@ -117,5 +125,21 @@ func WithPollInterval(d time.Duration) WorkerOption {
 		if d >= 50*time.Millisecond {
 			c.PollInterval = d
 		}
+	})
+}
+
+// WithStaleLockInterval sets how often the worker checks for stale running jobs.
+// Default is 5 minutes. Set to 0 to disable the stale lock reaper.
+func WithStaleLockInterval(d time.Duration) WorkerOption {
+	return workerOptionFunc(func(c *WorkerConfig) {
+		c.StaleLockInterval = d
+	})
+}
+
+// WithStaleLockAge sets how long a lock must be expired before the job is reclaimed.
+// Default is 45 minutes (matching the lock duration).
+func WithStaleLockAge(d time.Duration) WorkerOption {
+	return workerOptionFunc(func(c *WorkerConfig) {
+		c.StaleLockAge = d
 	})
 }
