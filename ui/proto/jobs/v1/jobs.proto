@@ -1,0 +1,176 @@
+syntax = "proto3";
+package jobs.v1;
+
+option go_package = "github.com/jdziat/simple-durable-jobs/ui/gen/jobs/v1;jobsv1";
+
+import "google/protobuf/timestamp.proto";
+
+service JobsService {
+  // Dashboard
+  rpc GetStats(GetStatsRequest) returns (GetStatsResponse);
+  rpc GetStatsHistory(GetStatsHistoryRequest) returns (GetStatsHistoryResponse);
+
+  // Jobs
+  rpc ListJobs(ListJobsRequest) returns (ListJobsResponse);
+  rpc GetJob(GetJobRequest) returns (GetJobResponse);
+  rpc RetryJob(RetryJobRequest) returns (RetryJobResponse);
+  rpc DeleteJob(DeleteJobRequest) returns (DeleteJobResponse);
+  rpc BulkRetryJobs(BulkRetryJobsRequest) returns (BulkRetryJobsResponse);
+  rpc BulkDeleteJobs(BulkDeleteJobsRequest) returns (BulkDeleteJobsResponse);
+
+  // Queues
+  rpc ListQueues(ListQueuesRequest) returns (ListQueuesResponse);
+  rpc PurgeQueue(PurgeQueueRequest) returns (PurgeQueueResponse);
+
+  // Scheduled
+  rpc ListScheduledJobs(ListScheduledJobsRequest) returns (ListScheduledJobsResponse);
+
+  // Real-time
+  rpc WatchEvents(WatchEventsRequest) returns (stream Event);
+}
+
+// --- Messages ---
+
+message Job {
+  string id = 1;
+  string type = 2;
+  string queue = 3;
+  string status = 4;
+  int32 priority = 5;
+  int32 attempt = 6;
+  int32 max_retries = 7;
+  bytes args = 8;
+  string last_error = 9;
+  google.protobuf.Timestamp created_at = 10;
+  google.protobuf.Timestamp started_at = 11;
+  google.protobuf.Timestamp completed_at = 12;
+  google.protobuf.Timestamp run_at = 13;
+}
+
+message Checkpoint {
+  string id = 1;
+  string job_id = 2;
+  int32 call_index = 3;
+  string call_type = 4;
+  bytes result = 5;
+  string error = 6;
+  google.protobuf.Timestamp created_at = 7;
+}
+
+message QueueStats {
+  string name = 1;
+  int64 pending = 2;
+  int64 running = 3;
+  int64 completed = 4;
+  int64 failed = 5;
+}
+
+message Event {
+  string type = 1;
+  Job job = 2;
+  google.protobuf.Timestamp timestamp = 3;
+}
+
+// --- Requests/Responses ---
+
+message GetStatsRequest {}
+message GetStatsResponse {
+  repeated QueueStats queues = 1;
+  int64 total_pending = 2;
+  int64 total_running = 3;
+  int64 total_completed = 4;
+  int64 total_failed = 5;
+  int32 active_workers = 6;
+}
+
+message GetStatsHistoryRequest {
+  string period = 1;
+  string queue = 2;
+}
+message GetStatsHistoryResponse {
+  repeated DataPoint completed = 1;
+  repeated DataPoint failed = 2;
+}
+message DataPoint {
+  google.protobuf.Timestamp timestamp = 1;
+  int64 value = 2;
+}
+
+message ListJobsRequest {
+  string status = 1;
+  string queue = 2;
+  string type = 3;
+  string search = 4;
+  google.protobuf.Timestamp since = 5;
+  google.protobuf.Timestamp until = 6;
+  int32 page = 7;
+  int32 limit = 8;
+}
+message ListJobsResponse {
+  repeated Job jobs = 1;
+  int64 total = 2;
+  int32 page = 3;
+}
+
+message GetJobRequest {
+  string id = 1;
+}
+message GetJobResponse {
+  Job job = 1;
+  repeated Checkpoint checkpoints = 2;
+}
+
+message RetryJobRequest {
+  string id = 1;
+}
+message RetryJobResponse {
+  Job job = 1;
+}
+
+message DeleteJobRequest {
+  string id = 1;
+}
+message DeleteJobResponse {}
+
+message BulkRetryJobsRequest {
+  repeated string ids = 1;
+}
+message BulkRetryJobsResponse {
+  int32 count = 1;
+}
+
+message BulkDeleteJobsRequest {
+  repeated string ids = 1;
+}
+message BulkDeleteJobsResponse {
+  int32 count = 1;
+}
+
+message ListQueuesRequest {}
+message ListQueuesResponse {
+  repeated QueueStats queues = 1;
+}
+
+message PurgeQueueRequest {
+  string name = 1;
+  string status = 2;
+}
+message PurgeQueueResponse {
+  int64 deleted = 1;
+}
+
+message ListScheduledJobsRequest {}
+message ListScheduledJobsResponse {
+  repeated ScheduledJobInfo jobs = 1;
+}
+message ScheduledJobInfo {
+  string name = 1;
+  string schedule = 2;
+  string queue = 3;
+  google.protobuf.Timestamp next_run = 4;
+  google.protobuf.Timestamp last_run = 5;
+}
+
+message WatchEventsRequest {
+  repeated string queues = 1;
+}

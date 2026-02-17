@@ -136,6 +136,124 @@ type Order struct {
 
 ---
 
+## Fan-Out/Fan-In
+
+Process items in parallel using sub-jobs, then aggregate results.
+
+```go
+package main
+
+import (
+    "context"
+    "fmt"
+
+    jobs "github.com/jdziat/simple-durable-jobs"
+    "gorm.io/driver/sqlite"
+    "gorm.io/gorm"
+)
+
+func main() {
+    db, _ := gorm.Open(sqlite.Open("fanout.db"), &gorm.Config{})
+    storage := jobs.NewGormStorage(db)
+    storage.Migrate(context.Background())
+    queue := jobs.New(storage)
+
+    // Register sub-job handler
+    queue.Register("process-image", func(ctx context.Context, img Image) (Result, error) {
+        fmt.Printf("Processing image: %s\n", img.URL)
+        return Result{ImageID: img.ID, Thumbnail: img.URL + "/thumb"}, nil
+    })
+
+    // Register parent job that fans out
+    queue.Register("batch-process-images", func(ctx context.Context, images []Image) error {
+        // Create sub-jobs for each image
+        subJobs := make([]jobs.SubJob, len(images))
+        for i, img := range images {
+            subJobs[i] = jobs.Sub("process-image", img)
+        }
+
+        // Fan-out: spawn all sub-jobs in parallel, wait for results
+        results, err := jobs.FanOut[Result](ctx, subJobs,
+            jobs.FailFast(),                    // Stop on first failure
+            jobs.WithFanOutQueue("batch"),      // Run on batch queue
+            jobs.WithFanOutRetries(3),          // Retry failed sub-jobs
+        )
+        if err != nil {
+            return err
+        }
+
+        // Aggregate successful results
+        thumbnails := jobs.Values(results)
+        fmt.Printf("Generated %d thumbnails\n", len(thumbnails))
+        return nil
+    })
+
+    ctx := context.Background()
+    queue.Enqueue(ctx, "batch-process-images", []Image{
+        {ID: "1", URL: "https://example.com/image1.jpg"},
+        {ID: "2", URL: "https://example.com/image2.jpg"},
+        {ID: "3", URL: "https://example.com/image3.jpg"},
+    })
+
+    worker := queue.NewWorker(
+        jobs.WorkerQueue("default", jobs.Concurrency(5)),
+        jobs.WorkerQueue("batch", jobs.Concurrency(10)),
+    )
+    worker.Start(ctx)
+}
+
+type Image struct {
+    ID  string `json:"id"`
+    URL string `json:"url"`
+}
+
+type Result struct {
+    ImageID   string `json:"image_id"`
+    Thumbnail string `json:"thumbnail"`
+}
+```
+
+### Fan-Out Strategies
+
+```go
+// FailFast: Stop on first sub-job failure (default)
+results, err := jobs.FanOut[T](ctx, subJobs, jobs.FailFast())
+
+// CollectAll: Wait for all sub-jobs, return partial results
+results, err := jobs.FanOut[T](ctx, subJobs, jobs.CollectAll())
+
+// Threshold: Succeed if at least 80% of sub-jobs complete
+results, err := jobs.FanOut[T](ctx, subJobs, jobs.Threshold(0.8))
+```
+
+### Working with Results
+
+```go
+results, _ := jobs.FanOut[T](ctx, subJobs, jobs.CollectAll())
+
+// Extract all successful values
+values := jobs.Values(results)
+
+// Split into successes and failures
+successes, failures := jobs.Partition(results)
+
+// Check if all succeeded
+if jobs.AllSucceeded(results) {
+    fmt.Println("All sub-jobs completed successfully")
+}
+
+// Access individual results
+for _, r := range results {
+    if r.Err != nil {
+        fmt.Printf("Sub-job %d failed: %v\n", r.Index, r.Err)
+    } else {
+        fmt.Printf("Sub-job %d result: %v\n", r.Index, r.Value)
+    }
+}
+```
+
+---
+
 ## Scheduled Jobs
 
 Recurring jobs with various schedule types.

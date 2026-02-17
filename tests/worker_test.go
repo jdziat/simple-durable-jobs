@@ -439,3 +439,96 @@ func TestWorker_UnknownHandler(t *testing.T) {
 	assert.Equal(t, jobs.StatusFailed, updatedJob.Status)
 	assert.Contains(t, updatedJob.LastError, "no handler")
 }
+
+func TestWorkerQueue_ConcurrencyIsolation(t *testing.T) {
+	queue, _ := setupWorkerTestQueue(t)
+
+	var processed atomic.Int32
+	queue.Register("count-job", func(ctx context.Context, _ struct{}) error {
+		processed.Add(1)
+		time.Sleep(500 * time.Millisecond)
+		return nil
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Enqueue 6 jobs to the default queue
+	for i := 0; i < 6; i++ {
+		_, err := queue.Enqueue(ctx, "count-job", struct{}{})
+		require.NoError(t, err)
+	}
+
+	// Configure default=8, other=2. With the bug, both get concurrency=2.
+	w := jobs.NewWorker(queue,
+		jobs.WorkerQueue("default", jobs.Concurrency(8)),
+		jobs.WorkerQueue("other", jobs.Concurrency(2)),
+	)
+	go w.Start(ctx)
+
+	// With concurrency=8 on default, all 6 jobs should complete within ~1s
+	// With the bug (concurrency=2), it would take ~1.5s minimum
+	deadline := time.After(1200 * time.Millisecond)
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-deadline:
+			t.Fatalf("expected 6 jobs processed within 1.2s, got %d (concurrency likely wrong)", processed.Load())
+		case <-ticker.C:
+			if processed.Load() >= 6 {
+				return
+			}
+		}
+	}
+}
+
+func TestWorker_ReleasesStaleRunningJobs(t *testing.T) {
+	queue, store := setupWorkerTestQueue(t)
+
+	var processed atomic.Int32
+	queue.Register("stale-test", func(ctx context.Context, _ struct{}) error {
+		processed.Add(1)
+		return nil
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	// Enqueue a job normally first
+	jobID, err := queue.Enqueue(ctx, "stale-test", struct{}{})
+	require.NoError(t, err)
+
+	// Manually set it to running with an expired lock,
+	// simulating a job that got stuck (e.g., worker crashed, Complete failed).
+	expiredLock := time.Now().Add(-1 * time.Hour)
+	gormStore := store.(*jobs.GormStorage)
+	err = gormStore.DB().Model(&jobs.Job{}).Where("id = ?", jobID).Updates(map[string]any{
+		"status":       jobs.StatusRunning,
+		"locked_by":    "dead-worker",
+		"locked_until": expiredLock,
+	}).Error
+	require.NoError(t, err)
+
+	// Verify it's stuck in running
+	job, _ := store.GetJob(ctx, jobID)
+	require.Equal(t, jobs.StatusRunning, job.Status)
+
+	// Start worker with a short stale lock check interval
+	worker := jobs.NewWorker(queue,
+		jobs.WithStaleLockInterval(1*time.Second),
+		jobs.WithStaleLockAge(30*time.Minute),
+	)
+	go worker.Start(ctx)
+
+	// The reaper should detect the stale lock, reset to pending, and the worker should process it
+	for i := 0; i < 100; i++ {
+		if processed.Load() >= 1 {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	assert.GreaterOrEqual(t, processed.Load(), int32(1), "stale job should have been reclaimed and processed")
+}

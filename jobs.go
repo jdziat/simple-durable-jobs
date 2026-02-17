@@ -32,6 +32,8 @@ import (
 
 	"github.com/jdziat/simple-durable-jobs/pkg/call"
 	"github.com/jdziat/simple-durable-jobs/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/pkg/fanout"
+	"github.com/jdziat/simple-durable-jobs/pkg/jobctx"
 	"github.com/jdziat/simple-durable-jobs/pkg/queue"
 	"github.com/jdziat/simple-durable-jobs/pkg/schedule"
 	"github.com/jdziat/simple-durable-jobs/pkg/security"
@@ -65,6 +67,9 @@ type (
 
 	// Storage defines the persistence layer for jobs.
 	Storage = core.Storage
+
+	// Starter is an interface for types that can be started with a context.
+	Starter = core.Starter
 
 	// Event is the interface for all queue events.
 	Event = core.Event
@@ -114,11 +119,45 @@ type (
 	// WorkerConfig holds worker configuration.
 	WorkerConfig = worker.WorkerConfig
 
+	// RetryConfig holds configuration for retry with backoff.
+	RetryConfig = worker.RetryConfig
+
 	// Schedule defines when a job should run next.
 	Schedule = schedule.Schedule
 
 	// GormStorage implements Storage using GORM.
 	GormStorage = storage.GormStorage
+
+	// PoolConfig holds connection pool configuration.
+	PoolConfig = storage.PoolConfig
+
+	// PoolOption configures connection pool settings.
+	PoolOption = storage.PoolOption
+
+	// Fan-out types
+
+	// SubJob represents a sub-job to be spawned in a fan-out.
+	SubJob = fanout.SubJob
+
+	// FanOutOption configures fan-out behavior.
+	FanOutOption = fanout.Option
+
+	// FanOutError contains details about fan-out failures.
+	FanOutError = fanout.Error
+
+	// SubJobFailure contains details about a single sub-job failure.
+	SubJobFailure = fanout.SubJobFailure
+
+	// FanOut tracking types
+
+	// FanOut tracks a batch of sub-jobs spawned by a parent job.
+	FanOutRecord = core.FanOut
+
+	// FanOutStrategy defines how sub-job failures affect the parent.
+	FanOutStrategy = core.FanOutStrategy
+
+	// FanOutStatus represents the state of a fan-out batch.
+	FanOutStatus = core.FanOutStatus
 )
 
 // Status constants
@@ -128,6 +167,23 @@ const (
 	StatusCompleted = core.StatusCompleted
 	StatusFailed    = core.StatusFailed
 	StatusRetrying  = core.StatusRetrying
+	StatusWaiting   = core.StatusWaiting
+	StatusCancelled = core.StatusCancelled
+	StatusPaused    = core.StatusPaused
+)
+
+// Fan-out strategy constants
+const (
+	StrategyFailFast   = core.StrategyFailFast
+	StrategyCollectAll = core.StrategyCollectAll
+	StrategyThreshold  = core.StrategyThreshold
+)
+
+// Fan-out status constants
+const (
+	FanOutPending   = core.FanOutPending
+	FanOutCompleted = core.FanOutCompleted
+	FanOutFailed    = core.FanOutFailed
 )
 
 // Determinism mode constants
@@ -157,6 +213,12 @@ var (
 	ErrJobArgsTooLarge    = core.ErrJobArgsTooLarge
 	ErrJobNotOwned        = core.ErrJobNotOwned
 	ErrDuplicateJob       = core.ErrDuplicateJob
+	ErrUniqueKeyTooLong   = core.ErrUniqueKeyTooLong
+	ErrJobAlreadyPaused   = core.ErrJobAlreadyPaused
+	ErrJobNotPaused       = core.ErrJobNotPaused
+	ErrQueueAlreadyPaused = core.ErrQueueAlreadyPaused
+	ErrQueueNotPaused     = core.ErrQueueNotPaused
+	ErrCannotPauseStatus  = core.ErrCannotPauseStatus
 )
 
 // Default values
@@ -175,6 +237,57 @@ func NewGormStorage(db *gorm.DB) *GormStorage {
 	return storage.NewGormStorage(db)
 }
 
+// NewGormStorageWithPool creates storage with connection pool configuration.
+// Uses sensible defaults that can be overridden with PoolOption arguments.
+func NewGormStorageWithPool(db *gorm.DB, opts ...PoolOption) (*GormStorage, error) {
+	return storage.NewGormStorageWithPool(db, opts...)
+}
+
+// ConfigurePool applies pool configuration to a GORM database connection.
+func ConfigurePool(db *gorm.DB, opts ...PoolOption) error {
+	return storage.ConfigurePool(db, opts...)
+}
+
+// DefaultPoolConfig returns sensible defaults for connection pooling.
+func DefaultPoolConfig() PoolConfig {
+	return storage.DefaultPoolConfig()
+}
+
+// HighConcurrencyPoolConfig returns pool settings for high-concurrency workloads.
+func HighConcurrencyPoolConfig() PoolConfig {
+	return storage.HighConcurrencyPoolConfig()
+}
+
+// LowLatencyPoolConfig returns pool settings optimized for low-latency processing.
+func LowLatencyPoolConfig() PoolConfig {
+	return storage.LowLatencyPoolConfig()
+}
+
+// ResourceConstrainedPoolConfig returns pool settings for limited database resources.
+func ResourceConstrainedPoolConfig() PoolConfig {
+	return storage.ResourceConstrainedPoolConfig()
+}
+
+// MaxOpenConns sets the maximum number of open database connections.
+func MaxOpenConns(n int) PoolOption {
+	return storage.MaxOpenConns(n)
+}
+
+// MaxIdleConns sets the maximum number of idle connections in the pool.
+func MaxIdleConns(n int) PoolOption {
+	return storage.MaxIdleConns(n)
+}
+
+// ConnMaxLifetime sets the maximum lifetime of database connections.
+func ConnMaxLifetime(d time.Duration) PoolOption {
+	return storage.ConnMaxLifetime(d)
+}
+
+// ConnMaxIdleTime sets the maximum idle time for connections.
+func ConnMaxIdleTime(d time.Duration) PoolOption {
+	return storage.ConnMaxIdleTime(d)
+}
+
 // NewOptions creates Options with defaults.
 func NewOptions() *Options {
 	return queue.NewOptions()
@@ -189,6 +302,18 @@ func NewWorker(q *Queue, opts ...WorkerOption) *Worker {
 // Results are checkpointed; on replay, cached results are returned without re-execution.
 func Call[T any](ctx context.Context, name string, args any) (T, error) {
 	return call.Call[T](ctx, name, args)
+}
+
+// SavePhaseCheckpoint saves a phase result to the checkpoint store.
+// Use this to checkpoint expensive operations so they can be skipped on job retry.
+func SavePhaseCheckpoint(ctx context.Context, phaseName string, result any) error {
+	return jobctx.SavePhaseCheckpoint(ctx, phaseName, result)
+}
+
+// LoadPhaseCheckpoint loads a previously saved phase result from the checkpoint store.
+// Returns (result, true) if found, (zero, false) if not found or not in job context.
+func LoadPhaseCheckpoint[T any](ctx context.Context, phaseName string) (T, bool) {
+	return jobctx.LoadPhaseCheckpoint[T](ctx, phaseName)
 }
 
 // NoRetry wraps an error to indicate it should not be retried.
@@ -280,6 +405,48 @@ func WorkerQueue(name string, opts ...WorkerOption) WorkerOption {
 	return worker.WorkerQueue(name, opts...)
 }
 
+// WithStorageRetry configures retry behavior for storage operations.
+func WithStorageRetry(config RetryConfig) WorkerOption {
+	return worker.WithStorageRetry(config)
+}
+
+// WithDequeueRetry configures retry behavior for dequeue operations.
+func WithDequeueRetry(config RetryConfig) WorkerOption {
+	return worker.WithDequeueRetry(config)
+}
+
+// WithRetryAttempts sets the max retry attempts for storage operations.
+func WithRetryAttempts(attempts int) WorkerOption {
+	return worker.WithRetryAttempts(attempts)
+}
+
+// DisableRetry disables retry for storage operations.
+func DisableRetry() WorkerOption {
+	return worker.DisableRetry()
+}
+
+// WithPollInterval sets the interval between job polling attempts.
+// Lower values increase throughput but also database load.
+// Default is 100ms. Minimum is 50ms to prevent database overload.
+func WithPollInterval(d time.Duration) WorkerOption {
+	return worker.WithPollInterval(d)
+}
+
+// WithStaleLockInterval sets how often the worker checks for stale running jobs.
+func WithStaleLockInterval(d time.Duration) WorkerOption {
+	return worker.WithStaleLockInterval(d)
+}
+
+// WithStaleLockAge sets how long a lock must be expired before reclaim.
+func WithStaleLockAge(d time.Duration) WorkerOption {
+	return worker.WithStaleLockAge(d)
+}
+
+// DefaultRetryConfig returns the default retry configuration.
+func DefaultRetryConfig() RetryConfig {
+	return worker.DefaultRetryConfig()
+}
+
 // Schedule functions
 
 // Every creates a schedule that runs at fixed intervals.
@@ -300,4 +467,106 @@ func Weekly(day time.Weekday, hour, minute int) Schedule {
 // Cron creates a schedule from a cron expression.
 func Cron(expr string) Schedule {
 	return schedule.Cron(expr)
+}
+
+// JobFromContext returns the current Job from context, or nil if not in a job handler.
+// Use this to get the job ID for logging or progress tracking.
+func JobFromContext(ctx context.Context) *Job {
+	return jobctx.JobFromContext(ctx)
+}
+
+// JobIDFromContext returns the current job ID from context, or empty string if not in a job handler.
+func JobIDFromContext(ctx context.Context) string {
+	return jobctx.JobIDFromContext(ctx)
+}
+
+// Fan-out functions
+
+// Sub creates a sub-job definition for use with FanOut.
+func Sub(jobType string, args any, opts ...Option) SubJob {
+	return fanout.Sub(jobType, args, opts...)
+}
+
+// FanOut spawns sub-jobs in parallel and waits for all results.
+// Checkpoints progress - safe to retry if parent crashes.
+// Returns a slice of Result[T] with success/failure for each sub-job.
+func FanOut[T any](ctx context.Context, subJobs []SubJob, opts ...FanOutOption) ([]fanout.Result[T], error) {
+	return fanout.FanOut[T](ctx, subJobs, opts...)
+}
+
+// FanOutResult wraps a sub-job result with its index and potential error.
+type FanOutResult[T any] struct {
+	Index int
+	Value T
+	Err   error
+}
+
+// Values extracts values from successful fan-out results.
+func Values[T any](results []fanout.Result[T]) []T {
+	return fanout.Values(results)
+}
+
+// Partition splits fan-out results into successes and failures.
+func Partition[T any](results []fanout.Result[T]) ([]T, []error) {
+	return fanout.Partition(results)
+}
+
+// AllSucceeded checks if all fan-out results succeeded.
+func AllSucceeded[T any](results []fanout.Result[T]) bool {
+	return fanout.AllSucceeded(results)
+}
+
+// SuccessCount returns the number of successful fan-out results.
+func SuccessCount[T any](results []fanout.Result[T]) int {
+	return fanout.SuccessCount(results)
+}
+
+// Fan-out option functions
+
+// FailFast fails the parent on first sub-job failure.
+func FailFast() FanOutOption {
+	return fanout.FailFast()
+}
+
+// CollectAll waits for all sub-jobs, returns partial results.
+func CollectAll() FanOutOption {
+	return fanout.CollectAll()
+}
+
+// Threshold succeeds if at least pct% of sub-jobs succeed.
+func Threshold(pct float64) FanOutOption {
+	return fanout.Threshold(pct)
+}
+
+// WithFanOutQueue sets the queue for sub-jobs.
+func WithFanOutQueue(q string) FanOutOption {
+	return fanout.WithQueue(q)
+}
+
+// WithFanOutPriority sets the priority for sub-jobs.
+func WithFanOutPriority(p int) FanOutOption {
+	return fanout.WithPriority(p)
+}
+
+// WithFanOutRetries sets the retry count for sub-jobs.
+func WithFanOutRetries(n int) FanOutOption {
+	return fanout.WithRetries(n)
+}
+
+// WithFanOutTimeout sets a deadline for the entire fan-out operation.
+// The deadline is stored on the fan-out record (TimeoutAt field) but is not
+// automatically enforced. Applications can query fan-outs by TimeoutAt to
+// implement custom timeout handling.
+func WithFanOutTimeout(d time.Duration) FanOutOption {
+	return fanout.WithTimeout(d)
+}
+
+// CancelOnParentFailure cancels sub-jobs if parent fails.
+func CancelOnParentFailure() FanOutOption {
+	return fanout.CancelOnParentFailure()
+}
+
+// IsSuspendError checks if an error indicates a fan-out suspend.
+func IsSuspendError(err error) bool {
+	return fanout.IsSuspendError(err)
 }
