@@ -53,3 +53,64 @@ type CheckpointSaved struct {
 }
 
 func (*CheckpointSaved) eventMarker() {}
+
+// JobPaused is emitted when a job is paused.
+type JobPaused struct {
+	Job       *Job
+	Mode      PauseMode
+	Timestamp time.Time
+}
+
+func (*JobPaused) eventMarker() {}
+
+// JobResumed is emitted when a job is resumed.
+type JobResumed struct {
+	Job       *Job
+	Timestamp time.Time
+}
+
+func (*JobResumed) eventMarker() {}
+
+// QueuePaused is emitted when a queue is paused.
+type QueuePaused struct {
+	Queue     string
+	Timestamp time.Time
+}
+
+func (*QueuePaused) eventMarker() {}
+
+// QueueResumed is emitted when a queue is resumed.
+type QueueResumed struct {
+	Queue     string
+	Timestamp time.Time
+}
+
+func (*QueueResumed) eventMarker() {}
+
+// WorkerPaused is emitted when a worker is paused.
+type WorkerPaused struct {
+	WorkerID  string
+	Mode      PauseMode
+	Timestamp time.Time
+}
+
+func (*WorkerPaused) eventMarker() {}
+
+// WorkerResumed is emitted when a worker is resumed.
+type WorkerResumed struct {
+	WorkerID  string
+	Timestamp time.Time
+}
+
+func (*WorkerResumed) eventMarker() {}
+
+// CustomEvent is emitted by workers to carry arbitrary progress data
+// through the Events() channel without requiring new event types.
+type CustomEvent struct {
+	JobID     string
+	Kind      string         // "progress", "phase_change", "log", etc.
+	Data      map[string]any
+	Timestamp time.Time
+}
+
+func (*CustomEvent) eventMarker() {}

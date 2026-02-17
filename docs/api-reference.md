@@ -90,6 +90,35 @@ go worker.Start(ctx)
 cancel() // Graceful shutdown
 ```
 
+### `(*Worker) Pause(mode PauseMode)`
+
+Pauses the worker. In graceful mode, running jobs complete but no new jobs are picked up. In aggressive mode, running jobs are cancelled via context cancellation.
+
+```go
+worker.Pause(jobs.PauseModeGraceful)
+worker.Pause(jobs.PauseModeAggressive)
+```
+
+### `(*Worker) Resume()`
+
+Resumes a paused worker.
+
+### `(*Worker) IsPaused() bool`
+
+Returns whether the worker is currently paused.
+
+### `(*Worker) WaitForPause(timeout time.Duration) bool`
+
+Blocks until all running jobs complete (after a graceful pause) or the timeout expires. Returns true if all jobs completed.
+
+### `(*Worker) RunningJobCount() int`
+
+Returns the number of currently executing jobs.
+
+### `(*Worker) CancelJob(jobID string)`
+
+Cancels a specific running job's context.
+
 ---
 
 ## Durable Calls
@@ -112,6 +141,137 @@ queue.Register("workflow", func(ctx context.Context, input Input) error {
 })
 ```
 
+### `SavePhaseCheckpoint(ctx context.Context, phaseName string, result any) error`
+
+Manually saves a checkpoint for a named phase within a job handler.
+
+### `LoadPhaseCheckpoint[T any](ctx context.Context, phaseName string) (T, bool, error)`
+
+Retrieves a previously saved phase checkpoint.
+
+---
+
+## Fan-Out/Fan-In
+
+### `Sub(jobType string, args any, opts ...Option) SubJob`
+
+Creates a sub-job definition for use with FanOut.
+
+```go
+subJobs := []jobs.SubJob{
+    jobs.Sub("process-item", item1),
+    jobs.Sub("process-item", item2, jobs.Priority(10)),
+}
+```
+
+### `FanOut[T any](ctx context.Context, subJobs []SubJob, opts ...FanOutOption) ([]Result[T], error)`
+
+Spawns sub-jobs in parallel and waits for all results. Must be called from within a job handler.
+
+```go
+results, err := jobs.FanOut[ProcessedItem](ctx, subJobs, jobs.FailFast())
+if err != nil {
+    return err
+}
+```
+
+### `Values[T any](results []Result[T]) []T`
+
+Extracts successful values from fan-out results.
+
+### `Partition[T any](results []Result[T]) ([]T, []error)`
+
+Splits results into successes and failures.
+
+### `AllSucceeded[T any](results []Result[T]) bool`
+
+Returns true if all results succeeded.
+
+### `SuccessCount[T any](results []Result[T]) int`
+
+Returns the number of successful results.
+
+---
+
+## Fan-Out Options
+
+### `FailFast() FanOutOption`
+
+Fails the parent job on first sub-job failure.
+
+### `CollectAll() FanOutOption`
+
+Waits for all sub-jobs and returns partial results.
+
+### `Threshold(pct float64) FanOutOption`
+
+Succeeds if at least pct% of sub-jobs complete successfully.
+
+### `WithFanOutQueue(name string) FanOutOption`
+
+Sets the queue for sub-jobs.
+
+### `WithFanOutRetries(n int) FanOutOption`
+
+Sets the retry count for sub-jobs.
+
+### `WithFanOutTimeout(d time.Duration) FanOutOption`
+
+Sets timeout for entire fan-out operation.
+
+### `CancelOnParentFailure() FanOutOption`
+
+Cancels remaining sub-jobs if parent fails.
+
+---
+
+## Pause/Resume
+
+### Job-Level Pause
+
+```go
+// Via queue (emits events, handles running jobs)
+queue.PauseJob(ctx, jobID)
+queue.PauseJob(ctx, jobID, jobs.WithPauseMode(jobs.PauseModeAggressive))
+queue.ResumeJob(ctx, jobID)
+paused, err := queue.IsJobPaused(ctx, jobID)
+pausedJobs, err := queue.GetPausedJobs(ctx, "emails")
+```
+
+### Queue-Level Pause
+
+```go
+// Via queue (emits events)
+queue.PauseQueue(ctx, "emails")
+queue.ResumeQueue(ctx, "emails")
+paused, err := queue.IsQueuePaused(ctx, "emails")
+queues, err := queue.GetPausedQueues(ctx)
+```
+
+### Standalone Functions
+
+For direct storage operations without a queue instance:
+
+```go
+jobs.PauseJob(ctx, storage, jobID)
+jobs.ResumeJob(ctx, storage, jobID)
+jobs.IsJobPaused(ctx, storage, jobID)
+jobs.GetPausedJobs(ctx, storage, "emails")
+jobs.PauseQueue(ctx, storage, "emails")
+jobs.ResumeQueue(ctx, storage, "emails")
+jobs.IsQueuePaused(ctx, storage, "emails")
+jobs.GetPausedQueues(ctx, storage)
+```
+
+### Pause Modes
+
+```go
+const (
+    PauseModeGraceful  // Let running jobs finish, stop picking new ones
+    PauseModeAggressive // Cancel running jobs immediately via context
+)
+```
+
 ---
 
 ## Job Options
@@ -120,41 +280,25 @@ queue.Register("workflow", func(ctx context.Context, input Input) error {
 
 Sets job priority. Higher values run first. Default is 0.
 
-```go
-queue.Enqueue(ctx, "task", args, jobs.Priority(100))
-```
-
 ### `Retries(n int) Option`
 
 Sets maximum retry attempts. Default is 3.
-
-```go
-queue.Enqueue(ctx, "task", args, jobs.Retries(5))
-```
 
 ### `Delay(d time.Duration) Option`
 
 Delays job execution by the specified duration.
 
-```go
-queue.Enqueue(ctx, "task", args, jobs.Delay(10 * time.Minute))
-```
-
 ### `At(t time.Time) Option`
 
 Schedules the job to run at a specific time.
-
-```go
-queue.Enqueue(ctx, "task", args, jobs.At(time.Now().Add(time.Hour)))
-```
 
 ### `QueueOpt(name string) Option`
 
 Assigns the job to a specific queue.
 
-```go
-queue.Enqueue(ctx, "task", args, jobs.QueueOpt("critical"))
-```
+### `Unique(key string) Option`
+
+Ensures only one job with this key exists.
 
 ---
 
@@ -164,13 +308,6 @@ queue.Enqueue(ctx, "task", args, jobs.QueueOpt("critical"))
 
 Configures the worker to process a specific queue.
 
-```go
-worker := queue.NewWorker(
-    jobs.WorkerQueue("default", jobs.Concurrency(10)),
-    jobs.WorkerQueue("critical", jobs.Concurrency(5)),
-)
-```
-
 ### `Concurrency(n int) WorkerOption`
 
 Sets the number of concurrent job processors. Default is 10.
@@ -179,9 +316,13 @@ Sets the number of concurrent job processors. Default is 10.
 
 Enables the scheduler for recurring jobs.
 
-```go
-worker := queue.NewWorker(jobs.WithScheduler(true))
-```
+### `WithPollInterval(d time.Duration) WorkerOption`
+
+Sets how often the worker polls for new jobs.
+
+### `WithStorageRetry(config RetryConfig) WorkerOption`
+
+Configures retry behavior for storage operations.
 
 ---
 
@@ -191,34 +332,53 @@ worker := queue.NewWorker(jobs.WithScheduler(true))
 
 Creates a schedule that runs at fixed intervals.
 
-```go
-jobs.Every(5 * time.Minute)
-```
-
 ### `Daily(hour, minute int) Schedule`
 
 Creates a schedule that runs daily at the specified time (UTC).
-
-```go
-jobs.Daily(9, 0)  // 9:00 AM UTC
-```
 
 ### `Weekly(day time.Weekday, hour, minute int) Schedule`
 
 Creates a schedule that runs weekly on the specified day and time (UTC).
 
-```go
-jobs.Weekly(time.Sunday, 2, 0)  // Sunday at 2:00 AM UTC
-```
-
 ### `Cron(expr string) Schedule`
 
 Creates a schedule from a cron expression.
 
+---
+
+## Events
+
+### `(*Queue) Events() <-chan Event`
+
+Returns a channel that receives job events. Caller must call `Unsubscribe` when done.
+
+### `(*Queue) Unsubscribe(ch <-chan Event)`
+
+Removes a subscriber channel. The channel is not closed; callers must stop reading before calling this.
+
+### `(*Queue) Emit(event Event)`
+
+Emits an event to all subscribers. Non-blocking; drops events if a subscriber's buffer is full.
+
+### `(*Queue) EmitCustomEvent(jobID, kind string, data map[string]any)`
+
+Emits a custom ephemeral event (not persisted).
+
+### Event Types
+
 ```go
-jobs.Cron("0 * * * *")     // Every hour
-jobs.Cron("0 9 * * 1-5")   // Weekdays at 9:00 AM
-jobs.Cron("0 0 1 * *")     // First day of month
+*JobStarted   // Job began processing
+*JobCompleted // Job finished successfully
+*JobFailed    // Job failed permanently
+*JobRetrying  // Job being retried
+*JobPaused    // Job was paused
+*JobResumed   // Job was resumed
+*QueuePaused  // Queue was paused
+*QueueResumed // Queue was resumed
+*WorkerPaused // Worker was paused
+*WorkerResumed // Worker was resumed
+*CheckpointSaved // Checkpoint was saved
+*CustomEvent  // Custom ephemeral event
 ```
 
 ---
@@ -237,59 +397,49 @@ Registers a callback for when a job completes successfully.
 
 Registers a callback for when a job fails permanently.
 
-### `(*Queue) OnRetry(fn func(context.Context, *Job, error))`
+### `(*Queue) OnRetry(fn func(context.Context, *Job, int, error))`
 
 Registers a callback for when a job is being retried.
 
 ---
 
-## Events
-
-### `(*Queue) Events() <-chan Event`
-
-Returns a channel that receives job events.
-
-```go
-events := queue.Events()
-go func() {
-    for event := range events {
-        switch e := event.(type) {
-        case *jobs.JobStarted:
-            log.Printf("Started: %s", e.Job.ID)
-        case *jobs.JobCompleted:
-            log.Printf("Completed: %s", e.Job.ID)
-        case *jobs.JobFailed:
-            log.Printf("Failed: %s - %v", e.Job.ID, e.Error)
-        case *jobs.JobRetrying:
-            log.Printf("Retrying: %s", e.Job.ID)
-        }
-    }
-}()
-```
-
----
-
-## Error Types
+## Error Handling
 
 ### `NoRetry(err error) error`
 
 Wraps an error to indicate the job should not be retried.
 
-```go
-if invalidInput {
-    return jobs.NoRetry(errors.New("invalid input"))
-}
-```
-
 ### `RetryAfter(d time.Duration, err error) error`
 
 Wraps an error to indicate the job should be retried after a specific duration.
 
+---
+
+## Embedded UI
+
+### `ui.Handler(storage core.Storage, opts ...Option) http.Handler`
+
+Creates an HTTP handler serving the dashboard and Connect-RPC API.
+
 ```go
-if rateLimited {
-    return jobs.RetryAfter(5 * time.Minute, errors.New("rate limited"))
-}
+import "github.com/jdziat/simple-durable-jobs/ui"
+
+mux.Handle("/jobs/", http.StripPrefix("/jobs", ui.Handler(storage,
+    ui.WithQueue(queue),
+    ui.WithContext(ctx),
+    ui.WithStatsRetention(7 * 24 * time.Hour),
+    ui.WithMiddleware(authMiddleware),
+)))
 ```
+
+### UI Options
+
+| Option | Description |
+|--------|-------------|
+| `WithQueue(q)` | Provides queue for event streaming and scheduled jobs view |
+| `WithContext(ctx)` | Lifecycle context for background goroutines; when cancelled, workers flush and exit |
+| `WithStatsRetention(d)` | How long stats rows are kept (default: 7 days) |
+| `WithMiddleware(mw)` | Wraps handler with middleware (auth, logging, etc.) |
 
 ---
 
@@ -319,58 +469,44 @@ type Job struct {
 ### `JobStatus`
 
 ```go
-type JobStatus string
-
 const (
     StatusPending   JobStatus = "pending"
     StatusRunning   JobStatus = "running"
     StatusCompleted JobStatus = "completed"
     StatusFailed    JobStatus = "failed"
     StatusRetrying  JobStatus = "retrying"
+    StatusWaiting   JobStatus = "waiting"    // Suspended waiting for sub-jobs
+    StatusCancelled JobStatus = "cancelled"  // Terminated before completion
+    StatusPaused    JobStatus = "paused"     // Paused by user
 )
 ```
 
-### `Checkpoint`
+### `PauseMode`
 
 ```go
-type Checkpoint struct {
-    ID        string
-    JobID     string
-    CallIndex int
-    CallType  string
-    Result    []byte  // JSON-encoded result
-    Error     string
-    CreatedAt time.Time
-}
+const (
+    PauseModeGraceful   // Let running jobs finish
+    PauseModeAggressive // Cancel running jobs immediately
+)
 ```
 
 ---
 
-## Storage Interface
-
-```go
-type Storage interface {
-    Migrate(ctx context.Context) error
-    Enqueue(ctx context.Context, job *Job) error
-    Dequeue(ctx context.Context, queues []string) (*Job, error)
-    Complete(ctx context.Context, jobID string) error
-    Fail(ctx context.Context, jobID string, errMsg string, runAt *time.Time) error
-    SaveCheckpoint(ctx context.Context, checkpoint *Checkpoint) error
-    GetCheckpoints(ctx context.Context, jobID string) ([]Checkpoint, error)
-    DeleteCheckpoints(ctx context.Context, jobID string) error
-    GetDueJobs(ctx context.Context, limit int) ([]Job, error)
-    Heartbeat(ctx context.Context, jobID string, workerID string) error
-    ReleaseStaleLocks(ctx context.Context, timeout time.Duration) (int64, error)
-    GetJob(ctx context.Context, jobID string) (*Job, error)
-    GetJobsByStatus(ctx context.Context, status JobStatus, limit int) ([]Job, error)
-}
-```
+## Storage
 
 ### `NewGormStorage(db *gorm.DB) *GormStorage`
 
 Creates a new GORM-based storage implementation.
 
+### `NewGormStorageWithPool(db *gorm.DB, opts ...PoolOption) *GormStorage`
+
+Creates storage with connection pool configuration.
+
+### Pool Presets
+
 ```go
-db, _ := gorm.Open(sqlite.Open("jobs.db"), &gorm.Config{})
-storage := jobs.NewGormStorage(db)
+jobs.DefaultPoolConfig()              // Sensible defaults
+jobs.HighConcurrencyPoolConfig()      // High-concurrency workloads
+jobs.LowLatencyPoolConfig()          // Low-latency optimized
+jobs.ResourceConstrainedPoolConfig() // Limited resources
 ```
