@@ -23,7 +23,7 @@ func setupFacadeTestQueue(t *testing.T) (*jobs.Queue, jobs.Storage) {
 	facadeTestCounter++
 	dbPath := fmt.Sprintf("/tmp/jobs_facade_test_%d_%d.db", os.Getpid(), facadeTestCounter)
 	t.Cleanup(func() {
-		os.Remove(dbPath)
+		_ = os.Remove(dbPath)
 	})
 
 	db, err := gorm.Open(sqlite.Open(dbPath), &gorm.Config{
@@ -94,7 +94,7 @@ func TestFacade_WorkerProcessesJob(t *testing.T) {
 
 	// Create worker via queue.NewWorker() which uses the factory
 	worker := q.NewWorker()
-	go worker.Start(ctx)
+	go func() { _ = worker.Start(ctx) }()
 
 	// Wait for processing
 	for i := 0; i < 50; i++ {
@@ -116,7 +116,7 @@ func TestFacade_TypeAliases(t *testing.T) {
 	var checkpoint *jobs.Checkpoint
 	assert.Nil(t, checkpoint)
 
-	var status jobs.JobStatus = jobs.StatusPending
+	status := jobs.StatusPending
 	assert.Equal(t, jobs.StatusPending, status)
 
 	// Verify constants are accessible

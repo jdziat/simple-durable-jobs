@@ -24,7 +24,7 @@ func TestStress_ThousandJobs(t *testing.T) {
 
 	dbPath := fmt.Sprintf("/tmp/jobs_stress_test_%d.db", os.Getpid())
 	t.Cleanup(func() {
-		os.Remove(dbPath)
+		_ = os.Remove(dbPath)
 	})
 
 	// Use WAL mode for better concurrent performance
@@ -77,7 +77,7 @@ func TestStress_ThousandJobs(t *testing.T) {
 
 	for i := 0; i < numWorkers; i++ {
 		worker := queue.NewWorker(jobs.WorkerQueue("default", jobs.Concurrency(concurrencyPerWorker)))
-		go worker.Start(workerCtx)
+		go func() { _ = worker.Start(workerCtx) }()
 	}
 
 	// Wait for all jobs to complete
@@ -132,7 +132,7 @@ func TestStress_WorkflowsWithCheckpoints(t *testing.T) {
 
 	dbPath := fmt.Sprintf("/tmp/jobs_stress_workflow_%d.db", os.Getpid())
 	t.Cleanup(func() {
-		os.Remove(dbPath)
+		_ = os.Remove(dbPath)
 	})
 
 	db, err := gorm.Open(sqlite.Open(dbPath+"?_journal_mode=WAL&_busy_timeout=5000"), &gorm.Config{
@@ -213,7 +213,7 @@ func TestStress_WorkflowsWithCheckpoints(t *testing.T) {
 
 	for i := 0; i < numWorkers; i++ {
 		worker := queue.NewWorker(jobs.WorkerQueue("default", jobs.Concurrency(3)))
-		go worker.Start(workerCtx)
+		go func() { _ = worker.Start(workerCtx) }()
 	}
 
 	// Wait for completion
@@ -264,7 +264,7 @@ func TestStress_MixedPriorities(t *testing.T) {
 
 	dbPath := fmt.Sprintf("/tmp/jobs_stress_priorities_%d.db", os.Getpid())
 	t.Cleanup(func() {
-		os.Remove(dbPath)
+		_ = os.Remove(dbPath)
 	})
 
 	db, err := gorm.Open(sqlite.Open(dbPath+"?_journal_mode=WAL&_busy_timeout=5000"), &gorm.Config{
@@ -322,7 +322,7 @@ func TestStress_MixedPriorities(t *testing.T) {
 	defer cancel()
 
 	worker := queue.NewWorker(jobs.WorkerQueue("default", jobs.Concurrency(1)))
-	go worker.Start(workerCtx)
+	go func() { _ = worker.Start(workerCtx) }()
 
 	// Wait for completion
 	for orderIndex.Load() < numJobs {

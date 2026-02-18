@@ -56,15 +56,16 @@ func NewHandler(fn any) (*Handler, error) {
 
 	// Validate return type - allow error or (T, error)
 	numOut := fnType.NumOut()
-	if numOut == 1 {
+	switch numOut {
+	case 1:
 		if !fnType.Out(0).Implements(reflect.TypeOf((*error)(nil)).Elem()) {
 			return nil, fmt.Errorf("handler must return error")
 		}
-	} else if numOut == 2 {
+	case 2:
 		if !fnType.Out(1).Implements(reflect.TypeOf((*error)(nil)).Elem()) {
 			return nil, fmt.Errorf("handler must return (T, error)")
 		}
-	} else {
+	default:
 		return nil, fmt.Errorf("handler must return error or (T, error)")
 	}
 
@@ -96,11 +97,12 @@ func (h *Handler) Execute(ctx context.Context, argsJSON []byte) error {
 
 	// Handle return values
 	numOut := h.Fn.Type().NumOut()
-	if numOut == 1 {
+	switch numOut {
+	case 1:
 		if !results[0].IsNil() {
 			return results[0].Interface().(error)
 		}
-	} else if numOut == 2 {
+	case 2:
 		if !results[1].IsNil() {
 			return results[1].Interface().(error)
 		}
@@ -160,7 +162,9 @@ func ExecuteCall[T any](ctx context.Context, h *Handler, args any) (T, error) {
 			}
 			resultBytes, _ := json.Marshal(results[0].Interface())
 			var result T
-			json.Unmarshal(resultBytes, &result)
+			if err := json.Unmarshal(resultBytes, &result); err != nil {
+				return zero, err
+			}
 			return result, nil
 		}
 	}

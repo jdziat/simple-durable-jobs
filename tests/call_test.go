@@ -24,7 +24,7 @@ func setupCallTestQueue(t *testing.T) (*jobs.Queue, jobs.Storage) {
 	callTestCounter++
 	dbPath := fmt.Sprintf("/tmp/jobs_call_test_%d_%d.db", os.Getpid(), callTestCounter)
 	t.Cleanup(func() {
-		os.Remove(dbPath)
+		_ = os.Remove(dbPath)
 	})
 
 	db, err := gorm.Open(sqlite.Open(dbPath), &gorm.Config{
@@ -66,7 +66,7 @@ func TestCall_ExecutesNestedJob(t *testing.T) {
 	require.NoError(t, err)
 
 	worker := queue.NewWorker()
-	go worker.Start(ctx)
+	go func() { _ = worker.Start(ctx) }()
 
 	// Wait for completion
 	var job *jobs.Job
@@ -125,7 +125,7 @@ func TestCall_ReturnsCheckpointedResult(t *testing.T) {
 	defer cancel()
 
 	worker := queue.NewWorker()
-	go worker.Start(ctx)
+	go func() { _ = worker.Start(ctx) }()
 
 	time.Sleep(500 * time.Millisecond)
 
@@ -154,7 +154,7 @@ func TestCall_PropagatesError(t *testing.T) {
 	require.NoError(t, err)
 
 	worker := queue.NewWorker()
-	go worker.Start(ctx)
+	go func() { _ = worker.Start(ctx) }()
 
 	// Wait for failure
 	for i := 0; i < 50; i++ {
@@ -186,7 +186,7 @@ func TestCall_UnknownHandler(t *testing.T) {
 	require.NoError(t, err)
 
 	worker := queue.NewWorker()
-	go worker.Start(ctx)
+	go func() { _ = worker.Start(ctx) }()
 
 	// Wait for failure
 	for i := 0; i < 50; i++ {
@@ -235,7 +235,7 @@ func TestCall_MultipleNestedCalls(t *testing.T) {
 	require.NoError(t, err)
 
 	worker := queue.NewWorker()
-	go worker.Start(ctx)
+	go func() { _ = worker.Start(ctx) }()
 
 	// Wait for completion
 	for i := 0; i < 50; i++ {
@@ -287,7 +287,7 @@ func TestCall_WithComplexTypes(t *testing.T) {
 	require.NoError(t, err)
 
 	worker := queue.NewWorker()
-	go worker.Start(ctx)
+	go func() { _ = worker.Start(ctx) }()
 
 	// Wait for completion
 	for i := 0; i < 50; i++ {
@@ -323,7 +323,7 @@ func TestCall_VoidReturn(t *testing.T) {
 	require.NoError(t, err)
 
 	worker := queue.NewWorker()
-	go worker.Start(ctx)
+	go func() { _ = worker.Start(ctx) }()
 
 	// Wait for completion
 	for i := 0; i < 50; i++ {
@@ -384,7 +384,7 @@ func TestCall_NestedCallsInSequence(t *testing.T) {
 	require.NoError(t, err)
 
 	worker := queue.NewWorker()
-	go worker.Start(ctx)
+	go func() { _ = worker.Start(ctx) }()
 
 	// Wait for completion
 	for i := 0; i < 50; i++ {
@@ -443,7 +443,7 @@ func TestCall_CheckpointedErrorReturned(t *testing.T) {
 	defer cancel()
 
 	worker := queue.NewWorker()
-	go worker.Start(ctx)
+	go func() { _ = worker.Start(ctx) }()
 
 	// Wait for failure
 	for i := 0; i < 50; i++ {
@@ -544,7 +544,7 @@ func TestCall_ResumesAfterWorkerKilled(t *testing.T) {
 	// Start first worker
 	ctx1, cancel1 := context.WithCancel(context.Background())
 	worker1 := queue.NewWorker()
-	go worker1.Start(ctx1)
+	go func() { _ = worker1.Start(ctx1) }()
 
 	// Wait for step2 to start, then kill the worker
 	select {
@@ -584,7 +584,7 @@ func TestCall_ResumesAfterWorkerKilled(t *testing.T) {
 	defer cancel2()
 
 	worker2 := queue.NewWorker()
-	go worker2.Start(ctx2)
+	go func() { _ = worker2.Start(ctx2) }()
 
 	// Wait for job to complete
 	for i := 0; i < 100; i++ {
@@ -664,7 +664,7 @@ func TestCall_MultipleResumesPreservesCheckpoints(t *testing.T) {
 
 		ctx, cancel := context.WithCancel(context.Background())
 		worker := queue.NewWorker()
-		go worker.Start(ctx)
+		go func() { _ = worker.Start(ctx) }()
 
 		// Wait for target step to start
 		for {
@@ -674,7 +674,7 @@ func TestCall_MultipleResumesPreservesCheckpoints(t *testing.T) {
 					cancel()
 					time.Sleep(100 * time.Millisecond) // Let worker shut down
 					// Release locks so job can be picked up again (negative duration = force release)
-					store.ReleaseStaleLocks(context.Background(), -time.Hour)
+					_, _ = store.ReleaseStaleLocks(context.Background(), -time.Hour)
 					return
 				}
 			case <-time.After(5 * time.Second):
@@ -705,7 +705,7 @@ func TestCall_MultipleResumesPreservesCheckpoints(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	worker := queue.NewWorker()
-	go worker.Start(ctx)
+	go func() { _ = worker.Start(ctx) }()
 
 	// Wait for completion
 	for i := 0; i < 100; i++ {

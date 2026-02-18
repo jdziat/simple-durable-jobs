@@ -94,8 +94,8 @@ func TestCron_InvalidExpression_Panics(t *testing.T) {
 
 func TestScheduleInterface(t *testing.T) {
 	// All schedule types implement Schedule interface
-	var _ Schedule = Every(time.Minute)
-	var _ Schedule = Daily(9, 0)
-	var _ Schedule = Weekly(time.Monday, 9, 0)
-	var _ Schedule = Cron("* * * * *")
+	var _ Schedule = Every(time.Minute)   //nolint:staticcheck // interface conformance check
+	var _ Schedule = Daily(9, 0)          //nolint:staticcheck // interface conformance check
+	var _ Schedule = Weekly(time.Monday, 9, 0) //nolint:staticcheck // interface conformance check
+	var _ Schedule = Cron("* * * * *")   //nolint:staticcheck // interface conformance check
 }

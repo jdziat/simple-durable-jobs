@@ -27,7 +27,7 @@ func NewGormStorage(db *gorm.DB) *GormStorage {
 	// Detect SQLite by checking the dialect name
 	isSQLite := false
 	if db != nil {
-		dialector := db.Dialector.Name()
+		dialector := db.Name()
 		isSQLite = strings.Contains(strings.ToLower(dialector), "sqlite")
 	}
 	return &GormStorage{db: db, isSQLite: isSQLite}

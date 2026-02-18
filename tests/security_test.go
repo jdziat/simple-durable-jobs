@@ -21,7 +21,7 @@ func setupSecurityTestQueue(t *testing.T) (*jobs.Queue, jobs.Storage) {
 	securityTestCounter++
 	dbPath := fmt.Sprintf("/tmp/jobs_security_test_%d_%d.db", os.Getpid(), securityTestCounter)
 	t.Cleanup(func() {
-		os.Remove(dbPath)
+		_ = os.Remove(dbPath)
 	})
 
 	db, err := gorm.Open(sqlite.Open(dbPath), &gorm.Config{

@@ -23,7 +23,7 @@ func setupTestQueue(t *testing.T) (*jobs.Queue, *gorm.DB) {
 	queueTestCounter++
 	dbPath := fmt.Sprintf("/tmp/jobs_queue_test_%d_%d.db", os.Getpid(), queueTestCounter)
 	t.Cleanup(func() {
-		os.Remove(dbPath)
+		_ = os.Remove(dbPath)
 	})
 
 	db, err := gorm.Open(sqlite.Open(dbPath), &gorm.Config{
@@ -274,7 +274,7 @@ func TestQueue_Schedule(t *testing.T) {
 	workerCtx, cancel := context.WithTimeout(ctx, 1*time.Second)
 	defer cancel()
 
-	go worker.Start(workerCtx)
+	go func() { _ = worker.Start(workerCtx) }()
 
 	time.Sleep(800 * time.Millisecond)
 
@@ -302,7 +302,7 @@ func TestQueue_Schedule_WithOptions(t *testing.T) {
 	workerCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
 	defer cancel()
 
-	go worker.Start(workerCtx)
+	go func() { _ = worker.Start(workerCtx) }()
 
 	time.Sleep(300 * time.Millisecond)
 
