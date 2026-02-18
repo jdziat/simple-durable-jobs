@@ -85,7 +85,7 @@ func main() {
 
 	go func() {
 		fmt.Printf("[%s] Starting worker...\n", *workerID)
-		worker.Start(workerCtx)
+		_ = worker.Start(workerCtx)
 	}()
 
 	// Handle shutdown

@@ -14,7 +14,7 @@ func TestPauseJob_Standalone(t *testing.T) {
 	ctx := context.Background()
 
 	job := &jobs.Job{Type: "test", Queue: "default"}
-	store.Enqueue(ctx, job)
+	_ = store.Enqueue(ctx, job)
 
 	err := jobs.PauseJob(ctx, store, job.ID)
 	require.NoError(t, err)
@@ -29,8 +29,8 @@ func TestResumeJob_Standalone(t *testing.T) {
 	ctx := context.Background()
 
 	job := &jobs.Job{Type: "test", Queue: "default"}
-	store.Enqueue(ctx, job)
-	jobs.PauseJob(ctx, store, job.ID)
+	_ = store.Enqueue(ctx, job)
+	_ = jobs.PauseJob(ctx, store, job.ID)
 
 	err := jobs.ResumeJob(ctx, store, job.ID)
 	require.NoError(t, err)
@@ -56,7 +56,7 @@ func TestResumeQueue_Standalone(t *testing.T) {
 	store := setupStorageTest(t)
 	ctx := context.Background()
 
-	jobs.PauseQueue(ctx, store, "emails")
+	_ = jobs.PauseQueue(ctx, store, "emails")
 
 	err := jobs.ResumeQueue(ctx, store, "emails")
 	require.NoError(t, err)
@@ -71,8 +71,8 @@ func TestGetPausedJobs_Standalone(t *testing.T) {
 	ctx := context.Background()
 
 	job := &jobs.Job{Type: "test", Queue: "default"}
-	store.Enqueue(ctx, job)
-	jobs.PauseJob(ctx, store, job.ID)
+	_ = store.Enqueue(ctx, job)
+	_ = jobs.PauseJob(ctx, store, job.ID)
 
 	paused, err := jobs.GetPausedJobs(ctx, store, "default")
 	require.NoError(t, err)
@@ -83,8 +83,8 @@ func TestGetPausedQueues_Standalone(t *testing.T) {
 	store := setupStorageTest(t)
 	ctx := context.Background()
 
-	jobs.PauseQueue(ctx, store, "emails")
-	jobs.PauseQueue(ctx, store, "notifications")
+	_ = jobs.PauseQueue(ctx, store, "emails")
+	_ = jobs.PauseQueue(ctx, store, "notifications")
 
 	queues, err := jobs.GetPausedQueues(ctx, store)
 	require.NoError(t, err)

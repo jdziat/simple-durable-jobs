@@ -19,6 +19,8 @@ A Go library for durable job queues with checkpointed workflows, inspired by [Ri
 - **Retries with Backoff** - Configurable retry logic with exponential backoff
 - **Observability** - Hooks, event streams, and an embedded web dashboard
 - **Embedded Web UI** - Real-time monitoring dashboard with stats and event streaming
+- **Stale Lock Reaper** - Automatically reclaims stuck running jobs after worker crashes
+- **Connection Pool Presets** - Pre-built pool configurations for different workloads
 - **Simple API** - Minimal boilerplate, type-safe handlers
 
 ## Installation
@@ -377,9 +379,11 @@ All public types and functions are re-exported through the facade for a clean AP
 
 ## Documentation
 
-- [Getting Started](https://jdziat.github.io/simple-durable-jobs/getting-started/)
-- [API Reference](https://jdziat.github.io/simple-durable-jobs/api-reference/)
-- [Examples](./examples/)
+- [Getting Started](https://jdziat.github.io/simple-durable-jobs/docs/getting-started/)
+- [API Reference](https://jdziat.github.io/simple-durable-jobs/docs/api-reference/)
+- [Examples](https://jdziat.github.io/simple-durable-jobs/docs/examples/)
+- [Embedded Web UI](https://jdziat.github.io/simple-durable-jobs/docs/embedded-ui/)
+- [Advanced Topics](https://jdziat.github.io/simple-durable-jobs/docs/advanced/) - Stale lock reaper, pool configuration, storage retry
 
 ## Examples
 

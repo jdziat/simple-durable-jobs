@@ -464,10 +464,9 @@ func (w *Worker) handleSubJobCompletion(ctx context.Context, job *core.Job, succ
 	}
 
 	var fo *core.FanOut
-	var err error
 
 	// Retry the increment to prevent lost counts (which cause stuck parents).
-	err = retryWithBackoff(ctx, *w.config.StorageRetry, func() error {
+	err := retryWithBackoff(ctx, *w.config.StorageRetry, func() error {
 		var incrementErr error
 		if succeeded {
 			fo, incrementErr = w.queue.Storage().IncrementFanOutCompleted(ctx, *job.FanOutID)

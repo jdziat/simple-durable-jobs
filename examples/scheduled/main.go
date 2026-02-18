@@ -94,7 +94,7 @@ func main() {
 
 	go func() {
 		fmt.Println("\nStarting worker with scheduler...")
-		worker.Start(ctx)
+		_ = worker.Start(ctx)
 	}()
 
 	// Wait for interrupt

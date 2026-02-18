@@ -1,6 +1,6 @@
 ---
-layout: default
-title: API Reference
+title: "API Reference"
+weight: 2
 ---
 
 # API Reference
@@ -79,9 +79,9 @@ Returns the underlying storage implementation.
 
 ## Worker
 
-### `(*Worker) Start(ctx context.Context)`
+### `(*Worker) Start(ctx context.Context) error`
 
-Starts the worker. Blocks until the context is cancelled.
+Starts the worker. Blocks until the context is cancelled. Returns the context error after shutdown.
 
 ```go
 ctx, cancel := context.WithCancel(context.Background())
@@ -107,23 +107,47 @@ Resumes a paused worker.
 
 Returns whether the worker is currently paused.
 
-### `(*Worker) WaitForPause(timeout time.Duration) bool`
+### `(*Worker) PauseMode() PauseMode`
 
-Blocks until all running jobs complete (after a graceful pause) or the timeout expires. Returns true if all jobs completed.
+Returns the current pause mode (graceful or aggressive).
+
+### `(*Worker) WaitForPause(timeout time.Duration) error`
+
+Blocks until all running jobs complete (after a graceful pause) or the timeout expires. Returns nil if all jobs completed, or an error if the timeout was reached or the worker is not paused.
 
 ### `(*Worker) RunningJobCount() int`
 
 Returns the number of currently executing jobs.
 
-### `(*Worker) CancelJob(jobID string)`
+### `(*Worker) CancelJob(jobID string) bool`
 
-Cancels a specific running job's context.
+Cancels a specific running job's context. Returns true if the job was found and cancelled, false if the job was not running on this worker.
+
+---
+
+## Context Helpers
+
+### `JobFromContext(ctx context.Context) *Job`
+
+Returns the current Job from context, or nil if not in a job handler. Use this to get the job ID for logging or progress tracking.
+
+```go
+queue.Register("my-job", func(ctx context.Context, args MyArgs) error {
+    job := jobs.JobFromContext(ctx)
+    log.Printf("Processing job %s", job.ID)
+    return nil
+})
+```
+
+### `JobIDFromContext(ctx context.Context) string`
+
+Returns the current job ID from context, or empty string if not in a job handler.
 
 ---
 
 ## Durable Calls
 
-### `Call[T any](ctx context.Context, name string, args any, opts ...Option) (T, error)`
+### `Call[T any](ctx context.Context, name string, args any) (T, error)`
 
 Executes a nested job call with checkpointing. Must be called from within a job handler.
 
@@ -145,9 +169,9 @@ queue.Register("workflow", func(ctx context.Context, input Input) error {
 
 Manually saves a checkpoint for a named phase within a job handler.
 
-### `LoadPhaseCheckpoint[T any](ctx context.Context, phaseName string) (T, bool, error)`
+### `LoadPhaseCheckpoint[T any](ctx context.Context, phaseName string) (T, bool)`
 
-Retrieves a previously saved phase checkpoint.
+Retrieves a previously saved phase checkpoint. Returns the result and true if found, or the zero value and false if not found.
 
 ---
 
@@ -324,6 +348,92 @@ Sets how often the worker polls for new jobs.
 
 Configures retry behavior for storage operations.
 
+### `WithDequeueRetry(config RetryConfig) WorkerOption`
+
+Configures retry behavior specifically for dequeue operations. When the database is temporarily unavailable, this prevents tight-loop polling.
+
+### `WithRetryAttempts(attempts int) WorkerOption`
+
+Sets the max retry attempts for storage operations. Convenience wrapper; use `WithStorageRetry` for full control.
+
+### `DisableRetry() WorkerOption`
+
+Disables retry for both storage and dequeue operations.
+
+### `WithStaleLockInterval(d time.Duration) WorkerOption`
+
+Sets how often the worker checks for stale running jobs. Default is 5 minutes. Set to 0 to disable.
+
+### `WithStaleLockAge(d time.Duration) WorkerOption`
+
+Sets how long a lock must be expired before the job is reclaimed. Default is 45 minutes.
+
+---
+
+## Types
+
+### `RetryConfig`
+
+```go
+type RetryConfig struct {
+    MaxAttempts       int           // Default: 5
+    InitialBackoff    time.Duration // Default: 100ms
+    MaxBackoff        time.Duration // Default: 5s
+    BackoffMultiplier float64       // Default: 2.0
+    JitterFraction    float64       // Default: 0.1 (10%)
+}
+```
+
+### `DefaultRetryConfig() RetryConfig`
+
+Returns the default retry configuration.
+
+### `Job`
+
+```go
+type Job struct {
+    ID              string
+    Type            string
+    Args            []byte      // JSON-encoded arguments
+    Queue           string
+    Priority        int
+    Status          JobStatus
+    Attempt         int
+    MaxRetries      int
+    LastError       string
+    RunAt           *time.Time
+    StartedAt       *time.Time
+    CompletedAt     *time.Time
+    CreatedAt       time.Time
+    UpdatedAt       time.Time
+    LastHeartbeatAt *time.Time  // Updated by worker heartbeats
+}
+```
+
+### `JobStatus`
+
+```go
+const (
+    StatusPending   JobStatus = "pending"
+    StatusRunning   JobStatus = "running"
+    StatusCompleted JobStatus = "completed"
+    StatusFailed    JobStatus = "failed"
+    StatusRetrying  JobStatus = "retrying"
+    StatusWaiting   JobStatus = "waiting"    // Suspended waiting for sub-jobs
+    StatusCancelled JobStatus = "cancelled"  // Terminated before completion
+    StatusPaused    JobStatus = "paused"     // Paused by user
+)
+```
+
+### `PauseMode`
+
+```go
+const (
+    PauseModeGraceful   // Let running jobs finish
+    PauseModeAggressive // Cancel running jobs immediately
+)
+```
+
 ---
 
 ## Schedules
@@ -443,62 +553,13 @@ mux.Handle("/jobs/", http.StripPrefix("/jobs", ui.Handler(storage,
 
 ---
 
-## Types
-
-### `Job`
-
-```go
-type Job struct {
-    ID          string
-    Type        string
-    Args        []byte      // JSON-encoded arguments
-    Queue       string
-    Priority    int
-    Status      JobStatus
-    Attempt     int
-    MaxRetries  int
-    LastError   string
-    RunAt       *time.Time
-    StartedAt   *time.Time
-    CompletedAt *time.Time
-    CreatedAt   time.Time
-    UpdatedAt   time.Time
-}
-```
-
-### `JobStatus`
-
-```go
-const (
-    StatusPending   JobStatus = "pending"
-    StatusRunning   JobStatus = "running"
-    StatusCompleted JobStatus = "completed"
-    StatusFailed    JobStatus = "failed"
-    StatusRetrying  JobStatus = "retrying"
-    StatusWaiting   JobStatus = "waiting"    // Suspended waiting for sub-jobs
-    StatusCancelled JobStatus = "cancelled"  // Terminated before completion
-    StatusPaused    JobStatus = "paused"     // Paused by user
-)
-```
-
-### `PauseMode`
-
-```go
-const (
-    PauseModeGraceful   // Let running jobs finish
-    PauseModeAggressive // Cancel running jobs immediately
-)
-```
-
----
-
 ## Storage
 
 ### `NewGormStorage(db *gorm.DB) *GormStorage`
 
 Creates a new GORM-based storage implementation.
 
-### `NewGormStorageWithPool(db *gorm.DB, opts ...PoolOption) *GormStorage`
+### `NewGormStorageWithPool(db *gorm.DB, opts ...PoolOption) (*GormStorage, error)`
 
 Creates storage with connection pool configuration.
 
@@ -510,3 +571,32 @@ jobs.HighConcurrencyPoolConfig()      // High-concurrency workloads
 jobs.LowLatencyPoolConfig()          // Low-latency optimized
 jobs.ResourceConstrainedPoolConfig() // Limited resources
 ```
+
+| Preset | MaxOpen | MaxIdle | MaxLifetime | MaxIdleTime |
+|--------|---------|---------|-------------|-------------|
+| `DefaultPoolConfig()` | 25 | 10 | 5min | 1min |
+| `HighConcurrencyPoolConfig()` | 100 | 25 | 10min | 2min |
+| `LowLatencyPoolConfig()` | 50 | 40 | 15min | 5min |
+| `ResourceConstrainedPoolConfig()` | 10 | 5 | 3min | 30s |
+
+### Pool Option Functions
+
+### `MaxOpenConns(n int) PoolOption`
+
+Sets the maximum number of open connections.
+
+### `MaxIdleConns(n int) PoolOption`
+
+Sets the maximum number of idle connections.
+
+### `ConnMaxLifetime(d time.Duration) PoolOption`
+
+Sets the maximum connection lifetime.
+
+### `ConnMaxIdleTime(d time.Duration) PoolOption`
+
+Sets the maximum idle time for connections.
+
+### `ConfigurePool(db *gorm.DB, opts ...PoolOption) error`
+
+Applies pool configuration to a GORM database connection.

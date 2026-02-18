@@ -38,7 +38,7 @@ func TestPauseIntegration_JobLevelPause(t *testing.T) {
 	workerCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
 	defer cancel()
 
-	go w.Start(workerCtx)
+	go func() { _ = w.Start(workerCtx) }()
 	<-workerCtx.Done()
 
 	// Only job2 should be processed (job1 is paused)
@@ -57,7 +57,7 @@ func TestPauseIntegration_JobLevelPause(t *testing.T) {
 	workerCtx2, cancel2 := context.WithTimeout(ctx, 500*time.Millisecond)
 	defer cancel2()
 	w2 := jobs.NewWorker(q)
-	go w2.Start(workerCtx2)
+	go func() { _ = w2.Start(workerCtx2) }()
 	<-workerCtx2.Done()
 
 	// Now both should be processed
@@ -95,7 +95,7 @@ func TestPauseIntegration_QueueLevelPause(t *testing.T) {
 	workerCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
 	defer cancel()
 
-	go w.Start(workerCtx)
+	go func() { _ = w.Start(workerCtx) }()
 	<-workerCtx.Done()
 
 	// Only other queue should be processed
@@ -127,7 +127,7 @@ func TestPauseIntegration_WorkerGracefulPause(t *testing.T) {
 	workerCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	go w.Start(workerCtx)
+	go func() { _ = w.Start(workerCtx) }()
 
 	// Wait for job to start
 	select {
@@ -173,7 +173,7 @@ func TestPauseIntegration_WorkerAggressivePause(t *testing.T) {
 	workerCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	go w.Start(workerCtx)
+	go func() { _ = w.Start(workerCtx) }()
 
 	// Wait for job to start
 	select {
@@ -224,7 +224,7 @@ func TestPauseIntegration_WorkerResumeAfterPause(t *testing.T) {
 	// Start paused
 	w.Pause(jobs.PauseModeGraceful)
 
-	go w.Start(workerCtx)
+	go func() { _ = w.Start(workerCtx) }()
 
 	// Wait a bit - no jobs should be processed
 	time.Sleep(200 * time.Millisecond)
@@ -268,7 +268,7 @@ func TestPauseIntegration_QueueResume(t *testing.T) {
 	workerCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	go w.Start(workerCtx)
+	go func() { _ = w.Start(workerCtx) }()
 
 	// Wait a bit - no jobs should be processed (queue is paused)
 	time.Sleep(300 * time.Millisecond)
@@ -318,7 +318,7 @@ func TestPauseIntegration_MixedPauseStates(t *testing.T) {
 	workerCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
 	defer cancel()
 
-	go w.Start(workerCtx)
+	go func() { _ = w.Start(workerCtx) }()
 	<-workerCtx.Done()
 
 	// Only queue-b should be processed
@@ -348,7 +348,7 @@ func TestPauseIntegration_PauseWorkerStopsNewJobs(t *testing.T) {
 	workerCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	go w.Start(workerCtx)
+	go func() { _ = w.Start(workerCtx) }()
 
 	// Give worker time to start
 	time.Sleep(100 * time.Millisecond)

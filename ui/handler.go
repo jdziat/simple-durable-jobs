@@ -65,7 +65,7 @@ func Handler(storage core.Storage, opts ...Option) http.Handler {
 		mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 			if r.URL.Path == "/" || r.URL.Path == "/index.html" {
 				w.Header().Set("Content-Type", "text/html")
-				w.Write([]byte(placeholderHTML))
+				_, _ = w.Write([]byte(placeholderHTML))
 				return
 			}
 			http.NotFound(w, r)

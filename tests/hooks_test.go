@@ -23,7 +23,7 @@ func setupHooksTestQueue(t *testing.T) (*jobs.Queue, jobs.Storage) {
 	hooksTestCounter++
 	dbPath := fmt.Sprintf("/tmp/jobs_hooks_test_%d_%d.db", os.Getpid(), hooksTestCounter)
 	t.Cleanup(func() {
-		os.Remove(dbPath)
+		_ = os.Remove(dbPath)
 	})
 
 	db, err := gorm.Open(sqlite.Open(dbPath), &gorm.Config{
@@ -58,7 +58,7 @@ func TestHooks_OnJobStart(t *testing.T) {
 	require.NoError(t, err)
 
 	worker := queue.NewWorker()
-	go worker.Start(ctx)
+	go func() { _ = worker.Start(ctx) }()
 
 	time.Sleep(300 * time.Millisecond)
 
@@ -84,7 +84,7 @@ func TestHooks_OnJobComplete(t *testing.T) {
 	require.NoError(t, err)
 
 	worker := queue.NewWorker()
-	go worker.Start(ctx)
+	go func() { _ = worker.Start(ctx) }()
 
 	time.Sleep(300 * time.Millisecond)
 
@@ -110,7 +110,7 @@ func TestHooks_OnJobFail(t *testing.T) {
 	require.NoError(t, err)
 
 	worker := queue.NewWorker()
-	go worker.Start(ctx)
+	go func() { _ = worker.Start(ctx) }()
 
 	time.Sleep(300 * time.Millisecond)
 
@@ -140,7 +140,7 @@ func TestHooks_OnRetry(t *testing.T) {
 	require.NoError(t, err)
 
 	worker := queue.NewWorker()
-	go worker.Start(ctx)
+	go func() { _ = worker.Start(ctx) }()
 
 	// Wait for retry
 	for i := 0; i < 50; i++ {
@@ -183,7 +183,7 @@ func TestHooks_MultipleHooks(t *testing.T) {
 	require.NoError(t, err)
 
 	worker := queue.NewWorker()
-	go worker.Start(ctx)
+	go func() { _ = worker.Start(ctx) }()
 
 	time.Sleep(300 * time.Millisecond)
 
@@ -215,7 +215,7 @@ func TestHooks_JobDataInHook(t *testing.T) {
 	require.NoError(t, err)
 
 	worker := queue.NewWorker(jobs.WorkerQueue("special", jobs.Concurrency(1)))
-	go worker.Start(ctx)
+	go func() { _ = worker.Start(ctx) }()
 
 	// Poll for hook to be called
 	var cap *captured

@@ -1,6 +1,6 @@
 ---
-layout: default
-title: Simple Durable Jobs
+title: "Simple Durable Jobs"
+type: docs
 ---
 
 # Simple Durable Jobs
@@ -31,6 +31,9 @@ Building reliable background job processing is hard. Jobs fail, servers crash, a
 | Observability | Hooks, event streams, and custom events |
 | Web UI | Embeddable real-time monitoring dashboard |
 | Unique Jobs | Deduplicate jobs by key |
+| Stale Lock Reaper | Automatically reclaims stuck running jobs whose locks have expired |
+| Connection Pool Presets | Pre-built pool configurations for different workloads |
+| Per-Queue Concurrency | Independent concurrency limits per queue |
 
 ## Installation
 
@@ -76,9 +79,11 @@ func main() {
 
 ## Documentation
 
-- [Getting Started](./getting-started/) - Installation and basic usage
-- [API Reference](./api-reference/) - Complete API documentation
-- [Examples](./examples/) - Code examples for common use cases
+- [Getting Started](./docs/getting-started/) - Installation and basic usage
+- [API Reference](./docs/api-reference/) - Complete API documentation
+- [Examples](./docs/examples/) - Code examples for common use cases
+- [Embedded Web UI](./docs/embedded-ui/) - Dashboard setup and configuration
+- [Advanced Topics](./docs/advanced/) - Stale lock reaper, pool configuration, storage retry
 
 ## Links
 

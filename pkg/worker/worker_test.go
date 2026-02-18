@@ -150,7 +150,7 @@ func TestWorker_Pause(t *testing.T) {
 		Logger: logger.Default.LogMode(logger.Silent),
 	})
 	store := storage.NewGormStorage(db)
-	store.Migrate(context.Background())
+	_ = store.Migrate(context.Background())
 	q := queue.New(store)
 
 	w := NewWorker(q)
@@ -172,7 +172,7 @@ func TestWorker_PauseMode(t *testing.T) {
 		Logger: logger.Default.LogMode(logger.Silent),
 	})
 	store := storage.NewGormStorage(db)
-	store.Migrate(context.Background())
+	_ = store.Migrate(context.Background())
 	q := queue.New(store)
 
 	w := NewWorker(q)
@@ -191,7 +191,7 @@ func TestWorker_PausedDoesNotDequeue(t *testing.T) {
 		Logger: logger.Default.LogMode(logger.Silent),
 	})
 	store := storage.NewGormStorage(db)
-	store.Migrate(context.Background())
+	_ = store.Migrate(context.Background())
 	q := queue.New(store)
 
 	// Register a handler
@@ -213,7 +213,7 @@ func TestWorker_PausedDoesNotDequeue(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
 
-	go w.Start(ctx)
+	go func() { _ = w.Start(ctx) }()
 
 	// Wait a bit - job should NOT be processed
 	select {
@@ -229,7 +229,7 @@ func TestWorker_AggressivePauseCancelsRunningJobs(t *testing.T) {
 		Logger: logger.Default.LogMode(logger.Silent),
 	})
 	store := storage.NewGormStorage(db)
-	store.Migrate(context.Background())
+	_ = store.Migrate(context.Background())
 	q := queue.New(store)
 
 	started := make(chan struct{})
@@ -250,7 +250,7 @@ func TestWorker_AggressivePauseCancelsRunningJobs(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	go w.Start(ctx)
+	go func() { _ = w.Start(ctx) }()
 
 	// Wait for job to start
 	select {

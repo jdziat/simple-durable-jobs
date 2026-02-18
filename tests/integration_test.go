@@ -24,7 +24,7 @@ func setupIntegrationQueue(t *testing.T) (*jobs.Queue, jobs.Storage) {
 	integrationTestCounter++
 	dbPath := fmt.Sprintf("/tmp/jobs_integration_test_%d_%d.db", os.Getpid(), integrationTestCounter)
 	t.Cleanup(func() {
-		os.Remove(dbPath)
+		_ = os.Remove(dbPath)
 	})
 
 	db, err := gorm.Open(sqlite.Open(dbPath), &gorm.Config{
@@ -95,7 +95,7 @@ func TestIntegration_WorkflowWithNestedCalls(t *testing.T) {
 	require.NoError(t, err)
 
 	worker := queue.NewWorker()
-	go worker.Start(ctx)
+	go func() { _ = worker.Start(ctx) }()
 
 	// Wait for completion
 	time.Sleep(1 * time.Second)
@@ -134,7 +134,7 @@ func TestIntegration_RetryOnFailure(t *testing.T) {
 	require.NoError(t, err)
 
 	worker := queue.NewWorker()
-	go worker.Start(ctx)
+	go func() { _ = worker.Start(ctx) }()
 
 	// Wait for retries - use a loop instead of sleep
 	for i := 0; i < 50; i++ {
@@ -180,7 +180,7 @@ func TestIntegration_Priorities(t *testing.T) {
 
 	// Single worker with concurrency 1 to ensure sequential processing
 	worker := queue.NewWorker(jobs.WorkerQueue("default", jobs.Concurrency(1)))
-	go worker.Start(workerCtx)
+	go func() { _ = worker.Start(workerCtx) }()
 
 	time.Sleep(1 * time.Second)
 
@@ -218,7 +218,7 @@ func TestIntegration_MultipleQueues(t *testing.T) {
 
 	// Worker only processes "critical" queue
 	worker := queue.NewWorker(jobs.WorkerQueue("critical", jobs.Concurrency(1)))
-	go worker.Start(ctx)
+	go func() { _ = worker.Start(ctx) }()
 
 	time.Sleep(500 * time.Millisecond)
 
@@ -254,7 +254,7 @@ func TestIntegration_HooksAndEvents(t *testing.T) {
 	events := queue.Events()
 
 	worker := queue.NewWorker()
-	go worker.Start(ctx)
+	go func() { _ = worker.Start(ctx) }()
 
 	// Wait for events
 	var startedEvent, completedEvent bool
@@ -301,7 +301,7 @@ func TestIntegration_DelayedJob(t *testing.T) {
 	require.NoError(t, err)
 
 	worker := queue.NewWorker()
-	go worker.Start(ctx)
+	go func() { _ = worker.Start(ctx) }()
 
 	// Should not execute immediately
 	time.Sleep(200 * time.Millisecond)
@@ -385,7 +385,7 @@ func TestIntegration_CrashRecoveryReplay(t *testing.T) {
 	defer cancel()
 
 	worker := queue.NewWorker()
-	go worker.Start(workerCtx)
+	go func() { _ = worker.Start(workerCtx) }()
 
 	// Wait for job to complete (after retry)
 	for i := 0; i < 100; i++ {
@@ -430,7 +430,7 @@ func TestIntegration_SchedulerRecurringJobs(t *testing.T) {
 
 	// Start worker with scheduler enabled
 	worker := queue.NewWorker(jobs.WithScheduler(true))
-	go worker.Start(ctx)
+	go func() { _ = worker.Start(ctx) }()
 
 	// Wait for multiple executions
 	time.Sleep(1 * time.Second)
@@ -480,7 +480,7 @@ func TestIntegration_ConcurrentWorkers(t *testing.T) {
 	// Start 3 workers with concurrency 2 each (6 total concurrent processors)
 	for i := 0; i < 3; i++ {
 		worker := queue.NewWorker(jobs.WorkerQueue("default", jobs.Concurrency(2)))
-		go worker.Start(workerCtx)
+		go func() { _ = worker.Start(workerCtx) }()
 	}
 
 	// Wait for all jobs to complete
@@ -551,7 +551,7 @@ func TestIntegration_StaleLockCleanup(t *testing.T) {
 	defer cancel()
 
 	worker := queue.NewWorker()
-	go worker.Start(workerCtx)
+	go func() { _ = worker.Start(workerCtx) }()
 
 	// Wait for execution
 	for i := 0; i < 30; i++ {
@@ -592,7 +592,7 @@ func TestIntegration_ExponentialBackoffRetries(t *testing.T) {
 	defer cancel()
 
 	worker := queue.NewWorker()
-	go worker.Start(workerCtx)
+	go func() { _ = worker.Start(workerCtx) }()
 
 	// Wait for completion
 	for i := 0; i < 150; i++ {

@@ -21,7 +21,7 @@ func setupStorageTest(t *testing.T) jobs.Storage {
 	storageTestCounter++
 	dbPath := fmt.Sprintf("/tmp/jobs_storage_test_%d_%d.db", os.Getpid(), storageTestCounter)
 	t.Cleanup(func() {
-		os.Remove(dbPath)
+		_ = os.Remove(dbPath)
 	})
 
 	db, err := gorm.Open(sqlite.Open(dbPath), &gorm.Config{
@@ -555,7 +555,7 @@ func TestGormStorage_GetJobsByStatus(t *testing.T) {
 	}
 	err = store.Enqueue(ctx, runningJob)
 	require.NoError(t, err)
-	store.Dequeue(ctx, []string{"default"}, "worker-1")
+	_, _ = store.Dequeue(ctx, []string{"default"}, "worker-1")
 
 	// Get pending jobs
 	pendingJobs, err := store.GetJobsByStatus(ctx, jobs.StatusPending, 10)

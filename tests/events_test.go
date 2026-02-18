@@ -23,7 +23,7 @@ func setupEventsTestQueue(t *testing.T) (*jobs.Queue, jobs.Storage) {
 	eventsTestCounter++
 	dbPath := fmt.Sprintf("/tmp/jobs_events_test_%d_%d.db", os.Getpid(), eventsTestCounter)
 	t.Cleanup(func() {
-		os.Remove(dbPath)
+		_ = os.Remove(dbPath)
 	})
 
 	db, err := gorm.Open(sqlite.Open(dbPath), &gorm.Config{
@@ -55,7 +55,7 @@ func TestEvents_Stream(t *testing.T) {
 	require.NoError(t, err)
 
 	worker := queue.NewWorker()
-	go worker.Start(ctx)
+	go func() { _ = worker.Start(ctx) }()
 
 	var received []jobs.Event
 	timeout := time.After(1 * time.Second)
@@ -92,7 +92,7 @@ func TestEvents_JobStarted(t *testing.T) {
 	require.NoError(t, err)
 
 	worker := queue.NewWorker()
-	go worker.Start(ctx)
+	go func() { _ = worker.Start(ctx) }()
 
 	var startedEvent *jobs.JobStarted
 	timeout := time.After(1 * time.Second)
@@ -132,7 +132,7 @@ func TestEvents_JobCompleted(t *testing.T) {
 	require.NoError(t, err)
 
 	worker := queue.NewWorker()
-	go worker.Start(ctx)
+	go func() { _ = worker.Start(ctx) }()
 
 	var completedEvent *jobs.JobCompleted
 	timeout := time.After(1 * time.Second)
@@ -172,7 +172,7 @@ func TestEvents_JobFailed(t *testing.T) {
 	require.NoError(t, err)
 
 	worker := queue.NewWorker()
-	go worker.Start(ctx)
+	go func() { _ = worker.Start(ctx) }()
 
 	var failedEvent *jobs.JobFailed
 	timeout := time.After(1 * time.Second)
@@ -216,7 +216,7 @@ func TestEvents_JobRetrying(t *testing.T) {
 	require.NoError(t, err)
 
 	worker := queue.NewWorker()
-	go worker.Start(ctx)
+	go func() { _ = worker.Start(ctx) }()
 
 	var retryingEvent *jobs.JobRetrying
 	timeout := time.After(3 * time.Second)
@@ -259,7 +259,7 @@ func TestEvents_MultipleSubscribers(t *testing.T) {
 	require.NoError(t, err)
 
 	worker := queue.NewWorker()
-	go worker.Start(ctx)
+	go func() { _ = worker.Start(ctx) }()
 
 	var received1, received2 int
 	timeout := time.After(1 * time.Second)

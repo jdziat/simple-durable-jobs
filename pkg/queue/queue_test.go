@@ -645,7 +645,7 @@ func TestQueue_GetPausedJobs(t *testing.T) {
 	job1, _ := q.Enqueue(ctx, "test-job", struct{}{}, QueueOpt("emails"))
 	job2, _ := q.Enqueue(ctx, "test-job", struct{}{}, QueueOpt("emails"))
 
-	q.PauseJob(ctx, job1)
+	_ = q.PauseJob(ctx, job1)
 
 	paused, err := q.GetPausedJobs(ctx, "emails")
 	require.NoError(t, err)
@@ -660,8 +660,8 @@ func TestQueue_GetPausedQueues(t *testing.T) {
 	ctx := context.Background()
 
 	// Pause some queues
-	q.PauseQueue(ctx, "emails")
-	q.PauseQueue(ctx, "notifications")
+	_ = q.PauseQueue(ctx, "emails")
+	_ = q.PauseQueue(ctx, "notifications")
 
 	paused, err := q.GetPausedQueues(ctx)
 	require.NoError(t, err)
