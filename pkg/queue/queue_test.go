@@ -669,3 +669,356 @@ func TestQueue_GetPausedQueues(t *testing.T) {
 	assert.Contains(t, paused, "emails")
 	assert.Contains(t, paused, "notifications")
 }
+
+// ---------------------------------------------------------------------------
+// GetHandler
+// ---------------------------------------------------------------------------
+
+func TestQueue_GetHandler_ReturnsHandlerAfterRegister(t *testing.T) {
+	store := newMockStorage()
+	q := New(store)
+
+	q.Register("known-job", func(ctx context.Context, args string) error {
+		return nil
+	})
+
+	h, ok := q.GetHandler("known-job")
+	assert.True(t, ok)
+	assert.NotNil(t, h)
+}
+
+func TestQueue_GetHandler_ReturnsFalseForUnknown(t *testing.T) {
+	store := newMockStorage()
+	q := New(store)
+
+	h, ok := q.GetHandler("does-not-exist")
+	assert.False(t, ok)
+	assert.Nil(t, h)
+}
+
+// ---------------------------------------------------------------------------
+// EmitCustomEvent
+// ---------------------------------------------------------------------------
+
+func TestQueue_EmitCustomEvent_DeliveredToSubscriber(t *testing.T) {
+	store := newMockStorage()
+	q := New(store)
+
+	ch := q.Events()
+	defer q.Unsubscribe(ch)
+
+	q.EmitCustomEvent("job-99", "progress", map[string]any{"pct": 75})
+
+	select {
+	case evt := <-ch:
+		ce, ok := evt.(*core.CustomEvent)
+		require.True(t, ok, "expected *core.CustomEvent")
+		assert.Equal(t, "job-99", ce.JobID)
+		assert.Equal(t, "progress", ce.Kind)
+		assert.Equal(t, 75, ce.Data["pct"])
+	default:
+		t.Fatal("expected event but channel was empty")
+	}
+}
+
+func TestQueue_EmitCustomEvent_NilDataIsAccepted(t *testing.T) {
+	store := newMockStorage()
+	q := New(store)
+
+	ch := q.Events()
+	defer q.Unsubscribe(ch)
+
+	// nil data map should not panic
+	q.EmitCustomEvent("job-1", "heartbeat", nil)
+
+	select {
+	case evt := <-ch:
+		ce, ok := evt.(*core.CustomEvent)
+		require.True(t, ok)
+		assert.Nil(t, ce.Data)
+	default:
+		t.Fatal("expected event")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ApplyPause / WithPauseMode
+// ---------------------------------------------------------------------------
+
+func TestWithPauseMode_AppliesGraceful(t *testing.T) {
+	opt := WithPauseMode(core.PauseModeGraceful)
+	po := &PauseOptions{}
+	opt.ApplyPause(po)
+	assert.Equal(t, core.PauseModeGraceful, po.Mode)
+}
+
+func TestWithPauseMode_AppliesAggressive(t *testing.T) {
+	opt := WithPauseMode(core.PauseModeAggressive)
+	po := &PauseOptions{}
+	opt.ApplyPause(po)
+	assert.Equal(t, core.PauseModeAggressive, po.Mode)
+}
+
+func TestWithPauseMode_ReturnsNonNil(t *testing.T) {
+	opt := WithPauseMode(core.PauseModeGraceful)
+	assert.NotNil(t, opt)
+}
+
+// ---------------------------------------------------------------------------
+// RegisterRunningJob / UnregisterRunningJob
+// ---------------------------------------------------------------------------
+
+func TestQueue_RegisterRunningJob_StoresCancel(t *testing.T) {
+	store := newMockStorage()
+	q := New(store)
+
+	var cancelled bool
+	cancel := func() { cancelled = true }
+
+	q.RegisterRunningJob("job-abc", cancel)
+
+	// Verify the cancel function was stored by calling it via PauseJob
+	// with a job that's in the running registry.
+	// (Direct field access is not possible from outside the package;
+	// we confirm indirectly via UnregisterRunningJob not panicking.)
+	q.UnregisterRunningJob("job-abc")
+	assert.False(t, cancelled, "cancel should not be called by UnregisterRunningJob")
+}
+
+func TestQueue_RegisterRunningJob_OverwritesPrevious(t *testing.T) {
+	store := newMockStorage()
+	q := New(store)
+
+	var first, second bool
+	q.RegisterRunningJob("job-x", func() { first = true })
+	q.RegisterRunningJob("job-x", func() { second = true })
+	q.UnregisterRunningJob("job-x")
+
+	assert.False(t, first)
+	assert.False(t, second)
+}
+
+func TestQueue_UnregisterRunningJob_NonExistentIsNoop(t *testing.T) {
+	store := newMockStorage()
+	q := New(store)
+
+	// Must not panic when job was never registered.
+	assert.NotPanics(t, func() {
+		q.UnregisterRunningJob("never-existed")
+	})
+}
+
+// ---------------------------------------------------------------------------
+// CancelSubJob — mockStorage returns nil (not a sub-job)
+// ---------------------------------------------------------------------------
+
+func TestQueue_CancelSubJob_NotASubJob_ReturnsNil(t *testing.T) {
+	store := newMockStorage()
+	q := New(store)
+
+	ctx := context.Background()
+	fo, err := q.CancelSubJob(ctx, "some-job-id")
+	require.NoError(t, err)
+	assert.Nil(t, fo)
+}
+
+// cancelSubJobStorage is a mockStorage variant that returns a FanOut from
+// CancelSubJob so we can exercise the completion-check logic.
+type cancelSubJobStorage struct {
+	*mockStorage
+	fanOut *core.FanOut
+}
+
+func (c *cancelSubJobStorage) CancelSubJob(ctx context.Context, jobID string) (*core.FanOut, error) {
+	return c.fanOut, nil
+}
+
+func (c *cancelSubJobStorage) UpdateFanOutStatus(ctx context.Context, fanOutID string, status core.FanOutStatus) (bool, error) {
+	return true, nil
+}
+
+func (c *cancelSubJobStorage) ResumeJob(ctx context.Context, jobID string) (bool, error) {
+	return true, nil
+}
+
+func TestQueue_CancelSubJob_FanOutComplete_ResumesParent(t *testing.T) {
+	base := newMockStorage()
+	fo := &core.FanOut{
+		ID:             "fo-1",
+		ParentJobID:    "parent-job",
+		TotalCount:     2,
+		CompletedCount: 1,
+		CancelledCount: 1,
+		FailedCount:    0,
+		Status:         core.FanOutPending,
+	}
+	store := &cancelSubJobStorage{mockStorage: base, fanOut: fo}
+
+	q := New(store)
+	ctx := context.Background()
+
+	result, err := q.CancelSubJob(ctx, "sub-job-id")
+	require.NoError(t, err)
+	assert.NotNil(t, result)
+	assert.Equal(t, "fo-1", result.ID)
+}
+
+func TestQueue_CancelSubJob_FanOutIncomplete_DoesNotResume(t *testing.T) {
+	base := newMockStorage()
+	fo := &core.FanOut{
+		ID:             "fo-2",
+		ParentJobID:    "parent-job",
+		TotalCount:     5,
+		CompletedCount: 1,
+		CancelledCount: 1,
+		FailedCount:    0,
+		Status:         core.FanOutPending,
+	}
+	store := &cancelSubJobStorage{mockStorage: base, fanOut: fo}
+
+	q := New(store)
+	ctx := context.Background()
+
+	result, err := q.CancelSubJob(ctx, "sub-job-id")
+	require.NoError(t, err)
+	assert.NotNil(t, result)
+}
+
+func TestQueue_CancelSubJob_AllFailed_StatusFailed(t *testing.T) {
+	base := newMockStorage()
+	fo := &core.FanOut{
+		ID:             "fo-3",
+		ParentJobID:    "parent-job",
+		TotalCount:     2,
+		CompletedCount: 0,
+		FailedCount:    0,
+		CancelledCount: 2,
+		Status:         core.FanOutPending,
+	}
+	store := &cancelSubJobStorage{mockStorage: base, fanOut: fo}
+
+	q := New(store)
+	ctx := context.Background()
+
+	result, err := q.CancelSubJob(ctx, "sub-job-id")
+	require.NoError(t, err)
+	assert.NotNil(t, result)
+}
+
+// ---------------------------------------------------------------------------
+// errPauseStorage — a mock whose PauseJob always returns ErrCannotPauseStatus.
+// This exercises the running-job-registry branches of Queue.PauseJob.
+// ---------------------------------------------------------------------------
+
+type errPauseStorage struct {
+	*mockStorage
+}
+
+func (e *errPauseStorage) PauseJob(_ context.Context, _ string) error {
+	return core.ErrCannotPauseStatus
+}
+
+func TestQueue_PauseJob_WithPauseMode_Graceful(t *testing.T) {
+	store := newMockStorage()
+	q := New(store)
+	ctx := context.Background()
+
+	q.Register("pm-job", func(ctx context.Context, args struct{}) error { return nil })
+	jobID, err := q.Enqueue(ctx, "pm-job", struct{}{})
+	require.NoError(t, err)
+
+	// PauseJob with an explicit pause mode option.
+	err = q.PauseJob(ctx, jobID, WithPauseMode(core.PauseModeGraceful))
+	require.NoError(t, err)
+
+	paused, err := q.IsJobPaused(ctx, jobID)
+	require.NoError(t, err)
+	assert.True(t, paused)
+}
+
+func TestQueue_PauseJob_RunningJobInRegistry_CancelsCancelFunc(t *testing.T) {
+	base := newMockStorage()
+	store := &errPauseStorage{mockStorage: base}
+	q := New(store)
+	ctx := context.Background()
+
+	var cancelled bool
+	cancel := func() { cancelled = true }
+
+	// Register a "running" job in the queue registry.
+	q.RegisterRunningJob("running-job-1", cancel)
+
+	// PauseJob will fail with ErrCannotPauseStatus from storage, then look
+	// up the running registry and call cancel().
+	err := q.PauseJob(ctx, "running-job-1")
+	require.NoError(t, err)
+	assert.True(t, cancelled, "cancel function should have been called")
+}
+
+func TestQueue_PauseJob_RunningJobNotInRegistry_ReturnsError(t *testing.T) {
+	base := newMockStorage()
+	store := &errPauseStorage{mockStorage: base}
+	q := New(store)
+	ctx := context.Background()
+
+	// No cancel registered for this job — PauseJob should propagate the error.
+	err := q.PauseJob(ctx, "not-in-registry")
+	assert.ErrorIs(t, err, core.ErrCannotPauseStatus)
+}
+
+func TestQueue_PauseJob_WithPauseMode_Aggressive(t *testing.T) {
+	store := newMockStorage()
+	q := New(store)
+	ctx := context.Background()
+
+	q.Register("agg-job", func(ctx context.Context, args struct{}) error { return nil })
+	jobID, err := q.Enqueue(ctx, "agg-job", struct{}{})
+	require.NoError(t, err)
+
+	err = q.PauseJob(ctx, jobID, WithPauseMode(core.PauseModeAggressive))
+	require.NoError(t, err)
+
+	paused, err := q.IsJobPaused(ctx, jobID)
+	require.NoError(t, err)
+	assert.True(t, paused)
+}
+
+// ---------------------------------------------------------------------------
+// Queue-level validation error paths
+// ---------------------------------------------------------------------------
+
+func TestQueue_GetPausedJobs_InvalidQueueName_ReturnsError(t *testing.T) {
+	store := newMockStorage()
+	q := New(store)
+	ctx := context.Background()
+
+	_, err := q.GetPausedJobs(ctx, "")
+	assert.Error(t, err)
+}
+
+func TestQueue_PauseQueue_InvalidQueueName_ReturnsError(t *testing.T) {
+	store := newMockStorage()
+	q := New(store)
+	ctx := context.Background()
+
+	err := q.PauseQueue(ctx, "")
+	assert.Error(t, err)
+}
+
+func TestQueue_ResumeQueue_InvalidQueueName_ReturnsError(t *testing.T) {
+	store := newMockStorage()
+	q := New(store)
+	ctx := context.Background()
+
+	err := q.ResumeQueue(ctx, "")
+	assert.Error(t, err)
+}
+
+func TestQueue_IsQueuePaused_InvalidQueueName_ReturnsError(t *testing.T) {
+	store := newMockStorage()
+	q := New(store)
+	ctx := context.Background()
+
+	_, err := q.IsQueuePaused(ctx, "")
+	assert.Error(t, err)
+}

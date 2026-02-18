@@ -1523,3 +1523,234 @@ func TestGetWaitingJobsToResume_DoesNotReturnPendingFanOut(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, waiting)
 }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// EnqueueBatch — additional edge cases
+// ──────────────────────────────────────────────────────────────────────────────
+
+func TestEnqueueBatch_SetsDefaultsForEachJob(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	// Jobs with no ID, Status, or Queue should get defaults filled in.
+	jobs := []*core.Job{
+		{Type: "task.a"},
+		{Type: "task.b", Queue: "custom"},
+		{Type: "task.c", Status: core.StatusWaiting},
+	}
+	require.NoError(t, s.EnqueueBatch(ctx, jobs))
+
+	assert.NotEmpty(t, jobs[0].ID)
+	assert.Equal(t, core.StatusPending, jobs[0].Status)
+	assert.Equal(t, "default", jobs[0].Queue)
+
+	assert.NotEmpty(t, jobs[1].ID)
+	assert.Equal(t, core.StatusPending, jobs[1].Status)
+	assert.Equal(t, "custom", jobs[1].Queue)
+
+	// Pre-set status should be preserved.
+	assert.Equal(t, core.StatusWaiting, jobs[2].Status)
+}
+
+func TestEnqueueBatch_PreservesExistingIDs(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	customID := "my-batch-job-id"
+	jobs := []*core.Job{
+		{ID: customID, Type: "task.a"},
+	}
+	require.NoError(t, s.EnqueueBatch(ctx, jobs))
+
+	assert.Equal(t, customID, jobs[0].ID)
+
+	got, err := s.GetJob(ctx, customID)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, customID, got.ID)
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// PauseQueue — additional paths
+// ──────────────────────────────────────────────────────────────────────────────
+
+// TestPauseQueue_UnpauseThenRepause covers the "existing, paused=false → update"
+// branch in PauseQueue where a QueueState record already exists but is not paused.
+func TestPauseQueue_UnpauseThenRepause(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	// Pause then unpause to create a QueueState row with paused=false.
+	require.NoError(t, s.PauseQueue(ctx, "repause-q"))
+	require.NoError(t, s.UnpauseQueue(ctx, "repause-q"))
+
+	// PauseQueue should now find the existing (unpaused) row and update it.
+	require.NoError(t, s.PauseQueue(ctx, "repause-q"))
+
+	paused, err := s.IsQueuePaused(ctx, "repause-q")
+	require.NoError(t, err)
+	assert.True(t, paused)
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Complete — ErrJobNotOwned path with explicit job ID
+// ──────────────────────────────────────────────────────────────────────────────
+
+func TestComplete_ErrJobNotOwned_CorrectError(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	job := newTestJob("default", "task.run")
+	require.NoError(t, s.Enqueue(ctx, job))
+
+	got, err := s.Dequeue(ctx, []string{"default"}, "worker-A")
+	require.NoError(t, err)
+	require.NotNil(t, got)
+
+	// Different worker tries to complete — must get ErrJobNotOwned.
+	err = s.Complete(ctx, got.ID, "worker-B")
+	require.Error(t, err)
+	assert.ErrorIs(t, err, core.ErrJobNotOwned)
+
+	// The job should still be running (not completed).
+	after, err := s.GetJob(ctx, got.ID)
+	require.NoError(t, err)
+	require.NotNil(t, after)
+	assert.Equal(t, core.StatusRunning, after.Status)
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Fail — retry path sets run_at
+// ──────────────────────────────────────────────────────────────────────────────
+
+func TestFail_RetryAtSetsStatusToPendingAndRunAt(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	job := newTestJob("default", "task.run")
+	require.NoError(t, s.Enqueue(ctx, job))
+
+	got, err := s.Dequeue(ctx, []string{"default"}, "worker-1")
+	require.NoError(t, err)
+	require.NotNil(t, got)
+
+	retryAt := time.Now().Add(10 * time.Minute)
+	require.NoError(t, s.Fail(ctx, got.ID, "worker-1", "transient", &retryAt))
+
+	after, err := s.GetJob(ctx, got.ID)
+	require.NoError(t, err)
+	require.NotNil(t, after)
+	assert.Equal(t, core.StatusPending, after.Status, "job should be re-queued for retry")
+	assert.NotNil(t, after.RunAt, "run_at should be set for scheduled retry")
+	assert.Empty(t, after.LockedBy, "LockedBy should be cleared on retry")
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Dequeue — all queues paused returns nil (distinct queue list path)
+// ──────────────────────────────────────────────────────────────────────────────
+
+func TestDequeue_MultipleQueuesBothPausedReturnsNil(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	require.NoError(t, s.Enqueue(ctx, newTestJob("q1", "task.a")))
+	require.NoError(t, s.Enqueue(ctx, newTestJob("q2", "task.b")))
+	require.NoError(t, s.PauseQueue(ctx, "q1"))
+	require.NoError(t, s.PauseQueue(ctx, "q2"))
+
+	got, err := s.Dequeue(ctx, []string{"q1", "q2"}, "worker-1")
+	require.NoError(t, err)
+	assert.Nil(t, got, "no job should be returned when all queues are paused")
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// GetDueJobs — all queues paused returns nil slice
+// ──────────────────────────────────────────────────────────────────────────────
+
+func TestGetDueJobs_AllQueuesPausedReturnsNil(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	require.NoError(t, s.Enqueue(ctx, newTestJob("only-q", "task.a")))
+	require.NoError(t, s.PauseQueue(ctx, "only-q"))
+
+	jobs, err := s.GetDueJobs(ctx, []string{"only-q"}, 10)
+	require.NoError(t, err)
+	assert.Nil(t, jobs, "all paused queues should return nil job slice from GetDueJobs")
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// CancelSubJobs — zero rows affected (no sub-jobs to cancel)
+// ──────────────────────────────────────────────────────────────────────────────
+
+func TestCancelSubJobs_NoSubJobsReturnsZero(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	parent := newTestJob("default", "workflow.run")
+	require.NoError(t, s.Enqueue(ctx, parent))
+
+	fanOut := &core.FanOut{ParentJobID: parent.ID, TotalCount: 2}
+	require.NoError(t, s.CreateFanOut(ctx, fanOut))
+
+	// No sub-jobs were actually created for this fan-out.
+	cancelled, err := s.CancelSubJobs(ctx, fanOut.ID)
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), cancelled)
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// CancelSubJob — job already completed is a no-op
+// ──────────────────────────────────────────────────────────────────────────────
+
+func TestCancelSubJob_AlreadyCompletedJobIsNoop(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	parent := newTestJob("default", "workflow.run")
+	require.NoError(t, s.Enqueue(ctx, parent))
+
+	fanOut := &core.FanOut{ParentJobID: parent.ID, TotalCount: 1}
+	require.NoError(t, s.CreateFanOut(ctx, fanOut))
+
+	sub := &core.Job{Type: "sub", Queue: "default", FanOutID: &fanOut.ID, FanOutIndex: 0}
+	require.NoError(t, s.EnqueueBatch(ctx, []*core.Job{sub}))
+
+	// Dequeue and complete the sub-job first.
+	got, err := s.Dequeue(ctx, []string{"default"}, "worker-1")
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	require.NoError(t, s.Complete(ctx, got.ID, "worker-1"))
+
+	// Attempting to cancel a completed job should be a no-op (returns nil FanOut).
+	fo, err := s.CancelSubJob(ctx, got.ID)
+	require.NoError(t, err)
+	assert.Nil(t, fo, "cancelling an already-completed sub-job should return nil FanOut")
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// ResumeJob — decrement clamp: attempt of 0 stays 0
+// ──────────────────────────────────────────────────────────────────────────────
+
+func TestResumeJob_AttemptZeroDoesNotGoNegative(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	// Manually insert a waiting job with attempt=0 to exercise the CASE guard.
+	job := &core.Job{
+		Type:   "task.run",
+		Queue:  "default",
+		Status: core.StatusWaiting,
+	}
+	require.NoError(t, s.Enqueue(ctx, job))
+	// Force status to waiting directly (Enqueue preserves the pre-set status).
+
+	resumed, err := s.ResumeJob(ctx, job.ID)
+	require.NoError(t, err)
+	assert.True(t, resumed)
+
+	after, err := s.GetJob(ctx, job.ID)
+	require.NoError(t, err)
+	require.NotNil(t, after)
+	assert.Equal(t, 0, after.Attempt, "attempt should not go below 0")
+}

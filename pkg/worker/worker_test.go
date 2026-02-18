@@ -16,6 +16,7 @@ import (
 
 	"github.com/jdziat/simple-durable-jobs/pkg/core"
 	"github.com/jdziat/simple-durable-jobs/pkg/queue"
+	"github.com/jdziat/simple-durable-jobs/pkg/schedule"
 	"github.com/jdziat/simple-durable-jobs/pkg/storage"
 )
 
@@ -34,11 +35,33 @@ type mockStorage struct {
 	heartbeatFunc   func(ctx context.Context, jobID string, workerID string) error
 	checkpointFunc  func(ctx context.Context, jobID string) ([]core.Checkpoint, error)
 	waitingJobsFunc func(ctx context.Context) ([]*core.Job, error)
+
+	// fan-out control hooks
+	incrementCompletedFunc func(ctx context.Context, fanOutID string) (*core.FanOut, error)
+	incrementFailedFunc    func(ctx context.Context, fanOutID string) (*core.FanOut, error)
+	updateFanOutStatusFunc func(ctx context.Context, fanOutID string, status core.FanOutStatus) (bool, error)
+	resumeJobFunc          func(ctx context.Context, jobID string) (bool, error)
+	cancelSubJobsFunc      func(ctx context.Context, fanOutID string) (int64, error)
+
+	// enqueue tracking
+	enqueueMu    sync.Mutex
+	enqueueCount int64 // incremented on each Enqueue call
 }
 
 func (m *mockStorage) Migrate(_ context.Context) error { return nil }
 
-func (m *mockStorage) Enqueue(_ context.Context, _ *core.Job) error { return nil }
+func (m *mockStorage) Enqueue(_ context.Context, _ *core.Job) error {
+	m.enqueueMu.Lock()
+	m.enqueueCount++
+	m.enqueueMu.Unlock()
+	return nil
+}
+
+func (m *mockStorage) getEnqueueCount() int64 {
+	m.enqueueMu.Lock()
+	defer m.enqueueMu.Unlock()
+	return m.enqueueCount
+}
 
 func (m *mockStorage) Dequeue(ctx context.Context, queues []string, workerID string) (*core.Job, error) {
 	if m.dequeueFunc != nil {
@@ -107,11 +130,17 @@ func (m *mockStorage) GetFanOut(_ context.Context, _ string) (*core.FanOut, erro
 	return nil, nil
 }
 
-func (m *mockStorage) IncrementFanOutCompleted(_ context.Context, _ string) (*core.FanOut, error) {
+func (m *mockStorage) IncrementFanOutCompleted(ctx context.Context, fanOutID string) (*core.FanOut, error) {
+	if m.incrementCompletedFunc != nil {
+		return m.incrementCompletedFunc(ctx, fanOutID)
+	}
 	return nil, nil
 }
 
-func (m *mockStorage) IncrementFanOutFailed(_ context.Context, _ string) (*core.FanOut, error) {
+func (m *mockStorage) IncrementFanOutFailed(ctx context.Context, fanOutID string) (*core.FanOut, error) {
+	if m.incrementFailedFunc != nil {
+		return m.incrementFailedFunc(ctx, fanOutID)
+	}
 	return nil, nil
 }
 
@@ -119,7 +148,10 @@ func (m *mockStorage) IncrementFanOutCancelled(_ context.Context, _ string) (*co
 	return nil, nil
 }
 
-func (m *mockStorage) UpdateFanOutStatus(_ context.Context, _ string, _ core.FanOutStatus) (bool, error) {
+func (m *mockStorage) UpdateFanOutStatus(ctx context.Context, fanOutID string, status core.FanOutStatus) (bool, error) {
+	if m.updateFanOutStatusFunc != nil {
+		return m.updateFanOutStatusFunc(ctx, fanOutID, status)
+	}
 	return false, nil
 }
 
@@ -137,7 +169,12 @@ func (m *mockStorage) GetSubJobResults(_ context.Context, _ string) ([]*core.Job
 	return nil, nil
 }
 
-func (m *mockStorage) CancelSubJobs(_ context.Context, _ string) (int64, error) { return 0, nil }
+func (m *mockStorage) CancelSubJobs(ctx context.Context, fanOutID string) (int64, error) {
+	if m.cancelSubJobsFunc != nil {
+		return m.cancelSubJobsFunc(ctx, fanOutID)
+	}
+	return 0, nil
+}
 
 func (m *mockStorage) CancelSubJob(_ context.Context, _ string) (*core.FanOut, error) {
 	return nil, nil
@@ -145,7 +182,12 @@ func (m *mockStorage) CancelSubJob(_ context.Context, _ string) (*core.FanOut, e
 
 func (m *mockStorage) SuspendJob(_ context.Context, _ string, _ string) error { return nil }
 
-func (m *mockStorage) ResumeJob(_ context.Context, _ string) (bool, error) { return false, nil }
+func (m *mockStorage) ResumeJob(ctx context.Context, jobID string) (bool, error) {
+	if m.resumeJobFunc != nil {
+		return m.resumeJobFunc(ctx, jobID)
+	}
+	return false, nil
+}
 
 func (m *mockStorage) GetWaitingJobsToResume(ctx context.Context) ([]*core.Job, error) {
 	if m.waitingJobsFunc != nil {
@@ -1550,5 +1592,628 @@ func TestWorker_HandleError_RetryAfterExhausted(t *testing.T) {
 		// RetryAfter branch was exercised.
 	case <-time.After(1500 * time.Millisecond):
 		t.Fatal("RetryAfter retry hook was not called")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// runScheduler tests
+// ---------------------------------------------------------------------------
+
+// TestWorker_RunScheduler_ExitsOnContextCancel verifies that runScheduler
+// returns promptly when its context is cancelled.
+func TestWorker_RunScheduler_ExitsOnContextCancel(t *testing.T) {
+	mock := &mockStorage{}
+	q := queue.New(mock)
+
+	w := NewWorker(q, WithStaleLockInterval(0))
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		w.runScheduler(ctx)
+	}()
+
+	cancel()
+
+	select {
+	case <-done:
+		// runScheduler exited cleanly after context cancellation.
+	case <-time.After(time.Second):
+		t.Fatal("runScheduler did not exit after context cancellation")
+	}
+}
+
+// TestWorker_RunScheduler_NilScheduledJobsIsNoop verifies that runScheduler
+// handles the case where there are no scheduled jobs (GetScheduledJobs returns nil).
+func TestWorker_RunScheduler_NilScheduledJobsIsNoop(t *testing.T) {
+	mock := &mockStorage{}
+	q := queue.New(mock)
+	// No scheduled jobs registered on q.
+
+	w := NewWorker(q, WithStaleLockInterval(0))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		w.runScheduler(ctx)
+	}()
+
+	<-ctx.Done()
+
+	select {
+	case <-done:
+		// Should have exited when context expired.
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("runScheduler did not exit after context expiry")
+	}
+
+	// No enqueue should have been attempted.
+	assert.Equal(t, int64(0), mock.getEnqueueCount())
+}
+
+// TestWorker_RunScheduler_EnqueuesDueJob verifies that a scheduled job whose
+// next run time is in the past gets enqueued by the scheduler goroutine.
+func TestWorker_RunScheduler_EnqueuesDueJob(t *testing.T) {
+	q, cleanup := newSQLiteQueue(t)
+	defer cleanup()
+
+	// Register the handler so Queue.Enqueue does not reject the job.
+	q.Register("scheduled-task", func(_ context.Context, _ struct{}) error {
+		return nil
+	})
+
+	// Register a schedule that always returns a time in the past so the
+	// scheduler immediately considers the job due.
+	q.Schedule("scheduled-task", schedule.Every(1*time.Millisecond))
+
+	w := NewWorker(q, WithStaleLockInterval(0))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	go func() { w.runScheduler(ctx) }()
+
+	// Wait until at least one job has been enqueued.
+	require.Eventually(t, func() bool {
+		jobs, err := q.Storage().GetJobsByStatus(context.Background(), core.StatusPending, 10)
+		if err != nil {
+			return false
+		}
+		return len(jobs) > 0
+	}, 1500*time.Millisecond, 20*time.Millisecond,
+		"scheduler should enqueue at least one due job")
+}
+
+// ---------------------------------------------------------------------------
+// checkFanOutCompletion / completeFanOut tests
+// ---------------------------------------------------------------------------
+
+// TestWorker_CheckFanOutCompletion_AllDoneCompletesParent exercises the path
+// where completed+failed+cancelled == total, causing completeFanOut to be called.
+// Uses the StrategyCollectAll strategy so status becomes FanOutCompleted.
+func TestWorker_CheckFanOutCompletion_AllDoneCompletesParent(t *testing.T) {
+	parentResumed := make(chan string, 1)
+	fanOutUpdated := make(chan core.FanOutStatus, 1)
+
+	mock := &mockStorage{
+		updateFanOutStatusFunc: func(_ context.Context, id string, status core.FanOutStatus) (bool, error) {
+			fanOutUpdated <- status
+			return true, nil // claim the update
+		},
+		resumeJobFunc: func(_ context.Context, jobID string) (bool, error) {
+			parentResumed <- jobID
+			return true, nil
+		},
+	}
+	q := queue.New(mock)
+	w := NewWorker(q, WithStorageRetry(RetryConfig{MaxAttempts: 1}))
+
+	fo := &core.FanOut{
+		ID:             "fo-1",
+		ParentJobID:    "parent-job-1",
+		TotalCount:     2,
+		CompletedCount: 2,
+		FailedCount:    0,
+		CancelledCount: 0,
+		Strategy:       core.StrategyCollectAll,
+	}
+
+	err := w.checkFanOutCompletion(context.Background(), fo)
+	require.NoError(t, err)
+
+	select {
+	case status := <-fanOutUpdated:
+		assert.Equal(t, core.FanOutCompleted, status)
+	case <-time.After(time.Second):
+		t.Fatal("UpdateFanOutStatus was not called")
+	}
+
+	select {
+	case jobID := <-parentResumed:
+		assert.Equal(t, "parent-job-1", jobID)
+	case <-time.After(time.Second):
+		t.Fatal("ResumeJob was not called for parent")
+	}
+}
+
+// TestWorker_CheckFanOutCompletion_NotDoneYetReturnsNil exercises the early
+// return when there are still pending sub-jobs.
+func TestWorker_CheckFanOutCompletion_NotDoneYetReturnsNil(t *testing.T) {
+	mock := &mockStorage{}
+	q := queue.New(mock)
+	w := NewWorker(q)
+
+	fo := &core.FanOut{
+		ID:             "fo-2",
+		ParentJobID:    "parent-job-2",
+		TotalCount:     5,
+		CompletedCount: 2,
+		FailedCount:    0,
+		CancelledCount: 0,
+		Strategy:       core.StrategyCollectAll,
+	}
+
+	err := w.checkFanOutCompletion(context.Background(), fo)
+	assert.NoError(t, err, "incomplete fan-out should return nil without calling completeFanOut")
+}
+
+// TestWorker_CheckFanOutCompletion_FailFastTriggersEarly exercises the fail-fast
+// branch where a failure is detected before all sub-jobs complete.
+func TestWorker_CheckFanOutCompletion_FailFastTriggersEarly(t *testing.T) {
+	fanOutUpdated := make(chan core.FanOutStatus, 1)
+
+	mock := &mockStorage{
+		updateFanOutStatusFunc: func(_ context.Context, _ string, status core.FanOutStatus) (bool, error) {
+			fanOutUpdated <- status
+			return true, nil
+		},
+		resumeJobFunc: func(_ context.Context, _ string) (bool, error) {
+			return true, nil
+		},
+	}
+	q := queue.New(mock)
+	w := NewWorker(q, WithStorageRetry(RetryConfig{MaxAttempts: 1}))
+
+	// 3 of 5 sub-jobs done, but 1 failed — fail-fast should trigger immediately.
+	fo := &core.FanOut{
+		ID:             "fo-3",
+		ParentJobID:    "parent-job-3",
+		TotalCount:     5,
+		CompletedCount: 2,
+		FailedCount:    1,
+		CancelledCount: 0,
+		Strategy:       core.StrategyFailFast,
+	}
+
+	err := w.checkFanOutCompletion(context.Background(), fo)
+	require.NoError(t, err)
+
+	select {
+	case status := <-fanOutUpdated:
+		assert.Equal(t, core.FanOutFailed, status)
+	case <-time.After(time.Second):
+		t.Fatal("UpdateFanOutStatus was not called for fail-fast early exit")
+	}
+}
+
+// TestWorker_CheckFanOutCompletion_ThresholdExceeded exercises the threshold
+// strategy early-exit when failures exceed the allowed maximum.
+func TestWorker_CheckFanOutCompletion_ThresholdExceeded(t *testing.T) {
+	fanOutUpdated := make(chan core.FanOutStatus, 1)
+
+	mock := &mockStorage{
+		updateFanOutStatusFunc: func(_ context.Context, _ string, status core.FanOutStatus) (bool, error) {
+			fanOutUpdated <- status
+			return true, nil
+		},
+		resumeJobFunc: func(_ context.Context, _ string) (bool, error) {
+			return true, nil
+		},
+	}
+	q := queue.New(mock)
+	w := NewWorker(q, WithStorageRetry(RetryConfig{MaxAttempts: 1}))
+
+	// Threshold = 0.8 (80% success required). TotalCount=10, maxFailures = 10*(1-0.8) = 2.
+	// FailedCount=3 > 2 so threshold is breached even though 7 jobs remain.
+	fo := &core.FanOut{
+		ID:             "fo-4",
+		ParentJobID:    "parent-job-4",
+		TotalCount:     10,
+		CompletedCount: 3,
+		FailedCount:    3,
+		CancelledCount: 0,
+		Strategy:       core.StrategyThreshold,
+		Threshold:      0.8,
+	}
+
+	err := w.checkFanOutCompletion(context.Background(), fo)
+	require.NoError(t, err)
+
+	select {
+	case status := <-fanOutUpdated:
+		assert.Equal(t, core.FanOutFailed, status)
+	case <-time.After(time.Second):
+		t.Fatal("UpdateFanOutStatus was not called for threshold breach")
+	}
+}
+
+// TestWorker_CheckFanOutCompletion_AllCancelledNoCompletions exercises the branch
+// where all sub-jobs are cancelled and completedCount == 0, resulting in FanOutFailed.
+func TestWorker_CheckFanOutCompletion_AllCancelledNoCompletions(t *testing.T) {
+	fanOutUpdated := make(chan core.FanOutStatus, 1)
+
+	mock := &mockStorage{
+		updateFanOutStatusFunc: func(_ context.Context, _ string, status core.FanOutStatus) (bool, error) {
+			fanOutUpdated <- status
+			return true, nil
+		},
+		resumeJobFunc: func(_ context.Context, _ string) (bool, error) {
+			return true, nil
+		},
+	}
+	q := queue.New(mock)
+	w := NewWorker(q, WithStorageRetry(RetryConfig{MaxAttempts: 1}))
+
+	fo := &core.FanOut{
+		ID:             "fo-5",
+		ParentJobID:    "parent-job-5",
+		TotalCount:     3,
+		CompletedCount: 0,
+		FailedCount:    0,
+		CancelledCount: 3,
+		Strategy:       core.StrategyCollectAll,
+	}
+
+	err := w.checkFanOutCompletion(context.Background(), fo)
+	require.NoError(t, err)
+
+	select {
+	case status := <-fanOutUpdated:
+		assert.Equal(t, core.FanOutFailed, status)
+	case <-time.After(time.Second):
+		t.Fatal("UpdateFanOutStatus was not called")
+	}
+}
+
+// TestWorker_CheckFanOutCompletion_ThresholdAllDoneSuccessRate exercises
+// the threshold strategy when all sub-jobs are done and the success rate
+// is checked against the threshold.
+func TestWorker_CheckFanOutCompletion_ThresholdAllDoneBelowThreshold(t *testing.T) {
+	fanOutUpdated := make(chan core.FanOutStatus, 1)
+
+	mock := &mockStorage{
+		updateFanOutStatusFunc: func(_ context.Context, _ string, status core.FanOutStatus) (bool, error) {
+			fanOutUpdated <- status
+			return true, nil
+		},
+		resumeJobFunc: func(_ context.Context, _ string) (bool, error) {
+			return true, nil
+		},
+	}
+	q := queue.New(mock)
+	w := NewWorker(q, WithStorageRetry(RetryConfig{MaxAttempts: 1}))
+
+	// All 4 sub-jobs done: 1 completed, 3 failed. successRate = 0.25 < threshold 0.8.
+	fo := &core.FanOut{
+		ID:             "fo-6",
+		ParentJobID:    "parent-job-6",
+		TotalCount:     4,
+		CompletedCount: 1,
+		FailedCount:    3,
+		CancelledCount: 0,
+		Strategy:       core.StrategyThreshold,
+		Threshold:      0.8,
+	}
+
+	err := w.checkFanOutCompletion(context.Background(), fo)
+	require.NoError(t, err)
+
+	select {
+	case status := <-fanOutUpdated:
+		assert.Equal(t, core.FanOutFailed, status)
+	case <-time.After(time.Second):
+		t.Fatal("UpdateFanOutStatus was not called")
+	}
+}
+
+// TestWorker_CheckFanOutCompletion_ThresholdAllDoneAboveThreshold exercises
+// the threshold strategy when the success rate meets or exceeds the threshold.
+func TestWorker_CheckFanOutCompletion_ThresholdAllDoneAboveThreshold(t *testing.T) {
+	fanOutUpdated := make(chan core.FanOutStatus, 1)
+
+	mock := &mockStorage{
+		updateFanOutStatusFunc: func(_ context.Context, _ string, status core.FanOutStatus) (bool, error) {
+			fanOutUpdated <- status
+			return true, nil
+		},
+		resumeJobFunc: func(_ context.Context, _ string) (bool, error) {
+			return true, nil
+		},
+	}
+	q := queue.New(mock)
+	w := NewWorker(q, WithStorageRetry(RetryConfig{MaxAttempts: 1}))
+
+	// All 4 sub-jobs done: 4 completed, 0 failed. successRate = 1.0 >= threshold 0.8.
+	fo := &core.FanOut{
+		ID:             "fo-7",
+		ParentJobID:    "parent-job-7",
+		TotalCount:     4,
+		CompletedCount: 4,
+		FailedCount:    0,
+		CancelledCount: 0,
+		Strategy:       core.StrategyThreshold,
+		Threshold:      0.8,
+	}
+
+	err := w.checkFanOutCompletion(context.Background(), fo)
+	require.NoError(t, err)
+
+	select {
+	case status := <-fanOutUpdated:
+		assert.Equal(t, core.FanOutCompleted, status)
+	case <-time.After(time.Second):
+		t.Fatal("UpdateFanOutStatus was not called")
+	}
+}
+
+// TestWorker_CheckFanOutCompletion_ThresholdAllCancelledNoActive exercises the
+// threshold strategy when all active jobs are cancelled (activeTotal == 0).
+func TestWorker_CheckFanOutCompletion_ThresholdAllCancelledNoActive(t *testing.T) {
+	fanOutUpdated := make(chan core.FanOutStatus, 1)
+
+	mock := &mockStorage{
+		updateFanOutStatusFunc: func(_ context.Context, _ string, status core.FanOutStatus) (bool, error) {
+			fanOutUpdated <- status
+			return true, nil
+		},
+		resumeJobFunc: func(_ context.Context, _ string) (bool, error) {
+			return true, nil
+		},
+	}
+	q := queue.New(mock)
+	w := NewWorker(q, WithStorageRetry(RetryConfig{MaxAttempts: 1}))
+
+	// Threshold strategy with all cancelled — activeTotal == 0, falls to failed.
+	fo := &core.FanOut{
+		ID:             "fo-8",
+		ParentJobID:    "parent-job-8",
+		TotalCount:     3,
+		CompletedCount: 0,
+		FailedCount:    0,
+		CancelledCount: 3,
+		Strategy:       core.StrategyThreshold,
+		Threshold:      0.8,
+	}
+
+	err := w.checkFanOutCompletion(context.Background(), fo)
+	require.NoError(t, err)
+
+	select {
+	case status := <-fanOutUpdated:
+		assert.Equal(t, core.FanOutFailed, status)
+	case <-time.After(time.Second):
+		t.Fatal("UpdateFanOutStatus was not called")
+	}
+}
+
+// TestWorker_CompleteFanOut_AlreadyCompletedByAnotherWorker exercises the
+// branch where UpdateFanOutStatus returns (false, nil) — another worker won
+// the race and completeFanOut should return nil without calling ResumeJob.
+func TestWorker_CompleteFanOut_AlreadyCompletedByAnotherWorker(t *testing.T) {
+	resumeCalled := false
+
+	mock := &mockStorage{
+		updateFanOutStatusFunc: func(_ context.Context, _ string, _ core.FanOutStatus) (bool, error) {
+			return false, nil // another worker already completed
+		},
+		resumeJobFunc: func(_ context.Context, _ string) (bool, error) {
+			resumeCalled = true
+			return true, nil
+		},
+	}
+	q := queue.New(mock)
+	w := NewWorker(q, WithStorageRetry(RetryConfig{MaxAttempts: 1}))
+
+	fo := &core.FanOut{
+		ID:          "fo-9",
+		ParentJobID: "parent-job-9",
+	}
+
+	err := w.completeFanOut(context.Background(), fo, core.FanOutCompleted)
+	require.NoError(t, err)
+	assert.False(t, resumeCalled, "ResumeJob must not be called when update was a no-op")
+}
+
+// TestWorker_CompleteFanOut_CancelOnFailCancelsSubJobs exercises the
+// CancelOnFail=true + FanOutFailed branch inside completeFanOut.
+func TestWorker_CompleteFanOut_CancelOnFailCancelsSubJobs(t *testing.T) {
+	cancelSubJobsCalled := make(chan string, 1)
+
+	mock := &mockStorage{
+		updateFanOutStatusFunc: func(_ context.Context, _ string, _ core.FanOutStatus) (bool, error) {
+			return true, nil
+		},
+		resumeJobFunc: func(_ context.Context, _ string) (bool, error) {
+			return true, nil
+		},
+		cancelSubJobsFunc: func(_ context.Context, fanOutID string) (int64, error) {
+			cancelSubJobsCalled <- fanOutID
+			return 2, nil
+		},
+	}
+	q := queue.New(mock)
+	w := NewWorker(q, WithStorageRetry(RetryConfig{MaxAttempts: 1}))
+
+	fo := &core.FanOut{
+		ID:           "fo-10",
+		ParentJobID:  "parent-job-10",
+		CancelOnFail: true,
+	}
+
+	err := w.completeFanOut(context.Background(), fo, core.FanOutFailed)
+	require.NoError(t, err)
+
+	select {
+	case id := <-cancelSubJobsCalled:
+		assert.Equal(t, "fo-10", id)
+	case <-time.After(time.Second):
+		t.Fatal("CancelSubJobs was not called with CancelOnFail=true")
+	}
+}
+
+// TestWorker_CompleteFanOut_ParentNotInWaitingStatus exercises the warning
+// path when ResumeJob returns (false, nil) — parent was not waiting.
+func TestWorker_CompleteFanOut_ParentNotInWaitingStatus(t *testing.T) {
+	mock := &mockStorage{
+		updateFanOutStatusFunc: func(_ context.Context, _ string, _ core.FanOutStatus) (bool, error) {
+			return true, nil
+		},
+		resumeJobFunc: func(_ context.Context, _ string) (bool, error) {
+			return false, nil // parent not in waiting status
+		},
+	}
+	q := queue.New(mock)
+	w := NewWorker(q, WithStorageRetry(RetryConfig{MaxAttempts: 1}))
+
+	fo := &core.FanOut{
+		ID:          "fo-11",
+		ParentJobID: "parent-job-11",
+	}
+
+	// Should log a warning but return nil (not an error).
+	err := w.completeFanOut(context.Background(), fo, core.FanOutCompleted)
+	assert.NoError(t, err)
+}
+
+// TestWorker_HandleSubJobCompletion_FullFlow_Succeeded wires a real fan-out
+// counter increment into handleSubJobCompletion to exercise the path where
+// IncrementFanOutCompleted returns a non-nil FanOut that triggers completion.
+func TestWorker_HandleSubJobCompletion_FullFlow_Succeeded(t *testing.T) {
+	parentResumed := make(chan struct{}, 1)
+
+	fanOutID := "fo-full-1"
+	fo := &core.FanOut{
+		ID:             fanOutID,
+		ParentJobID:    "parent-full-1",
+		TotalCount:     1,
+		CompletedCount: 1, // this increment makes it complete
+		FailedCount:    0,
+		CancelledCount: 0,
+		Strategy:       core.StrategyCollectAll,
+	}
+
+	mock := &mockStorage{
+		incrementCompletedFunc: func(_ context.Context, _ string) (*core.FanOut, error) {
+			return fo, nil
+		},
+		updateFanOutStatusFunc: func(_ context.Context, _ string, _ core.FanOutStatus) (bool, error) {
+			return true, nil
+		},
+		resumeJobFunc: func(_ context.Context, _ string) (bool, error) {
+			parentResumed <- struct{}{}
+			return true, nil
+		},
+	}
+	q := queue.New(mock)
+	w := NewWorker(q, WithStorageRetry(RetryConfig{MaxAttempts: 1}))
+
+	job := &core.Job{ID: "sub-job-1", FanOutID: &fanOutID}
+
+	err := w.handleSubJobCompletion(context.Background(), job, true)
+	require.NoError(t, err)
+
+	select {
+	case <-parentResumed:
+		// completeFanOut was called and parent was resumed.
+	case <-time.After(time.Second):
+		t.Fatal("parent was not resumed after fan-out completion")
+	}
+}
+
+// TestWorker_HandleSubJobCompletion_FullFlow_Failed wires IncrementFanOutFailed
+// to return a FanOut that is now fully accounted for (failed path).
+func TestWorker_HandleSubJobCompletion_FullFlow_Failed(t *testing.T) {
+	parentResumed := make(chan struct{}, 1)
+
+	fanOutID := "fo-full-2"
+	fo := &core.FanOut{
+		ID:             fanOutID,
+		ParentJobID:    "parent-full-2",
+		TotalCount:     1,
+		CompletedCount: 0,
+		FailedCount:    1,
+		CancelledCount: 0,
+		Strategy:       core.StrategyCollectAll,
+	}
+
+	mock := &mockStorage{
+		incrementFailedFunc: func(_ context.Context, _ string) (*core.FanOut, error) {
+			return fo, nil
+		},
+		updateFanOutStatusFunc: func(_ context.Context, _ string, _ core.FanOutStatus) (bool, error) {
+			return true, nil
+		},
+		resumeJobFunc: func(_ context.Context, _ string) (bool, error) {
+			parentResumed <- struct{}{}
+			return true, nil
+		},
+	}
+	q := queue.New(mock)
+	w := NewWorker(q, WithStorageRetry(RetryConfig{MaxAttempts: 1}))
+
+	job := &core.Job{ID: "sub-job-2", FanOutID: &fanOutID}
+
+	err := w.handleSubJobCompletion(context.Background(), job, false)
+	require.NoError(t, err)
+
+	select {
+	case <-parentResumed:
+		// completeFanOut called via the failed path.
+	case <-time.After(time.Second):
+		t.Fatal("parent was not resumed after fan-out failure")
+	}
+}
+
+// TestWorker_CheckFanOutCompletion_FailFastAllDone exercises the
+// StrategyFailFast branch when all jobs are done and FailedCount > 0.
+func TestWorker_CheckFanOutCompletion_FailFastAllDone(t *testing.T) {
+	fanOutUpdated := make(chan core.FanOutStatus, 1)
+
+	mock := &mockStorage{
+		updateFanOutStatusFunc: func(_ context.Context, _ string, status core.FanOutStatus) (bool, error) {
+			fanOutUpdated <- status
+			return true, nil
+		},
+		resumeJobFunc: func(_ context.Context, _ string) (bool, error) {
+			return true, nil
+		},
+	}
+	q := queue.New(mock)
+	w := NewWorker(q, WithStorageRetry(RetryConfig{MaxAttempts: 1}))
+
+	// All done, 1 succeeded and 1 failed; FailFast → FanOutFailed.
+	fo := &core.FanOut{
+		ID:             "fo-ff-done",
+		ParentJobID:    "parent-ff-done",
+		TotalCount:     2,
+		CompletedCount: 1,
+		FailedCount:    1,
+		CancelledCount: 0,
+		Strategy:       core.StrategyFailFast,
+	}
+
+	err := w.checkFanOutCompletion(context.Background(), fo)
+	require.NoError(t, err)
+
+	select {
+	case status := <-fanOutUpdated:
+		assert.Equal(t, core.FanOutFailed, status)
+	case <-time.After(time.Second):
+		t.Fatal("UpdateFanOutStatus was not called for FailFast all-done path")
 	}
 }
