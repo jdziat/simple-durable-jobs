@@ -1,6 +1,6 @@
 ---
-layout: default
-title: Getting Started
+title: "Getting Started"
+weight: 1
 ---
 
 # Getting Started
@@ -147,6 +147,8 @@ worker := queue.NewWorker(
     jobs.WithScheduler(true),
 )
 ```
+
+> **Note:** When `Concurrency()` is used inside `WorkerQueue()`, it applies only to that queue. Each queue independently tracks how many jobs it has running and only dequeues more when below its limit.
 
 ## Durable Workflows
 
@@ -297,8 +299,49 @@ Run multiple workers for horizontal scaling:
 
 Each worker will process jobs from the queue without duplicates.
 
+### Stale Lock Reaper
+
+Workers automatically reclaim jobs stuck in "running" status when their lock expires (e.g., after a worker crash). This runs in the background with configurable intervals:
+
+```go
+worker := queue.NewWorker(
+    jobs.WithStaleLockInterval(5 * time.Minute), // How often to check (default: 5min)
+    jobs.WithStaleLockAge(45 * time.Minute),      // How old a lock must be (default: 45min)
+)
+```
+
+Set `WithStaleLockInterval(0)` to disable the reaper.
+
+### Connection Pool Configuration
+
+For production deployments, tune the database connection pool:
+
+```go
+// Use a preset
+storage, err := jobs.NewGormStorageWithPool(db, jobs.HighConcurrencyPoolConfig())
+
+// Or customize individual settings
+storage, err := jobs.NewGormStorageWithPool(db,
+    jobs.MaxOpenConns(50),
+    jobs.MaxIdleConns(20),
+    jobs.ConnMaxLifetime(10 * time.Minute),
+    jobs.ConnMaxIdleTime(2 * time.Minute),
+)
+```
+
+Available presets:
+
+| Preset | MaxOpen | MaxIdle | MaxLifetime | MaxIdleTime | Use Case |
+|--------|---------|---------|-------------|-------------|----------|
+| `DefaultPoolConfig()` | 25 | 10 | 5min | 1min | General purpose |
+| `HighConcurrencyPoolConfig()` | 100 | 25 | 10min | 2min | 50+ workers, high volume |
+| `LowLatencyPoolConfig()` | 50 | 40 | 15min | 5min | Latency-sensitive |
+| `ResourceConstrainedPoolConfig()` | 10 | 5 | 3min | 30s | Limited DB resources |
+
 ## Next Steps
 
-- [API Reference](./api-reference/) - Complete API documentation
-- [Examples](./examples/) - More code examples
+- [API Reference](../api-reference/) - Complete API documentation
+- [Examples](../examples/) - More code examples
+- [Embedded Web UI](../embedded-ui/) - Dashboard setup and configuration
+- [Advanced Topics](../advanced/) - Stale lock reaper, pool configuration, storage retry
 - [GitHub](https://github.com/jdziat/simple-durable-jobs) - Source code and issues

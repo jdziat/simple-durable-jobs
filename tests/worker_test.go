@@ -23,7 +23,7 @@ func setupWorkerTestQueue(t *testing.T) (*jobs.Queue, jobs.Storage) {
 	workerTestCounter++
 	dbPath := fmt.Sprintf("/tmp/jobs_worker_test_%d_%d.db", os.Getpid(), workerTestCounter)
 	t.Cleanup(func() {
-		os.Remove(dbPath)
+		_ = os.Remove(dbPath)
 	})
 
 	db, err := gorm.Open(sqlite.Open(dbPath), &gorm.Config{
@@ -55,7 +55,7 @@ func TestWorker_ProcessesJob(t *testing.T) {
 	require.NoError(t, err)
 
 	worker := queue.NewWorker()
-	go worker.Start(ctx)
+	go func() { _ = worker.Start(ctx) }()
 
 	// Poll for completion
 	for i := 0; i < 50; i++ {
@@ -82,7 +82,7 @@ func TestWorker_MarksJobComplete(t *testing.T) {
 	require.NoError(t, err)
 
 	worker := queue.NewWorker()
-	go worker.Start(ctx)
+	go func() { _ = worker.Start(ctx) }()
 
 	// Poll for completion
 	var job *jobs.Job
@@ -113,7 +113,7 @@ func TestWorker_HandlesJobError(t *testing.T) {
 	require.NoError(t, err)
 
 	worker := queue.NewWorker()
-	go worker.Start(ctx)
+	go func() { _ = worker.Start(ctx) }()
 
 	// Poll for failure
 	var job *jobs.Job
@@ -149,7 +149,7 @@ func TestWorker_RetriesOnError(t *testing.T) {
 	require.NoError(t, err)
 
 	worker := queue.NewWorker()
-	go worker.Start(ctx)
+	go func() { _ = worker.Start(ctx) }()
 
 	// Poll for completion
 	var job *jobs.Job
@@ -182,7 +182,7 @@ func TestWorker_NoRetryError(t *testing.T) {
 	require.NoError(t, err)
 
 	worker := queue.NewWorker()
-	go worker.Start(ctx)
+	go func() { _ = worker.Start(ctx) }()
 
 	// Poll for failure
 	var job *jobs.Job
@@ -219,7 +219,7 @@ func TestWorker_RetryAfterError(t *testing.T) {
 	require.NoError(t, err)
 
 	worker := queue.NewWorker()
-	go worker.Start(ctx)
+	go func() { _ = worker.Start(ctx) }()
 
 	// Poll for completion
 	var job *jobs.Job
@@ -252,7 +252,7 @@ func TestWorker_PanicRecovery(t *testing.T) {
 	require.NoError(t, err)
 
 	worker := queue.NewWorker()
-	go worker.Start(ctx)
+	go func() { _ = worker.Start(ctx) }()
 
 	// Poll for failure - use longer timeout
 	var job *jobs.Job
@@ -311,7 +311,7 @@ func TestWorker_ConcurrentProcessing(t *testing.T) {
 
 	// Worker with concurrency 3
 	worker := queue.NewWorker(jobs.WorkerQueue("default", jobs.Concurrency(3)))
-	go worker.Start(ctx)
+	go func() { _ = worker.Start(ctx) }()
 
 	// Wait for all jobs
 	for i := 0; i < 100; i++ {
@@ -351,7 +351,7 @@ func TestWorker_MultipleQueues(t *testing.T) {
 
 	// Worker only processes "high" queue
 	worker := queue.NewWorker(jobs.WorkerQueue("high", jobs.Concurrency(1)))
-	go worker.Start(ctx)
+	go func() { _ = worker.Start(ctx) }()
 
 	time.Sleep(500 * time.Millisecond)
 
@@ -379,7 +379,7 @@ func TestWorker_ContextCancellation(t *testing.T) {
 
 	worker := queue.NewWorker()
 	go func() {
-		worker.Start(ctx)
+		_ = worker.Start(ctx)
 		close(done)
 	}()
 
@@ -423,7 +423,7 @@ func TestWorker_UnknownHandler(t *testing.T) {
 	require.NoError(t, err)
 
 	worker := queue.NewWorker()
-	go worker.Start(ctx)
+	go func() { _ = worker.Start(ctx) }()
 
 	// Poll for failure
 	var updatedJob *jobs.Job
@@ -464,7 +464,7 @@ func TestWorkerQueue_ConcurrencyIsolation(t *testing.T) {
 		jobs.WorkerQueue("default", jobs.Concurrency(8)),
 		jobs.WorkerQueue("other", jobs.Concurrency(2)),
 	)
-	go w.Start(ctx)
+	go func() { _ = w.Start(ctx) }()
 
 	// With concurrency=8 on default, all 6 jobs should complete within ~1s
 	// With the bug (concurrency=2), it would take ~1.5s minimum
@@ -520,7 +520,7 @@ func TestWorker_ReleasesStaleRunningJobs(t *testing.T) {
 		jobs.WithStaleLockInterval(1*time.Second),
 		jobs.WithStaleLockAge(30*time.Minute),
 	)
-	go worker.Start(ctx)
+	go func() { _ = worker.Start(ctx) }()
 
 	// The reaper should detect the stale lock, reset to pending, and the worker should process it
 	for i := 0; i < 100; i++ {

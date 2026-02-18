@@ -1,6 +1,6 @@
 ---
-layout: default
-title: Examples
+title: "Examples"
+weight: 3
 ---
 
 # Examples
@@ -447,8 +447,8 @@ func main() {
         log.Printf("[FAIL] %s: %v", job.ID[:8], err)
     })
 
-    queue.OnRetry(func(ctx context.Context, job *jobs.Job, err error) {
-        log.Printf("[RETRY] %s attempt %d: %v", job.ID[:8], job.Attempt, err)
+    queue.OnRetry(func(ctx context.Context, job *jobs.Job, attempt int, err error) {
+        log.Printf("[RETRY] %s attempt %d: %v", job.ID[:8], attempt, err)
     })
 
     // Or use event stream for async processing
@@ -526,6 +526,85 @@ Run multiple instances:
 ```
 
 [View full example](https://github.com/jdziat/simple-durable-jobs/tree/main/examples/distributed)
+
+---
+
+## Pause/Resume
+
+Control job execution at the worker, queue, and individual job level.
+
+```go
+// Graceful pause: finish running jobs, stop picking new ones
+worker.Pause(jobs.PauseModeGraceful)
+
+// Wait for all running jobs to complete (with timeout)
+if err := worker.WaitForPause(30 * time.Second); err != nil {
+    log.Printf("Timeout waiting for jobs: %v", err)
+}
+
+worker.Resume()
+
+// Aggressive pause: cancel running jobs immediately
+worker.Pause(jobs.PauseModeAggressive)
+
+// Cancel a specific running job
+cancelled := worker.CancelJob(jobID)
+
+// Pause/resume at queue level
+queue.PauseQueue(ctx, "emails")
+queue.ResumeQueue(ctx, "emails")
+
+// Pause/resume individual jobs
+queue.PauseJob(ctx, jobID)
+queue.ResumeJob(ctx, jobID)
+```
+
+---
+
+## Embedded Web UI
+
+Mount a full-featured monitoring dashboard into any Go HTTP server.
+
+```go
+import "github.com/jdziat/simple-durable-jobs/ui"
+
+ctx, cancel := context.WithCancel(context.Background())
+defer cancel()
+
+mux := http.NewServeMux()
+mux.Handle("/jobs/", http.StripPrefix("/jobs", ui.Handler(storage,
+    ui.WithQueue(queue),                       // Enable event streaming and scheduled jobs
+    ui.WithContext(ctx),                        // Graceful shutdown for background workers
+    ui.WithStatsRetention(7 * 24 * time.Hour), // Keep stats for 7 days
+    ui.WithMiddleware(func(next http.Handler) http.Handler {
+        return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+            // Add authentication here
+            next.ServeHTTP(w, r)
+        })
+    }),
+)))
+
+log.Fatal(http.ListenAndServe(":8080", mux))
+```
+
+---
+
+## Connection Pool Configuration
+
+Tune database connection pooling for your workload.
+
+```go
+// Use a preset for high-concurrency workloads
+storage, err := jobs.NewGormStorageWithPool(db, jobs.HighConcurrencyPoolConfig())
+
+// Or customize individual pool settings
+storage, err := jobs.NewGormStorageWithPool(db,
+    jobs.MaxOpenConns(50),
+    jobs.MaxIdleConns(20),
+    jobs.ConnMaxLifetime(10 * time.Minute),
+    jobs.ConnMaxIdleTime(2 * time.Minute),
+)
+```
 
 ---
 

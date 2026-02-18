@@ -37,8 +37,8 @@ func TestGormStorage_PauseJob_AlreadyPaused(t *testing.T) {
 	ctx := context.Background()
 
 	job := &jobs.Job{Type: "test-job", Queue: "default"}
-	store.Enqueue(ctx, job)
-	store.PauseJob(ctx, job.ID)
+	_ = store.Enqueue(ctx, job)
+	_ = store.PauseJob(ctx, job.ID)
 
 	err := store.PauseJob(ctx, job.ID)
 	assert.ErrorIs(t, err, jobs.ErrJobAlreadyPaused)
@@ -49,11 +49,11 @@ func TestGormStorage_PauseJob_CannotPauseCompleted(t *testing.T) {
 	ctx := context.Background()
 
 	job := &jobs.Job{Type: "test-job", Queue: "default"}
-	store.Enqueue(ctx, job)
+	_ = store.Enqueue(ctx, job)
 
 	dequeued, _ := store.Dequeue(ctx, []string{"default"}, "worker-1")
 	require.NotNil(t, dequeued)
-	store.Complete(ctx, job.ID, "worker-1")
+	_ = store.Complete(ctx, job.ID, "worker-1")
 
 	err := store.PauseJob(ctx, job.ID)
 	assert.ErrorIs(t, err, jobs.ErrCannotPauseStatus)
@@ -64,8 +64,8 @@ func TestGormStorage_UnpauseJob(t *testing.T) {
 	ctx := context.Background()
 
 	job := &jobs.Job{Type: "test-job", Queue: "default"}
-	store.Enqueue(ctx, job)
-	store.PauseJob(ctx, job.ID)
+	_ = store.Enqueue(ctx, job)
+	_ = store.PauseJob(ctx, job.ID)
 
 	err := store.UnpauseJob(ctx, job.ID)
 	require.NoError(t, err)
@@ -79,7 +79,7 @@ func TestGormStorage_UnpauseJob_NotPaused(t *testing.T) {
 	ctx := context.Background()
 
 	job := &jobs.Job{Type: "test-job", Queue: "default"}
-	store.Enqueue(ctx, job)
+	_ = store.Enqueue(ctx, job)
 
 	err := store.UnpauseJob(ctx, job.ID)
 	assert.ErrorIs(t, err, jobs.ErrJobNotPaused)
@@ -92,12 +92,12 @@ func TestGormStorage_GetPausedJobs(t *testing.T) {
 	job1 := &jobs.Job{Type: "job1", Queue: "emails"}
 	job2 := &jobs.Job{Type: "job2", Queue: "emails"}
 	job3 := &jobs.Job{Type: "job3", Queue: "other"}
-	store.Enqueue(ctx, job1)
-	store.Enqueue(ctx, job2)
-	store.Enqueue(ctx, job3)
+	_ = store.Enqueue(ctx, job1)
+	_ = store.Enqueue(ctx, job2)
+	_ = store.Enqueue(ctx, job3)
 
-	store.PauseJob(ctx, job1.ID)
-	store.PauseJob(ctx, job3.ID)
+	_ = store.PauseJob(ctx, job1.ID)
+	_ = store.PauseJob(ctx, job3.ID)
 
 	paused, err := store.GetPausedJobs(ctx, "emails")
 	require.NoError(t, err)
@@ -110,12 +110,12 @@ func TestGormStorage_IsJobPaused(t *testing.T) {
 	ctx := context.Background()
 
 	job := &jobs.Job{Type: "test-job", Queue: "default"}
-	store.Enqueue(ctx, job)
+	_ = store.Enqueue(ctx, job)
 
 	paused, _ := store.IsJobPaused(ctx, job.ID)
 	assert.False(t, paused)
 
-	store.PauseJob(ctx, job.ID)
+	_ = store.PauseJob(ctx, job.ID)
 
 	paused, _ = store.IsJobPaused(ctx, job.ID)
 	assert.True(t, paused)
@@ -137,7 +137,7 @@ func TestGormStorage_PauseQueue_AlreadyPaused(t *testing.T) {
 	store := setupStorageTest(t)
 	ctx := context.Background()
 
-	store.PauseQueue(ctx, "emails")
+	_ = store.PauseQueue(ctx, "emails")
 
 	err := store.PauseQueue(ctx, "emails")
 	assert.ErrorIs(t, err, jobs.ErrQueueAlreadyPaused)
@@ -147,7 +147,7 @@ func TestGormStorage_UnpauseQueue(t *testing.T) {
 	store := setupStorageTest(t)
 	ctx := context.Background()
 
-	store.PauseQueue(ctx, "emails")
+	_ = store.PauseQueue(ctx, "emails")
 
 	err := store.UnpauseQueue(ctx, "emails")
 	require.NoError(t, err)
@@ -168,8 +168,8 @@ func TestGormStorage_GetPausedQueues(t *testing.T) {
 	store := setupStorageTest(t)
 	ctx := context.Background()
 
-	store.PauseQueue(ctx, "emails")
-	store.PauseQueue(ctx, "notifications")
+	_ = store.PauseQueue(ctx, "emails")
+	_ = store.PauseQueue(ctx, "notifications")
 
 	queues, err := store.GetPausedQueues(ctx)
 	require.NoError(t, err)
@@ -182,7 +182,7 @@ func TestGormStorage_RefreshQueueStates(t *testing.T) {
 	store := setupStorageTest(t)
 	ctx := context.Background()
 
-	store.PauseQueue(ctx, "emails")
+	_ = store.PauseQueue(ctx, "emails")
 
 	states, err := store.RefreshQueueStates(ctx)
 	require.NoError(t, err)
@@ -198,11 +198,11 @@ func TestGormStorage_Dequeue_SkipsPausedQueues(t *testing.T) {
 	// Create jobs in two queues
 	job1 := &jobs.Job{Type: "job1", Queue: "emails"}
 	job2 := &jobs.Job{Type: "job2", Queue: "other"}
-	store.Enqueue(ctx, job1)
-	store.Enqueue(ctx, job2)
+	_ = store.Enqueue(ctx, job1)
+	_ = store.Enqueue(ctx, job2)
 
 	// Pause emails queue
-	store.PauseQueue(ctx, "emails")
+	_ = store.PauseQueue(ctx, "emails")
 
 	// Dequeue from both queues - should only get the "other" job
 	dequeued, err := store.Dequeue(ctx, []string{"emails", "other"}, "worker-1")

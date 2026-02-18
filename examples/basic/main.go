@@ -90,7 +90,7 @@ func main() {
 
 	go func() {
 		fmt.Println("Starting worker...")
-		worker.Start(workerCtx)
+		_ = worker.Start(workerCtx)
 	}()
 
 	// Wait for interrupt signal
