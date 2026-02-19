@@ -3,8 +3,6 @@ package jobs_test
 import (
 	"context"
 	"errors"
-	"fmt"
-	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -13,31 +11,11 @@ import (
 	"github.com/jdziat/simple-durable-jobs"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"gorm.io/driver/sqlite"
-	"gorm.io/gorm"
-	"gorm.io/gorm/logger"
 )
 
-var integrationTestCounter int
-
 func setupIntegrationQueue(t *testing.T) (*jobs.Queue, jobs.Storage) {
-	integrationTestCounter++
-	dbPath := fmt.Sprintf("/tmp/jobs_integration_test_%d_%d.db", os.Getpid(), integrationTestCounter)
-	t.Cleanup(func() {
-		_ = os.Remove(dbPath)
-	})
-
-	db, err := gorm.Open(sqlite.Open(dbPath), &gorm.Config{
-		Logger: logger.Default.LogMode(logger.Silent),
-	})
-	require.NoError(t, err)
-
-	store := jobs.NewGormStorage(db)
-	err = store.Migrate(context.Background())
-	require.NoError(t, err)
-
-	queue := jobs.New(store)
-	return queue, store
+	t.Helper()
+	return openIntegrationQueue(t)
 }
 
 func TestIntegration_WorkflowWithNestedCalls(t *testing.T) {
