@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.0.1](https://github.com/jdziat/simple-durable-jobs/compare/v1.0.0...v1.0.1) (2026-02-19)
+
+
+### Bug Fixes
+
+* **ci:** create docs/static dir before copying demo ([#5](https://github.com/jdziat/simple-durable-jobs/issues/5)) ([ec29398](https://github.com/jdziat/simple-durable-jobs/commit/ec29398bcbc8784de59d99ff87751e2ffc361d16))
+
 ## 1.0.0 (2026-02-19)
 
 
