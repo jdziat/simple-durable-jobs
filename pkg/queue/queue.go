@@ -74,6 +74,15 @@ func (q *Queue) Register(name string, fn any, opts ...Option) {
 		panic(fmt.Sprintf("jobs: handler for %q: %v", name, err))
 	}
 
+	// Apply registration options (e.g. Timeout)
+	if len(opts) > 0 {
+		o := NewOptions()
+		for _, opt := range opts {
+			opt.Apply(o)
+		}
+		h.Timeout = o.Timeout
+	}
+
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.handlers[name] = h

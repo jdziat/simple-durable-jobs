@@ -59,6 +59,11 @@ const (
 	// JobsServiceListScheduledJobsProcedure is the fully-qualified name of the JobsService's
 	// ListScheduledJobs RPC.
 	JobsServiceListScheduledJobsProcedure = "/jobs.v1.JobsService/ListScheduledJobs"
+	// JobsServiceGetWorkflowProcedure is the fully-qualified name of the JobsService's GetWorkflow RPC.
+	JobsServiceGetWorkflowProcedure = "/jobs.v1.JobsService/GetWorkflow"
+	// JobsServiceListWorkflowsProcedure is the fully-qualified name of the JobsService's ListWorkflows
+	// RPC.
+	JobsServiceListWorkflowsProcedure = "/jobs.v1.JobsService/ListWorkflows"
 	// JobsServiceWatchEventsProcedure is the fully-qualified name of the JobsService's WatchEvents RPC.
 	JobsServiceWatchEventsProcedure = "/jobs.v1.JobsService/WatchEvents"
 )
@@ -80,6 +85,9 @@ type JobsServiceClient interface {
 	PurgeQueue(context.Context, *connect.Request[v1.PurgeQueueRequest]) (*connect.Response[v1.PurgeQueueResponse], error)
 	// Scheduled
 	ListScheduledJobs(context.Context, *connect.Request[v1.ListScheduledJobsRequest]) (*connect.Response[v1.ListScheduledJobsResponse], error)
+	// Workflows
+	GetWorkflow(context.Context, *connect.Request[v1.GetWorkflowRequest]) (*connect.Response[v1.GetWorkflowResponse], error)
+	ListWorkflows(context.Context, *connect.Request[v1.ListWorkflowsRequest]) (*connect.Response[v1.ListWorkflowsResponse], error)
 	// Real-time
 	WatchEvents(context.Context, *connect.Request[v1.WatchEventsRequest]) (*connect.ServerStreamForClient[v1.Event], error)
 }
@@ -161,6 +169,18 @@ func NewJobsServiceClient(httpClient connect.HTTPClient, baseURL string, opts ..
 			connect.WithSchema(jobsServiceMethods.ByName("ListScheduledJobs")),
 			connect.WithClientOptions(opts...),
 		),
+		getWorkflow: connect.NewClient[v1.GetWorkflowRequest, v1.GetWorkflowResponse](
+			httpClient,
+			baseURL+JobsServiceGetWorkflowProcedure,
+			connect.WithSchema(jobsServiceMethods.ByName("GetWorkflow")),
+			connect.WithClientOptions(opts...),
+		),
+		listWorkflows: connect.NewClient[v1.ListWorkflowsRequest, v1.ListWorkflowsResponse](
+			httpClient,
+			baseURL+JobsServiceListWorkflowsProcedure,
+			connect.WithSchema(jobsServiceMethods.ByName("ListWorkflows")),
+			connect.WithClientOptions(opts...),
+		),
 		watchEvents: connect.NewClient[v1.WatchEventsRequest, v1.Event](
 			httpClient,
 			baseURL+JobsServiceWatchEventsProcedure,
@@ -183,6 +203,8 @@ type jobsServiceClient struct {
 	listQueues        *connect.Client[v1.ListQueuesRequest, v1.ListQueuesResponse]
 	purgeQueue        *connect.Client[v1.PurgeQueueRequest, v1.PurgeQueueResponse]
 	listScheduledJobs *connect.Client[v1.ListScheduledJobsRequest, v1.ListScheduledJobsResponse]
+	getWorkflow       *connect.Client[v1.GetWorkflowRequest, v1.GetWorkflowResponse]
+	listWorkflows     *connect.Client[v1.ListWorkflowsRequest, v1.ListWorkflowsResponse]
 	watchEvents       *connect.Client[v1.WatchEventsRequest, v1.Event]
 }
 
@@ -241,6 +263,16 @@ func (c *jobsServiceClient) ListScheduledJobs(ctx context.Context, req *connect.
 	return c.listScheduledJobs.CallUnary(ctx, req)
 }
 
+// GetWorkflow calls jobs.v1.JobsService.GetWorkflow.
+func (c *jobsServiceClient) GetWorkflow(ctx context.Context, req *connect.Request[v1.GetWorkflowRequest]) (*connect.Response[v1.GetWorkflowResponse], error) {
+	return c.getWorkflow.CallUnary(ctx, req)
+}
+
+// ListWorkflows calls jobs.v1.JobsService.ListWorkflows.
+func (c *jobsServiceClient) ListWorkflows(ctx context.Context, req *connect.Request[v1.ListWorkflowsRequest]) (*connect.Response[v1.ListWorkflowsResponse], error) {
+	return c.listWorkflows.CallUnary(ctx, req)
+}
+
 // WatchEvents calls jobs.v1.JobsService.WatchEvents.
 func (c *jobsServiceClient) WatchEvents(ctx context.Context, req *connect.Request[v1.WatchEventsRequest]) (*connect.ServerStreamForClient[v1.Event], error) {
 	return c.watchEvents.CallServerStream(ctx, req)
@@ -263,6 +295,9 @@ type JobsServiceHandler interface {
 	PurgeQueue(context.Context, *connect.Request[v1.PurgeQueueRequest]) (*connect.Response[v1.PurgeQueueResponse], error)
 	// Scheduled
 	ListScheduledJobs(context.Context, *connect.Request[v1.ListScheduledJobsRequest]) (*connect.Response[v1.ListScheduledJobsResponse], error)
+	// Workflows
+	GetWorkflow(context.Context, *connect.Request[v1.GetWorkflowRequest]) (*connect.Response[v1.GetWorkflowResponse], error)
+	ListWorkflows(context.Context, *connect.Request[v1.ListWorkflowsRequest]) (*connect.Response[v1.ListWorkflowsResponse], error)
 	// Real-time
 	WatchEvents(context.Context, *connect.Request[v1.WatchEventsRequest], *connect.ServerStream[v1.Event]) error
 }
@@ -340,6 +375,18 @@ func NewJobsServiceHandler(svc JobsServiceHandler, opts ...connect.HandlerOption
 		connect.WithSchema(jobsServiceMethods.ByName("ListScheduledJobs")),
 		connect.WithHandlerOptions(opts...),
 	)
+	jobsServiceGetWorkflowHandler := connect.NewUnaryHandler(
+		JobsServiceGetWorkflowProcedure,
+		svc.GetWorkflow,
+		connect.WithSchema(jobsServiceMethods.ByName("GetWorkflow")),
+		connect.WithHandlerOptions(opts...),
+	)
+	jobsServiceListWorkflowsHandler := connect.NewUnaryHandler(
+		JobsServiceListWorkflowsProcedure,
+		svc.ListWorkflows,
+		connect.WithSchema(jobsServiceMethods.ByName("ListWorkflows")),
+		connect.WithHandlerOptions(opts...),
+	)
 	jobsServiceWatchEventsHandler := connect.NewServerStreamHandler(
 		JobsServiceWatchEventsProcedure,
 		svc.WatchEvents,
@@ -370,6 +417,10 @@ func NewJobsServiceHandler(svc JobsServiceHandler, opts ...connect.HandlerOption
 			jobsServicePurgeQueueHandler.ServeHTTP(w, r)
 		case JobsServiceListScheduledJobsProcedure:
 			jobsServiceListScheduledJobsHandler.ServeHTTP(w, r)
+		case JobsServiceGetWorkflowProcedure:
+			jobsServiceGetWorkflowHandler.ServeHTTP(w, r)
+		case JobsServiceListWorkflowsProcedure:
+			jobsServiceListWorkflowsHandler.ServeHTTP(w, r)
 		case JobsServiceWatchEventsProcedure:
 			jobsServiceWatchEventsHandler.ServeHTTP(w, r)
 		default:
@@ -423,6 +474,14 @@ func (UnimplementedJobsServiceHandler) PurgeQueue(context.Context, *connect.Requ
 
 func (UnimplementedJobsServiceHandler) ListScheduledJobs(context.Context, *connect.Request[v1.ListScheduledJobsRequest]) (*connect.Response[v1.ListScheduledJobsResponse], error) {
 	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("jobs.v1.JobsService.ListScheduledJobs is not implemented"))
+}
+
+func (UnimplementedJobsServiceHandler) GetWorkflow(context.Context, *connect.Request[v1.GetWorkflowRequest]) (*connect.Response[v1.GetWorkflowResponse], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("jobs.v1.JobsService.GetWorkflow is not implemented"))
+}
+
+func (UnimplementedJobsServiceHandler) ListWorkflows(context.Context, *connect.Request[v1.ListWorkflowsRequest]) (*connect.Response[v1.ListWorkflowsResponse], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("jobs.v1.JobsService.ListWorkflows is not implemented"))
 }
 
 func (UnimplementedJobsServiceHandler) WatchEvents(context.Context, *connect.Request[v1.WatchEventsRequest], *connect.ServerStream[v1.Event]) error {

@@ -22,6 +22,10 @@ import {
   ListQueuesResponse,
   PurgeQueueResponse,
   ListScheduledJobsResponse,
+  FanOut as ProtoFanOut,
+  GetWorkflowResponse,
+  ListWorkflowsResponse,
+  WorkflowSummary,
 } from './gen/jobs/v1/jobs_pb.js'
 
 // ---------------------------------------------------------------------------
@@ -113,7 +117,7 @@ interface MockJob {
   id: string
   type: string
   queue: QueueName
-  status: Status
+  status: Status | 'cancelled'
   priority: number
   attempt: number
   maxRetries: number
@@ -122,6 +126,11 @@ interface MockJob {
   createdAt: Date
   startedAt: Date | null
   completedAt: Date | null
+  parentJobId?: string
+  rootJobId?: string
+  fanOutId?: string
+  fanOutIndex?: number
+  result?: Uint8Array
 }
 
 interface HistoryPoint {
@@ -130,8 +139,25 @@ interface HistoryPoint {
   failed: number
 }
 
+interface MockFanOut {
+  id: string
+  parentJobId: string
+  totalCount: number
+  completedCount: number
+  failedCount: number
+  cancelledCount: number
+  strategy: string
+  threshold: number
+  status: string
+  cancelOnFail: boolean
+  createdAt: Date
+  updatedAt: Date
+}
+
 const jobs: MockJob[] = []
 const historyPoints: HistoryPoint[] = []
+const workflowJobs: MockJob[] = []
+const fanOuts: MockFanOut[] = []
 
 function makeJob(overrides: Partial<MockJob> = {}): MockJob {
   const type = overrides.type ?? pick(JOB_TYPES)
@@ -151,8 +177,17 @@ function makeJob(overrides: Partial<MockJob> = {}): MockJob {
     args: overrides.args ?? jsonBytes(argsFn()),
     lastError: overrides.lastError ?? (status === 'failed' ? pick(ERROR_MESSAGES) : ''),
     createdAt,
-    startedAt: overrides.startedAt ?? (['running', 'completed', 'failed'].includes(status) ? new Date(createdAt.getTime() + randInt(1, 10) * 1000) : null),
-    completedAt: overrides.completedAt ?? (['completed', 'failed'].includes(status) ? new Date(createdAt.getTime() + randInt(10, 300) * 1000) : null),
+    startedAt: overrides.startedAt !== undefined
+      ? overrides.startedAt
+      : (['running', 'completed', 'failed'].includes(status as string) ? new Date(createdAt.getTime() + randInt(1, 10) * 1000) : null),
+    completedAt: overrides.completedAt !== undefined
+      ? overrides.completedAt
+      : (['completed', 'failed'].includes(status as string) ? new Date(createdAt.getTime() + randInt(10, 300) * 1000) : null),
+    parentJobId: overrides.parentJobId,
+    rootJobId: overrides.rootJobId,
+    fanOutId: overrides.fanOutId,
+    fanOutIndex: overrides.fanOutIndex,
+    result: overrides.result,
   }
 }
 
@@ -178,6 +213,291 @@ function seedHistory(): void {
       timestamp: minutesAgo(i),
       completed: randInt(2, 12),
       failed: randInt(0, 2),
+    })
+  }
+}
+
+// Seed workflow scenarios
+function seedWorkflows(): void {
+  // -------------------------------------------------------------------
+  // Scenario 1: Batch Order Processing (FailFast)
+  // Root job running, 5 sub-jobs (3 completed, 1 running, 1 pending)
+  // -------------------------------------------------------------------
+  const batchRootId = 'wf_batch_orders'
+  const batchFanOutId = 'fo_batch_orders'
+  const batchRootCreated = minutesAgo(30)
+  const batchRootStarted = minutesAgo(29)
+
+  workflowJobs.push(makeJob({
+    id: batchRootId,
+    type: 'process-batch-orders',
+    status: 'running',
+    queue: 'critical',
+    createdAt: batchRootCreated,
+    startedAt: batchRootStarted,
+    completedAt: null,
+    priority: 8,
+    attempt: 1,
+    maxRetries: 3,
+    args: jsonBytes({ batchId: 'BATCH-2024-001', orderCount: 5 }),
+    lastError: '',
+  }))
+
+  fanOuts.push({
+    id: batchFanOutId,
+    parentJobId: batchRootId,
+    totalCount: 5,
+    completedCount: 3,
+    failedCount: 0,
+    cancelledCount: 0,
+    strategy: 'fail_fast',
+    threshold: 0,
+    status: 'pending',
+    cancelOnFail: false,
+    createdAt: batchRootCreated,
+    updatedAt: minutesAgo(5),
+  })
+
+  // 3 completed sub-jobs (staggered)
+  for (let i = 0; i < 3; i++) {
+    const subCreated = new Date(batchRootStarted.getTime() + i * 90_000)
+    const subStarted = new Date(subCreated.getTime() + 2_000)
+    const subCompleted = new Date(subStarted.getTime() + 45_000)
+    workflowJobs.push(makeJob({
+      id: `sub_batch_${i + 1}`,
+      type: 'process-single-order',
+      status: 'completed',
+      queue: 'critical',
+      parentJobId: batchRootId,
+      rootJobId: batchRootId,
+      fanOutId: batchFanOutId,
+      fanOutIndex: i,
+      createdAt: subCreated,
+      startedAt: subStarted,
+      completedAt: subCompleted,
+      priority: 8,
+      attempt: 1,
+      maxRetries: 3,
+      args: jsonBytes({ orderId: `ORD-${10001 + i}`, items: randInt(1, 5) }),
+      lastError: '',
+    }))
+  }
+
+  // 1 running sub-job
+  const runningSubCreated = new Date(batchRootStarted.getTime() + 3 * 90_000)
+  const runningSubStarted = new Date(runningSubCreated.getTime() + 2_000)
+  workflowJobs.push(makeJob({
+    id: 'sub_batch_4',
+    type: 'process-single-order',
+    status: 'running',
+    queue: 'critical',
+    parentJobId: batchRootId,
+    rootJobId: batchRootId,
+    fanOutId: batchFanOutId,
+    fanOutIndex: 3,
+    createdAt: runningSubCreated,
+    startedAt: runningSubStarted,
+    completedAt: null,
+    priority: 8,
+    attempt: 1,
+    maxRetries: 3,
+    args: jsonBytes({ orderId: 'ORD-10004', items: 3 }),
+    lastError: '',
+  }))
+
+  // 1 pending sub-job
+  const pendingSubCreated = new Date(batchRootStarted.getTime() + 4 * 90_000)
+  workflowJobs.push(makeJob({
+    id: 'sub_batch_5',
+    type: 'process-single-order',
+    status: 'pending',
+    queue: 'critical',
+    parentJobId: batchRootId,
+    rootJobId: batchRootId,
+    fanOutId: batchFanOutId,
+    fanOutIndex: 4,
+    createdAt: pendingSubCreated,
+    startedAt: null,
+    completedAt: null,
+    priority: 8,
+    attempt: 0,
+    maxRetries: 3,
+    args: jsonBytes({ orderId: 'ORD-10005', items: 2 }),
+    lastError: '',
+  }))
+
+  // -------------------------------------------------------------------
+  // Scenario 2: ETL Pipeline (CollectAll) - all completed
+  // -------------------------------------------------------------------
+  const etlRootId = 'wf_etl_pipeline'
+  const etlFanOutId = 'fo_etl_pipeline'
+  const etlRootCreated = minutesAgo(45)
+  const etlRootStarted = minutesAgo(44)
+  const etlRootCompleted = minutesAgo(10)
+
+  workflowJobs.push(makeJob({
+    id: etlRootId,
+    type: 'etl-pipeline',
+    status: 'running',
+    queue: 'default',
+    createdAt: etlRootCreated,
+    startedAt: etlRootStarted,
+    completedAt: null,
+    priority: 5,
+    attempt: 1,
+    maxRetries: 3,
+    args: jsonBytes({ pipelineId: 'ETL-2024-Q1', source: 's3://data-lake/raw', destination: 'postgres://warehouse' }),
+    lastError: '',
+  }))
+
+  fanOuts.push({
+    id: etlFanOutId,
+    parentJobId: etlRootId,
+    totalCount: 4,
+    completedCount: 4,
+    failedCount: 0,
+    cancelledCount: 0,
+    strategy: 'collect_all',
+    threshold: 0,
+    status: 'completed',
+    cancelOnFail: false,
+    createdAt: etlRootCreated,
+    updatedAt: etlRootCompleted,
+  })
+
+  // 4 completed sub-jobs (staggered timing)
+  for (let i = 0; i < 4; i++) {
+    const subCreated = new Date(etlRootStarted.getTime() + i * 120_000)
+    const subStarted = new Date(subCreated.getTime() + 3_000)
+    const subCompleted = new Date(subStarted.getTime() + 8 * 60_000 + i * 30_000)
+    workflowJobs.push(makeJob({
+      id: `sub_etl_${i + 1}`,
+      type: 'transform-record-batch',
+      status: 'completed',
+      queue: 'default',
+      parentJobId: etlRootId,
+      rootJobId: etlRootId,
+      fanOutId: etlFanOutId,
+      fanOutIndex: i,
+      createdAt: subCreated,
+      startedAt: subStarted,
+      completedAt: subCompleted,
+      priority: 5,
+      attempt: 1,
+      maxRetries: 3,
+      args: jsonBytes({ batchIndex: i, recordCount: randInt(500, 2000), schema: 'orders_v2' }),
+      lastError: '',
+    }))
+  }
+
+  // -------------------------------------------------------------------
+  // Scenario 3: Failed Bulk Notifications (FailFast with cancellation)
+  // -------------------------------------------------------------------
+  const notifRootId = 'wf_failed_notifications'
+  const notifFanOutId = 'fo_failed_notifications'
+  const notifRootCreated = minutesAgo(20)
+  const notifRootStarted = minutesAgo(19)
+  const notifRootCompleted = minutesAgo(15)
+  const cancellationTime = minutesAgo(16)
+
+  workflowJobs.push(makeJob({
+    id: notifRootId,
+    type: 'send-bulk-notifications',
+    status: 'failed',
+    queue: 'emails',
+    createdAt: notifRootCreated,
+    startedAt: notifRootStarted,
+    completedAt: notifRootCompleted,
+    priority: 3,
+    attempt: 1,
+    maxRetries: 3,
+    args: jsonBytes({ campaignId: 'CAMP-2024-PROMO', recipientCount: 6 }),
+    lastError: 'fan-out failed: SMTP connection refused',
+  }))
+
+  fanOuts.push({
+    id: notifFanOutId,
+    parentJobId: notifRootId,
+    totalCount: 6,
+    completedCount: 2,
+    failedCount: 1,
+    cancelledCount: 3,
+    strategy: 'fail_fast',
+    threshold: 0,
+    status: 'failed',
+    cancelOnFail: true,
+    createdAt: notifRootCreated,
+    updatedAt: cancellationTime,
+  })
+
+  // 2 completed sub-jobs
+  for (let i = 0; i < 2; i++) {
+    const subCreated = new Date(notifRootStarted.getTime() + i * 30_000)
+    const subStarted = new Date(subCreated.getTime() + 1_000)
+    const subCompleted = new Date(subStarted.getTime() + 20_000)
+    workflowJobs.push(makeJob({
+      id: `sub_notif_${i + 1}`,
+      type: 'send-notification',
+      status: 'completed',
+      queue: 'emails',
+      parentJobId: notifRootId,
+      rootJobId: notifRootId,
+      fanOutId: notifFanOutId,
+      fanOutIndex: i,
+      createdAt: subCreated,
+      startedAt: subStarted,
+      completedAt: subCompleted,
+      priority: 3,
+      attempt: 1,
+      maxRetries: 3,
+      args: jsonBytes({ recipientId: `user_${1000 + i}`, channel: 'email', template: 'promo-2024' }),
+      lastError: '',
+    }))
+  }
+
+  // 1 failed sub-job
+  const failedSubCreated = new Date(notifRootStarted.getTime() + 2 * 30_000)
+  const failedSubStarted = new Date(failedSubCreated.getTime() + 1_000)
+  const failedSubCompleted = new Date(failedSubStarted.getTime() + 12_000)
+  workflowJobs.push(makeJob({
+    id: 'sub_notif_3',
+    type: 'send-notification',
+    status: 'failed',
+    queue: 'emails',
+    parentJobId: notifRootId,
+    rootJobId: notifRootId,
+    fanOutId: notifFanOutId,
+    fanOutIndex: 2,
+    createdAt: failedSubCreated,
+    startedAt: failedSubStarted,
+    completedAt: failedSubCompleted,
+    priority: 3,
+    attempt: 1,
+    maxRetries: 3,
+    args: jsonBytes({ recipientId: 'user_1002', channel: 'email', template: 'promo-2024' }),
+    lastError: 'SMTP connection refused',
+  }))
+
+  // 3 cancelled sub-jobs (startedAt null, completedAt = cancellation time)
+  for (let i = 0; i < 3; i++) {
+    const subCreated = new Date(notifRootStarted.getTime() + (3 + i) * 30_000)
+    workflowJobs.push({
+      id: `sub_notif_${4 + i}`,
+      type: 'send-notification',
+      status: 'cancelled',
+      queue: 'emails',
+      parentJobId: notifRootId,
+      rootJobId: notifRootId,
+      fanOutId: notifFanOutId,
+      fanOutIndex: 3 + i,
+      createdAt: subCreated,
+      startedAt: null,
+      completedAt: cancellationTime,
+      priority: 3,
+      attempt: 0,
+      maxRetries: 3,
+      args: jsonBytes({ recipientId: `user_${1003 + i}`, channel: 'email', template: 'promo-2024' }),
+      lastError: '',
     })
   }
 }
@@ -267,6 +587,7 @@ function ensureSimulation(): void {
   if (jobs.length === 0) {
     seedJobs()
     seedHistory()
+    seedWorkflows()
   }
   simulationTimer = setInterval(tick, 3000)
 }
@@ -356,6 +677,28 @@ function toProtoJob(j: MockJob): Job {
     createdAt: ts(j.createdAt),
     startedAt: j.startedAt ? ts(j.startedAt) : undefined,
     completedAt: j.completedAt ? ts(j.completedAt) : undefined,
+    parentJobId: j.parentJobId,
+    rootJobId: j.rootJobId,
+    fanOutId: j.fanOutId,
+    fanOutIndex: j.fanOutIndex ?? 0,
+    result: j.result ? (j.result as Uint8Array<ArrayBuffer>) : undefined,
+  })
+}
+
+function fanOutToProto(fo: MockFanOut): ProtoFanOut {
+  return new ProtoFanOut({
+    id: fo.id,
+    parentJobId: fo.parentJobId,
+    totalCount: fo.totalCount,
+    completedCount: fo.completedCount,
+    failedCount: fo.failedCount,
+    cancelledCount: fo.cancelledCount,
+    strategy: fo.strategy,
+    threshold: fo.threshold,
+    status: fo.status,
+    cancelOnFail: fo.cancelOnFail,
+    createdAt: ts(fo.createdAt),
+    updatedAt: ts(fo.updatedAt),
   })
 }
 
@@ -454,7 +797,7 @@ export const mockJobsClient = {
   ): Promise<ListJobsResponse> {
     ensureSimulation()
 
-    let filtered = [...jobs]
+    let filtered = [...jobs, ...workflowJobs]
     if (req.status) filtered = filtered.filter((j) => j.status === req.status)
     if (req.queue) filtered = filtered.filter((j) => j.queue === req.queue)
     if (req.type) filtered = filtered.filter((j) => j.type === req.type)
@@ -488,7 +831,8 @@ export const mockJobsClient = {
     req: { id: string },
   ): Promise<GetJobResponse> {
     ensureSimulation()
-    const j = jobs.find((job) => job.id === req.id)
+    const allJobs = [...jobs, ...workflowJobs]
+    const j = allJobs.find((job) => job.id === req.id)
     if (!j) {
       // Return empty response (component handles missing job)
       return new GetJobResponse({})
@@ -559,6 +903,69 @@ export const mockJobsClient = {
     ensureSimulation()
     return new ListScheduledJobsResponse({
       jobs: scheduledJobs,
+    })
+  },
+
+  async getWorkflow(req: { jobId: string }): Promise<GetWorkflowResponse> {
+    ensureSimulation()
+    // Find the job in both arrays
+    const allJobs = [...jobs, ...workflowJobs]
+    let job = allJobs.find(j => j.id === req.jobId)
+    if (!job) return new GetWorkflowResponse({})
+
+    // Walk to root
+    let root = job
+    let depth = 0
+    while (root.parentJobId && depth < 100) {
+      const parent = allJobs.find(j => j.id === root.parentJobId)
+      if (!parent) break
+      root = parent
+      depth++
+    }
+
+    // Collect all fan-outs for root
+    const rootFanOuts = fanOuts.filter(fo => fo.parentJobId === root.id)
+    // Collect all children
+    const children = workflowJobs.filter(j => j.rootJobId === root.id && j.id !== root.id)
+
+    return new GetWorkflowResponse({
+      root: toProtoJob(root),
+      fanOuts: rootFanOuts.map(fanOutToProto),
+      children: children.map(toProtoJob),
+    })
+  },
+
+  async listWorkflows(req: { page?: number; limit?: number; status?: string }): Promise<ListWorkflowsResponse> {
+    ensureSimulation()
+    // Root jobs are workflow jobs with no parentJobId
+    let roots = workflowJobs.filter(j => !j.parentJobId)
+    if (req.status) roots = roots.filter(j => j.status === req.status)
+
+    roots.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())
+
+    const total = roots.length
+    const page = req.page ?? 1
+    const limit = req.limit ?? 20
+    const start = (page - 1) * limit
+    const paged = roots.slice(start, start + limit)
+
+    const summaries = paged.map(root => {
+      const rootFanOuts = fanOuts.filter(fo => fo.parentJobId === root.id)
+      const children = workflowJobs.filter(j => j.rootJobId === root.id && j.id !== root.id)
+      return new WorkflowSummary({
+        rootJob: toProtoJob(root),
+        totalJobs: children.length,
+        completedJobs: children.filter(j => j.status === 'completed').length,
+        failedJobs: children.filter(j => j.status === 'failed').length,
+        runningJobs: children.filter(j => j.status === 'running').length,
+        strategy: rootFanOuts[0]?.strategy ?? '',
+      })
+    })
+
+    return new ListWorkflowsResponse({
+      workflows: summaries,
+      total: i64(total),
+      page,
     })
   },
 }

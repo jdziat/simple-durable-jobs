@@ -5,9 +5,12 @@
   import JobDetail from './routes/JobDetail.svelte'
   import Queues from './routes/Queues.svelte'
   import Scheduled from './routes/Scheduled.svelte'
+  import Workflows from './routes/Workflows.svelte'
+  import WorkflowDetail from './routes/WorkflowDetail.svelte'
 
   let currentPath = $state(window.location.hash.slice(1) || '/')
   let jobId = $state<string | null>(null)
+  let workflowId = $state<string | null>(null)
   let queryParams = $state<Record<string, string>>({})
 
   function navigate(path: string) {
@@ -34,6 +37,9 @@
 
     const jobMatch = path.match(/^\/jobs\/([^/]+)$/)
     jobId = jobMatch ? jobMatch[1] : null
+
+    const workflowMatch = path.match(/^\/workflows\/([^/]+)$/)
+    workflowId = workflowMatch ? workflowMatch[1] : null
   }
 
   onMount(() => {
@@ -66,6 +72,9 @@
       <li>
         <a href="#/scheduled" class:active={isActive('/scheduled')}>Scheduled</a>
       </li>
+      <li>
+        <a href="#/workflows" class:active={isActive('/workflows')}>Workflows</a>
+      </li>
     </ul>
   </nav>
   <main class="content">
@@ -79,6 +88,10 @@
       <Queues />
     {:else if currentPath === '/scheduled'}
       <Scheduled />
+    {:else if currentPath === '/workflows'}
+      <Workflows />
+    {:else if workflowId}
+      <WorkflowDetail id={workflowId} {navigate} />
     {:else}
       <Dashboard />
     {/if}

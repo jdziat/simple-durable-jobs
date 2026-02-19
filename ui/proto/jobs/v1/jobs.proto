@@ -25,6 +25,10 @@ service JobsService {
   // Scheduled
   rpc ListScheduledJobs(ListScheduledJobsRequest) returns (ListScheduledJobsResponse);
 
+  // Workflows
+  rpc GetWorkflow(GetWorkflowRequest) returns (GetWorkflowResponse);
+  rpc ListWorkflows(ListWorkflowsRequest) returns (ListWorkflowsResponse);
+
   // Real-time
   rpc WatchEvents(WatchEventsRequest) returns (stream Event);
 }
@@ -45,6 +49,11 @@ message Job {
   google.protobuf.Timestamp started_at = 11;
   google.protobuf.Timestamp completed_at = 12;
   google.protobuf.Timestamp run_at = 13;
+  optional string parent_job_id = 14;
+  optional string root_job_id = 15;
+  optional string fan_out_id = 16;
+  int32 fan_out_index = 17;
+  bytes result = 18;
 }
 
 message Checkpoint {
@@ -63,6 +72,22 @@ message QueueStats {
   int64 running = 3;
   int64 completed = 4;
   int64 failed = 5;
+}
+
+message FanOut {
+  string id = 1;
+  string parent_job_id = 2;
+  int32 total_count = 3;
+  int32 completed_count = 4;
+  int32 failed_count = 5;
+  int32 cancelled_count = 6;
+  string strategy = 7;
+  double threshold = 8;
+  string status = 9;
+  google.protobuf.Timestamp timeout_at = 10;
+  bool cancel_on_fail = 11;
+  google.protobuf.Timestamp created_at = 12;
+  google.protobuf.Timestamp updated_at = 13;
 }
 
 message Event {
@@ -169,6 +194,35 @@ message ScheduledJobInfo {
   string queue = 3;
   google.protobuf.Timestamp next_run = 4;
   google.protobuf.Timestamp last_run = 5;
+}
+
+message GetWorkflowRequest {
+  string job_id = 1;
+}
+message GetWorkflowResponse {
+  Job root = 1;
+  repeated FanOut fan_outs = 2;
+  repeated Job children = 3;
+}
+
+message ListWorkflowsRequest {
+  int32 page = 1;
+  int32 limit = 2;
+  string status = 3;
+}
+message ListWorkflowsResponse {
+  repeated WorkflowSummary workflows = 1;
+  int64 total = 2;
+  int32 page = 3;
+}
+
+message WorkflowSummary {
+  Job root_job = 1;
+  int32 total_jobs = 2;
+  int32 completed_jobs = 3;
+  int32 failed_jobs = 4;
+  int32 running_jobs = 5;
+  string strategy = 6;
 }
 
 message WatchEventsRequest {

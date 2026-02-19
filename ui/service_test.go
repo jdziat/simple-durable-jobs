@@ -114,11 +114,12 @@ func (m *mockStorage) GetCheckpoints(ctx context.Context, jobID string) ([]core.
 
 type mockUIStorage struct {
 	mockStorage
-	getQueueStatsFn func(ctx context.Context) ([]*jobsv1.QueueStats, error)
-	searchJobsFn    func(ctx context.Context, f JobFilter) ([]*core.Job, int64, error)
-	retryJobFn      func(ctx context.Context, id string) (*core.Job, error)
-	deleteJobFn     func(ctx context.Context, id string) error
-	purgeJobsFn     func(ctx context.Context, queue string, status core.JobStatus) (int64, error)
+	getQueueStatsFn    func(ctx context.Context) ([]*jobsv1.QueueStats, error)
+	searchJobsFn       func(ctx context.Context, f JobFilter) ([]*core.Job, int64, error)
+	retryJobFn         func(ctx context.Context, id string) (*core.Job, error)
+	deleteJobFn        func(ctx context.Context, id string) error
+	purgeJobsFn        func(ctx context.Context, queue string, status core.JobStatus) (int64, error)
+	getWorkflowRootsFn func(ctx context.Context, status string, limit, offset int) ([]*core.Job, int64, error)
 }
 
 func (m *mockUIStorage) GetQueueStats(ctx context.Context) ([]*jobsv1.QueueStats, error) {
@@ -154,6 +155,13 @@ func (m *mockUIStorage) PurgeJobs(ctx context.Context, queue string, status core
 		return m.purgeJobsFn(ctx, queue, status)
 	}
 	return 0, nil
+}
+
+func (m *mockUIStorage) GetWorkflowRoots(ctx context.Context, status string, limit, offset int) ([]*core.Job, int64, error) {
+	if m.getWorkflowRootsFn != nil {
+		return m.getWorkflowRootsFn(ctx, status, limit, offset)
+	}
+	return nil, 0, nil
 }
 
 // Verify the interface is satisfied at compile time.

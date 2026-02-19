@@ -75,6 +75,31 @@ export class Job extends Message<Job> {
    */
   runAt?: Timestamp;
 
+  /**
+   * @generated from field: optional string parent_job_id = 14;
+   */
+  parentJobId?: string;
+
+  /**
+   * @generated from field: optional string root_job_id = 15;
+   */
+  rootJobId?: string;
+
+  /**
+   * @generated from field: optional string fan_out_id = 16;
+   */
+  fanOutId?: string;
+
+  /**
+   * @generated from field: int32 fan_out_index = 17;
+   */
+  fanOutIndex = 0;
+
+  /**
+   * @generated from field: bytes result = 18;
+   */
+  result = new Uint8Array(0);
+
   constructor(data?: PartialMessage<Job>) {
     super();
     proto3.util.initPartial(data, this);
@@ -96,6 +121,11 @@ export class Job extends Message<Job> {
     { no: 11, name: "started_at", kind: "message", T: Timestamp },
     { no: 12, name: "completed_at", kind: "message", T: Timestamp },
     { no: 13, name: "run_at", kind: "message", T: Timestamp },
+    { no: 14, name: "parent_job_id", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 15, name: "root_job_id", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 16, name: "fan_out_id", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 17, name: "fan_out_index", kind: "scalar", T: 5 /* ScalarType.INT32 */ },
+    { no: 18, name: "result", kind: "scalar", T: 12 /* ScalarType.BYTES */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): Job {
@@ -246,6 +276,115 @@ export class QueueStats extends Message<QueueStats> {
 
   static equals(a: QueueStats | PlainMessage<QueueStats> | undefined, b: QueueStats | PlainMessage<QueueStats> | undefined): boolean {
     return proto3.util.equals(QueueStats, a, b);
+  }
+}
+
+/**
+ * @generated from message jobs.v1.FanOut
+ */
+export class FanOut extends Message<FanOut> {
+  /**
+   * @generated from field: string id = 1;
+   */
+  id = "";
+
+  /**
+   * @generated from field: string parent_job_id = 2;
+   */
+  parentJobId = "";
+
+  /**
+   * @generated from field: int32 total_count = 3;
+   */
+  totalCount = 0;
+
+  /**
+   * @generated from field: int32 completed_count = 4;
+   */
+  completedCount = 0;
+
+  /**
+   * @generated from field: int32 failed_count = 5;
+   */
+  failedCount = 0;
+
+  /**
+   * @generated from field: int32 cancelled_count = 6;
+   */
+  cancelledCount = 0;
+
+  /**
+   * @generated from field: string strategy = 7;
+   */
+  strategy = "";
+
+  /**
+   * @generated from field: double threshold = 8;
+   */
+  threshold = 0;
+
+  /**
+   * @generated from field: string status = 9;
+   */
+  status = "";
+
+  /**
+   * @generated from field: google.protobuf.Timestamp timeout_at = 10;
+   */
+  timeoutAt?: Timestamp;
+
+  /**
+   * @generated from field: bool cancel_on_fail = 11;
+   */
+  cancelOnFail = false;
+
+  /**
+   * @generated from field: google.protobuf.Timestamp created_at = 12;
+   */
+  createdAt?: Timestamp;
+
+  /**
+   * @generated from field: google.protobuf.Timestamp updated_at = 13;
+   */
+  updatedAt?: Timestamp;
+
+  constructor(data?: PartialMessage<FanOut>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "jobs.v1.FanOut";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "parent_job_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "total_count", kind: "scalar", T: 5 /* ScalarType.INT32 */ },
+    { no: 4, name: "completed_count", kind: "scalar", T: 5 /* ScalarType.INT32 */ },
+    { no: 5, name: "failed_count", kind: "scalar", T: 5 /* ScalarType.INT32 */ },
+    { no: 6, name: "cancelled_count", kind: "scalar", T: 5 /* ScalarType.INT32 */ },
+    { no: 7, name: "strategy", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 8, name: "threshold", kind: "scalar", T: 1 /* ScalarType.DOUBLE */ },
+    { no: 9, name: "status", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 10, name: "timeout_at", kind: "message", T: Timestamp },
+    { no: 11, name: "cancel_on_fail", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 12, name: "created_at", kind: "message", T: Timestamp },
+    { no: 13, name: "updated_at", kind: "message", T: Timestamp },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): FanOut {
+    return new FanOut().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): FanOut {
+    return new FanOut().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): FanOut {
+    return new FanOut().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: FanOut | PlainMessage<FanOut> | undefined, b: FanOut | PlainMessage<FanOut> | undefined): boolean {
+    return proto3.util.equals(FanOut, a, b);
   }
 }
 
@@ -1297,6 +1436,257 @@ export class ScheduledJobInfo extends Message<ScheduledJobInfo> {
 
   static equals(a: ScheduledJobInfo | PlainMessage<ScheduledJobInfo> | undefined, b: ScheduledJobInfo | PlainMessage<ScheduledJobInfo> | undefined): boolean {
     return proto3.util.equals(ScheduledJobInfo, a, b);
+  }
+}
+
+/**
+ * @generated from message jobs.v1.GetWorkflowRequest
+ */
+export class GetWorkflowRequest extends Message<GetWorkflowRequest> {
+  /**
+   * @generated from field: string job_id = 1;
+   */
+  jobId = "";
+
+  constructor(data?: PartialMessage<GetWorkflowRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "jobs.v1.GetWorkflowRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "job_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetWorkflowRequest {
+    return new GetWorkflowRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetWorkflowRequest {
+    return new GetWorkflowRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetWorkflowRequest {
+    return new GetWorkflowRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetWorkflowRequest | PlainMessage<GetWorkflowRequest> | undefined, b: GetWorkflowRequest | PlainMessage<GetWorkflowRequest> | undefined): boolean {
+    return proto3.util.equals(GetWorkflowRequest, a, b);
+  }
+}
+
+/**
+ * @generated from message jobs.v1.GetWorkflowResponse
+ */
+export class GetWorkflowResponse extends Message<GetWorkflowResponse> {
+  /**
+   * @generated from field: jobs.v1.Job root = 1;
+   */
+  root?: Job;
+
+  /**
+   * @generated from field: repeated jobs.v1.FanOut fan_outs = 2;
+   */
+  fanOuts: FanOut[] = [];
+
+  /**
+   * @generated from field: repeated jobs.v1.Job children = 3;
+   */
+  children: Job[] = [];
+
+  constructor(data?: PartialMessage<GetWorkflowResponse>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "jobs.v1.GetWorkflowResponse";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "root", kind: "message", T: Job },
+    { no: 2, name: "fan_outs", kind: "message", T: FanOut, repeated: true },
+    { no: 3, name: "children", kind: "message", T: Job, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetWorkflowResponse {
+    return new GetWorkflowResponse().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetWorkflowResponse {
+    return new GetWorkflowResponse().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetWorkflowResponse {
+    return new GetWorkflowResponse().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetWorkflowResponse | PlainMessage<GetWorkflowResponse> | undefined, b: GetWorkflowResponse | PlainMessage<GetWorkflowResponse> | undefined): boolean {
+    return proto3.util.equals(GetWorkflowResponse, a, b);
+  }
+}
+
+/**
+ * @generated from message jobs.v1.ListWorkflowsRequest
+ */
+export class ListWorkflowsRequest extends Message<ListWorkflowsRequest> {
+  /**
+   * @generated from field: int32 page = 1;
+   */
+  page = 0;
+
+  /**
+   * @generated from field: int32 limit = 2;
+   */
+  limit = 0;
+
+  /**
+   * @generated from field: string status = 3;
+   */
+  status = "";
+
+  constructor(data?: PartialMessage<ListWorkflowsRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "jobs.v1.ListWorkflowsRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "page", kind: "scalar", T: 5 /* ScalarType.INT32 */ },
+    { no: 2, name: "limit", kind: "scalar", T: 5 /* ScalarType.INT32 */ },
+    { no: 3, name: "status", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListWorkflowsRequest {
+    return new ListWorkflowsRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListWorkflowsRequest {
+    return new ListWorkflowsRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListWorkflowsRequest {
+    return new ListWorkflowsRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ListWorkflowsRequest | PlainMessage<ListWorkflowsRequest> | undefined, b: ListWorkflowsRequest | PlainMessage<ListWorkflowsRequest> | undefined): boolean {
+    return proto3.util.equals(ListWorkflowsRequest, a, b);
+  }
+}
+
+/**
+ * @generated from message jobs.v1.ListWorkflowsResponse
+ */
+export class ListWorkflowsResponse extends Message<ListWorkflowsResponse> {
+  /**
+   * @generated from field: repeated jobs.v1.WorkflowSummary workflows = 1;
+   */
+  workflows: WorkflowSummary[] = [];
+
+  /**
+   * @generated from field: int64 total = 2;
+   */
+  total = protoInt64.zero;
+
+  /**
+   * @generated from field: int32 page = 3;
+   */
+  page = 0;
+
+  constructor(data?: PartialMessage<ListWorkflowsResponse>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "jobs.v1.ListWorkflowsResponse";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "workflows", kind: "message", T: WorkflowSummary, repeated: true },
+    { no: 2, name: "total", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 3, name: "page", kind: "scalar", T: 5 /* ScalarType.INT32 */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListWorkflowsResponse {
+    return new ListWorkflowsResponse().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListWorkflowsResponse {
+    return new ListWorkflowsResponse().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListWorkflowsResponse {
+    return new ListWorkflowsResponse().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ListWorkflowsResponse | PlainMessage<ListWorkflowsResponse> | undefined, b: ListWorkflowsResponse | PlainMessage<ListWorkflowsResponse> | undefined): boolean {
+    return proto3.util.equals(ListWorkflowsResponse, a, b);
+  }
+}
+
+/**
+ * @generated from message jobs.v1.WorkflowSummary
+ */
+export class WorkflowSummary extends Message<WorkflowSummary> {
+  /**
+   * @generated from field: jobs.v1.Job root_job = 1;
+   */
+  rootJob?: Job;
+
+  /**
+   * @generated from field: int32 total_jobs = 2;
+   */
+  totalJobs = 0;
+
+  /**
+   * @generated from field: int32 completed_jobs = 3;
+   */
+  completedJobs = 0;
+
+  /**
+   * @generated from field: int32 failed_jobs = 4;
+   */
+  failedJobs = 0;
+
+  /**
+   * @generated from field: int32 running_jobs = 5;
+   */
+  runningJobs = 0;
+
+  /**
+   * @generated from field: string strategy = 6;
+   */
+  strategy = "";
+
+  constructor(data?: PartialMessage<WorkflowSummary>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "jobs.v1.WorkflowSummary";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "root_job", kind: "message", T: Job },
+    { no: 2, name: "total_jobs", kind: "scalar", T: 5 /* ScalarType.INT32 */ },
+    { no: 3, name: "completed_jobs", kind: "scalar", T: 5 /* ScalarType.INT32 */ },
+    { no: 4, name: "failed_jobs", kind: "scalar", T: 5 /* ScalarType.INT32 */ },
+    { no: 5, name: "running_jobs", kind: "scalar", T: 5 /* ScalarType.INT32 */ },
+    { no: 6, name: "strategy", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): WorkflowSummary {
+    return new WorkflowSummary().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): WorkflowSummary {
+    return new WorkflowSummary().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): WorkflowSummary {
+    return new WorkflowSummary().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: WorkflowSummary | PlainMessage<WorkflowSummary> | undefined, b: WorkflowSummary | PlainMessage<WorkflowSummary> | undefined): boolean {
+    return proto3.util.equals(WorkflowSummary, a, b);
   }
 }
 

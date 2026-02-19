@@ -17,6 +17,7 @@ type Options struct {
 	UniqueKey   string
 	Determinism DeterminismMode
 	Timezone    *time.Location
+	Timeout     time.Duration // max wall time for handler execution; 0 means no limit
 }
 
 // NewOptions creates Options with defaults.
@@ -70,6 +71,15 @@ func Delay(d time.Duration) Option {
 func At(t time.Time) Option {
 	return optionFunc(func(o *Options) {
 		o.RunAt = &t
+	})
+}
+
+// Timeout sets the maximum wall time for handler execution.
+// When the deadline expires, the handler's context is cancelled.
+// 0 means no limit (default).
+func Timeout(d time.Duration) Option {
+	return optionFunc(func(o *Options) {
+		o.Timeout = d
 	})
 }
 

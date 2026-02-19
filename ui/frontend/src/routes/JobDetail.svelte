@@ -1,6 +1,8 @@
 <script lang="ts">
   import { onMount } from 'svelte'
   import { jobsClient } from '../lib/client'
+  import WaterfallChart from '../components/WaterfallChart.svelte'
+  import type { Job as ProtoJob, FanOut } from '../lib/gen/jobs/v1/jobs_pb'
 
   let { id, navigate }: { id: string; navigate: (path: string) => void } = $props()
 
@@ -31,6 +33,25 @@
   let loading = $state(true)
   let error = $state<string | null>(null)
 
+  let workflowRoot = $state<ProtoJob | null>(null)
+  let workflowFanOuts = $state<FanOut[]>([])
+  let workflowChildren = $state<ProtoJob[]>([])
+
+  async function loadWorkflow(jobData: { parentJobId?: string; rootJobId?: string; fanOutId?: string; id: string }) {
+    if (!jobData.parentJobId && !jobData.fanOutId) return
+    try {
+      const rootId = jobData.rootJobId || jobData.id
+      const response = await jobsClient.getWorkflow({ jobId: rootId })
+      if (response.root) {
+        workflowRoot = response.root
+        workflowFanOuts = response.fanOuts
+        workflowChildren = response.children
+      }
+    } catch {
+      // Silently ignore - workflow is optional
+    }
+  }
+
   async function loadJob() {
     try {
       const response = await jobsClient.getJob({ id })
@@ -58,6 +79,15 @@
           error: cp.error,
           createdAt: cp.createdAt?.toDate() ?? null,
         }))
+        // Check if this job is part of a workflow
+        if (j.parentJobId || j.fanOutId) {
+          loadWorkflow({
+            parentJobId: j.parentJobId ?? undefined,
+            rootJobId: j.rootJobId ?? undefined,
+            fanOutId: j.fanOutId ?? undefined,
+            id: j.id,
+          })
+        }
       }
     } catch (e) {
       error = e instanceof Error ? e.message : 'Failed to load job'
@@ -187,6 +217,18 @@
             {/each}
           </tbody>
         </table>
+      </div>
+    {/if}
+
+    {#if workflowRoot}
+      <div class="workflow-section">
+        <h4>Workflow Timeline</h4>
+        <WaterfallChart
+          root={workflowRoot}
+          fanOuts={workflowFanOuts}
+          children={workflowChildren}
+          onJobClick={(jobId) => navigate(`#/jobs/${jobId}`)}
+        />
       </div>
     {/if}
 
@@ -340,6 +382,16 @@
 
   .btn-retry { background: #3b82f6; color: white; }
   .btn-delete { background: #ef4444; color: white; }
+
+  .workflow-section {
+    margin-bottom: 24px;
+  }
+
+  .workflow-section h4 {
+    margin: 0 0 12px;
+    font-size: 14px;
+    color: #666;
+  }
 
   .loading { color: #666; }
   .error { color: #ef4444; }

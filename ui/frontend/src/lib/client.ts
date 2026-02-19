@@ -17,4 +17,4 @@ if (import.meta.env.VITE_DEMO_MODE === 'true') {
 export { jobsClient }
 
 // Re-export types for convenience
-export type { Job, QueueStats, Checkpoint } from './gen/jobs/v1/jobs_pb'
+export type { Job, QueueStats, Checkpoint, FanOut, WorkflowSummary, GetWorkflowResponse, ListWorkflowsResponse } from './gen/jobs/v1/jobs_pb'
