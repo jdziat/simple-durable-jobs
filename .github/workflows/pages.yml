@@ -41,7 +41,7 @@ jobs:
           npm run build:demo
 
       - name: Copy demo to docs static
-        run: cp -r ui/frontend/demo-dist docs/static/demo
+        run: mkdir -p docs/static && cp -r ui/frontend/demo-dist docs/static/demo
 
       - name: Setup Hugo
         uses: peaceiris/actions-hugo@v3
