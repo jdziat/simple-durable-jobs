@@ -3,8 +3,6 @@ title: "API Reference"
 weight: 2
 ---
 
-# API Reference
-
 Complete API documentation for Simple Durable Jobs.
 
 ## Package `jobs`

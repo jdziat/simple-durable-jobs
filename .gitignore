@@ -48,9 +48,9 @@ bin/
 dist/
 
 # Hugo build output
-docs/public/
-docs/resources/
-docs/.hugo_build.lock
+public/
+resources/
+.hugo_build.lock
 
 # Temporary files
 tmp/
@@ -60,7 +60,7 @@ temp/
 ui/frontend/node_modules/
 ui/frontend/dist/
 ui/frontend/demo-dist/
-docs/static/demo/
+static/demo/
 
 # Compiled binaries
 jobsui

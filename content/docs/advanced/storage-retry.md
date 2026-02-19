@@ -3,8 +3,6 @@ title: "Storage Operation Retry"
 weight: 3
 ---
 
-# Storage Operation Retry
-
 Transient database errors -- connection drops, query timeouts, lock-wait
 timeouts, deadlocks -- are a fact of life in production systems. Without retry
 logic a single blip can cause a job to be lost or stuck in an incorrect state.

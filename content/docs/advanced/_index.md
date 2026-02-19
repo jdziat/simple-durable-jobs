@@ -1,9 +1,6 @@
 ---
 title: "Advanced Topics"
-weight: 5
-bookCollapseSection: false
+weight: 6
 ---
-
-# Advanced Topics
 
 Detailed documentation for advanced features and production tuning.

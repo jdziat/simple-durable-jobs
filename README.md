@@ -7,6 +7,15 @@
 
 A Go library for durable job queues with checkpointed workflows, inspired by [River](https://riverqueue.com/), [Temporal](https://temporal.io/), and async patterns.
 
+## Documentation
+
+- [Getting Started](https://jdziat.github.io/simple-durable-jobs/docs/getting-started/)
+- [API Reference](https://jdziat.github.io/simple-durable-jobs/docs/api-reference/)
+- [Examples](https://jdziat.github.io/simple-durable-jobs/docs/examples/)
+- [Embedded Web UI](https://jdziat.github.io/simple-durable-jobs/docs/embedded-ui/)
+- [Live Demo](https://jdziat.github.io/simple-durable-jobs/docs/live-demo/)
+- [Advanced Topics](https://jdziat.github.io/simple-durable-jobs/docs/advanced/) - Stale lock reaper, pool configuration, storage retry
+
 ## Features
 
 - **Background Jobs** - Fire-and-forget task processing
@@ -376,14 +385,6 @@ import jobs "github.com/jdziat/simple-durable-jobs"
 ```
 
 All public types and functions are re-exported through the facade for a clean API.
-
-## Documentation
-
-- [Getting Started](https://jdziat.github.io/simple-durable-jobs/docs/getting-started/)
-- [API Reference](https://jdziat.github.io/simple-durable-jobs/docs/api-reference/)
-- [Examples](https://jdziat.github.io/simple-durable-jobs/docs/examples/)
-- [Embedded Web UI](https://jdziat.github.io/simple-durable-jobs/docs/embedded-ui/)
-- [Advanced Topics](https://jdziat.github.io/simple-durable-jobs/docs/advanced/) - Stale lock reaper, pool configuration, storage retry
 
 ## Examples
 

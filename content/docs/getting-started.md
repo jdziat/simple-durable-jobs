@@ -3,8 +3,6 @@ title: "Getting Started"
 weight: 1
 ---
 
-# Getting Started
-
 This guide walks you through setting up Simple Durable Jobs in your Go application.
 
 ## Installation
@@ -148,7 +146,9 @@ worker := queue.NewWorker(
 )
 ```
 
-> **Note:** When `Concurrency()` is used inside `WorkerQueue()`, it applies only to that queue. Each queue independently tracks how many jobs it has running and only dequeues more when below its limit.
+{{< callout type="info" >}}
+When `Concurrency()` is used inside `WorkerQueue()`, it applies only to that queue. Each queue independently tracks how many jobs it has running and only dequeues more when below its limit.
+{{< /callout >}}
 
 ## Durable Workflows
 

@@ -3,8 +3,6 @@ title: "Live Demo"
 weight: 5
 ---
 
-# Live Demo
-
 Try the embedded web UI dashboard below. This is an interactive demo running entirely in your browser with simulated job data -- no backend required.
 
 Jobs move through states automatically (pending, running, completed, failed), and you can interact with all views: click jobs, filter, retry failed jobs, and browse queues.
@@ -22,6 +20,6 @@ Jobs move through states automatically (pending, running, completed, failed), an
   ></iframe>
 </div>
 
-{{< hint info >}}
+{{< callout type="info" >}}
 **Note:** This demo uses simulated data that updates every few seconds. In a real deployment, the dashboard connects to your Go application's backend via Connect-RPC. See [Embedded Web UI]({{< relref "embedded-ui" >}}) for setup instructions.
-{{< /hint >}}
+{{< /callout >}}

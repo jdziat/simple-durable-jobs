@@ -3,8 +3,6 @@ title: "Embedded Web UI"
 weight: 4
 ---
 
-# Embedded Web UI
-
 The `ui` package provides a full-featured monitoring dashboard that embeds directly into your Go application. It serves a Svelte SPA frontend alongside a Connect-RPC API, giving you real-time visibility into job queues, execution history, and worker status without deploying a separate service.
 
 ## Setup

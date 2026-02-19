@@ -3,8 +3,6 @@ title: "Stale Lock Reaper"
 weight: 1
 ---
 
-# Stale Lock Reaper
-
 When a worker crashes mid-job, the job stays in "running" status with no one to
 complete or fail it. The stale lock reaper is a background mechanism that detects
 these abandoned jobs and resets them so another worker can pick them up.

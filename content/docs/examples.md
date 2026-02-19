@@ -3,8 +3,6 @@ title: "Examples"
 weight: 3
 ---
 
-# Examples
-
 Complete code examples for common use cases.
 
 ## Basic Job Processing

@@ -1,0 +1,10 @@
+{{ define "main" }}
+  <div class='hx:mx-auto hx:flex hextra-max-page-width'>
+    {{ partial "sidebar.html" (dict "context" . "disableSidebar" true) }}
+    <div class="hx:w-full hx:break-words hx:min-h-[calc(100vh-var(--navbar-height))] hx:min-w-0 hx:pb-16 hx:pt-16 hx:md:pt-24 hx:px-6 hx:md:px-12">
+      <div class="hx:flex hx:flex-col hx:items-center hx:text-center">
+        {{ .Content }}
+      </div>
+    </div>
+  </div>
+{{ end }}
