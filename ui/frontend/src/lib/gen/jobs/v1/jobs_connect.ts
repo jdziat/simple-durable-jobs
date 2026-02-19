@@ -3,7 +3,7 @@
 /* eslint-disable */
 // @ts-nocheck
 
-import { BulkDeleteJobsRequest, BulkDeleteJobsResponse, BulkRetryJobsRequest, BulkRetryJobsResponse, DeleteJobRequest, DeleteJobResponse, Event, GetJobRequest, GetJobResponse, GetStatsHistoryRequest, GetStatsHistoryResponse, GetStatsRequest, GetStatsResponse, ListJobsRequest, ListJobsResponse, ListQueuesRequest, ListQueuesResponse, ListScheduledJobsRequest, ListScheduledJobsResponse, PurgeQueueRequest, PurgeQueueResponse, RetryJobRequest, RetryJobResponse, WatchEventsRequest } from "./jobs_pb.js";
+import { BulkDeleteJobsRequest, BulkDeleteJobsResponse, BulkRetryJobsRequest, BulkRetryJobsResponse, DeleteJobRequest, DeleteJobResponse, Event, GetJobRequest, GetJobResponse, GetStatsHistoryRequest, GetStatsHistoryResponse, GetStatsRequest, GetStatsResponse, GetWorkflowRequest, GetWorkflowResponse, ListJobsRequest, ListJobsResponse, ListQueuesRequest, ListQueuesResponse, ListScheduledJobsRequest, ListScheduledJobsResponse, ListWorkflowsRequest, ListWorkflowsResponse, PurgeQueueRequest, PurgeQueueResponse, RetryJobRequest, RetryJobResponse, WatchEventsRequest } from "./jobs_pb.js";
 import { MethodKind } from "@bufbuild/protobuf";
 
 /**
@@ -117,6 +117,26 @@ export const JobsService = {
       name: "ListScheduledJobs",
       I: ListScheduledJobsRequest,
       O: ListScheduledJobsResponse,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Workflows
+     *
+     * @generated from rpc jobs.v1.JobsService.GetWorkflow
+     */
+    getWorkflow: {
+      name: "GetWorkflow",
+      I: GetWorkflowRequest,
+      O: GetWorkflowResponse,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * @generated from rpc jobs.v1.JobsService.ListWorkflows
+     */
+    listWorkflows: {
+      name: "ListWorkflows",
+      I: ListWorkflowsRequest,
+      O: ListWorkflowsResponse,
       kind: MethodKind.Unary,
     },
     /**

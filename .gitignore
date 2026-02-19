@@ -59,6 +59,8 @@ temp/
 # UI frontend
 ui/frontend/node_modules/
 ui/frontend/dist/
+ui/frontend/demo-dist/
+docs/static/demo/
 
 # Compiled binaries
 jobsui

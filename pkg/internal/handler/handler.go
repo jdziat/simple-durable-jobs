@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"time"
 )
 
 // Handler holds metadata about a registered job handler.
@@ -13,6 +14,7 @@ type Handler struct {
 	Fn         reflect.Value
 	ArgsType   reflect.Type
 	HasContext bool
+	Timeout    time.Duration // max wall time for handler execution; 0 means no limit
 }
 
 // NewHandler creates a Handler from a function.

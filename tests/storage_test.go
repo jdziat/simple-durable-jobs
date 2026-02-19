@@ -2,8 +2,6 @@ package jobs_test
 
 import (
 	"context"
-	"fmt"
-	"os"
 	"testing"
 	"time"
 
@@ -15,25 +13,9 @@ import (
 	"gorm.io/gorm/logger"
 )
 
-var storageTestCounter int
-
 func setupStorageTest(t *testing.T) jobs.Storage {
-	storageTestCounter++
-	dbPath := fmt.Sprintf("/tmp/jobs_storage_test_%d_%d.db", os.Getpid(), storageTestCounter)
-	t.Cleanup(func() {
-		_ = os.Remove(dbPath)
-	})
-
-	db, err := gorm.Open(sqlite.Open(dbPath), &gorm.Config{
-		Logger: logger.Default.LogMode(logger.Silent),
-	})
-	require.NoError(t, err)
-
-	store := jobs.NewGormStorage(db)
-	err = store.Migrate(context.Background())
-	require.NoError(t, err)
-
-	return store
+	t.Helper()
+	return openIntegrationStorage(t)
 }
 
 func TestGormStorage_Migrate(t *testing.T) {

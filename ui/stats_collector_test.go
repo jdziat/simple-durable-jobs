@@ -2,6 +2,7 @@ package ui
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -134,3 +135,103 @@ func TestStatsCollector_Retention(t *testing.T) {
 	collector := NewStatsCollector(q, statsStore, WithStatsCollectorRetention(24*time.Hour))
 	assert.Equal(t, 24*time.Hour, collector.retention)
 }
+
+func TestStatsCollector_Snapshot(t *testing.T) {
+	collector, statsStore, q := setupCollectorTest(t)
+	ctx := context.Background()
+
+	// Put some jobs in the storage via the queue's underlying storage.
+	store := q.Storage()
+	_ = store.Enqueue(ctx, &core.Job{
+		ID: "snap-1", Queue: "snap-queue", Type: "work", Status: core.StatusPending,
+	})
+	_ = store.Enqueue(ctx, &core.Job{
+		ID: "snap-2", Queue: "snap-queue", Type: "work", Status: core.StatusPending,
+	})
+
+	// Call snapshot directly (unexported method, accessible from same package).
+	collector.snapshot(ctx)
+
+	ts := time.Now().Truncate(time.Minute)
+	stats, err := statsStore.GetStatsHistory(ctx, "snap-queue", ts.Add(-time.Minute), ts.Add(time.Minute))
+	require.NoError(t, err)
+	require.Len(t, stats, 1)
+	assert.Equal(t, int64(2), stats[0].Pending)
+}
+
+func TestStatsCollector_Prune(t *testing.T) {
+	_, statsStore, q := setupCollectorTest(t)
+	ctx := context.Background()
+
+	// Insert an old record and a recent one.
+	old := time.Now().Add(-48 * time.Hour).Truncate(time.Minute)
+	recent := time.Now().Truncate(time.Minute)
+	err := statsStore.UpsertStatCounters(ctx, "default", old, 1, 0, 0)
+	require.NoError(t, err)
+	err = statsStore.UpsertStatCounters(ctx, "default", recent, 1, 0, 0)
+	require.NoError(t, err)
+
+	collector := NewStatsCollector(q, statsStore, WithStatsCollectorRetention(24*time.Hour))
+	collector.prune(ctx)
+
+	all, err := statsStore.GetStatsHistory(ctx, "", time.Time{}, time.Now().Add(time.Hour))
+	require.NoError(t, err)
+	// Only the recent row should survive.
+	assert.Len(t, all, 1)
+	assert.Equal(t, recent.Unix(), all[0].Timestamp.Unix())
+}
+
+func TestStatsCollector_PruneZeroRetention(t *testing.T) {
+	_, statsStore, q := setupCollectorTest(t)
+	ctx := context.Background()
+
+	old := time.Now().Add(-48 * time.Hour).Truncate(time.Minute)
+	err := statsStore.UpsertStatCounters(ctx, "default", old, 1, 0, 0)
+	require.NoError(t, err)
+
+	// Zero retention means prune is a no-op.
+	collector := NewStatsCollector(q, statsStore, WithStatsCollectorRetention(0))
+	collector.prune(ctx)
+
+	all, err := statsStore.GetStatsHistory(ctx, "", time.Time{}, time.Now().Add(time.Hour))
+	require.NoError(t, err)
+	assert.Len(t, all, 1, "zero retention should skip pruning")
+}
+
+func TestStatsCollector_SnapshotStorageError(t *testing.T) {
+	// snapshot silently ignores GetJobsByStatus errors via continue; this test
+	// verifies snapshot does not panic or return an error when storage fails.
+	_, _, _ = setupCollectorTest(t)
+	ctx := context.Background()
+
+	// Use a broken storage that always errors.
+	brokenStore := queue.New(&errStorage{})
+	collector := NewStatsCollector(brokenStore, &nopStatsStorage{}, WithStatsCollectorRetention(time.Hour))
+
+	// Should complete without panic.
+	assert.NotPanics(t, func() { collector.snapshot(ctx) })
+}
+
+// errStorage is a storage that returns errors for GetJobsByStatus.
+type errStorage struct{ mockStorage }
+
+func (e *errStorage) GetJobsByStatus(_ context.Context, _ core.JobStatus, _ int) ([]*core.Job, error) {
+	return nil, errStorageError
+}
+
+var errStorageError = errors.New("simulated storage error")
+
+// nopStatsStorage is a no-op StatsStorage.
+type nopStatsStorage struct{}
+
+func (n *nopStatsStorage) MigrateStats(_ context.Context) error { return nil }
+func (n *nopStatsStorage) UpsertStatCounters(_ context.Context, _ string, _ time.Time, _, _, _ int64) error {
+	return nil
+}
+func (n *nopStatsStorage) SnapshotQueueDepth(_ context.Context, _ string, _ time.Time, _, _ int64) error {
+	return nil
+}
+func (n *nopStatsStorage) GetStatsHistory(_ context.Context, _ string, _, _ time.Time) ([]JobStat, error) {
+	return nil, nil
+}
+func (n *nopStatsStorage) PruneStats(_ context.Context, _ time.Time) (int64, error) { return 0, nil }

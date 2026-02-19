@@ -242,8 +242,14 @@ func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 		return
 	}
 
-	// Create cancellable context for this job
-	jobCtx, cancelJob := context.WithCancel(ctx)
+	// Create context for this job — with timeout if handler specifies one
+	var jobCtx context.Context
+	var cancelJob context.CancelFunc
+	if h.Timeout > 0 {
+		jobCtx, cancelJob = context.WithTimeout(ctx, h.Timeout)
+	} else {
+		jobCtx, cancelJob = context.WithCancel(ctx)
+	}
 	defer cancelJob()
 
 	// Track this running job for aggressive pause (worker-local + queue-level registry)

@@ -378,6 +378,13 @@ func At(t time.Time) Option {
 	return queue.At(t)
 }
 
+// Timeout sets the maximum wall time for handler execution.
+// When the deadline expires, the handler's context is cancelled.
+// 0 means no limit (default).
+func Timeout(d time.Duration) Option {
+	return queue.Timeout(d)
+}
+
 // Unique ensures only one job with this key exists.
 func Unique(key string) Option {
 	return queue.Unique(key)

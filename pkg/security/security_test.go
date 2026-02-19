@@ -161,3 +161,64 @@ func TestConstants(t *testing.T) {
 	assert.Equal(t, 255, MaxQueueNameLength)
 	assert.Equal(t, 255, MaxUniqueKeyLength)
 }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// ValidateUniqueKey
+// ──────────────────────────────────────────────────────────────────────────────
+
+func TestValidateUniqueKey_ValidKey(t *testing.T) {
+	// Any non-empty string within the length limit is accepted.
+	validKeys := []string{
+		"user:42",
+		"email:user@example.com",
+		"order-123",
+		"key_with_underscores",
+		"key with spaces",        // spaces are allowed
+		"key!@#$%^&*()",          // special characters are allowed
+		strings.Repeat("a", 255), // exactly at limit
+		"",                       // empty string is always valid (zero-length)
+	}
+	for _, key := range validKeys {
+		err := ValidateUniqueKey(key)
+		assert.NoError(t, err, "expected key %q to be valid", key)
+	}
+}
+
+func TestValidateUniqueKey_TooLong(t *testing.T) {
+	// One character over the 255-byte limit.
+	tooLong := strings.Repeat("x", MaxUniqueKeyLength+1)
+
+	err := ValidateUniqueKey(tooLong)
+
+	assert.Error(t, err, "key longer than MaxUniqueKeyLength should be rejected")
+}
+
+func TestValidateUniqueKey_ExactlyAtLimit(t *testing.T) {
+	atLimit := strings.Repeat("z", MaxUniqueKeyLength)
+
+	err := ValidateUniqueKey(atLimit)
+
+	assert.NoError(t, err, "key exactly at MaxUniqueKeyLength should be accepted")
+}
+
+func TestValidateUniqueKey_Empty(t *testing.T) {
+	// Empty key has length 0, which is <= MaxUniqueKeyLength.
+	err := ValidateUniqueKey("")
+
+	assert.NoError(t, err, "empty key should be accepted")
+}
+
+func TestValidateUniqueKey_SpecialCharacters(t *testing.T) {
+	// Special characters, unicode, and control-looking chars are all accepted
+	// as long as the byte length is within bounds.
+	keys := []string{
+		"key\twith\ttabs",
+		"key\nwith\nnewlines",
+		"unicode-key-你好世界",
+		"emoji-🚀🎉",
+	}
+	for _, key := range keys {
+		err := ValidateUniqueKey(key)
+		assert.NoError(t, err, "expected key %q to be accepted", key)
+	}
+}
