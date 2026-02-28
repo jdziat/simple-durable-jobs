@@ -39,8 +39,11 @@ Thumbs.db
 *.db-wal
 
 # Build output
-dist/
+/dist/
 bin/
+
+# Track embedded UI assets (required for go:embed)
+!ui/frontend/dist/
 
 # Hugo build output
 public/
@@ -53,7 +56,6 @@ temp/
 
 # UI frontend
 ui/frontend/node_modules/
-ui/frontend/dist/
 ui/frontend/demo-dist/
 static/demo/
 
