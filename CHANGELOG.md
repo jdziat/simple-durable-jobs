@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.0.2](https://github.com/jdziat/simple-durable-jobs/compare/v1.0.1...v1.0.2) (2026-02-28)
+
+
+### Bug Fixes
+
+* track frontend/dist so go:embed works for consumers ([c13cf66](https://github.com/jdziat/simple-durable-jobs/commit/c13cf6636b8d8981b252df2458d27388a40b246c))
+* track frontend/dist so go:embed works for consumers ([0dd1796](https://github.com/jdziat/simple-durable-jobs/commit/0dd17961ba86c38a8fe17e6f314ca2b0eb83479f))
+
 ## [1.0.1](https://github.com/jdziat/simple-durable-jobs/compare/v1.0.0...v1.0.1) (2026-02-28)
 
 
