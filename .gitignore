@@ -4,11 +4,9 @@
 *.dll
 *.so
 *.dylib
-
-# Test binary, built with `go test -c`
 *.test
 
-# Output of the go coverage tool
+# Test binary, built with `go test -c`
 *.out
 coverage.html
 
@@ -43,9 +41,6 @@ Thumbs.db
 # Build output
 dist/
 bin/
-
-# GoReleaser
-dist/
 
 # Hugo build output
 public/

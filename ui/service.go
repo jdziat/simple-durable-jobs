@@ -741,7 +741,7 @@ func parsePeriod(period string) (since, until time.Time) {
 type UIStorage interface {
 	core.Storage
 	GetQueueStats(ctx context.Context) ([]*jobsv1.QueueStats, error)
-	SearchJobs(ctx context.Context, filter JobFilter) ([]*core.Job, int64, error)
+	SearchJobs(ctx context.Context, filter core.JobFilter) ([]*core.Job, int64, error)
 	RetryJob(ctx context.Context, jobID string) (*core.Job, error)
 	DeleteJob(ctx context.Context, jobID string) error
 	PurgeJobs(ctx context.Context, queue string, status core.JobStatus) (int64, error)
@@ -751,14 +751,5 @@ type UIStorage interface {
 	GetWorkflowRoots(ctx context.Context, status string, limit, offset int) ([]*core.Job, int64, error)
 }
 
-// JobFilter holds search criteria for jobs.
-type JobFilter struct {
-	Status string
-	Queue  string
-	Type   string
-	Search string
-	Since  time.Time
-	Until  time.Time
-	Limit  int
-	Offset int
-}
+// JobFilter is an alias for core.JobFilter for backward compatibility.
+type JobFilter = core.JobFilter

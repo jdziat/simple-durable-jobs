@@ -357,6 +357,9 @@ The library is organized into a layered architecture with a clean facade:
 simple-durable-jobs/
 ├── jobs.go                    # Root facade - import this package
 ├── pause.go                   # Standalone pause/resume functions
+├── hugo.toml                  # Documentation site config (Hextra theme)
+├── content/                   # Hugo documentation pages
+├── layouts/                   # Hugo layout overrides
 ├── pkg/
 │   ├── core/                  # Domain models (Job, FanOut, Storage, Event, errors)
 │   ├── storage/               # GormStorage implementation
