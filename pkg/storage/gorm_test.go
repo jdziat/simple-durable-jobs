@@ -587,6 +587,41 @@ func TestSaveCheckpoint_PreservesExistingID(t *testing.T) {
 	assert.Equal(t, "custom-cp-id", cp.ID)
 }
 
+func TestSaveCheckpoint_UpsertsOnSameJobCallIndexCallType(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	job := newTestJob("default", "task.run")
+	require.NoError(t, s.Enqueue(ctx, job))
+
+	// Save initial checkpoint.
+	cp1 := &core.Checkpoint{
+		JobID:     job.ID,
+		CallIndex: -1,
+		CallType:  "ocr_tiles",
+		Result:    []byte(`{"results":{"0":{"text":"tile 0"}}}`),
+	}
+	require.NoError(t, s.SaveCheckpoint(ctx, cp1))
+	assert.NotEmpty(t, cp1.ID)
+
+	// Save again with same (job_id, call_index, call_type) — should upsert, not insert.
+	cp2 := &core.Checkpoint{
+		JobID:     job.ID,
+		CallIndex: -1,
+		CallType:  "ocr_tiles",
+		Result:    []byte(`{"results":{"0":{"text":"tile 0"},"1":{"text":"tile 1"}}}`),
+	}
+	require.NoError(t, s.SaveCheckpoint(ctx, cp2))
+
+	// Should be exactly 1 checkpoint, not 2.
+	checkpoints, err := s.GetCheckpoints(ctx, job.ID)
+	require.NoError(t, err)
+	assert.Len(t, checkpoints, 1, "expected upsert to produce 1 row, not 2")
+
+	// The result should be the updated value.
+	assert.Equal(t, `{"results":{"0":{"text":"tile 0"},"1":{"text":"tile 1"}}}`, string(checkpoints[0].Result))
+}
+
 func TestGetCheckpoints_ReturnsEmptySliceForUnknownJob(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStorage(t)

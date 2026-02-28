@@ -4,9 +4,12 @@ on:
   push:
     branches: [main]
     paths:
-      - 'docs/**'
+      - 'content/**'
+      - 'hugo.toml'
+      - 'layouts/**'
       - 'README.md'
       - 'ui/frontend/**'
+      - '.github/workflows/pages.yml'
   workflow_dispatch:
 
 permissions:
@@ -24,8 +27,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          submodules: true
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -40,8 +41,8 @@ jobs:
           npm ci
           npm run build:demo
 
-      - name: Copy demo to docs static
-        run: mkdir -p docs/static && cp -r ui/frontend/demo-dist docs/static/demo
+      - name: Copy demo to static
+        run: mkdir -p static && cp -r ui/frontend/demo-dist static/demo
 
       - name: Setup Hugo
         uses: peaceiris/actions-hugo@v3
@@ -49,17 +50,21 @@ jobs:
           hugo-version: 'latest'
           extended: true
 
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+
       - name: Setup Pages
         uses: actions/configure-pages@v4
 
       - name: Build with Hugo
-        working-directory: docs
-        run: hugo --minify --baseURL "https://jdziat.github.io/simple-durable-jobs/"
+        run: hugo --minify
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: docs/public
+          path: ./public
 
   deploy:
     environment:

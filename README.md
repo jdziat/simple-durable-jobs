@@ -7,6 +7,15 @@
 
 A Go library for durable job queues with checkpointed workflows, inspired by [River](https://riverqueue.com/), [Temporal](https://temporal.io/), and async patterns.
 
+## Documentation
+
+- [Getting Started](https://jdziat.github.io/simple-durable-jobs/docs/getting-started/)
+- [API Reference](https://jdziat.github.io/simple-durable-jobs/docs/api-reference/)
+- [Examples](https://jdziat.github.io/simple-durable-jobs/docs/examples/)
+- [Embedded Web UI](https://jdziat.github.io/simple-durable-jobs/docs/embedded-ui/)
+- [Live Demo](https://jdziat.github.io/simple-durable-jobs/docs/live-demo/)
+- [Advanced Topics](https://jdziat.github.io/simple-durable-jobs/docs/advanced/) - Stale lock reaper, pool configuration, storage retry
+
 ## Features
 
 - **Background Jobs** - Fire-and-forget task processing
@@ -348,6 +357,9 @@ The library is organized into a layered architecture with a clean facade:
 simple-durable-jobs/
 ├── jobs.go                    # Root facade - import this package
 ├── pause.go                   # Standalone pause/resume functions
+├── hugo.toml                  # Documentation site config (Hextra theme)
+├── content/                   # Hugo documentation pages
+├── layouts/                   # Hugo layout overrides
 ├── pkg/
 │   ├── core/                  # Domain models (Job, FanOut, Storage, Event, errors)
 │   ├── storage/               # GormStorage implementation
@@ -376,14 +388,6 @@ import jobs "github.com/jdziat/simple-durable-jobs"
 ```
 
 All public types and functions are re-exported through the facade for a clean API.
-
-## Documentation
-
-- [Getting Started](https://jdziat.github.io/simple-durable-jobs/docs/getting-started/)
-- [API Reference](https://jdziat.github.io/simple-durable-jobs/docs/api-reference/)
-- [Examples](https://jdziat.github.io/simple-durable-jobs/docs/examples/)
-- [Embedded Web UI](https://jdziat.github.io/simple-durable-jobs/docs/embedded-ui/)
-- [Advanced Topics](https://jdziat.github.io/simple-durable-jobs/docs/advanced/) - Stale lock reaper, pool configuration, storage retry
 
 ## Examples
 

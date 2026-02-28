@@ -56,9 +56,9 @@ type Job struct {
 // Checkpoint stores the result of a durable Call() for replay.
 type Checkpoint struct {
 	ID        string    `gorm:"primaryKey;size:36"`
-	JobID     string    `gorm:"index;size:36;not null"`
-	CallIndex int       `gorm:"not null"`
-	CallType  string    `gorm:"size:255;not null"`
+	JobID     string    `gorm:"index;uniqueIndex:idx_checkpoints_job_call,priority:1;size:36;not null"`
+	CallIndex int       `gorm:"uniqueIndex:idx_checkpoints_job_call,priority:2;not null"`
+	CallType  string    `gorm:"uniqueIndex:idx_checkpoints_job_call,priority:3;size:255;not null"`
 	Result    []byte    `gorm:"type:bytes"`
 	Error     string    `gorm:"type:text"`
 	CreatedAt time.Time `gorm:"autoCreateTime"`

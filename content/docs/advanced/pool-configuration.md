@@ -3,8 +3,6 @@ title: "Connection Pool Configuration"
 weight: 2
 ---
 
-# Connection Pool Configuration
-
 A job queue system opens many concurrent database connections -- one per worker
 goroutine, plus connections for heartbeats, scheduling, and the stale lock
 reaper. Without proper pool configuration the database can be overwhelmed by

@@ -77,3 +77,15 @@ type Storage interface {
 	IsQueuePaused(ctx context.Context, queue string) (bool, error)
 	RefreshQueueStates(ctx context.Context) (map[string]bool, error)
 }
+
+// JobFilter holds search criteria for jobs used by UIStorage implementations.
+type JobFilter struct {
+	Status string
+	Queue  string
+	Type   string
+	Search string
+	Since  time.Time
+	Until  time.Time
+	Limit  int
+	Offset int
+}
