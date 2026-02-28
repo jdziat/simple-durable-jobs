@@ -325,11 +325,18 @@ func (s *GormStorage) Fail(ctx context.Context, jobID string, workerID string, e
 }
 
 // SaveCheckpoint stores a checkpoint for a durable call.
+// If a checkpoint with the same (job_id, call_index, call_type) already exists,
+// the result, error, and created_at fields are updated in place (upsert).
 func (s *GormStorage) SaveCheckpoint(ctx context.Context, cp *core.Checkpoint) error {
 	if cp.ID == "" {
 		cp.ID = uuid.New().String()
 	}
-	return s.db.WithContext(ctx).Create(cp).Error
+	return s.db.WithContext(ctx).
+		Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "job_id"}, {Name: "call_index"}, {Name: "call_type"}},
+			DoUpdates: clause.AssignmentColumns([]string{"result", "error", "created_at"}),
+		}).
+		Create(cp).Error
 }
 
 // GetCheckpoints retrieves all checkpoints for a job.
