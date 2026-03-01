@@ -267,6 +267,9 @@ func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 	// Call start hooks
 	w.queue.CallStartHooks(jobCtx, job)
 
+	// Call context-modifying start hooks (e.g. OTel span injection)
+	jobCtx = w.queue.CallStartCtxHooks(jobCtx, job)
+
 	// Emit start event
 	w.queue.Emit(&core.JobStarted{Job: job, Timestamp: startTime})
 

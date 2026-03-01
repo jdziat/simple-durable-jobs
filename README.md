@@ -26,7 +26,7 @@ A Go library for durable job queues with checkpointed workflows, inspired by [Ri
 - **Scheduled Jobs** - Cron, daily, weekly, and interval-based scheduling
 - **Priority Queues** - Higher priority jobs run first
 - **Retries with Backoff** - Configurable retry logic with exponential backoff
-- **Observability** - Hooks, event streams, and an embedded web dashboard
+- **Observability** - Hooks, event streams, optional OpenTelemetry tracing, and an embedded web dashboard
 - **Embedded Web UI** - Real-time monitoring dashboard with stats and event streaming
 - **Stale Lock Reaper** - Automatically reclaims stuck running jobs after worker crashes
 - **Connection Pool Presets** - Pre-built pool configurations for different workloads
@@ -309,6 +309,28 @@ go func() {
 queue.EmitCustomEvent(jobID, "progress", map[string]any{"pct": 75})
 ```
 
+### OpenTelemetry Tracing
+
+Optional distributed tracing via the `pkg/otel` sub-package. Trace context propagates
+from enqueue to worker execution automatically.
+
+```go
+import jobsotel "github.com/jdziat/simple-durable-jobs/pkg/otel"
+
+// Instrument the queue (uses global TracerProvider by default)
+jobsotel.Instrument(queue)
+
+// Or provide a custom TracerProvider
+jobsotel.Instrument(queue, jobsotel.WithTracerProvider(tp))
+```
+
+This creates spans for:
+- `job.enqueue` — when a job is enqueued (producer span)
+- `job.process {type}` — when a job is executed by a worker (consumer span, child of enqueue)
+- `job.retry` — span event when a job is retried
+
+Span attributes include `job.id`, `job.type`, `job.queue`, `job.attempt`, and `job.priority`.
+
 ## Worker Configuration
 
 ```go
@@ -368,6 +390,7 @@ simple-durable-jobs/
 │   ├── schedule/              # Schedule implementations (Every, Daily, Cron)
 │   ├── call/                  # Durable Call[T] function
 │   ├── fanout/                # Fan-out/fan-in patterns (Sub, FanOut, helpers)
+│   ├── otel/                  # Optional OpenTelemetry tracing integration
 │   ├── jobctx/                # Job context helpers (JobFromContext, phase checkpoints)
 │   ├── security/              # Validation and sanitization
 │   └── internal/              # Private implementation details
