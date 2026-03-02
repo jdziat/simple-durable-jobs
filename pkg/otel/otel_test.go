@@ -29,7 +29,7 @@ func setupTracer() (*sdktrace.TracerProvider, *tracetest.InMemoryExporter) {
 
 func TestEnqueueMiddleware_InjectsTraceContext(t *testing.T) {
 	tp, exporter := setupTracer()
-	defer tp.Shutdown(context.Background())
+	defer func() { _ = tp.Shutdown(context.Background()) }()
 
 	tracer := tp.Tracer(instrumentationName)
 	prop := propagation.TraceContext{}
@@ -67,7 +67,7 @@ func TestEnqueueMiddleware_InjectsTraceContext(t *testing.T) {
 
 	// Verify the enqueue span was created
 	parentSpan.End()
-	tp.ForceFlush(context.Background())
+	_ = tp.ForceFlush(context.Background())
 	spans := exporter.GetSpans()
 
 	var enqueueSpan *tracetest.SpanStub
@@ -83,7 +83,7 @@ func TestEnqueueMiddleware_InjectsTraceContext(t *testing.T) {
 
 func TestEnqueueMiddleware_NoActiveSpan(t *testing.T) {
 	tp, _ := setupTracer()
-	defer tp.Shutdown(context.Background())
+	defer func() { _ = tp.Shutdown(context.Background()) }()
 
 	tracer := tp.Tracer(instrumentationName)
 	prop := propagation.TraceContext{}
@@ -110,7 +110,7 @@ func TestEnqueueMiddleware_NoActiveSpan(t *testing.T) {
 
 func TestEnqueueMiddleware_PropagatesPersistError(t *testing.T) {
 	tp, exporter := setupTracer()
-	defer tp.Shutdown(context.Background())
+	defer func() { _ = tp.Shutdown(context.Background()) }()
 
 	tracer := tp.Tracer(instrumentationName)
 	prop := propagation.TraceContext{}
@@ -128,7 +128,7 @@ func TestEnqueueMiddleware_PropagatesPersistError(t *testing.T) {
 	assert.ErrorIs(t, err, persistErr)
 
 	// Verify the span recorded the error
-	tp.ForceFlush(context.Background())
+	_ = tp.ForceFlush(context.Background())
 	spans := exporter.GetSpans()
 	require.NotEmpty(t, spans)
 
@@ -145,7 +145,7 @@ func TestEnqueueMiddleware_PropagatesPersistError(t *testing.T) {
 
 func TestStartCtxHook_CreatesConsumerSpan(t *testing.T) {
 	tp, exporter := setupTracer()
-	defer tp.Shutdown(context.Background())
+	defer func() { _ = tp.Shutdown(context.Background()) }()
 
 	tracer := tp.Tracer(instrumentationName)
 	prop := propagation.TraceContext{}
@@ -177,7 +177,7 @@ func TestStartCtxHook_CreatesConsumerSpan(t *testing.T) {
 
 	// End the span so it gets exported
 	span.End()
-	tp.ForceFlush(context.Background())
+	_ = tp.ForceFlush(context.Background())
 
 	spans := exporter.GetSpans()
 	var processSpan *tracetest.SpanStub
@@ -202,7 +202,7 @@ func TestStartCtxHook_CreatesConsumerSpan(t *testing.T) {
 
 func TestStartCtxHook_NoTraceContext(t *testing.T) {
 	tp, _ := setupTracer()
-	defer tp.Shutdown(context.Background())
+	defer func() { _ = tp.Shutdown(context.Background()) }()
 
 	tracer := tp.Tracer(instrumentationName)
 	prop := propagation.TraceContext{}
@@ -225,7 +225,7 @@ func TestStartCtxHook_NoTraceContext(t *testing.T) {
 
 func TestCompleteHook_EndsSpanWithOK(t *testing.T) {
 	tp, exporter := setupTracer()
-	defer tp.Shutdown(context.Background())
+	defer func() { _ = tp.Shutdown(context.Background()) }()
 
 	tracer := tp.Tracer(instrumentationName)
 	ctx, span := tracer.Start(context.Background(), "job.process test-job")
@@ -233,7 +233,7 @@ func TestCompleteHook_EndsSpanWithOK(t *testing.T) {
 	hook := completeHook()
 	hook(ctx, &core.Job{ID: "job-1"})
 
-	tp.ForceFlush(context.Background())
+	_ = tp.ForceFlush(context.Background())
 	spans := exporter.GetSpans()
 
 	var processSpan *tracetest.SpanStub
@@ -250,7 +250,7 @@ func TestCompleteHook_EndsSpanWithOK(t *testing.T) {
 
 func TestFailHook_EndsSpanWithError(t *testing.T) {
 	tp, exporter := setupTracer()
-	defer tp.Shutdown(context.Background())
+	defer func() { _ = tp.Shutdown(context.Background()) }()
 
 	tracer := tp.Tracer(instrumentationName)
 	ctx, span := tracer.Start(context.Background(), "job.process failing-job")
@@ -259,7 +259,7 @@ func TestFailHook_EndsSpanWithError(t *testing.T) {
 	jobErr := errors.New("handler panicked")
 	hook(ctx, &core.Job{ID: "job-2"}, jobErr)
 
-	tp.ForceFlush(context.Background())
+	_ = tp.ForceFlush(context.Background())
 	spans := exporter.GetSpans()
 
 	var processSpan *tracetest.SpanStub
@@ -277,7 +277,7 @@ func TestFailHook_EndsSpanWithError(t *testing.T) {
 
 func TestRetryHook_AddsRetryEvent(t *testing.T) {
 	tp, exporter := setupTracer()
-	defer tp.Shutdown(context.Background())
+	defer func() { _ = tp.Shutdown(context.Background()) }()
 
 	tracer := tp.Tracer(instrumentationName)
 	ctx, span := tracer.Start(context.Background(), "job.process retry-job")
@@ -287,7 +287,7 @@ func TestRetryHook_AddsRetryEvent(t *testing.T) {
 	hook(ctx, &core.Job{ID: "job-3"}, 2, retryErr)
 
 	span.End()
-	tp.ForceFlush(context.Background())
+	_ = tp.ForceFlush(context.Background())
 	spans := exporter.GetSpans()
 
 	var processSpan *tracetest.SpanStub
