@@ -40,6 +40,11 @@ type WorkerConfig struct {
 	// StaleLockAge is how long a running job's lock must be expired before
 	// it is reclaimed (reset to pending). Default: 45 minutes (matches lock duration).
 	StaleLockAge time.Duration
+
+	// LockDuration is how long a job is locked when dequeued or heartbeated.
+	// Default: 45 minutes. If non-zero, the worker will configure the storage
+	// backend with this duration at startup.
+	LockDuration time.Duration
 }
 
 // Concurrency sets the concurrency for a queue.
@@ -141,5 +146,14 @@ func WithStaleLockInterval(d time.Duration) WorkerOption {
 func WithStaleLockAge(d time.Duration) WorkerOption {
 	return workerOptionFunc(func(c *WorkerConfig) {
 		c.StaleLockAge = d
+	})
+}
+
+// WithLockDuration sets how long a job is locked when dequeued or extended by
+// a heartbeat. The worker propagates this to the storage backend if the backend
+// implements SetLockDuration. Default is 45 minutes.
+func WithLockDuration(d time.Duration) WorkerOption {
+	return workerOptionFunc(func(c *WorkerConfig) {
+		c.LockDuration = d
 	})
 }

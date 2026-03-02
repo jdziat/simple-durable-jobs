@@ -532,6 +532,57 @@ func TestWithStaleLockAge_SetsValue(t *testing.T) {
 	assert.Equal(t, 30*time.Minute, config.StaleLockAge)
 }
 
+func TestWithLockDuration_SetsValue(t *testing.T) {
+	config := WorkerConfig{}
+
+	WithLockDuration(2 * time.Hour).ApplyWorker(&config)
+
+	assert.Equal(t, 2*time.Hour, config.LockDuration)
+}
+
+func TestWithLockDuration_PropagatedToStorage(t *testing.T) {
+	// Use a real GormStorage backed by SQLite so we can verify the lock
+	// duration is propagated when the worker is created with WithLockDuration.
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{
+		Logger: logger.Default.LogMode(logger.Silent),
+	})
+	require.NoError(t, err)
+
+	s := storage.NewGormStorage(db)
+	q := queue.New(s)
+
+	NewWorker(q, WithLockDuration(2*time.Hour))
+
+	// Verify by enqueueing + dequeueing and checking the lock window.
+	require.NoError(t, s.Migrate(context.Background()))
+	require.NoError(t, s.Enqueue(context.Background(), &core.Job{Type: "x", Queue: "default"}))
+
+	before := time.Now()
+	job, err := s.Dequeue(context.Background(), []string{"default"}, "w1")
+	require.NoError(t, err)
+	require.NotNil(t, job)
+	require.NotNil(t, job.LockedUntil)
+
+	expectedMin := before.Add(110 * time.Minute)
+	expectedMax := before.Add(130 * time.Minute)
+	assert.True(t, job.LockedUntil.After(expectedMin),
+		"LockedUntil %v should be after %v (want ~2h)", job.LockedUntil, expectedMin)
+	assert.True(t, job.LockedUntil.Before(expectedMax),
+		"LockedUntil %v should be before %v (want ~2h)", job.LockedUntil, expectedMax)
+}
+
+func TestWithLockDuration_StorageWithoutSetterIsNoop(t *testing.T) {
+	// When storage does not implement SetLockDuration the worker must not panic
+	// and must start without error.
+	mock := &mockStorage{}
+	q := queue.New(mock)
+
+	// Should not panic even though mockStorage has no SetLockDuration.
+	assert.NotPanics(t, func() {
+		NewWorker(q, WithLockDuration(2*time.Hour))
+	})
+}
+
 // ---------------------------------------------------------------------------
 // retryWithBackoff additional tests
 // ---------------------------------------------------------------------------

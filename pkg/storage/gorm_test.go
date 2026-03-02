@@ -2542,3 +2542,91 @@ func TestMigrate_DBError(t *testing.T) {
 // Note: ConfigurePool and NewGormStorageWithPool error paths require db.DB()
 // to fail, which doesn't happen with GORM's SQLite driver (it caches the
 // *sql.DB pointer). Those error branches are unreachable in SQLite tests.
+
+// ──────────────────────────────────────────────────────────────────────────────
+// WithStorageLockDuration / SetLockDuration
+// ──────────────────────────────────────────────────────────────────────────────
+
+func TestNewGormStorage_DefaultLockDuration(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{
+		Logger: logger.Default.LogMode(logger.Silent),
+	})
+	require.NoError(t, err)
+
+	s := NewGormStorage(db)
+	assert.Equal(t, 45*time.Minute, s.lockDuration, "default lock duration should be 45 minutes")
+}
+
+func TestWithStorageLockDuration_SetsCustomDuration(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{
+		Logger: logger.Default.LogMode(logger.Silent),
+	})
+	require.NoError(t, err)
+
+	s := NewGormStorage(db, WithStorageLockDuration(2*time.Hour))
+	assert.Equal(t, 2*time.Hour, s.lockDuration)
+}
+
+func TestSetLockDuration_OverridesValue(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{
+		Logger: logger.Default.LogMode(logger.Silent),
+	})
+	require.NoError(t, err)
+
+	s := NewGormStorage(db)
+	s.SetLockDuration(90 * time.Minute)
+	assert.Equal(t, 90*time.Minute, s.lockDuration)
+}
+
+func TestDequeue_CustomLockDurationIsApplied(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+	s.SetLockDuration(10 * time.Minute)
+
+	require.NoError(t, s.Enqueue(ctx, newTestJob("default", "task.run")))
+
+	before := time.Now()
+	got, err := s.Dequeue(ctx, []string{"default"}, "worker-1")
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	require.NotNil(t, got.LockedUntil)
+
+	// The lock should expire in ~10 minutes, not 45.
+	// Allow a few seconds of clock skew.
+	expectedMin := before.Add(9 * time.Minute)
+	expectedMax := before.Add(11 * time.Minute)
+	assert.True(t, got.LockedUntil.After(expectedMin),
+		"LockedUntil %v should be after %v", got.LockedUntil, expectedMin)
+	assert.True(t, got.LockedUntil.Before(expectedMax),
+		"LockedUntil %v should be before %v", got.LockedUntil, expectedMax)
+}
+
+func TestHeartbeat_CustomLockDurationIsApplied(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+	s.SetLockDuration(10 * time.Minute)
+
+	require.NoError(t, s.Enqueue(ctx, newTestJob("default", "task.run")))
+
+	got, err := s.Dequeue(ctx, []string{"default"}, "worker-1")
+	require.NoError(t, err)
+	require.NotNil(t, got)
+
+	time.Sleep(10 * time.Millisecond)
+
+	before := time.Now()
+	require.NoError(t, s.Heartbeat(ctx, got.ID, "worker-1"))
+
+	refreshed, err := s.GetJob(ctx, got.ID)
+	require.NoError(t, err)
+	require.NotNil(t, refreshed)
+	require.NotNil(t, refreshed.LockedUntil)
+
+	// The extended lock should still be ~10 minutes from now, not 45.
+	expectedMin := before.Add(9 * time.Minute)
+	expectedMax := before.Add(11 * time.Minute)
+	assert.True(t, refreshed.LockedUntil.After(expectedMin),
+		"LockedUntil %v should be after %v", refreshed.LockedUntil, expectedMin)
+	assert.True(t, refreshed.LockedUntil.Before(expectedMax),
+		"LockedUntil %v should be before %v", refreshed.LockedUntil, expectedMax)
+}
