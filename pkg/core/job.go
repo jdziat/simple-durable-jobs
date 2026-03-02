@@ -51,6 +51,9 @@ type Job struct {
 
 	// Result storage for parent retrieval
 	Result []byte `gorm:"type:bytes"` // Serialized return value
+
+	// Trace context for distributed tracing (serialized span context)
+	TraceContext []byte `gorm:"type:bytes"`
 }
 
 // Checkpoint stores the result of a durable Call() for replay.

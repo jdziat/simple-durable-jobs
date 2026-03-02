@@ -82,6 +82,17 @@ func NewWorker(q *queue.Queue, opts ...WorkerOption) *Worker {
 		config.StaleLockAge = 45 * time.Minute
 	}
 
+	// Propagate lock duration to the storage backend if supported.
+	// The storage must implement SetLockDuration(time.Duration) for this to take effect.
+	if config.LockDuration > 0 {
+		type lockDurationSetter interface {
+			SetLockDuration(time.Duration)
+		}
+		if setter, ok := q.Storage().(lockDurationSetter); ok {
+			setter.SetLockDuration(config.LockDuration)
+		}
+	}
+
 	// Initialize per-queue concurrency counters
 	queueRunning := make(map[string]*atomic.Int32, len(config.Queues))
 	for name := range config.Queues {
@@ -266,6 +277,9 @@ func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 
 	// Call start hooks
 	w.queue.CallStartHooks(jobCtx, job)
+
+	// Call context-modifying start hooks (e.g. OTel span injection)
+	jobCtx = w.queue.CallStartCtxHooks(jobCtx, job)
 
 	// Emit start event
 	w.queue.Emit(&core.JobStarted{Job: job, Timestamp: startTime})

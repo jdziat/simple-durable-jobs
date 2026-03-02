@@ -101,6 +101,9 @@ type (
 	// Option modifies Options.
 	Option = queue.Option
 
+	// EnqueueMiddleware wraps the enqueue operation for cross-cutting concerns.
+	EnqueueMiddleware = queue.EnqueueMiddleware
+
 	// Options holds configuration for job enqueueing and registration.
 	Options = queue.Options
 

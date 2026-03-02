@@ -16,21 +16,45 @@ import (
 	"github.com/jdziat/simple-durable-jobs/pkg/security"
 )
 
+const defaultLockDuration = 45 * time.Minute
+
+// GormStorageOption configures a GormStorage.
+type GormStorageOption func(*GormStorage)
+
+// WithStorageLockDuration sets the duration for which a job lock is held when
+// dequeued or extended by a heartbeat. The default is 45 minutes.
+func WithStorageLockDuration(d time.Duration) GormStorageOption {
+	return func(s *GormStorage) {
+		s.lockDuration = d
+	}
+}
+
 // GormStorage implements Storage using GORM.
 type GormStorage struct {
-	db       *gorm.DB
-	isSQLite bool
+	db           *gorm.DB
+	isSQLite     bool
+	lockDuration time.Duration
 }
 
 // NewGormStorage creates a new GORM-backed storage.
-func NewGormStorage(db *gorm.DB) *GormStorage {
+func NewGormStorage(db *gorm.DB, opts ...GormStorageOption) *GormStorage {
 	// Detect SQLite by checking the dialect name
 	isSQLite := false
 	if db != nil {
 		dialector := db.Name()
 		isSQLite = strings.Contains(strings.ToLower(dialector), "sqlite")
 	}
-	return &GormStorage{db: db, isSQLite: isSQLite}
+	s := &GormStorage{db: db, isSQLite: isSQLite, lockDuration: defaultLockDuration}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
+}
+
+// SetLockDuration updates the lock duration after construction.
+// This is used by the worker when WithLockDuration is passed as a worker option.
+func (s *GormStorage) SetLockDuration(d time.Duration) {
+	s.lockDuration = d
 }
 
 // IsSQLite returns true if the storage is using SQLite.
@@ -113,7 +137,7 @@ func (s *GormStorage) EnqueueUnique(ctx context.Context, job *core.Job, uniqueKe
 func (s *GormStorage) Dequeue(ctx context.Context, queues []string, workerID string) (*core.Job, error) {
 	var job core.Job
 	now := time.Now()
-	lockUntil := now.Add(45 * time.Minute) // Extended to support long-running scans
+	lockUntil := now.Add(s.lockDuration)
 
 	// Get paused queues
 	pausedQueues, err := s.GetPausedQueues(ctx)
@@ -399,7 +423,7 @@ func (s *GormStorage) GetDueJobs(ctx context.Context, queues []string, limit int
 // Returns ErrJobNotOwned if the job is no longer owned by this worker.
 func (s *GormStorage) Heartbeat(ctx context.Context, jobID string, workerID string) error {
 	now := time.Now()
-	lockUntil := now.Add(45 * time.Minute)
+	lockUntil := now.Add(s.lockDuration)
 	result := s.db.WithContext(ctx).
 		Model(&core.Job{}).
 		Where("id = ? AND locked_by = ?", jobID, workerID).

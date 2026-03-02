@@ -16,6 +16,10 @@ import (
 	"github.com/jdziat/simple-durable-jobs/pkg/schedule"
 )
 
+// EnqueueMiddleware wraps the enqueue operation.
+// next persists the job; middleware can modify the job or context before calling next.
+type EnqueueMiddleware func(ctx context.Context, job *core.Job, next func(context.Context, *core.Job) error) error
+
 // Queue manages job registration, enqueueing, and processing.
 type Queue struct {
 	storage       core.Storage
@@ -25,9 +29,13 @@ type Queue struct {
 
 	// Hooks
 	onStart    []func(context.Context, *core.Job)
+	onStartCtx []func(context.Context, *core.Job) context.Context
 	onComplete []func(context.Context, *core.Job)
 	onFail     []func(context.Context, *core.Job, error)
 	onRetry    []func(context.Context, *core.Job, int, error)
+
+	// Enqueue middleware chain
+	enqueueMiddleware []EnqueueMiddleware
 
 	// Event stream
 	events    chan core.Event
@@ -155,26 +163,51 @@ func (q *Queue) Enqueue(ctx context.Context, name string, args any, opts ...Opti
 		job.RunAt = options.RunAt
 	}
 
-	// Use unique enqueue if a unique key is specified
-	if options.UniqueKey != "" {
-		// Validate unique key length to prevent database errors
-		if err := security.ValidateUniqueKey(options.UniqueKey); err != nil {
-			return "", err
-		}
-		if err := q.storage.EnqueueUnique(ctx, job, options.UniqueKey); err != nil {
-			if errors.Is(err, core.ErrDuplicateJob) {
-				return "", err
+	// Build the persist function that the middleware chain will eventually call
+	persist := func(ctx context.Context, j *core.Job) error {
+		if options.UniqueKey != "" {
+			if err := security.ValidateUniqueKey(options.UniqueKey); err != nil {
+				return err
 			}
-			return "", fmt.Errorf("jobs: failed to enqueue: %w", err)
+			if err := q.storage.EnqueueUnique(ctx, j, options.UniqueKey); err != nil {
+				if errors.Is(err, core.ErrDuplicateJob) {
+					return err
+				}
+				return fmt.Errorf("jobs: failed to enqueue: %w", err)
+			}
+			return nil
 		}
-		return job.ID, nil
+		if err := q.storage.Enqueue(ctx, j); err != nil {
+			return fmt.Errorf("jobs: failed to enqueue: %w", err)
+		}
+		return nil
 	}
 
-	if err := q.storage.Enqueue(ctx, job); err != nil {
-		return "", fmt.Errorf("jobs: failed to enqueue: %w", err)
+	// Run enqueue middleware chain
+	if err := q.runEnqueueMiddleware(ctx, job, persist); err != nil {
+		return "", err
 	}
 
 	return job.ID, nil
+}
+
+// runEnqueueMiddleware executes the enqueue middleware chain, ending with persist.
+func (q *Queue) runEnqueueMiddleware(ctx context.Context, job *core.Job, persist func(context.Context, *core.Job) error) error {
+	q.mu.RLock()
+	mws := make([]EnqueueMiddleware, len(q.enqueueMiddleware))
+	copy(mws, q.enqueueMiddleware)
+	q.mu.RUnlock()
+
+	// Build the chain from inside out: persist is the innermost, each middleware wraps the next
+	next := persist
+	for i := len(mws) - 1; i >= 0; i-- {
+		mw := mws[i]
+		inner := next
+		next = func(ctx context.Context, j *core.Job) error {
+			return mw(ctx, j, inner)
+		}
+	}
+	return next(ctx, job)
 }
 
 // Schedule registers a recurring job.
@@ -213,10 +246,27 @@ func (q *Queue) SetDeterminism(mode DeterminismMode) {
 	q.determinism = mode
 }
 
+// UseEnqueueMiddleware registers middleware that wraps the enqueue operation.
+// Middleware is called in registration order, wrapping the storage persist call.
+func (q *Queue) UseEnqueueMiddleware(mw EnqueueMiddleware) {
+	q.mu.Lock()
+	q.enqueueMiddleware = append(q.enqueueMiddleware, mw)
+	q.mu.Unlock()
+}
+
 // OnJobStart registers a callback for when a job starts.
 func (q *Queue) OnJobStart(fn func(context.Context, *core.Job)) {
 	q.mu.Lock()
 	q.onStart = append(q.onStart, fn)
+	q.mu.Unlock()
+}
+
+// OnJobStartCtx registers a callback that can modify the job's context.
+// The returned context replaces the job context for handler execution.
+// Use this to inject trace spans or other context values before the handler runs.
+func (q *Queue) OnJobStartCtx(fn func(context.Context, *core.Job) context.Context) {
+	q.mu.Lock()
+	q.onStartCtx = append(q.onStartCtx, fn)
 	q.mu.Unlock()
 }
 
@@ -305,6 +355,20 @@ func (q *Queue) CallStartHooks(ctx context.Context, job *core.Job) {
 	for _, fn := range hooks {
 		fn(ctx, job)
 	}
+}
+
+// CallStartCtxHooks calls all registered context-modifying start hooks.
+// Returns the (possibly modified) context.
+func (q *Queue) CallStartCtxHooks(ctx context.Context, job *core.Job) context.Context {
+	q.mu.RLock()
+	hooks := make([]func(context.Context, *core.Job) context.Context, len(q.onStartCtx))
+	copy(hooks, q.onStartCtx)
+	q.mu.RUnlock()
+
+	for _, fn := range hooks {
+		ctx = fn(ctx, job)
+	}
+	return ctx
 }
 
 // CallCompleteHooks calls all registered complete hooks.
