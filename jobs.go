@@ -452,6 +452,13 @@ func WithStaleLockAge(d time.Duration) WorkerOption {
 	return worker.WithStaleLockAge(d)
 }
 
+// WithLockDuration sets how long a job lock is held before expiring.
+// The heartbeat extends the lock by this duration every 2 minutes.
+// Default is 45 minutes.
+func WithLockDuration(d time.Duration) WorkerOption {
+	return worker.WithLockDuration(d)
+}
+
 // DefaultRetryConfig returns the default retry configuration.
 func DefaultRetryConfig() RetryConfig {
 	return worker.DefaultRetryConfig()
