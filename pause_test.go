@@ -46,7 +46,7 @@ func TestPauseJob_PausesJob(t *testing.T) {
 	id, err := q.Enqueue(ctx, "pause-test-job", "hello")
 	require.NoError(t, err)
 
-	err = jobs.PauseJob(ctx, store, id)
+	err = jobs.PauseJob(ctx, q, id)
 	require.NoError(t, err)
 
 	paused, err := jobs.IsJobPaused(ctx, store, id)
@@ -63,7 +63,7 @@ func TestResumeJob_ResumesJob(t *testing.T) {
 	require.NoError(t, err)
 
 	// Pause first, then resume.
-	require.NoError(t, jobs.PauseJob(ctx, store, id))
+	require.NoError(t, jobs.PauseJob(ctx, q, id))
 
 	err = jobs.ResumeJob(ctx, store, id)
 	require.NoError(t, err)
@@ -103,8 +103,8 @@ func TestGetPausedJobs_ReturnsPausedJobIDs(t *testing.T) {
 	_, err = q.Enqueue(ctx, "gpj-job", "c", jobs.QueueOpt("emails"))
 	require.NoError(t, err)
 
-	require.NoError(t, jobs.PauseJob(ctx, store, id1))
-	require.NoError(t, jobs.PauseJob(ctx, store, id2))
+	require.NoError(t, jobs.PauseJob(ctx, q, id1))
+	require.NoError(t, jobs.PauseJob(ctx, q, id2))
 
 	paused, err := jobs.GetPausedJobs(ctx, store, "emails")
 	require.NoError(t, err)
