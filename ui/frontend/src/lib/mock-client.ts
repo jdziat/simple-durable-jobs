@@ -26,6 +26,10 @@ import {
   GetWorkflowResponse,
   ListWorkflowsResponse,
   WorkflowSummary,
+  PauseJobResponse,
+  ResumeJobResponse,
+  PauseQueueResponse,
+  ResumeQueueResponse,
 } from './gen/jobs/v1/jobs_pb.js'
 
 // ---------------------------------------------------------------------------
@@ -81,7 +85,7 @@ const JOB_TYPES = [
   'update-search-index',
 ] as const
 
-const STATUSES = ['pending', 'running', 'completed', 'failed'] as const
+const STATUSES = ['pending', 'running', 'completed', 'failed', 'paused'] as const
 type Status = (typeof STATUSES)[number]
 
 const QUEUE_FOR_TYPE: Record<string, QueueName> = {
@@ -112,6 +116,9 @@ const ARGS_BY_TYPE: Record<string, () => unknown> = {
 // ---------------------------------------------------------------------------
 // Mock data store
 // ---------------------------------------------------------------------------
+
+// Track which queues are paused
+const pausedQueues = new Set<string>()
 
 interface MockJob {
   id: string
@@ -718,6 +725,8 @@ function buildQueueStats(queueName: string): QueueStats {
     running: i64(countByStatus(inQueue, 'running')),
     completed: i64(countByStatus(inQueue, 'completed')),
     failed: i64(countByStatus(inQueue, 'failed')),
+    paused: i64(countByStatus(inQueue, 'paused')),
+    isPaused: pausedQueues.has(queueName),
   })
 }
 
@@ -733,6 +742,7 @@ export const mockJobsClient = {
       totalRunning: i64(countByStatus(jobs, 'running')),
       totalCompleted: i64(countByStatus(jobs, 'completed')),
       totalFailed: i64(countByStatus(jobs, 'failed')),
+      totalPaused: i64(countByStatus(jobs, 'paused')),
       activeWorkers: jobs.filter((j) => j.status === 'running').length,
     })
   },
@@ -933,6 +943,44 @@ export const mockJobsClient = {
       fanOuts: rootFanOuts.map(fanOutToProto),
       children: children.map(toProtoJob),
     })
+  },
+
+  async pauseJob(
+    req: { id: string },
+  ): Promise<PauseJobResponse> {
+    ensureSimulation()
+    const j = [...jobs, ...workflowJobs].find((job) => job.id === req.id)
+    if (j && (j.status === 'pending' || j.status === 'running')) {
+      j.status = 'paused'
+    }
+    return new PauseJobResponse({})
+  },
+
+  async resumeJob(
+    req: { id: string },
+  ): Promise<ResumeJobResponse> {
+    ensureSimulation()
+    const j = [...jobs, ...workflowJobs].find((job) => job.id === req.id)
+    if (j && j.status === 'paused') {
+      j.status = 'pending'
+    }
+    return new ResumeJobResponse({})
+  },
+
+  async pauseQueue(
+    req: { name: string },
+  ): Promise<PauseQueueResponse> {
+    ensureSimulation()
+    pausedQueues.add(req.name)
+    return new PauseQueueResponse({})
+  },
+
+  async resumeQueue(
+    req: { name: string },
+  ): Promise<ResumeQueueResponse> {
+    ensureSimulation()
+    pausedQueues.delete(req.name)
+    return new ResumeQueueResponse({})
   },
 
   async listWorkflows(req: { page?: number; limit?: number; status?: string }): Promise<ListWorkflowsResponse> {

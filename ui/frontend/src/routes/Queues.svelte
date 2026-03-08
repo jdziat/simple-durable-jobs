@@ -8,13 +8,16 @@
     running: number
     completed: number
     failed: number
+    paused: number
     total: number
+    isPaused: boolean
   }
 
   let queues = $state<QueueItem[]>([])
   let loading = $state(true)
   let error = $state<string | null>(null)
-  let sortKey = $state<keyof QueueItem>('name')
+  type SortableQueueKey = 'name' | 'pending' | 'running' | 'completed' | 'failed' | 'paused' | 'total'
+  let sortKey = $state<SortableQueueKey>('name')
   let sortDir = $state<'asc' | 'desc'>('asc')
   let filterName = $state('')
 
@@ -33,7 +36,7 @@
     })
   )
 
-  function toggleSort(key: keyof QueueItem) {
+  function toggleSort(key: SortableQueueKey) {
     if (sortKey === key) {
       sortDir = sortDir === 'asc' ? 'desc' : 'asc'
     } else {
@@ -51,12 +54,32 @@
         running: Number(q.running),
         completed: Number(q.completed),
         failed: Number(q.failed),
-        total: Number(q.pending) + Number(q.running) + Number(q.completed) + Number(q.failed),
+        paused: Number(q.paused),
+        total: Number(q.pending) + Number(q.running) + Number(q.completed) + Number(q.failed) + Number(q.paused),
+        isPaused: q.isPaused,
       }))
     } catch (e) {
       error = e instanceof Error ? e.message : 'Failed to load queues'
     } finally {
       loading = false
+    }
+  }
+
+  async function pauseQueue(name: string) {
+    try {
+      await jobsClient.pauseQueue({ name })
+      loadQueues()
+    } catch (e) {
+      alert('Failed to pause queue')
+    }
+  }
+
+  async function resumeQueue(name: string) {
+    try {
+      await jobsClient.resumeQueue({ name })
+      loadQueues()
+    } catch (e) {
+      alert('Failed to resume queue')
     }
   }
 
@@ -110,6 +133,9 @@
           <th class="sortable" onclick={() => toggleSort('failed')}>
             Failed {sortKey === 'failed' ? (sortDir === 'asc' ? '▲' : '▼') : ''}
           </th>
+          <th class="sortable" onclick={() => toggleSort('paused')}>
+            Paused {sortKey === 'paused' ? (sortDir === 'asc' ? '▲' : '▼') : ''}
+          </th>
           <th class="sortable" onclick={() => toggleSort('total')}>
             Total {sortKey === 'total' ? (sortDir === 'asc' ? '▲' : '▼') : ''}
           </th>
@@ -119,13 +145,28 @@
       <tbody>
         {#each sortedQueues as queue}
           <tr>
-            <td class="queue-name">{queue.name}</td>
+            <td class="queue-name">
+              {queue.name}
+              {#if queue.isPaused}
+                <span class="badge-paused">Paused</span>
+              {/if}
+            </td>
             <td class="num">{queue.pending}</td>
             <td class="num">{queue.running}</td>
             <td class="num">{queue.completed}</td>
             <td class="num">{queue.failed}</td>
+            <td class="num">{queue.paused}</td>
             <td class="num total">{queue.total}</td>
             <td class="actions">
+              {#if queue.isPaused}
+                <button class="btn-resume-queue" onclick={() => resumeQueue(queue.name)}>
+                  Resume Queue
+                </button>
+              {:else}
+                <button class="btn-pause-queue" onclick={() => pauseQueue(queue.name)}>
+                  Pause Queue
+                </button>
+              {/if}
               {#if queue.failed > 0}
                 <button class="btn-purge" onclick={() => purgeQueue(queue.name, 'failed')}>
                   Purge Failed
@@ -214,7 +255,9 @@
   }
 
   .btn-purge,
-  .btn-purge-secondary {
+  .btn-purge-secondary,
+  .btn-pause-queue,
+  .btn-resume-queue {
     padding: 6px 12px;
     border: none;
     border-radius: 4px;
@@ -230,6 +273,28 @@
   .btn-purge-secondary {
     background: #6b7280;
     color: white;
+  }
+
+  .btn-pause-queue {
+    background: #f59e0b;
+    color: white;
+  }
+
+  .btn-resume-queue {
+    background: #10b981;
+    color: white;
+  }
+
+  .badge-paused {
+    display: inline-block;
+    margin-left: 8px;
+    padding: 2px 8px;
+    background: #fef9c3;
+    color: #854d0e;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 500;
+    vertical-align: middle;
   }
 
   .summary {

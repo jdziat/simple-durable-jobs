@@ -247,6 +247,16 @@ export class QueueStats extends Message<QueueStats> {
    */
   failed = protoInt64.zero;
 
+  /**
+   * @generated from field: int64 paused = 6;
+   */
+  paused = protoInt64.zero;
+
+  /**
+   * @generated from field: bool is_paused = 7;
+   */
+  isPaused = false;
+
   constructor(data?: PartialMessage<QueueStats>) {
     super();
     proto3.util.initPartial(data, this);
@@ -260,6 +270,8 @@ export class QueueStats extends Message<QueueStats> {
     { no: 3, name: "running", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
     { no: 4, name: "completed", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
     { no: 5, name: "failed", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 6, name: "paused", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 7, name: "is_paused", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): QueueStats {
@@ -502,6 +514,11 @@ export class GetStatsResponse extends Message<GetStatsResponse> {
    */
   activeWorkers = 0;
 
+  /**
+   * @generated from field: int64 total_paused = 7;
+   */
+  totalPaused = protoInt64.zero;
+
   constructor(data?: PartialMessage<GetStatsResponse>) {
     super();
     proto3.util.initPartial(data, this);
@@ -516,6 +533,7 @@ export class GetStatsResponse extends Message<GetStatsResponse> {
     { no: 4, name: "total_completed", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
     { no: 5, name: "total_failed", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
     { no: 6, name: "active_workers", kind: "scalar", T: 5 /* ScalarType.INT32 */ },
+    { no: 7, name: "total_paused", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetStatsResponse {
@@ -1159,6 +1177,290 @@ export class BulkDeleteJobsResponse extends Message<BulkDeleteJobsResponse> {
 
   static equals(a: BulkDeleteJobsResponse | PlainMessage<BulkDeleteJobsResponse> | undefined, b: BulkDeleteJobsResponse | PlainMessage<BulkDeleteJobsResponse> | undefined): boolean {
     return proto3.util.equals(BulkDeleteJobsResponse, a, b);
+  }
+}
+
+/**
+ * @generated from message jobs.v1.PauseJobRequest
+ */
+export class PauseJobRequest extends Message<PauseJobRequest> {
+  /**
+   * @generated from field: string id = 1;
+   */
+  id = "";
+
+  constructor(data?: PartialMessage<PauseJobRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "jobs.v1.PauseJobRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): PauseJobRequest {
+    return new PauseJobRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): PauseJobRequest {
+    return new PauseJobRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): PauseJobRequest {
+    return new PauseJobRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: PauseJobRequest | PlainMessage<PauseJobRequest> | undefined, b: PauseJobRequest | PlainMessage<PauseJobRequest> | undefined): boolean {
+    return proto3.util.equals(PauseJobRequest, a, b);
+  }
+}
+
+/**
+ * @generated from message jobs.v1.PauseJobResponse
+ */
+export class PauseJobResponse extends Message<PauseJobResponse> {
+  /**
+   * @generated from field: jobs.v1.Job job = 1;
+   */
+  job?: Job;
+
+  constructor(data?: PartialMessage<PauseJobResponse>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "jobs.v1.PauseJobResponse";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "job", kind: "message", T: Job },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): PauseJobResponse {
+    return new PauseJobResponse().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): PauseJobResponse {
+    return new PauseJobResponse().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): PauseJobResponse {
+    return new PauseJobResponse().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: PauseJobResponse | PlainMessage<PauseJobResponse> | undefined, b: PauseJobResponse | PlainMessage<PauseJobResponse> | undefined): boolean {
+    return proto3.util.equals(PauseJobResponse, a, b);
+  }
+}
+
+/**
+ * @generated from message jobs.v1.ResumeJobRequest
+ */
+export class ResumeJobRequest extends Message<ResumeJobRequest> {
+  /**
+   * @generated from field: string id = 1;
+   */
+  id = "";
+
+  constructor(data?: PartialMessage<ResumeJobRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "jobs.v1.ResumeJobRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ResumeJobRequest {
+    return new ResumeJobRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ResumeJobRequest {
+    return new ResumeJobRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ResumeJobRequest {
+    return new ResumeJobRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ResumeJobRequest | PlainMessage<ResumeJobRequest> | undefined, b: ResumeJobRequest | PlainMessage<ResumeJobRequest> | undefined): boolean {
+    return proto3.util.equals(ResumeJobRequest, a, b);
+  }
+}
+
+/**
+ * @generated from message jobs.v1.ResumeJobResponse
+ */
+export class ResumeJobResponse extends Message<ResumeJobResponse> {
+  /**
+   * @generated from field: jobs.v1.Job job = 1;
+   */
+  job?: Job;
+
+  constructor(data?: PartialMessage<ResumeJobResponse>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "jobs.v1.ResumeJobResponse";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "job", kind: "message", T: Job },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ResumeJobResponse {
+    return new ResumeJobResponse().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ResumeJobResponse {
+    return new ResumeJobResponse().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ResumeJobResponse {
+    return new ResumeJobResponse().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ResumeJobResponse | PlainMessage<ResumeJobResponse> | undefined, b: ResumeJobResponse | PlainMessage<ResumeJobResponse> | undefined): boolean {
+    return proto3.util.equals(ResumeJobResponse, a, b);
+  }
+}
+
+/**
+ * @generated from message jobs.v1.PauseQueueRequest
+ */
+export class PauseQueueRequest extends Message<PauseQueueRequest> {
+  /**
+   * @generated from field: string name = 1;
+   */
+  name = "";
+
+  constructor(data?: PartialMessage<PauseQueueRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "jobs.v1.PauseQueueRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): PauseQueueRequest {
+    return new PauseQueueRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): PauseQueueRequest {
+    return new PauseQueueRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): PauseQueueRequest {
+    return new PauseQueueRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: PauseQueueRequest | PlainMessage<PauseQueueRequest> | undefined, b: PauseQueueRequest | PlainMessage<PauseQueueRequest> | undefined): boolean {
+    return proto3.util.equals(PauseQueueRequest, a, b);
+  }
+}
+
+/**
+ * @generated from message jobs.v1.PauseQueueResponse
+ */
+export class PauseQueueResponse extends Message<PauseQueueResponse> {
+  constructor(data?: PartialMessage<PauseQueueResponse>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "jobs.v1.PauseQueueResponse";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): PauseQueueResponse {
+    return new PauseQueueResponse().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): PauseQueueResponse {
+    return new PauseQueueResponse().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): PauseQueueResponse {
+    return new PauseQueueResponse().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: PauseQueueResponse | PlainMessage<PauseQueueResponse> | undefined, b: PauseQueueResponse | PlainMessage<PauseQueueResponse> | undefined): boolean {
+    return proto3.util.equals(PauseQueueResponse, a, b);
+  }
+}
+
+/**
+ * @generated from message jobs.v1.ResumeQueueRequest
+ */
+export class ResumeQueueRequest extends Message<ResumeQueueRequest> {
+  /**
+   * @generated from field: string name = 1;
+   */
+  name = "";
+
+  constructor(data?: PartialMessage<ResumeQueueRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "jobs.v1.ResumeQueueRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ResumeQueueRequest {
+    return new ResumeQueueRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ResumeQueueRequest {
+    return new ResumeQueueRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ResumeQueueRequest {
+    return new ResumeQueueRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ResumeQueueRequest | PlainMessage<ResumeQueueRequest> | undefined, b: ResumeQueueRequest | PlainMessage<ResumeQueueRequest> | undefined): boolean {
+    return proto3.util.equals(ResumeQueueRequest, a, b);
+  }
+}
+
+/**
+ * @generated from message jobs.v1.ResumeQueueResponse
+ */
+export class ResumeQueueResponse extends Message<ResumeQueueResponse> {
+  constructor(data?: PartialMessage<ResumeQueueResponse>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "jobs.v1.ResumeQueueResponse";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ResumeQueueResponse {
+    return new ResumeQueueResponse().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ResumeQueueResponse {
+    return new ResumeQueueResponse().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ResumeQueueResponse {
+    return new ResumeQueueResponse().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ResumeQueueResponse | PlainMessage<ResumeQueueResponse> | undefined, b: ResumeQueueResponse | PlainMessage<ResumeQueueResponse> | undefined): boolean {
+    return proto3.util.equals(ResumeQueueResponse, a, b);
   }
 }
 

@@ -52,6 +52,14 @@ const (
 	// JobsServiceBulkDeleteJobsProcedure is the fully-qualified name of the JobsService's
 	// BulkDeleteJobs RPC.
 	JobsServiceBulkDeleteJobsProcedure = "/jobs.v1.JobsService/BulkDeleteJobs"
+	// JobsServicePauseJobProcedure is the fully-qualified name of the JobsService's PauseJob RPC.
+	JobsServicePauseJobProcedure = "/jobs.v1.JobsService/PauseJob"
+	// JobsServiceResumeJobProcedure is the fully-qualified name of the JobsService's ResumeJob RPC.
+	JobsServiceResumeJobProcedure = "/jobs.v1.JobsService/ResumeJob"
+	// JobsServicePauseQueueProcedure is the fully-qualified name of the JobsService's PauseQueue RPC.
+	JobsServicePauseQueueProcedure = "/jobs.v1.JobsService/PauseQueue"
+	// JobsServiceResumeQueueProcedure is the fully-qualified name of the JobsService's ResumeQueue RPC.
+	JobsServiceResumeQueueProcedure = "/jobs.v1.JobsService/ResumeQueue"
 	// JobsServiceListQueuesProcedure is the fully-qualified name of the JobsService's ListQueues RPC.
 	JobsServiceListQueuesProcedure = "/jobs.v1.JobsService/ListQueues"
 	// JobsServicePurgeQueueProcedure is the fully-qualified name of the JobsService's PurgeQueue RPC.
@@ -80,6 +88,11 @@ type JobsServiceClient interface {
 	DeleteJob(context.Context, *connect.Request[v1.DeleteJobRequest]) (*connect.Response[v1.DeleteJobResponse], error)
 	BulkRetryJobs(context.Context, *connect.Request[v1.BulkRetryJobsRequest]) (*connect.Response[v1.BulkRetryJobsResponse], error)
 	BulkDeleteJobs(context.Context, *connect.Request[v1.BulkDeleteJobsRequest]) (*connect.Response[v1.BulkDeleteJobsResponse], error)
+	// Pause/Resume
+	PauseJob(context.Context, *connect.Request[v1.PauseJobRequest]) (*connect.Response[v1.PauseJobResponse], error)
+	ResumeJob(context.Context, *connect.Request[v1.ResumeJobRequest]) (*connect.Response[v1.ResumeJobResponse], error)
+	PauseQueue(context.Context, *connect.Request[v1.PauseQueueRequest]) (*connect.Response[v1.PauseQueueResponse], error)
+	ResumeQueue(context.Context, *connect.Request[v1.ResumeQueueRequest]) (*connect.Response[v1.ResumeQueueResponse], error)
 	// Queues
 	ListQueues(context.Context, *connect.Request[v1.ListQueuesRequest]) (*connect.Response[v1.ListQueuesResponse], error)
 	PurgeQueue(context.Context, *connect.Request[v1.PurgeQueueRequest]) (*connect.Response[v1.PurgeQueueResponse], error)
@@ -151,6 +164,30 @@ func NewJobsServiceClient(httpClient connect.HTTPClient, baseURL string, opts ..
 			connect.WithSchema(jobsServiceMethods.ByName("BulkDeleteJobs")),
 			connect.WithClientOptions(opts...),
 		),
+		pauseJob: connect.NewClient[v1.PauseJobRequest, v1.PauseJobResponse](
+			httpClient,
+			baseURL+JobsServicePauseJobProcedure,
+			connect.WithSchema(jobsServiceMethods.ByName("PauseJob")),
+			connect.WithClientOptions(opts...),
+		),
+		resumeJob: connect.NewClient[v1.ResumeJobRequest, v1.ResumeJobResponse](
+			httpClient,
+			baseURL+JobsServiceResumeJobProcedure,
+			connect.WithSchema(jobsServiceMethods.ByName("ResumeJob")),
+			connect.WithClientOptions(opts...),
+		),
+		pauseQueue: connect.NewClient[v1.PauseQueueRequest, v1.PauseQueueResponse](
+			httpClient,
+			baseURL+JobsServicePauseQueueProcedure,
+			connect.WithSchema(jobsServiceMethods.ByName("PauseQueue")),
+			connect.WithClientOptions(opts...),
+		),
+		resumeQueue: connect.NewClient[v1.ResumeQueueRequest, v1.ResumeQueueResponse](
+			httpClient,
+			baseURL+JobsServiceResumeQueueProcedure,
+			connect.WithSchema(jobsServiceMethods.ByName("ResumeQueue")),
+			connect.WithClientOptions(opts...),
+		),
 		listQueues: connect.NewClient[v1.ListQueuesRequest, v1.ListQueuesResponse](
 			httpClient,
 			baseURL+JobsServiceListQueuesProcedure,
@@ -200,6 +237,10 @@ type jobsServiceClient struct {
 	deleteJob         *connect.Client[v1.DeleteJobRequest, v1.DeleteJobResponse]
 	bulkRetryJobs     *connect.Client[v1.BulkRetryJobsRequest, v1.BulkRetryJobsResponse]
 	bulkDeleteJobs    *connect.Client[v1.BulkDeleteJobsRequest, v1.BulkDeleteJobsResponse]
+	pauseJob          *connect.Client[v1.PauseJobRequest, v1.PauseJobResponse]
+	resumeJob         *connect.Client[v1.ResumeJobRequest, v1.ResumeJobResponse]
+	pauseQueue        *connect.Client[v1.PauseQueueRequest, v1.PauseQueueResponse]
+	resumeQueue       *connect.Client[v1.ResumeQueueRequest, v1.ResumeQueueResponse]
 	listQueues        *connect.Client[v1.ListQueuesRequest, v1.ListQueuesResponse]
 	purgeQueue        *connect.Client[v1.PurgeQueueRequest, v1.PurgeQueueResponse]
 	listScheduledJobs *connect.Client[v1.ListScheduledJobsRequest, v1.ListScheduledJobsResponse]
@@ -248,6 +289,26 @@ func (c *jobsServiceClient) BulkDeleteJobs(ctx context.Context, req *connect.Req
 	return c.bulkDeleteJobs.CallUnary(ctx, req)
 }
 
+// PauseJob calls jobs.v1.JobsService.PauseJob.
+func (c *jobsServiceClient) PauseJob(ctx context.Context, req *connect.Request[v1.PauseJobRequest]) (*connect.Response[v1.PauseJobResponse], error) {
+	return c.pauseJob.CallUnary(ctx, req)
+}
+
+// ResumeJob calls jobs.v1.JobsService.ResumeJob.
+func (c *jobsServiceClient) ResumeJob(ctx context.Context, req *connect.Request[v1.ResumeJobRequest]) (*connect.Response[v1.ResumeJobResponse], error) {
+	return c.resumeJob.CallUnary(ctx, req)
+}
+
+// PauseQueue calls jobs.v1.JobsService.PauseQueue.
+func (c *jobsServiceClient) PauseQueue(ctx context.Context, req *connect.Request[v1.PauseQueueRequest]) (*connect.Response[v1.PauseQueueResponse], error) {
+	return c.pauseQueue.CallUnary(ctx, req)
+}
+
+// ResumeQueue calls jobs.v1.JobsService.ResumeQueue.
+func (c *jobsServiceClient) ResumeQueue(ctx context.Context, req *connect.Request[v1.ResumeQueueRequest]) (*connect.Response[v1.ResumeQueueResponse], error) {
+	return c.resumeQueue.CallUnary(ctx, req)
+}
+
 // ListQueues calls jobs.v1.JobsService.ListQueues.
 func (c *jobsServiceClient) ListQueues(ctx context.Context, req *connect.Request[v1.ListQueuesRequest]) (*connect.Response[v1.ListQueuesResponse], error) {
 	return c.listQueues.CallUnary(ctx, req)
@@ -290,6 +351,11 @@ type JobsServiceHandler interface {
 	DeleteJob(context.Context, *connect.Request[v1.DeleteJobRequest]) (*connect.Response[v1.DeleteJobResponse], error)
 	BulkRetryJobs(context.Context, *connect.Request[v1.BulkRetryJobsRequest]) (*connect.Response[v1.BulkRetryJobsResponse], error)
 	BulkDeleteJobs(context.Context, *connect.Request[v1.BulkDeleteJobsRequest]) (*connect.Response[v1.BulkDeleteJobsResponse], error)
+	// Pause/Resume
+	PauseJob(context.Context, *connect.Request[v1.PauseJobRequest]) (*connect.Response[v1.PauseJobResponse], error)
+	ResumeJob(context.Context, *connect.Request[v1.ResumeJobRequest]) (*connect.Response[v1.ResumeJobResponse], error)
+	PauseQueue(context.Context, *connect.Request[v1.PauseQueueRequest]) (*connect.Response[v1.PauseQueueResponse], error)
+	ResumeQueue(context.Context, *connect.Request[v1.ResumeQueueRequest]) (*connect.Response[v1.ResumeQueueResponse], error)
 	// Queues
 	ListQueues(context.Context, *connect.Request[v1.ListQueuesRequest]) (*connect.Response[v1.ListQueuesResponse], error)
 	PurgeQueue(context.Context, *connect.Request[v1.PurgeQueueRequest]) (*connect.Response[v1.PurgeQueueResponse], error)
@@ -357,6 +423,30 @@ func NewJobsServiceHandler(svc JobsServiceHandler, opts ...connect.HandlerOption
 		connect.WithSchema(jobsServiceMethods.ByName("BulkDeleteJobs")),
 		connect.WithHandlerOptions(opts...),
 	)
+	jobsServicePauseJobHandler := connect.NewUnaryHandler(
+		JobsServicePauseJobProcedure,
+		svc.PauseJob,
+		connect.WithSchema(jobsServiceMethods.ByName("PauseJob")),
+		connect.WithHandlerOptions(opts...),
+	)
+	jobsServiceResumeJobHandler := connect.NewUnaryHandler(
+		JobsServiceResumeJobProcedure,
+		svc.ResumeJob,
+		connect.WithSchema(jobsServiceMethods.ByName("ResumeJob")),
+		connect.WithHandlerOptions(opts...),
+	)
+	jobsServicePauseQueueHandler := connect.NewUnaryHandler(
+		JobsServicePauseQueueProcedure,
+		svc.PauseQueue,
+		connect.WithSchema(jobsServiceMethods.ByName("PauseQueue")),
+		connect.WithHandlerOptions(opts...),
+	)
+	jobsServiceResumeQueueHandler := connect.NewUnaryHandler(
+		JobsServiceResumeQueueProcedure,
+		svc.ResumeQueue,
+		connect.WithSchema(jobsServiceMethods.ByName("ResumeQueue")),
+		connect.WithHandlerOptions(opts...),
+	)
 	jobsServiceListQueuesHandler := connect.NewUnaryHandler(
 		JobsServiceListQueuesProcedure,
 		svc.ListQueues,
@@ -411,6 +501,14 @@ func NewJobsServiceHandler(svc JobsServiceHandler, opts ...connect.HandlerOption
 			jobsServiceBulkRetryJobsHandler.ServeHTTP(w, r)
 		case JobsServiceBulkDeleteJobsProcedure:
 			jobsServiceBulkDeleteJobsHandler.ServeHTTP(w, r)
+		case JobsServicePauseJobProcedure:
+			jobsServicePauseJobHandler.ServeHTTP(w, r)
+		case JobsServiceResumeJobProcedure:
+			jobsServiceResumeJobHandler.ServeHTTP(w, r)
+		case JobsServicePauseQueueProcedure:
+			jobsServicePauseQueueHandler.ServeHTTP(w, r)
+		case JobsServiceResumeQueueProcedure:
+			jobsServiceResumeQueueHandler.ServeHTTP(w, r)
 		case JobsServiceListQueuesProcedure:
 			jobsServiceListQueuesHandler.ServeHTTP(w, r)
 		case JobsServicePurgeQueueProcedure:
@@ -462,6 +560,22 @@ func (UnimplementedJobsServiceHandler) BulkRetryJobs(context.Context, *connect.R
 
 func (UnimplementedJobsServiceHandler) BulkDeleteJobs(context.Context, *connect.Request[v1.BulkDeleteJobsRequest]) (*connect.Response[v1.BulkDeleteJobsResponse], error) {
 	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("jobs.v1.JobsService.BulkDeleteJobs is not implemented"))
+}
+
+func (UnimplementedJobsServiceHandler) PauseJob(context.Context, *connect.Request[v1.PauseJobRequest]) (*connect.Response[v1.PauseJobResponse], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("jobs.v1.JobsService.PauseJob is not implemented"))
+}
+
+func (UnimplementedJobsServiceHandler) ResumeJob(context.Context, *connect.Request[v1.ResumeJobRequest]) (*connect.Response[v1.ResumeJobResponse], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("jobs.v1.JobsService.ResumeJob is not implemented"))
+}
+
+func (UnimplementedJobsServiceHandler) PauseQueue(context.Context, *connect.Request[v1.PauseQueueRequest]) (*connect.Response[v1.PauseQueueResponse], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("jobs.v1.JobsService.PauseQueue is not implemented"))
+}
+
+func (UnimplementedJobsServiceHandler) ResumeQueue(context.Context, *connect.Request[v1.ResumeQueueRequest]) (*connect.Response[v1.ResumeQueueResponse], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("jobs.v1.JobsService.ResumeQueue is not implemented"))
 }
 
 func (UnimplementedJobsServiceHandler) ListQueues(context.Context, *connect.Request[v1.ListQueuesRequest]) (*connect.Response[v1.ListQueuesResponse], error) {

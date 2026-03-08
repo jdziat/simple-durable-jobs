@@ -45,11 +45,23 @@ func (s *GormStorage) GetQueueStats(ctx context.Context) ([]*jobsv1.QueueStats, 
 			qs.Completed += r.Count
 		case core.StatusFailed:
 			qs.Failed += r.Count
+		case core.StatusPaused:
+			qs.Paused += r.Count
 		}
+	}
+
+	// Check which queues are paused
+	pausedQueues, _ := s.GetPausedQueues(ctx)
+	pausedSet := make(map[string]struct{}, len(pausedQueues))
+	for _, q := range pausedQueues {
+		pausedSet[q] = struct{}{}
 	}
 
 	result := make([]*jobsv1.QueueStats, 0, len(statsMap))
 	for _, qs := range statsMap {
+		if _, ok := pausedSet[qs.Name]; ok {
+			qs.IsPaused = true
+		}
 		result = append(result, qs)
 	}
 	return result, nil

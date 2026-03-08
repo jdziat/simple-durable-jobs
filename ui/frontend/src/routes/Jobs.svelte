@@ -92,6 +92,24 @@
     }
   }
 
+  async function pauseJob(id: string) {
+    try {
+      await jobsClient.pauseJob({ id })
+      loadJobs()
+    } catch (e) {
+      alert('Failed to pause job')
+    }
+  }
+
+  async function resumeJob(id: string) {
+    try {
+      await jobsClient.resumeJob({ id })
+      loadJobs()
+    } catch (e) {
+      alert('Failed to resume job')
+    }
+  }
+
   async function deleteJob(id: string) {
     if (!confirm('Are you sure you want to delete this job?')) return
     try {
@@ -141,6 +159,10 @@
       <option value="running">Running</option>
       <option value="completed">Completed</option>
       <option value="failed">Failed</option>
+      <option value="paused">Paused</option>
+      <option value="cancelled">Cancelled</option>
+      <option value="waiting">Waiting</option>
+      <option value="retrying">Retrying</option>
     </select>
     <input
       type="text"
@@ -199,6 +221,12 @@
             <td class="actions" onclick={(e) => e.stopPropagation()}>
               {#if job.status === 'failed'}
                 <button class="btn-retry" onclick={() => retryJob(job.id)}>Retry</button>
+              {/if}
+              {#if job.status === 'pending' || job.status === 'running'}
+                <button class="btn-pause" onclick={() => pauseJob(job.id)}>Pause</button>
+              {/if}
+              {#if job.status === 'paused'}
+                <button class="btn-resume" onclick={() => resumeJob(job.id)}>Resume</button>
               {/if}
               <button class="btn-delete" onclick={() => deleteJob(job.id)}>Delete</button>
             </td>
@@ -315,6 +343,10 @@
   .status-running { background: #dbeafe; color: #1e40af; }
   .status-completed { background: #d1fae5; color: #065f46; }
   .status-failed { background: #fee2e2; color: #991b1b; }
+  .status-paused { background: #fef9c3; color: #854d0e; }
+  .status-cancelled { background: #fce7f3; color: #9d174d; }
+  .status-waiting { background: #e0e7ff; color: #3730a3; }
+  .status-retrying { background: #fff7ed; color: #9a3412; }
 
   .actions {
     display: flex;
@@ -322,7 +354,9 @@
   }
 
   .btn-retry,
-  .btn-delete {
+  .btn-delete,
+  .btn-pause,
+  .btn-resume {
     padding: 4px 12px;
     border: none;
     border-radius: 4px;
@@ -337,6 +371,16 @@
 
   .btn-delete {
     background: #ef4444;
+    color: white;
+  }
+
+  .btn-pause {
+    background: #f59e0b;
+    color: white;
+  }
+
+  .btn-resume {
+    background: #10b981;
     color: white;
   }
 
