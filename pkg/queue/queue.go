@@ -112,7 +112,21 @@ func (q *Queue) GetHandler(name string) (*handler.Handler, bool) {
 	return h, ok
 }
 
-// Enqueue adds a job to the queue.
+// CallDirect looks up a registered handler by name and invokes it directly
+// with the given context and serialized args. Unlike Call/Enqueue, this does
+// not create a job record or checkpoint — it's a synchronous in-process call.
+// Use this when a workflow needs to invoke an activity handler inline.
+func (q *Queue) CallDirect(ctx context.Context, name string, argsJSON []byte) error {
+	q.mu.RLock()
+	h, ok := q.handlers[name]
+	q.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("jobs: no handler registered for %q", name)
+	}
+	return h.Execute(ctx, argsJSON)
+}
+
+// Enqueue adds a job to the queue. The job type must have a registered handler.
 func (q *Queue) Enqueue(ctx context.Context, name string, args any, opts ...Option) (string, error) {
 	q.mu.RLock()
 	_, ok := q.handlers[name]
@@ -122,6 +136,16 @@ func (q *Queue) Enqueue(ctx context.Context, name string, args any, opts ...Opti
 		return "", fmt.Errorf("jobs: no handler registered for %q", name)
 	}
 
+	return q.enqueue(ctx, name, args, opts...)
+}
+
+// EnqueueRemote adds a job to the queue without requiring a local handler registration.
+// Use this for producer-only clients that enqueue jobs for workers in a separate process.
+func (q *Queue) EnqueueRemote(ctx context.Context, name string, args any, opts ...Option) (string, error) {
+	return q.enqueue(ctx, name, args, opts...)
+}
+
+func (q *Queue) enqueue(ctx context.Context, name string, args any, opts ...Option) (string, error) {
 	options := NewOptions()
 	for _, opt := range opts {
 		opt.Apply(options)
@@ -476,34 +500,21 @@ func (q *Queue) PauseJob(ctx context.Context, jobID string, opts ...PauseOption)
 		opt.ApplyPause(po)
 	}
 
-	err := q.storage.PauseJob(ctx, jobID)
-	if err == nil {
-		// Pending/waiting job paused successfully in storage
-		job, getErr := q.storage.GetJob(ctx, jobID)
-		if getErr == nil && job != nil {
-			q.Emit(&core.JobPaused{Job: job, Mode: po.Mode, Timestamp: time.Now()})
-		}
-		return nil
-	}
-
-	// If the error is ErrCannotPauseStatus, the job might be running.
-	// Try to cancel it via the running job registry.
-	if !errors.Is(err, core.ErrCannotPauseStatus) {
-		return err
-	}
-
-	// Check if the job is actually running and we have a cancel for it
+	// Check if the job is running locally before touching storage,
+	// so we can cancel its context after the DB update.
 	q.runningJobsMu.Lock()
-	cancel, found := q.runningJobs[jobID]
+	cancel, runningLocally := q.runningJobs[jobID]
 	q.runningJobsMu.Unlock()
 
-	if !found {
-		// Job is in a status we can't pause and it's not in the running registry
+	err := q.storage.PauseJob(ctx, jobID)
+	if err != nil {
 		return err
 	}
 
-	// Cancel the running job's context
-	cancel()
+	// If the job was running locally, cancel its context so the handler stops.
+	if runningLocally {
+		cancel()
+	}
 
 	// Emit event
 	job, getErr := q.storage.GetJob(ctx, jobID)

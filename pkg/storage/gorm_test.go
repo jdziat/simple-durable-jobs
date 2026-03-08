@@ -729,7 +729,7 @@ func TestPauseJob_AlreadyPausedReturnsError(t *testing.T) {
 	assert.True(t, errors.Is(err, core.ErrJobAlreadyPaused))
 }
 
-func TestPauseJob_CannotPauseRunningJob(t *testing.T) {
+func TestPauseJob_CancelsRunningJob(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStorage(t)
 
@@ -739,9 +739,15 @@ func TestPauseJob_CannotPauseRunningJob(t *testing.T) {
 	_, err := s.Dequeue(ctx, []string{"default"}, "worker-1")
 	require.NoError(t, err)
 
+	// Running jobs should be cancelled (not paused)
 	err = s.PauseJob(ctx, job.ID)
-	require.Error(t, err)
-	assert.True(t, errors.Is(err, core.ErrCannotPauseStatus))
+	require.NoError(t, err)
+
+	got, err := s.GetJob(ctx, job.ID)
+	require.NoError(t, err)
+	assert.Equal(t, core.StatusCancelled, got.Status)
+	assert.Equal(t, "cancelled by user", got.LastError)
+	assert.NotNil(t, got.CompletedAt)
 }
 
 func TestPauseJob_NotFoundReturnsError(t *testing.T) {

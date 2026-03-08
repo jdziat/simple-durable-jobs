@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	"gorm.io/driver/mysql"
 	"gorm.io/driver/postgres"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
@@ -25,8 +26,27 @@ var dbCounter atomic.Int64
 // avoid exceeding max_connections.
 func openIntegrationDB(t *testing.T) *gorm.DB {
 	t.Helper()
-	dsn := os.Getenv("TEST_DATABASE_URL")
-	if dsn != "" {
+
+	if dsn := os.Getenv("TEST_MYSQL_URL"); dsn != "" {
+		db, err := gorm.Open(mysql.Open(dsn), &gorm.Config{
+			Logger: logger.Default.LogMode(logger.Silent),
+		})
+		require.NoError(t, err, "open mysql integration db")
+
+		sqlDB, err := db.DB()
+		require.NoError(t, err, "get underlying sql.DB")
+		sqlDB.SetMaxOpenConns(2)
+		sqlDB.SetMaxIdleConns(1)
+
+		cleanupExternalIntegrationDB(t, db)
+		t.Cleanup(func() {
+			cleanupExternalIntegrationDB(t, db)
+			_ = sqlDB.Close()
+		})
+		return db
+	}
+
+	if dsn := os.Getenv("TEST_DATABASE_URL"); dsn != "" {
 		db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{
 			Logger: logger.Default.LogMode(logger.Silent),
 		})
@@ -37,10 +57,9 @@ func openIntegrationDB(t *testing.T) *gorm.DB {
 		sqlDB.SetMaxOpenConns(2)
 		sqlDB.SetMaxIdleConns(1)
 
-		// Clean before AND after to ensure test isolation.
-		cleanupPostgresIntegrationDB(t, db)
+		cleanupExternalIntegrationDB(t, db)
 		t.Cleanup(func() {
-			cleanupPostgresIntegrationDB(t, db)
+			cleanupExternalIntegrationDB(t, db)
 			_ = sqlDB.Close()
 		})
 		return db
@@ -74,8 +93,8 @@ func openIntegrationQueue(t *testing.T) (*jobs.Queue, jobs.Storage) {
 	return queue, store
 }
 
-// cleanupPostgresIntegrationDB deletes all rows so tests are isolated.
-func cleanupPostgresIntegrationDB(t *testing.T, db *gorm.DB) {
+// cleanupExternalIntegrationDB deletes all rows so tests are isolated.
+func cleanupExternalIntegrationDB(t *testing.T, db *gorm.DB) {
 	t.Helper()
 	tables := []string{"checkpoints", "fan_outs", "queue_states", "jobs"}
 	for _, tbl := range tables {
