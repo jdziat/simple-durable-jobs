@@ -4,11 +4,15 @@ import (
 	"context"
 
 	"github.com/jdziat/simple-durable-jobs/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/pkg/queue"
 	"github.com/jdziat/simple-durable-jobs/pkg/security"
 )
 
 // PauseMode determines how pause operations behave.
 type PauseMode = core.PauseMode
+
+// PauseOption configures pause behavior.
+type PauseOption = queue.PauseOption
 
 // Pause mode constants.
 const (
@@ -19,8 +23,10 @@ const (
 )
 
 // PauseJob pauses a specific job by ID.
-func PauseJob(ctx context.Context, storage Storage, jobID string) error {
-	return storage.PauseJob(ctx, jobID)
+// This delegates to Queue.PauseJob so that running jobs have their context
+// cancelled via the running-job registry.
+func PauseJob(ctx context.Context, q *Queue, jobID string, opts ...PauseOption) error {
+	return q.PauseJob(ctx, jobID, opts...)
 }
 
 // ResumeJob resumes a paused job.
@@ -34,35 +40,35 @@ func IsJobPaused(ctx context.Context, storage Storage, jobID string) (bool, erro
 }
 
 // GetPausedJobs returns all paused jobs in a queue.
-func GetPausedJobs(ctx context.Context, storage Storage, queue string) ([]*Job, error) {
-	if err := security.ValidateQueueName(queue); err != nil {
+func GetPausedJobs(ctx context.Context, storage Storage, queueName string) ([]*Job, error) {
+	if err := security.ValidateQueueName(queueName); err != nil {
 		return nil, err
 	}
-	return storage.GetPausedJobs(ctx, queue)
+	return storage.GetPausedJobs(ctx, queueName)
 }
 
 // PauseQueue pauses an entire queue.
-func PauseQueue(ctx context.Context, storage Storage, queue string) error {
-	if err := security.ValidateQueueName(queue); err != nil {
+func PauseQueue(ctx context.Context, storage Storage, queueName string) error {
+	if err := security.ValidateQueueName(queueName); err != nil {
 		return err
 	}
-	return storage.PauseQueue(ctx, queue)
+	return storage.PauseQueue(ctx, queueName)
 }
 
 // ResumeQueue resumes a paused queue.
-func ResumeQueue(ctx context.Context, storage Storage, queue string) error {
-	if err := security.ValidateQueueName(queue); err != nil {
+func ResumeQueue(ctx context.Context, storage Storage, queueName string) error {
+	if err := security.ValidateQueueName(queueName); err != nil {
 		return err
 	}
-	return storage.UnpauseQueue(ctx, queue)
+	return storage.UnpauseQueue(ctx, queueName)
 }
 
 // IsQueuePaused checks if a queue is paused.
-func IsQueuePaused(ctx context.Context, storage Storage, queue string) (bool, error) {
-	if err := security.ValidateQueueName(queue); err != nil {
+func IsQueuePaused(ctx context.Context, storage Storage, queueName string) (bool, error) {
+	if err := security.ValidateQueueName(queueName); err != nil {
 		return false, err
 	}
-	return storage.IsQueuePaused(ctx, queue)
+	return storage.IsQueuePaused(ctx, queueName)
 }
 
 // GetPausedQueues returns all paused queue names.
@@ -70,24 +76,7 @@ func GetPausedQueues(ctx context.Context, storage Storage) ([]string, error) {
 	return storage.GetPausedQueues(ctx)
 }
 
-// PauseOption configures pause behavior.
-type PauseOption interface {
-	applyPause(*pauseOptions)
-}
-
-type pauseOptions struct {
-	mode core.PauseMode
-}
-
-type pauseModeOpt struct {
-	mode core.PauseMode
-}
-
-func (o pauseModeOpt) applyPause(opts *pauseOptions) {
-	opts.mode = o.mode
-}
-
 // WithPauseMode sets the pause mode for pause operations.
 func WithPauseMode(mode PauseMode) PauseOption {
-	return pauseModeOpt{mode: mode}
+	return queue.WithPauseMode(mode)
 }

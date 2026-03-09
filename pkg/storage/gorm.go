@@ -11,6 +11,7 @@ import (
 	"github.com/google/uuid"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
+	"gorm.io/gorm/logger"
 
 	"github.com/jdziat/simple-durable-jobs/pkg/core"
 	"github.com/jdziat/simple-durable-jobs/pkg/security"
@@ -167,7 +168,10 @@ func (s *GormStorage) Dequeue(ctx context.Context, queues []string, workerID str
 	}
 
 	// PostgreSQL/MySQL: Use FOR UPDATE SKIP LOCKED for proper distributed locking
-	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	// Use silent logger for this transaction — "record not found" is the normal
+	// idle state and spams logs every poll interval.
+	silentDB := s.db.Session(&gorm.Session{Logger: s.db.Logger.LogMode(logger.Silent)})
+	err = silentDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		// FOR UPDATE SKIP LOCKED ensures:
 		// 1. The selected row is locked for this transaction
 		// 2. Other workers skip locked rows instead of waiting
@@ -783,23 +787,31 @@ func (s *GormStorage) PauseJob(ctx context.Context, jobID string) error {
 			return core.ErrJobAlreadyPaused
 		}
 
-		// Only allow pausing pending or waiting jobs.
-		// Running jobs cannot be paused - use worker.Pause() for that.
+		now := time.Now()
+
 		switch job.Status {
 		case core.StatusPending, core.StatusWaiting:
-			// OK to pause
+			// Pause: store previous status for restoration on unpause
+			return tx.Model(&core.Job{}).
+				Where("id = ?", jobID).
+				Updates(map[string]any{
+					"status":          core.StatusPaused,
+					"previous_status": job.Status,
+					"updated_at":      now,
+				}).Error
+		case core.StatusRunning:
+			// Cancel: running jobs transition directly to cancelled
+			return tx.Model(&core.Job{}).
+				Where("id = ?", jobID).
+				Updates(map[string]any{
+					"status":       core.StatusCancelled,
+					"completed_at": now,
+					"updated_at":   now,
+					"last_error":   "cancelled by user",
+				}).Error
 		default:
 			return core.ErrCannotPauseStatus
 		}
-
-		// Store previous status for restoration on unpause
-		return tx.Model(&core.Job{}).
-			Where("id = ?", jobID).
-			Updates(map[string]any{
-				"status":          core.StatusPaused,
-				"previous_status": job.Status,
-				"updated_at":      time.Now(),
-			}).Error
 	})
 }
 

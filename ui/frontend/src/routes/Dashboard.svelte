@@ -11,6 +11,7 @@
     totalRunning: number
     totalCompleted: number
     totalFailed: number
+    totalPaused: number
     queues: QueueStat[]
   } | null>(null)
 
@@ -52,6 +53,7 @@
         totalRunning: Number(response.totalRunning),
         totalCompleted: Number(response.totalCompleted),
         totalFailed: Number(response.totalFailed),
+        totalPaused: Number(response.totalPaused),
         queues: response.queues.map(q => ({
           name: q.name,
           pending: Number(q.pending),
@@ -118,6 +120,7 @@
       <StatsCard title="Running" value={stats.totalRunning} color="#3b82f6" href="#/jobs?status=running" />
       <StatsCard title="Completed" value={stats.totalCompleted} color="#10b981" href="#/jobs?status=completed" />
       <StatsCard title="Failed" value={stats.totalFailed} color="#ef4444" href="#/jobs?status=failed" />
+      <StatsCard title="Paused" value={stats.totalPaused} color="#854d0e" href="#/jobs?status=paused" />
     </div>
 
     <div class="chart-section">

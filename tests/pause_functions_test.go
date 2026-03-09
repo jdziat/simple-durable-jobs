@@ -10,13 +10,13 @@ import (
 )
 
 func TestPauseJob_Standalone(t *testing.T) {
-	store := setupStorageTest(t)
+	q, store := openIntegrationQueue(t)
 	ctx := context.Background()
 
 	job := &jobs.Job{Type: "test", Queue: "default"}
 	_ = store.Enqueue(ctx, job)
 
-	err := jobs.PauseJob(ctx, store, job.ID)
+	err := jobs.PauseJob(ctx, q, job.ID)
 	require.NoError(t, err)
 
 	paused, err := jobs.IsJobPaused(ctx, store, job.ID)
@@ -25,12 +25,12 @@ func TestPauseJob_Standalone(t *testing.T) {
 }
 
 func TestResumeJob_Standalone(t *testing.T) {
-	store := setupStorageTest(t)
+	q, store := openIntegrationQueue(t)
 	ctx := context.Background()
 
 	job := &jobs.Job{Type: "test", Queue: "default"}
 	_ = store.Enqueue(ctx, job)
-	_ = jobs.PauseJob(ctx, store, job.ID)
+	_ = jobs.PauseJob(ctx, q, job.ID)
 
 	err := jobs.ResumeJob(ctx, store, job.ID)
 	require.NoError(t, err)
@@ -41,7 +41,7 @@ func TestResumeJob_Standalone(t *testing.T) {
 }
 
 func TestPauseQueue_Standalone(t *testing.T) {
-	store := setupStorageTest(t)
+	_, store := openIntegrationQueue(t)
 	ctx := context.Background()
 
 	err := jobs.PauseQueue(ctx, store, "emails")
@@ -53,7 +53,7 @@ func TestPauseQueue_Standalone(t *testing.T) {
 }
 
 func TestResumeQueue_Standalone(t *testing.T) {
-	store := setupStorageTest(t)
+	_, store := openIntegrationQueue(t)
 	ctx := context.Background()
 
 	_ = jobs.PauseQueue(ctx, store, "emails")
@@ -67,12 +67,12 @@ func TestResumeQueue_Standalone(t *testing.T) {
 }
 
 func TestGetPausedJobs_Standalone(t *testing.T) {
-	store := setupStorageTest(t)
+	q, store := openIntegrationQueue(t)
 	ctx := context.Background()
 
 	job := &jobs.Job{Type: "test", Queue: "default"}
 	_ = store.Enqueue(ctx, job)
-	_ = jobs.PauseJob(ctx, store, job.ID)
+	_ = jobs.PauseJob(ctx, q, job.ID)
 
 	paused, err := jobs.GetPausedJobs(ctx, store, "default")
 	require.NoError(t, err)
@@ -80,7 +80,7 @@ func TestGetPausedJobs_Standalone(t *testing.T) {
 }
 
 func TestGetPausedQueues_Standalone(t *testing.T) {
-	store := setupStorageTest(t)
+	_, store := openIntegrationQueue(t)
 	ctx := context.Background()
 
 	_ = jobs.PauseQueue(ctx, store, "emails")

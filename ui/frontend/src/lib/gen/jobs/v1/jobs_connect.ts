@@ -3,7 +3,7 @@
 /* eslint-disable */
 // @ts-nocheck
 
-import { BulkDeleteJobsRequest, BulkDeleteJobsResponse, BulkRetryJobsRequest, BulkRetryJobsResponse, DeleteJobRequest, DeleteJobResponse, Event, GetJobRequest, GetJobResponse, GetStatsHistoryRequest, GetStatsHistoryResponse, GetStatsRequest, GetStatsResponse, GetWorkflowRequest, GetWorkflowResponse, ListJobsRequest, ListJobsResponse, ListQueuesRequest, ListQueuesResponse, ListScheduledJobsRequest, ListScheduledJobsResponse, ListWorkflowsRequest, ListWorkflowsResponse, PurgeQueueRequest, PurgeQueueResponse, RetryJobRequest, RetryJobResponse, WatchEventsRequest } from "./jobs_pb.js";
+import { BulkDeleteJobsRequest, BulkDeleteJobsResponse, BulkRetryJobsRequest, BulkRetryJobsResponse, DeleteJobRequest, DeleteJobResponse, Event, GetJobRequest, GetJobResponse, GetStatsHistoryRequest, GetStatsHistoryResponse, GetStatsRequest, GetStatsResponse, GetWorkflowRequest, GetWorkflowResponse, ListJobsRequest, ListJobsResponse, ListQueuesRequest, ListQueuesResponse, ListScheduledJobsRequest, ListScheduledJobsResponse, ListWorkflowsRequest, ListWorkflowsResponse, PauseJobRequest, PauseJobResponse, PauseQueueRequest, PauseQueueResponse, PurgeQueueRequest, PurgeQueueResponse, ResumeJobRequest, ResumeJobResponse, ResumeQueueRequest, ResumeQueueResponse, RetryJobRequest, RetryJobResponse, WatchEventsRequest } from "./jobs_pb.js";
 import { MethodKind } from "@bufbuild/protobuf";
 
 /**
@@ -86,6 +86,44 @@ export const JobsService = {
       name: "BulkDeleteJobs",
       I: BulkDeleteJobsRequest,
       O: BulkDeleteJobsResponse,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Pause/Resume
+     *
+     * @generated from rpc jobs.v1.JobsService.PauseJob
+     */
+    pauseJob: {
+      name: "PauseJob",
+      I: PauseJobRequest,
+      O: PauseJobResponse,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * @generated from rpc jobs.v1.JobsService.ResumeJob
+     */
+    resumeJob: {
+      name: "ResumeJob",
+      I: ResumeJobRequest,
+      O: ResumeJobResponse,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * @generated from rpc jobs.v1.JobsService.PauseQueue
+     */
+    pauseQueue: {
+      name: "PauseQueue",
+      I: PauseQueueRequest,
+      O: PauseQueueResponse,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * @generated from rpc jobs.v1.JobsService.ResumeQueue
+     */
+    resumeQueue: {
+      name: "ResumeQueue",
+      I: ResumeQueueRequest,
+      O: ResumeQueueResponse,
       kind: MethodKind.Unary,
     },
     /**

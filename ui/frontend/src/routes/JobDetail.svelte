@@ -114,6 +114,24 @@
     }
   }
 
+  async function pauseJob() {
+    try {
+      await jobsClient.pauseJob({ id })
+      loadJob()
+    } catch (e) {
+      alert('Failed to pause job')
+    }
+  }
+
+  async function resumeJob() {
+    try {
+      await jobsClient.resumeJob({ id })
+      loadJob()
+    } catch (e) {
+      alert('Failed to resume job')
+    }
+  }
+
   async function deleteJob() {
     if (!confirm('Are you sure you want to delete this job?')) return
     try {
@@ -236,6 +254,12 @@
       {#if job.status === 'failed'}
         <button class="btn-retry" onclick={retryJob}>Retry Job</button>
       {/if}
+      {#if job.status === 'pending' || job.status === 'running'}
+        <button class="btn-pause" onclick={pauseJob}>Pause Job</button>
+      {/if}
+      {#if job.status === 'paused'}
+        <button class="btn-resume" onclick={resumeJob}>Resume Job</button>
+      {/if}
       <button class="btn-delete" onclick={deleteJob}>Delete Job</button>
     </div>
   {/if}
@@ -275,6 +299,10 @@
   .status-running { background: #dbeafe; color: #1e40af; }
   .status-completed { background: #d1fae5; color: #065f46; }
   .status-failed { background: #fee2e2; color: #991b1b; }
+  .status-paused { background: #fef9c3; color: #854d0e; }
+  .status-cancelled { background: #fce7f3; color: #9d174d; }
+  .status-waiting { background: #e0e7ff; color: #3730a3; }
+  .status-retrying { background: #fff7ed; color: #9a3412; }
 
   .meta, .timestamps {
     display: grid;
@@ -372,7 +400,7 @@
     margin-top: 24px;
   }
 
-  .btn-retry, .btn-delete {
+  .btn-retry, .btn-delete, .btn-pause, .btn-resume {
     padding: 10px 20px;
     border: none;
     border-radius: 6px;
@@ -382,6 +410,8 @@
 
   .btn-retry { background: #3b82f6; color: white; }
   .btn-delete { background: #ef4444; color: white; }
+  .btn-pause { background: #f59e0b; color: white; }
+  .btn-resume { background: #10b981; color: white; }
 
   .workflow-section {
     margin-bottom: 24px;

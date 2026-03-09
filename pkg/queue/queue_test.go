@@ -2,6 +2,7 @@ package queue
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -37,10 +38,19 @@ func (m *mockStorage) EnqueueUnique(ctx context.Context, job *core.Job, uniqueKe
 }
 
 func (m *mockStorage) Dequeue(ctx context.Context, queues []string, workerID string) (*core.Job, error) {
+	for _, job := range m.jobs {
+		if job.Status == core.StatusPending {
+			job.Status = core.StatusRunning
+			return job, nil
+		}
+	}
 	return nil, nil
 }
 
 func (m *mockStorage) Complete(ctx context.Context, jobID, workerID string) error {
+	if job, ok := m.jobs[jobID]; ok {
+		job.Status = core.StatusCompleted
+	}
 	return nil
 }
 
@@ -452,8 +462,17 @@ func (m *mockStarter) Start(ctx context.Context) error {
 
 // Pause operation methods for mock storage
 func (m *mockStorage) PauseJob(ctx context.Context, jobID string) error {
-	if job, ok := m.jobs[jobID]; ok {
+	job, ok := m.jobs[jobID]
+	if !ok {
+		return fmt.Errorf("job not found: %s", jobID)
+	}
+	switch job.Status {
+	case core.StatusPending, core.StatusWaiting:
 		job.Status = core.StatusPaused
+	case core.StatusRunning:
+		job.Status = core.StatusCancelled
+	default:
+		return core.ErrCannotPauseStatus
 	}
 	return nil
 }
@@ -906,18 +925,6 @@ func TestQueue_CancelSubJob_AllFailed_StatusFailed(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// errPauseStorage — a mock whose PauseJob always returns ErrCannotPauseStatus.
-// This exercises the running-job-registry branches of Queue.PauseJob.
-// ---------------------------------------------------------------------------
-
-type errPauseStorage struct {
-	*mockStorage
-}
-
-func (e *errPauseStorage) PauseJob(_ context.Context, _ string) error {
-	return core.ErrCannotPauseStatus
-}
-
 func TestQueue_PauseJob_WithPauseMode_Graceful(t *testing.T) {
 	store := newMockStorage()
 	q := New(store)
@@ -936,33 +943,52 @@ func TestQueue_PauseJob_WithPauseMode_Graceful(t *testing.T) {
 	assert.True(t, paused)
 }
 
-func TestQueue_PauseJob_RunningJobInRegistry_CancelsCancelFunc(t *testing.T) {
-	base := newMockStorage()
-	store := &errPauseStorage{mockStorage: base}
+func TestQueue_PauseJob_RunningJobCancelsContext(t *testing.T) {
+	store := newMockStorage()
 	q := New(store)
 	ctx := context.Background()
+
+	q.Register("run-job", func(ctx context.Context, args struct{}) error { return nil })
+	jobID, err := q.Enqueue(ctx, "run-job", struct{}{})
+	require.NoError(t, err)
+
+	// Dequeue to set status to running
+	_, err = store.Dequeue(ctx, []string{"default"}, "worker-1")
+	require.NoError(t, err)
 
 	var cancelled bool
 	cancel := func() { cancelled = true }
 
-	// Register a "running" job in the queue registry.
-	q.RegisterRunningJob("running-job-1", cancel)
+	// Register as running locally
+	q.RegisterRunningJob(jobID, cancel)
 
-	// PauseJob will fail with ErrCannotPauseStatus from storage, then look
-	// up the running registry and call cancel().
-	err := q.PauseJob(ctx, "running-job-1")
+	// PauseJob on a running job: storage sets cancelled, queue cancels context
+	err = q.PauseJob(ctx, jobID)
 	require.NoError(t, err)
 	assert.True(t, cancelled, "cancel function should have been called")
+
+	// Verify it's cancelled in storage
+	job, err := store.GetJob(ctx, jobID)
+	require.NoError(t, err)
+	assert.Equal(t, core.StatusCancelled, job.Status)
 }
 
-func TestQueue_PauseJob_RunningJobNotInRegistry_ReturnsError(t *testing.T) {
-	base := newMockStorage()
-	store := &errPauseStorage{mockStorage: base}
+func TestQueue_PauseJob_CompletedJobReturnsError(t *testing.T) {
+	store := newMockStorage()
 	q := New(store)
 	ctx := context.Background()
 
-	// No cancel registered for this job — PauseJob should propagate the error.
-	err := q.PauseJob(ctx, "not-in-registry")
+	q.Register("done-job", func(ctx context.Context, args struct{}) error { return nil })
+	jobID, err := q.Enqueue(ctx, "done-job", struct{}{})
+	require.NoError(t, err)
+
+	// Dequeue and complete
+	_, err = store.Dequeue(ctx, []string{"default"}, "worker-1")
+	require.NoError(t, err)
+	require.NoError(t, store.Complete(ctx, jobID, "worker-1"))
+
+	// Cannot pause a completed job
+	err = q.PauseJob(ctx, jobID)
 	assert.ErrorIs(t, err, core.ErrCannotPauseStatus)
 }
 

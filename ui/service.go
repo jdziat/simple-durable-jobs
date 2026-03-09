@@ -53,6 +53,7 @@ func (s *jobsService) GetStats(ctx context.Context, req *connect.Request[jobsv1.
 		resp.TotalRunning += qs.Running
 		resp.TotalCompleted += qs.Completed
 		resp.TotalFailed += qs.Failed
+		resp.TotalPaused += qs.Paused
 	}
 
 	return connect.NewResponse(resp), nil
@@ -206,6 +207,55 @@ func (s *jobsService) BulkDeleteJobs(ctx context.Context, req *connect.Request[j
 	return connect.NewResponse(&jobsv1.BulkDeleteJobsResponse{
 		Count: int32(count),
 	}), nil
+}
+
+// PauseJob pauses a specific job.
+func (s *jobsService) PauseJob(ctx context.Context, req *connect.Request[jobsv1.PauseJobRequest]) (*connect.Response[jobsv1.PauseJobResponse], error) {
+	if s.queue == nil {
+		return nil, connect.NewError(connect.CodeUnimplemented, nil)
+	}
+	if err := s.queue.PauseJob(ctx, req.Msg.Id); err != nil {
+		return nil, connect.NewError(connect.CodeInternal, err)
+	}
+	job, err := s.storage.GetJob(ctx, req.Msg.Id)
+	if err != nil {
+		return nil, connect.NewError(connect.CodeInternal, err)
+	}
+	if job == nil {
+		return nil, connect.NewError(connect.CodeNotFound, nil)
+	}
+	return connect.NewResponse(&jobsv1.PauseJobResponse{Job: jobToProto(job)}), nil
+}
+
+// ResumeJob resumes a paused job.
+func (s *jobsService) ResumeJob(ctx context.Context, req *connect.Request[jobsv1.ResumeJobRequest]) (*connect.Response[jobsv1.ResumeJobResponse], error) {
+	if err := s.storage.UnpauseJob(ctx, req.Msg.Id); err != nil {
+		return nil, connect.NewError(connect.CodeInternal, err)
+	}
+	job, err := s.storage.GetJob(ctx, req.Msg.Id)
+	if err != nil {
+		return nil, connect.NewError(connect.CodeInternal, err)
+	}
+	if job == nil {
+		return nil, connect.NewError(connect.CodeNotFound, nil)
+	}
+	return connect.NewResponse(&jobsv1.ResumeJobResponse{Job: jobToProto(job)}), nil
+}
+
+// PauseQueue pauses an entire queue.
+func (s *jobsService) PauseQueue(ctx context.Context, req *connect.Request[jobsv1.PauseQueueRequest]) (*connect.Response[jobsv1.PauseQueueResponse], error) {
+	if err := s.storage.PauseQueue(ctx, req.Msg.Name); err != nil {
+		return nil, connect.NewError(connect.CodeInternal, err)
+	}
+	return connect.NewResponse(&jobsv1.PauseQueueResponse{}), nil
+}
+
+// ResumeQueue resumes a paused queue.
+func (s *jobsService) ResumeQueue(ctx context.Context, req *connect.Request[jobsv1.ResumeQueueRequest]) (*connect.Response[jobsv1.ResumeQueueResponse], error) {
+	if err := s.storage.UnpauseQueue(ctx, req.Msg.Name); err != nil {
+		return nil, connect.NewError(connect.CodeInternal, err)
+	}
+	return connect.NewResponse(&jobsv1.ResumeQueueResponse{}), nil
 }
 
 // ListQueues returns all queues with stats.
@@ -459,7 +509,7 @@ func (s *jobsService) getQueueStats(ctx context.Context) ([]*jobsv1.QueueStats, 
 	const maxFallbackJobs = 1000
 	stats := make(map[string]*jobsv1.QueueStats)
 
-	for _, status := range []core.JobStatus{core.StatusPending, core.StatusRunning, core.StatusCompleted, core.StatusFailed} {
+	for _, status := range []core.JobStatus{core.StatusPending, core.StatusRunning, core.StatusCompleted, core.StatusFailed, core.StatusPaused} {
 		jobs, err := s.storage.GetJobsByStatus(ctx, status, maxFallbackJobs)
 		if err != nil {
 			return nil, err
@@ -479,6 +529,8 @@ func (s *jobsService) getQueueStats(ctx context.Context) ([]*jobsv1.QueueStats, 
 				qs.Completed++
 			case core.StatusFailed:
 				qs.Failed++
+			case core.StatusPaused:
+				qs.Paused++
 			}
 		}
 	}
@@ -521,7 +573,7 @@ func (s *jobsService) searchJobs(ctx context.Context, req *jobsv1.ListJobsReques
 		allJobs = jobs
 	} else {
 		// No status filter - fetch from all statuses
-		for _, status := range []core.JobStatus{core.StatusPending, core.StatusRunning, core.StatusCompleted, core.StatusFailed} {
+		for _, status := range []core.JobStatus{core.StatusPending, core.StatusRunning, core.StatusCompleted, core.StatusFailed, core.StatusPaused} {
 			jobs, err := s.storage.GetJobsByStatus(ctx, status, fetchLimit)
 			if err != nil {
 				return nil, 0, err

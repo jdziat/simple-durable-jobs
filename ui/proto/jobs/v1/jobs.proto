@@ -18,6 +18,12 @@ service JobsService {
   rpc BulkRetryJobs(BulkRetryJobsRequest) returns (BulkRetryJobsResponse);
   rpc BulkDeleteJobs(BulkDeleteJobsRequest) returns (BulkDeleteJobsResponse);
 
+  // Pause/Resume
+  rpc PauseJob(PauseJobRequest) returns (PauseJobResponse);
+  rpc ResumeJob(ResumeJobRequest) returns (ResumeJobResponse);
+  rpc PauseQueue(PauseQueueRequest) returns (PauseQueueResponse);
+  rpc ResumeQueue(ResumeQueueRequest) returns (ResumeQueueResponse);
+
   // Queues
   rpc ListQueues(ListQueuesRequest) returns (ListQueuesResponse);
   rpc PurgeQueue(PurgeQueueRequest) returns (PurgeQueueResponse);
@@ -72,6 +78,8 @@ message QueueStats {
   int64 running = 3;
   int64 completed = 4;
   int64 failed = 5;
+  int64 paused = 6;
+  bool is_paused = 7;
 }
 
 message FanOut {
@@ -106,6 +114,7 @@ message GetStatsResponse {
   int64 total_completed = 4;
   int64 total_failed = 5;
   int32 active_workers = 6;
+  int64 total_paused = 7;
 }
 
 message GetStatsHistoryRequest {
@@ -170,6 +179,30 @@ message BulkDeleteJobsRequest {
 message BulkDeleteJobsResponse {
   int32 count = 1;
 }
+
+message PauseJobRequest {
+  string id = 1;
+}
+message PauseJobResponse {
+  Job job = 1;
+}
+
+message ResumeJobRequest {
+  string id = 1;
+}
+message ResumeJobResponse {
+  Job job = 1;
+}
+
+message PauseQueueRequest {
+  string name = 1;
+}
+message PauseQueueResponse {}
+
+message ResumeQueueRequest {
+  string name = 1;
+}
+message ResumeQueueResponse {}
 
 message ListQueuesRequest {}
 message ListQueuesResponse {

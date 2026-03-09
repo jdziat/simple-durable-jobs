@@ -31,6 +31,14 @@ type mockStorage struct {
 	getCheckpointsFn      func(ctx context.Context, jobID string) ([]core.Checkpoint, error)
 	getFanOutsByParentFn  func(ctx context.Context, parentID string) ([]*core.FanOut, error)
 	getSubJobsFn          func(ctx context.Context, fanOutID string) ([]*core.Job, error)
+	pauseJobFn            func(ctx context.Context, id string) error
+	unpauseJobFn          func(ctx context.Context, id string) error
+	isJobPausedFn         func(ctx context.Context, id string) (bool, error)
+	getPausedJobsFn       func(ctx context.Context, queue string) ([]*core.Job, error)
+	pauseQueueFn          func(ctx context.Context, name string) error
+	unpauseQueueFn        func(ctx context.Context, name string) error
+	isQueuePausedFn       func(ctx context.Context, name string) (bool, error)
+	getPausedQueuesFn     func(ctx context.Context) ([]string, error)
 }
 
 // Implement the full core.Storage interface; methods not under test return zero values.
@@ -85,14 +93,54 @@ func (m *mockStorage) SuspendJob(_ context.Context, _, _ string) error          
 func (m *mockStorage) ResumeJob(_ context.Context, _ string) (bool, error)               { return false, nil }
 func (m *mockStorage) GetWaitingJobsToResume(_ context.Context) ([]*core.Job, error)     { return nil, nil }
 func (m *mockStorage) SaveJobResult(_ context.Context, _, _ string, _ []byte) error      { return nil }
-func (m *mockStorage) PauseJob(_ context.Context, _ string) error                        { return nil }
-func (m *mockStorage) UnpauseJob(_ context.Context, _ string) error                      { return nil }
-func (m *mockStorage) GetPausedJobs(_ context.Context, _ string) ([]*core.Job, error)    { return nil, nil }
-func (m *mockStorage) IsJobPaused(_ context.Context, _ string) (bool, error)             { return false, nil }
-func (m *mockStorage) PauseQueue(_ context.Context, _ string) error                      { return nil }
-func (m *mockStorage) UnpauseQueue(_ context.Context, _ string) error                    { return nil }
-func (m *mockStorage) GetPausedQueues(_ context.Context) ([]string, error)               { return nil, nil }
-func (m *mockStorage) IsQueuePaused(_ context.Context, _ string) (bool, error)           { return false, nil }
+func (m *mockStorage) PauseJob(ctx context.Context, id string) error {
+	if m.pauseJobFn != nil {
+		return m.pauseJobFn(ctx, id)
+	}
+	return nil
+}
+func (m *mockStorage) UnpauseJob(ctx context.Context, id string) error {
+	if m.unpauseJobFn != nil {
+		return m.unpauseJobFn(ctx, id)
+	}
+	return nil
+}
+func (m *mockStorage) GetPausedJobs(ctx context.Context, queue string) ([]*core.Job, error) {
+	if m.getPausedJobsFn != nil {
+		return m.getPausedJobsFn(ctx, queue)
+	}
+	return nil, nil
+}
+func (m *mockStorage) IsJobPaused(ctx context.Context, id string) (bool, error) {
+	if m.isJobPausedFn != nil {
+		return m.isJobPausedFn(ctx, id)
+	}
+	return false, nil
+}
+func (m *mockStorage) PauseQueue(ctx context.Context, name string) error {
+	if m.pauseQueueFn != nil {
+		return m.pauseQueueFn(ctx, name)
+	}
+	return nil
+}
+func (m *mockStorage) UnpauseQueue(ctx context.Context, name string) error {
+	if m.unpauseQueueFn != nil {
+		return m.unpauseQueueFn(ctx, name)
+	}
+	return nil
+}
+func (m *mockStorage) GetPausedQueues(ctx context.Context) ([]string, error) {
+	if m.getPausedQueuesFn != nil {
+		return m.getPausedQueuesFn(ctx)
+	}
+	return nil, nil
+}
+func (m *mockStorage) IsQueuePaused(ctx context.Context, name string) (bool, error) {
+	if m.isQueuePausedFn != nil {
+		return m.isQueuePausedFn(ctx, name)
+	}
+	return false, nil
+}
 func (m *mockStorage) RefreshQueueStates(_ context.Context) (map[string]bool, error) {
 	return nil, nil
 }
@@ -1547,4 +1595,229 @@ func TestJobToProto_WithRunAt(t *testing.T) {
 	}
 	pb := jobToProto(j)
 	assert.NotNil(t, pb.RunAt)
+}
+
+// ---------------------------------------------------------------------------
+// PauseJob tests
+// ---------------------------------------------------------------------------
+
+func TestPauseJob_Success(t *testing.T) {
+	paused := sampleJob("j1", "default", "work", core.StatusPaused)
+
+	store := &mockStorage{
+		pauseJobFn: func(_ context.Context, id string) error {
+			assert.Equal(t, "j1", id)
+			return nil
+		},
+		getJobFn: func(_ context.Context, id string) (*core.Job, error) {
+			assert.Equal(t, "j1", id)
+			return paused, nil
+		},
+	}
+
+	q := queue.New(store)
+	svc := newJobsService(store, q, nil)
+
+	resp, err := svc.PauseJob(context.Background(), connect.NewRequest(&jobsv1.PauseJobRequest{Id: "j1"}))
+	require.NoError(t, err)
+	require.NotNil(t, resp.Msg.Job)
+	assert.Equal(t, "j1", resp.Msg.Job.Id)
+	assert.Equal(t, string(core.StatusPaused), resp.Msg.Job.Status)
+}
+
+func TestPauseJob_NilQueue_ReturnsUnimplemented(t *testing.T) {
+	svc := newJobsService(&mockStorage{}, nil, nil)
+	_, err := svc.PauseJob(context.Background(), connect.NewRequest(&jobsv1.PauseJobRequest{Id: "j1"}))
+	require.Error(t, err)
+	assert.Equal(t, connect.CodeUnimplemented, connect.CodeOf(err))
+}
+
+func TestPauseJob_StorageError(t *testing.T) {
+	store := &mockStorage{
+		pauseJobFn: func(_ context.Context, _ string) error {
+			return errors.New("db error")
+		},
+	}
+	q := queue.New(store)
+	svc := newJobsService(store, q, nil)
+
+	_, err := svc.PauseJob(context.Background(), connect.NewRequest(&jobsv1.PauseJobRequest{Id: "j1"}))
+	require.Error(t, err)
+	assert.Equal(t, connect.CodeInternal, connect.CodeOf(err))
+}
+
+func TestPauseJob_JobNotFoundAfterPause(t *testing.T) {
+	store := &mockStorage{
+		pauseJobFn: func(_ context.Context, _ string) error { return nil },
+		getJobFn:   func(_ context.Context, _ string) (*core.Job, error) { return nil, nil },
+	}
+	q := queue.New(store)
+	svc := newJobsService(store, q, nil)
+
+	_, err := svc.PauseJob(context.Background(), connect.NewRequest(&jobsv1.PauseJobRequest{Id: "j1"}))
+	require.Error(t, err)
+	assert.Equal(t, connect.CodeNotFound, connect.CodeOf(err))
+}
+
+// ---------------------------------------------------------------------------
+// ResumeJob tests
+// ---------------------------------------------------------------------------
+
+func TestResumeJob_Success(t *testing.T) {
+	resumed := sampleJob("j1", "default", "work", core.StatusPending)
+
+	store := &mockStorage{
+		unpauseJobFn: func(_ context.Context, id string) error {
+			assert.Equal(t, "j1", id)
+			return nil
+		},
+		getJobFn: func(_ context.Context, id string) (*core.Job, error) {
+			assert.Equal(t, "j1", id)
+			return resumed, nil
+		},
+	}
+	svc := newJobsService(store, nil, nil)
+
+	resp, err := svc.ResumeJob(context.Background(), connect.NewRequest(&jobsv1.ResumeJobRequest{Id: "j1"}))
+	require.NoError(t, err)
+	require.NotNil(t, resp.Msg.Job)
+	assert.Equal(t, "j1", resp.Msg.Job.Id)
+}
+
+func TestResumeJob_UnpauseError(t *testing.T) {
+	store := &mockStorage{
+		unpauseJobFn: func(_ context.Context, _ string) error {
+			return errors.New("db error")
+		},
+	}
+	svc := newJobsService(store, nil, nil)
+
+	_, err := svc.ResumeJob(context.Background(), connect.NewRequest(&jobsv1.ResumeJobRequest{Id: "j1"}))
+	require.Error(t, err)
+	assert.Equal(t, connect.CodeInternal, connect.CodeOf(err))
+}
+
+func TestResumeJob_JobNotFoundAfterUnpause(t *testing.T) {
+	store := &mockStorage{
+		unpauseJobFn: func(_ context.Context, _ string) error { return nil },
+		getJobFn:     func(_ context.Context, _ string) (*core.Job, error) { return nil, nil },
+	}
+	svc := newJobsService(store, nil, nil)
+
+	_, err := svc.ResumeJob(context.Background(), connect.NewRequest(&jobsv1.ResumeJobRequest{Id: "j1"}))
+	require.Error(t, err)
+	assert.Equal(t, connect.CodeNotFound, connect.CodeOf(err))
+}
+
+// ---------------------------------------------------------------------------
+// PauseQueue tests
+// ---------------------------------------------------------------------------
+
+func TestPauseQueue_Success(t *testing.T) {
+	called := false
+	store := &mockStorage{
+		pauseQueueFn: func(_ context.Context, name string) error {
+			assert.Equal(t, "emails", name)
+			called = true
+			return nil
+		},
+	}
+	svc := newJobsService(store, nil, nil)
+
+	resp, err := svc.PauseQueue(context.Background(), connect.NewRequest(&jobsv1.PauseQueueRequest{Name: "emails"}))
+	require.NoError(t, err)
+	assert.NotNil(t, resp)
+	assert.True(t, called)
+}
+
+func TestPauseQueue_StorageError(t *testing.T) {
+	store := &mockStorage{
+		pauseQueueFn: func(_ context.Context, _ string) error {
+			return errors.New("db error")
+		},
+	}
+	svc := newJobsService(store, nil, nil)
+
+	_, err := svc.PauseQueue(context.Background(), connect.NewRequest(&jobsv1.PauseQueueRequest{Name: "emails"}))
+	require.Error(t, err)
+	assert.Equal(t, connect.CodeInternal, connect.CodeOf(err))
+}
+
+// ---------------------------------------------------------------------------
+// ResumeQueue tests
+// ---------------------------------------------------------------------------
+
+func TestResumeQueue_Success(t *testing.T) {
+	called := false
+	store := &mockStorage{
+		unpauseQueueFn: func(_ context.Context, name string) error {
+			assert.Equal(t, "emails", name)
+			called = true
+			return nil
+		},
+	}
+	svc := newJobsService(store, nil, nil)
+
+	resp, err := svc.ResumeQueue(context.Background(), connect.NewRequest(&jobsv1.ResumeQueueRequest{Name: "emails"}))
+	require.NoError(t, err)
+	assert.NotNil(t, resp)
+	assert.True(t, called)
+}
+
+func TestResumeQueue_StorageError(t *testing.T) {
+	store := &mockStorage{
+		unpauseQueueFn: func(_ context.Context, _ string) error {
+			return errors.New("db error")
+		},
+	}
+	svc := newJobsService(store, nil, nil)
+
+	_, err := svc.ResumeQueue(context.Background(), connect.NewRequest(&jobsv1.ResumeQueueRequest{Name: "emails"}))
+	require.Error(t, err)
+	assert.Equal(t, connect.CodeInternal, connect.CodeOf(err))
+}
+
+// ---------------------------------------------------------------------------
+// GetStats — paused count propagation
+// ---------------------------------------------------------------------------
+
+func TestGetStats_IncludesPausedCount(t *testing.T) {
+	qs := []*jobsv1.QueueStats{
+		{Name: "default", Pending: 2, Running: 1, Completed: 5, Failed: 0, Paused: 3},
+	}
+	store := &mockUIStorage{
+		getQueueStatsFn: func(_ context.Context) ([]*jobsv1.QueueStats, error) {
+			return qs, nil
+		},
+	}
+	svc := newServiceWithUIStorage(store)
+
+	resp, err := svc.GetStats(context.Background(), connect.NewRequest(&jobsv1.GetStatsRequest{}))
+	require.NoError(t, err)
+	assert.Equal(t, int64(3), resp.Msg.TotalPaused)
+	require.Len(t, resp.Msg.Queues, 1)
+	assert.Equal(t, int64(3), resp.Msg.Queues[0].Paused)
+}
+
+func TestGetStats_FallbackIncludesPausedCount(t *testing.T) {
+	// Exercises the fallback path (plain mockStorage, not UIStorage) with StatusPaused jobs.
+	pausedJobs := []*core.Job{
+		sampleJob("j-p1", "default", "work", core.StatusPaused),
+		sampleJob("j-p2", "default", "work", core.StatusPaused),
+	}
+	store := &mockStorage{
+		getJobsByStatusFn: func(_ context.Context, status core.JobStatus, _ int) ([]*core.Job, error) {
+			if status == core.StatusPaused {
+				return pausedJobs, nil
+			}
+			return nil, nil
+		},
+	}
+	svc := newServiceWithBaseStorage(store)
+
+	resp, err := svc.GetStats(context.Background(), connect.NewRequest(&jobsv1.GetStatsRequest{}))
+	require.NoError(t, err)
+	assert.Equal(t, int64(2), resp.Msg.TotalPaused)
+	require.Len(t, resp.Msg.Queues, 1)
+	assert.Equal(t, int64(2), resp.Msg.Queues[0].Paused)
 }
