@@ -308,14 +308,19 @@ func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 		completeErr := w.completeWithRetry(ctx, job.ID)
 		if completeErr != nil {
 			w.logger.Error("failed to complete job after retries", "job_id", job.ID, "error", completeErr)
-			return
+			// Still handle sub-job completion — the work is done even if
+			// we couldn't mark it in the DB. Without this, the fan-out
+			// counter never increments and the parent stays in 'waiting'.
+		} else {
+			w.queue.CallCompleteHooks(ctx, job)
+			// Emit completion event
+			w.queue.Emit(&core.JobCompleted{Job: job, Duration: time.Since(startTime), Timestamp: time.Now()})
 		}
-		w.queue.CallCompleteHooks(ctx, job)
-		// Emit completion event
-		w.queue.Emit(&core.JobCompleted{Job: job, Duration: time.Since(startTime), Timestamp: time.Now()})
 
-		// Handle sub-job completion (resume parent if needed)
-		if err := w.handleSubJobCompletion(ctx, job, true); err != nil {
+		// Handle sub-job completion (resume parent if needed) — always run
+		// regardless of whether Complete() succeeded, to prevent orphaned
+		// parent jobs stuck in 'waiting' with all sub-jobs actually done.
+		if err := w.handleSubJobCompletion(ctx, job, completeErr == nil); err != nil {
 			w.logger.Error("failed to handle sub-job completion", "job_id", job.ID, "error", err)
 		}
 	}
@@ -575,19 +580,36 @@ func (w *Worker) completeFanOut(ctx context.Context, fo *core.FanOut, status cor
 		}
 	}
 
-	// Resume parent job
-	resumed, err := w.queue.Storage().ResumeJob(ctx, fo.ParentJobID)
-	if err != nil {
-		return fmt.Errorf("failed to resume parent job: %w", err)
+	// Resume parent job — retry a few times because the parent might still be
+	// transitioning from running → waiting (SuspendJob hasn't completed yet).
+	var resumed bool
+	for attempt := 0; attempt < 5; attempt++ {
+		resumed, err = w.queue.Storage().ResumeJob(ctx, fo.ParentJobID)
+		if err != nil {
+			return fmt.Errorf("failed to resume parent job: %w", err)
+		}
+		if resumed {
+			break
+		}
+		// Parent not in waiting/paused status yet — wait briefly and retry
+		if attempt < 4 {
+			w.logger.Debug("parent job not yet in resumable status, retrying",
+				"parent_job_id", fo.ParentJobID,
+				"attempt", attempt+1)
+			time.Sleep(time.Duration(100*(1<<attempt)) * time.Millisecond) // 100ms, 200ms, 400ms, 800ms
+		}
 	}
 	if !resumed {
-		w.logger.Warn("parent job was not in waiting status", "parent_job_id", fo.ParentJobID)
+		w.logger.Error("CRITICAL: parent job could not be resumed after retries — may be stuck",
+			"parent_job_id", fo.ParentJobID,
+			"fan_out_id", fo.ID)
 	}
 
 	w.logger.Info("resumed parent job after fan-out completion",
 		"parent_job_id", fo.ParentJobID,
 		"fan_out_id", fo.ID,
-		"status", status)
+		"status", status,
+		"resumed", resumed)
 
 	return nil
 }

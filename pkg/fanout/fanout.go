@@ -156,11 +156,7 @@ func FanOut[T any](ctx context.Context, subJobs []SubJob, opts ...Option) ([]Res
 		}
 	}
 
-	if err := jc.Storage.EnqueueBatch(ctx, jobs); err != nil {
-		return nil, fmt.Errorf("failed to enqueue sub-jobs: %w", err)
-	}
-
-	// Save checkpoint
+	// Save checkpoint BEFORE suspending
 	cpData, _ := json.Marshal(core.FanOutCheckpoint{
 		FanOutID:  fanOutID,
 		CallIndex: callIndex,
@@ -176,9 +172,24 @@ func FanOut[T any](ctx context.Context, subJobs []SubJob, opts ...Option) ([]Res
 		return nil, fmt.Errorf("failed to save fan-out checkpoint: %w", err)
 	}
 
-	// Suspend parent job and wait for resume
+	// CRITICAL: Suspend parent BEFORE enqueuing sub-jobs.
+	// If we enqueue first, a fast worker can complete a sub-job and call
+	// ResumeJob before we suspend — ResumeJob finds status=running instead
+	// of waiting, and the parent is stuck forever.
 	if err := jc.Storage.SuspendJob(ctx, jc.Job.ID, jc.WorkerID); err != nil {
 		return nil, fmt.Errorf("failed to suspend job: %w", err)
+	}
+
+	// Now enqueue sub-jobs — parent is already in waiting status,
+	// so ResumeJob will succeed when children complete.
+	if err := jc.Storage.EnqueueBatch(ctx, jobs); err != nil {
+		// If enqueue fails after suspend, we need to resume the parent
+		// to avoid leaving it stuck in waiting with no sub-jobs.
+		if _, resumeErr := jc.Storage.ResumeJob(ctx, jc.Job.ID); resumeErr != nil {
+			// Log but don't mask the original error
+			_ = resumeErr
+		}
+		return nil, fmt.Errorf("failed to enqueue sub-jobs: %w", err)
 	}
 
 	// Signal to worker that this job should not continue

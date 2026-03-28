@@ -67,3 +67,4 @@ ui/frontend/test-results/
 jobsui
 ui/cmd/jobsui/jobsui
 ui/cmd/e2etestserver/e2etestserver
+e2etestserver
