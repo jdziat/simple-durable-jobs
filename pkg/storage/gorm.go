@@ -577,6 +577,8 @@ func (s *GormStorage) EnqueueBatch(ctx context.Context, jobs []*core.Job) error 
 	if len(jobs) == 0 {
 		return nil
 	}
+
+	var toCreate []*core.Job
 	for _, job := range jobs {
 		if job.ID == "" {
 			job.ID = uuid.New().String()
@@ -587,8 +589,25 @@ func (s *GormStorage) EnqueueBatch(ctx context.Context, jobs []*core.Job) error 
 		if job.Queue == "" {
 			job.Queue = "default"
 		}
+
+		// Skip jobs with UniqueKey that already exist (prevents duplicates on replay)
+		if job.UniqueKey != "" {
+			var count int64
+			s.db.WithContext(ctx).Model(&core.Job{}).
+				Where("unique_key = ? AND status IN ?", job.UniqueKey,
+					[]core.JobStatus{core.StatusPending, core.StatusRunning, core.StatusCompleted}).
+				Count(&count)
+			if count > 0 {
+				continue // Already exists, skip
+			}
+		}
+		toCreate = append(toCreate, job)
 	}
-	return s.db.WithContext(ctx).Create(jobs).Error
+
+	if len(toCreate) == 0 {
+		return nil // All jobs already exist
+	}
+	return s.db.WithContext(ctx).Create(toCreate).Error
 }
 
 // GetSubJobs retrieves all sub-jobs for a fan-out.

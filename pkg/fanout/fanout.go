@@ -142,8 +142,9 @@ func FanOut[T any](ctx context.Context, subJobs []SubJob, opts ...Option) ([]Res
 			rootID = &jc.Job.ID
 		}
 
+		jobID := uuid.New().String()
 		jobs[i] = &core.Job{
-			ID:          uuid.New().String(),
+			ID:          jobID,
 			Type:        sj.Type,
 			Args:        args,
 			Queue:       queue,
@@ -153,6 +154,7 @@ func FanOut[T any](ctx context.Context, subJobs []SubJob, opts ...Option) ([]Res
 			RootJobID:   rootID,
 			FanOutID:    &fanOutID,
 			FanOutIndex: i,
+			UniqueKey:   fmt.Sprintf("fanout-%s-%d", fanOutID, i), // Prevent duplicate sub-jobs on replay
 		}
 	}
 
