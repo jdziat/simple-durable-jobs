@@ -573,12 +573,18 @@ func (s *GormStorage) GetFanOutsByParent(ctx context.Context, parentJobID string
 // --- Sub-job operations ---
 
 // EnqueueBatch inserts multiple jobs in a single operation.
+// Jobs carrying a UniqueKey are deduplicated against pending/running/completed
+// rows so a parent workflow that crashes mid fan-out can replay safely. The
+// dedup lookup and insert run inside a single transaction with row-level
+// locking on non-SQLite backends, mirroring EnqueueUnique, so concurrent
+// replays cannot produce duplicate sub-jobs.
 func (s *GormStorage) EnqueueBatch(ctx context.Context, jobs []*core.Job) error {
 	if len(jobs) == 0 {
 		return nil
 	}
 
-	var toCreate []*core.Job
+	// Fill in defaults up front so callers always see the resolved IDs/statuses
+	// regardless of which rows survive the dedup pass.
 	for _, job := range jobs {
 		if job.ID == "" {
 			job.ID = uuid.New().String()
@@ -589,25 +595,59 @@ func (s *GormStorage) EnqueueBatch(ctx context.Context, jobs []*core.Job) error 
 		if job.Queue == "" {
 			job.Queue = "default"
 		}
+	}
 
-		// Skip jobs with UniqueKey that already exist (prevents duplicates on replay)
-		if job.UniqueKey != "" {
-			var count int64
-			s.db.WithContext(ctx).Model(&core.Job{}).
-				Where("unique_key = ? AND status IN ?", job.UniqueKey,
-					[]core.JobStatus{core.StatusPending, core.StatusRunning, core.StatusCompleted}).
-				Count(&count)
-			if count > 0 {
-				continue // Already exists, skip
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// Collect the non-empty UniqueKeys we need to check. A single
+		// IN-list query amortizes the round-trip cost across the batch.
+		keys := make([]string, 0, len(jobs))
+		for _, job := range jobs {
+			if job.UniqueKey != "" {
+				keys = append(keys, job.UniqueKey)
 			}
 		}
-		toCreate = append(toCreate, job)
-	}
 
-	if len(toCreate) == 0 {
-		return nil // All jobs already exist
-	}
-	return s.db.WithContext(ctx).Create(toCreate).Error
+		existing := make(map[string]struct{}, len(keys))
+		if len(keys) > 0 {
+			query := tx.Model(&core.Job{}).
+				Select("unique_key").
+				Where("unique_key IN ? AND status IN ?", keys,
+					[]core.JobStatus{core.StatusPending, core.StatusRunning, core.StatusCompleted})
+
+			// SQLite's writer lock already serializes the transaction, so
+			// FOR UPDATE is both unsupported and unnecessary there.
+			if !s.isSQLite {
+				query = query.Clauses(clause.Locking{Strength: "UPDATE"})
+			}
+
+			var found []string
+			if err := query.Pluck("unique_key", &found).Error; err != nil {
+				return err
+			}
+			for _, k := range found {
+				existing[k] = struct{}{}
+			}
+		}
+
+		toCreate := make([]*core.Job, 0, len(jobs))
+		for _, job := range jobs {
+			if job.UniqueKey != "" {
+				if _, seen := existing[job.UniqueKey]; seen {
+					continue
+				}
+				// Guard against duplicates within the same batch (e.g.,
+				// two sub-jobs with the same UniqueKey in one call) so
+				// the later Create does not insert siblings twice.
+				existing[job.UniqueKey] = struct{}{}
+			}
+			toCreate = append(toCreate, job)
+		}
+
+		if len(toCreate) == 0 {
+			return nil
+		}
+		return tx.Create(toCreate).Error
+	})
 }
 
 // GetSubJobs retrieves all sub-jobs for a fan-out.

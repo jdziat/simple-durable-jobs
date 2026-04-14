@@ -56,17 +56,26 @@ func newConcurrentTestStorage(t *testing.T) *GormStorage {
 	}
 
 	dbFile := t.TempDir() + "/concurrent.db"
-	dsn := "file:" + dbFile + "?_journal_mode=WAL&_busy_timeout=5000&_synchronous=NORMAL"
+	dsn := "file:" + dbFile + "?_journal_mode=WAL&_busy_timeout=10000&_synchronous=NORMAL&_txlock=immediate"
 	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{
 		Logger: logger.Default.LogMode(logger.Silent),
 	})
 	require.NoError(t, err, "open wal-mode sqlite")
 
+	// Apply pragmas explicitly too — some builds of the SQLite driver do
+	// not respect all DSN parameters, and without a long busy_timeout
+	// concurrent writers trip SQLITE_BUSY the moment the writer lock is
+	// held by another transaction.
+	require.NoError(t, db.Exec("PRAGMA journal_mode=WAL").Error)
+	require.NoError(t, db.Exec("PRAGMA busy_timeout=10000").Error)
+	require.NoError(t, db.Exec("PRAGMA synchronous=NORMAL").Error)
+
 	sqlDB, err := db.DB()
 	require.NoError(t, err)
 	// Multiple connections against the WAL DB can read concurrently; writes
 	// serialize at the file level but are fast enough that the TOCTOU window
-	// between Count and Create in EnqueueBatch is still observable.
+	// between the dedup SELECT and Create in EnqueueBatch is still
+	// observable when the fix is missing.
 	sqlDB.SetMaxOpenConns(4)
 	t.Cleanup(func() { _ = sqlDB.Close() })
 
@@ -2792,18 +2801,7 @@ func TestEnqueueBatch_SkipsDuplicatesAcrossTerminalStates(t *testing.T) {
 // Uses a WAL-mode SQLite file (or the external TEST_DATABASE_URL) so pooled
 // connections see the same database — plain ":memory:" gives each
 // connection its own isolated DB, which would mask the race entirely.
-//
-// FIXME: This test is currently skipped because EnqueueBatch performs a
-// non-transactional Count-then-Create on UniqueKey, so concurrent calls
-// with the same keys do produce duplicates. Unskip after the idempotency
-// check is moved into a transaction with row locking (or a DB-level unique
-// index on unique_key with INSERT ... ON CONFLICT DO NOTHING).
 func TestEnqueueBatch_ConcurrentUniqueKey_NoDuplicates(t *testing.T) {
-	t.Skip("FIXME: EnqueueBatch has a TOCTOU race between Count and Create; " +
-		"concurrent replays produce duplicate sub-jobs. Unskip once the " +
-		"idempotency check is made transactional or backed by a DB-level " +
-		"unique constraint.")
-
 	ctx := context.Background()
 	s := newConcurrentTestStorage(t)
 
