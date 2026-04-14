@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -516,4 +517,45 @@ func TestFanOut_ResumeWithBadCheckpointJSON_ReturnsError(t *testing.T) {
 	_, err := FanOut[string](ctx, subs)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "unmarshal fan-out checkpoint")
+}
+
+// TestFanOut_AssignsIdempotencyKeyToSubJobs verifies that FanOut stamps a
+// deterministic UniqueKey on every sub-job it creates, of the form
+// "fanout-<fanOutID>-<index>". EnqueueBatch relies on these keys to skip
+// duplicates when a parent workflow replays after a crash mid fan-out.
+func TestFanOut_AssignsIdempotencyKeyToSubJobs(t *testing.T) {
+	store := newMinimalStorage()
+	jc := makeJobCtx(store, "parent-idem", "default")
+	ctx := buildCtx(jc, nil)
+
+	subs := []SubJob{
+		{Type: "do-work", Args: "a"},
+		{Type: "do-work", Args: "b"},
+		{Type: "do-work", Args: "c"},
+	}
+	_, err := FanOut[string](ctx, subs)
+	require.Error(t, err)
+	require.True(t, IsSuspendError(err))
+
+	// There should be exactly one FanOut record; pull its ID.
+	require.Len(t, store.fanOuts, 1)
+	var fanOutID string
+	for id := range store.fanOuts {
+		fanOutID = id
+	}
+
+	// Every sub-job's UniqueKey must be fanout-<id>-<index>, with each
+	// index appearing exactly once.
+	seen := map[int]string{}
+	for _, j := range store.jobs {
+		if j.ParentJobID == nil {
+			continue
+		}
+		expected := fmt.Sprintf("fanout-%s-%d", fanOutID, j.FanOutIndex)
+		assert.Equal(t, expected, j.UniqueKey,
+			"sub-job index %d must have deterministic UniqueKey", j.FanOutIndex)
+		assert.Empty(t, seen[j.FanOutIndex], "duplicate FanOutIndex %d", j.FanOutIndex)
+		seen[j.FanOutIndex] = j.UniqueKey
+	}
+	assert.Len(t, seen, 3, "expected one UniqueKey per sub-job index")
 }

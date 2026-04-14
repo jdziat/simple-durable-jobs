@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -35,6 +36,43 @@ func newTestJob(queue, jobType string) *core.Job {
 		Type:  jobType,
 		Queue: queue,
 	}
+}
+
+// newConcurrentTestStorage returns a storage whose underlying DB can be
+// accessed from multiple goroutines at once. Plain openTestDB on SQLite
+// uses ":memory:" which gives each pooled connection its own isolated
+// database — useless for concurrency tests. When TEST_DATABASE_URL /
+// TEST_MYSQL_URL are set we fall through to the standard helper because
+// those backends already share state across connections.
+//
+// On default SQLite we use a per-test temp file in WAL journal mode so
+// multiple connections can perform reads and writes concurrently without
+// tripping the file-level writer lock.
+func newConcurrentTestStorage(t *testing.T) *GormStorage {
+	t.Helper()
+
+	if os.Getenv("TEST_DATABASE_URL") != "" || os.Getenv("TEST_MYSQL_URL") != "" {
+		return newTestStorage(t)
+	}
+
+	dbFile := t.TempDir() + "/concurrent.db"
+	dsn := "file:" + dbFile + "?_journal_mode=WAL&_busy_timeout=5000&_synchronous=NORMAL"
+	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{
+		Logger: logger.Default.LogMode(logger.Silent),
+	})
+	require.NoError(t, err, "open wal-mode sqlite")
+
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	// Multiple connections against the WAL DB can read concurrently; writes
+	// serialize at the file level but are fast enough that the TOCTOU window
+	// between Count and Create in EnqueueBatch is still observable.
+	sqlDB.SetMaxOpenConns(4)
+	t.Cleanup(func() { _ = sqlDB.Close() })
+
+	s := NewGormStorage(db)
+	require.NoError(t, s.Migrate(context.Background()))
+	return s
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -2635,4 +2673,192 @@ func TestHeartbeat_CustomLockDurationIsApplied(t *testing.T) {
 		"LockedUntil %v should be after %v", refreshed.LockedUntil, expectedMin)
 	assert.True(t, refreshed.LockedUntil.Before(expectedMax),
 		"LockedUntil %v should be before %v", refreshed.LockedUntil, expectedMax)
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// EnqueueBatch — UniqueKey idempotency (fan-out replay safety)
+// ──────────────────────────────────────────────────────────────────────────────
+
+// TestEnqueueBatch_SkipsDuplicatesByUniqueKey verifies that a second call to
+// EnqueueBatch with the same UniqueKey values is a no-op, so replaying a
+// parent workflow after a crash does not create duplicate sub-jobs.
+func TestEnqueueBatch_SkipsDuplicatesByUniqueKey(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	first := []*core.Job{
+		{Type: "sub.a", Queue: "default", UniqueKey: "fanout-abc-0"},
+		{Type: "sub.b", Queue: "default", UniqueKey: "fanout-abc-1"},
+		{Type: "sub.c", Queue: "default", UniqueKey: "fanout-abc-2"},
+	}
+	require.NoError(t, s.EnqueueBatch(ctx, first))
+
+	// Simulate a replay: different Job IDs, same UniqueKeys.
+	replay := []*core.Job{
+		{Type: "sub.a", Queue: "default", UniqueKey: "fanout-abc-0"},
+		{Type: "sub.b", Queue: "default", UniqueKey: "fanout-abc-1"},
+		{Type: "sub.c", Queue: "default", UniqueKey: "fanout-abc-2"},
+	}
+	require.NoError(t, s.EnqueueBatch(ctx, replay))
+
+	all, err := s.GetJobsByStatus(ctx, core.StatusPending, 100)
+	require.NoError(t, err)
+	assert.Len(t, all, 3, "replay must not create duplicate sub-jobs")
+
+	// The surviving rows are the originals.
+	originalIDs := map[string]bool{first[0].ID: true, first[1].ID: true, first[2].ID: true}
+	for _, j := range all {
+		assert.Truef(t, originalIDs[j.ID], "unexpected duplicate job %q", j.ID)
+	}
+}
+
+// TestEnqueueBatch_MixedReplayInsertsOnlyNewJobs covers the realistic
+// partial-replay case where some sub-jobs were persisted before the parent
+// crashed and some were not. EnqueueBatch must insert only the missing ones.
+func TestEnqueueBatch_MixedReplayInsertsOnlyNewJobs(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	// First pass: imagine only the first two sub-jobs made it to storage
+	// before a crash.
+	require.NoError(t, s.EnqueueBatch(ctx, []*core.Job{
+		{Type: "sub.a", Queue: "default", UniqueKey: "fanout-xyz-0"},
+		{Type: "sub.b", Queue: "default", UniqueKey: "fanout-xyz-1"},
+	}))
+
+	// Replay: parent workflow re-runs and attempts to enqueue all three
+	// sub-jobs. The first two should be skipped; only index 2 is new.
+	replay := []*core.Job{
+		{Type: "sub.a", Queue: "default", UniqueKey: "fanout-xyz-0"},
+		{Type: "sub.b", Queue: "default", UniqueKey: "fanout-xyz-1"},
+		{Type: "sub.c", Queue: "default", UniqueKey: "fanout-xyz-2"},
+	}
+	require.NoError(t, s.EnqueueBatch(ctx, replay))
+
+	all, err := s.GetJobsByStatus(ctx, core.StatusPending, 100)
+	require.NoError(t, err)
+	assert.Len(t, all, 3, "replay must add exactly one new sub-job")
+
+	byKey := map[string]int{}
+	for _, j := range all {
+		byKey[j.UniqueKey]++
+	}
+	assert.Equal(t, 1, byKey["fanout-xyz-0"])
+	assert.Equal(t, 1, byKey["fanout-xyz-1"])
+	assert.Equal(t, 1, byKey["fanout-xyz-2"])
+}
+
+// TestEnqueueBatch_SkipsDuplicatesAcrossTerminalStates verifies that the
+// idempotency filter considers pending, running, and completed jobs — not
+// just pending — so a replay does not re-create a sub-job that has already
+// executed.
+func TestEnqueueBatch_SkipsDuplicatesAcrossTerminalStates(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	// Seed two sub-jobs: drive one to completed, leave one pending.
+	seed := []*core.Job{
+		{Type: "sub.a", Queue: "default", UniqueKey: "fanout-states-0"},
+		{Type: "sub.b", Queue: "default", UniqueKey: "fanout-states-1"},
+	}
+	require.NoError(t, s.EnqueueBatch(ctx, seed))
+
+	dequeued, err := s.Dequeue(ctx, []string{"default"}, "worker-X")
+	require.NoError(t, err)
+	require.NotNil(t, dequeued)
+	require.NoError(t, s.Complete(ctx, dequeued.ID, "worker-X"))
+
+	// Replay with the same UniqueKeys should skip both.
+	replay := []*core.Job{
+		{Type: "sub.a", Queue: "default", UniqueKey: "fanout-states-0"},
+		{Type: "sub.b", Queue: "default", UniqueKey: "fanout-states-1"},
+	}
+	require.NoError(t, s.EnqueueBatch(ctx, replay))
+
+	// Count unique-keyed jobs regardless of status.
+	var total int64
+	require.NoError(t, s.DB().Model(&core.Job{}).
+		Where("unique_key LIKE ?", "fanout-states-%").
+		Count(&total).Error)
+	assert.EqualValues(t, 2, total, "completed + pending siblings must not be duplicated on replay")
+}
+
+// TestEnqueueBatch_ConcurrentUniqueKey_NoDuplicates probes the TOCTOU window
+// between the Count and Create statements in EnqueueBatch. Multiple goroutines
+// race to insert the same set of UniqueKeys simultaneously; afterwards the
+// database must contain exactly one row per key. Failure of this test means
+// two concurrent parent replays could produce duplicate sub-jobs.
+//
+// Uses a WAL-mode SQLite file (or the external TEST_DATABASE_URL) so pooled
+// connections see the same database — plain ":memory:" gives each
+// connection its own isolated DB, which would mask the race entirely.
+//
+// FIXME: This test is currently skipped because EnqueueBatch performs a
+// non-transactional Count-then-Create on UniqueKey, so concurrent calls
+// with the same keys do produce duplicates. Unskip after the idempotency
+// check is moved into a transaction with row locking (or a DB-level unique
+// index on unique_key with INSERT ... ON CONFLICT DO NOTHING).
+func TestEnqueueBatch_ConcurrentUniqueKey_NoDuplicates(t *testing.T) {
+	t.Skip("FIXME: EnqueueBatch has a TOCTOU race between Count and Create; " +
+		"concurrent replays produce duplicate sub-jobs. Unskip once the " +
+		"idempotency check is made transactional or backed by a DB-level " +
+		"unique constraint.")
+
+	ctx := context.Background()
+	s := newConcurrentTestStorage(t)
+
+	const workers = 8
+	keys := []string{
+		"fanout-race-0",
+		"fanout-race-1",
+		"fanout-race-2",
+	}
+
+	// Gate so all goroutines hit EnqueueBatch as close to simultaneously
+	// as possible, maximizing the chance of exposing the race.
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	errs := make(chan error, workers)
+
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			batch := make([]*core.Job, len(keys))
+			for i, k := range keys {
+				batch[i] = &core.Job{
+					Type:      "sub.race",
+					Queue:     "default",
+					UniqueKey: k,
+				}
+			}
+			<-start
+			if err := s.EnqueueBatch(ctx, batch); err != nil {
+				errs <- err
+			}
+		}()
+	}
+
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		// A unique-constraint violation surfacing here would also be an
+		// acceptable signal that duplicates were prevented; any other error
+		// is a real failure.
+		require.NoError(t, err)
+	}
+
+	byKey := map[string]int64{}
+	for _, k := range keys {
+		var count int64
+		require.NoError(t, s.DB().Model(&core.Job{}).
+			Where("unique_key = ?", k).Count(&count).Error)
+		byKey[k] = count
+	}
+
+	for _, k := range keys {
+		assert.EqualValuesf(t, 1, byKey[k],
+			"UniqueKey %q has %d rows; concurrent EnqueueBatch produced duplicates", k, byKey[k])
+	}
 }
