@@ -1,0 +1,16 @@
+{{- /*
+  Full-screen layout that strips the Hextra chrome (sidebar, TOC,
+  content column max-width) so a single embedded asset — typically an
+  iframe — can fill the viewport edge-to-edge.
+
+  Used by pages that set `layout: fullscreen` in frontmatter, e.g.
+  the shareable `/demo/` page that iframes the live UI dashboard.
+
+  The navbar is intentionally kept so visitors can click back to the
+  docs, but the usual sidebar and max-width wrapper are removed.
+*/ -}}
+{{ define "main" }}
+  <div class="hx:w-screen hx:min-h-[calc(100vh-var(--navbar-height))] hx:m-0 hx:p-0">
+    {{ .Content }}
+  </div>
+{{ end }}
