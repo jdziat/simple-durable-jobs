@@ -297,10 +297,10 @@ func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 	cancelHeartbeat()
 
 	if err != nil {
-		// Check for SuspendError - job is waiting for sub-jobs
-		if fanout.IsSuspendError(err) {
-			w.logger.Info("job suspended waiting for sub-jobs", "job_id", job.ID)
-			// Job is already suspended in storage, just return
+		// Check for WaitingError - job is waiting for sub-jobs
+		if fanout.IsWaitingError(err) {
+			w.logger.Info("job waiting for sub-jobs", "job_id", job.ID)
+			// Job is already in StatusWaiting; just return
 			return
 		}
 		w.handleError(ctx, job, err)
@@ -308,14 +308,19 @@ func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 		completeErr := w.completeWithRetry(ctx, job.ID)
 		if completeErr != nil {
 			w.logger.Error("failed to complete job after retries", "job_id", job.ID, "error", completeErr)
-			return
+			// Still handle sub-job completion — the work is done even if
+			// we couldn't mark it in the DB. Without this, the fan-out
+			// counter never increments and the parent stays in 'waiting'.
+		} else {
+			w.queue.CallCompleteHooks(ctx, job)
+			// Emit completion event
+			w.queue.Emit(&core.JobCompleted{Job: job, Duration: time.Since(startTime), Timestamp: time.Now()})
 		}
-		w.queue.CallCompleteHooks(ctx, job)
-		// Emit completion event
-		w.queue.Emit(&core.JobCompleted{Job: job, Duration: time.Since(startTime), Timestamp: time.Now()})
 
-		// Handle sub-job completion (resume parent if needed)
-		if err := w.handleSubJobCompletion(ctx, job, true); err != nil {
+		// Handle sub-job completion (resume parent if needed) — always run
+		// regardless of whether Complete() succeeded, to prevent orphaned
+		// parent jobs stuck in 'waiting' with all sub-jobs actually done.
+		if err := w.handleSubJobCompletion(ctx, job, completeErr == nil); err != nil {
 			w.logger.Error("failed to handle sub-job completion", "job_id", job.ID, "error", err)
 		}
 	}
@@ -361,12 +366,12 @@ func (w *Worker) executeHandler(ctx context.Context, job *core.Job, h *handler.H
 	defer func() {
 		if r := recover(); r != nil {
 			// Check if the panicked value is an error - preserve type for special errors
-			// like SuspendError that need type-based detection
+			// like WaitingError that need type-based detection
 			if e, ok := r.(error); ok {
-				// Check if this is a suspend error (expected behavior from fan-out)
-				if fanout.IsSuspendError(e) {
+				// Check if this is a waiting signal (expected behavior from fan-out)
+				if fanout.IsWaitingError(e) {
 					// Don't log as panic - this is expected behavior
-					w.logger.Debug("job handler signaled suspend via panic",
+					w.logger.Debug("job handler signaled waiting via panic",
 						"job_id", job.ID,
 						"job_type", job.Type)
 					err = e
@@ -575,19 +580,36 @@ func (w *Worker) completeFanOut(ctx context.Context, fo *core.FanOut, status cor
 		}
 	}
 
-	// Resume parent job
-	resumed, err := w.queue.Storage().ResumeJob(ctx, fo.ParentJobID)
-	if err != nil {
-		return fmt.Errorf("failed to resume parent job: %w", err)
+	// Resume parent job — retry a few times because the parent might still be
+	// transitioning from running → waiting (SuspendJob hasn't completed yet).
+	var resumed bool
+	for attempt := 0; attempt < 5; attempt++ {
+		resumed, err = w.queue.Storage().ResumeJob(ctx, fo.ParentJobID)
+		if err != nil {
+			return fmt.Errorf("failed to resume parent job: %w", err)
+		}
+		if resumed {
+			break
+		}
+		// Parent not in waiting/paused status yet — wait briefly and retry
+		if attempt < 4 {
+			w.logger.Debug("parent job not yet in resumable status, retrying",
+				"parent_job_id", fo.ParentJobID,
+				"attempt", attempt+1)
+			time.Sleep(time.Duration(100*(1<<attempt)) * time.Millisecond) // 100ms, 200ms, 400ms, 800ms
+		}
 	}
 	if !resumed {
-		w.logger.Warn("parent job was not in waiting status", "parent_job_id", fo.ParentJobID)
+		w.logger.Error("CRITICAL: parent job could not be resumed after retries — may be stuck",
+			"parent_job_id", fo.ParentJobID,
+			"fan_out_id", fo.ID)
 	}
 
 	w.logger.Info("resumed parent job after fan-out completion",
 		"parent_job_id", fo.ParentJobID,
 		"fan_out_id", fo.ID,
-		"status", status)
+		"status", status,
+		"resumed", resumed)
 
 	return nil
 }

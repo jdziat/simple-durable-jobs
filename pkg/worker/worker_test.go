@@ -1225,7 +1225,13 @@ func newSQLiteQueue(t *testing.T) (*queue.Queue, func()) {
 	// Each test gets its own named in-memory database to prevent cross-test
 	// contamination when tests run in parallel or when one test's enqueued
 	// jobs bleed into another test's dequeue cycle.
-	dsn := "file:" + t.Name() + "?mode=memory&cache=private"
+	//
+	// cache=shared is required so every connection pulled from the pool
+	// sees the same schema — with cache=private, a second connection gets
+	// a fresh empty DB and any code path that lands on it fails with
+	// "no such table: jobs" (e.g. the scheduler goroutine in
+	// TestWorker_RunScheduler_EnqueuesDueJob).
+	dsn := "file:" + t.Name() + "?mode=memory&cache=shared"
 	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{
 		Logger: logger.Default.LogMode(logger.Silent),
 	})
@@ -1233,7 +1239,11 @@ func newSQLiteQueue(t *testing.T) (*queue.Queue, func()) {
 	store := storage.NewGormStorage(db)
 	require.NoError(t, store.Migrate(context.Background()))
 	q := queue.New(store)
-	return q, func() {}
+	return q, func() {
+		if sqlDB, dbErr := db.DB(); dbErr == nil {
+			_ = sqlDB.Close()
+		}
+	}
 }
 
 func TestWorker_CompleteWithRetry_SuccessfulJob(t *testing.T) {

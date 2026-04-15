@@ -576,7 +576,17 @@ func CancelOnParentFailure() FanOutOption {
 	return fanout.CancelOnParentFailure()
 }
 
-// IsSuspendError checks if an error indicates a fan-out suspend.
+// IsWaitingError reports whether err is the signal FanOut returns to
+// tell the worker a job has moved into the waiting status pending its
+// sub-jobs.
+func IsWaitingError(err error) bool {
+	return fanout.IsWaitingError(err)
+}
+
+// IsSuspendError reports whether err is a waiting-for-fan-out signal.
+//
+// Deprecated: Use IsWaitingError. The naming was revised to match
+// core.StatusWaiting, which is the actual status the parent job carries.
 func IsSuspendError(err error) bool {
-	return fanout.IsSuspendError(err)
+	return fanout.IsWaitingError(err)
 }

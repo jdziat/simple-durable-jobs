@@ -89,6 +89,56 @@ func (s *GormStorage) Enqueue(ctx context.Context, job *core.Job) error {
 	return s.db.WithContext(ctx).Create(job).Error
 }
 
+// withSerializationRetry runs fn and retries it on transient serialization
+// failures reported by the underlying driver. MySQL REPEATABLE READ turns
+// gap-locked inserts into deadlocks (error 1213); lock wait timeouts (1205)
+// surface under contention; Postgres reports serialization_failure (40001)
+// and deadlock_detected (40P01) under SERIALIZABLE/READ COMMITTED mixes.
+// All of these are advisory — the client is expected to re-run the tx.
+func (s *GormStorage) withSerializationRetry(ctx context.Context, fn func() error) error {
+	const maxAttempts = 5
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		lastErr = fn()
+		if lastErr == nil {
+			return nil
+		}
+		if !isSerializationFailure(lastErr) {
+			return lastErr
+		}
+		// Linear backoff with a small cap — the retriable errors above
+		// clear on the next acquisition, so we do not need exponential.
+		time.Sleep(time.Duration(attempt+1) * 5 * time.Millisecond)
+	}
+	return fmt.Errorf("transaction failed after %d retries: %w", maxAttempts, lastErr)
+}
+
+// isSerializationFailure reports whether err is a transient
+// serialization/deadlock failure that can be resolved by retrying the
+// enclosing transaction. String matching is used deliberately to avoid
+// pulling mysql and pgconn driver packages in just for error typing.
+func isSerializationFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "Error 1213"),          // MySQL deadlock
+		strings.Contains(msg, "Deadlock found"),        // MySQL deadlock (text)
+		strings.Contains(msg, "Error 1205"),            // MySQL lock wait timeout
+		strings.Contains(msg, "Lock wait timeout"),     // MySQL (text)
+		strings.Contains(msg, "SQLSTATE 40001"),        // serialization_failure
+		strings.Contains(msg, "SQLSTATE 40P01"),        // deadlock_detected (pg)
+		strings.Contains(msg, "could not serialize"),   // pg text
+		strings.Contains(msg, "deadlock detected"):     // pg text
+		return true
+	}
+	return false
+}
+
 // EnqueueUnique adds a job only if no job with the same unique key exists in pending/running state.
 // Uses SELECT FOR UPDATE to prevent TOCTOU race conditions in concurrent scenarios.
 // For SQLite, relies on serializable transaction isolation (SQLite's default).
@@ -573,10 +623,23 @@ func (s *GormStorage) GetFanOutsByParent(ctx context.Context, parentJobID string
 // --- Sub-job operations ---
 
 // EnqueueBatch inserts multiple jobs in a single operation.
+// Jobs carrying a UniqueKey are deduplicated against pending/running/completed
+// rows so a parent workflow that crashes mid fan-out can replay safely. The
+// dedup lookup and insert run inside a single transaction with row-level
+// locking on non-SQLite backends, mirroring EnqueueUnique, so concurrent
+// replays cannot produce duplicate sub-jobs.
+//
+// Under MySQL's default REPEATABLE READ, concurrent callers that insert the
+// same UniqueKey set can deadlock on gap locks; we retry the transaction a
+// bounded number of times when the driver reports a serialization failure
+// or deadlock (MySQL error 1213/1205, Postgres SQLSTATE 40001/40P01).
 func (s *GormStorage) EnqueueBatch(ctx context.Context, jobs []*core.Job) error {
 	if len(jobs) == 0 {
 		return nil
 	}
+
+	// Fill in defaults up front so callers always see the resolved IDs/statuses
+	// regardless of which rows survive the dedup pass.
 	for _, job := range jobs {
 		if job.ID == "" {
 			job.ID = uuid.New().String()
@@ -588,7 +651,67 @@ func (s *GormStorage) EnqueueBatch(ctx context.Context, jobs []*core.Job) error 
 			job.Queue = "default"
 		}
 	}
-	return s.db.WithContext(ctx).Create(jobs).Error
+
+	return s.withSerializationRetry(ctx, func() error {
+		return s.enqueueBatchTx(ctx, jobs)
+	})
+}
+
+// enqueueBatchTx is the core body of EnqueueBatch, extracted so it can be
+// retried on transient serialization failures without re-running the
+// default-filling pass above.
+func (s *GormStorage) enqueueBatchTx(ctx context.Context, jobs []*core.Job) error {
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// Collect the non-empty UniqueKeys we need to check. A single
+		// IN-list query amortizes the round-trip cost across the batch.
+		keys := make([]string, 0, len(jobs))
+		for _, job := range jobs {
+			if job.UniqueKey != "" {
+				keys = append(keys, job.UniqueKey)
+			}
+		}
+
+		existing := make(map[string]struct{}, len(keys))
+		if len(keys) > 0 {
+			query := tx.Model(&core.Job{}).
+				Select("unique_key").
+				Where("unique_key IN ? AND status IN ?", keys,
+					[]core.JobStatus{core.StatusPending, core.StatusRunning, core.StatusCompleted})
+
+			// SQLite's writer lock already serializes the transaction, so
+			// FOR UPDATE is both unsupported and unnecessary there.
+			if !s.isSQLite {
+				query = query.Clauses(clause.Locking{Strength: "UPDATE"})
+			}
+
+			var found []string
+			if err := query.Pluck("unique_key", &found).Error; err != nil {
+				return err
+			}
+			for _, k := range found {
+				existing[k] = struct{}{}
+			}
+		}
+
+		toCreate := make([]*core.Job, 0, len(jobs))
+		for _, job := range jobs {
+			if job.UniqueKey != "" {
+				if _, seen := existing[job.UniqueKey]; seen {
+					continue
+				}
+				// Guard against duplicates within the same batch (e.g.,
+				// two sub-jobs with the same UniqueKey in one call) so
+				// the later Create does not insert siblings twice.
+				existing[job.UniqueKey] = struct{}{}
+			}
+			toCreate = append(toCreate, job)
+		}
+
+		if len(toCreate) == 0 {
+			return nil
+		}
+		return tx.Create(toCreate).Error
+	})
 }
 
 // GetSubJobs retrieves all sub-jobs for a fan-out.
@@ -725,16 +848,18 @@ func (s *GormStorage) SuspendJob(ctx context.Context, jobID string, workerID str
 	return nil
 }
 
-// ResumeJob resumes a waiting job to pending status.
+// ResumeJob resumes a waiting (or paused) job to pending status.
 // Decrements the attempt counter so that the next Dequeue (which always
 // increments attempt) doesn't count the fan-out suspend/resume cycle as
 // a real retry. Without this, each fan-out round eats one retry attempt
 // and the job exhausts max_retries before completing.
-// Returns (true, nil) if resumed, (false, nil) if job was not in waiting status.
+// Returns (true, nil) if resumed, (false, nil) if job was not in a resumable status.
 func (s *GormStorage) ResumeJob(ctx context.Context, jobID string) (bool, error) {
+	// Accept both waiting and paused status — paused jobs should also be
+	// resumable when their fan-out completes.
 	result := s.db.WithContext(ctx).
 		Model(&core.Job{}).
-		Where("id = ? AND status = ?", jobID, core.StatusWaiting).
+		Where("id = ? AND status IN (?, ?)", jobID, core.StatusWaiting, core.StatusPaused).
 		Updates(map[string]any{
 			"status":     core.StatusPending,
 			"attempt":    gorm.Expr("CASE WHEN attempt > 0 THEN attempt - 1 ELSE 0 END"),

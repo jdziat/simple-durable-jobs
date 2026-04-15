@@ -42,7 +42,7 @@ func TestFanOut_Basic(t *testing.T) {
 		results, err := jobs.FanOut[int](ctx, subJobs, jobs.FailFast())
 		if err != nil {
 			// If we get a suspend error, that's expected during first run
-			if jobs.IsSuspendError(err) {
+			if jobs.IsWaitingError(err) {
 				return nil, err
 			}
 			return nil, err
@@ -141,12 +141,12 @@ func TestFanOutError_Message(t *testing.T) {
 	assert.Equal(t, "fan-out failed: 3/10 sub-jobs failed", err.Error())
 }
 
-func TestSuspendError(t *testing.T) {
-	err := &fanout.SuspendError{FanOutID: "test-123"}
+func TestWaitingError(t *testing.T) {
+	err := &fanout.WaitingError{FanOutID: "test-123"}
 	assert.Contains(t, err.Error(), "test-123")
-	assert.True(t, fanout.IsSuspendError(err))
-	assert.False(t, fanout.IsSuspendError(fmt.Errorf("regular error")))
-	assert.False(t, fanout.IsSuspendError(nil))
+	assert.True(t, fanout.IsWaitingError(err))
+	assert.False(t, fanout.IsWaitingError(fmt.Errorf("regular error")))
+	assert.False(t, fanout.IsWaitingError(nil))
 }
 
 func TestFanOut_FailFast_StopsOnFirstFailure(t *testing.T) {
@@ -176,7 +176,7 @@ func TestFanOut_FailFast_StopsOnFirstFailure(t *testing.T) {
 		}
 
 		_, err := jobs.FanOut[int](ctx, subJobs, jobs.FailFast())
-		if jobs.IsSuspendError(err) {
+		if jobs.IsWaitingError(err) {
 			return err
 		}
 		fanoutErr = err
@@ -239,7 +239,7 @@ func TestFanOut_CollectAll_ReturnsPartialResults(t *testing.T) {
 
 		var err error
 		results, err = jobs.FanOut[int](ctx, subJobs, jobs.CollectAll())
-		if jobs.IsSuspendError(err) {
+		if jobs.IsWaitingError(err) {
 			return err
 		}
 		fanoutCompleted.Store(true)
@@ -312,7 +312,7 @@ func TestFanOut_Threshold_SucceedsAboveThreshold(t *testing.T) {
 
 		// 75% threshold - should succeed since 80% pass
 		_, err := jobs.FanOut[int](ctx, subJobs, jobs.Threshold(0.75))
-		if jobs.IsSuspendError(err) {
+		if jobs.IsWaitingError(err) {
 			return err
 		}
 		fanoutErr = err
@@ -371,7 +371,7 @@ func TestFanOut_Threshold_FailsBelowThreshold(t *testing.T) {
 
 		// 75% threshold - should fail since only 50% pass
 		_, err := jobs.FanOut[int](ctx, subJobs, jobs.Threshold(0.75))
-		if jobs.IsSuspendError(err) {
+		if jobs.IsWaitingError(err) {
 			return err
 		}
 		fanoutErr = err
@@ -427,7 +427,7 @@ func TestFanOut_WithOptions(t *testing.T) {
 			jobs.FailFast(),
 			jobs.WithFanOutRetries(5),
 		)
-		if jobs.IsSuspendError(err) {
+		if jobs.IsWaitingError(err) {
 			return err
 		}
 		fanoutCompleted.Store(true)
@@ -523,7 +523,7 @@ func TestFanOut_CancelledSubJobsCountTowardCompletion(t *testing.T) {
 		}
 
 		_, err := jobs.FanOut[int](ctx, subJobs, jobs.CollectAll())
-		if jobs.IsSuspendError(err) {
+		if jobs.IsWaitingError(err) {
 			return err
 		}
 		fanoutCompleted.Store(true)
