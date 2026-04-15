@@ -343,5 +343,6 @@ Available presets:
 - [API Reference](../api-reference/) - Complete API documentation
 - [Examples](../examples/) - More code examples
 - [Embedded Web UI](../embedded-ui/) - Dashboard setup and configuration
+- [Live Demo](../live-demo/) - The dashboard running on simulated data
 - [Advanced Topics](../advanced/) - Stale lock reaper, pool configuration, storage retry
 - [GitHub](https://github.com/jdziat/simple-durable-jobs) - Source code and issues
