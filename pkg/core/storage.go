@@ -57,6 +57,10 @@ type Storage interface {
 	CancelSubJob(ctx context.Context, jobID string) (*FanOut, error)
 
 	// Waiting job operations
+	//
+	// SuspendJob moves a running job into StatusWaiting (e.g. while it
+	// waits for fan-out sub-jobs). The name is historical; a rename to
+	// MarkWaiting is planned for the next major release.
 	SuspendJob(ctx context.Context, jobID string, workerID string) error
 	ResumeJob(ctx context.Context, jobID string) (bool, error)
 	GetWaitingJobsToResume(ctx context.Context) ([]*Job, error)

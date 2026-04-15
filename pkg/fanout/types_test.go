@@ -124,41 +124,59 @@ func TestFanOutError_ImplementsErrorInterface(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// SuspendError
+// WaitingError
 // ---------------------------------------------------------------------------
 
-func TestSuspendError_ErrorMessage(t *testing.T) {
-	e := &SuspendError{FanOutID: "fo-abc"}
+func TestWaitingError_ErrorMessage(t *testing.T) {
+	e := &WaitingError{FanOutID: "fo-abc"}
 	msg := e.Error()
 	assert.Contains(t, msg, "fo-abc")
-	assert.Contains(t, msg, "suspended")
+	assert.Contains(t, msg, "waiting")
 }
 
-func TestSuspendError_EmptyFanOutID(t *testing.T) {
-	e := &SuspendError{}
+func TestWaitingError_EmptyFanOutID(t *testing.T) {
+	e := &WaitingError{}
 	msg := e.Error()
 	assert.NotEmpty(t, msg)
 }
 
 // ---------------------------------------------------------------------------
-// IsSuspendError
+// IsWaitingError
 // ---------------------------------------------------------------------------
 
-func TestIsSuspendError_TrueForSuspendError(t *testing.T) {
-	err := &SuspendError{FanOutID: "fo-1"}
-	assert.True(t, IsSuspendError(err))
+func TestIsWaitingError_TrueForWaitingError(t *testing.T) {
+	err := &WaitingError{FanOutID: "fo-1"}
+	assert.True(t, IsWaitingError(err))
 }
 
-func TestIsSuspendError_FalseForRegularError(t *testing.T) {
-	err := errors.New("not a suspend")
-	assert.False(t, IsSuspendError(err))
+func TestIsWaitingError_FalseForRegularError(t *testing.T) {
+	err := errors.New("not a waiting signal")
+	assert.False(t, IsWaitingError(err))
 }
 
-func TestIsSuspendError_FalseForNil(t *testing.T) {
-	assert.False(t, IsSuspendError(nil))
+func TestIsWaitingError_FalseForNil(t *testing.T) {
+	assert.False(t, IsWaitingError(nil))
 }
 
-func TestIsSuspendError_FalseForFanOutError(t *testing.T) {
+func TestIsWaitingError_FalseForFanOutError(t *testing.T) {
 	err := &Error{TotalCount: 2, FailedCount: 1}
-	assert.False(t, IsSuspendError(err))
+	assert.False(t, IsWaitingError(err))
+}
+
+// TestSuspendErrorAliasContract pins the additive-deprecation contract:
+// SuspendError and WaitingError must be the same type so downstream code
+// using either literal keeps working, and IsSuspendError / IsWaitingError
+// must each recognize values built with the other name.
+func TestSuspendErrorAliasContract(t *testing.T) {
+	// Constructing with the deprecated name is caught by the new detector.
+	//nolint:staticcheck // intentionally exercising the deprecated alias
+	viaOld := &SuspendError{FanOutID: "fo-old"}
+	assert.True(t, IsWaitingError(viaOld),
+		"IsWaitingError must recognize values built with the deprecated name")
+
+	// Constructing with the new name is caught by the deprecated detector.
+	viaNew := &WaitingError{FanOutID: "fo-new"}
+	//nolint:staticcheck // intentionally exercising the deprecated alias
+	assert.True(t, IsSuspendError(viaNew),
+		"IsSuspendError must keep working for callers that have not migrated")
 }

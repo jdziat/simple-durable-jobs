@@ -15,8 +15,8 @@ import (
 
 // FanOut spawns sub-jobs in parallel and waits for all results.
 // Checkpoints progress - safe to retry if parent crashes.
-// When sub-jobs are created, the parent job is suspended.
-// The worker should detect SuspendError and stop processing.
+// When sub-jobs are created, the parent job is moved to StatusWaiting.
+// The worker should detect WaitingError and stop processing.
 func FanOut[T any](ctx context.Context, subJobs []SubJob, opts ...Option) ([]Result[T], error) {
 	if len(subJobs) == 0 {
 		return nil, nil
@@ -65,11 +65,11 @@ func FanOut[T any](ctx context.Context, subJobs []SubJob, opts ...Option) ([]Res
 			return CollectResults[T](ctx, fanOutID)
 		}
 
-		// Fan-out not complete, suspend again
+		// Fan-out not complete, mark waiting again
 		if err := jc.Storage.SuspendJob(ctx, jc.Job.ID, jc.WorkerID); err != nil {
-			return nil, fmt.Errorf("failed to suspend job: %w", err)
+			return nil, fmt.Errorf("failed to mark job waiting: %w", err)
 		}
-		return nil, &SuspendError{FanOutID: fanOutID}
+		return nil, &WaitingError{FanOutID: fanOutID}
 	}
 
 	// First execution: create fan-out and sub-jobs
@@ -174,19 +174,19 @@ func FanOut[T any](ctx context.Context, subJobs []SubJob, opts ...Option) ([]Res
 		return nil, fmt.Errorf("failed to save fan-out checkpoint: %w", err)
 	}
 
-	// CRITICAL: Suspend parent BEFORE enqueuing sub-jobs.
+	// CRITICAL: Mark parent waiting BEFORE enqueuing sub-jobs.
 	// If we enqueue first, a fast worker can complete a sub-job and call
-	// ResumeJob before we suspend — ResumeJob finds status=running instead
-	// of waiting, and the parent is stuck forever.
+	// ResumeJob before we update the status — ResumeJob finds status=running
+	// instead of waiting, and the parent is stuck forever.
 	if err := jc.Storage.SuspendJob(ctx, jc.Job.ID, jc.WorkerID); err != nil {
-		return nil, fmt.Errorf("failed to suspend job: %w", err)
+		return nil, fmt.Errorf("failed to mark job waiting: %w", err)
 	}
 
 	// Now enqueue sub-jobs — parent is already in waiting status,
 	// so ResumeJob will succeed when children complete.
 	if err := jc.Storage.EnqueueBatch(ctx, jobs); err != nil {
-		// If enqueue fails after suspend, we need to resume the parent
-		// to avoid leaving it stuck in waiting with no sub-jobs.
+		// If enqueue fails after marking waiting, resume the parent so
+		// it does not get stuck in waiting with no sub-jobs behind it.
 		if _, resumeErr := jc.Storage.ResumeJob(ctx, jc.Job.ID); resumeErr != nil {
 			// Log but don't mask the original error
 			_ = resumeErr
@@ -195,23 +195,38 @@ func FanOut[T any](ctx context.Context, subJobs []SubJob, opts ...Option) ([]Res
 	}
 
 	// Signal to worker that this job should not continue
-	return nil, &SuspendError{FanOutID: fanOutID}
+	return nil, &WaitingError{FanOutID: fanOutID}
 }
 
-// SuspendError signals the worker to stop processing and wait for resume.
-type SuspendError struct {
+// WaitingError signals the worker that the job has moved into
+// core.StatusWaiting, pending completion of its fan-out sub-jobs. The
+// worker uses this signal to stop processing the current handler without
+// treating the outcome as a failure.
+type WaitingError struct {
 	FanOutID string
 }
 
-func (e *SuspendError) Error() string {
-	return fmt.Sprintf("job suspended waiting for fan-out %s", e.FanOutID)
+func (e *WaitingError) Error() string {
+	return fmt.Sprintf("job waiting for fan-out %s", e.FanOutID)
 }
 
-// IsSuspendError checks if an error is a suspend signal.
-func IsSuspendError(err error) bool {
-	_, ok := err.(*SuspendError)
+// IsWaitingError reports whether err is a waiting-for-fan-out signal
+// produced by FanOut.
+func IsWaitingError(err error) bool {
+	_, ok := err.(*WaitingError)
 	return ok
 }
+
+// SuspendError is the previous name for WaitingError.
+//
+// Deprecated: Use WaitingError. The control-flow signal aligns with the
+// core.StatusWaiting status the parent job carries while its sub-jobs run.
+type SuspendError = WaitingError
+
+// IsSuspendError reports whether err is a waiting-for-fan-out signal.
+//
+// Deprecated: Use IsWaitingError.
+func IsSuspendError(err error) bool { return IsWaitingError(err) }
 
 // CollectResults gathers results from completed sub-jobs.
 // Called when parent job resumes after fan-out.

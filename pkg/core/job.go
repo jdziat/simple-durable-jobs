@@ -14,7 +14,7 @@ const (
 	StatusCompleted JobStatus = "completed"
 	StatusFailed    JobStatus = "failed"
 	StatusRetrying  JobStatus = "retrying"
-	StatusWaiting   JobStatus = "waiting"   // Suspended waiting for sub-jobs
+	StatusWaiting   JobStatus = "waiting"   // Waiting for fan-out sub-jobs to complete
 	StatusCancelled JobStatus = "cancelled" // Terminated before completion
 	StatusPaused    JobStatus = "paused"    // Paused, won't be picked up
 )

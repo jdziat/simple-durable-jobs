@@ -297,10 +297,10 @@ func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 	cancelHeartbeat()
 
 	if err != nil {
-		// Check for SuspendError - job is waiting for sub-jobs
-		if fanout.IsSuspendError(err) {
-			w.logger.Info("job suspended waiting for sub-jobs", "job_id", job.ID)
-			// Job is already suspended in storage, just return
+		// Check for WaitingError - job is waiting for sub-jobs
+		if fanout.IsWaitingError(err) {
+			w.logger.Info("job waiting for sub-jobs", "job_id", job.ID)
+			// Job is already in StatusWaiting; just return
 			return
 		}
 		w.handleError(ctx, job, err)
@@ -366,12 +366,12 @@ func (w *Worker) executeHandler(ctx context.Context, job *core.Job, h *handler.H
 	defer func() {
 		if r := recover(); r != nil {
 			// Check if the panicked value is an error - preserve type for special errors
-			// like SuspendError that need type-based detection
+			// like WaitingError that need type-based detection
 			if e, ok := r.(error); ok {
-				// Check if this is a suspend error (expected behavior from fan-out)
-				if fanout.IsSuspendError(e) {
+				// Check if this is a waiting signal (expected behavior from fan-out)
+				if fanout.IsWaitingError(e) {
 					// Don't log as panic - this is expected behavior
-					w.logger.Debug("job handler signaled suspend via panic",
+					w.logger.Debug("job handler signaled waiting via panic",
 						"job_id", job.ID,
 						"job_type", job.Type)
 					err = e

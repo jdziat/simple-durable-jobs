@@ -239,12 +239,12 @@ func TestFanOut_FirstExecution_SuspendsAndReturnsError(t *testing.T) {
 		{Type: "do-work", Args: "item-2"},
 	}
 	results, err := FanOut[string](ctx, subs)
-	// FanOut returns a SuspendError on first execution.
+	// FanOut returns a WaitingError on first execution.
 	require.Error(t, err)
 	assert.Nil(t, results)
-	assert.True(t, IsSuspendError(err), "expected SuspendError, got: %v", err)
+	assert.True(t, IsWaitingError(err), "expected WaitingError, got: %v", err)
 
-	// Parent job should be marked suspended.
+	// Parent job should be marked waiting.
 	assert.True(t, store.suspended["parent-first"])
 
 	// A checkpoint should have been saved.
@@ -285,9 +285,9 @@ func TestFanOut_WithTimeout_SetsTimeoutAt(t *testing.T) {
 
 	subs := []SubJob{{Type: "do-work", Args: 1}}
 	_, err := FanOut[int](ctx, subs, WithTimeout(30*time.Second))
-	// Still returns SuspendError on first execution.
+	// Still returns WaitingError on first execution.
 	require.Error(t, err)
-	assert.True(t, IsSuspendError(err))
+	assert.True(t, IsWaitingError(err))
 
 	// The FanOut record should have a TimeoutAt set.
 	for _, fo := range store.fanOuts {
@@ -365,8 +365,8 @@ func TestFanOut_ResumeWithPendingFanOut_SuspendsAgain(t *testing.T) {
 	subs := []SubJob{{Type: "do-work", Args: "x"}, {Type: "do-work", Args: "y"}}
 	_, err := FanOut[string](ctx, subs)
 	require.Error(t, err)
-	assert.True(t, IsSuspendError(err))
-	// Parent should be suspended again.
+	assert.True(t, IsWaitingError(err))
+	// Parent should be marked waiting again.
 	assert.True(t, store.suspended[parentID])
 }
 
@@ -535,7 +535,7 @@ func TestFanOut_AssignsIdempotencyKeyToSubJobs(t *testing.T) {
 	}
 	_, err := FanOut[string](ctx, subs)
 	require.Error(t, err)
-	require.True(t, IsSuspendError(err))
+	require.True(t, IsWaitingError(err))
 
 	// There should be exactly one FanOut record; pull its ID.
 	require.Len(t, store.fanOuts, 1)
