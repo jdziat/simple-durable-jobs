@@ -89,6 +89,56 @@ func (s *GormStorage) Enqueue(ctx context.Context, job *core.Job) error {
 	return s.db.WithContext(ctx).Create(job).Error
 }
 
+// withSerializationRetry runs fn and retries it on transient serialization
+// failures reported by the underlying driver. MySQL REPEATABLE READ turns
+// gap-locked inserts into deadlocks (error 1213); lock wait timeouts (1205)
+// surface under contention; Postgres reports serialization_failure (40001)
+// and deadlock_detected (40P01) under SERIALIZABLE/READ COMMITTED mixes.
+// All of these are advisory — the client is expected to re-run the tx.
+func (s *GormStorage) withSerializationRetry(ctx context.Context, fn func() error) error {
+	const maxAttempts = 5
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		lastErr = fn()
+		if lastErr == nil {
+			return nil
+		}
+		if !isSerializationFailure(lastErr) {
+			return lastErr
+		}
+		// Linear backoff with a small cap — the retriable errors above
+		// clear on the next acquisition, so we do not need exponential.
+		time.Sleep(time.Duration(attempt+1) * 5 * time.Millisecond)
+	}
+	return fmt.Errorf("transaction failed after %d retries: %w", maxAttempts, lastErr)
+}
+
+// isSerializationFailure reports whether err is a transient
+// serialization/deadlock failure that can be resolved by retrying the
+// enclosing transaction. String matching is used deliberately to avoid
+// pulling mysql and pgconn driver packages in just for error typing.
+func isSerializationFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "Error 1213"),          // MySQL deadlock
+		strings.Contains(msg, "Deadlock found"),        // MySQL deadlock (text)
+		strings.Contains(msg, "Error 1205"),            // MySQL lock wait timeout
+		strings.Contains(msg, "Lock wait timeout"),     // MySQL (text)
+		strings.Contains(msg, "SQLSTATE 40001"),        // serialization_failure
+		strings.Contains(msg, "SQLSTATE 40P01"),        // deadlock_detected (pg)
+		strings.Contains(msg, "could not serialize"),   // pg text
+		strings.Contains(msg, "deadlock detected"):     // pg text
+		return true
+	}
+	return false
+}
+
 // EnqueueUnique adds a job only if no job with the same unique key exists in pending/running state.
 // Uses SELECT FOR UPDATE to prevent TOCTOU race conditions in concurrent scenarios.
 // For SQLite, relies on serializable transaction isolation (SQLite's default).
@@ -578,6 +628,11 @@ func (s *GormStorage) GetFanOutsByParent(ctx context.Context, parentJobID string
 // dedup lookup and insert run inside a single transaction with row-level
 // locking on non-SQLite backends, mirroring EnqueueUnique, so concurrent
 // replays cannot produce duplicate sub-jobs.
+//
+// Under MySQL's default REPEATABLE READ, concurrent callers that insert the
+// same UniqueKey set can deadlock on gap locks; we retry the transaction a
+// bounded number of times when the driver reports a serialization failure
+// or deadlock (MySQL error 1213/1205, Postgres SQLSTATE 40001/40P01).
 func (s *GormStorage) EnqueueBatch(ctx context.Context, jobs []*core.Job) error {
 	if len(jobs) == 0 {
 		return nil
@@ -597,6 +652,15 @@ func (s *GormStorage) EnqueueBatch(ctx context.Context, jobs []*core.Job) error 
 		}
 	}
 
+	return s.withSerializationRetry(ctx, func() error {
+		return s.enqueueBatchTx(ctx, jobs)
+	})
+}
+
+// enqueueBatchTx is the core body of EnqueueBatch, extracted so it can be
+// retried on transient serialization failures without re-running the
+// default-filling pass above.
+func (s *GormStorage) enqueueBatchTx(ctx context.Context, jobs []*core.Job) error {
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		// Collect the non-empty UniqueKeys we need to check. A single
 		// IN-list query amortizes the round-trip cost across the batch.
