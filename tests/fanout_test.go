@@ -54,7 +54,7 @@ func TestFanOut_Basic(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	_, err := queue.Enqueue(ctx, "batchMultiply", []int{1, 2, 3, 4, 5})
+	jobID, err := queue.Enqueue(ctx, "batchMultiply", []int{1, 2, 3, 4, 5})
 	require.NoError(t, err)
 
 	worker := queue.NewWorker(jobs.WithScheduler(false))
@@ -76,6 +76,16 @@ waitLoop:
 	}
 
 	assert.Equal(t, int32(5), processedCount.Load(), "all 5 sub-jobs should be processed")
+
+	// Verify the parent workflow's return value is now persisted and decodes correctly.
+	require.Eventually(t, func() bool {
+		status, err := queue.LoadStatus(ctx, jobID)
+		return err == nil && status == jobs.StatusCompleted
+	}, 5*time.Second, 50*time.Millisecond, "parent job must reach completed")
+
+	got, err := jobs.LoadResult[[]int](ctx, queue, jobID)
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []int{2, 4, 6, 8, 10}, got, "parent must return doubled values from sub-jobs")
 }
 
 func TestFanOut_Empty(t *testing.T) {
