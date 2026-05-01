@@ -610,4 +610,3 @@ func TestIntegration_ExponentialBackoffRetries(t *testing.T) {
 		assert.Greater(t, gap2, gap1, "Backoff should be exponential (gap2 > gap1)")
 	}
 }
-

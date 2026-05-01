@@ -26,41 +26,41 @@ import (
 // ---------------------------------------------------------------------------
 
 type mockStorage struct {
-	getJobFn              func(ctx context.Context, id string) (*core.Job, error)
-	getJobsByStatusFn     func(ctx context.Context, status core.JobStatus, limit int) ([]*core.Job, error)
-	getCheckpointsFn      func(ctx context.Context, jobID string) ([]core.Checkpoint, error)
-	getFanOutsByParentFn  func(ctx context.Context, parentID string) ([]*core.FanOut, error)
-	getSubJobsFn          func(ctx context.Context, fanOutID string) ([]*core.Job, error)
-	pauseJobFn            func(ctx context.Context, id string) error
-	unpauseJobFn          func(ctx context.Context, id string) error
-	isJobPausedFn         func(ctx context.Context, id string) (bool, error)
-	getPausedJobsFn       func(ctx context.Context, queue string) ([]*core.Job, error)
-	pauseQueueFn          func(ctx context.Context, name string) error
-	unpauseQueueFn        func(ctx context.Context, name string) error
-	isQueuePausedFn       func(ctx context.Context, name string) (bool, error)
-	getPausedQueuesFn     func(ctx context.Context) ([]string, error)
+	getJobFn             func(ctx context.Context, id string) (*core.Job, error)
+	getJobsByStatusFn    func(ctx context.Context, status core.JobStatus, limit int) ([]*core.Job, error)
+	getCheckpointsFn     func(ctx context.Context, jobID string) ([]core.Checkpoint, error)
+	getFanOutsByParentFn func(ctx context.Context, parentID string) ([]*core.FanOut, error)
+	getSubJobsFn         func(ctx context.Context, fanOutID string) ([]*core.Job, error)
+	pauseJobFn           func(ctx context.Context, id string) error
+	unpauseJobFn         func(ctx context.Context, id string) error
+	isJobPausedFn        func(ctx context.Context, id string) (bool, error)
+	getPausedJobsFn      func(ctx context.Context, queue string) ([]*core.Job, error)
+	pauseQueueFn         func(ctx context.Context, name string) error
+	unpauseQueueFn       func(ctx context.Context, name string) error
+	isQueuePausedFn      func(ctx context.Context, name string) (bool, error)
+	getPausedQueuesFn    func(ctx context.Context) ([]string, error)
 }
 
 // Implement the full core.Storage interface; methods not under test return zero values.
-func (m *mockStorage) Migrate(_ context.Context) error                              { return nil }
-func (m *mockStorage) Enqueue(_ context.Context, _ *core.Job) error                { return nil }
+func (m *mockStorage) Migrate(_ context.Context) error              { return nil }
+func (m *mockStorage) Enqueue(_ context.Context, _ *core.Job) error { return nil }
 func (m *mockStorage) Dequeue(_ context.Context, _ []string, _ string) (*core.Job, error) {
 	return nil, nil
 }
-func (m *mockStorage) Complete(_ context.Context, _, _ string) error                    { return nil }
-func (m *mockStorage) Fail(_ context.Context, _, _, _ string, _ *time.Time) error       { return nil }
-func (m *mockStorage) EnqueueUnique(_ context.Context, _ *core.Job, _ string) error     { return nil }
-func (m *mockStorage) SaveCheckpoint(_ context.Context, _ *core.Checkpoint) error       { return nil }
-func (m *mockStorage) DeleteCheckpoints(_ context.Context, _ string) error              { return nil }
+func (m *mockStorage) Complete(_ context.Context, _, _ string) error                { return nil }
+func (m *mockStorage) Fail(_ context.Context, _, _, _ string, _ *time.Time) error   { return nil }
+func (m *mockStorage) EnqueueUnique(_ context.Context, _ *core.Job, _ string) error { return nil }
+func (m *mockStorage) SaveCheckpoint(_ context.Context, _ *core.Checkpoint) error   { return nil }
+func (m *mockStorage) DeleteCheckpoints(_ context.Context, _ string) error          { return nil }
 func (m *mockStorage) GetDueJobs(_ context.Context, _ []string, _ int) ([]*core.Job, error) {
 	return nil, nil
 }
-func (m *mockStorage) Heartbeat(_ context.Context, _, _ string) error                   { return nil }
+func (m *mockStorage) Heartbeat(_ context.Context, _, _ string) error { return nil }
 func (m *mockStorage) ReleaseStaleLocks(_ context.Context, _ time.Duration) (int64, error) {
 	return 0, nil
 }
-func (m *mockStorage) CreateFanOut(_ context.Context, _ *core.FanOut) error             { return nil }
-func (m *mockStorage) GetFanOut(_ context.Context, _ string) (*core.FanOut, error)      { return nil, nil }
+func (m *mockStorage) CreateFanOut(_ context.Context, _ *core.FanOut) error        { return nil }
+func (m *mockStorage) GetFanOut(_ context.Context, _ string) (*core.FanOut, error) { return nil, nil }
 func (m *mockStorage) IncrementFanOutCompleted(_ context.Context, _ string) (*core.FanOut, error) {
 	return nil, nil
 }
@@ -79,20 +79,24 @@ func (m *mockStorage) GetFanOutsByParent(ctx context.Context, parentID string) (
 	}
 	return nil, nil
 }
-func (m *mockStorage) EnqueueBatch(_ context.Context, _ []*core.Job) error               { return nil }
+func (m *mockStorage) EnqueueBatch(_ context.Context, _ []*core.Job) error { return nil }
 func (m *mockStorage) GetSubJobs(ctx context.Context, fanOutID string) ([]*core.Job, error) {
 	if m.getSubJobsFn != nil {
 		return m.getSubJobsFn(ctx, fanOutID)
 	}
 	return nil, nil
 }
-func (m *mockStorage) GetSubJobResults(_ context.Context, _ string) ([]*core.Job, error) { return nil, nil }
-func (m *mockStorage) CancelSubJobs(_ context.Context, _ string) (int64, error)          { return 0, nil }
-func (m *mockStorage) CancelSubJob(_ context.Context, _ string) (*core.FanOut, error)    { return nil, nil }
-func (m *mockStorage) SuspendJob(_ context.Context, _, _ string) error                   { return nil }
-func (m *mockStorage) ResumeJob(_ context.Context, _ string) (bool, error)               { return false, nil }
-func (m *mockStorage) GetWaitingJobsToResume(_ context.Context) ([]*core.Job, error)     { return nil, nil }
-func (m *mockStorage) SaveJobResult(_ context.Context, _, _ string, _ []byte) error      { return nil }
+func (m *mockStorage) GetSubJobResults(_ context.Context, _ string) ([]*core.Job, error) {
+	return nil, nil
+}
+func (m *mockStorage) CancelSubJobs(_ context.Context, _ string) (int64, error) { return 0, nil }
+func (m *mockStorage) CancelSubJob(_ context.Context, _ string) (*core.FanOut, error) {
+	return nil, nil
+}
+func (m *mockStorage) SuspendJob(_ context.Context, _, _ string) error               { return nil }
+func (m *mockStorage) ResumeJob(_ context.Context, _ string) (bool, error)           { return false, nil }
+func (m *mockStorage) GetWaitingJobsToResume(_ context.Context) ([]*core.Job, error) { return nil, nil }
+func (m *mockStorage) SaveJobResult(_ context.Context, _, _ string, _ []byte) error  { return nil }
 func (m *mockStorage) PauseJob(ctx context.Context, id string) error {
 	if m.pauseJobFn != nil {
 		return m.pauseJobFn(ctx, id)
@@ -1138,7 +1142,7 @@ func TestListScheduledJobs_WithScheduledJobs(t *testing.T) {
 type stringerSchedule struct{ label string }
 
 func (s *stringerSchedule) Next(from time.Time) time.Time { return from.Add(time.Hour) }
-func (s *stringerSchedule) String() string                 { return s.label }
+func (s *stringerSchedule) String() string                { return s.label }
 
 func TestListScheduledJobs_WithStringerSchedule(t *testing.T) {
 	svc, q := setupServiceWithQueue(t)
@@ -1407,8 +1411,8 @@ func TestListWorkflows_Success(t *testing.T) {
 func TestListWorkflows_DefaultPagination(t *testing.T) {
 	store := &mockUIStorage{
 		getWorkflowRootsFn: func(_ context.Context, _ string, limit, offset int) ([]*core.Job, int64, error) {
-			assert.Equal(t, 50, limit)  // default
-			assert.Equal(t, 0, offset)  // page 1
+			assert.Equal(t, 50, limit) // default
+			assert.Equal(t, 0, offset) // page 1
 			return nil, 0, nil
 		},
 	}

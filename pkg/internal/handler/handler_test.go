@@ -631,7 +631,7 @@ func TestExecuteCall_DefensiveTail_ZeroReturn(t *testing.T) {
 	h := &Handler{
 		Fn:         fnVal,
 		ArgsType:   reflect.TypeOf(testArgs{}),
-		HasContext:  true,
+		HasContext: true,
 	}
 
 	result, err := ExecuteCall[testResult](context.Background(), h, testArgs{})

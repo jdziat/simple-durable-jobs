@@ -34,13 +34,13 @@ func TestSecurity_ValidateJobTypeName_Valid(t *testing.T) {
 
 func TestSecurity_ValidateJobTypeName_Invalid(t *testing.T) {
 	invalidNames := []string{
-		"",                          // empty
-		"123-task",                  // starts with number
-		"-task",                     // starts with hyphen
-		"task with spaces",          // contains spaces
-		"task@email",                // contains special char
-		"task/subtask",              // contains slash
-		strings.Repeat("a", 300),    // too long
+		"",                       // empty
+		"123-task",               // starts with number
+		"-task",                  // starts with hyphen
+		"task with spaces",       // contains spaces
+		"task@email",             // contains special char
+		"task/subtask",           // contains slash
+		strings.Repeat("a", 300), // too long
 	}
 
 	for _, name := range invalidNames {

@@ -10,15 +10,15 @@ import (
 
 func TestJob_HasRequiredFields(t *testing.T) {
 	job := jobs.Job{
-		ID:        "test-123",
-		Type:      "send-email",
-		Args:      []byte(`{"to":"user@example.com"}`),
-		Queue:     "default",
-		Priority:  0,
-		Status:    jobs.StatusPending,
-		Attempt:   0,
+		ID:         "test-123",
+		Type:       "send-email",
+		Args:       []byte(`{"to":"user@example.com"}`),
+		Queue:      "default",
+		Priority:   0,
+		Status:     jobs.StatusPending,
+		Attempt:    0,
 		MaxRetries: 3,
-		CreatedAt: time.Now(),
+		CreatedAt:  time.Now(),
 	}
 
 	assert.Equal(t, "test-123", job.ID)

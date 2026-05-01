@@ -198,8 +198,8 @@ func jobAttributes(job *core.Job) []attribute.KeyValue {
 // mapCarrier is a propagation.TextMapCarrier backed by a map.
 type mapCarrier map[string]string
 
-func (c mapCarrier) Get(key string) string       { return c[key] }
-func (c mapCarrier) Set(key, value string)        { c[key] = value }
+func (c mapCarrier) Get(key string) string { return c[key] }
+func (c mapCarrier) Set(key, value string) { c[key] = value }
 func (c mapCarrier) Keys() []string {
 	keys := make([]string, 0, len(c))
 	for k := range c {

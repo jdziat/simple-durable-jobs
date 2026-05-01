@@ -19,25 +19,29 @@ import (
 // ---------------------------------------------------------------------------
 
 type minimalStorage struct {
-	jobs       map[string]*core.Job
-	fanOuts    map[string]*core.FanOut
+	jobs        map[string]*core.Job
+	fanOuts     map[string]*core.FanOut
 	checkpoints map[string][]*core.Checkpoint
-	suspended  map[string]bool
+	suspended   map[string]bool
 }
 
 func newMinimalStorage() *minimalStorage {
 	return &minimalStorage{
-		jobs:       make(map[string]*core.Job),
-		fanOuts:    make(map[string]*core.FanOut),
+		jobs:        make(map[string]*core.Job),
+		fanOuts:     make(map[string]*core.FanOut),
 		checkpoints: make(map[string][]*core.Checkpoint),
-		suspended:  make(map[string]bool),
+		suspended:   make(map[string]bool),
 	}
 }
 
-func (s *minimalStorage) Migrate(ctx context.Context) error                              { return nil }
-func (s *minimalStorage) Enqueue(ctx context.Context, job *core.Job) error               { s.jobs[job.ID] = job; return nil }
+func (s *minimalStorage) Migrate(ctx context.Context) error { return nil }
+func (s *minimalStorage) Enqueue(ctx context.Context, job *core.Job) error {
+	s.jobs[job.ID] = job
+	return nil
+}
 func (s *minimalStorage) EnqueueUnique(ctx context.Context, job *core.Job, key string) error {
-	s.jobs[job.ID] = job; return nil
+	s.jobs[job.ID] = job
+	return nil
 }
 func (s *minimalStorage) EnqueueBatch(ctx context.Context, jobs []*core.Job) error {
 	for _, j := range jobs {
@@ -150,16 +154,20 @@ func (s *minimalStorage) GetWaitingJobsToResume(ctx context.Context) ([]*core.Jo
 func (s *minimalStorage) SaveJobResult(ctx context.Context, jobID, workerID string, result []byte) error {
 	return nil
 }
-func (s *minimalStorage) PauseJob(ctx context.Context, jobID string) error               { return nil }
-func (s *minimalStorage) UnpauseJob(ctx context.Context, jobID string) error             { return nil }
-func (s *minimalStorage) IsJobPaused(ctx context.Context, jobID string) (bool, error)    { return false, nil }
+func (s *minimalStorage) PauseJob(ctx context.Context, jobID string) error   { return nil }
+func (s *minimalStorage) UnpauseJob(ctx context.Context, jobID string) error { return nil }
+func (s *minimalStorage) IsJobPaused(ctx context.Context, jobID string) (bool, error) {
+	return false, nil
+}
 func (s *minimalStorage) GetPausedJobs(ctx context.Context, queue string) ([]*core.Job, error) {
 	return nil, nil
 }
-func (s *minimalStorage) PauseQueue(ctx context.Context, queue string) error            { return nil }
-func (s *minimalStorage) UnpauseQueue(ctx context.Context, queue string) error          { return nil }
-func (s *minimalStorage) IsQueuePaused(ctx context.Context, queue string) (bool, error) { return false, nil }
-func (s *minimalStorage) GetPausedQueues(ctx context.Context) ([]string, error)         { return nil, nil }
+func (s *minimalStorage) PauseQueue(ctx context.Context, queue string) error   { return nil }
+func (s *minimalStorage) UnpauseQueue(ctx context.Context, queue string) error { return nil }
+func (s *minimalStorage) IsQueuePaused(ctx context.Context, queue string) (bool, error) {
+	return false, nil
+}
+func (s *minimalStorage) GetPausedQueues(ctx context.Context) ([]string, error) { return nil, nil }
 func (s *minimalStorage) RefreshQueueStates(ctx context.Context) (map[string]bool, error) {
 	return make(map[string]bool), nil
 }

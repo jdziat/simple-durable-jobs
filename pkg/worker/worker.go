@@ -35,9 +35,9 @@ type Worker struct {
 	runningJobsMu sync.Mutex
 
 	// Per-queue concurrency tracking
-	queueRunning   map[string]*atomic.Int32 // queue name -> active count
-	queueJobID     map[string]string        // job ID -> queue name (for decrement on completion)
-	queueJobIDMu   sync.Mutex
+	queueRunning map[string]*atomic.Int32 // queue name -> active count
+	queueJobID   map[string]string        // job ID -> queue name (for decrement on completion)
+	queueJobIDMu sync.Mutex
 }
 
 // NewWorker creates a new worker for the given queue.
