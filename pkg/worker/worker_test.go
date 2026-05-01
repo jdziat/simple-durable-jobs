@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"sync"
 	"sync/atomic"
@@ -46,6 +47,9 @@ type mockStorage struct {
 	// enqueue tracking
 	enqueueMu    sync.Mutex
 	enqueueCount int64 // incremented on each Enqueue call
+
+	// result tracking
+	savedResults map[string][]byte
 }
 
 func (m *mockStorage) Migrate(_ context.Context) error { return nil }
@@ -196,7 +200,13 @@ func (m *mockStorage) GetWaitingJobsToResume(ctx context.Context) ([]*core.Job, 
 	return nil, nil
 }
 
-func (m *mockStorage) SaveJobResult(_ context.Context, _ string, _ string, _ []byte) error {
+func (m *mockStorage) SaveJobResult(_ context.Context, jobID string, _ string, result []byte) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.savedResults == nil {
+		m.savedResults = map[string][]byte{}
+	}
+	m.savedResults[jobID] = result
 	return nil
 }
 
@@ -2318,4 +2328,64 @@ func TestWorker_CheckFanOutCompletion_FailFastAllDone(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("UpdateFanOutStatus was not called for FailFast all-done path")
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Handler result persistence tests
+// ---------------------------------------------------------------------------
+
+// trackingStorage wraps a real storage and records SaveJobResult calls.
+type trackingStorage struct {
+	core.Storage
+	mu           sync.Mutex
+	savedResults map[string][]byte
+}
+
+func (s *trackingStorage) SaveJobResult(ctx context.Context, jobID string, workerID string, result []byte) error {
+	s.mu.Lock()
+	if s.savedResults == nil {
+		s.savedResults = map[string][]byte{}
+	}
+	s.savedResults[jobID] = result
+	s.mu.Unlock()
+	// Also delegate to the real storage so the job lifecycle isn't broken.
+	return s.Storage.SaveJobResult(ctx, jobID, workerID, result)
+}
+
+func TestWorker_PersistsHandlerResult(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{
+		Logger: logger.Default.LogMode(logger.Silent),
+	})
+	require.NoError(t, err)
+
+	base := storage.NewGormStorage(db)
+	require.NoError(t, base.Migrate(context.Background()))
+
+	store := &trackingStorage{Storage: base}
+	q := queue.New(store)
+	q.Register("make-video", func(ctx context.Context, name string) (map[string]any, error) {
+		return map[string]any{"name": name, "duration_s": 12}, nil
+	})
+
+	jobID, enqErr := q.Enqueue(context.Background(), "make-video", "demo")
+	require.NoError(t, enqErr)
+
+	w := NewWorker(q, WithScheduler(false))
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	go func() { _ = w.Start(ctx) }()
+
+	require.Eventually(t, func() bool {
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		_, ok := store.savedResults[jobID]
+		return ok
+	}, 2*time.Second, 10*time.Millisecond, "handler result must be persisted via SaveJobResult")
+
+	store.mu.Lock()
+	got := store.savedResults[jobID]
+	store.mu.Unlock()
+	var decoded map[string]any
+	require.NoError(t, json.Unmarshal(got, &decoded))
+	assert.Equal(t, "demo", decoded["name"])
 }

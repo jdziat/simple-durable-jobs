@@ -291,7 +291,7 @@ func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 	// Start heartbeat goroutine to extend lock during long-running jobs
 	go w.runHeartbeat(heartbeatCtx, job)
 
-	err := w.executeHandler(jobCtx, job, h)
+	resultBytes, err := w.executeHandler(jobCtx, job, h)
 
 	// Stop heartbeat before completing/failing the job
 	cancelHeartbeat()
@@ -305,6 +305,12 @@ func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 		}
 		w.handleError(ctx, job, err)
 	} else {
+		if resultBytes != nil {
+			if saveErr := w.queue.Storage().SaveJobResult(ctx, job.ID, w.config.WorkerID, resultBytes); saveErr != nil {
+				w.logger.Error("failed to persist job result", "job_id", job.ID, "error", saveErr)
+				// fall through — completion still proceeds
+			}
+		}
 		completeErr := w.completeWithRetry(ctx, job.ID)
 		if completeErr != nil {
 			w.logger.Error("failed to complete job after retries", "job_id", job.ID, "error", completeErr)
@@ -362,7 +368,7 @@ func (w *Worker) runHeartbeat(ctx context.Context, job *core.Job) {
 	}
 }
 
-func (w *Worker) executeHandler(ctx context.Context, job *core.Job, h *handler.Handler) (err error) {
+func (w *Worker) executeHandler(ctx context.Context, job *core.Job, h *handler.Handler) (resultBytes []byte, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			// Check if the panicked value is an error - preserve type for special errors
@@ -401,7 +407,7 @@ func (w *Worker) executeHandler(ctx context.Context, job *core.Job, h *handler.H
 	// Load checkpoints for replay
 	checkpoints, err := w.queue.Storage().GetCheckpoints(ctx, job.ID)
 	if err != nil {
-		return fmt.Errorf("failed to load checkpoints: %w", err)
+		return nil, fmt.Errorf("failed to load checkpoints: %w", err)
 	}
 
 	// Create job context with all necessary references
