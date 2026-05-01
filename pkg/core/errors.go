@@ -21,6 +21,7 @@ var (
 	ErrQueueAlreadyPaused = errors.New("jobs: queue is already paused")
 	ErrQueueNotPaused     = errors.New("jobs: queue is not paused")
 	ErrCannotPauseStatus  = errors.New("jobs: cannot pause job in current status")
+	ErrJobNotCompleted    = errors.New("jobs: job has not completed")
 )
 
 // NoRetryError indicates an error that should not be retried.
