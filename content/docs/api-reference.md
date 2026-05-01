@@ -280,8 +280,10 @@ Marks the fan-out so that if the parent job itself enters `failed` before collec
 ### Job-Level Pause
 
 ```go
-// Via queue (emits events, handles running jobs)
+// Via queue (emits events)
+// Default graceful mode pauses pending or waiting jobs.
 queue.PauseJob(ctx, jobID)
+// Aggressive mode cancels running jobs.
 queue.PauseJob(ctx, jobID, jobs.WithPauseMode(jobs.PauseModeAggressive))
 queue.ResumeJob(ctx, jobID)
 paused, err := queue.IsJobPaused(ctx, jobID)

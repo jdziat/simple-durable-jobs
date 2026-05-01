@@ -227,7 +227,7 @@ defer queue.Unsubscribe(events)
 Pause and resume at the job, queue, or worker level:
 
 ```go
-// Pause a specific job
+// Pause a pending or waiting job
 queue.PauseJob(ctx, jobID)
 queue.ResumeJob(ctx, jobID)
 

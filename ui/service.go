@@ -484,6 +484,8 @@ func (s *jobsService) WatchEvents(ctx context.Context, req *connect.Request[jobs
 				eventQueue := ""
 				if pbEvent.Job != nil {
 					eventQueue = pbEvent.Job.Queue
+				} else {
+					eventQueue = pbEvent.Queue
 				}
 				if _, ok := filterSet[eventQueue]; !ok {
 					continue
@@ -752,11 +754,13 @@ func coreEventToProto(e core.Event) *jobsv1.Event {
 	case *core.QueuePaused:
 		return &jobsv1.Event{
 			Type:      "queue.paused",
+			Queue:     ev.Queue,
 			Timestamp: timestamppb.New(ev.Timestamp),
 		}
 	case *core.QueueResumed:
 		return &jobsv1.Event{
 			Type:      "queue.resumed",
+			Queue:     ev.Queue,
 			Timestamp: timestamppb.New(ev.Timestamp),
 		}
 	case *core.WorkerPaused:

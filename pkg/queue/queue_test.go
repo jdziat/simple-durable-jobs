@@ -962,8 +962,8 @@ func TestQueue_PauseJob_RunningJobCancelsContext(t *testing.T) {
 	// Register as running locally
 	q.RegisterRunningJob(jobID, cancel)
 
-	// PauseJob on a running job: storage sets cancelled, queue cancels context
-	err = q.PauseJob(ctx, jobID)
+	// Aggressive PauseJob on a running job: storage sets cancelled, queue cancels context.
+	err = q.PauseJob(ctx, jobID, WithPauseMode(core.PauseModeAggressive))
 	require.NoError(t, err)
 	assert.True(t, cancelled, "cancel function should have been called")
 
@@ -971,6 +971,30 @@ func TestQueue_PauseJob_RunningJobCancelsContext(t *testing.T) {
 	job, err := store.GetJob(ctx, jobID)
 	require.NoError(t, err)
 	assert.Equal(t, core.StatusCancelled, job.Status)
+}
+
+func TestQueue_PauseJob_RunningGracefulReturnsError(t *testing.T) {
+	store := newMockStorage()
+	q := New(store)
+	ctx := context.Background()
+
+	q.Register("run-job", func(ctx context.Context, args struct{}) error { return nil })
+	jobID, err := q.Enqueue(ctx, "run-job", struct{}{})
+	require.NoError(t, err)
+
+	_, err = store.Dequeue(ctx, []string{"default"}, "worker-1")
+	require.NoError(t, err)
+
+	cancelled := false
+	q.RegisterRunningJob(jobID, func() { cancelled = true })
+
+	err = q.PauseJob(ctx, jobID, WithPauseMode(core.PauseModeGraceful))
+	require.ErrorIs(t, err, core.ErrCannotPauseStatus)
+	assert.False(t, cancelled, "graceful pause should not cancel a running job")
+
+	job, err := store.GetJob(ctx, jobID)
+	require.NoError(t, err)
+	assert.Equal(t, core.StatusRunning, job.Status)
 }
 
 func TestQueue_PauseJob_CompletedJobReturnsError(t *testing.T) {
@@ -1007,6 +1031,20 @@ func TestQueue_PauseJob_WithPauseMode_Aggressive(t *testing.T) {
 	paused, err := q.IsJobPaused(ctx, jobID)
 	require.NoError(t, err)
 	assert.True(t, paused)
+}
+
+func TestQueue_GetScheduledJobs_ReturnsCopy(t *testing.T) {
+	store := newMockStorage()
+	q := New(store)
+
+	q.Schedule("job-a", nil)
+	scheduled := q.GetScheduledJobs()
+	require.Contains(t, scheduled, "job-a")
+
+	delete(scheduled, "job-a")
+
+	again := q.GetScheduledJobs()
+	assert.Contains(t, again, "job-a")
 }
 
 // ---------------------------------------------------------------------------

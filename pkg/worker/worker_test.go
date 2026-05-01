@@ -200,15 +200,15 @@ func (m *mockStorage) SaveJobResult(_ context.Context, _ string, _ string, _ []b
 	return nil
 }
 
-func (m *mockStorage) PauseJob(_ context.Context, _ string) error      { return nil }
-func (m *mockStorage) UnpauseJob(_ context.Context, _ string) error    { return nil }
+func (m *mockStorage) PauseJob(_ context.Context, _ string) error   { return nil }
+func (m *mockStorage) UnpauseJob(_ context.Context, _ string) error { return nil }
 func (m *mockStorage) GetPausedJobs(_ context.Context, _ string) ([]*core.Job, error) {
 	return nil, nil
 }
 func (m *mockStorage) IsJobPaused(_ context.Context, _ string) (bool, error) { return false, nil }
-func (m *mockStorage) PauseQueue(_ context.Context, _ string) error           { return nil }
-func (m *mockStorage) UnpauseQueue(_ context.Context, _ string) error         { return nil }
-func (m *mockStorage) GetPausedQueues(_ context.Context) ([]string, error)    { return nil, nil }
+func (m *mockStorage) PauseQueue(_ context.Context, _ string) error          { return nil }
+func (m *mockStorage) UnpauseQueue(_ context.Context, _ string) error        { return nil }
+func (m *mockStorage) GetPausedQueues(_ context.Context) ([]string, error)   { return nil, nil }
 func (m *mockStorage) IsQueuePaused(_ context.Context, _ string) (bool, error) {
 	return false, nil
 }
@@ -477,6 +477,47 @@ func TestWorker_AggressivePauseCancelsRunningJobs(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("job was not cancelled")
 	}
+}
+
+func TestWorker_PauseJobAggressivePreservesCancelledStatus(t *testing.T) {
+	db, _ := gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{
+		Logger: logger.Default.LogMode(logger.Silent),
+	})
+	store := storage.NewGormStorage(db)
+	_ = store.Migrate(context.Background())
+	q := queue.New(store)
+
+	started := make(chan struct{})
+	q.Register("long-job", func(ctx context.Context, args struct{}) error {
+		close(started)
+		<-ctx.Done()
+		return ctx.Err()
+	})
+
+	jobID, err := q.Enqueue(context.Background(), "long-job", struct{}{})
+	require.NoError(t, err)
+
+	w := NewWorker(q, WithPollInterval(50*time.Millisecond))
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	go func() { _ = w.Start(ctx) }()
+
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("job did not start")
+	}
+
+	require.NoError(t, q.PauseJob(context.Background(), jobID, queue.WithPauseMode(core.PauseModeAggressive)))
+
+	require.Eventually(t, func() bool {
+		return w.RunningJobCount() == 0
+	}, 2*time.Second, 25*time.Millisecond)
+
+	job, err := store.GetJob(context.Background(), jobID)
+	require.NoError(t, err)
+	require.NotNil(t, job)
+	assert.Equal(t, core.StatusCancelled, job.Status)
 }
 
 // ---------------------------------------------------------------------------
@@ -1635,7 +1676,7 @@ func TestWorker_HandleError_RetryAfterExhausted(t *testing.T) {
 			Type:       "ra-exhausted",
 			Queue:      "default",
 			Args:       []byte(`{}`),
-			Attempt:    1,  // Attempt < MaxRetries: retry branch is taken
+			Attempt:    1, // Attempt < MaxRetries: retry branch is taken
 			MaxRetries: 3,
 		}, nil
 	}

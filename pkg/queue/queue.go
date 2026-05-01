@@ -12,8 +12,8 @@ import (
 
 	"github.com/jdziat/simple-durable-jobs/pkg/core"
 	"github.com/jdziat/simple-durable-jobs/pkg/internal/handler"
-	"github.com/jdziat/simple-durable-jobs/pkg/security"
 	"github.com/jdziat/simple-durable-jobs/pkg/schedule"
+	"github.com/jdziat/simple-durable-jobs/pkg/security"
 )
 
 // EnqueueMiddleware wraps the enqueue operation.
@@ -258,7 +258,15 @@ func (q *Queue) Schedule(name string, sched schedule.Schedule, opts ...Option) {
 func (q *Queue) GetScheduledJobs() map[string]*ScheduledJob {
 	q.mu.RLock()
 	defer q.mu.RUnlock()
-	return q.scheduledJobs
+
+	if q.scheduledJobs == nil {
+		return nil
+	}
+	scheduled := make(map[string]*ScheduledJob, len(q.scheduledJobs))
+	for name, job := range q.scheduledJobs {
+		scheduled[name] = job
+	}
+	return scheduled
 }
 
 // Storage returns the underlying storage.
@@ -492,13 +500,21 @@ func (q *Queue) UnregisterRunningJob(jobID string) {
 // --- Job Pause Operations ---
 
 // PauseJob pauses a specific job. For pending/waiting jobs, the status is set
-// to paused in storage. For running jobs in aggressive mode, the job's context
-// is cancelled via the running job registry. In graceful mode for running jobs,
-// the pause flag is set so the job stops after the current phase completes.
+// to paused in storage. Running jobs require aggressive mode, which cancels
+// the local job context when the job is running in this process. Graceful mode
+// returns ErrCannotPauseStatus for running jobs.
 func (q *Queue) PauseJob(ctx context.Context, jobID string, opts ...PauseOption) error {
 	po := &PauseOptions{Mode: core.PauseModeGraceful}
 	for _, opt := range opts {
 		opt.ApplyPause(po)
+	}
+
+	job, err := q.storage.GetJob(ctx, jobID)
+	if err != nil {
+		return err
+	}
+	if job != nil && job.Status == core.StatusRunning && po.Mode == core.PauseModeGraceful {
+		return core.ErrCannotPauseStatus
 	}
 
 	// Check if the job is running locally before touching storage,
@@ -507,13 +523,13 @@ func (q *Queue) PauseJob(ctx context.Context, jobID string, opts ...PauseOption)
 	cancel, runningLocally := q.runningJobs[jobID]
 	q.runningJobsMu.Unlock()
 
-	err := q.storage.PauseJob(ctx, jobID)
+	err = q.storage.PauseJob(ctx, jobID)
 	if err != nil {
 		return err
 	}
 
 	// If the job was running locally, cancel its context so the handler stops.
-	if runningLocally {
+	if runningLocally && po.Mode == core.PauseModeAggressive {
 		cancel()
 	}
 

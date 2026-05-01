@@ -126,14 +126,14 @@ func isSerializationFailure(err error) bool {
 	}
 	msg := err.Error()
 	switch {
-	case strings.Contains(msg, "Error 1213"),          // MySQL deadlock
-		strings.Contains(msg, "Deadlock found"),        // MySQL deadlock (text)
-		strings.Contains(msg, "Error 1205"),            // MySQL lock wait timeout
-		strings.Contains(msg, "Lock wait timeout"),     // MySQL (text)
-		strings.Contains(msg, "SQLSTATE 40001"),        // serialization_failure
-		strings.Contains(msg, "SQLSTATE 40P01"),        // deadlock_detected (pg)
-		strings.Contains(msg, "could not serialize"),   // pg text
-		strings.Contains(msg, "deadlock detected"):     // pg text
+	case strings.Contains(msg, "Error 1213"), // MySQL deadlock
+		strings.Contains(msg, "Deadlock found"),      // MySQL deadlock (text)
+		strings.Contains(msg, "Error 1205"),          // MySQL lock wait timeout
+		strings.Contains(msg, "Lock wait timeout"),   // MySQL (text)
+		strings.Contains(msg, "SQLSTATE 40001"),      // serialization_failure
+		strings.Contains(msg, "SQLSTATE 40P01"),      // deadlock_detected (pg)
+		strings.Contains(msg, "could not serialize"), // pg text
+		strings.Contains(msg, "deadlock detected"):   // pg text
 		return true
 	}
 	return false
@@ -349,7 +349,7 @@ func (s *GormStorage) Complete(ctx context.Context, jobID string, workerID strin
 	now := time.Now()
 	result := s.db.WithContext(ctx).
 		Model(&core.Job{}).
-		Where("id = ? AND locked_by = ?", jobID, workerID).
+		Where("id = ? AND locked_by = ? AND status = ?", jobID, workerID, core.StatusRunning).
 		Updates(map[string]any{
 			"status":       core.StatusCompleted,
 			"completed_at": now,
@@ -390,7 +390,7 @@ func (s *GormStorage) Fail(ctx context.Context, jobID string, workerID string, e
 
 	result := s.db.WithContext(ctx).
 		Model(&core.Job{}).
-		Where("id = ? AND locked_by = ?", jobID, workerID).
+		Where("id = ? AND locked_by = ? AND status = ?", jobID, workerID, core.StatusRunning).
 		Updates(updates)
 
 	if result.Error != nil {
@@ -933,6 +933,8 @@ func (s *GormStorage) PauseJob(ctx context.Context, jobID string) error {
 					"completed_at": now,
 					"updated_at":   now,
 					"last_error":   "cancelled by user",
+					"locked_by":    "",
+					"locked_until": nil,
 				}).Error
 		default:
 			return core.ErrCannotPauseStatus

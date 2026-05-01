@@ -195,9 +195,12 @@ if jobs.AllSucceeded(results) {
 Pause and resume at three levels: individual jobs, entire queues, or workers.
 
 ```go
-// Pause/resume a specific job
+// Pause/resume a pending or waiting job
 queue.PauseJob(ctx, jobID)
 queue.ResumeJob(ctx, jobID)
+
+// Cancel a running job
+queue.PauseJob(ctx, jobID, jobs.WithPauseMode(jobs.PauseModeAggressive))
 
 // Pause/resume an entire queue (stops dequeuing)
 queue.PauseQueue(ctx, "emails")
