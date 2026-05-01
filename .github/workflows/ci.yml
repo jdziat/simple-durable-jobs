@@ -35,7 +35,7 @@ jobs:
         run: go mod download
 
       - name: Run tests
-        run: go test -v -race -coverprofile=coverage.out $(go list ./... | grep -v /examples/ | grep -v /ui/cmd/ | grep -v /ui/gen/)
+        run: go test -v -short -race -coverprofile=coverage.out $(go list ./... | grep -v /examples/ | grep -v /ui/cmd/ | grep -v /ui/gen/)
 
       - name: Upload coverage
         uses: codecov/codecov-action@v4
@@ -86,7 +86,7 @@ jobs:
       - name: Run tests
         env:
           TEST_DATABASE_URL: postgres://jobs:jobs@localhost:5432/jobs_test?sslmode=disable
-        run: go test -v -race -p=1 -coverprofile=coverage-pg.out $(go list ./... | grep -v /examples/ | grep -v /ui/cmd/ | grep -v /ui/gen/)
+        run: go test -v -short -race -p=1 -coverprofile=coverage-pg.out $(go list ./... | grep -v /examples/ | grep -v /ui/cmd/ | grep -v /ui/gen/)
 
       - name: Upload coverage
         uses: codecov/codecov-action@v4
@@ -136,7 +136,7 @@ jobs:
       - name: Run tests
         env:
           TEST_MYSQL_URL: root:jobs@tcp(localhost:3306)/jobs_test?parseTime=true
-        run: go test -v -race -p=1 -coverprofile=coverage-mysql.out $(go list ./... | grep -v /examples/ | grep -v /ui/cmd/ | grep -v /ui/gen/)
+        run: go test -v -short -race -p=1 -coverprofile=coverage-mysql.out $(go list ./... | grep -v /examples/ | grep -v /ui/cmd/ | grep -v /ui/gen/)
 
       - name: Upload coverage
         uses: codecov/codecov-action@v4
