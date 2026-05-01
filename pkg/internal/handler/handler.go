@@ -75,10 +75,12 @@ func NewHandler(fn any) (*Handler, error) {
 }
 
 // Execute runs the handler with the given context and arguments.
-func (h *Handler) Execute(ctx context.Context, argsJSON []byte) error {
+// Returns the JSON-marshaled return value (or nil for error-only handlers
+// or when the handler returned an error) and any handler error.
+func (h *Handler) Execute(ctx context.Context, argsJSON []byte) ([]byte, error) {
 	// Defensive check: ensure handler function is valid
 	if !h.Fn.IsValid() || h.Fn.IsNil() {
-		return fmt.Errorf("handler function is nil or invalid")
+		return nil, fmt.Errorf("handler function is nil or invalid")
 	}
 
 	var args []reflect.Value
@@ -90,7 +92,7 @@ func (h *Handler) Execute(ctx context.Context, argsJSON []byte) error {
 	if h.ArgsType != nil {
 		argVal := reflect.New(h.ArgsType)
 		if err := json.Unmarshal(argsJSON, argVal.Interface()); err != nil {
-			return fmt.Errorf("failed to unmarshal args: %w", err)
+			return nil, fmt.Errorf("failed to unmarshal args: %w", err)
 		}
 		args = append(args, argVal.Elem())
 	}
@@ -102,14 +104,21 @@ func (h *Handler) Execute(ctx context.Context, argsJSON []byte) error {
 	switch numOut {
 	case 1:
 		if !results[0].IsNil() {
-			return results[0].Interface().(error)
+			return nil, results[0].Interface().(error)
 		}
+		return nil, nil
 	case 2:
 		if !results[1].IsNil() {
-			return results[1].Interface().(error)
+			return nil, results[1].Interface().(error)
 		}
+		// Marshal the return value to JSON bytes.
+		resultBytes, marshalErr := json.Marshal(results[0].Interface())
+		if marshalErr != nil {
+			return nil, fmt.Errorf("failed to marshal handler result: %w", marshalErr)
+		}
+		return resultBytes, nil
 	}
-	return nil
+	return nil, nil
 }
 
 // ExecuteCall runs the handler for a nested Call, returning the result.

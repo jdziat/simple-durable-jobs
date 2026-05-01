@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"reflect"
@@ -168,7 +169,7 @@ func TestNewHandler_AcceptsResultAndError(t *testing.T) {
 
 func TestHandler_Execute_ReturnsErrorForInvalidFn(t *testing.T) {
 	h := &Handler{}
-	err := h.Execute(context.Background(), []byte("{}"))
+	_, err := h.Execute(context.Background(), []byte("{}"))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "nil or invalid")
 }
@@ -182,7 +183,7 @@ func TestHandler_Execute_BadJSON(t *testing.T) {
 	h, err := NewHandler(fn)
 	require.NoError(t, err)
 
-	err = h.Execute(context.Background(), []byte("not json"))
+	_, err = h.Execute(context.Background(), []byte("not json"))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "unmarshal")
 }
@@ -201,7 +202,7 @@ func TestHandler_Execute_StructArgs_Success(t *testing.T) {
 	require.NoError(t, err)
 
 	argsJSON := []byte(`{"name":"hello","value":7}`)
-	err = h.Execute(context.Background(), argsJSON)
+	_, err = h.Execute(context.Background(), argsJSON)
 	require.NoError(t, err)
 	assert.Equal(t, "hello", received.Name)
 	assert.Equal(t, 7, received.Value)
@@ -220,7 +221,7 @@ func TestHandler_Execute_StringArgs_Success(t *testing.T) {
 	h, err := NewHandler(fn)
 	require.NoError(t, err)
 
-	err = h.Execute(context.Background(), []byte(`"world"`))
+	_, err = h.Execute(context.Background(), []byte(`"world"`))
 	require.NoError(t, err)
 	assert.Equal(t, "world", received)
 }
@@ -235,7 +236,7 @@ func TestHandler_Execute_HandlerReturnsError(t *testing.T) {
 	h, err := NewHandler(fn)
 	require.NoError(t, err)
 
-	err = h.Execute(context.Background(), []byte("{}"))
+	_, err = h.Execute(context.Background(), []byte("{}"))
 	require.Error(t, err)
 	assert.Equal(t, sentinel, err)
 }
@@ -251,7 +252,7 @@ func TestHandler_Execute_TwoReturnValues_Success(t *testing.T) {
 	h, err := NewHandler(fn)
 	require.NoError(t, err)
 
-	err = h.Execute(context.Background(), []byte("{}"))
+	_, err = h.Execute(context.Background(), []byte("{}"))
 	require.NoError(t, err)
 }
 
@@ -267,7 +268,7 @@ func TestHandler_Execute_TwoReturnValues_Error(t *testing.T) {
 	h, err := NewHandler(fn)
 	require.NoError(t, err)
 
-	err = h.Execute(context.Background(), []byte("{}"))
+	_, err = h.Execute(context.Background(), []byte("{}"))
 	require.Error(t, err)
 	assert.Equal(t, sentinel, err)
 }
@@ -286,7 +287,7 @@ func TestHandler_Execute_NoArgsType(t *testing.T) {
 	require.NoError(t, err)
 	require.Nil(t, h.ArgsType)
 
-	err = h.Execute(context.Background(), []byte("{}"))
+	_, err = h.Execute(context.Background(), []byte("{}"))
 	require.NoError(t, err)
 	assert.True(t, called)
 }
@@ -305,7 +306,7 @@ func TestHandler_Execute_NoContext_Success(t *testing.T) {
 	require.NoError(t, err)
 	assert.False(t, h.HasContext)
 
-	err = h.Execute(context.Background(), []byte(`"direct"`))
+	_, err = h.Execute(context.Background(), []byte(`"direct"`))
 	require.NoError(t, err)
 	assert.Equal(t, "direct", received)
 }
@@ -517,7 +518,7 @@ func TestHandler_Execute_ContextPropagation(t *testing.T) {
 	h, err := NewHandler(fn)
 	require.NoError(t, err)
 
-	err = h.Execute(ctx, []byte(`"anything"`))
+	_, err = h.Execute(ctx, []byte(`"anything"`))
 	require.NoError(t, err)
 	assert.Equal(t, "exec-marker", gotCtx.Value(ctxKey{}))
 }
@@ -536,7 +537,7 @@ func TestHandler_Execute_EmptyJSONObject(t *testing.T) {
 	require.NoError(t, err)
 
 	// Empty JSON object → zero-value struct
-	err = h.Execute(context.Background(), []byte("{}"))
+	_, err = h.Execute(context.Background(), []byte("{}"))
 	require.NoError(t, err)
 	assert.Equal(t, testArgs{}, received)
 }
@@ -665,7 +666,7 @@ func TestHandler_Execute_VariousPayloads(t *testing.T) {
 
 	for _, p := range payloads {
 		t.Run(p.name, func(t *testing.T) {
-			err := h.Execute(context.Background(), p.json)
+			_, err := h.Execute(context.Background(), p.json)
 			if p.wantErr {
 				require.Error(t, err)
 			} else {
@@ -673,4 +674,52 @@ func TestHandler_Execute_VariousPayloads(t *testing.T) {
 			}
 		})
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Execute – two return values, result bytes returned
+// ---------------------------------------------------------------------------
+
+func TestHandler_Execute_TwoReturnValues_ReturnsResultBytes(t *testing.T) {
+	type out struct {
+		Name string `json:"name"`
+		Code int    `json:"code"`
+	}
+	fn := func(ctx context.Context, in struct{}) (out, error) {
+		return out{Name: "video-42", Code: 7}, nil
+	}
+	h, err := NewHandler(fn)
+	require.NoError(t, err)
+
+	resultBytes, err := h.Execute(context.Background(), []byte("{}"))
+	require.NoError(t, err)
+
+	var got out
+	require.NoError(t, json.Unmarshal(resultBytes, &got))
+	assert.Equal(t, "video-42", got.Name)
+	assert.Equal(t, 7, got.Code)
+}
+
+func TestHandler_Execute_ErrorOnly_ReturnsNilBytes(t *testing.T) {
+	fn := func(ctx context.Context, in struct{}) error {
+		return nil
+	}
+	h, err := NewHandler(fn)
+	require.NoError(t, err)
+
+	resultBytes, err := h.Execute(context.Background(), []byte("{}"))
+	require.NoError(t, err)
+	assert.Nil(t, resultBytes)
+}
+
+func TestHandler_Execute_TwoReturnValues_ErrorReturnsNilBytes(t *testing.T) {
+	fn := func(ctx context.Context, in struct{}) (string, error) {
+		return "should-be-ignored", errors.New("boom")
+	}
+	h, err := NewHandler(fn)
+	require.NoError(t, err)
+
+	resultBytes, err := h.Execute(context.Background(), []byte("{}"))
+	require.Error(t, err)
+	assert.Nil(t, resultBytes, "result bytes must be nil when handler returns an error")
 }
