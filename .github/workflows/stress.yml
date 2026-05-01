@@ -1,0 +1,26 @@
+name: Stress Tests
+
+on:
+  schedule:
+    - cron: '17 7 * * *'
+  workflow_dispatch:
+
+jobs:
+  stress:
+    name: Stress (SQLite)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Run stress tests
+        run: go test -v -race -timeout=25m -run '^TestStress_' ./tests/...
