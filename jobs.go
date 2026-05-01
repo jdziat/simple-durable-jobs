@@ -26,6 +26,8 @@ package jobs
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"time"
 
 	"gorm.io/gorm"
@@ -214,6 +216,7 @@ var (
 	ErrInvalidQueueName   = core.ErrInvalidQueueName
 	ErrQueueNameTooLong   = core.ErrQueueNameTooLong
 	ErrJobArgsTooLarge    = core.ErrJobArgsTooLarge
+	ErrJobNotCompleted    = core.ErrJobNotCompleted
 	ErrJobNotOwned        = core.ErrJobNotOwned
 	ErrDuplicateJob       = core.ErrDuplicateJob
 	ErrUniqueKeyTooLong   = core.ErrUniqueKeyTooLong
@@ -589,4 +592,37 @@ func IsWaitingError(err error) bool {
 // core.StatusWaiting, which is the actual status the parent job carries.
 func IsSuspendError(err error) bool {
 	return fanout.IsWaitingError(err)
+}
+
+// LoadResult decodes the persisted return value of a completed job into T.
+//
+// Returns:
+//   - core.ErrJobNotCompleted if the job has not reached a terminal state.
+//   - An error wrapping job.LastError if the job failed.
+//   - The zero value of T with nil error if the job completed but the
+//     handler returned only an error (no result value).
+func LoadResult[T any](ctx context.Context, q *Queue, jobID string) (T, error) {
+	var zero T
+	job, err := q.Storage().GetJob(ctx, jobID)
+	if err != nil {
+		return zero, err
+	}
+	if job == nil {
+		return zero, fmt.Errorf("jobs: job not found: %s", jobID)
+	}
+	switch job.Status {
+	case core.StatusCompleted:
+		if job.Result == nil {
+			return zero, nil
+		}
+		var out T
+		if err := json.Unmarshal(job.Result, &out); err != nil {
+			return zero, fmt.Errorf("jobs: failed to decode result: %w", err)
+		}
+		return out, nil
+	case core.StatusFailed:
+		return zero, fmt.Errorf("jobs: job %s failed: %s", jobID, job.LastError)
+	default:
+		return zero, core.ErrJobNotCompleted
+	}
 }
