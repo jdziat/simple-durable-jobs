@@ -123,7 +123,8 @@ func (q *Queue) CallDirect(ctx context.Context, name string, argsJSON []byte) er
 	if !ok {
 		return fmt.Errorf("jobs: no handler registered for %q", name)
 	}
-	return h.Execute(ctx, argsJSON)
+	_, err := h.Execute(ctx, argsJSON)
+	return err
 }
 
 // Enqueue adds a job to the queue. The job type must have a registered handler.
