@@ -41,10 +41,10 @@ func TestDequeue_PostgreSQL_ForUpdateSkipLocked(t *testing.T) {
 
 	// Two goroutines dequeue concurrently — each should get a distinct job.
 	var (
-		mu       sync.Mutex
-		results  []*core.Job
-		errs     []error
-		wg       sync.WaitGroup
+		mu      sync.Mutex
+		results []*core.Job
+		errs    []error
+		wg      sync.WaitGroup
 	)
 
 	for range 2 {
@@ -152,11 +152,11 @@ func TestEnqueueUnique_PostgreSQL_ForUpdate(t *testing.T) {
 	// Run concurrent unique enqueues with the same key — exactly one should succeed.
 	const concurrency = 5
 	var (
-		mu      sync.Mutex
-		successes int
+		mu         sync.Mutex
+		successes  int
 		duplicates int
-		errs      []error
-		wg        sync.WaitGroup
+		errs       []error
+		wg         sync.WaitGroup
 	)
 
 	for range concurrency {

@@ -24,7 +24,7 @@ const (
 
 // PauseJob pauses a specific job by ID.
 // This delegates to Queue.PauseJob so that running jobs have their context
-// cancelled via the running-job registry.
+// cancelled via the running-job registry when PauseModeAggressive is used.
 func PauseJob(ctx context.Context, q *Queue, jobID string, opts ...PauseOption) error {
 	return q.PauseJob(ctx, jobID, opts...)
 }

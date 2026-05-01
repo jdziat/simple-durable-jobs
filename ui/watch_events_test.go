@@ -64,6 +64,7 @@ func TestCoreEventToProto_QueueEvents_NoJobField(t *testing.T) {
 	require.NotNil(t, ev)
 	assert.Nil(t, ev.Job)
 	assert.Equal(t, "queue.paused", ev.Type)
+	assert.Equal(t, "default", ev.Queue)
 }
 
 func TestCoreEventToProto_UnknownEvent_ReturnsNil(t *testing.T) {
@@ -86,8 +87,8 @@ func TestParsePeriod(t *testing.T) {
 		{"1h", 1 * time.Hour},
 		{"24h", 24 * time.Hour},
 		{"7d", 7 * 24 * time.Hour},
-		{"", 1 * time.Hour},         // default
-		{"invalid", 1 * time.Hour},  // default
+		{"", 1 * time.Hour},        // default
+		{"invalid", 1 * time.Hour}, // default
 	}
 
 	for _, tt := range tests {

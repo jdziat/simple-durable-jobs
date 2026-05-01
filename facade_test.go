@@ -2,6 +2,7 @@ package jobs_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -561,4 +562,70 @@ func TestFacadeIsSuspendError_ReturnsFalseForRegularError(t *testing.T) {
 
 func TestFacadeIsSuspendError_ReturnsFalseForNil(t *testing.T) {
 	assert.False(t, jobs.IsSuspendError(nil))
+}
+
+// ---------------------------------------------------------------------------
+// LoadResult[T] tests
+// ---------------------------------------------------------------------------
+
+func TestLoadResult_DecodesCompletedJob(t *testing.T) {
+	q, store := setupTestStorage(t)
+
+	type Video struct {
+		Name string `json:"name"`
+		Sec  int    `json:"sec"`
+	}
+	want := Video{Name: "demo", Sec: 12}
+	resultBytes, err := json.Marshal(want)
+	require.NoError(t, err)
+
+	require.NoError(t, store.Enqueue(context.Background(), &jobs.Job{
+		ID:     "job-ok",
+		Type:   "x",
+		Status: jobs.StatusCompleted,
+		Result: resultBytes,
+	}))
+
+	got, err := jobs.LoadResult[Video](context.Background(), q, "job-ok")
+	require.NoError(t, err)
+	assert.Equal(t, want, got)
+}
+
+func TestLoadResult_NotCompleted(t *testing.T) {
+	q, store := setupTestStorage(t)
+	require.NoError(t, store.Enqueue(context.Background(), &jobs.Job{
+		ID:     "job-pending",
+		Type:   "x",
+		Status: jobs.StatusPending,
+	}))
+
+	_, err := jobs.LoadResult[string](context.Background(), q, "job-pending")
+	require.ErrorIs(t, err, jobs.ErrJobNotCompleted)
+}
+
+func TestLoadResult_FailedJobReturnsError(t *testing.T) {
+	q, store := setupTestStorage(t)
+	require.NoError(t, store.Enqueue(context.Background(), &jobs.Job{
+		ID:        "job-failed",
+		Type:      "x",
+		Status:    jobs.StatusFailed,
+		LastError: "boom",
+	}))
+
+	_, err := jobs.LoadResult[string](context.Background(), q, "job-failed")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "boom")
+}
+
+func TestLoadResult_CompletedWithNilResult(t *testing.T) {
+	q, store := setupTestStorage(t)
+	require.NoError(t, store.Enqueue(context.Background(), &jobs.Job{
+		ID:     "job-no-result",
+		Type:   "x",
+		Status: jobs.StatusCompleted,
+	}))
+
+	got, err := jobs.LoadResult[string](context.Background(), q, "job-no-result")
+	require.NoError(t, err)
+	assert.Equal(t, "", got)
 }

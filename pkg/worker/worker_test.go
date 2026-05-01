@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"sync"
 	"sync/atomic"
@@ -46,6 +47,9 @@ type mockStorage struct {
 	// enqueue tracking
 	enqueueMu    sync.Mutex
 	enqueueCount int64 // incremented on each Enqueue call
+
+	// result tracking
+	savedResults map[string][]byte
 }
 
 func (m *mockStorage) Migrate(_ context.Context) error { return nil }
@@ -196,19 +200,25 @@ func (m *mockStorage) GetWaitingJobsToResume(ctx context.Context) ([]*core.Job, 
 	return nil, nil
 }
 
-func (m *mockStorage) SaveJobResult(_ context.Context, _ string, _ string, _ []byte) error {
+func (m *mockStorage) SaveJobResult(_ context.Context, jobID string, _ string, result []byte) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.savedResults == nil {
+		m.savedResults = map[string][]byte{}
+	}
+	m.savedResults[jobID] = result
 	return nil
 }
 
-func (m *mockStorage) PauseJob(_ context.Context, _ string) error      { return nil }
-func (m *mockStorage) UnpauseJob(_ context.Context, _ string) error    { return nil }
+func (m *mockStorage) PauseJob(_ context.Context, _ string) error   { return nil }
+func (m *mockStorage) UnpauseJob(_ context.Context, _ string) error { return nil }
 func (m *mockStorage) GetPausedJobs(_ context.Context, _ string) ([]*core.Job, error) {
 	return nil, nil
 }
 func (m *mockStorage) IsJobPaused(_ context.Context, _ string) (bool, error) { return false, nil }
-func (m *mockStorage) PauseQueue(_ context.Context, _ string) error           { return nil }
-func (m *mockStorage) UnpauseQueue(_ context.Context, _ string) error         { return nil }
-func (m *mockStorage) GetPausedQueues(_ context.Context) ([]string, error)    { return nil, nil }
+func (m *mockStorage) PauseQueue(_ context.Context, _ string) error          { return nil }
+func (m *mockStorage) UnpauseQueue(_ context.Context, _ string) error        { return nil }
+func (m *mockStorage) GetPausedQueues(_ context.Context) ([]string, error)   { return nil, nil }
 func (m *mockStorage) IsQueuePaused(_ context.Context, _ string) (bool, error) {
 	return false, nil
 }
@@ -477,6 +487,47 @@ func TestWorker_AggressivePauseCancelsRunningJobs(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("job was not cancelled")
 	}
+}
+
+func TestWorker_PauseJobAggressivePreservesCancelledStatus(t *testing.T) {
+	db, _ := gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{
+		Logger: logger.Default.LogMode(logger.Silent),
+	})
+	store := storage.NewGormStorage(db)
+	_ = store.Migrate(context.Background())
+	q := queue.New(store)
+
+	started := make(chan struct{})
+	q.Register("long-job", func(ctx context.Context, args struct{}) error {
+		close(started)
+		<-ctx.Done()
+		return ctx.Err()
+	})
+
+	jobID, err := q.Enqueue(context.Background(), "long-job", struct{}{})
+	require.NoError(t, err)
+
+	w := NewWorker(q, WithPollInterval(50*time.Millisecond))
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	go func() { _ = w.Start(ctx) }()
+
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("job did not start")
+	}
+
+	require.NoError(t, q.PauseJob(context.Background(), jobID, queue.WithPauseMode(core.PauseModeAggressive)))
+
+	require.Eventually(t, func() bool {
+		return w.RunningJobCount() == 0
+	}, 2*time.Second, 25*time.Millisecond)
+
+	job, err := store.GetJob(context.Background(), jobID)
+	require.NoError(t, err)
+	require.NotNil(t, job)
+	assert.Equal(t, core.StatusCancelled, job.Status)
 }
 
 // ---------------------------------------------------------------------------
@@ -1635,7 +1686,7 @@ func TestWorker_HandleError_RetryAfterExhausted(t *testing.T) {
 			Type:       "ra-exhausted",
 			Queue:      "default",
 			Args:       []byte(`{}`),
-			Attempt:    1,  // Attempt < MaxRetries: retry branch is taken
+			Attempt:    1, // Attempt < MaxRetries: retry branch is taken
 			MaxRetries: 3,
 		}, nil
 	}
@@ -2277,4 +2328,64 @@ func TestWorker_CheckFanOutCompletion_FailFastAllDone(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("UpdateFanOutStatus was not called for FailFast all-done path")
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Handler result persistence tests
+// ---------------------------------------------------------------------------
+
+// trackingStorage wraps a real storage and records SaveJobResult calls.
+type trackingStorage struct {
+	core.Storage
+	mu           sync.Mutex
+	savedResults map[string][]byte
+}
+
+func (s *trackingStorage) SaveJobResult(ctx context.Context, jobID string, workerID string, result []byte) error {
+	s.mu.Lock()
+	if s.savedResults == nil {
+		s.savedResults = map[string][]byte{}
+	}
+	s.savedResults[jobID] = result
+	s.mu.Unlock()
+	// Also delegate to the real storage so the job lifecycle isn't broken.
+	return s.Storage.SaveJobResult(ctx, jobID, workerID, result)
+}
+
+func TestWorker_PersistsHandlerResult(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{
+		Logger: logger.Default.LogMode(logger.Silent),
+	})
+	require.NoError(t, err)
+
+	base := storage.NewGormStorage(db)
+	require.NoError(t, base.Migrate(context.Background()))
+
+	store := &trackingStorage{Storage: base}
+	q := queue.New(store)
+	q.Register("make-video", func(ctx context.Context, name string) (map[string]any, error) {
+		return map[string]any{"name": name, "duration_s": 12}, nil
+	})
+
+	jobID, enqErr := q.Enqueue(context.Background(), "make-video", "demo")
+	require.NoError(t, enqErr)
+
+	w := NewWorker(q, WithScheduler(false))
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	go func() { _ = w.Start(ctx) }()
+
+	require.Eventually(t, func() bool {
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		_, ok := store.savedResults[jobID]
+		return ok
+	}, 2*time.Second, 10*time.Millisecond, "handler result must be persisted via SaveJobResult")
+
+	store.mu.Lock()
+	got := store.savedResults[jobID]
+	store.mu.Unlock()
+	var decoded map[string]any
+	require.NoError(t, json.Unmarshal(got, &decoded))
+	assert.Equal(t, "demo", decoded["name"])
 }

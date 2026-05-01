@@ -531,6 +531,7 @@ type Event struct {
 	Type          string                 `protobuf:"bytes,1,opt,name=type,proto3" json:"type,omitempty"`
 	Job           *Job                   `protobuf:"bytes,2,opt,name=job,proto3" json:"job,omitempty"`
 	Timestamp     *timestamppb.Timestamp `protobuf:"bytes,3,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
+	Queue         string                 `protobuf:"bytes,4,opt,name=queue,proto3" json:"queue,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -584,6 +585,13 @@ func (x *Event) GetTimestamp() *timestamppb.Timestamp {
 		return x.Timestamp
 	}
 	return nil
+}
+
+func (x *Event) GetQueue() string {
+	if x != nil {
+		return x.Queue
+	}
+	return ""
 }
 
 type GetStatsRequest struct {
@@ -2561,11 +2569,12 @@ const file_jobs_v1_jobs_proto_rawDesc = "" +
 	"\n" +
 	"created_at\x18\f \x01(\v2\x1a.google.protobuf.TimestampR\tcreatedAt\x129\n" +
 	"\n" +
-	"updated_at\x18\r \x01(\v2\x1a.google.protobuf.TimestampR\tupdatedAt\"u\n" +
+	"updated_at\x18\r \x01(\v2\x1a.google.protobuf.TimestampR\tupdatedAt\"\x8b\x01\n" +
 	"\x05Event\x12\x12\n" +
 	"\x04type\x18\x01 \x01(\tR\x04type\x12\x1e\n" +
 	"\x03job\x18\x02 \x01(\v2\f.jobs.v1.JobR\x03job\x128\n" +
-	"\ttimestamp\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\ttimestamp\"\x11\n" +
+	"\ttimestamp\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\ttimestamp\x12\x14\n" +
+	"\x05queue\x18\x04 \x01(\tR\x05queue\"\x11\n" +
 	"\x0fGetStatsRequest\"\x9f\x02\n" +
 	"\x10GetStatsResponse\x12+\n" +
 	"\x06queues\x18\x01 \x03(\v2\x13.jobs.v1.QueueStatsR\x06queues\x12#\n" +

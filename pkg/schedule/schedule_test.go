@@ -61,7 +61,7 @@ func TestWeekly_NextWeek(t *testing.T) {
 }
 
 func TestWeekly_DifferentDay(t *testing.T) {
-	s := Weekly(time.Friday, 17, 0) // Friday 5 PM
+	s := Weekly(time.Friday, 17, 0)                     // Friday 5 PM
 	from := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC) // Monday
 
 	next := s.Next(from)
@@ -78,7 +78,7 @@ func TestCron(t *testing.T) {
 }
 
 func TestCron_MultipleFields(t *testing.T) {
-	s := Cron("30 14 * * 1-5") // 2:30 PM on weekdays
+	s := Cron("30 14 * * 1-5")                          // 2:30 PM on weekdays
 	from := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC) // Monday
 
 	next := s.Next(from)
@@ -94,8 +94,8 @@ func TestCron_InvalidExpression_Panics(t *testing.T) {
 
 func TestScheduleInterface(t *testing.T) {
 	// All schedule types implement Schedule interface
-	var _ Schedule = Every(time.Minute)   //nolint:staticcheck // interface conformance check
-	var _ Schedule = Daily(9, 0)          //nolint:staticcheck // interface conformance check
+	var _ Schedule = Every(time.Minute)        //nolint:staticcheck // interface conformance check
+	var _ Schedule = Daily(9, 0)               //nolint:staticcheck // interface conformance check
 	var _ Schedule = Weekly(time.Monday, 9, 0) //nolint:staticcheck // interface conformance check
-	var _ Schedule = Cron("* * * * *")   //nolint:staticcheck // interface conformance check
+	var _ Schedule = Cron("* * * * *")         //nolint:staticcheck // interface conformance check
 }

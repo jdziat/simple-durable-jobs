@@ -160,11 +160,11 @@ func TestStartCtxHook_CreatesConsumerSpan(t *testing.T) {
 	hook := startCtxHook(tracer, prop)
 
 	job := &core.Job{
-		ID:       "job-789",
-		Type:     "process-order",
-		Queue:    "orders",
-		Priority: 10,
-		Attempt:  2,
+		ID:           "job-789",
+		Type:         "process-order",
+		Queue:        "orders",
+		Priority:     10,
+		Attempt:      2,
 		TraceContext: traceData,
 	}
 

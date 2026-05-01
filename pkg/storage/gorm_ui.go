@@ -82,7 +82,11 @@ func (s *GormStorage) SearchJobs(ctx context.Context, filter core.JobFilter) ([]
 	}
 	if filter.Search != "" {
 		search := "%" + filter.Search + "%"
-		q = q.Where("id LIKE ? OR CAST(args AS TEXT) LIKE ?", search, search)
+		argsExpr := "CAST(args AS TEXT)"
+		if strings.Contains(strings.ToLower(s.db.Name()), "mysql") {
+			argsExpr = "CONVERT(args USING utf8mb4)"
+		}
+		q = q.Where("id LIKE ? OR "+argsExpr+" LIKE ?", search, search)
 	}
 	if !filter.Since.IsZero() {
 		q = q.Where("created_at >= ?", filter.Since)

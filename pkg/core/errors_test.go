@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestNoRetryError(t *testing.T) {
@@ -54,4 +55,9 @@ func TestPauseErrors(t *testing.T) {
 	assert.Error(t, ErrQueueAlreadyPaused)
 	assert.Error(t, ErrQueueNotPaused)
 	assert.Error(t, ErrCannotPauseStatus)
+}
+
+func TestErrJobNotCompleted_Defined(t *testing.T) {
+	require.Error(t, ErrJobNotCompleted)
+	assert.Contains(t, ErrJobNotCompleted.Error(), "not completed")
 }

@@ -419,6 +419,11 @@ export class Event extends Message<Event> {
    */
   timestamp?: Timestamp;
 
+  /**
+   * @generated from field: string queue = 4;
+   */
+  queue = "";
+
   constructor(data?: PartialMessage<Event>) {
     super();
     proto3.util.initPartial(data, this);
@@ -430,6 +435,7 @@ export class Event extends Message<Event> {
     { no: 1, name: "type", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 2, name: "job", kind: "message", T: Job },
     { no: 3, name: "timestamp", kind: "message", T: Timestamp },
+    { no: 4, name: "queue", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): Event {

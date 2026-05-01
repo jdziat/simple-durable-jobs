@@ -795,6 +795,48 @@ func TestPauseJob_CancelsRunningJob(t *testing.T) {
 	assert.Equal(t, core.StatusCancelled, got.Status)
 	assert.Equal(t, "cancelled by user", got.LastError)
 	assert.NotNil(t, got.CompletedAt)
+	assert.Empty(t, got.LockedBy)
+	assert.Nil(t, got.LockedUntil)
+}
+
+func TestComplete_DoesNotOverwriteCancelledJob(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	job := newTestJob("default", "task.run")
+	require.NoError(t, s.Enqueue(ctx, job))
+
+	_, err := s.Dequeue(ctx, []string{"default"}, "worker-1")
+	require.NoError(t, err)
+	require.NoError(t, s.PauseJob(ctx, job.ID))
+
+	err = s.Complete(ctx, job.ID, "worker-1")
+	require.ErrorIs(t, err, core.ErrJobNotOwned)
+
+	got, err := s.GetJob(ctx, job.ID)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, core.StatusCancelled, got.Status)
+}
+
+func TestFail_DoesNotOverwriteCancelledJob(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	job := newTestJob("default", "task.run")
+	require.NoError(t, s.Enqueue(ctx, job))
+
+	_, err := s.Dequeue(ctx, []string{"default"}, "worker-1")
+	require.NoError(t, err)
+	require.NoError(t, s.PauseJob(ctx, job.ID))
+
+	err = s.Fail(ctx, job.ID, "worker-1", "context canceled", nil)
+	require.ErrorIs(t, err, core.ErrJobNotOwned)
+
+	got, err := s.GetJob(ctx, job.ID)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, core.StatusCancelled, got.Status)
 }
 
 func TestPauseJob_NotFoundReturnsError(t *testing.T) {

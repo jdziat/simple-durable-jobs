@@ -108,7 +108,7 @@ func (*WorkerResumed) eventMarker() {}
 // through the Events() channel without requiring new event types.
 type CustomEvent struct {
 	JobID     string
-	Kind      string         // "progress", "phase_change", "log", etc.
+	Kind      string // "progress", "phase_change", "log", etc.
 	Data      map[string]any
 	Timestamp time.Time
 }

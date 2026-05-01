@@ -188,12 +188,24 @@ subJobs := []jobs.SubJob{
 
 ### `FanOut[T any](ctx context.Context, subJobs []SubJob, opts ...FanOutOption) ([]Result[T], error)`
 
-Spawns sub-jobs in parallel and waits for all results. Must be called from within a job handler.
+Spawns sub-jobs in parallel and waits for all results. Must be called from within a job handler. On first execution FanOut marks the parent job `waiting`, enqueues the sub-jobs, and returns `(nil, *WaitingError)` — the worker treats that signal as "suspend, not fail". When the sub-jobs complete the worker resumes the parent, FanOut replays, detects the completed fan-out via a checkpoint, and returns the collected results.
+
+Sub-jobs receive a deterministic `UniqueKey` of the form `fanout-<fanOutID>-<index>` so a crashed parent can replay without inserting duplicate children.
 
 ```go
 results, err := jobs.FanOut[ProcessedItem](ctx, subJobs, jobs.FailFast())
 if err != nil {
     return err
+}
+```
+
+#### `Result[T]` struct
+
+```go
+type Result[T any] struct {
+    Index int   // Position in the original subJobs slice
+    Value T     // Decoded return value; zero value if Err != nil
+    Err   error // Non-nil when the sub-job failed
 }
 ```
 
@@ -212,6 +224,18 @@ Returns true if all results succeeded.
 ### `SuccessCount[T any](results []Result[T]) int`
 
 Returns the number of successful results.
+
+### `IsWaitingError(err error) bool`
+
+Reports whether `err` is the signal `FanOut` returns to the worker when a parent job has moved into `StatusWaiting` for its sub-jobs. Handlers generally do not need to inspect this — the worker treats it as "suspend, do not fail" automatically.
+
+```go
+if jobs.IsWaitingError(err) {
+    // expected control-flow signal; worker has already suspended the parent
+}
+```
+
+`IsSuspendError` is the prior name and is still exported as a deprecated alias.
 
 ---
 
@@ -233,17 +257,21 @@ Succeeds if at least pct% of sub-jobs complete successfully.
 
 Sets the queue for sub-jobs.
 
+### `WithFanOutPriority(p int) FanOutOption`
+
+Sets the default priority for sub-jobs that do not pin their own via `Sub(...)`. Higher values run first.
+
 ### `WithFanOutRetries(n int) FanOutOption`
 
 Sets the retry count for sub-jobs.
 
 ### `WithFanOutTimeout(d time.Duration) FanOutOption`
 
-Sets timeout for entire fan-out operation.
+Records a deadline on the fan-out record (`TimeoutAt` field on the `FanOut` row) for bookkeeping and observability. **Not automatically enforced** — applications should react to the timeout via their own monitoring or by checking `FanOut.TimeoutAt` before acting on partial results.
 
 ### `CancelOnParentFailure() FanOutOption`
 
-Cancels remaining sub-jobs if parent fails.
+Marks the fan-out so that if the parent job itself enters `failed` before collecting results, the worker cancels any still-pending sub-jobs instead of leaving them to run.
 
 ---
 
@@ -252,8 +280,10 @@ Cancels remaining sub-jobs if parent fails.
 ### Job-Level Pause
 
 ```go
-// Via queue (emits events, handles running jobs)
+// Via queue (emits events)
+// Default graceful mode pauses pending or waiting jobs.
 queue.PauseJob(ctx, jobID)
+// Aggressive mode cancels running jobs.
 queue.PauseJob(ctx, jobID, jobs.WithPauseMode(jobs.PauseModeAggressive))
 queue.ResumeJob(ctx, jobID)
 paused, err := queue.IsJobPaused(ctx, jobID)
@@ -320,7 +350,21 @@ Assigns the job to a specific queue.
 
 ### `Unique(key string) Option`
 
-Ensures only one job with this key exists.
+Ensures only one pending-or-running job with this `key` exists. If a matching job already exists, `Queue.Enqueue` returns `ErrDuplicateJob`. The uniqueness check runs inside a transaction with row-level locking on Postgres/MySQL and relies on SQLite's writer serialization. The key has no TTL — the guard releases as soon as the existing job reaches `completed`, `failed`, or `cancelled`.
+
+### `Timeout(d time.Duration) Option`
+
+Records a per-job timeout on the job record. The value is surfaced on the job metadata and in events — applications should enforce it via the handler's `context.Context` or external monitoring; the queue does not cancel handlers automatically.
+
+### `Determinism(mode DeterminismMode) Option`
+
+Controls how strictly a handler's non-deterministic actions are policed on replay of a checkpointed workflow. Exported modes:
+
+| Mode | Behavior |
+|---|---|
+| `ExplicitCheckpoints` *(default)* | Only values wrapped in `Call()` / `SavePhaseCheckpoint()` are persisted; direct side effects are the handler's responsibility. |
+| `Strict` | Replay panics if a new `Call()` invocation appears that was not present in the checkpoint history — useful for catching accidental non-determinism. |
+| `BestEffort` | Extra calls on replay are tolerated; the engine re-executes them and captures new checkpoints. |
 
 ---
 
@@ -344,11 +388,11 @@ Sets how often the worker polls for new jobs.
 
 ### `WithStorageRetry(config RetryConfig) WorkerOption`
 
-Configures retry behavior for storage operations.
+Configures retry behavior for storage operations. See [Storage Retry]({{< relref "advanced/storage-retry" >}}) for when and why.
 
 ### `WithDequeueRetry(config RetryConfig) WorkerOption`
 
-Configures retry behavior specifically for dequeue operations. When the database is temporarily unavailable, this prevents tight-loop polling.
+Configures retry behavior specifically for dequeue operations. When the database is temporarily unavailable, this prevents tight-loop polling. Kept separate from `WithStorageRetry` because dequeue failures are the hottest path and benefit from more aggressive backoff than one-off writes; see [Storage Retry]({{< relref "advanced/storage-retry" >}}).
 
 ### `WithRetryAttempts(attempts int) WorkerOption`
 
@@ -360,11 +404,21 @@ Disables retry for both storage and dequeue operations.
 
 ### `WithStaleLockInterval(d time.Duration) WorkerOption`
 
-Sets how often the worker checks for stale running jobs. Default is 5 minutes. Set to 0 to disable.
+Sets how often the worker checks for stale running jobs. Default is 5 minutes. Set to 0 to disable. See [Stale Lock Reaper]({{< relref "advanced/stale-lock-reaper" >}}) for the full story.
 
 ### `WithStaleLockAge(d time.Duration) WorkerOption`
 
 Sets how long a lock must be expired before the job is reclaimed. Default is 45 minutes.
+
+### `worker.WithLockDuration(d time.Duration) WorkerOption`
+
+Overrides the per-dequeue lock duration (default: 45 minutes). Useful when your jobs routinely run longer than the default lock window and the built-in heartbeat is not enough. Currently exposed via the `pkg/worker` subpackage rather than the root facade:
+
+```go
+import "github.com/jdziat/simple-durable-jobs/pkg/worker"
+
+w := queue.NewWorker(worker.WithLockDuration(2 * time.Hour))
+```
 
 ---
 
@@ -417,7 +471,7 @@ const (
     StatusCompleted JobStatus = "completed"
     StatusFailed    JobStatus = "failed"
     StatusRetrying  JobStatus = "retrying"
-    StatusWaiting   JobStatus = "waiting"    // Suspended waiting for sub-jobs
+    StatusWaiting   JobStatus = "waiting"    // Parent waiting for fan-out sub-jobs
     StatusCancelled JobStatus = "cancelled"  // Terminated before completion
     StatusPaused    JobStatus = "paused"     // Paused by user
 )
@@ -429,6 +483,41 @@ const (
 const (
     PauseModeGraceful   // Let running jobs finish
     PauseModeAggressive // Cancel running jobs immediately
+)
+```
+
+### `SubJobFailure`
+
+Populated on `FanOutError.Failures` when a fan-out returns with at least one failed sub-job.
+
+```go
+type SubJobFailure struct {
+    Index   int    // Position in the original subJobs slice
+    JobID   string // Sub-job ID; useful for cross-referencing logs and events
+    Error   string // Last error message reported by the sub-job
+    Attempt int    // Attempt number that produced Error
+}
+```
+
+### Error Variables
+
+Sentinel errors exported from the `jobs` package. Compare with `errors.Is`:
+
+```go
+var (
+    ErrInvalidJobTypeName error // Job type name failed validation
+    ErrJobTypeNameTooLong error
+    ErrInvalidQueueName   error
+    ErrQueueNameTooLong   error
+    ErrJobArgsTooLarge    error // Marshalled args exceed MaxJobArgsSize
+    ErrJobNotOwned        error // Complete/Fail called by a worker that does not hold the lock
+    ErrDuplicateJob       error // Unique()-keyed job already pending/running
+    ErrUniqueKeyTooLong   error
+    ErrJobAlreadyPaused   error
+    ErrJobNotPaused       error
+    ErrQueueAlreadyPaused error
+    ErrQueueNotPaused     error
+    ErrCannotPauseStatus  error // Attempted to pause a job in an incompatible status
 )
 ```
 
@@ -474,19 +563,82 @@ Emits a custom ephemeral event (not persisted).
 
 ### Event Types
 
+Every event implements the `Event` interface. Type-switch on the pointer type in your subscriber loop; each payload's fields are listed below.
+
 ```go
-*JobStarted   // Job began processing
-*JobCompleted // Job finished successfully
-*JobFailed    // Job failed permanently
-*JobRetrying  // Job being retried
-*JobPaused    // Job was paused
-*JobResumed   // Job was resumed
-*QueuePaused  // Queue was paused
-*QueueResumed // Queue was resumed
-*WorkerPaused // Worker was paused
-*WorkerResumed // Worker was resumed
-*CheckpointSaved // Checkpoint was saved
-*CustomEvent  // Custom ephemeral event
+// Lifecycle
+type JobStarted struct {
+    Job       *Job
+    Timestamp time.Time
+}
+
+type JobCompleted struct {
+    Job       *Job
+    Duration  time.Duration
+    Timestamp time.Time
+}
+
+type JobFailed struct {
+    Job       *Job
+    Error     error
+    Timestamp time.Time
+}
+
+type JobRetrying struct {
+    Job       *Job
+    Attempt   int
+    Error     error
+    NextRunAt time.Time
+    Timestamp time.Time
+}
+
+type CheckpointSaved struct {
+    JobID     string
+    CallIndex int
+    CallType  string  // e.g. "call", "fanout", "phase"
+    Timestamp time.Time
+}
+
+// Pause / resume
+type JobPaused struct {
+    Job       *Job
+    Mode      PauseMode
+    Timestamp time.Time
+}
+
+type JobResumed struct {
+    Job       *Job
+    Timestamp time.Time
+}
+
+type QueuePaused struct {
+    Queue     string
+    Timestamp time.Time
+}
+
+type QueueResumed struct {
+    Queue     string
+    Timestamp time.Time
+}
+
+type WorkerPaused struct {
+    WorkerID  string
+    Mode      PauseMode
+    Timestamp time.Time
+}
+
+type WorkerResumed struct {
+    WorkerID  string
+    Timestamp time.Time
+}
+
+// Ephemeral / custom
+type CustomEvent struct {
+    JobID     string
+    Kind      string         // "progress", "phase_change", "log", …
+    Data      map[string]any
+    Timestamp time.Time
+}
 ```
 
 ---
@@ -496,6 +648,10 @@ Emits a custom ephemeral event (not persisted).
 ### `(*Queue) OnJobStart(fn func(context.Context, *Job))`
 
 Registers a callback for when a job starts processing.
+
+### `(*Queue) OnJobStartCtx(fn func(context.Context, *Job) context.Context)`
+
+Registers a context-transforming callback that runs when a job starts. The returned `context.Context` is threaded into the handler, so hooks can attach values (OTel spans, tenant IDs, correlation IDs, …) that downstream code reads out of the context. This is the hook the built-in OTel instrumentation (`pkg/otel.Instrument`) uses to re-attach the enqueue-time trace span to the worker-side handler.
 
 ### `(*Queue) OnJobComplete(fn func(context.Context, *Job))`
 
@@ -520,6 +676,36 @@ Wraps an error to indicate the job should not be retried.
 ### `RetryAfter(d time.Duration, err error) error`
 
 Wraps an error to indicate the job should be retried after a specific duration.
+
+---
+
+## OpenTelemetry Tracing
+
+### `otel.Instrument(q *Queue, opts ...otel.Option)`
+
+Imports:
+
+```go
+import jobsotel "github.com/jdziat/simple-durable-jobs/pkg/otel"
+```
+
+Attaches tracing to a queue with no hand-rolled hook wiring. By default the instrumentation uses the global `TracerProvider`; pass `jobsotel.WithTracerProvider(tp)` to override.
+
+```go
+jobsotel.Instrument(queue) // uses otel.GetTracerProvider()
+// or
+jobsotel.Instrument(queue, jobsotel.WithTracerProvider(tp))
+```
+
+Spans emitted:
+
+| Span | When |
+|---|---|
+| `job.enqueue` | `Queue.Enqueue` — producer span; trace context is persisted on the job so the consumer picks it up. |
+| `job.process {type}` | Worker handler execution — child of `job.enqueue`. |
+| `job.retry` | Span event added to `job.process` when a job is retried. |
+
+Every span carries `job.id`, `job.type`, `job.queue`, `job.attempt`, and `job.priority` attributes.
 
 ---
 

@@ -195,9 +195,12 @@ if jobs.AllSucceeded(results) {
 Pause and resume at three levels: individual jobs, entire queues, or workers.
 
 ```go
-// Pause/resume a specific job
+// Pause/resume a pending or waiting job
 queue.PauseJob(ctx, jobID)
 queue.ResumeJob(ctx, jobID)
+
+// Cancel a running job
+queue.PauseJob(ctx, jobID, jobs.WithPauseMode(jobs.PauseModeAggressive))
 
 // Pause/resume an entire queue (stops dequeuing)
 queue.PauseQueue(ctx, "emails")
@@ -263,11 +266,14 @@ worker := queue.NewWorker(jobs.WithScheduler(true))
 
 ```go
 queue.Enqueue(ctx, "task", args,
-    jobs.Priority(100),              // Higher priority runs first
-    jobs.Retries(5),                 // Max retry attempts
-    jobs.Delay(10 * time.Second),    // Delay execution
-    jobs.QueueOpt("critical"),       // Assign to named queue
-    jobs.Unique("order-123"),        // Deduplicate by key
+    jobs.Priority(100),                   // Higher priority runs first
+    jobs.Retries(5),                      // Max retry attempts
+    jobs.Delay(10 * time.Second),         // Delay execution
+    jobs.At(scheduledAt),                 // Run at a specific time
+    jobs.Timeout(30 * time.Minute),       // Recorded on the job; enforce via ctx
+    jobs.QueueOpt("critical"),            // Assign to named queue
+    jobs.Unique("order-123"),             // Deduplicate by key; ErrDuplicateJob if taken
+    jobs.Determinism(jobs.Strict),        // Policy for Call() replay on restart
 )
 ```
 

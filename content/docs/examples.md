@@ -552,7 +552,7 @@ cancelled := worker.CancelJob(jobID)
 queue.PauseQueue(ctx, "emails")
 queue.ResumeQueue(ctx, "emails")
 
-// Pause/resume individual jobs
+// Pause/resume pending or waiting jobs
 queue.PauseJob(ctx, jobID)
 queue.ResumeJob(ctx, jobID)
 ```
