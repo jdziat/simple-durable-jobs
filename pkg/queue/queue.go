@@ -275,7 +275,11 @@ func (q *Queue) Storage() core.Storage {
 }
 
 // LoadStatus returns the current status of a job by ID.
-// Returns an error if the job cannot be found.
+//
+// Returns:
+//   - The job's current status if found.
+//   - An error formatted as "jobs: job not found: <id>" if no row matches the ID.
+//   - The underlying storage error (unwrapped) if GetJob itself fails.
 func (q *Queue) LoadStatus(ctx context.Context, jobID string) (core.JobStatus, error) {
 	job, err := q.storage.GetJob(ctx, jobID)
 	if err != nil {

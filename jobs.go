@@ -597,10 +597,11 @@ func IsSuspendError(err error) bool {
 // LoadResult decodes the persisted return value of a completed job into T.
 //
 // Returns:
-//   - core.ErrJobNotCompleted if the job has not reached a terminal state.
-//   - An error wrapping job.LastError if the job failed.
+//   - ErrJobNotCompleted if the job has not reached a terminal state.
+//   - An error containing job.LastError if the job failed.
 //   - The zero value of T with nil error if the job completed but the
 //     handler returned only an error (no result value).
+//   - An error wrapping the JSON decode failure if Result cannot be unmarshaled into T.
 func LoadResult[T any](ctx context.Context, q *Queue, jobID string) (T, error) {
 	var zero T
 	job, err := q.Storage().GetJob(ctx, jobID)
