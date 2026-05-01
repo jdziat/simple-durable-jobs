@@ -1086,3 +1086,22 @@ func TestQueue_IsQueuePaused_InvalidQueueName_ReturnsError(t *testing.T) {
 	_, err := q.IsQueuePaused(ctx, "")
 	assert.Error(t, err)
 }
+
+func TestQueue_LoadStatus_ReturnsJobStatus(t *testing.T) {
+	store := newMockStorage()
+	q := New(store)
+
+	store.jobs["job-1"] = &core.Job{ID: "job-1", Status: core.StatusCompleted}
+
+	status, err := q.LoadStatus(context.Background(), "job-1")
+	require.NoError(t, err)
+	assert.Equal(t, core.StatusCompleted, status)
+}
+
+func TestQueue_LoadStatus_UnknownJob(t *testing.T) {
+	store := newMockStorage()
+	q := New(store)
+
+	_, err := q.LoadStatus(context.Background(), "missing")
+	require.Error(t, err)
+}

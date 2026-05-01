@@ -274,6 +274,19 @@ func (q *Queue) Storage() core.Storage {
 	return q.storage
 }
 
+// LoadStatus returns the current status of a job by ID.
+// Returns an error if the job cannot be found.
+func (q *Queue) LoadStatus(ctx context.Context, jobID string) (core.JobStatus, error) {
+	job, err := q.storage.GetJob(ctx, jobID)
+	if err != nil {
+		return "", err
+	}
+	if job == nil {
+		return "", fmt.Errorf("jobs: job not found: %s", jobID)
+	}
+	return job.Status, nil
+}
+
 // SetDeterminism sets the default determinism mode.
 func (q *Queue) SetDeterminism(mode DeterminismMode) {
 	q.determinism = mode
