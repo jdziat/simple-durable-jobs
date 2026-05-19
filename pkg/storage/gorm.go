@@ -872,15 +872,30 @@ func (s *GormStorage) ResumeJob(ctx context.Context, jobID string) (bool, error)
 }
 
 // GetWaitingJobsToResume finds waiting jobs whose fan-out is complete.
+//
+// Subtle: a parent that does sequential fan-outs (e.g. a workflow that
+// dispatches fan_out #1, suspends, resumes, dispatches fan_out #2, suspends
+// again) has multiple rows in fan_outs. The old query joined any
+// completed/failed fan-out without checking whether a later fan-out was
+// still pending — so once fan_out #1 finished, the polling fallback would
+// keep returning the parent every tick and ResumeJob would spuriously
+// pull the parent off its #2 wait, replay the workflow, and re-suspend.
+// The NOT EXISTS guard restricts the result to parents that have at least
+// one terminated fan-out AND no pending fan-outs. DISTINCT keeps the
+// result one-row-per-parent when there are multiple terminated fan-outs.
 func (s *GormStorage) GetWaitingJobsToResume(ctx context.Context) ([]*core.Job, error) {
 	var jobs []*core.Job
-	// Find waiting jobs where their fan-out is complete
 	err := s.db.WithContext(ctx).Raw(`
-		SELECT j.* FROM jobs j
+		SELECT DISTINCT j.* FROM jobs j
 		INNER JOIN fan_outs f ON j.id = f.parent_job_id
 		WHERE j.status = ?
 		AND f.status IN (?, ?)
-	`, core.StatusWaiting, core.FanOutCompleted, core.FanOutFailed).Scan(&jobs).Error
+		AND NOT EXISTS (
+			SELECT 1 FROM fan_outs f2
+			WHERE f2.parent_job_id = j.id
+			AND f2.status = ?
+		)
+	`, core.StatusWaiting, core.FanOutCompleted, core.FanOutFailed, core.FanOutPending).Scan(&jobs).Error
 	return jobs, err
 }
 

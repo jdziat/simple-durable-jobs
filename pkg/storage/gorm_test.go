@@ -1654,6 +1654,70 @@ func TestGetWaitingJobsToResume_DoesNotReturnPendingFanOut(t *testing.T) {
 	assert.Empty(t, waiting)
 }
 
+// TestGetWaitingJobsToResume_SkipsParentsWithPendingFanOuts is the regression
+// guard for the sequential-fan-out bug. A workflow that dispatches phase 1,
+// suspends, resumes, dispatches phase 2, suspends again has two rows in
+// fan_outs: #1 completed, #2 pending. The polling fallback must NOT resume
+// the parent — phase 2 is still running. Before the fix, the INNER JOIN
+// matched fan_out #1 alone and woke the parent every poll tick, causing the
+// workflow to spin and re-enter the phase loop forever while phase 2's child
+// quietly tried to make progress underneath. After the fix, the NOT EXISTS
+// guard requires every fan-out for the parent to have terminated.
+func TestGetWaitingJobsToResume_SkipsParentsWithPendingFanOuts(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	parent := newTestJob("default", "workflow.run")
+	require.NoError(t, s.Enqueue(ctx, parent))
+
+	got, err := s.Dequeue(ctx, []string{"default"}, "worker-1")
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	require.NoError(t, s.SuspendJob(ctx, got.ID, "worker-1"))
+
+	// Sequential fan-outs: phase 1 done, phase 2 still running.
+	fanOut1 := &core.FanOut{ParentJobID: parent.ID, TotalCount: 1, Status: core.FanOutCompleted}
+	require.NoError(t, s.CreateFanOut(ctx, fanOut1))
+	fanOut2 := &core.FanOut{ParentJobID: parent.ID, TotalCount: 1, Status: core.FanOutPending}
+	require.NoError(t, s.CreateFanOut(ctx, fanOut2))
+
+	waiting, err := s.GetWaitingJobsToResume(ctx)
+	require.NoError(t, err)
+	assert.Empty(t, waiting, "parent must not be eligible to resume while a later fan-out is still pending")
+}
+
+// TestGetWaitingJobsToResume_DeduplicatesParentsWithMultipleTerminatedFanOuts
+// guards against the parent appearing multiple times in the result when it
+// has more than one completed/failed fan-out (e.g. a workflow that ran phase
+// 1 and phase 2 successfully and is now waiting on phase 3). DISTINCT in the
+// query keeps the row count honest.
+func TestGetWaitingJobsToResume_DeduplicatesParentsWithMultipleTerminatedFanOuts(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	parent := newTestJob("default", "workflow.run")
+	require.NoError(t, s.Enqueue(ctx, parent))
+
+	got, err := s.Dequeue(ctx, []string{"default"}, "worker-1")
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	require.NoError(t, s.SuspendJob(ctx, got.ID, "worker-1"))
+
+	// Three terminated fan-outs, no pending — parent should appear once.
+	for _, status := range []core.FanOutStatus{core.FanOutCompleted, core.FanOutCompleted, core.FanOutFailed} {
+		require.NoError(t, s.CreateFanOut(ctx, &core.FanOut{
+			ParentJobID: parent.ID,
+			TotalCount:  1,
+			Status:      status,
+		}))
+	}
+
+	waiting, err := s.GetWaitingJobsToResume(ctx)
+	require.NoError(t, err)
+	require.Len(t, waiting, 1)
+	assert.Equal(t, parent.ID, waiting[0].ID)
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // EnqueueBatch — additional edge cases
 // ──────────────────────────────────────────────────────────────────────────────
