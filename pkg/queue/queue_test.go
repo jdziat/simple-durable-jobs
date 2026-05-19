@@ -84,8 +84,8 @@ func (m *mockStorage) Heartbeat(ctx context.Context, jobID, workerID string) err
 	return nil
 }
 
-func (m *mockStorage) ReleaseStaleLocks(ctx context.Context, staleDuration time.Duration) (int64, error) {
-	return 0, nil
+func (m *mockStorage) ReleaseStaleLocks(ctx context.Context, staleDuration time.Duration) ([]string, error) {
+	return nil, nil
 }
 
 func (m *mockStorage) GetJobsByStatus(ctx context.Context, status core.JobStatus, limit int) ([]*core.Job, error) {
@@ -136,8 +136,8 @@ func (m *mockStorage) GetSubJobResults(ctx context.Context, fanOutID string) ([]
 	return nil, nil
 }
 
-func (m *mockStorage) CancelSubJobs(ctx context.Context, fanOutID string) (int64, error) {
-	return 0, nil
+func (m *mockStorage) CancelSubJobs(ctx context.Context, fanOutID string) ([]string, error) {
+	return nil, nil
 }
 
 func (m *mockStorage) CancelSubJob(ctx context.Context, jobID string) (*core.FanOut, error) {

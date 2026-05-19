@@ -495,18 +495,39 @@ func (s *GormStorage) Heartbeat(ctx context.Context, jobID string, workerID stri
 }
 
 // ReleaseStaleLocks releases locks on jobs that haven't had a heartbeat.
-func (s *GormStorage) ReleaseStaleLocks(ctx context.Context, staleDuration time.Duration) (int64, error) {
+// Returns the IDs of the jobs whose locks were released so the caller can
+// cancel any local in-flight handlers — see core.Storage.ReleaseStaleLocks
+// for the rationale.
+func (s *GormStorage) ReleaseStaleLocks(ctx context.Context, staleDuration time.Duration) ([]string, error) {
 	cutoff := time.Now().Add(-staleDuration)
-	result := s.db.WithContext(ctx).
-		Model(&core.Job{}).
-		Where("status = ?", core.StatusRunning).
-		Where("locked_until < ?", cutoff).
-		Updates(map[string]any{
-			"status":       core.StatusPending,
-			"locked_by":    nil,
-			"locked_until": nil,
-		})
-	return result.RowsAffected, result.Error
+
+	// Two-step: first capture the IDs of stale jobs, then update them in
+	// the same transaction so the reader and the writer agree. RETURNING
+	// would let us do this in one statement but isn't portable across all
+	// GORM drivers, so we do it the long way.
+	var released []string
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Model(&core.Job{}).
+			Where("status = ?", core.StatusRunning).
+			Where("locked_until < ?", cutoff).
+			Pluck("id", &released).Error; err != nil {
+			return err
+		}
+		if len(released) == 0 {
+			return nil
+		}
+		return tx.Model(&core.Job{}).
+			Where("id IN ?", released).
+			Updates(map[string]any{
+				"status":       core.StatusPending,
+				"locked_by":    nil,
+				"locked_until": nil,
+			}).Error
+	})
+	if err != nil {
+		return nil, err
+	}
+	return released, nil
 }
 
 // GetJob retrieves a job by ID.
@@ -735,34 +756,45 @@ func (s *GormStorage) GetSubJobResults(ctx context.Context, fanOutID string) ([]
 }
 
 // CancelSubJobs cancels pending/running sub-jobs for a fan-out.
-// Updates the fan-out's cancelled_count to reflect the number of cancelled jobs.
-func (s *GormStorage) CancelSubJobs(ctx context.Context, fanOutID string) (int64, error) {
-	var rowsAffected int64
+// Updates the fan-out's cancelled_count to reflect the number of cancelled
+// jobs and returns the IDs of the cancelled sub-jobs so the caller can
+// cancel any local in-flight handlers — see core.Storage.CancelSubJobs
+// for the rationale.
+func (s *GormStorage) CancelSubJobs(ctx context.Context, fanOutID string) ([]string, error) {
+	var cancelled []string
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		result := tx.
-			Model(&core.Job{}).
+		// Capture the IDs of sub-jobs we're about to cancel. Done before
+		// the UPDATE so we get the in-flight set, not just rows that
+		// happen to remain pending after the update.
+		if err := tx.Model(&core.Job{}).
 			Where("fan_out_id = ? AND status IN ?", fanOutID, []core.JobStatus{core.StatusPending, core.StatusRunning}).
+			Pluck("id", &cancelled).Error; err != nil {
+			return err
+		}
+		if len(cancelled) == 0 {
+			return nil
+		}
+
+		now := time.Now()
+		if err := tx.Model(&core.Job{}).
+			Where("id IN ?", cancelled).
 			Updates(map[string]any{
 				"status":     core.StatusCancelled,
-				"updated_at": time.Now(),
-			})
-		if result.Error != nil {
-			return result.Error
+				"updated_at": now,
+			}).Error; err != nil {
+			return err
 		}
-		rowsAffected = result.RowsAffected
 
-		// Update the fan-out's cancelled count to match
-		if rowsAffected > 0 {
-			if err := tx.Exec(
-				"UPDATE fan_outs SET cancelled_count = cancelled_count + ?, updated_at = ? WHERE id = ?",
-				rowsAffected, time.Now(), fanOutID,
-			).Error; err != nil {
-				return err
-			}
-		}
-		return nil
+		// Update the fan-out's cancelled count to match.
+		return tx.Exec(
+			"UPDATE fan_outs SET cancelled_count = cancelled_count + ?, updated_at = ? WHERE id = ?",
+			len(cancelled), now, fanOutID,
+		).Error
 	})
-	return rowsAffected, err
+	if err != nil {
+		return nil, err
+	}
+	return cancelled, nil
 }
 
 // CancelSubJob cancels a single sub-job and updates its fan-out's cancelled count.

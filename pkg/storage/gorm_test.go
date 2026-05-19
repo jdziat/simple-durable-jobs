@@ -544,16 +544,17 @@ func TestReleaseStaleLocks_ResetsExpiredRunningJobsToPending(t *testing.T) {
 		Update("locked_until", past).Error
 	require.NoError(t, err)
 
-	count, err := s.ReleaseStaleLocks(ctx, 1*time.Hour)
+	released, err := s.ReleaseStaleLocks(ctx, 1*time.Hour)
 	require.NoError(t, err)
-	assert.Equal(t, int64(1), count)
+	require.Len(t, released, 1, "should report the released job's ID")
+	assert.Equal(t, got.ID, released[0])
 
-	released, err := s.GetJob(ctx, got.ID)
+	row, err := s.GetJob(ctx, got.ID)
 	require.NoError(t, err)
-	require.NotNil(t, released)
-	assert.Equal(t, core.StatusPending, released.Status)
-	assert.Empty(t, released.LockedBy)
-	assert.Nil(t, released.LockedUntil)
+	require.NotNil(t, row)
+	assert.Equal(t, core.StatusPending, row.Status)
+	assert.Empty(t, row.LockedBy)
+	assert.Nil(t, row.LockedUntil)
 }
 
 func TestReleaseStaleLocks_DoesNotTouchFreshLocks(t *testing.T) {
@@ -567,9 +568,9 @@ func TestReleaseStaleLocks_DoesNotTouchFreshLocks(t *testing.T) {
 	require.NotNil(t, got)
 
 	// staleDuration is 2 hours – fresh lock of 45 min should not be affected
-	count, err := s.ReleaseStaleLocks(ctx, 2*time.Hour)
+	released, err := s.ReleaseStaleLocks(ctx, 2*time.Hour)
 	require.NoError(t, err)
-	assert.Equal(t, int64(0), count)
+	assert.Empty(t, released, "fresh locks should not be released")
 
 	still, err := s.GetJob(ctx, got.ID)
 	require.NoError(t, err)
@@ -1551,9 +1552,16 @@ func TestCancelSubJobs_CancelsPendingSubJobs(t *testing.T) {
 	}
 	require.NoError(t, s.EnqueueBatch(ctx, subs))
 
-	cancelled, err := s.CancelSubJobs(ctx, fanOut.ID)
+	cancelledIDs, err := s.CancelSubJobs(ctx, fanOut.ID)
 	require.NoError(t, err)
-	assert.Equal(t, int64(3), cancelled)
+	assert.Len(t, cancelledIDs, 3, "should return all three sub-job IDs")
+	gotIDs := map[string]bool{}
+	for _, id := range cancelledIDs {
+		gotIDs[id] = true
+	}
+	for _, sub := range subs {
+		assert.True(t, gotIDs[sub.ID], "cancelledIDs missing sub %s", sub.ID)
+	}
 
 	for _, sub := range subs {
 		got, err := s.GetJob(ctx, sub.ID)
@@ -1890,7 +1898,7 @@ func TestCancelSubJobs_NoSubJobsReturnsZero(t *testing.T) {
 	// No sub-jobs were actually created for this fan-out.
 	cancelled, err := s.CancelSubJobs(ctx, fanOut.ID)
 	require.NoError(t, err)
-	assert.Equal(t, int64(0), cancelled)
+	assert.Empty(t, cancelled)
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -2163,7 +2171,7 @@ func TestCancelSubJobs_CancelsMultiplePending(t *testing.T) {
 
 	cancelled, err := s.CancelSubJobs(ctx, "fo-multi")
 	require.NoError(t, err)
-	assert.Equal(t, int64(3), cancelled)
+	assert.Len(t, cancelled, 3)
 
 	// Verify fan-out cancelled_count was updated.
 	updated, err := s.GetFanOut(ctx, "fo-multi")

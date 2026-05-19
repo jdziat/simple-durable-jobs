@@ -644,10 +644,30 @@ func (w *Worker) completeFanOut(ctx context.Context, fo *core.FanOut, status cor
 		return nil
 	}
 
-	// Cancel remaining sub-jobs if needed
+	// Cancel remaining sub-jobs if needed. CancelSubJobs only updates the
+	// DB rows — to actually stop the in-flight handlers we have to cancel
+	// their contexts via w.CancelJob (one entry per local sub-job in the
+	// runningJobs map). Sub-jobs running on OTHER workers in the fleet
+	// won't see this signal directly; they'll notice via their heartbeat
+	// returning ErrJobNotOwned and abandon after the configured threshold
+	// (see runHeartbeat).
 	if status == core.FanOutFailed && fo.CancelOnFail {
-		if _, err := w.queue.Storage().CancelSubJobs(ctx, fo.ID); err != nil {
+		cancelledIDs, err := w.queue.Storage().CancelSubJobs(ctx, fo.ID)
+		if err != nil {
 			w.logger.Error("failed to cancel sub-jobs", "fan_out_id", fo.ID, "error", err)
+		} else {
+			cancelledLocally := 0
+			for _, jobID := range cancelledIDs {
+				if w.CancelJob(jobID) {
+					cancelledLocally++
+				}
+			}
+			if cancelledLocally > 0 {
+				w.logger.Info("cancelled in-flight sub-job handlers on this worker",
+					"fan_out_id", fo.ID,
+					"cancelled_locally", cancelledLocally,
+					"cancelled_total", len(cancelledIDs))
+			}
 		}
 	}
 
@@ -786,9 +806,25 @@ func (w *Worker) reapStaleLocks(ctx context.Context) {
 				}
 				continue
 			}
-			if released > 0 {
-				w.logger.Info("released stale running jobs", "count", released)
+			if len(released) == 0 {
+				continue
 			}
+
+			// Cancel any local in-flight handlers for jobs whose locks
+			// were just released. The DB-level release already reverted
+			// the lock fields; without this loop the original handler
+			// would keep running until its own heartbeat-abandon timer
+			// fires (~6 minutes by default). This brings the local
+			// cancel latency down to "next heartbeat tick."
+			cancelledLocally := 0
+			for _, jobID := range released {
+				if w.CancelJob(jobID) {
+					cancelledLocally++
+				}
+			}
+			w.logger.Info("released stale running jobs",
+				"count", len(released),
+				"cancelled_locally", cancelledLocally)
 		}
 	}
 }

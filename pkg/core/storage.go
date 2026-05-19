@@ -34,7 +34,13 @@ type Storage interface {
 
 	// Locking
 	Heartbeat(ctx context.Context, jobID string, workerID string) error
-	ReleaseStaleLocks(ctx context.Context, staleDuration time.Duration) (int64, error)
+	// ReleaseStaleLocks releases locks on jobs whose heartbeat is older than
+	// staleDuration and returns the IDs of the jobs that were reclaimed. The
+	// caller can use those IDs to cancel in-flight handler contexts on the
+	// local worker — without this, an orphaned handler keeps running until
+	// its own heartbeat sees ErrJobNotOwned and times out (a slow path
+	// added in the heartbeat-abandon fix).
+	ReleaseStaleLocks(ctx context.Context, staleDuration time.Duration) (releasedJobIDs []string, err error)
 
 	// Queries
 	GetJob(ctx context.Context, jobID string) (*Job, error)
@@ -53,7 +59,14 @@ type Storage interface {
 	EnqueueBatch(ctx context.Context, jobs []*Job) error
 	GetSubJobs(ctx context.Context, fanOutID string) ([]*Job, error)
 	GetSubJobResults(ctx context.Context, fanOutID string) ([]*Job, error)
-	CancelSubJobs(ctx context.Context, fanOutID string) (int64, error)
+	// CancelSubJobs marks all pending/running sub-jobs for a fan-out as
+	// cancelled and returns the IDs of the jobs that were cancelled. The
+	// caller is expected to invoke worker.CancelJob (or the cross-worker
+	// equivalent) for each returned ID so in-flight handler contexts get
+	// cancelled, not just the DB row. Without this, an in-flight sub-job
+	// continues executing even after its fan-out has been marked failed —
+	// observed in production on 2026-05-19.
+	CancelSubJobs(ctx context.Context, fanOutID string) (cancelledJobIDs []string, err error)
 	CancelSubJob(ctx context.Context, jobID string) (*FanOut, error)
 
 	// Waiting job operations

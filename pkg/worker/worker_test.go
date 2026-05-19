@@ -27,7 +27,7 @@ type mockStorage struct {
 	mu sync.Mutex
 
 	releaseCount    int64         // number of ReleaseStaleLocks calls
-	releasedCount   int64         // value returned by ReleaseStaleLocks
+	releasedIDs     []string      // IDs returned by ReleaseStaleLocks
 	releaseErr      error         // error returned by ReleaseStaleLocks
 	releaseDelay    time.Duration // optional artificial delay per call
 	dequeueFunc     func(ctx context.Context, queues []string, workerID string) (*core.Job, error)
@@ -42,7 +42,7 @@ type mockStorage struct {
 	incrementFailedFunc    func(ctx context.Context, fanOutID string) (*core.FanOut, error)
 	updateFanOutStatusFunc func(ctx context.Context, fanOutID string, status core.FanOutStatus) (bool, error)
 	resumeJobFunc          func(ctx context.Context, jobID string) (bool, error)
-	cancelSubJobsFunc      func(ctx context.Context, fanOutID string) (int64, error)
+	cancelSubJobsFunc      func(ctx context.Context, fanOutID string) ([]string, error)
 
 	// enqueue tracking
 	enqueueMu    sync.Mutex
@@ -112,14 +112,14 @@ func (m *mockStorage) Heartbeat(ctx context.Context, jobID string, workerID stri
 	return nil
 }
 
-func (m *mockStorage) ReleaseStaleLocks(_ context.Context, _ time.Duration) (int64, error) {
+func (m *mockStorage) ReleaseStaleLocks(_ context.Context, _ time.Duration) ([]string, error) {
 	if m.releaseDelay > 0 {
 		time.Sleep(m.releaseDelay)
 	}
 	m.mu.Lock()
 	m.releaseCount++
 	m.mu.Unlock()
-	return m.releasedCount, m.releaseErr
+	return m.releasedIDs, m.releaseErr
 }
 
 func (m *mockStorage) GetJob(_ context.Context, _ string) (*core.Job, error) { return nil, nil }
@@ -173,11 +173,11 @@ func (m *mockStorage) GetSubJobResults(_ context.Context, _ string) ([]*core.Job
 	return nil, nil
 }
 
-func (m *mockStorage) CancelSubJobs(ctx context.Context, fanOutID string) (int64, error) {
+func (m *mockStorage) CancelSubJobs(ctx context.Context, fanOutID string) ([]string, error) {
 	if m.cancelSubJobsFunc != nil {
 		return m.cancelSubJobsFunc(ctx, fanOutID)
 	}
-	return 0, nil
+	return nil, nil
 }
 
 func (m *mockStorage) CancelSubJob(_ context.Context, _ string) (*core.FanOut, error) {
@@ -741,7 +741,7 @@ func TestRetryWithBackoff_DisableRetryFailsImmediately(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestWorker_StaleLockReaperCallsReleaseStaleLocks(t *testing.T) {
-	mock := &mockStorage{releasedCount: 0, releaseErr: nil}
+	mock := &mockStorage{releasedIDs: nil, releaseErr: nil}
 	q := queue.New(mock)
 
 	// Use a very short interval so the reaper fires quickly.
@@ -1225,7 +1225,7 @@ func TestWorker_QueuesWithCapacity_MissingCounterTreatedAsAvailable(t *testing.T
 
 func TestWorker_StaleLockReaper_ErrorPathContinues(t *testing.T) {
 	mock := &mockStorage{
-		releasedCount: 0,
+		releasedIDs: nil,
 		releaseErr:    errors.New("db unavailable"),
 	}
 	q := queue.New(mock)
@@ -1247,7 +1247,7 @@ func TestWorker_StaleLockReaper_ErrorPathContinues(t *testing.T) {
 
 func TestWorker_StaleLockReaper_LogsWhenJobsReleased(t *testing.T) {
 	mock := &mockStorage{
-		releasedCount: 3, // pretend 3 jobs were released
+		releasedIDs: []string{"job-a","job-b","job-c"}, // pretend 3 jobs were released
 		releaseErr:    nil,
 	}
 	q := queue.New(mock)
@@ -2153,9 +2153,9 @@ func TestWorker_CompleteFanOut_CancelOnFailCancelsSubJobs(t *testing.T) {
 		resumeJobFunc: func(_ context.Context, _ string) (bool, error) {
 			return true, nil
 		},
-		cancelSubJobsFunc: func(_ context.Context, fanOutID string) (int64, error) {
+		cancelSubJobsFunc: func(_ context.Context, fanOutID string) ([]string, error) {
 			cancelSubJobsCalled <- fanOutID
-			return 2, nil
+			return []string{"sub-1", "sub-2"}, nil
 		},
 	}
 	q := queue.New(mock)
@@ -2551,4 +2551,89 @@ func TestRunHeartbeat_SuccessResetsCounter(t *testing.T) {
 	}
 
 	<-done
+}
+
+// TestCompleteFanOut_CancelsLocalSubJobHandlers verifies the fix for the
+// 2026-05-19 production observation: when a fan-out fails with
+// CancelOnFail=true, the in-flight sub-job handlers running on this worker
+// must have their contexts cancelled. The old code only updated DB rows,
+// leaving the handler goroutines running for as long as it took their own
+// heartbeats to notice they'd been reclaimed.
+func TestCompleteFanOut_CancelsLocalSubJobHandlers(t *testing.T) {
+	mock := &mockStorage{}
+	mock.cancelSubJobsFunc = func(_ context.Context, fanOutID string) ([]string, error) {
+		return []string{"sub-a", "sub-b", "sub-c"}, nil
+	}
+	mock.updateFanOutStatusFunc = func(_ context.Context, _ string, _ core.FanOutStatus) (bool, error) {
+		return true, nil
+	}
+	mock.resumeJobFunc = func(_ context.Context, _ string) (bool, error) {
+		return true, nil
+	}
+
+	q := queue.New(mock)
+	w := NewWorker(q, DisableRetry())
+
+	// Pre-populate the runningJobs map with the local sub-jobs.
+	cancelCalls := make(map[string]int)
+	for _, id := range []string{"sub-a", "sub-b"} {
+		id := id
+		w.runningJobsMu.Lock()
+		w.runningJobs[id] = func() { cancelCalls[id]++ }
+		w.runningJobsMu.Unlock()
+	}
+	// sub-c is intentionally NOT in this worker's runningJobs — it's
+	// "running on another worker." Cancellation for cross-worker
+	// sub-jobs goes through the heartbeat-abandon path instead.
+
+	fo := &core.FanOut{
+		ID:           "fo-test",
+		ParentJobID:  "parent-1",
+		CancelOnFail: true,
+	}
+
+	err := w.completeFanOut(context.Background(), fo, core.FanOutFailed)
+	require.NoError(t, err)
+
+	assert.Equal(t, 1, cancelCalls["sub-a"], "local sub-a context should have been cancelled exactly once")
+	assert.Equal(t, 1, cancelCalls["sub-b"], "local sub-b context should have been cancelled exactly once")
+	_, hasC := cancelCalls["sub-c"]
+	assert.False(t, hasC, "sub-c was not in this worker's runningJobs; should not have been cancelled locally")
+}
+
+// TestReapStaleLocks_CancelsLocalHandlersOfReleasedJobs verifies that when
+// the stale-lock reaper releases locks on jobs whose heartbeats are dead,
+// any local in-flight handlers for those jobs also get their contexts
+// cancelled — instead of running forever until their own heartbeat
+// abandons (which can be 6+ minutes).
+func TestReapStaleLocks_CancelsLocalHandlersOfReleasedJobs(t *testing.T) {
+	mock := &mockStorage{}
+	mock.releasedIDs = []string{"orphan-1", "orphan-2"}
+
+	q := queue.New(mock)
+	w := NewWorker(q,
+		DisableRetry(),
+		WithStaleLockInterval(10*time.Millisecond),
+	)
+
+	cancelled := make(map[string]int)
+	for _, id := range []string{"orphan-1", "orphan-2"} {
+		id := id
+		w.runningJobsMu.Lock()
+		w.runningJobs[id] = func() { cancelled[id]++ }
+		w.runningJobsMu.Unlock()
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go w.reapStaleLocks(ctx)
+
+	// Give the reaper a couple of ticks.
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+
+	w.runningJobsMu.Lock()
+	defer w.runningJobsMu.Unlock()
+	assert.GreaterOrEqual(t, cancelled["orphan-1"], 1, "orphan-1 should have been cancelled")
+	assert.GreaterOrEqual(t, cancelled["orphan-2"], 1, "orphan-2 should have been cancelled")
 }
