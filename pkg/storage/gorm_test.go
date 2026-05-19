@@ -2974,3 +2974,92 @@ func TestEnqueueBatch_ConcurrentUniqueKey_NoDuplicates(t *testing.T) {
 			"UniqueKey %q has %d rows; concurrent EnqueueBatch produced duplicates", k, byKey[k])
 	}
 }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// FindOrphanedJobs
+// ──────────────────────────────────────────────────────────────────────────────
+
+// TestFindOrphanedJobs_FlagsReclaimedAndCancelled is the storage-level
+// contract test for the cross-worker cancellation feature. The audit
+// query must return IDs of jobs whose DB state indicates the caller no
+// longer owns them:
+//   - locked_by changed (reclaimed by another worker)
+//   - locked_by IS NULL (stale-lock reaper released)
+//   - status terminal (cancelled by a fan-out or completed by a replay)
+// and must NOT return jobs still legitimately owned by the caller.
+func TestFindOrphanedJobs_FlagsReclaimedAndCancelled(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	// Seed four jobs in different states. We'll claim the first two from
+	// worker-A's perspective and check the audit.
+	for i := 0; i < 4; i++ {
+		require.NoError(t, s.Enqueue(ctx, newTestJob("default", "t")))
+	}
+
+	// worker-A dequeues 2 jobs.
+	jobA, err := s.Dequeue(ctx, []string{"default"}, "worker-A")
+	require.NoError(t, err)
+	require.NotNil(t, jobA)
+	jobB, err := s.Dequeue(ctx, []string{"default"}, "worker-A")
+	require.NoError(t, err)
+	require.NotNil(t, jobB)
+	jobC, err := s.Dequeue(ctx, []string{"default"}, "worker-A")
+	require.NoError(t, err)
+	require.NotNil(t, jobC)
+	jobD, err := s.Dequeue(ctx, []string{"default"}, "worker-A")
+	require.NoError(t, err)
+	require.NotNil(t, jobD)
+
+	// jobA: still owned by worker-A → not orphaned.
+	// jobB: stolen by worker-B.
+	require.NoError(t, s.db.Model(&core.Job{}).
+		Where("id = ?", jobB.ID).
+		Update("locked_by", "worker-B").Error)
+	// jobC: lock released to nil (stale-lock reaper).
+	require.NoError(t, s.db.Model(&core.Job{}).
+		Where("id = ?", jobC.ID).
+		Updates(map[string]any{"locked_by": nil, "status": core.StatusPending}).Error)
+	// jobD: cancelled by a fan-out.
+	require.NoError(t, s.db.Model(&core.Job{}).
+		Where("id = ?", jobD.ID).
+		Update("status", core.StatusCancelled).Error)
+
+	orphaned, err := s.FindOrphanedJobs(ctx, []string{jobA.ID, jobB.ID, jobC.ID, jobD.ID}, "worker-A")
+	require.NoError(t, err)
+
+	// Convert to set for order-independent assertion.
+	got := map[string]bool{}
+	for _, id := range orphaned {
+		got[id] = true
+	}
+	assert.False(t, got[jobA.ID], "jobA is still owned, should not be orphaned")
+	assert.True(t, got[jobB.ID], "jobB was stolen, should be orphaned")
+	assert.True(t, got[jobC.ID], "jobC's lock was released, should be orphaned")
+	assert.True(t, got[jobD.ID], "jobD was cancelled, should be orphaned")
+}
+
+func TestFindOrphanedJobs_EmptyInputReturnsEmpty(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	orphaned, err := s.FindOrphanedJobs(ctx, nil, "worker-A")
+	require.NoError(t, err)
+	assert.Empty(t, orphaned)
+
+	orphaned, err = s.FindOrphanedJobs(ctx, []string{}, "worker-A")
+	require.NoError(t, err)
+	assert.Empty(t, orphaned)
+}
+
+func TestFindOrphanedJobs_UnknownIDsAreNotReturned(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	// Asking about IDs that don't exist must not cause errors and must
+	// not return those IDs (they're not in the DB, so not technically
+	// orphaned — they're just non-existent).
+	orphaned, err := s.FindOrphanedJobs(ctx, []string{"does-not-exist-1", "does-not-exist-2"}, "worker-A")
+	require.NoError(t, err)
+	assert.Empty(t, orphaned)
+}

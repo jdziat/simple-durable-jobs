@@ -59,6 +59,10 @@ func (m *mockStorage) Heartbeat(_ context.Context, _, _ string) error { return n
 func (m *mockStorage) ReleaseStaleLocks(_ context.Context, _ time.Duration) ([]string, error) {
 	return nil, nil
 }
+
+func (m *mockStorage) FindOrphanedJobs(_ context.Context, _ []string, _ string) ([]string, error) {
+	return nil, nil
+}
 func (m *mockStorage) CreateFanOut(_ context.Context, _ *core.FanOut) error        { return nil }
 func (m *mockStorage) GetFanOut(_ context.Context, _ string) (*core.FanOut, error) { return nil, nil }
 func (m *mockStorage) IncrementFanOutCompleted(_ context.Context, _ string) (*core.FanOut, error) {

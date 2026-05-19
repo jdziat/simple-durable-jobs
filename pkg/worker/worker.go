@@ -106,6 +106,12 @@ func NewWorker(q *queue.Queue, opts ...WorkerOption) *Worker {
 		queueRunning[name] = &atomic.Int32{}
 	}
 
+	// Default OwnershipAuditInterval to 5s if unset (zero is honored as
+	// "disabled" via the option helper; the NewWorker default is enabled).
+	if config.OwnershipAuditInterval == 0 {
+		config.OwnershipAuditInterval = 5 * time.Second
+	}
+
 	return &Worker{
 		queue:             q,
 		config:            config,
@@ -139,6 +145,14 @@ func (w *Worker) Start(ctx context.Context) error {
 	// Start stale lock reaper to reclaim stuck running jobs
 	if w.config.StaleLockInterval > 0 {
 		go w.reapStaleLocks(ctx)
+	}
+
+	// Start ownership audit to cancel local handlers for jobs cancelled
+	// or reclaimed by other workers. Same-worker cancellation is handled
+	// directly by completeFanOut/reapStaleLocks; this is the cross-worker
+	// counterpart.
+	if w.config.OwnershipAuditInterval > 0 {
+		go w.runOwnershipAudit(ctx)
 	}
 
 	for i := 0; i < totalConcurrency; i++ {
@@ -825,6 +839,69 @@ func (w *Worker) reapStaleLocks(ctx context.Context) {
 			w.logger.Info("released stale running jobs",
 				"count", len(released),
 				"cancelled_locally", cancelledLocally)
+		}
+	}
+}
+
+// runOwnershipAudit periodically checks whether any of this worker's
+// running jobs have been cancelled or reclaimed by another worker, and
+// cancels the corresponding local handler context. This is the
+// cross-worker counterpart of the cancellation logic in completeFanOut
+// and reapStaleLocks (which only see local sub-jobs).
+//
+// The query cost is one row per running job per tick — bounded by THIS
+// worker's concurrency, not by the size of the fleet.
+//
+// A grace window protects newly-acquired jobs from being mis-flagged
+// during the brief gap between Dequeue (which sets locked_by) and the
+// audit's read. In practice GORM's WithContext().First() commits the
+// update before returning, so the gap is sub-microsecond and a grace
+// window isn't strictly needed — but the snapshot-then-query pattern
+// below makes a transient inconsistency vanish on the next tick anyway.
+func (w *Worker) runOwnershipAudit(ctx context.Context) {
+	ticker := time.NewTicker(w.config.OwnershipAuditInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			// Snapshot the IDs we think we own. Holding the mutex during
+			// the DB call would block dequeue/complete; copy and release.
+			w.runningJobsMu.Lock()
+			ids := make([]string, 0, len(w.runningJobs))
+			for id := range w.runningJobs {
+				ids = append(ids, id)
+			}
+			w.runningJobsMu.Unlock()
+			if len(ids) == 0 {
+				continue
+			}
+
+			orphaned, err := w.queue.Storage().FindOrphanedJobs(ctx, ids, w.config.WorkerID)
+			if err != nil {
+				if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+					w.logger.Warn("ownership audit query failed", "error", err)
+				}
+				continue
+			}
+			if len(orphaned) == 0 {
+				continue
+			}
+
+			cancelled := 0
+			for _, id := range orphaned {
+				if w.CancelJob(id) {
+					cancelled++
+				}
+			}
+			if cancelled > 0 {
+				w.logger.Warn("ownership audit cancelled orphaned local handlers",
+					"orphaned_count", len(orphaned),
+					"cancelled_count", cancelled,
+					"audit_interval", w.config.OwnershipAuditInterval)
+			}
 		}
 	}
 }

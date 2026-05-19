@@ -41,6 +41,19 @@ type WorkerConfig struct {
 	// it is reclaimed (reset to pending). Default: 45 minutes (matches lock duration).
 	StaleLockAge time.Duration
 
+	// OwnershipAuditInterval is how often the worker checks whether any of
+	// its in-flight jobs have been cancelled (e.g. by a fan-out failure on
+	// another worker) or reclaimed (e.g. by a stale-lock reaper running on
+	// another worker). Any orphaned local handler has its context cancelled.
+	// This is the cross-worker counterpart of the same-worker cancellation
+	// that completeFanOut and reapStaleLocks do directly.
+	//
+	// Default: 5 seconds. Set to 0 to disable. Lower values reduce the
+	// cancellation latency for distributed fan-out failures but increase DB
+	// query rate; the query is bounded by len(runningJobs), so the cost
+	// scales with concurrency, not fleet size.
+	OwnershipAuditInterval time.Duration
+
 	// LockDuration is how long a job is locked when dequeued or heartbeated.
 	// Default: 45 minutes. If non-zero, the worker will configure the storage
 	// backend with this duration at startup.
@@ -155,5 +168,18 @@ func WithStaleLockAge(d time.Duration) WorkerOption {
 func WithLockDuration(d time.Duration) WorkerOption {
 	return workerOptionFunc(func(c *WorkerConfig) {
 		c.LockDuration = d
+	})
+}
+
+// WithOwnershipAuditInterval sets how often the worker checks whether its
+// in-flight jobs have been cancelled or reclaimed by another worker.
+// Default is 5 seconds. Set to 0 to disable.
+//
+// Lower values reduce cross-worker cancellation latency but increase the DB
+// query rate. The query cost scales with this worker's concurrency
+// (len(runningJobs)), not with fleet size.
+func WithOwnershipAuditInterval(d time.Duration) WorkerOption {
+	return workerOptionFunc(func(c *WorkerConfig) {
+		c.OwnershipAuditInterval = d
 	})
 }

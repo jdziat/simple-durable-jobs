@@ -81,6 +81,9 @@ func (s *minimalStorage) Heartbeat(ctx context.Context, jobID, workerID string) 
 func (s *minimalStorage) ReleaseStaleLocks(ctx context.Context, d time.Duration) ([]string, error) {
 	return nil, nil
 }
+func (s *minimalStorage) FindOrphanedJobs(ctx context.Context, jobIDs []string, workerID string) ([]string, error) {
+	return nil, nil
+}
 func (s *minimalStorage) GetJobsByStatus(ctx context.Context, status core.JobStatus, limit int) ([]*core.Job, error) {
 	return nil, nil
 }

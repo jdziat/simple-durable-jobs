@@ -43,6 +43,7 @@ type mockStorage struct {
 	updateFanOutStatusFunc func(ctx context.Context, fanOutID string, status core.FanOutStatus) (bool, error)
 	resumeJobFunc          func(ctx context.Context, jobID string) (bool, error)
 	cancelSubJobsFunc      func(ctx context.Context, fanOutID string) ([]string, error)
+	findOrphanedFunc       func(jobIDs []string) ([]string, error)
 
 	// enqueue tracking
 	enqueueMu    sync.Mutex
@@ -120,6 +121,13 @@ func (m *mockStorage) ReleaseStaleLocks(_ context.Context, _ time.Duration) ([]s
 	m.releaseCount++
 	m.mu.Unlock()
 	return m.releasedIDs, m.releaseErr
+}
+
+func (m *mockStorage) FindOrphanedJobs(_ context.Context, jobIDs []string, _ string) ([]string, error) {
+	if m.findOrphanedFunc != nil {
+		return m.findOrphanedFunc(jobIDs)
+	}
+	return nil, nil
 }
 
 func (m *mockStorage) GetJob(_ context.Context, _ string) (*core.Job, error) { return nil, nil }
@@ -2636,4 +2644,113 @@ func TestReapStaleLocks_CancelsLocalHandlersOfReleasedJobs(t *testing.T) {
 	defer w.runningJobsMu.Unlock()
 	assert.GreaterOrEqual(t, cancelled["orphan-1"], 1, "orphan-1 should have been cancelled")
 	assert.GreaterOrEqual(t, cancelled["orphan-2"], 1, "orphan-2 should have been cancelled")
+}
+
+// ---------------------------------------------------------------------------
+// runOwnershipAudit cross-worker cancellation tests
+// ---------------------------------------------------------------------------
+
+// TestOwnershipAudit_CancelsOrphanedLocalHandlers verifies the cross-worker
+// case: when another worker cancels or reclaims one of our running jobs,
+// the audit goroutine detects it via FindOrphanedJobs and cancels the
+// local handler context.
+//
+// Direct simulation: register two "running" jobs in this worker's map,
+// have the mock return one of them as orphaned, and confirm only THAT
+// one's context is cancelled.
+func TestOwnershipAudit_CancelsOrphanedLocalHandlers(t *testing.T) {
+	mock := &mockStorage{}
+	mock.findOrphanedFunc = func(jobIDs []string) ([]string, error) {
+		// "job-mine" is still ours; "job-stolen" is orphaned.
+		for _, id := range jobIDs {
+			if id == "job-stolen" {
+				return []string{"job-stolen"}, nil
+			}
+		}
+		return nil, nil
+	}
+
+	q := queue.New(mock)
+	w := NewWorker(q,
+		DisableRetry(),
+		WithOwnershipAuditInterval(10*time.Millisecond),
+	)
+
+	mineCancelled, stolenCancelled := 0, 0
+	w.runningJobsMu.Lock()
+	w.runningJobs["job-mine"] = func() { mineCancelled++ }
+	w.runningJobs["job-stolen"] = func() { stolenCancelled++ }
+	w.runningJobsMu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go w.runOwnershipAudit(ctx)
+
+	// Give the audit a couple of ticks.
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+
+	assert.GreaterOrEqual(t, stolenCancelled, 1, "stolen job's context should have been cancelled")
+	assert.Equal(t, 0, mineCancelled, "still-owned job's context must not have been touched")
+}
+
+// TestOwnershipAudit_NoOpWhenNoOrphans confirms the audit doesn't gratuitously
+// cancel anything when FindOrphanedJobs returns empty. Defense against a
+// regression that would falsely flag healthy jobs and shred the running set.
+func TestOwnershipAudit_NoOpWhenNoOrphans(t *testing.T) {
+	mock := &mockStorage{}
+	var auditCalls atomic.Int32
+	mock.findOrphanedFunc = func(_ []string) ([]string, error) {
+		auditCalls.Add(1)
+		return nil, nil
+	}
+
+	q := queue.New(mock)
+	w := NewWorker(q,
+		DisableRetry(),
+		WithOwnershipAuditInterval(5*time.Millisecond),
+	)
+
+	cancelled := 0
+	w.runningJobsMu.Lock()
+	w.runningJobs["healthy-1"] = func() { cancelled++ }
+	w.runningJobs["healthy-2"] = func() { cancelled++ }
+	w.runningJobsMu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go w.runOwnershipAudit(ctx)
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+
+	assert.GreaterOrEqual(t, auditCalls.Load(), int32(3), "audit should have run several times")
+	assert.Equal(t, 0, cancelled, "no orphans → no cancellations")
+}
+
+// TestOwnershipAudit_SkipsQueryWhenNoRunningJobs is the cheapest-tick test:
+// when the worker has nothing in flight, the audit must not query at all.
+// Important for fleet-wide DB load when most workers are idle.
+func TestOwnershipAudit_SkipsQueryWhenNoRunningJobs(t *testing.T) {
+	mock := &mockStorage{}
+	var queries atomic.Int32
+	mock.findOrphanedFunc = func(_ []string) ([]string, error) {
+		queries.Add(1)
+		return nil, nil
+	}
+
+	q := queue.New(mock)
+	w := NewWorker(q,
+		DisableRetry(),
+		WithOwnershipAuditInterval(5*time.Millisecond),
+	)
+	// runningJobs is empty.
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go w.runOwnershipAudit(ctx)
+	time.Sleep(40 * time.Millisecond)
+	cancel()
+
+	assert.Equal(t, int32(0), queries.Load(),
+		"audit must not call FindOrphanedJobs when runningJobs is empty")
 }

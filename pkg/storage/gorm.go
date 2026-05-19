@@ -494,6 +494,40 @@ func (s *GormStorage) Heartbeat(ctx context.Context, jobID string, workerID stri
 	return nil
 }
 
+// FindOrphanedJobs returns the IDs from the input slice whose DB row
+// indicates the caller no longer owns the job. See core.Storage.FindOrphanedJobs
+// for the protocol — this is the implementation.
+//
+// A job is considered orphaned to workerID when ANY of these is true:
+//   - locked_by != workerID  (another worker took the lock)
+//   - locked_by IS NULL      (lock was released, no new owner)
+//   - status IN ('cancelled','completed','failed')  (job is done by some path)
+//
+// Returns an empty slice (not nil) when no jobs are orphaned, so callers
+// can len()-test without nil-checking.
+func (s *GormStorage) FindOrphanedJobs(ctx context.Context, jobIDs []string, workerID string) ([]string, error) {
+	if len(jobIDs) == 0 {
+		return []string{}, nil
+	}
+	var orphaned []string
+	err := s.db.WithContext(ctx).
+		Model(&core.Job{}).
+		Where("id IN ?", jobIDs).
+		Where(
+			s.db.Where("locked_by IS NULL").
+				Or("locked_by != ?", workerID).
+				Or("status IN ?", []core.JobStatus{core.StatusCancelled, core.StatusCompleted, core.StatusFailed}),
+		).
+		Pluck("id", &orphaned).Error
+	if err != nil {
+		return nil, err
+	}
+	if orphaned == nil {
+		orphaned = []string{}
+	}
+	return orphaned, nil
+}
+
 // ReleaseStaleLocks releases locks on jobs that haven't had a heartbeat.
 // Returns the IDs of the jobs whose locks were released so the caller can
 // cancel any local in-flight handlers — see core.Storage.ReleaseStaleLocks

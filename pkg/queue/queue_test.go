@@ -88,6 +88,10 @@ func (m *mockStorage) ReleaseStaleLocks(ctx context.Context, staleDuration time.
 	return nil, nil
 }
 
+func (m *mockStorage) FindOrphanedJobs(ctx context.Context, jobIDs []string, workerID string) ([]string, error) {
+	return nil, nil
+}
+
 func (m *mockStorage) GetJobsByStatus(ctx context.Context, status core.JobStatus, limit int) ([]*core.Job, error) {
 	return nil, nil
 }

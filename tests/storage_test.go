@@ -479,9 +479,9 @@ func TestGormStorage_ReleaseStaleLocks(t *testing.T) {
 	require.NotNil(t, dequeued)
 
 	// Release stale locks with a very long duration (nothing should be released)
-	count, err := store.ReleaseStaleLocks(ctx, 10*time.Minute)
+	released, err := store.ReleaseStaleLocks(ctx, 10*time.Minute)
 	require.NoError(t, err)
-	assert.Equal(t, int64(0), count)
+	assert.Empty(t, released)
 
 	// The job should still be running
 	updated, _ := store.GetJob(ctx, job.ID)

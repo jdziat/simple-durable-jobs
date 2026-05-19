@@ -556,7 +556,7 @@ func TestCall_ResumesAfterWorkerKilled(t *testing.T) {
 	// Use negative duration to force release all locks (locked_until < now + 1 hour)
 	released, err := store.ReleaseStaleLocks(context.Background(), -time.Hour)
 	require.NoError(t, err)
-	t.Logf("Released %d stale locks", released)
+	t.Logf("Released %d stale locks: %v", len(released), released)
 
 	// Start second worker to resume the job
 	ctx2, cancel2 := context.WithTimeout(context.Background(), 10*time.Second)
