@@ -38,6 +38,13 @@ type Worker struct {
 	queueRunning map[string]*atomic.Int32 // queue name -> active count
 	queueJobID   map[string]string        // job ID -> queue name (for decrement on completion)
 	queueJobIDMu sync.Mutex
+
+	// heartbeatInterval is the tick rate for runHeartbeat. Defaults to
+	// 2 minutes; tests override with a sub-second value. Not exposed via
+	// WorkerConfig because changing it in production would change lock
+	// contention semantics — the 2-minute default is paired with the
+	// 45-minute lock expiry assumed elsewhere.
+	heartbeatInterval time.Duration
 }
 
 // NewWorker creates a new worker for the given queue.
@@ -100,12 +107,13 @@ func NewWorker(q *queue.Queue, opts ...WorkerOption) *Worker {
 	}
 
 	return &Worker{
-		queue:        q,
-		config:       config,
-		logger:       slog.Default(),
-		runningJobs:  make(map[string]context.CancelFunc),
-		queueRunning: queueRunning,
-		queueJobID:   make(map[string]string),
+		queue:             q,
+		config:            config,
+		logger:            slog.Default(),
+		runningJobs:       make(map[string]context.CancelFunc),
+		queueRunning:      queueRunning,
+		queueJobID:        make(map[string]string),
+		heartbeatInterval: 2 * time.Minute,
 	}
 }
 
@@ -339,12 +347,50 @@ func (w *Worker) completeWithRetry(ctx context.Context, jobID string) error {
 	})
 }
 
+// orphanHeartbeatThreshold is the number of consecutive Heartbeat calls
+// returning ErrJobNotOwned that runHeartbeat will tolerate before
+// concluding the job has been reclaimed by another worker (via stale-lock
+// recovery) and cancelling the in-flight handler.
+//
+// Set to 3 so a transient ownership blip — e.g. a clock skew between the
+// worker and the DB at the moment of a lock-renewal race — doesn't kill
+// a legitimate run. With a 2-minute tick, 3 consecutive failures = 6
+// minutes of confirmed orphaning, which is well past any normal lock
+// contention window.
+const orphanHeartbeatThreshold = 3
+
 // runHeartbeat periodically extends the job lock during execution.
 // This prevents long-running jobs from being reclaimed as stale.
+//
+// If the heartbeat repeatedly receives core.ErrJobNotOwned, the handler
+// is presumed orphaned (the stale-lock reaper at line 708 has released
+// the lock and another worker has picked the job up). In that case
+// runHeartbeat cancels the handler's context via CancelJob and returns,
+// so:
+//  1. The handler stops doing wasted work against a job it doesn't own.
+//  2. The "heartbeat failed after retries / jobs: job not owned by this
+//     worker" log line stops repeating forever — observed in production
+//     on 2026-05-19 firing every ~2 minutes for HOURS after the job
+//     was reclaimed.
+//  3. Activities the orphaned handler had spawned in goroutines (e.g.
+//     FireAndForgetNotification) stop racing the new handler's state
+//     transitions.
+//
+// Non-ownership errors (DB unreachable, retry exhaustion on a transient
+// error) are logged but don't trip the counter — those are operational
+// issues to fix elsewhere, not orphaning.
 func (w *Worker) runHeartbeat(ctx context.Context, job *core.Job) {
-	// Heartbeat every 2 minutes (lock is 45 minutes, so plenty of buffer)
-	ticker := time.NewTicker(2 * time.Minute)
+	// Heartbeat every 2 minutes (lock is 45 minutes, so plenty of buffer).
+	// Tests override w.heartbeatInterval directly to drive the loop at
+	// sub-second speed.
+	interval := w.heartbeatInterval
+	if interval <= 0 {
+		interval = 2 * time.Minute
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+
+	var consecutiveOrphanErrs int
 
 	for {
 		select {
@@ -359,10 +405,29 @@ func (w *Worker) runHeartbeat(ctx context.Context, job *core.Job) {
 			err := retryWithBackoff(ctx, *w.config.StorageRetry, func() error {
 				return w.queue.Storage().Heartbeat(ctx, job.ID, w.config.WorkerID)
 			})
-			if err != nil {
-				w.logger.Warn("heartbeat failed after retries", "job_id", job.ID, "error", err)
-			} else {
+			switch {
+			case err == nil:
+				consecutiveOrphanErrs = 0
 				w.logger.Debug("heartbeat sent", "job_id", job.ID)
+			case errors.Is(err, core.ErrJobNotOwned):
+				consecutiveOrphanErrs++
+				w.logger.Warn("heartbeat failed: job not owned by this worker",
+					"job_id", job.ID,
+					"consecutive_orphan_errs", consecutiveOrphanErrs,
+					"threshold", orphanHeartbeatThreshold)
+				if consecutiveOrphanErrs >= orphanHeartbeatThreshold {
+					w.logger.Error("heartbeat abandoning orphaned job — cancelling handler",
+						"job_id", job.ID,
+						"consecutive_orphan_errs", consecutiveOrphanErrs)
+					w.CancelJob(job.ID)
+					return
+				}
+			default:
+				// Some other error (DB down, retry exhaustion on a transient
+				// failure, etc.). Log but don't trip the orphan counter — these
+				// are operational concerns, not ownership transfer.
+				consecutiveOrphanErrs = 0
+				w.logger.Warn("heartbeat failed after retries", "job_id", job.ID, "error", err)
 			}
 		}
 	}

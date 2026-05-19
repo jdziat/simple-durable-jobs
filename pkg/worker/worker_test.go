@@ -2389,3 +2389,166 @@ func TestWorker_PersistsHandlerResult(t *testing.T) {
 	require.NoError(t, json.Unmarshal(got, &decoded))
 	assert.Equal(t, "demo", decoded["name"])
 }
+
+// ---------------------------------------------------------------------------
+// runHeartbeat orphan-abandonment tests
+// ---------------------------------------------------------------------------
+
+// TestRunHeartbeat_AbandonsOrphanedJob is the regression for the 2026-05-19
+// production observation: a stale-lock reaper reclaimed two jobs from the
+// running worker, but the worker's heartbeat goroutines kept logging
+// "jobs: job not owned by this worker" every 2 minutes for HOURS, while
+// the orphaned handler goroutines continued doing work against jobs they
+// no longer owned. The fix: after orphanHeartbeatThreshold consecutive
+// ErrJobNotOwned responses, the heartbeat cancels the handler's context
+// via CancelJob and exits.
+func TestRunHeartbeat_AbandonsOrphanedJob(t *testing.T) {
+	mock := &mockStorage{}
+	var heartbeatCalls atomic.Int32
+	mock.heartbeatFunc = func(_ context.Context, _ string, _ string) error {
+		heartbeatCalls.Add(1)
+		return core.ErrJobNotOwned
+	}
+
+	q := queue.New(mock)
+	w := NewWorker(q, DisableRetry())
+	w.heartbeatInterval = 10 * time.Millisecond // drive the loop fast
+
+	// Register a fake running-job context so CancelJob has something to cancel.
+	jobCtx, jobCancel := context.WithCancel(context.Background())
+	defer jobCancel()
+	w.runningJobsMu.Lock()
+	w.runningJobs["test-job-id"] = jobCancel
+	w.runningJobsMu.Unlock()
+
+	// Drive the heartbeat loop until orphan threshold trips.
+	hbCtx, hbCancel := context.WithCancel(context.Background())
+	defer hbCancel()
+	done := make(chan struct{})
+	go func() {
+		w.runHeartbeat(hbCtx, &core.Job{ID: "test-job-id"})
+		close(done)
+	}()
+
+	// runHeartbeat should call CancelJob (cancelling jobCtx) within a
+	// few ticks past the threshold. Give it generous slack.
+	select {
+	case <-jobCtx.Done():
+		// success — orphan threshold tripped, handler context cancelled
+	case <-time.After(2 * time.Second):
+		t.Fatal("runHeartbeat did not cancel orphaned handler within 2s")
+	}
+
+	// runHeartbeat itself should also return after cancelling the handler.
+	select {
+	case <-done:
+		// success — goroutine exited; no more "heartbeat failed" log spam
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("runHeartbeat did not exit after abandoning job")
+	}
+
+	// Sanity: it should have called Heartbeat at least orphanHeartbeatThreshold
+	// times before giving up.
+	if got := heartbeatCalls.Load(); int(got) < orphanHeartbeatThreshold {
+		t.Errorf("heartbeat tried %d times before abandoning; want at least %d",
+			got, orphanHeartbeatThreshold)
+	}
+}
+
+// TestRunHeartbeat_TransientErrorDoesNotAbandon confirms a transient
+// non-ownership error (e.g. DB unreachable) doesn't trip the orphan
+// threshold. The counter only advances on ErrJobNotOwned specifically.
+func TestRunHeartbeat_TransientErrorDoesNotAbandon(t *testing.T) {
+	mock := &mockStorage{}
+	var heartbeatCalls atomic.Int32
+	transientErr := errors.New("db unreachable")
+	mock.heartbeatFunc = func(_ context.Context, _ string, _ string) error {
+		heartbeatCalls.Add(1)
+		return transientErr
+	}
+
+	q := queue.New(mock)
+	w := NewWorker(q, DisableRetry())
+	w.heartbeatInterval = 10 * time.Millisecond
+
+	jobCtx, jobCancel := context.WithCancel(context.Background())
+	defer jobCancel()
+	w.runningJobsMu.Lock()
+	w.runningJobs["transient-job"] = jobCancel
+	w.runningJobsMu.Unlock()
+
+	hbCtx, hbCancel := context.WithCancel(context.Background())
+	defer hbCancel()
+	go w.runHeartbeat(hbCtx, &core.Job{ID: "transient-job"})
+
+	// Let the heartbeat tick several times.
+	time.Sleep(150 * time.Millisecond)
+
+	// jobCtx must NOT be cancelled — transient errors don't trip orphan.
+	select {
+	case <-jobCtx.Done():
+		t.Fatal("transient error wrongly tripped orphan abandonment")
+	default:
+		// expected: handler context still live
+	}
+
+	if heartbeatCalls.Load() < int32(orphanHeartbeatThreshold)+2 {
+		t.Errorf("expected several heartbeat attempts, got %d", heartbeatCalls.Load())
+	}
+}
+
+// TestRunHeartbeat_SuccessResetsCounter confirms that a single success
+// after some orphan errors resets the orphan counter — so a brief
+// ownership blip doesn't accumulate toward eventual abandonment if the
+// owner reclaims the job in time.
+func TestRunHeartbeat_SuccessResetsCounter(t *testing.T) {
+	mock := &mockStorage{}
+	var calls atomic.Int32
+	mock.heartbeatFunc = func(_ context.Context, _ string, _ string) error {
+		n := calls.Add(1)
+		// Return ErrJobNotOwned for the first 2 calls, then succeed, then
+		// orphan again. The counter should reset after the success, so
+		// we shouldn't trip abandonment until 3 MORE orphan responses
+		// pile up after the success.
+		if n <= 2 {
+			return core.ErrJobNotOwned
+		}
+		if n == 3 {
+			return nil
+		}
+		return core.ErrJobNotOwned
+	}
+
+	q := queue.New(mock)
+	w := NewWorker(q, DisableRetry())
+	w.heartbeatInterval = 10 * time.Millisecond
+
+	jobCtx, jobCancel := context.WithCancel(context.Background())
+	defer jobCancel()
+	w.runningJobsMu.Lock()
+	w.runningJobs["blip-job"] = jobCancel
+	w.runningJobsMu.Unlock()
+
+	hbCtx, hbCancel := context.WithCancel(context.Background())
+	defer hbCancel()
+	done := make(chan struct{})
+	go func() {
+		w.runHeartbeat(hbCtx, &core.Job{ID: "blip-job"})
+		close(done)
+	}()
+
+	// Should still eventually abandon — but the success at call #3 resets
+	// the counter, so it takes 3 more orphan errors (calls 4, 5, 6) to
+	// trip abandonment. That's call #6 minimum.
+	select {
+	case <-jobCtx.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("runHeartbeat did not abandon after orphan persisted post-success")
+	}
+
+	if got := calls.Load(); got < 6 {
+		t.Errorf("abandoned at call %d; expected >= 6 because success at call 3 should have reset the counter", got)
+	}
+
+	<-done
+}
