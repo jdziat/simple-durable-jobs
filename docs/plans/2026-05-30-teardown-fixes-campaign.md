@@ -60,8 +60,12 @@ Harness MUST be RED on current code (reproduce ≥2 defect classes) and GREEN-ab
 | H0 | ✅ committed | `469c6d0` | harness verified RED: INV-EXACTLY-ONCE phase_reexec=50, INV-SCHED immediate_burst |
 | P1 | ✅ committed | `b827971` | 0.1/0.2/3.3/5.3 — INV-EXACTLY-ONCE flipped to PASS (phase_reexec=0) |
 | P2 | ✅ committed | `73e6d09` | 0.4 + partial 2.5 — partial active-unique index (PG+sqlite) + MySQL deadlock-retry; verified on all 3 engines |
-| P3 | 🔄 in progress | — | fan-out atomicity (0.3/5.1/5.2) |
-| P4–P14 | pending | — | |
+| P3 | ✅ committed | `28a0291` | 0.3 mode-b + 5.1/5.2 — resume-path idempotent re-enqueue + sub-job validation |
+| P3b | ✅ committed | `b8769ca` | 0.3 mode-a — GetStalledFanOutParents recovery; chaos harness ALL HARD invariants green (PG+MySQL verified) |
+| P4 | 🔄 in progress | — | scheduler (0.5/1.1/5.5/5.6) |
+| P5–P14 | pending | — | |
+
+**Milestone (after P3b):** chaos harness reports NO HARD failures — INV-EXACTLY-ONCE / NO-WEDGE / FANOUT-COUNTS / UNIQUE all PASS under SIGKILL chaos. Only INV-SCHED (INFO, finding 0.5) still RED → P4. Distributed-correctness Tier-0 (0.1/0.3/0.4) closed.
 
 **P2 lesson (multi-backend gate):** codex (sqlite-only) reported pass twice; the real fix needed a Postgres-only partial index AND a MySQL-only `withSerializationRetry` wrap (the 1213 deadlock = finding 2.5). The race is PG-only, the deadlock MySQL-only, sqlite shows neither — only the docker-compose multi-backend run caught both. First P2 attempt (permanent unique index) was correctly rejected by the dispatch loop for breaking the frees-after-completion contract.
 
