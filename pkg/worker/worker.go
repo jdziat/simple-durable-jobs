@@ -143,23 +143,23 @@ func (w *Worker) Start(ctx context.Context) error {
 
 	// Start scheduler if enabled
 	if w.config.EnableScheduler {
-		go w.runScheduler(ctx)
+		w.goTracked(func() { w.runScheduler(ctx) })
 	}
 
 	// Start polling for waiting jobs (fan-out fallback)
-	go w.pollWaitingJobs(ctx)
+	w.goTracked(func() { w.pollWaitingJobs(ctx) })
 
 	// Start the stale-lock reaper to reclaim jobs whose owning worker died.
 	// This always runs — it's the only recovery path for crashed workers, so
 	// it cannot be disabled (NewWorker guarantees a positive interval).
-	go w.reapStaleLocks(ctx)
+	w.goTracked(func() { w.reapStaleLocks(ctx) })
 
 	// Start ownership audit to cancel local handlers for jobs cancelled
 	// or reclaimed by other workers. Same-worker cancellation is handled
 	// directly by completeFanOut/reapStaleLocks; this is the cross-worker
 	// counterpart.
 	if w.config.OwnershipAuditInterval > 0 {
-		go w.runOwnershipAudit(ctx)
+		w.goTracked(func() { w.runOwnershipAudit(ctx) })
 	}
 
 	for i := 0; i < totalConcurrency; i++ {
@@ -206,6 +206,14 @@ func (w *Worker) Start(ctx context.Context) error {
 			}
 		}
 	}
+}
+
+func (w *Worker) goTracked(fn func()) {
+	w.wg.Add(1)
+	go func() {
+		defer w.wg.Done()
+		fn()
+	}()
 }
 
 // queuesWithCapacity returns queue names that haven't reached their concurrency limit.

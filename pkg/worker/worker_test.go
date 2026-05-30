@@ -31,6 +31,7 @@ type mockStorage struct {
 	releasedIDs     []string      // IDs returned by ReleaseStaleLocks
 	releaseErr      error         // error returned by ReleaseStaleLocks
 	releaseDelay    time.Duration // optional artificial delay per call
+	releaseFunc     func(ctx context.Context, age time.Duration) ([]string, error)
 	dequeueFunc     func(ctx context.Context, queues []string, workerID string) (*core.Job, error)
 	completeFunc    func(ctx context.Context, jobID string, workerID string) error
 	failFunc        func(ctx context.Context, jobID string, workerID string, errMsg string, retryAt *time.Time) error
@@ -138,13 +139,16 @@ func (m *mockStorage) Heartbeat(ctx context.Context, jobID string, workerID stri
 	return nil
 }
 
-func (m *mockStorage) ReleaseStaleLocks(_ context.Context, _ time.Duration) ([]string, error) {
+func (m *mockStorage) ReleaseStaleLocks(ctx context.Context, age time.Duration) ([]string, error) {
 	if m.releaseDelay > 0 {
 		time.Sleep(m.releaseDelay)
 	}
 	m.mu.Lock()
 	m.releaseCount++
 	m.mu.Unlock()
+	if m.releaseFunc != nil {
+		return m.releaseFunc(ctx, age)
+	}
 	return m.releasedIDs, m.releaseErr
 }
 
@@ -847,6 +851,55 @@ func TestWorker_StaleLockReaperAlwaysRuns(t *testing.T) {
 
 	assert.GreaterOrEqual(t, mock.getReleaseCount(), int64(1),
 		"the stale-lock reaper must run; it cannot be disabled")
+}
+
+func TestWorker_StartWaitsForStaleLockReaperToFinish(t *testing.T) {
+	reaperEntered := make(chan struct{})
+	releaseReaper := make(chan struct{})
+	var enterOnce sync.Once
+
+	mock := &mockStorage{}
+	mock.releaseFunc = func(_ context.Context, _ time.Duration) ([]string, error) {
+		enterOnce.Do(func() { close(reaperEntered) })
+		<-releaseReaper
+		return nil, nil
+	}
+	q := queue.New(mock)
+	w := NewWorker(q,
+		WithPollInterval(50*time.Millisecond),
+		WithOwnershipAuditInterval(0),
+	)
+	w.config.StaleLockInterval = 10 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	startReturned := make(chan error, 1)
+	go func() {
+		startReturned <- w.Start(ctx)
+	}()
+
+	select {
+	case <-reaperEntered:
+	case <-time.After(time.Second):
+		t.Fatal("stale-lock reaper did not enter ReleaseStaleLocks")
+	}
+
+	cancel()
+
+	select {
+	case err := <-startReturned:
+		t.Fatalf("Start returned before ReleaseStaleLocks finished: %v", err)
+	case <-time.After(100 * time.Millisecond):
+		// Expected: Start is waiting for the blocked reaper goroutine.
+	}
+
+	close(releaseReaper)
+
+	select {
+	case err := <-startReturned:
+		assert.ErrorIs(t, err, context.Canceled)
+	case <-time.After(time.Second):
+		t.Fatal("Start did not return after ReleaseStaleLocks finished")
+	}
 }
 
 // ---------------------------------------------------------------------------
