@@ -343,6 +343,7 @@ func TestQueue_Emit_DropsWhenFull(t *testing.T) {
 
 	// Verify channel is full
 	assert.Len(t, ch, 100)
+	assert.Equal(t, uint64(1), q.DroppedEventCount())
 }
 
 func TestQueue_Unsubscribe_StopsDelivery(t *testing.T) {
@@ -628,6 +629,8 @@ func TestQueue_ResumeJob(t *testing.T) {
 	store := newMockStorage()
 	q := New(store)
 	ctx := context.Background()
+	events := q.Events()
+	defer q.Unsubscribe(events)
 
 	q.Register("test-job", func(ctx context.Context, args struct{}) error {
 		return nil
@@ -639,9 +642,25 @@ func TestQueue_ResumeJob(t *testing.T) {
 	// Pause then resume
 	err = q.PauseJob(ctx, jobID)
 	require.NoError(t, err)
+	select {
+	case event := <-events:
+		paused, ok := event.(*core.JobPaused)
+		require.True(t, ok)
+		assert.Equal(t, jobID, paused.Job.ID)
+	default:
+		t.Fatal("expected job paused event")
+	}
 
 	err = q.ResumeJob(ctx, jobID)
 	require.NoError(t, err)
+	select {
+	case event := <-events:
+		resumed, ok := event.(*core.JobResumed)
+		require.True(t, ok)
+		assert.Equal(t, jobID, resumed.Job.ID)
+	default:
+		t.Fatal("expected job resumed event")
+	}
 
 	paused, err := q.IsJobPaused(ctx, jobID)
 	require.NoError(t, err)

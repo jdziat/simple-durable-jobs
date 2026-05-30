@@ -245,7 +245,10 @@ func (s *jobsService) PauseJob(ctx context.Context, req *connect.Request[jobsv1.
 
 // ResumeJob resumes a paused job.
 func (s *jobsService) ResumeJob(ctx context.Context, req *connect.Request[jobsv1.ResumeJobRequest]) (*connect.Response[jobsv1.ResumeJobResponse], error) {
-	if err := s.storage.UnpauseJob(ctx, req.Msg.Id); err != nil {
+	if s.queue == nil {
+		return nil, connect.NewError(connect.CodeUnimplemented, nil)
+	}
+	if err := s.queue.ResumeJob(ctx, req.Msg.Id); err != nil {
 		return nil, connect.NewError(connect.CodeInternal, err)
 	}
 	job, err := s.storage.GetJob(ctx, req.Msg.Id)
@@ -260,7 +263,10 @@ func (s *jobsService) ResumeJob(ctx context.Context, req *connect.Request[jobsv1
 
 // PauseQueue pauses an entire queue.
 func (s *jobsService) PauseQueue(ctx context.Context, req *connect.Request[jobsv1.PauseQueueRequest]) (*connect.Response[jobsv1.PauseQueueResponse], error) {
-	if err := s.storage.PauseQueue(ctx, req.Msg.Name); err != nil {
+	if s.queue == nil {
+		return nil, connect.NewError(connect.CodeUnimplemented, nil)
+	}
+	if err := s.queue.PauseQueue(ctx, req.Msg.Name); err != nil {
 		return nil, connect.NewError(connect.CodeInternal, err)
 	}
 	return connect.NewResponse(&jobsv1.PauseQueueResponse{}), nil
@@ -268,7 +274,10 @@ func (s *jobsService) PauseQueue(ctx context.Context, req *connect.Request[jobsv
 
 // ResumeQueue resumes a paused queue.
 func (s *jobsService) ResumeQueue(ctx context.Context, req *connect.Request[jobsv1.ResumeQueueRequest]) (*connect.Response[jobsv1.ResumeQueueResponse], error) {
-	if err := s.storage.UnpauseQueue(ctx, req.Msg.Name); err != nil {
+	if s.queue == nil {
+		return nil, connect.NewError(connect.CodeUnimplemented, nil)
+	}
+	if err := s.queue.ResumeQueue(ctx, req.Msg.Name); err != nil {
 		return nil, connect.NewError(connect.CodeInternal, err)
 	}
 	return connect.NewResponse(&jobsv1.ResumeQueueResponse{}), nil
@@ -426,7 +435,8 @@ func (s *jobsService) ListWorkflows(ctx context.Context, req *connect.Request[jo
 	}), nil
 }
 
-// WatchEvents streams real-time job events.
+// WatchEvents streams real-time job events on a best-effort basis. Queue event
+// delivery may drop events for slow consumers; clients should resync via ListJobs.
 func (s *jobsService) WatchEvents(ctx context.Context, req *connect.Request[jobsv1.WatchEventsRequest], stream *connect.ServerStream[jobsv1.Event]) error {
 	if s.queue == nil {
 		<-ctx.Done()

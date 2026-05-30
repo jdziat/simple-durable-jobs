@@ -1854,12 +1854,20 @@ func TestResumeJob_Success(t *testing.T) {
 			return resumed, nil
 		},
 	}
-	svc := newJobsService(store, nil, nil)
+	q := queue.New(store)
+	svc := newJobsService(store, q, nil)
 
 	resp, err := svc.ResumeJob(context.Background(), connect.NewRequest(&jobsv1.ResumeJobRequest{Id: "j1"}))
 	require.NoError(t, err)
 	require.NotNil(t, resp.Msg.Job)
 	assert.Equal(t, "j1", resp.Msg.Job.Id)
+}
+
+func TestResumeJob_NilQueue_ReturnsUnimplemented(t *testing.T) {
+	svc := newJobsService(&mockStorage{}, nil, nil)
+	_, err := svc.ResumeJob(context.Background(), connect.NewRequest(&jobsv1.ResumeJobRequest{Id: "j1"}))
+	require.Error(t, err)
+	assert.Equal(t, connect.CodeUnimplemented, connect.CodeOf(err))
 }
 
 func TestResumeJob_UnpauseError(t *testing.T) {
@@ -1868,7 +1876,8 @@ func TestResumeJob_UnpauseError(t *testing.T) {
 			return errors.New("db error")
 		},
 	}
-	svc := newJobsService(store, nil, nil)
+	q := queue.New(store)
+	svc := newJobsService(store, q, nil)
 
 	_, err := svc.ResumeJob(context.Background(), connect.NewRequest(&jobsv1.ResumeJobRequest{Id: "j1"}))
 	require.Error(t, err)
@@ -1880,7 +1889,8 @@ func TestResumeJob_JobNotFoundAfterUnpause(t *testing.T) {
 		unpauseJobFn: func(_ context.Context, _ string) error { return nil },
 		getJobFn:     func(_ context.Context, _ string) (*core.Job, error) { return nil, nil },
 	}
-	svc := newJobsService(store, nil, nil)
+	q := queue.New(store)
+	svc := newJobsService(store, q, nil)
 
 	_, err := svc.ResumeJob(context.Background(), connect.NewRequest(&jobsv1.ResumeJobRequest{Id: "j1"}))
 	require.Error(t, err)
@@ -1900,12 +1910,20 @@ func TestPauseQueue_Success(t *testing.T) {
 			return nil
 		},
 	}
-	svc := newJobsService(store, nil, nil)
+	q := queue.New(store)
+	svc := newJobsService(store, q, nil)
 
 	resp, err := svc.PauseQueue(context.Background(), connect.NewRequest(&jobsv1.PauseQueueRequest{Name: "emails"}))
 	require.NoError(t, err)
 	assert.NotNil(t, resp)
 	assert.True(t, called)
+}
+
+func TestPauseQueue_NilQueue_ReturnsUnimplemented(t *testing.T) {
+	svc := newJobsService(&mockStorage{}, nil, nil)
+	_, err := svc.PauseQueue(context.Background(), connect.NewRequest(&jobsv1.PauseQueueRequest{Name: "emails"}))
+	require.Error(t, err)
+	assert.Equal(t, connect.CodeUnimplemented, connect.CodeOf(err))
 }
 
 func TestPauseQueue_StorageError(t *testing.T) {
@@ -1914,7 +1932,8 @@ func TestPauseQueue_StorageError(t *testing.T) {
 			return errors.New("db error")
 		},
 	}
-	svc := newJobsService(store, nil, nil)
+	q := queue.New(store)
+	svc := newJobsService(store, q, nil)
 
 	_, err := svc.PauseQueue(context.Background(), connect.NewRequest(&jobsv1.PauseQueueRequest{Name: "emails"}))
 	require.Error(t, err)
@@ -1934,12 +1953,20 @@ func TestResumeQueue_Success(t *testing.T) {
 			return nil
 		},
 	}
-	svc := newJobsService(store, nil, nil)
+	q := queue.New(store)
+	svc := newJobsService(store, q, nil)
 
 	resp, err := svc.ResumeQueue(context.Background(), connect.NewRequest(&jobsv1.ResumeQueueRequest{Name: "emails"}))
 	require.NoError(t, err)
 	assert.NotNil(t, resp)
 	assert.True(t, called)
+}
+
+func TestResumeQueue_NilQueue_ReturnsUnimplemented(t *testing.T) {
+	svc := newJobsService(&mockStorage{}, nil, nil)
+	_, err := svc.ResumeQueue(context.Background(), connect.NewRequest(&jobsv1.ResumeQueueRequest{Name: "emails"}))
+	require.Error(t, err)
+	assert.Equal(t, connect.CodeUnimplemented, connect.CodeOf(err))
 }
 
 func TestResumeQueue_StorageError(t *testing.T) {
@@ -1948,7 +1975,8 @@ func TestResumeQueue_StorageError(t *testing.T) {
 			return errors.New("db error")
 		},
 	}
-	svc := newJobsService(store, nil, nil)
+	q := queue.New(store)
+	svc := newJobsService(store, q, nil)
 
 	_, err := svc.ResumeQueue(context.Background(), connect.NewRequest(&jobsv1.ResumeQueueRequest{Name: "emails"}))
 	require.Error(t, err)

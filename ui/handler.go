@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io/fs"
+	"log/slog"
 	"net/http"
 	"strings"
 
@@ -34,7 +35,9 @@ func Handler(storage core.Storage, opts ...Option) http.Handler {
 	var statsStorage StatsStorage
 	if gs, ok := storage.(interface{ DB() *gorm.DB }); ok {
 		statsStore := NewGormStatsStorage(gs.DB())
-		_ = statsStore.MigrateStats(context.Background())
+		if err := statsStore.MigrateStats(context.Background()); err != nil {
+			slog.Default().Error("failed to migrate stats storage", "error", err)
+		}
 		statsStorage = statsStore
 
 		if cfg.queue != nil {

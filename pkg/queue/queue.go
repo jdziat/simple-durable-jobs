@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -38,8 +39,9 @@ type Queue struct {
 	enqueueMiddleware []EnqueueMiddleware
 
 	// Event stream
-	events    chan core.Event
-	eventSubs []chan core.Event
+	events        chan core.Event
+	eventSubs     []chan core.Event
+	droppedEvents atomic.Uint64
 
 	// Running job cancellation registry (used by workers to register cancel funcs)
 	runningJobs   map[string]context.CancelFunc
@@ -346,7 +348,9 @@ func (q *Queue) OnRetry(fn func(context.Context, *core.Job, int, error)) {
 	q.mu.Unlock()
 }
 
-// Events returns a channel for receiving queue events.
+// Events returns a best-effort channel for receiving queue events.
+// Events may be dropped when a subscriber is slow and its buffer fills.
+// Clients that need a complete view should periodically resync from storage.
 // The caller must call Unsubscribe when done to prevent resource leaks.
 func (q *Queue) Events() <-chan core.Event {
 	ch := make(chan core.Event, 100)
@@ -370,7 +374,14 @@ func (q *Queue) Unsubscribe(ch <-chan core.Event) {
 	}
 }
 
-// Emit emits an event to all subscribers.
+// DroppedEventCount returns the number of subscriber event deliveries dropped
+// because a subscriber buffer was full.
+func (q *Queue) DroppedEventCount() uint64 {
+	return q.droppedEvents.Load()
+}
+
+// Emit emits an event to all subscribers on a best-effort basis.
+// If a subscriber buffer is full, that delivery is dropped and counted.
 func (q *Queue) Emit(e core.Event) {
 	q.mu.RLock()
 	// Make a copy of the slice to avoid race conditions
@@ -383,7 +394,8 @@ func (q *Queue) Emit(e core.Event) {
 		select {
 		case ch <- e:
 		default:
-			// Drop if full - this prevents blocking on slow consumers
+			// Drop if full - this prevents blocking on slow consumers.
+			q.droppedEvents.Add(1)
 		}
 	}
 }
