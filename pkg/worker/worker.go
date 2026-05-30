@@ -578,6 +578,13 @@ func (w *Worker) handleError(ctx context.Context, jobCtx context.Context, job *c
 // It returns the final storage error so callers can detect a lost-ownership
 // outcome (core.ErrJobNotOwned) and skip downstream side effects.
 func (w *Worker) failWithRetry(ctx context.Context, jobID string, errMsg string, retryAt *time.Time) error {
+	if retryAt != nil {
+		now := time.Now()
+		if !retryAt.After(now) {
+			retryAt = &now
+		}
+	}
+
 	err := retryWithBackoff(ctx, *w.config.StorageRetry, func() error {
 		return w.queue.Storage().Fail(ctx, jobID, w.config.WorkerID, errMsg, retryAt)
 	})
@@ -743,9 +750,19 @@ func (w *Worker) completeFanOut(ctx context.Context, fo *core.FanOut, status cor
 }
 
 func (w *Worker) calculateBackoff(attempt int) time.Duration {
-	base := time.Second
-	backoff := base * (1 << attempt)
-	return min(backoff, time.Minute)
+	shift := attempt
+	if shift < 0 {
+		shift = 0
+	}
+	if shift > 30 {
+		shift = 30
+	}
+
+	backoff := time.Second << uint(shift)
+	if backoff <= 0 || backoff > time.Minute {
+		return time.Minute
+	}
+	return backoff
 }
 
 func (w *Worker) runScheduler(ctx context.Context) {

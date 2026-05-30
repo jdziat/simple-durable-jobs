@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1231,6 +1232,42 @@ func TestWorker_CalculateBackoff_CappedAtOneMinute(t *testing.T) {
 	b := w.calculateBackoff(10)
 
 	assert.Equal(t, time.Minute, b)
+}
+
+func TestWorker_CalculateBackoff_OverflowSafeForMaxRetryRange(t *testing.T) {
+	w := newTestWorker(t)
+
+	for _, attempt := range []int{0, 1, 2, 3, 4, 5, 30, 33, 63, 99, 100} {
+		t.Run(fmt.Sprintf("attempt_%d", attempt), func(t *testing.T) {
+			backoff := w.calculateBackoff(attempt)
+
+			assert.Greater(t, backoff, time.Duration(0))
+			assert.LessOrEqual(t, backoff, time.Minute)
+		})
+	}
+}
+
+func TestWorker_FailWithRetry_ClampsPastRetryAtToNow(t *testing.T) {
+	var captured *time.Time
+	mock := &mockStorage{
+		failFunc: func(_ context.Context, _ string, _ string, _ string, retryAt *time.Time) error {
+			require.NotNil(t, retryAt)
+			copy := *retryAt
+			captured = &copy
+			return nil
+		},
+	}
+	q := queue.New(mock)
+	w := NewWorker(q, WithStorageRetry(RetryConfig{MaxAttempts: 1}))
+
+	before := time.Now()
+	past := before.Add(-time.Hour)
+	err := w.failWithRetry(context.Background(), "job-1", "boom", &past)
+
+	require.NoError(t, err)
+	require.NotNil(t, captured)
+	assert.False(t, captured.Before(before), "retryAt must not be persisted in the past")
+	assert.WithinDuration(t, time.Now(), *captured, time.Second)
 }
 
 // ---------------------------------------------------------------------------

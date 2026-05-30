@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"reflect"
 	"time"
+
+	"github.com/jdziat/simple-durable-jobs/pkg/core"
 )
 
 // Handler holds metadata about a registered job handler.
@@ -92,7 +94,11 @@ func (h *Handler) Execute(ctx context.Context, argsJSON []byte) ([]byte, error) 
 	if h.ArgsType != nil {
 		argVal := reflect.New(h.ArgsType)
 		if err := json.Unmarshal(argsJSON, argVal.Interface()); err != nil {
-			return nil, fmt.Errorf("failed to unmarshal args: %w", err)
+			wrapped := fmt.Errorf("failed to unmarshal args: %w", err)
+			if len(argsJSON) == 0 && !isEmptyStructType(h.ArgsType) {
+				return nil, core.NoRetry(wrapped)
+			}
+			return nil, wrapped
 		}
 		args = append(args, argVal.Elem())
 	}
@@ -119,6 +125,10 @@ func (h *Handler) Execute(ctx context.Context, argsJSON []byte) ([]byte, error) 
 		return resultBytes, nil
 	}
 	return nil, nil
+}
+
+func isEmptyStructType(t reflect.Type) bool {
+	return t.Kind() == reflect.Struct && t.NumField() == 0
 }
 
 // ExecuteCall runs the handler for a nested Call, returning the result.
