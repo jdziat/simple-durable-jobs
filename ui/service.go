@@ -2,9 +2,9 @@ package ui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
-	"strings"
 	"sync/atomic"
 	"time"
 
@@ -20,6 +20,7 @@ import (
 const (
 	maxWatchStreams = 50
 	maxBulkJobIDs   = 1000
+	maxWorkflowJobs = 1000
 )
 
 // jobsService implements the JobsService Connect-RPC service.
@@ -122,6 +123,10 @@ func (s *jobsService) ListJobs(ctx context.Context, req *connect.Request[jobsv1.
 
 	jobs, total, err := s.searchJobs(ctx, req.Msg, limit, page)
 	if err != nil {
+		var connectErr *connect.Error
+		if errors.As(err, &connectErr) {
+			return nil, connectErr
+		}
 		return nil, connect.NewError(connect.CodeInternal, err)
 	}
 
@@ -344,44 +349,9 @@ func (s *jobsService) GetWorkflow(ctx context.Context, req *connect.Request[jobs
 		root = parent
 	}
 
-	// BFS to collect all descendants (fan-outs and child jobs).
-	// We cap at 1000 jobs to bound memory usage.
-	const maxJobs = 1000
-	var allFanOuts []*jobsv1.FanOut
-	var allChildren []*jobsv1.Job
-
-	queue := []string{root.ID}
-	visited := make(map[string]struct{}, maxJobs)
-	visited[root.ID] = struct{}{}
-
-	for len(queue) > 0 && len(allChildren) < maxJobs {
-		current := queue[0]
-		queue = queue[1:]
-
-		fanOuts, err := s.storage.GetFanOutsByParent(ctx, current)
-		if err != nil {
-			return nil, connect.NewError(connect.CodeInternal, err)
-		}
-		for _, fo := range fanOuts {
-			allFanOuts = append(allFanOuts, fanOutToProto(fo))
-
-			subJobs, err := s.storage.GetSubJobs(ctx, fo.ID)
-			if err != nil {
-				return nil, connect.NewError(connect.CodeInternal, err)
-			}
-			for _, sj := range subJobs {
-				if _, seen := visited[sj.ID]; seen {
-					continue
-				}
-				visited[sj.ID] = struct{}{}
-				allChildren = append(allChildren, jobToProto(sj))
-				// Enqueue so we can find deeper fan-outs rooted at this child.
-				queue = append(queue, sj.ID)
-				if len(allChildren) >= maxJobs {
-					break
-				}
-			}
-		}
+	allFanOuts, allChildren, err := s.collectWorkflowTree(ctx, root)
+	if err != nil {
+		return nil, connect.NewError(connect.CodeInternal, err)
 	}
 
 	return connect.NewResponse(&jobsv1.GetWorkflowResponse{
@@ -415,17 +385,17 @@ func (s *jobsService) ListWorkflows(ctx context.Context, req *connect.Request[jo
 		return nil, connect.NewError(connect.CodeInternal, err)
 	}
 
-	// For each root, build a WorkflowSummary by collecting its fan-outs.
+	fanOutsByParent, err := s.getFanOutsForParents(ctx, roots)
+	if err != nil {
+		return nil, connect.NewError(connect.CodeInternal, err)
+	}
+
 	summaries := make([]*jobsv1.WorkflowSummary, 0, len(roots))
 	for _, root := range roots {
 		summary := &jobsv1.WorkflowSummary{
 			RootJob: jobToProto(root),
 		}
-
-		fanOuts, err := s.storage.GetFanOutsByParent(ctx, root.ID)
-		if err != nil {
-			return nil, connect.NewError(connect.CodeInternal, err)
-		}
+		fanOuts := fanOutsByParent[root.ID]
 
 		if len(fanOuts) > 0 {
 			// Use strategy from the first fan-out as representative.
@@ -513,7 +483,10 @@ func (s *jobsService) WatchEvents(ctx context.Context, req *connect.Request[jobs
 // Helper methods
 
 func (s *jobsService) getQueueStats(ctx context.Context) ([]*jobsv1.QueueStats, error) {
-	// Check if storage implements UIStorage interface
+	if depth, ok := s.storage.(queueDepthStatsStorage); ok {
+		return depth.GetQueueDepthStats(ctx)
+	}
+
 	if ui, ok := s.storage.(UIStorage); ok {
 		return ui.GetQueueStats(ctx)
 	}
@@ -568,64 +541,158 @@ func (s *jobsService) searchJobs(ctx context.Context, req *jobsv1.ListJobsReques
 		})
 	}
 
-	// Fallback: basic implementation - fetch jobs from all statuses (capped)
-	const maxFetchPerStatus = 1000
-	var allJobs []*core.Job
+	return nil, 0, connect.NewError(connect.CodeUnimplemented, fmt.Errorf("ListJobs requires storage with UI search support"))
+}
 
-	fetchLimit := limit * page
-	if fetchLimit > maxFetchPerStatus {
-		fetchLimit = maxFetchPerStatus
+func (s *jobsService) collectWorkflowTree(ctx context.Context, root *core.Job) ([]*jobsv1.FanOut, []*jobsv1.Job, error) {
+	if batch, ok := s.storage.(workflowBatchStorage); ok {
+		return s.collectWorkflowTreeBatched(ctx, root, batch)
 	}
+	return s.collectWorkflowTreeFallback(ctx, root)
+}
 
-	if req.Status != "" {
-		// Filter by specific status
-		jobs, err := s.storage.GetJobsByStatus(ctx, core.JobStatus(req.Status), fetchLimit)
+func (s *jobsService) collectWorkflowTreeBatched(ctx context.Context, root *core.Job, batch workflowBatchStorage) ([]*jobsv1.FanOut, []*jobsv1.Job, error) {
+	var allFanOuts []*jobsv1.FanOut
+	var allChildren []*jobsv1.Job
+
+	queue := []string{root.ID}
+	visited := make(map[string]struct{}, maxWorkflowJobs)
+	visited[root.ID] = struct{}{}
+
+	for len(queue) > 0 && len(allChildren) < maxWorkflowJobs {
+		currentParents := queue
+		queue = nil
+
+		fanOuts, err := batch.GetFanOutsByParents(ctx, currentParents)
 		if err != nil {
-			return nil, 0, err
+			return nil, nil, err
 		}
-		allJobs = jobs
-	} else {
-		// No status filter - fetch from all statuses
-		for _, status := range []core.JobStatus{core.StatusPending, core.StatusRunning, core.StatusCompleted, core.StatusFailed, core.StatusPaused} {
-			jobs, err := s.storage.GetJobsByStatus(ctx, status, fetchLimit)
-			if err != nil {
-				return nil, 0, err
+		fanOutsByParent := groupFanOutsByParent(fanOuts)
+
+		fanOutIDs := make([]string, 0, len(fanOuts))
+		for _, parentID := range currentParents {
+			for _, fo := range fanOutsByParent[parentID] {
+				fanOutIDs = append(fanOutIDs, fo.ID)
 			}
-			allJobs = append(allJobs, jobs...)
+		}
+
+		subJobs, err := batch.GetSubJobsByFanOuts(ctx, fanOutIDs)
+		if err != nil {
+			return nil, nil, err
+		}
+		subJobsByFanOut := groupSubJobsByFanOut(subJobs)
+
+		for _, parentID := range currentParents {
+			for _, fo := range fanOutsByParent[parentID] {
+				allFanOuts = append(allFanOuts, fanOutToProto(fo))
+				for _, sj := range subJobsByFanOut[fo.ID] {
+					if _, seen := visited[sj.ID]; seen {
+						continue
+					}
+					visited[sj.ID] = struct{}{}
+					allChildren = append(allChildren, jobToProto(sj))
+					queue = append(queue, sj.ID)
+					if len(allChildren) >= maxWorkflowJobs {
+						break
+					}
+				}
+				if len(allChildren) >= maxWorkflowJobs {
+					break
+				}
+			}
+			if len(allChildren) >= maxWorkflowJobs {
+				break
+			}
 		}
 	}
 
-	// Apply additional filters
-	var filtered []*core.Job
-	for _, job := range allJobs {
-		if req.Queue != "" && job.Queue != req.Queue {
+	return allFanOuts, allChildren, nil
+}
+
+func (s *jobsService) collectWorkflowTreeFallback(ctx context.Context, root *core.Job) ([]*jobsv1.FanOut, []*jobsv1.Job, error) {
+	var allFanOuts []*jobsv1.FanOut
+	var allChildren []*jobsv1.Job
+
+	queue := []string{root.ID}
+	visited := make(map[string]struct{}, maxWorkflowJobs)
+	visited[root.ID] = struct{}{}
+
+	for len(queue) > 0 && len(allChildren) < maxWorkflowJobs {
+		current := queue[0]
+		queue = queue[1:]
+
+		fanOuts, err := s.storage.GetFanOutsByParent(ctx, current)
+		if err != nil {
+			return nil, nil, err
+		}
+		for _, fo := range fanOuts {
+			allFanOuts = append(allFanOuts, fanOutToProto(fo))
+
+			subJobs, err := s.storage.GetSubJobs(ctx, fo.ID)
+			if err != nil {
+				return nil, nil, err
+			}
+			for _, sj := range subJobs {
+				if _, seen := visited[sj.ID]; seen {
+					continue
+				}
+				visited[sj.ID] = struct{}{}
+				allChildren = append(allChildren, jobToProto(sj))
+				queue = append(queue, sj.ID)
+				if len(allChildren) >= maxWorkflowJobs {
+					break
+				}
+			}
+		}
+	}
+
+	return allFanOuts, allChildren, nil
+}
+
+func (s *jobsService) getFanOutsForParents(ctx context.Context, roots []*core.Job) (map[string][]*core.FanOut, error) {
+	parentIDs := make([]string, 0, len(roots))
+	for _, root := range roots {
+		parentIDs = append(parentIDs, root.ID)
+	}
+
+	if batch, ok := s.storage.(interface {
+		GetFanOutsByParents(context.Context, []string) ([]*core.FanOut, error)
+	}); ok {
+		fanOuts, err := batch.GetFanOutsByParents(ctx, parentIDs)
+		if err != nil {
+			return nil, err
+		}
+		return groupFanOutsByParent(fanOuts), nil
+	}
+
+	fanOutsByParent := make(map[string][]*core.FanOut, len(parentIDs))
+	for _, parentID := range parentIDs {
+		fanOuts, err := s.storage.GetFanOutsByParent(ctx, parentID)
+		if err != nil {
+			return nil, err
+		}
+		fanOutsByParent[parentID] = fanOuts
+	}
+	return fanOutsByParent, nil
+}
+
+func groupFanOutsByParent(fanOuts []*core.FanOut) map[string][]*core.FanOut {
+	grouped := make(map[string][]*core.FanOut)
+	for _, fo := range fanOuts {
+		grouped[fo.ParentJobID] = append(grouped[fo.ParentJobID], fo)
+	}
+	return grouped
+}
+
+func groupSubJobsByFanOut(jobs []*core.Job) map[string][]*core.Job {
+	grouped := make(map[string][]*core.Job)
+	for _, job := range jobs {
+		if job.FanOutID == nil {
 			continue
 		}
-		if req.Type != "" && job.Type != req.Type {
-			continue
-		}
-		if req.Search != "" && !strings.Contains(job.ID, req.Search) && !strings.Contains(string(job.Args), req.Search) {
-			continue
-		}
-		filtered = append(filtered, job)
+		grouped[*job.FanOutID] = append(grouped[*job.FanOutID], job)
 	}
-
-	// Sort by created_at DESC (newest first)
-	sort.Slice(filtered, func(i, j int) bool {
-		return filtered[i].CreatedAt.After(filtered[j].CreatedAt)
-	})
-
-	// Paginate
-	start := (page - 1) * limit
-	if start >= len(filtered) {
-		return nil, int64(len(filtered)), nil
-	}
-	end := start + limit
-	if end > len(filtered) {
-		end = len(filtered)
-	}
-
-	return filtered[start:end], int64(len(filtered)), nil
+	return grouped
 }
 
 func (s *jobsService) retryJob(ctx context.Context, id string) (*core.Job, error) {
@@ -816,6 +883,15 @@ type UIStorage interface {
 	// parents. status filters by job status when non-empty. limit and offset
 	// control pagination. Returns the matching jobs and the total count.
 	GetWorkflowRoots(ctx context.Context, status string, limit, offset int) ([]*core.Job, int64, error)
+}
+
+type workflowBatchStorage interface {
+	GetFanOutsByParents(ctx context.Context, parentJobIDs []string) ([]*core.FanOut, error)
+	GetSubJobsByFanOuts(ctx context.Context, fanOutIDs []string) ([]*core.Job, error)
+}
+
+type queueDepthStatsStorage interface {
+	GetQueueDepthStats(ctx context.Context) ([]*jobsv1.QueueStats, error)
 }
 
 // JobFilter is an alias for core.JobFilter for backward compatibility.

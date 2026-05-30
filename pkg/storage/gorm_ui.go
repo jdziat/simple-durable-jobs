@@ -16,6 +16,12 @@ const maxUISearchLength = 256
 
 // GetQueueStats returns per-queue job counts grouped by status.
 func (s *GormStorage) GetQueueStats(ctx context.Context) ([]*jobsv1.QueueStats, error) {
+	return s.GetQueueDepthStats(ctx)
+}
+
+// GetQueueDepthStats returns accurate per-queue depth counts using aggregate
+// queries instead of fetching job rows.
+func (s *GormStorage) GetQueueDepthStats(ctx context.Context) ([]*jobsv1.QueueStats, error) {
 	type row struct {
 		Queue  string
 		Status string
@@ -224,4 +230,32 @@ func (s *GormStorage) GetWorkflowRoots(ctx context.Context, status string, limit
 	}
 
 	return jobs, total, nil
+}
+
+// GetFanOutsByParents retrieves fan-outs for multiple parent jobs in one query.
+func (s *GormStorage) GetFanOutsByParents(ctx context.Context, parentJobIDs []string) ([]*core.FanOut, error) {
+	if len(parentJobIDs) == 0 {
+		return nil, nil
+	}
+
+	var fanOuts []*core.FanOut
+	err := s.db.WithContext(ctx).
+		Where("parent_job_id IN ?", parentJobIDs).
+		Order("parent_job_id ASC, created_at ASC").
+		Find(&fanOuts).Error
+	return fanOuts, err
+}
+
+// GetSubJobsByFanOuts retrieves sub-jobs for multiple fan-outs in one query.
+func (s *GormStorage) GetSubJobsByFanOuts(ctx context.Context, fanOutIDs []string) ([]*core.Job, error) {
+	if len(fanOutIDs) == 0 {
+		return nil, nil
+	}
+
+	var jobs []*core.Job
+	err := s.db.WithContext(ctx).
+		Where("fan_out_id IN ?", fanOutIDs).
+		Order("fan_out_id ASC, fan_out_index ASC").
+		Find(&jobs).Error
+	return jobs, err
 }
