@@ -64,8 +64,14 @@ Harness MUST be RED on current code (reproduce ≥2 defect classes) and GREEN-ab
 | P3b | ✅ committed | `b8769ca` | 0.3 mode-a — GetStalledFanOutParents recovery; chaos harness ALL HARD invariants green (PG+MySQL verified) |
 | P4 | ✅ committed | `a086779` | 0.5 boot-storm/1.1/5.5/5.6 — seed lastRun, options+args, UTC, Cron error+MustCron |
 | P4b | ✅ committed | `e6cc15a` | 0.5 exactly-once — atomic ClaimScheduledFire CAS; chaos INV-SCHED 6→2; PG+MySQL verified |
-| P5 | 🔄 in progress | — | OTel terminal-hook ctx (0.6) |
-| P6–P14 | pending | — | |
+| P5 | ✅ committed | `08e2a30` | 0.6 — span ctx to terminal hooks; storage stays on parent ctx |
+| P6 | ✅ committed | `eaa0c59` | 1.2/5.4 — overflow-safe backoff + empty-args NoRetry |
+| P7a | ✅ committed | `55108cd` | 1.7 — aux goroutines joined to wg |
+| P7b | ✅ committed | `0d4b08a` | 1.8 — graceful drain (WithoutCancel + DrainTimeout); chaos regression green |
+| P8a | 🔄 in progress | — | storage status guards + sentinel (2.1/2.2/2.3) |
+| P8b–P14 | pending | — | |
+
+Findings closed: 0.1 0.2 0.3 0.4 0.5 1.1 1.2 1.7 1.8 3.3 5.1 5.2 5.3 5.4 5.5 5.6 + partial 2.5. Remaining: 2.1 2.2 2.3 2.4 2.5(rest) 3.1 3.2 4.x 1.3 1.4 1.5 1.6 + Tier-6 API + Determinism/Timeout.
 
 **Milestone (after P4b):** chaos harness FULLY GREEN — all 4 HARD invariants + INV-SCHED PASS under SIGKILL chaos on Postgres. All harness-reproducible distributed findings (0.1/0.3/0.4/0.5 + 2.2-so-far) closed. Remaining packets (P5–P14) are unit-test-gated (OTel, backoff, lifecycle, storage guards, UI, API) — not distributed-correctness invariants.
 Findings closed: 0.1 0.2 0.3 0.4 0.5 1.1 3.3 5.1 5.2 5.3 5.5 5.6 + partial 2.5.
