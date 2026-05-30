@@ -45,7 +45,7 @@ func TestGormStatsStorage_MigrateCreatesUniqueQueueTimestampIndex(t *testing.T) 
 
 	rows, err := db.Raw("PRAGMA index_list(job_stats)").Rows()
 	require.NoError(t, err)
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	foundUnique := false
 	for rows.Next() {
