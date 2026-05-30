@@ -525,7 +525,8 @@ func TestIntegration_StaleLockCleanup(t *testing.T) {
 	// Release stale locks (older than 5 minutes)
 	released, err := store.ReleaseStaleLocks(ctx, 5*time.Minute)
 	require.NoError(t, err)
-	assert.Equal(t, int64(1), released, "Should release 1 stale lock")
+	assert.Len(t, released, 1, "Should release 1 stale lock")
+	assert.Equal(t, "stale-job", released[0])
 
 	// Verify job is now pending
 	updatedJob, err := store.GetJob(ctx, "stale-job")

@@ -494,19 +494,74 @@ func (s *GormStorage) Heartbeat(ctx context.Context, jobID string, workerID stri
 	return nil
 }
 
-// ReleaseStaleLocks releases locks on jobs that haven't had a heartbeat.
-func (s *GormStorage) ReleaseStaleLocks(ctx context.Context, staleDuration time.Duration) (int64, error) {
-	cutoff := time.Now().Add(-staleDuration)
-	result := s.db.WithContext(ctx).
+// FindOrphanedJobs returns the IDs from the input slice whose DB row
+// indicates the caller no longer owns the job. See core.Storage.FindOrphanedJobs
+// for the protocol — this is the implementation.
+//
+// A job is considered orphaned to workerID when ANY of these is true:
+//   - locked_by != workerID  (another worker took the lock)
+//   - locked_by IS NULL      (lock was released, no new owner)
+//   - status IN ('cancelled','completed','failed')  (job is done by some path)
+//
+// Returns an empty slice (not nil) when no jobs are orphaned, so callers
+// can len()-test without nil-checking.
+func (s *GormStorage) FindOrphanedJobs(ctx context.Context, jobIDs []string, workerID string) ([]string, error) {
+	if len(jobIDs) == 0 {
+		return []string{}, nil
+	}
+	var orphaned []string
+	err := s.db.WithContext(ctx).
 		Model(&core.Job{}).
-		Where("status = ?", core.StatusRunning).
-		Where("locked_until < ?", cutoff).
-		Updates(map[string]any{
-			"status":       core.StatusPending,
-			"locked_by":    nil,
-			"locked_until": nil,
-		})
-	return result.RowsAffected, result.Error
+		Where("id IN ?", jobIDs).
+		Where(
+			s.db.Where("locked_by IS NULL").
+				Or("locked_by != ?", workerID).
+				Or("status IN ?", []core.JobStatus{core.StatusCancelled, core.StatusCompleted, core.StatusFailed}),
+		).
+		Pluck("id", &orphaned).Error
+	if err != nil {
+		return nil, err
+	}
+	if orphaned == nil {
+		orphaned = []string{}
+	}
+	return orphaned, nil
+}
+
+// ReleaseStaleLocks releases locks on jobs that haven't had a heartbeat.
+// Returns the IDs of the jobs whose locks were released so the caller can
+// cancel any local in-flight handlers — see core.Storage.ReleaseStaleLocks
+// for the rationale.
+func (s *GormStorage) ReleaseStaleLocks(ctx context.Context, staleDuration time.Duration) ([]string, error) {
+	cutoff := time.Now().Add(-staleDuration)
+
+	// Two-step: first capture the IDs of stale jobs, then update them in
+	// the same transaction so the reader and the writer agree. RETURNING
+	// would let us do this in one statement but isn't portable across all
+	// GORM drivers, so we do it the long way.
+	var released []string
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Model(&core.Job{}).
+			Where("status = ?", core.StatusRunning).
+			Where("locked_until < ?", cutoff).
+			Pluck("id", &released).Error; err != nil {
+			return err
+		}
+		if len(released) == 0 {
+			return nil
+		}
+		return tx.Model(&core.Job{}).
+			Where("id IN ?", released).
+			Updates(map[string]any{
+				"status":       core.StatusPending,
+				"locked_by":    nil,
+				"locked_until": nil,
+			}).Error
+	})
+	if err != nil {
+		return nil, err
+	}
+	return released, nil
 }
 
 // GetJob retrieves a job by ID.
@@ -735,34 +790,45 @@ func (s *GormStorage) GetSubJobResults(ctx context.Context, fanOutID string) ([]
 }
 
 // CancelSubJobs cancels pending/running sub-jobs for a fan-out.
-// Updates the fan-out's cancelled_count to reflect the number of cancelled jobs.
-func (s *GormStorage) CancelSubJobs(ctx context.Context, fanOutID string) (int64, error) {
-	var rowsAffected int64
+// Updates the fan-out's cancelled_count to reflect the number of cancelled
+// jobs and returns the IDs of the cancelled sub-jobs so the caller can
+// cancel any local in-flight handlers — see core.Storage.CancelSubJobs
+// for the rationale.
+func (s *GormStorage) CancelSubJobs(ctx context.Context, fanOutID string) ([]string, error) {
+	var cancelled []string
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		result := tx.
-			Model(&core.Job{}).
+		// Capture the IDs of sub-jobs we're about to cancel. Done before
+		// the UPDATE so we get the in-flight set, not just rows that
+		// happen to remain pending after the update.
+		if err := tx.Model(&core.Job{}).
 			Where("fan_out_id = ? AND status IN ?", fanOutID, []core.JobStatus{core.StatusPending, core.StatusRunning}).
+			Pluck("id", &cancelled).Error; err != nil {
+			return err
+		}
+		if len(cancelled) == 0 {
+			return nil
+		}
+
+		now := time.Now()
+		if err := tx.Model(&core.Job{}).
+			Where("id IN ?", cancelled).
 			Updates(map[string]any{
 				"status":     core.StatusCancelled,
-				"updated_at": time.Now(),
-			})
-		if result.Error != nil {
-			return result.Error
+				"updated_at": now,
+			}).Error; err != nil {
+			return err
 		}
-		rowsAffected = result.RowsAffected
 
-		// Update the fan-out's cancelled count to match
-		if rowsAffected > 0 {
-			if err := tx.Exec(
-				"UPDATE fan_outs SET cancelled_count = cancelled_count + ?, updated_at = ? WHERE id = ?",
-				rowsAffected, time.Now(), fanOutID,
-			).Error; err != nil {
-				return err
-			}
-		}
-		return nil
+		// Update the fan-out's cancelled count to match.
+		return tx.Exec(
+			"UPDATE fan_outs SET cancelled_count = cancelled_count + ?, updated_at = ? WHERE id = ?",
+			len(cancelled), now, fanOutID,
+		).Error
 	})
-	return rowsAffected, err
+	if err != nil {
+		return nil, err
+	}
+	return cancelled, nil
 }
 
 // CancelSubJob cancels a single sub-job and updates its fan-out's cancelled count.
@@ -872,15 +938,30 @@ func (s *GormStorage) ResumeJob(ctx context.Context, jobID string) (bool, error)
 }
 
 // GetWaitingJobsToResume finds waiting jobs whose fan-out is complete.
+//
+// Subtle: a parent that does sequential fan-outs (e.g. a workflow that
+// dispatches fan_out #1, suspends, resumes, dispatches fan_out #2, suspends
+// again) has multiple rows in fan_outs. The old query joined any
+// completed/failed fan-out without checking whether a later fan-out was
+// still pending — so once fan_out #1 finished, the polling fallback would
+// keep returning the parent every tick and ResumeJob would spuriously
+// pull the parent off its #2 wait, replay the workflow, and re-suspend.
+// The NOT EXISTS guard restricts the result to parents that have at least
+// one terminated fan-out AND no pending fan-outs. DISTINCT keeps the
+// result one-row-per-parent when there are multiple terminated fan-outs.
 func (s *GormStorage) GetWaitingJobsToResume(ctx context.Context) ([]*core.Job, error) {
 	var jobs []*core.Job
-	// Find waiting jobs where their fan-out is complete
 	err := s.db.WithContext(ctx).Raw(`
-		SELECT j.* FROM jobs j
+		SELECT DISTINCT j.* FROM jobs j
 		INNER JOIN fan_outs f ON j.id = f.parent_job_id
 		WHERE j.status = ?
 		AND f.status IN (?, ?)
-	`, core.StatusWaiting, core.FanOutCompleted, core.FanOutFailed).Scan(&jobs).Error
+		AND NOT EXISTS (
+			SELECT 1 FROM fan_outs f2
+			WHERE f2.parent_job_id = j.id
+			AND f2.status = ?
+		)
+	`, core.StatusWaiting, core.FanOutCompleted, core.FanOutFailed, core.FanOutPending).Scan(&jobs).Error
 	return jobs, err
 }
 

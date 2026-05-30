@@ -56,8 +56,12 @@ func (m *mockStorage) GetDueJobs(_ context.Context, _ []string, _ int) ([]*core.
 	return nil, nil
 }
 func (m *mockStorage) Heartbeat(_ context.Context, _, _ string) error { return nil }
-func (m *mockStorage) ReleaseStaleLocks(_ context.Context, _ time.Duration) (int64, error) {
-	return 0, nil
+func (m *mockStorage) ReleaseStaleLocks(_ context.Context, _ time.Duration) ([]string, error) {
+	return nil, nil
+}
+
+func (m *mockStorage) FindOrphanedJobs(_ context.Context, _ []string, _ string) ([]string, error) {
+	return nil, nil
 }
 func (m *mockStorage) CreateFanOut(_ context.Context, _ *core.FanOut) error        { return nil }
 func (m *mockStorage) GetFanOut(_ context.Context, _ string) (*core.FanOut, error) { return nil, nil }
@@ -89,7 +93,7 @@ func (m *mockStorage) GetSubJobs(ctx context.Context, fanOutID string) ([]*core.
 func (m *mockStorage) GetSubJobResults(_ context.Context, _ string) ([]*core.Job, error) {
 	return nil, nil
 }
-func (m *mockStorage) CancelSubJobs(_ context.Context, _ string) (int64, error) { return 0, nil }
+func (m *mockStorage) CancelSubJobs(_ context.Context, _ string) ([]string, error) { return nil, nil }
 func (m *mockStorage) CancelSubJob(_ context.Context, _ string) (*core.FanOut, error) {
 	return nil, nil
 }

@@ -544,16 +544,17 @@ func TestReleaseStaleLocks_ResetsExpiredRunningJobsToPending(t *testing.T) {
 		Update("locked_until", past).Error
 	require.NoError(t, err)
 
-	count, err := s.ReleaseStaleLocks(ctx, 1*time.Hour)
+	released, err := s.ReleaseStaleLocks(ctx, 1*time.Hour)
 	require.NoError(t, err)
-	assert.Equal(t, int64(1), count)
+	require.Len(t, released, 1, "should report the released job's ID")
+	assert.Equal(t, got.ID, released[0])
 
-	released, err := s.GetJob(ctx, got.ID)
+	row, err := s.GetJob(ctx, got.ID)
 	require.NoError(t, err)
-	require.NotNil(t, released)
-	assert.Equal(t, core.StatusPending, released.Status)
-	assert.Empty(t, released.LockedBy)
-	assert.Nil(t, released.LockedUntil)
+	require.NotNil(t, row)
+	assert.Equal(t, core.StatusPending, row.Status)
+	assert.Empty(t, row.LockedBy)
+	assert.Nil(t, row.LockedUntil)
 }
 
 func TestReleaseStaleLocks_DoesNotTouchFreshLocks(t *testing.T) {
@@ -567,9 +568,9 @@ func TestReleaseStaleLocks_DoesNotTouchFreshLocks(t *testing.T) {
 	require.NotNil(t, got)
 
 	// staleDuration is 2 hours – fresh lock of 45 min should not be affected
-	count, err := s.ReleaseStaleLocks(ctx, 2*time.Hour)
+	released, err := s.ReleaseStaleLocks(ctx, 2*time.Hour)
 	require.NoError(t, err)
-	assert.Equal(t, int64(0), count)
+	assert.Empty(t, released, "fresh locks should not be released")
 
 	still, err := s.GetJob(ctx, got.ID)
 	require.NoError(t, err)
@@ -1551,9 +1552,16 @@ func TestCancelSubJobs_CancelsPendingSubJobs(t *testing.T) {
 	}
 	require.NoError(t, s.EnqueueBatch(ctx, subs))
 
-	cancelled, err := s.CancelSubJobs(ctx, fanOut.ID)
+	cancelledIDs, err := s.CancelSubJobs(ctx, fanOut.ID)
 	require.NoError(t, err)
-	assert.Equal(t, int64(3), cancelled)
+	assert.Len(t, cancelledIDs, 3, "should return all three sub-job IDs")
+	gotIDs := map[string]bool{}
+	for _, id := range cancelledIDs {
+		gotIDs[id] = true
+	}
+	for _, sub := range subs {
+		assert.True(t, gotIDs[sub.ID], "cancelledIDs missing sub %s", sub.ID)
+	}
 
 	for _, sub := range subs {
 		got, err := s.GetJob(ctx, sub.ID)
@@ -1652,6 +1660,70 @@ func TestGetWaitingJobsToResume_DoesNotReturnPendingFanOut(t *testing.T) {
 	waiting, err := s.GetWaitingJobsToResume(ctx)
 	require.NoError(t, err)
 	assert.Empty(t, waiting)
+}
+
+// TestGetWaitingJobsToResume_SkipsParentsWithPendingFanOuts is the regression
+// guard for the sequential-fan-out bug. A workflow that dispatches phase 1,
+// suspends, resumes, dispatches phase 2, suspends again has two rows in
+// fan_outs: #1 completed, #2 pending. The polling fallback must NOT resume
+// the parent — phase 2 is still running. Before the fix, the INNER JOIN
+// matched fan_out #1 alone and woke the parent every poll tick, causing the
+// workflow to spin and re-enter the phase loop forever while phase 2's child
+// quietly tried to make progress underneath. After the fix, the NOT EXISTS
+// guard requires every fan-out for the parent to have terminated.
+func TestGetWaitingJobsToResume_SkipsParentsWithPendingFanOuts(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	parent := newTestJob("default", "workflow.run")
+	require.NoError(t, s.Enqueue(ctx, parent))
+
+	got, err := s.Dequeue(ctx, []string{"default"}, "worker-1")
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	require.NoError(t, s.SuspendJob(ctx, got.ID, "worker-1"))
+
+	// Sequential fan-outs: phase 1 done, phase 2 still running.
+	fanOut1 := &core.FanOut{ParentJobID: parent.ID, TotalCount: 1, Status: core.FanOutCompleted}
+	require.NoError(t, s.CreateFanOut(ctx, fanOut1))
+	fanOut2 := &core.FanOut{ParentJobID: parent.ID, TotalCount: 1, Status: core.FanOutPending}
+	require.NoError(t, s.CreateFanOut(ctx, fanOut2))
+
+	waiting, err := s.GetWaitingJobsToResume(ctx)
+	require.NoError(t, err)
+	assert.Empty(t, waiting, "parent must not be eligible to resume while a later fan-out is still pending")
+}
+
+// TestGetWaitingJobsToResume_DeduplicatesParentsWithMultipleTerminatedFanOuts
+// guards against the parent appearing multiple times in the result when it
+// has more than one completed/failed fan-out (e.g. a workflow that ran phase
+// 1 and phase 2 successfully and is now waiting on phase 3). DISTINCT in the
+// query keeps the row count honest.
+func TestGetWaitingJobsToResume_DeduplicatesParentsWithMultipleTerminatedFanOuts(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	parent := newTestJob("default", "workflow.run")
+	require.NoError(t, s.Enqueue(ctx, parent))
+
+	got, err := s.Dequeue(ctx, []string{"default"}, "worker-1")
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	require.NoError(t, s.SuspendJob(ctx, got.ID, "worker-1"))
+
+	// Three terminated fan-outs, no pending — parent should appear once.
+	for _, status := range []core.FanOutStatus{core.FanOutCompleted, core.FanOutCompleted, core.FanOutFailed} {
+		require.NoError(t, s.CreateFanOut(ctx, &core.FanOut{
+			ParentJobID: parent.ID,
+			TotalCount:  1,
+			Status:      status,
+		}))
+	}
+
+	waiting, err := s.GetWaitingJobsToResume(ctx)
+	require.NoError(t, err)
+	require.Len(t, waiting, 1)
+	assert.Equal(t, parent.ID, waiting[0].ID)
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1826,7 +1898,7 @@ func TestCancelSubJobs_NoSubJobsReturnsZero(t *testing.T) {
 	// No sub-jobs were actually created for this fan-out.
 	cancelled, err := s.CancelSubJobs(ctx, fanOut.ID)
 	require.NoError(t, err)
-	assert.Equal(t, int64(0), cancelled)
+	assert.Empty(t, cancelled)
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -2099,7 +2171,7 @@ func TestCancelSubJobs_CancelsMultiplePending(t *testing.T) {
 
 	cancelled, err := s.CancelSubJobs(ctx, "fo-multi")
 	require.NoError(t, err)
-	assert.Equal(t, int64(3), cancelled)
+	assert.Len(t, cancelled, 3)
 
 	// Verify fan-out cancelled_count was updated.
 	updated, err := s.GetFanOut(ctx, "fo-multi")
@@ -2901,4 +2973,93 @@ func TestEnqueueBatch_ConcurrentUniqueKey_NoDuplicates(t *testing.T) {
 		assert.EqualValuesf(t, 1, byKey[k],
 			"UniqueKey %q has %d rows; concurrent EnqueueBatch produced duplicates", k, byKey[k])
 	}
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// FindOrphanedJobs
+// ──────────────────────────────────────────────────────────────────────────────
+
+// TestFindOrphanedJobs_FlagsReclaimedAndCancelled is the storage-level
+// contract test for the cross-worker cancellation feature. The audit
+// query must return IDs of jobs whose DB state indicates the caller no
+// longer owns them:
+//   - locked_by changed (reclaimed by another worker)
+//   - locked_by IS NULL (stale-lock reaper released)
+//   - status terminal (cancelled by a fan-out or completed by a replay)
+// and must NOT return jobs still legitimately owned by the caller.
+func TestFindOrphanedJobs_FlagsReclaimedAndCancelled(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	// Seed four jobs in different states. We'll claim the first two from
+	// worker-A's perspective and check the audit.
+	for i := 0; i < 4; i++ {
+		require.NoError(t, s.Enqueue(ctx, newTestJob("default", "t")))
+	}
+
+	// worker-A dequeues 2 jobs.
+	jobA, err := s.Dequeue(ctx, []string{"default"}, "worker-A")
+	require.NoError(t, err)
+	require.NotNil(t, jobA)
+	jobB, err := s.Dequeue(ctx, []string{"default"}, "worker-A")
+	require.NoError(t, err)
+	require.NotNil(t, jobB)
+	jobC, err := s.Dequeue(ctx, []string{"default"}, "worker-A")
+	require.NoError(t, err)
+	require.NotNil(t, jobC)
+	jobD, err := s.Dequeue(ctx, []string{"default"}, "worker-A")
+	require.NoError(t, err)
+	require.NotNil(t, jobD)
+
+	// jobA: still owned by worker-A → not orphaned.
+	// jobB: stolen by worker-B.
+	require.NoError(t, s.db.Model(&core.Job{}).
+		Where("id = ?", jobB.ID).
+		Update("locked_by", "worker-B").Error)
+	// jobC: lock released to nil (stale-lock reaper).
+	require.NoError(t, s.db.Model(&core.Job{}).
+		Where("id = ?", jobC.ID).
+		Updates(map[string]any{"locked_by": nil, "status": core.StatusPending}).Error)
+	// jobD: cancelled by a fan-out.
+	require.NoError(t, s.db.Model(&core.Job{}).
+		Where("id = ?", jobD.ID).
+		Update("status", core.StatusCancelled).Error)
+
+	orphaned, err := s.FindOrphanedJobs(ctx, []string{jobA.ID, jobB.ID, jobC.ID, jobD.ID}, "worker-A")
+	require.NoError(t, err)
+
+	// Convert to set for order-independent assertion.
+	got := map[string]bool{}
+	for _, id := range orphaned {
+		got[id] = true
+	}
+	assert.False(t, got[jobA.ID], "jobA is still owned, should not be orphaned")
+	assert.True(t, got[jobB.ID], "jobB was stolen, should be orphaned")
+	assert.True(t, got[jobC.ID], "jobC's lock was released, should be orphaned")
+	assert.True(t, got[jobD.ID], "jobD was cancelled, should be orphaned")
+}
+
+func TestFindOrphanedJobs_EmptyInputReturnsEmpty(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	orphaned, err := s.FindOrphanedJobs(ctx, nil, "worker-A")
+	require.NoError(t, err)
+	assert.Empty(t, orphaned)
+
+	orphaned, err = s.FindOrphanedJobs(ctx, []string{}, "worker-A")
+	require.NoError(t, err)
+	assert.Empty(t, orphaned)
+}
+
+func TestFindOrphanedJobs_UnknownIDsAreNotReturned(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	// Asking about IDs that don't exist must not cause errors and must
+	// not return those IDs (they're not in the DB, so not technically
+	// orphaned — they're just non-existent).
+	orphaned, err := s.FindOrphanedJobs(ctx, []string{"does-not-exist-1", "does-not-exist-2"}, "worker-A")
+	require.NoError(t, err)
+	assert.Empty(t, orphaned)
 }

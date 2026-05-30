@@ -7,6 +7,11 @@ import (
 	"github.com/jdziat/simple-durable-jobs/pkg/security"
 )
 
+// minStaleLockInterval is the floor for the stale-lock reaper cadence set via
+// WithStaleLockInterval. It guards against a pathologically tight reaper
+// hammering the database; the reaper itself can never be turned off.
+const minStaleLockInterval = 1 * time.Second
+
 // WorkerOption configures a Worker.
 type WorkerOption interface {
 	ApplyWorker(*WorkerConfig)
@@ -33,13 +38,36 @@ type WorkerConfig struct {
 	// If nil, uses a longer backoff config suitable for polling.
 	DequeueRetry *RetryConfig
 
-	// StaleLockInterval is how often to check for stale running jobs.
-	// Default: 5 minutes. Set to 0 to disable.
+	// StaleLockInterval is how often the worker checks for stale running jobs
+	// (jobs whose owning worker died) and reclaims them. The reaper is the
+	// only mechanism that recovers jobs from crashed workers, so it is always
+	// running and CANNOT be disabled — it can only be retuned. A non-positive
+	// value keeps the default; values below minStaleLockInterval are clamped
+	// up. Default: 5 minutes.
 	StaleLockInterval time.Duration
 
 	// StaleLockAge is how long a running job's lock must be expired before
 	// it is reclaimed (reset to pending). Default: 45 minutes (matches lock duration).
 	StaleLockAge time.Duration
+
+	// OwnershipAuditInterval is how often the worker checks whether any of
+	// its in-flight jobs have been cancelled (e.g. by a fan-out failure on
+	// another worker) or reclaimed (e.g. by a stale-lock reaper running on
+	// another worker). Any orphaned local handler has its context cancelled.
+	// This is the cross-worker counterpart of the same-worker cancellation
+	// that completeFanOut and reapStaleLocks do directly.
+	//
+	// Default: 5 seconds. Set to 0 to disable. Lower values reduce the
+	// cancellation latency for distributed fan-out failures but increase DB
+	// query rate; the query is bounded by len(runningJobs), so the cost
+	// scales with concurrency, not fleet size.
+	OwnershipAuditInterval time.Duration
+
+	// ownershipAuditSet records whether OwnershipAuditInterval was provided
+	// explicitly (via WithOwnershipAuditInterval). NewWorker needs this to
+	// tell "unset" (apply the 5s default) apart from an explicit 0, which
+	// the documented contract treats as "disable the audit".
+	ownershipAuditSet bool
 
 	// LockDuration is how long a job is locked when dequeued or heartbeated.
 	// Default: 45 minutes. If non-zero, the worker will configure the storage
@@ -133,10 +161,19 @@ func WithPollInterval(d time.Duration) WorkerOption {
 	})
 }
 
-// WithStaleLockInterval sets how often the worker checks for stale running jobs.
-// Default is 5 minutes. Set to 0 to disable the stale lock reaper.
+// WithStaleLockInterval sets how often the worker checks for stale running
+// jobs. The stale-lock reaper is what recovers jobs from crashed workers, so
+// it CANNOT be disabled: a non-positive duration is ignored (the default is
+// kept) and values below the 1s floor are clamped up to it. Default is 5
+// minutes.
 func WithStaleLockInterval(d time.Duration) WorkerOption {
 	return workerOptionFunc(func(c *WorkerConfig) {
+		if d <= 0 {
+			return // can't disable the reaper — keep whatever default applies
+		}
+		if d < minStaleLockInterval {
+			d = minStaleLockInterval
+		}
 		c.StaleLockInterval = d
 	})
 }
@@ -155,5 +192,19 @@ func WithStaleLockAge(d time.Duration) WorkerOption {
 func WithLockDuration(d time.Duration) WorkerOption {
 	return workerOptionFunc(func(c *WorkerConfig) {
 		c.LockDuration = d
+	})
+}
+
+// WithOwnershipAuditInterval sets how often the worker checks whether its
+// in-flight jobs have been cancelled or reclaimed by another worker.
+// Default is 5 seconds. Set to 0 to disable.
+//
+// Lower values reduce cross-worker cancellation latency but increase the DB
+// query rate. The query cost scales with this worker's concurrency
+// (len(runningJobs)), not with fleet size.
+func WithOwnershipAuditInterval(d time.Duration) WorkerOption {
+	return workerOptionFunc(func(c *WorkerConfig) {
+		c.OwnershipAuditInterval = d
+		c.ownershipAuditSet = true
 	})
 }

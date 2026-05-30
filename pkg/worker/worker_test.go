@@ -27,7 +27,7 @@ type mockStorage struct {
 	mu sync.Mutex
 
 	releaseCount    int64         // number of ReleaseStaleLocks calls
-	releasedCount   int64         // value returned by ReleaseStaleLocks
+	releasedIDs     []string      // IDs returned by ReleaseStaleLocks
 	releaseErr      error         // error returned by ReleaseStaleLocks
 	releaseDelay    time.Duration // optional artificial delay per call
 	dequeueFunc     func(ctx context.Context, queues []string, workerID string) (*core.Job, error)
@@ -42,7 +42,8 @@ type mockStorage struct {
 	incrementFailedFunc    func(ctx context.Context, fanOutID string) (*core.FanOut, error)
 	updateFanOutStatusFunc func(ctx context.Context, fanOutID string, status core.FanOutStatus) (bool, error)
 	resumeJobFunc          func(ctx context.Context, jobID string) (bool, error)
-	cancelSubJobsFunc      func(ctx context.Context, fanOutID string) (int64, error)
+	cancelSubJobsFunc      func(ctx context.Context, fanOutID string) ([]string, error)
+	findOrphanedFunc       func(jobIDs []string) ([]string, error)
 
 	// enqueue tracking
 	enqueueMu    sync.Mutex
@@ -112,14 +113,21 @@ func (m *mockStorage) Heartbeat(ctx context.Context, jobID string, workerID stri
 	return nil
 }
 
-func (m *mockStorage) ReleaseStaleLocks(_ context.Context, _ time.Duration) (int64, error) {
+func (m *mockStorage) ReleaseStaleLocks(_ context.Context, _ time.Duration) ([]string, error) {
 	if m.releaseDelay > 0 {
 		time.Sleep(m.releaseDelay)
 	}
 	m.mu.Lock()
 	m.releaseCount++
 	m.mu.Unlock()
-	return m.releasedCount, m.releaseErr
+	return m.releasedIDs, m.releaseErr
+}
+
+func (m *mockStorage) FindOrphanedJobs(_ context.Context, jobIDs []string, _ string) ([]string, error) {
+	if m.findOrphanedFunc != nil {
+		return m.findOrphanedFunc(jobIDs)
+	}
+	return nil, nil
 }
 
 func (m *mockStorage) GetJob(_ context.Context, _ string) (*core.Job, error) { return nil, nil }
@@ -173,11 +181,11 @@ func (m *mockStorage) GetSubJobResults(_ context.Context, _ string) ([]*core.Job
 	return nil, nil
 }
 
-func (m *mockStorage) CancelSubJobs(ctx context.Context, fanOutID string) (int64, error) {
+func (m *mockStorage) CancelSubJobs(ctx context.Context, fanOutID string) ([]string, error) {
 	if m.cancelSubJobsFunc != nil {
 		return m.cancelSubJobsFunc(ctx, fanOutID)
 	}
-	return 0, nil
+	return nil, nil
 }
 
 func (m *mockStorage) CancelSubJob(_ context.Context, _ string) (*core.FanOut, error) {
@@ -567,12 +575,25 @@ func TestWithStaleLockInterval_SetsValue(t *testing.T) {
 	assert.Equal(t, 10*time.Minute, config.StaleLockInterval)
 }
 
-func TestWithStaleLockInterval_ZeroDisablesReaper(t *testing.T) {
+func TestWithStaleLockInterval_NonPositiveIsIgnored(t *testing.T) {
+	// The reaper cannot be disabled, so a non-positive interval must leave the
+	// existing value untouched rather than zeroing it.
 	config := WorkerConfig{StaleLockInterval: 5 * time.Minute}
 
 	WithStaleLockInterval(0).ApplyWorker(&config)
+	assert.Equal(t, 5*time.Minute, config.StaleLockInterval, "zero must be ignored")
 
-	assert.Equal(t, time.Duration(0), config.StaleLockInterval)
+	WithStaleLockInterval(-1).ApplyWorker(&config)
+	assert.Equal(t, 5*time.Minute, config.StaleLockInterval, "negative must be ignored")
+}
+
+func TestWithStaleLockInterval_ClampsBelowFloor(t *testing.T) {
+	config := WorkerConfig{}
+
+	WithStaleLockInterval(10 * time.Millisecond).ApplyWorker(&config)
+
+	assert.Equal(t, minStaleLockInterval, config.StaleLockInterval,
+		"a sub-floor interval must be clamped up to the floor")
 }
 
 func TestWithStaleLockAge_SetsValue(t *testing.T) {
@@ -741,14 +762,12 @@ func TestRetryWithBackoff_DisableRetryFailsImmediately(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestWorker_StaleLockReaperCallsReleaseStaleLocks(t *testing.T) {
-	mock := &mockStorage{releasedCount: 0, releaseErr: nil}
+	mock := &mockStorage{releasedIDs: nil, releaseErr: nil}
 	q := queue.New(mock)
 
-	// Use a very short interval so the reaper fires quickly.
-	w := NewWorker(q,
-		WithStaleLockInterval(30*time.Millisecond),
-		WithStaleLockAge(1*time.Minute),
-	)
+	w := NewWorker(q, WithStaleLockAge(1*time.Minute))
+	// Drive the reaper fast (the public option floors at 1s; set directly).
+	w.config.StaleLockInterval = 30 * time.Millisecond
 
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
@@ -763,22 +782,31 @@ func TestWorker_StaleLockReaperCallsReleaseStaleLocks(t *testing.T) {
 		"ReleaseStaleLocks should have been called at least once")
 }
 
-func TestWorker_StaleLockReaperZeroIntervalDisabled(t *testing.T) {
+func TestWorker_StaleLockReaperAlwaysRuns(t *testing.T) {
 	mock := &mockStorage{}
 	q := queue.New(mock)
 
-	// Explicitly disable the reaper.
+	// WithStaleLockInterval(0) cannot disable the reaper — it is the only
+	// recovery path for crashed workers. The option is ignored and the 5m
+	// default applies, so the reaper is still scheduled (it just won't fire
+	// within this short window).
 	w := NewWorker(q, WithStaleLockInterval(0))
+	assert.Equal(t, 5*time.Minute, w.config.StaleLockInterval,
+		"a non-positive interval must fall back to the default, not disable the reaper")
 
-	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	// Prove it actually runs by driving it fast directly.
+	w.config.StaleLockInterval = 20 * time.Millisecond
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 
 	go func() { _ = w.Start(ctx) }()
 
-	<-ctx.Done()
+	time.Sleep(80 * time.Millisecond)
+	cancel()
 
-	assert.Equal(t, int64(0), mock.getReleaseCount(),
-		"ReleaseStaleLocks must not be called when interval is 0")
+	assert.GreaterOrEqual(t, mock.getReleaseCount(), int64(1),
+		"the stale-lock reaper must run; it cannot be disabled")
 }
 
 // ---------------------------------------------------------------------------
@@ -1173,10 +1201,9 @@ func TestWorker_StaleLockReaper_StopsOnContextCancel(t *testing.T) {
 	mock := &mockStorage{releaseDelay: 5 * time.Millisecond}
 
 	q := queue.New(mock)
-	w := NewWorker(q,
-		WithStaleLockInterval(20*time.Millisecond),
-		WithStaleLockAge(1*time.Minute),
-	)
+	w := NewWorker(q, WithStaleLockAge(1*time.Minute))
+	// Drive the reaper fast (the public option floors at 1s; set directly).
+	w.config.StaleLockInterval = 20 * time.Millisecond
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -1225,14 +1252,13 @@ func TestWorker_QueuesWithCapacity_MissingCounterTreatedAsAvailable(t *testing.T
 
 func TestWorker_StaleLockReaper_ErrorPathContinues(t *testing.T) {
 	mock := &mockStorage{
-		releasedCount: 0,
-		releaseErr:    errors.New("db unavailable"),
+		releasedIDs: nil,
+		releaseErr:  errors.New("db unavailable"),
 	}
 	q := queue.New(mock)
-	w := NewWorker(q,
-		WithStaleLockInterval(30*time.Millisecond),
-		WithStaleLockAge(1*time.Minute),
-	)
+	w := NewWorker(q, WithStaleLockAge(1*time.Minute))
+	// Drive the reaper fast (the public option floors at 1s; set directly).
+	w.config.StaleLockInterval = 30 * time.Millisecond
 
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
@@ -1247,14 +1273,13 @@ func TestWorker_StaleLockReaper_ErrorPathContinues(t *testing.T) {
 
 func TestWorker_StaleLockReaper_LogsWhenJobsReleased(t *testing.T) {
 	mock := &mockStorage{
-		releasedCount: 3, // pretend 3 jobs were released
-		releaseErr:    nil,
+		releasedIDs: []string{"job-a", "job-b", "job-c"}, // pretend 3 jobs were released
+		releaseErr:  nil,
 	}
 	q := queue.New(mock)
-	w := NewWorker(q,
-		WithStaleLockInterval(30*time.Millisecond),
-		WithStaleLockAge(1*time.Minute),
-	)
+	w := NewWorker(q, WithStaleLockAge(1*time.Minute))
+	// Drive the reaper fast (the public option floors at 1s; set directly).
+	w.config.StaleLockInterval = 30 * time.Millisecond
 
 	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
 	defer cancel()
@@ -2153,9 +2178,9 @@ func TestWorker_CompleteFanOut_CancelOnFailCancelsSubJobs(t *testing.T) {
 		resumeJobFunc: func(_ context.Context, _ string) (bool, error) {
 			return true, nil
 		},
-		cancelSubJobsFunc: func(_ context.Context, fanOutID string) (int64, error) {
+		cancelSubJobsFunc: func(_ context.Context, fanOutID string) ([]string, error) {
 			cancelSubJobsCalled <- fanOutID
-			return 2, nil
+			return []string{"sub-1", "sub-2"}, nil
 		},
 	}
 	q := queue.New(mock)
@@ -2388,4 +2413,480 @@ func TestWorker_PersistsHandlerResult(t *testing.T) {
 	var decoded map[string]any
 	require.NoError(t, json.Unmarshal(got, &decoded))
 	assert.Equal(t, "demo", decoded["name"])
+}
+
+// ---------------------------------------------------------------------------
+// runHeartbeat orphan-abandonment tests
+// ---------------------------------------------------------------------------
+
+// TestRunHeartbeat_AbandonsOrphanedJob is the regression for the 2026-05-19
+// production observation: a stale-lock reaper reclaimed two jobs from the
+// running worker, but the worker's heartbeat goroutines kept logging
+// "jobs: job not owned by this worker" every 2 minutes for HOURS, while
+// the orphaned handler goroutines continued doing work against jobs they
+// no longer owned. The fix: after orphanHeartbeatThreshold consecutive
+// ErrJobNotOwned responses, the heartbeat cancels the handler's context
+// via CancelJob and exits.
+func TestRunHeartbeat_AbandonsOrphanedJob(t *testing.T) {
+	mock := &mockStorage{}
+	var heartbeatCalls atomic.Int32
+	mock.heartbeatFunc = func(_ context.Context, _ string, _ string) error {
+		heartbeatCalls.Add(1)
+		return core.ErrJobNotOwned
+	}
+
+	q := queue.New(mock)
+	w := NewWorker(q, DisableRetry())
+	w.heartbeatInterval = 10 * time.Millisecond // drive the loop fast
+
+	// Register a fake running-job context so CancelJob has something to cancel.
+	jobCtx, jobCancel := context.WithCancel(context.Background())
+	defer jobCancel()
+	w.runningJobsMu.Lock()
+	w.runningJobs["test-job-id"] = jobCancel
+	w.runningJobsMu.Unlock()
+
+	// Drive the heartbeat loop until orphan threshold trips.
+	hbCtx, hbCancel := context.WithCancel(context.Background())
+	defer hbCancel()
+	done := make(chan struct{})
+	go func() {
+		w.runHeartbeat(hbCtx, &core.Job{ID: "test-job-id"})
+		close(done)
+	}()
+
+	// runHeartbeat should call CancelJob (cancelling jobCtx) within a
+	// few ticks past the threshold. Give it generous slack.
+	select {
+	case <-jobCtx.Done():
+		// success — orphan threshold tripped, handler context cancelled
+	case <-time.After(2 * time.Second):
+		t.Fatal("runHeartbeat did not cancel orphaned handler within 2s")
+	}
+
+	// runHeartbeat itself should also return after cancelling the handler.
+	select {
+	case <-done:
+		// success — goroutine exited; no more "heartbeat failed" log spam
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("runHeartbeat did not exit after abandoning job")
+	}
+
+	// Sanity: it should have called Heartbeat at least orphanHeartbeatThreshold
+	// times before giving up.
+	if got := heartbeatCalls.Load(); int(got) < orphanHeartbeatThreshold {
+		t.Errorf("heartbeat tried %d times before abandoning; want at least %d",
+			got, orphanHeartbeatThreshold)
+	}
+}
+
+// TestRunHeartbeat_TransientErrorDoesNotAbandon confirms a transient
+// non-ownership error (e.g. DB unreachable) doesn't trip the orphan
+// threshold. The counter only advances on ErrJobNotOwned specifically.
+func TestRunHeartbeat_TransientErrorDoesNotAbandon(t *testing.T) {
+	mock := &mockStorage{}
+	var heartbeatCalls atomic.Int32
+	transientErr := errors.New("db unreachable")
+	mock.heartbeatFunc = func(_ context.Context, _ string, _ string) error {
+		heartbeatCalls.Add(1)
+		return transientErr
+	}
+
+	q := queue.New(mock)
+	w := NewWorker(q, DisableRetry())
+	w.heartbeatInterval = 10 * time.Millisecond
+
+	jobCtx, jobCancel := context.WithCancel(context.Background())
+	defer jobCancel()
+	w.runningJobsMu.Lock()
+	w.runningJobs["transient-job"] = jobCancel
+	w.runningJobsMu.Unlock()
+
+	hbCtx, hbCancel := context.WithCancel(context.Background())
+	defer hbCancel()
+	go w.runHeartbeat(hbCtx, &core.Job{ID: "transient-job"})
+
+	// Let the heartbeat tick several times.
+	time.Sleep(150 * time.Millisecond)
+
+	// jobCtx must NOT be cancelled — transient errors don't trip orphan.
+	select {
+	case <-jobCtx.Done():
+		t.Fatal("transient error wrongly tripped orphan abandonment")
+	default:
+		// expected: handler context still live
+	}
+
+	if heartbeatCalls.Load() < int32(orphanHeartbeatThreshold)+2 {
+		t.Errorf("expected several heartbeat attempts, got %d", heartbeatCalls.Load())
+	}
+}
+
+// TestRunHeartbeat_SuccessResetsCounter confirms that a single success
+// after some orphan errors resets the orphan counter — so a brief
+// ownership blip doesn't accumulate toward eventual abandonment if the
+// owner reclaims the job in time.
+func TestRunHeartbeat_SuccessResetsCounter(t *testing.T) {
+	mock := &mockStorage{}
+	var calls atomic.Int32
+	mock.heartbeatFunc = func(_ context.Context, _ string, _ string) error {
+		n := calls.Add(1)
+		// Return ErrJobNotOwned for the first 2 calls, then succeed, then
+		// orphan again. The counter should reset after the success, so
+		// we shouldn't trip abandonment until 3 MORE orphan responses
+		// pile up after the success.
+		if n <= 2 {
+			return core.ErrJobNotOwned
+		}
+		if n == 3 {
+			return nil
+		}
+		return core.ErrJobNotOwned
+	}
+
+	q := queue.New(mock)
+	w := NewWorker(q, DisableRetry())
+	w.heartbeatInterval = 10 * time.Millisecond
+
+	jobCtx, jobCancel := context.WithCancel(context.Background())
+	defer jobCancel()
+	w.runningJobsMu.Lock()
+	w.runningJobs["blip-job"] = jobCancel
+	w.runningJobsMu.Unlock()
+
+	hbCtx, hbCancel := context.WithCancel(context.Background())
+	defer hbCancel()
+	done := make(chan struct{})
+	go func() {
+		w.runHeartbeat(hbCtx, &core.Job{ID: "blip-job"})
+		close(done)
+	}()
+
+	// Should still eventually abandon — but the success at call #3 resets
+	// the counter, so it takes 3 more orphan errors (calls 4, 5, 6) to
+	// trip abandonment. That's call #6 minimum.
+	select {
+	case <-jobCtx.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("runHeartbeat did not abandon after orphan persisted post-success")
+	}
+
+	if got := calls.Load(); got < 6 {
+		t.Errorf("abandoned at call %d; expected >= 6 because success at call 3 should have reset the counter", got)
+	}
+
+	<-done
+}
+
+// TestCompleteFanOut_CancelsLocalSubJobHandlers verifies the fix for the
+// 2026-05-19 production observation: when a fan-out fails with
+// CancelOnFail=true, the in-flight sub-job handlers running on this worker
+// must have their contexts cancelled. The old code only updated DB rows,
+// leaving the handler goroutines running for as long as it took their own
+// heartbeats to notice they'd been reclaimed.
+func TestCompleteFanOut_CancelsLocalSubJobHandlers(t *testing.T) {
+	mock := &mockStorage{}
+	mock.cancelSubJobsFunc = func(_ context.Context, fanOutID string) ([]string, error) {
+		return []string{"sub-a", "sub-b", "sub-c"}, nil
+	}
+	mock.updateFanOutStatusFunc = func(_ context.Context, _ string, _ core.FanOutStatus) (bool, error) {
+		return true, nil
+	}
+	mock.resumeJobFunc = func(_ context.Context, _ string) (bool, error) {
+		return true, nil
+	}
+
+	q := queue.New(mock)
+	w := NewWorker(q, DisableRetry())
+
+	// Pre-populate the runningJobs map with the local sub-jobs.
+	cancelCalls := make(map[string]int)
+	for _, id := range []string{"sub-a", "sub-b"} {
+		id := id
+		w.runningJobsMu.Lock()
+		w.runningJobs[id] = func() { cancelCalls[id]++ }
+		w.runningJobsMu.Unlock()
+	}
+	// sub-c is intentionally NOT in this worker's runningJobs — it's
+	// "running on another worker." Cancellation for cross-worker
+	// sub-jobs goes through the heartbeat-abandon path instead.
+
+	fo := &core.FanOut{
+		ID:           "fo-test",
+		ParentJobID:  "parent-1",
+		CancelOnFail: true,
+	}
+
+	err := w.completeFanOut(context.Background(), fo, core.FanOutFailed)
+	require.NoError(t, err)
+
+	assert.Equal(t, 1, cancelCalls["sub-a"], "local sub-a context should have been cancelled exactly once")
+	assert.Equal(t, 1, cancelCalls["sub-b"], "local sub-b context should have been cancelled exactly once")
+	_, hasC := cancelCalls["sub-c"]
+	assert.False(t, hasC, "sub-c was not in this worker's runningJobs; should not have been cancelled locally")
+}
+
+// TestReapStaleLocks_CancelsLocalHandlersOfReleasedJobs verifies that when
+// the stale-lock reaper releases locks on jobs whose heartbeats are dead,
+// any local in-flight handlers for those jobs also get their contexts
+// cancelled — instead of running forever until their own heartbeat
+// abandons (which can be 6+ minutes).
+func TestReapStaleLocks_CancelsLocalHandlersOfReleasedJobs(t *testing.T) {
+	mock := &mockStorage{}
+	mock.releasedIDs = []string{"orphan-1", "orphan-2"}
+
+	q := queue.New(mock)
+	w := NewWorker(q, DisableRetry())
+	// Drive the reaper fast. The public WithStaleLockInterval enforces a 1s
+	// floor, so set the cadence directly (the reaper reads config at startup).
+	w.config.StaleLockInterval = 10 * time.Millisecond
+
+	// Counters are incremented from the reaper goroutine (via CancelJob's
+	// stored func) and read from the test goroutine, so they must be atomic.
+	var orphan1, orphan2 atomic.Int32
+	w.runningJobsMu.Lock()
+	w.runningJobs["orphan-1"] = func() { orphan1.Add(1) }
+	w.runningJobs["orphan-2"] = func() { orphan2.Add(1) }
+	w.runningJobsMu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go w.reapStaleLocks(ctx)
+
+	// Give the reaper a couple of ticks.
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+
+	assert.GreaterOrEqual(t, orphan1.Load(), int32(1), "orphan-1 should have been cancelled")
+	assert.GreaterOrEqual(t, orphan2.Load(), int32(1), "orphan-2 should have been cancelled")
+}
+
+// ---------------------------------------------------------------------------
+// runOwnershipAudit cross-worker cancellation tests
+// ---------------------------------------------------------------------------
+
+// TestOwnershipAudit_CancelsOrphanedLocalHandlers verifies the cross-worker
+// case: when another worker cancels or reclaims one of our running jobs,
+// the audit goroutine detects it via FindOrphanedJobs and cancels the
+// local handler context.
+//
+// Direct simulation: register two "running" jobs in this worker's map,
+// have the mock return one of them as orphaned, and confirm only THAT
+// one's context is cancelled.
+func TestOwnershipAudit_CancelsOrphanedLocalHandlers(t *testing.T) {
+	mock := &mockStorage{}
+	mock.findOrphanedFunc = func(jobIDs []string) ([]string, error) {
+		// "job-mine" is still ours; "job-stolen" is orphaned.
+		for _, id := range jobIDs {
+			if id == "job-stolen" {
+				return []string{"job-stolen"}, nil
+			}
+		}
+		return nil, nil
+	}
+
+	q := queue.New(mock)
+	w := NewWorker(q,
+		DisableRetry(),
+		WithOwnershipAuditInterval(10*time.Millisecond),
+	)
+
+	// Counters are incremented from the audit goroutine (via CancelJob's
+	// stored func) and read from the test goroutine, so they must be atomic.
+	var mineCancelled, stolenCancelled atomic.Int32
+	w.runningJobsMu.Lock()
+	w.runningJobs["job-mine"] = func() { mineCancelled.Add(1) }
+	w.runningJobs["job-stolen"] = func() { stolenCancelled.Add(1) }
+	w.runningJobsMu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go w.runOwnershipAudit(ctx)
+
+	// Give the audit a couple of ticks.
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+
+	assert.GreaterOrEqual(t, stolenCancelled.Load(), int32(1), "stolen job's context should have been cancelled")
+	assert.Equal(t, int32(0), mineCancelled.Load(), "still-owned job's context must not have been touched")
+}
+
+// TestOwnershipAudit_NoOpWhenNoOrphans confirms the audit doesn't gratuitously
+// cancel anything when FindOrphanedJobs returns empty. Defense against a
+// regression that would falsely flag healthy jobs and shred the running set.
+func TestOwnershipAudit_NoOpWhenNoOrphans(t *testing.T) {
+	mock := &mockStorage{}
+	var auditCalls atomic.Int32
+	mock.findOrphanedFunc = func(_ []string) ([]string, error) {
+		auditCalls.Add(1)
+		return nil, nil
+	}
+
+	q := queue.New(mock)
+	w := NewWorker(q,
+		DisableRetry(),
+		WithOwnershipAuditInterval(5*time.Millisecond),
+	)
+
+	cancelled := 0
+	w.runningJobsMu.Lock()
+	w.runningJobs["healthy-1"] = func() { cancelled++ }
+	w.runningJobs["healthy-2"] = func() { cancelled++ }
+	w.runningJobsMu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go w.runOwnershipAudit(ctx)
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+
+	assert.GreaterOrEqual(t, auditCalls.Load(), int32(3), "audit should have run several times")
+	assert.Equal(t, 0, cancelled, "no orphans → no cancellations")
+}
+
+// TestOwnershipAudit_SkipsQueryWhenNoRunningJobs is the cheapest-tick test:
+// when the worker has nothing in flight, the audit must not query at all.
+// Important for fleet-wide DB load when most workers are idle.
+func TestOwnershipAudit_SkipsQueryWhenNoRunningJobs(t *testing.T) {
+	mock := &mockStorage{}
+	var queries atomic.Int32
+	mock.findOrphanedFunc = func(_ []string) ([]string, error) {
+		queries.Add(1)
+		return nil, nil
+	}
+
+	q := queue.New(mock)
+	w := NewWorker(q,
+		DisableRetry(),
+		WithOwnershipAuditInterval(5*time.Millisecond),
+	)
+	// runningJobs is empty.
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go w.runOwnershipAudit(ctx)
+	time.Sleep(40 * time.Millisecond)
+	cancel()
+
+	assert.Equal(t, int32(0), queries.Load(),
+		"audit must not call FindOrphanedJobs when runningJobs is empty")
+}
+
+// TestOwnershipAudit_IntervalConfiguration locks in the documented contract
+// for OwnershipAuditInterval: unset → 5s default, explicit value honored,
+// and an explicit 0 actually disables the audit. The last case is the
+// regression: NewWorker used to clobber a deliberate 0 back to 5s, so
+// "set to 0 to disable" never worked and the goroutine always ran.
+func TestOwnershipAudit_IntervalConfiguration(t *testing.T) {
+	q := queue.New(&mockStorage{})
+
+	t.Run("unset applies 5s default", func(t *testing.T) {
+		w := NewWorker(q)
+		assert.Equal(t, 5*time.Second, w.config.OwnershipAuditInterval)
+	})
+
+	t.Run("explicit value is honored", func(t *testing.T) {
+		w := NewWorker(q, WithOwnershipAuditInterval(250*time.Millisecond))
+		assert.Equal(t, 250*time.Millisecond, w.config.OwnershipAuditInterval)
+	})
+
+	t.Run("explicit zero disables the audit", func(t *testing.T) {
+		w := NewWorker(q, WithOwnershipAuditInterval(0))
+		assert.Equal(t, time.Duration(0), w.config.OwnershipAuditInterval,
+			"WithOwnershipAuditInterval(0) must keep the interval at 0 so Start() skips the audit goroutine")
+	})
+}
+
+// TestStaleLockInterval_IntervalConfiguration locks in the contract for
+// StaleLockInterval: unset → 5m default, an explicit value above the floor is
+// honored, sub-floor values clamp up to the floor, and a non-positive value
+// CANNOT disable the reaper (it falls back to the default). The reaper is the
+// only recovery path for crashed workers, so it is intentionally not
+// disable-able.
+func TestStaleLockInterval_IntervalConfiguration(t *testing.T) {
+	q := queue.New(&mockStorage{})
+
+	t.Run("unset applies 5m default", func(t *testing.T) {
+		w := NewWorker(q)
+		assert.Equal(t, 5*time.Minute, w.config.StaleLockInterval)
+	})
+
+	t.Run("explicit value above the floor is honored", func(t *testing.T) {
+		w := NewWorker(q, WithStaleLockInterval(30*time.Second))
+		assert.Equal(t, 30*time.Second, w.config.StaleLockInterval)
+	})
+
+	t.Run("sub-floor value clamps up to the floor", func(t *testing.T) {
+		w := NewWorker(q, WithStaleLockInterval(10*time.Millisecond))
+		assert.Equal(t, minStaleLockInterval, w.config.StaleLockInterval,
+			"a positive interval below the floor must be clamped up, not accepted as-is")
+	})
+
+	t.Run("non-positive cannot disable; falls back to default", func(t *testing.T) {
+		w := NewWorker(q, WithStaleLockInterval(0))
+		assert.Equal(t, 5*time.Minute, w.config.StaleLockInterval,
+			"WithStaleLockInterval(0) must not disable the reaper; the default applies")
+	})
+}
+
+// ---------------------------------------------------------------------------
+// Lost-ownership side-effect suppression (finding A)
+// ---------------------------------------------------------------------------
+
+// TestHandleError_NotOwnedSkipsFanOutAccounting verifies that when a handler
+// errors — e.g. because its context was cancelled by the orphan-abandon or
+// ownership-audit path — and storage reports the job is no longer owned by
+// this worker, handleError does NOT touch the fan-out counters. Otherwise the
+// orphaned worker would race the new owner and double-count the fan-out, the
+// exact corruption this branch's cancellation work aims to end.
+func TestHandleError_NotOwnedSkipsFanOutAccounting(t *testing.T) {
+	mock := &mockStorage{}
+	mock.failFunc = func(_ context.Context, _, _, _ string, _ *time.Time) error {
+		return core.ErrJobNotOwned
+	}
+	var incrementCalled atomic.Int32
+	mock.incrementFailedFunc = func(_ context.Context, _ string) (*core.FanOut, error) {
+		incrementCalled.Add(1)
+		return nil, nil
+	}
+
+	q := queue.New(mock)
+	w := NewWorker(q, DisableRetry())
+
+	fanOutID := "fo-1"
+	// Attempt >= MaxRetries → terminal path (the one that does fan-out accounting).
+	job := &core.Job{ID: "sub-1", FanOutID: &fanOutID, Attempt: 5, MaxRetries: 3}
+
+	w.handleError(context.Background(), job, errors.New("boom"))
+
+	assert.Equal(t, int32(0), incrementCalled.Load(),
+		"a job we no longer own must not write to the fan-out counters")
+}
+
+// TestHandleError_OwnedStillAccountsFanOut guards the refactor: when the job IS
+// still owned (Fail succeeds), the terminal path must still record the failure
+// against the fan-out so the parent isn't left stuck in 'waiting'.
+func TestHandleError_OwnedStillAccountsFanOut(t *testing.T) {
+	mock := &mockStorage{}
+	mock.failFunc = func(_ context.Context, _, _, _ string, _ *time.Time) error {
+		return nil // owned: Fail succeeds
+	}
+	var incrementCalled atomic.Int32
+	mock.incrementFailedFunc = func(_ context.Context, _ string) (*core.FanOut, error) {
+		incrementCalled.Add(1)
+		// Return a fan-out that is NOT yet complete so checkFanOutCompletion
+		// is a no-op and we don't pull in the completeFanOut machinery.
+		return &core.FanOut{ID: "fo-1", TotalCount: 5, FailedCount: 1, Strategy: core.StrategyCollectAll}, nil
+	}
+
+	q := queue.New(mock)
+	w := NewWorker(q, DisableRetry())
+
+	fanOutID := "fo-1"
+	job := &core.Job{ID: "sub-1", FanOutID: &fanOutID, Attempt: 5, MaxRetries: 3}
+
+	w.handleError(context.Background(), job, errors.New("boom"))
+
+	assert.Equal(t, int32(1), incrementCalled.Load(),
+		"a job we still own must record its failure against the fan-out")
 }

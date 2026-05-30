@@ -38,6 +38,13 @@ type Worker struct {
 	queueRunning map[string]*atomic.Int32 // queue name -> active count
 	queueJobID   map[string]string        // job ID -> queue name (for decrement on completion)
 	queueJobIDMu sync.Mutex
+
+	// heartbeatInterval is the tick rate for runHeartbeat. Defaults to
+	// 2 minutes; tests override with a sub-second value. Not exposed via
+	// WorkerConfig because changing it in production would change lock
+	// contention semantics — the 2-minute default is paired with the
+	// 45-minute lock expiry assumed elsewhere.
+	heartbeatInterval time.Duration
 }
 
 // NewWorker creates a new worker for the given queue.
@@ -74,8 +81,10 @@ func NewWorker(q *queue.Queue, opts ...WorkerOption) *Worker {
 		config.DequeueRetry = &dequeueCfg
 	}
 
-	// Set default stale lock reaper config
-	if config.StaleLockInterval == 0 {
+	// Set default stale lock reaper cadence. The reaper always runs (it
+	// recovers jobs from crashed workers and cannot be disabled), so a
+	// non-positive interval simply falls back to the 5m default.
+	if config.StaleLockInterval <= 0 {
 		config.StaleLockInterval = 5 * time.Minute
 	}
 	if config.StaleLockAge == 0 {
@@ -99,13 +108,22 @@ func NewWorker(q *queue.Queue, opts ...WorkerOption) *Worker {
 		queueRunning[name] = &atomic.Int32{}
 	}
 
+	// Default OwnershipAuditInterval to 5s only when it was never set. An
+	// explicit WithOwnershipAuditInterval(0) is honored as "disable" (the
+	// Start guard below skips the goroutine); without the ownershipAuditSet
+	// flag we couldn't tell that apart from "unset".
+	if !config.ownershipAuditSet && config.OwnershipAuditInterval == 0 {
+		config.OwnershipAuditInterval = 5 * time.Second
+	}
+
 	return &Worker{
-		queue:        q,
-		config:       config,
-		logger:       slog.Default(),
-		runningJobs:  make(map[string]context.CancelFunc),
-		queueRunning: queueRunning,
-		queueJobID:   make(map[string]string),
+		queue:             q,
+		config:            config,
+		logger:            slog.Default(),
+		runningJobs:       make(map[string]context.CancelFunc),
+		queueRunning:      queueRunning,
+		queueJobID:        make(map[string]string),
+		heartbeatInterval: 2 * time.Minute,
 	}
 }
 
@@ -128,9 +146,17 @@ func (w *Worker) Start(ctx context.Context) error {
 	// Start polling for waiting jobs (fan-out fallback)
 	go w.pollWaitingJobs(ctx)
 
-	// Start stale lock reaper to reclaim stuck running jobs
-	if w.config.StaleLockInterval > 0 {
-		go w.reapStaleLocks(ctx)
+	// Start the stale-lock reaper to reclaim jobs whose owning worker died.
+	// This always runs — it's the only recovery path for crashed workers, so
+	// it cannot be disabled (NewWorker guarantees a positive interval).
+	go w.reapStaleLocks(ctx)
+
+	// Start ownership audit to cancel local handlers for jobs cancelled
+	// or reclaimed by other workers. Same-worker cancellation is handled
+	// directly by completeFanOut/reapStaleLocks; this is the cross-worker
+	// counterpart.
+	if w.config.OwnershipAuditInterval > 0 {
+		go w.runOwnershipAudit(ctx)
 	}
 
 	for i := 0; i < totalConcurrency; i++ {
@@ -249,7 +275,9 @@ func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 	h, ok := w.queue.GetHandler(job.Type)
 	if !ok {
 		w.logger.Error("no handler for job", "type", job.Type)
-		w.failWithRetry(ctx, job.ID, fmt.Sprintf("no handler for %s", job.Type), nil)
+		// No fan-out side effects here, so the lost-ownership return value is
+		// not actionable — failWithRetry already logs any real failure.
+		_ = w.failWithRetry(ctx, job.ID, fmt.Sprintf("no handler for %s", job.Type), nil)
 		return
 	}
 
@@ -312,6 +340,15 @@ func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 			}
 		}
 		completeErr := w.completeWithRetry(ctx, job.ID)
+		if errors.Is(completeErr, core.ErrJobNotOwned) {
+			// The job was reclaimed, cancelled, or already completed by
+			// another path while this handler was running. The worker that
+			// now owns it is responsible for fan-out accounting; doing it
+			// here would double-count the fan-out and race the new owner.
+			w.logger.Warn("job no longer owned at completion; skipping completion handling",
+				"job_id", job.ID)
+			return
+		}
 		if completeErr != nil {
 			w.logger.Error("failed to complete job after retries", "job_id", job.ID, "error", completeErr)
 			// Still handle sub-job completion — the work is done even if
@@ -326,6 +363,7 @@ func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 		// Handle sub-job completion (resume parent if needed) — always run
 		// regardless of whether Complete() succeeded, to prevent orphaned
 		// parent jobs stuck in 'waiting' with all sub-jobs actually done.
+		// (The lost-ownership case returned above.)
 		if err := w.handleSubJobCompletion(ctx, job, completeErr == nil); err != nil {
 			w.logger.Error("failed to handle sub-job completion", "job_id", job.ID, "error", err)
 		}
@@ -339,12 +377,50 @@ func (w *Worker) completeWithRetry(ctx context.Context, jobID string) error {
 	})
 }
 
+// orphanHeartbeatThreshold is the number of consecutive Heartbeat calls
+// returning ErrJobNotOwned that runHeartbeat will tolerate before
+// concluding the job has been reclaimed by another worker (via stale-lock
+// recovery) and cancelling the in-flight handler.
+//
+// Set to 3 so a transient ownership blip — e.g. a clock skew between the
+// worker and the DB at the moment of a lock-renewal race — doesn't kill
+// a legitimate run. With a 2-minute tick, 3 consecutive failures = 6
+// minutes of confirmed orphaning, which is well past any normal lock
+// contention window.
+const orphanHeartbeatThreshold = 3
+
 // runHeartbeat periodically extends the job lock during execution.
 // This prevents long-running jobs from being reclaimed as stale.
+//
+// If the heartbeat repeatedly receives core.ErrJobNotOwned, the handler
+// is presumed orphaned (the stale-lock reaper at line 708 has released
+// the lock and another worker has picked the job up). In that case
+// runHeartbeat cancels the handler's context via CancelJob and returns,
+// so:
+//  1. The handler stops doing wasted work against a job it doesn't own.
+//  2. The "heartbeat failed after retries / jobs: job not owned by this
+//     worker" log line stops repeating forever — observed in production
+//     on 2026-05-19 firing every ~2 minutes for HOURS after the job
+//     was reclaimed.
+//  3. Activities the orphaned handler had spawned in goroutines (e.g.
+//     FireAndForgetNotification) stop racing the new handler's state
+//     transitions.
+//
+// Non-ownership errors (DB unreachable, retry exhaustion on a transient
+// error) are logged but don't trip the counter — those are operational
+// issues to fix elsewhere, not orphaning.
 func (w *Worker) runHeartbeat(ctx context.Context, job *core.Job) {
-	// Heartbeat every 2 minutes (lock is 45 minutes, so plenty of buffer)
-	ticker := time.NewTicker(2 * time.Minute)
+	// Heartbeat every 2 minutes (lock is 45 minutes, so plenty of buffer).
+	// Tests override w.heartbeatInterval directly to drive the loop at
+	// sub-second speed.
+	interval := w.heartbeatInterval
+	if interval <= 0 {
+		interval = 2 * time.Minute
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+
+	var consecutiveOrphanErrs int
 
 	for {
 		select {
@@ -359,10 +435,29 @@ func (w *Worker) runHeartbeat(ctx context.Context, job *core.Job) {
 			err := retryWithBackoff(ctx, *w.config.StorageRetry, func() error {
 				return w.queue.Storage().Heartbeat(ctx, job.ID, w.config.WorkerID)
 			})
-			if err != nil {
-				w.logger.Warn("heartbeat failed after retries", "job_id", job.ID, "error", err)
-			} else {
+			switch {
+			case err == nil:
+				consecutiveOrphanErrs = 0
 				w.logger.Debug("heartbeat sent", "job_id", job.ID)
+			case errors.Is(err, core.ErrJobNotOwned):
+				consecutiveOrphanErrs++
+				w.logger.Warn("heartbeat failed: job not owned by this worker",
+					"job_id", job.ID,
+					"consecutive_orphan_errs", consecutiveOrphanErrs,
+					"threshold", orphanHeartbeatThreshold)
+				if consecutiveOrphanErrs >= orphanHeartbeatThreshold {
+					w.logger.Error("heartbeat abandoning orphaned job — cancelling handler",
+						"job_id", job.ID,
+						"consecutive_orphan_errs", consecutiveOrphanErrs)
+					w.CancelJob(job.ID)
+					return
+				}
+			default:
+				// Some other error (DB down, retry exhaustion on a transient
+				// failure, etc.). Log but don't trip the orphan counter — these
+				// are operational concerns, not ownership transfer.
+				consecutiveOrphanErrs = 0
+				w.logger.Warn("heartbeat failed after retries", "job_id", job.ID, "error", err)
 			}
 		}
 	}
@@ -429,62 +524,66 @@ func (w *Worker) executeHandler(ctx context.Context, job *core.Job, h *handler.H
 }
 
 func (w *Worker) handleError(ctx context.Context, job *core.Job, err error) {
-	// Check for NoRetry
+	// Decide the disposition: a scheduled retry (retryAt != nil) or a terminal
+	// failure (retryAt == nil). NoRetry always wins; otherwise we retry while
+	// attempts remain. This mirrors the original branch-by-branch logic.
+	var retryAt *time.Time
 	var noRetry *core.NoRetryError
-	if errors.As(err, &noRetry) {
-		w.failWithRetry(ctx, job.ID, err.Error(), nil)
-		w.queue.CallFailHooks(ctx, job, err)
-		// Emit failure event
-		w.queue.Emit(&core.JobFailed{Job: job, Error: err, Timestamp: time.Now()})
-		// Handle sub-job failure (resume parent if needed)
-		if handleErr := w.handleSubJobCompletion(ctx, job, false); handleErr != nil {
-			w.logger.Error("failed to handle sub-job failure", "job_id", job.ID, "error", handleErr)
-		}
+	var retryAfter *core.RetryAfterError
+	switch {
+	case errors.As(err, &noRetry):
+		// terminal — NoRetry overrides any remaining attempts.
+	case errors.As(err, &retryAfter) && job.Attempt < job.MaxRetries:
+		t := time.Now().Add(retryAfter.Delay)
+		retryAt = &t
+	case job.Attempt < job.MaxRetries:
+		t := time.Now().Add(w.calculateBackoff(job.Attempt))
+		retryAt = &t
+	default:
+		// terminal — attempts exhausted.
+	}
+
+	// Persist the outcome first. If storage reports the job is no longer owned
+	// by this worker, it was reclaimed or cancelled by another path (the
+	// stale-lock reaper, a fan-out cancel, or another worker in the fleet —
+	// often the very reason this handler's context was cancelled). The owner
+	// is now responsible for hooks, events, and fan-out accounting; running
+	// them here would race the new owner's state writes and double-count the
+	// fan-out. So skip all side effects when ownership is lost.
+	if failErr := w.failWithRetry(ctx, job.ID, err.Error(), retryAt); errors.Is(failErr, core.ErrJobNotOwned) {
+		w.logger.Warn("job no longer owned by this worker; skipping failure handling",
+			"job_id", job.ID, "error", err)
 		return
 	}
 
-	// Check for RetryAfter
-	var retryAfter *core.RetryAfterError
-	if errors.As(err, &retryAfter) {
-		if job.Attempt < job.MaxRetries {
-			retryAt := time.Now().Add(retryAfter.Delay)
-			w.failWithRetry(ctx, job.ID, err.Error(), &retryAt)
-			w.queue.CallRetryHooks(ctx, job, job.Attempt, err)
-			// Emit retry event
-			w.queue.Emit(&core.JobRetrying{Job: job, Attempt: job.Attempt, Error: err, NextRunAt: retryAt, Timestamp: time.Now()})
-			return
-		}
+	if retryAt != nil {
+		w.queue.CallRetryHooks(ctx, job, job.Attempt, err)
+		w.queue.Emit(&core.JobRetrying{Job: job, Attempt: job.Attempt, Error: err, NextRunAt: *retryAt, Timestamp: time.Now()})
+		return
 	}
 
-	// Normal retry logic
-	if job.Attempt < job.MaxRetries {
-		backoff := w.calculateBackoff(job.Attempt)
-		retryAt := time.Now().Add(backoff)
-		w.failWithRetry(ctx, job.ID, err.Error(), &retryAt)
-		w.queue.CallRetryHooks(ctx, job, job.Attempt, err)
-		// Emit retry event
-		w.queue.Emit(&core.JobRetrying{Job: job, Attempt: job.Attempt, Error: err, NextRunAt: retryAt, Timestamp: time.Now()})
-	} else {
-		w.failWithRetry(ctx, job.ID, err.Error(), nil)
-		w.queue.CallFailHooks(ctx, job, err)
-		// Emit failure event
-		w.queue.Emit(&core.JobFailed{Job: job, Error: err, Timestamp: time.Now()})
-
-		// Handle sub-job failure (resume parent if needed)
-		if handleErr := w.handleSubJobCompletion(ctx, job, false); handleErr != nil {
-			w.logger.Error("failed to handle sub-job failure", "job_id", job.ID, "error", handleErr)
-		}
+	// Terminal failure.
+	w.queue.CallFailHooks(ctx, job, err)
+	w.queue.Emit(&core.JobFailed{Job: job, Error: err, Timestamp: time.Now()})
+	// Handle sub-job failure (resume parent if needed).
+	if handleErr := w.handleSubJobCompletion(ctx, job, false); handleErr != nil {
+		w.logger.Error("failed to handle sub-job failure", "job_id", job.ID, "error", handleErr)
 	}
 }
 
 // failWithRetry marks a job as failed with retry on transient storage failures.
-func (w *Worker) failWithRetry(ctx context.Context, jobID string, errMsg string, retryAt *time.Time) {
+// It returns the final storage error so callers can detect a lost-ownership
+// outcome (core.ErrJobNotOwned) and skip downstream side effects.
+func (w *Worker) failWithRetry(ctx context.Context, jobID string, errMsg string, retryAt *time.Time) error {
 	err := retryWithBackoff(ctx, *w.config.StorageRetry, func() error {
 		return w.queue.Storage().Fail(ctx, jobID, w.config.WorkerID, errMsg, retryAt)
 	})
-	if err != nil {
+	// ErrJobNotOwned is an expected, caller-handled outcome — don't log it as
+	// an error here (the caller decides what to do about lost ownership).
+	if err != nil && !errors.Is(err, core.ErrJobNotOwned) {
 		w.logger.Error("failed to mark job as failed after retries", "job_id", jobID, "error", err)
 	}
+	return err
 }
 
 // handleSubJobCompletion updates fan-out counters and resumes parent if needed.
@@ -579,10 +678,30 @@ func (w *Worker) completeFanOut(ctx context.Context, fo *core.FanOut, status cor
 		return nil
 	}
 
-	// Cancel remaining sub-jobs if needed
+	// Cancel remaining sub-jobs if needed. CancelSubJobs only updates the
+	// DB rows — to actually stop the in-flight handlers we have to cancel
+	// their contexts via w.CancelJob (one entry per local sub-job in the
+	// runningJobs map). Sub-jobs running on OTHER workers in the fleet
+	// won't see this signal directly; they'll notice via their heartbeat
+	// returning ErrJobNotOwned and abandon after the configured threshold
+	// (see runHeartbeat).
 	if status == core.FanOutFailed && fo.CancelOnFail {
-		if _, err := w.queue.Storage().CancelSubJobs(ctx, fo.ID); err != nil {
+		cancelledIDs, err := w.queue.Storage().CancelSubJobs(ctx, fo.ID)
+		if err != nil {
 			w.logger.Error("failed to cancel sub-jobs", "fan_out_id", fo.ID, "error", err)
+		} else {
+			cancelledLocally := 0
+			for _, jobID := range cancelledIDs {
+				if w.CancelJob(jobID) {
+					cancelledLocally++
+				}
+			}
+			if cancelledLocally > 0 {
+				w.logger.Info("cancelled in-flight sub-job handlers on this worker",
+					"fan_out_id", fo.ID,
+					"cancelled_locally", cancelledLocally,
+					"cancelled_total", len(cancelledIDs))
+			}
 		}
 	}
 
@@ -706,7 +825,14 @@ func (w *Worker) pollWaitingJobs(ctx context.Context) {
 // - Complete/Fail failed due to ErrJobNotOwned (lock expired during processing)
 // - A handler hung and the heartbeat eventually stopped
 func (w *Worker) reapStaleLocks(ctx context.Context) {
-	ticker := time.NewTicker(w.config.StaleLockInterval)
+	// Defensive: NewWorker guarantees a positive interval, but guard against a
+	// zero value (which would panic time.NewTicker) in case the config field
+	// is set directly.
+	interval := w.config.StaleLockInterval
+	if interval <= 0 {
+		interval = 5 * time.Minute
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for {
@@ -721,8 +847,86 @@ func (w *Worker) reapStaleLocks(ctx context.Context) {
 				}
 				continue
 			}
-			if released > 0 {
-				w.logger.Info("released stale running jobs", "count", released)
+			if len(released) == 0 {
+				continue
+			}
+
+			// Cancel any local in-flight handlers for jobs whose locks
+			// were just released. The DB-level release already reverted
+			// the lock fields; without this loop the original handler
+			// would keep running until its own heartbeat-abandon timer
+			// fires (~6 minutes by default). This brings the local
+			// cancel latency down to "next heartbeat tick."
+			cancelledLocally := 0
+			for _, jobID := range released {
+				if w.CancelJob(jobID) {
+					cancelledLocally++
+				}
+			}
+			w.logger.Info("released stale running jobs",
+				"count", len(released),
+				"cancelled_locally", cancelledLocally)
+		}
+	}
+}
+
+// runOwnershipAudit periodically checks whether any of this worker's
+// running jobs have been cancelled or reclaimed by another worker, and
+// cancels the corresponding local handler context. This is the
+// cross-worker counterpart of the cancellation logic in completeFanOut
+// and reapStaleLocks (which only see local sub-jobs).
+//
+// The query cost is one row per running job per tick — bounded by THIS
+// worker's concurrency, not by the size of the fleet.
+//
+// No grace window is needed for newly-acquired jobs: a job only enters
+// runningJobs (in processJob) after Dequeue has returned, and Dequeue
+// commits locked_by=this-worker before returning. So any ID in the
+// snapshot already has its ownership row persisted, and a freshly
+// dequeued job can't be mis-flagged as orphaned.
+func (w *Worker) runOwnershipAudit(ctx context.Context) {
+	ticker := time.NewTicker(w.config.OwnershipAuditInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			// Snapshot the IDs we think we own. Holding the mutex during
+			// the DB call would block dequeue/complete; copy and release.
+			w.runningJobsMu.Lock()
+			ids := make([]string, 0, len(w.runningJobs))
+			for id := range w.runningJobs {
+				ids = append(ids, id)
+			}
+			w.runningJobsMu.Unlock()
+			if len(ids) == 0 {
+				continue
+			}
+
+			orphaned, err := w.queue.Storage().FindOrphanedJobs(ctx, ids, w.config.WorkerID)
+			if err != nil {
+				if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+					w.logger.Warn("ownership audit query failed", "error", err)
+				}
+				continue
+			}
+			if len(orphaned) == 0 {
+				continue
+			}
+
+			cancelled := 0
+			for _, id := range orphaned {
+				if w.CancelJob(id) {
+					cancelled++
+				}
+			}
+			if cancelled > 0 {
+				w.logger.Warn("ownership audit cancelled orphaned local handlers",
+					"orphaned_count", len(orphaned),
+					"cancelled_count", cancelled,
+					"audit_interval", w.config.OwnershipAuditInterval)
 			}
 		}
 	}

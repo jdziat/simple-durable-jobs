@@ -78,8 +78,11 @@ func (s *minimalStorage) GetDueJobs(ctx context.Context, queues []string, limit 
 	return nil, nil
 }
 func (s *minimalStorage) Heartbeat(ctx context.Context, jobID, workerID string) error { return nil }
-func (s *minimalStorage) ReleaseStaleLocks(ctx context.Context, d time.Duration) (int64, error) {
-	return 0, nil
+func (s *minimalStorage) ReleaseStaleLocks(ctx context.Context, d time.Duration) ([]string, error) {
+	return nil, nil
+}
+func (s *minimalStorage) FindOrphanedJobs(ctx context.Context, jobIDs []string, workerID string) ([]string, error) {
+	return nil, nil
 }
 func (s *minimalStorage) GetJobsByStatus(ctx context.Context, status core.JobStatus, limit int) ([]*core.Job, error) {
 	return nil, nil
@@ -134,8 +137,8 @@ func (s *minimalStorage) GetSubJobResults(ctx context.Context, fanOutID string) 
 	}
 	return out, nil
 }
-func (s *minimalStorage) CancelSubJobs(ctx context.Context, fanOutID string) (int64, error) {
-	return 0, nil
+func (s *minimalStorage) CancelSubJobs(ctx context.Context, fanOutID string) ([]string, error) {
+	return nil, nil
 }
 func (s *minimalStorage) CancelSubJob(ctx context.Context, jobID string) (*core.FanOut, error) {
 	return nil, nil
