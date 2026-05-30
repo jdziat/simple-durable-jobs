@@ -355,7 +355,12 @@ func TestWorker_ContextCancellation(t *testing.T) {
 	_, err := queue.Enqueue(ctx, "long-job", struct{}{})
 	require.NoError(t, err)
 
-	worker := queue.NewWorker()
+	// Graceful drain (teardown 1.8): cancelling Start's ctx no longer aborts
+	// in-flight handlers instantly — it stops intake and lets running jobs
+	// finish within DrainTimeout, force-aborting only stragglers. This handler
+	// blocks until its context is cancelled, so it is force-aborted at the
+	// (short) drain timeout; the worker still shuts down promptly.
+	worker := queue.NewWorker(jobs.WithDrainTimeout(500 * time.Millisecond))
 	go func() {
 		_ = worker.Start(ctx)
 		close(done)
@@ -371,7 +376,7 @@ func TestWorker_ContextCancellation(t *testing.T) {
 	// Cancel context
 	cancel()
 
-	// Worker should exit
+	// Worker should exit after force-aborting the stuck handler at DrainTimeout.
 	select {
 	case <-done:
 	case <-time.After(2 * time.Second):

@@ -603,6 +603,14 @@ func TestWithPollInterval_SetsExactMinimum(t *testing.T) {
 	assert.Equal(t, 50*time.Millisecond, config.PollInterval)
 }
 
+func TestWithDrainTimeout_SetsValue(t *testing.T) {
+	config := WorkerConfig{}
+
+	WithDrainTimeout(5 * time.Second).ApplyWorker(&config)
+
+	assert.Equal(t, 5*time.Second, config.DrainTimeout)
+}
+
 func TestWithStaleLockInterval_SetsValue(t *testing.T) {
 	config := WorkerConfig{}
 
@@ -1241,6 +1249,7 @@ func TestNewWorker_DefaultsApplied(t *testing.T) {
 
 	assert.NotNil(t, w.config.StorageRetry)
 	assert.NotNil(t, w.config.DequeueRetry)
+	assert.Equal(t, 30*time.Second, w.config.DrainTimeout)
 	assert.Equal(t, 5*time.Minute, w.config.StaleLockInterval)
 	assert.Equal(t, 45*time.Minute, w.config.StaleLockAge)
 	assert.Equal(t, 2*time.Minute, w.config.FanOutRecoveryStaleAge)
@@ -1479,6 +1488,175 @@ func TestWorker_CompleteWithRetry_SuccessfulJob(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("job did not complete")
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Start drain behaviour
+// ---------------------------------------------------------------------------
+
+func TestWorker_StartGracefullyDrainsRunningHandlerOnContextCancel(t *testing.T) {
+	q, cleanup := newSQLiteQueue(t)
+	defer cleanup()
+
+	started := make(chan struct{})
+	completed := make(chan struct{})
+	var completeOnce sync.Once
+	var sideEffect atomic.Int32
+	var handlerCancelled atomic.Bool
+
+	q.Register("slow-success", func(ctx context.Context, args struct{}) error {
+		close(started)
+		select {
+		case <-time.After(200 * time.Millisecond):
+			sideEffect.Add(1)
+			return nil
+		case <-ctx.Done():
+			handlerCancelled.Store(true)
+			return ctx.Err()
+		}
+	})
+	q.OnJobComplete(func(_ context.Context, _ *core.Job) {
+		completeOnce.Do(func() { close(completed) })
+	})
+
+	jobID, err := q.Enqueue(context.Background(), "slow-success", struct{}{})
+	require.NoError(t, err)
+
+	w := NewWorker(q,
+		WithPollInterval(50*time.Millisecond),
+		WithDrainTimeout(2*time.Second),
+		WithOwnershipAuditInterval(0),
+	)
+	ctx, cancel := context.WithCancel(context.Background())
+	startReturned := make(chan error, 1)
+	go func() {
+		startReturned <- w.Start(ctx)
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("job did not start")
+	}
+
+	cancelStarted := time.Now()
+	cancel()
+
+	select {
+	case err := <-startReturned:
+		t.Fatalf("Start returned before the running handler completed: %v", err)
+	case <-time.After(100 * time.Millisecond):
+		// Expected: drain keeps the handler alive past Start context cancellation.
+	}
+
+	select {
+	case <-completed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("job did not complete during drain")
+	}
+
+	select {
+	case err := <-startReturned:
+		assert.ErrorIs(t, err, context.Canceled)
+	case <-time.After(time.Second):
+		t.Fatal("Start did not return after drained handler completed")
+	}
+
+	assert.GreaterOrEqual(t, time.Since(cancelStarted), 180*time.Millisecond)
+	assert.Equal(t, int32(1), sideEffect.Load())
+	assert.False(t, handlerCancelled.Load(), "handler context must survive Start context cancellation during drain")
+
+	job, err := q.Storage().GetJob(context.Background(), jobID)
+	require.NoError(t, err)
+	require.NotNil(t, job)
+	assert.Equal(t, core.StatusCompleted, job.Status)
+}
+
+func TestWorker_StartDrainTimeoutCancelsRunningHandler(t *testing.T) {
+	q, cleanup := newSQLiteQueue(t)
+	defer cleanup()
+
+	started := make(chan struct{})
+	cancelled := make(chan struct{})
+	var cancelOnce sync.Once
+
+	q.Register("blocked", func(ctx context.Context, args struct{}) error {
+		close(started)
+		<-ctx.Done()
+		cancelOnce.Do(func() { close(cancelled) })
+		return ctx.Err()
+	})
+
+	_, err := q.Enqueue(context.Background(), "blocked", struct{}{})
+	require.NoError(t, err)
+
+	drainTimeout := 80 * time.Millisecond
+	w := NewWorker(q,
+		WithPollInterval(50*time.Millisecond),
+		WithDrainTimeout(drainTimeout),
+		WithOwnershipAuditInterval(0),
+		DisableRetry(),
+	)
+	ctx, cancel := context.WithCancel(context.Background())
+	startReturned := make(chan error, 1)
+	go func() {
+		startReturned <- w.Start(ctx)
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("job did not start")
+	}
+
+	cancelStarted := time.Now()
+	cancel()
+
+	select {
+	case <-cancelled:
+	case <-time.After(time.Second):
+		t.Fatal("handler context was not cancelled after drain timeout")
+	}
+
+	select {
+	case err := <-startReturned:
+		assert.ErrorIs(t, err, context.Canceled)
+	case <-time.After(time.Second):
+		t.Fatal("Start did not return after drain timeout")
+	}
+
+	elapsed := time.Since(cancelStarted)
+	assert.GreaterOrEqual(t, elapsed, drainTimeout)
+	assert.Less(t, elapsed, 500*time.Millisecond)
+}
+
+func TestWorker_StartCancelIdleReturnsPromptly(t *testing.T) {
+	mock := &mockStorage{}
+	q := queue.New(mock)
+	w := NewWorker(q,
+		WithPollInterval(50*time.Millisecond),
+		WithDrainTimeout(2*time.Second),
+		WithOwnershipAuditInterval(0),
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	startReturned := make(chan error, 1)
+	go func() {
+		startReturned <- w.Start(ctx)
+	}()
+
+	time.Sleep(20 * time.Millisecond)
+	start := time.Now()
+	cancel()
+
+	select {
+	case err := <-startReturned:
+		assert.ErrorIs(t, err, context.Canceled)
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("idle worker waited for DrainTimeout on cancellation")
+	}
+
+	assert.Less(t, time.Since(start), 300*time.Millisecond)
 }
 
 func TestWorker_HandleError_NoRetryError(t *testing.T) {

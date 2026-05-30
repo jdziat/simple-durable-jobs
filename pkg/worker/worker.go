@@ -53,6 +53,7 @@ func NewWorker(q *queue.Queue, opts ...WorkerOption) *Worker {
 		Queues:       nil, // Will be set to default if no queue options provided
 		PollInterval: 100 * time.Millisecond,
 		WorkerID:     uuid.New().String(),
+		DrainTimeout: 30 * time.Second,
 	}
 
 	for _, opt := range opts {
@@ -140,6 +141,8 @@ func (w *Worker) Start(ctx context.Context) error {
 	}
 
 	jobsChan := make(chan *core.Job, totalConcurrency)
+	handlerBase, cancelHandlers := context.WithCancel(context.WithoutCancel(ctx))
+	defer cancelHandlers()
 
 	// Start scheduler if enabled
 	if w.config.EnableScheduler {
@@ -164,7 +167,7 @@ func (w *Worker) Start(ctx context.Context) error {
 
 	for i := 0; i < totalConcurrency; i++ {
 		w.wg.Add(1)
-		go w.processLoop(ctx, jobsChan)
+		go w.processLoop(handlerBase, jobsChan)
 	}
 
 	ticker := time.NewTicker(w.config.PollInterval)
@@ -174,7 +177,18 @@ func (w *Worker) Start(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			close(jobsChan)
-			w.wg.Wait()
+			if w.config.DrainTimeout <= 0 {
+				cancelHandlers()
+				w.wg.Wait()
+				return ctx.Err()
+			}
+			if !w.waitForDrain() {
+				w.logger.Warn("worker drain timeout reached; cancelling in-flight handlers",
+					"in_flight", w.RunningJobCount(),
+					"drain_timeout", w.config.DrainTimeout)
+				cancelHandlers()
+				w.wg.Wait()
+			}
 			return ctx.Err()
 		case <-ticker.C:
 			// Skip dequeue if paused
@@ -205,6 +219,24 @@ func (w *Worker) Start(ctx context.Context) error {
 				}
 			}
 		}
+	}
+}
+
+func (w *Worker) waitForDrain() bool {
+	done := make(chan struct{})
+	go func() {
+		w.wg.Wait()
+		close(done)
+	}()
+
+	timer := time.NewTimer(w.config.DrainTimeout)
+	defer timer.Stop()
+
+	select {
+	case <-done:
+		return true
+	case <-timer.C:
+		return false
 	}
 }
 

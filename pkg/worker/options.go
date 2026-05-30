@@ -29,6 +29,11 @@ type WorkerConfig struct {
 	EnableScheduler bool
 	currentQueue    string // internal: scopes Concurrency to this queue
 
+	// DrainTimeout is how long Start waits after its context is cancelled for
+	// in-flight handlers to finish and persist their result before forcing
+	// cancellation. A non-positive value aborts immediately. Default: 30 seconds.
+	DrainTimeout time.Duration
+
 	// StorageRetry configures retry behavior for storage operations.
 	// If nil, uses DefaultRetryConfig().
 	StorageRetry *RetryConfig
@@ -164,6 +169,14 @@ func WithPollInterval(d time.Duration) WorkerOption {
 		if d >= 50*time.Millisecond {
 			c.PollInterval = d
 		}
+	})
+}
+
+// WithDrainTimeout sets how long Start waits for in-flight handlers to finish
+// after its context is cancelled. A non-positive duration aborts immediately.
+func WithDrainTimeout(d time.Duration) WorkerOption {
+	return workerOptionFunc(func(c *WorkerConfig) {
+		c.DrainTimeout = d
 	})
 }
 

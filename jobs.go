@@ -445,6 +445,12 @@ func WithPollInterval(d time.Duration) WorkerOption {
 	return worker.WithPollInterval(d)
 }
 
+// WithDrainTimeout sets how long Start waits for in-flight handlers to finish
+// after its context is cancelled. A non-positive duration aborts immediately.
+func WithDrainTimeout(d time.Duration) WorkerOption {
+	return worker.WithDrainTimeout(d)
+}
+
 // WithStaleLockInterval sets how often the worker checks for stale running jobs.
 func WithStaleLockInterval(d time.Duration) WorkerOption {
 	return worker.WithStaleLockInterval(d)
