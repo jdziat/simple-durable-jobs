@@ -1951,6 +1951,25 @@ func TestGetWaitingJobsToResume_DeduplicatesParentsWithMultipleTerminatedFanOuts
 	assert.Equal(t, parent.ID, waiting[0].ID)
 }
 
+func TestGetWaitingJobsToResume_LimitsResumeBatch(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	for i := 0; i < maxResumeBatch+25; i++ {
+		parent := &core.Job{Type: "workflow.bulk", Queue: "default", Status: core.StatusWaiting}
+		require.NoError(t, s.Enqueue(ctx, parent))
+		require.NoError(t, s.CreateFanOut(ctx, &core.FanOut{
+			ParentJobID: parent.ID,
+			TotalCount:  1,
+			Status:      core.FanOutCompleted,
+		}))
+	}
+
+	waiting, err := s.GetWaitingJobsToResume(ctx)
+	require.NoError(t, err)
+	assert.Len(t, waiting, maxResumeBatch)
+}
+
 func TestGetStalledFanOutParents(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStorage(t)

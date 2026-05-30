@@ -17,7 +17,10 @@ import (
 	"github.com/jdziat/simple-durable-jobs/pkg/security"
 )
 
-const defaultLockDuration = 45 * time.Minute
+const (
+	defaultLockDuration = 45 * time.Minute
+	maxResumeBatch      = 100
+)
 
 // GormStorageOption configures a GormStorage.
 type GormStorageOption func(*GormStorage)
@@ -618,23 +621,26 @@ func (s *GormStorage) ReleaseStaleLocks(ctx context.Context, staleDuration time.
 	// would let us do this in one statement but isn't portable across all
 	// GORM drivers, so we do it the long way.
 	var released []string
-	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if err := tx.Model(&core.Job{}).
-			Where("status = ?", core.StatusRunning).
-			Where("locked_until < ?", cutoff).
-			Pluck("id", &released).Error; err != nil {
-			return err
-		}
-		if len(released) == 0 {
-			return nil
-		}
-		return tx.Model(&core.Job{}).
-			Where("id IN ?", released).
-			Updates(map[string]any{
-				"status":       core.StatusPending,
-				"locked_by":    "",
-				"locked_until": nil,
-			}).Error
+	err := s.withSerializationRetry(ctx, func() error {
+		released = nil
+		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			if err := tx.Model(&core.Job{}).
+				Where("status = ?", core.StatusRunning).
+				Where("locked_until < ?", cutoff).
+				Pluck("id", &released).Error; err != nil {
+				return err
+			}
+			if len(released) == 0 {
+				return nil
+			}
+			return tx.Model(&core.Job{}).
+				Where("id IN ?", released).
+				Updates(map[string]any{
+					"status":       core.StatusPending,
+					"locked_by":    "",
+					"locked_until": nil,
+				}).Error
+		})
 	})
 	if err != nil {
 		return nil, err
@@ -685,14 +691,16 @@ func (s *GormStorage) GetFanOut(ctx context.Context, fanOutID string) (*core.Fan
 // IncrementFanOutCompleted atomically increments the completed count.
 func (s *GormStorage) IncrementFanOutCompleted(ctx context.Context, fanOutID string) (*core.FanOut, error) {
 	var fanOut core.FanOut
-	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if err := tx.Exec(
-			"UPDATE fan_outs SET completed_count = completed_count + 1, updated_at = ? WHERE id = ?",
-			time.Now(), fanOutID,
-		).Error; err != nil {
-			return err
-		}
-		return tx.First(&fanOut, "id = ?", fanOutID).Error
+	err := s.withSerializationRetry(ctx, func() error {
+		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			if err := tx.Exec(
+				"UPDATE fan_outs SET completed_count = completed_count + 1, updated_at = ? WHERE id = ?",
+				time.Now(), fanOutID,
+			).Error; err != nil {
+				return err
+			}
+			return tx.First(&fanOut, "id = ?", fanOutID).Error
+		})
 	})
 	return &fanOut, err
 }
@@ -700,14 +708,16 @@ func (s *GormStorage) IncrementFanOutCompleted(ctx context.Context, fanOutID str
 // IncrementFanOutFailed atomically increments the failed count.
 func (s *GormStorage) IncrementFanOutFailed(ctx context.Context, fanOutID string) (*core.FanOut, error) {
 	var fanOut core.FanOut
-	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if err := tx.Exec(
-			"UPDATE fan_outs SET failed_count = failed_count + 1, updated_at = ? WHERE id = ?",
-			time.Now(), fanOutID,
-		).Error; err != nil {
-			return err
-		}
-		return tx.First(&fanOut, "id = ?", fanOutID).Error
+	err := s.withSerializationRetry(ctx, func() error {
+		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			if err := tx.Exec(
+				"UPDATE fan_outs SET failed_count = failed_count + 1, updated_at = ? WHERE id = ?",
+				time.Now(), fanOutID,
+			).Error; err != nil {
+				return err
+			}
+			return tx.First(&fanOut, "id = ?", fanOutID).Error
+		})
 	})
 	return &fanOut, err
 }
@@ -715,14 +725,16 @@ func (s *GormStorage) IncrementFanOutFailed(ctx context.Context, fanOutID string
 // IncrementFanOutCancelled atomically increments the cancelled count.
 func (s *GormStorage) IncrementFanOutCancelled(ctx context.Context, fanOutID string) (*core.FanOut, error) {
 	var fanOut core.FanOut
-	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if err := tx.Exec(
-			"UPDATE fan_outs SET cancelled_count = cancelled_count + 1, updated_at = ? WHERE id = ?",
-			time.Now(), fanOutID,
-		).Error; err != nil {
-			return err
-		}
-		return tx.First(&fanOut, "id = ?", fanOutID).Error
+	err := s.withSerializationRetry(ctx, func() error {
+		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			if err := tx.Exec(
+				"UPDATE fan_outs SET cancelled_count = cancelled_count + 1, updated_at = ? WHERE id = ?",
+				time.Now(), fanOutID,
+			).Error; err != nil {
+				return err
+			}
+			return tx.First(&fanOut, "id = ?", fanOutID).Error
+		})
 	})
 	return &fanOut, err
 }
@@ -874,43 +886,46 @@ func (s *GormStorage) GetSubJobResults(ctx context.Context, fanOutID string) ([]
 // for the rationale.
 func (s *GormStorage) CancelSubJobs(ctx context.Context, fanOutID string) ([]string, error) {
 	var cancelled []string
-	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		// Capture the IDs of sub-jobs we're about to cancel. Done before
-		// the UPDATE so we get the in-flight set, not just rows that
-		// happen to remain pending after the update.
-		query := tx.Model(&core.Job{}).
-			Where("fan_out_id = ? AND status IN ?", fanOutID, []core.JobStatus{core.StatusPending, core.StatusRunning}).
-			Order("fan_out_index ASC")
-		if !s.isSQLite {
-			query = query.Clauses(clause.Locking{Strength: "UPDATE"})
-		}
-		if err := query.Pluck("id", &cancelled).Error; err != nil {
-			return err
-		}
-		if len(cancelled) == 0 {
-			return nil
-		}
+	err := s.withSerializationRetry(ctx, func() error {
+		cancelled = nil
+		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			// Capture the IDs of sub-jobs we're about to cancel. Done before
+			// the UPDATE so we get the in-flight set, not just rows that
+			// happen to remain pending after the update.
+			query := tx.Model(&core.Job{}).
+				Where("fan_out_id = ? AND status IN ?", fanOutID, []core.JobStatus{core.StatusPending, core.StatusRunning}).
+				Order("fan_out_index ASC")
+			if !s.isSQLite {
+				query = query.Clauses(clause.Locking{Strength: "UPDATE"})
+			}
+			if err := query.Pluck("id", &cancelled).Error; err != nil {
+				return err
+			}
+			if len(cancelled) == 0 {
+				return nil
+			}
 
-		now := time.Now()
-		result := tx.Model(&core.Job{}).
-			Where("id IN ?", cancelled).
-			Where("status IN ?", []core.JobStatus{core.StatusPending, core.StatusRunning}).
-			Updates(map[string]any{
-				"status":     core.StatusCancelled,
-				"updated_at": now,
-			})
-		if result.Error != nil {
-			return result.Error
-		}
-		if result.RowsAffected == 0 {
-			return nil
-		}
+			now := time.Now()
+			result := tx.Model(&core.Job{}).
+				Where("id IN ?", cancelled).
+				Where("status IN ?", []core.JobStatus{core.StatusPending, core.StatusRunning}).
+				Updates(map[string]any{
+					"status":     core.StatusCancelled,
+					"updated_at": now,
+				})
+			if result.Error != nil {
+				return result.Error
+			}
+			if result.RowsAffected == 0 {
+				return nil
+			}
 
-		// Update the fan-out's cancelled count to match.
-		return tx.Exec(
-			"UPDATE fan_outs SET cancelled_count = cancelled_count + ?, updated_at = ? WHERE id = ?",
-			result.RowsAffected, now, fanOutID,
-		).Error
+			// Update the fan-out's cancelled count to match.
+			return tx.Exec(
+				"UPDATE fan_outs SET cancelled_count = cancelled_count + ?, updated_at = ? WHERE id = ?",
+				result.RowsAffected, now, fanOutID,
+			).Error
+		})
 	})
 	if err != nil {
 		return nil, err
@@ -925,48 +940,52 @@ func (s *GormStorage) CancelSubJob(ctx context.Context, jobID string) (*core.Fan
 	var fanOut core.FanOut
 	var hasFanOut bool
 
-	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		// Get the job to find its fan-out ID
-		var job core.Job
-		if err := tx.First(&job, "id = ?", jobID).Error; err != nil {
-			return err
-		}
+	err := s.withSerializationRetry(ctx, func() error {
+		hasFanOut = false
+		fanOut = core.FanOut{}
+		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			// Get the job to find its fan-out ID
+			var job core.Job
+			if err := tx.First(&job, "id = ?", jobID).Error; err != nil {
+				return err
+			}
 
-		// Not a sub-job
-		if job.FanOutID == nil || *job.FanOutID == "" {
+			// Not a sub-job
+			if job.FanOutID == nil || *job.FanOutID == "" {
+				return nil
+			}
+
+			// Only cancel if in a cancellable state
+			if job.Status == core.StatusCompleted || job.Status == core.StatusFailed || job.Status == core.StatusCancelled {
+				return nil
+			}
+
+			// Cancel the job
+			now := time.Now()
+			if err := tx.Model(&core.Job{}).
+				Where("id = ? AND status NOT IN ?", jobID, []core.JobStatus{core.StatusCompleted, core.StatusFailed, core.StatusCancelled}).
+				Updates(map[string]any{
+					"status":       core.StatusCancelled,
+					"completed_at": now,
+					"updated_at":   now,
+				}).Error; err != nil {
+				return err
+			}
+
+			// Increment cancelled count on the fan-out
+			if err := tx.Exec(
+				"UPDATE fan_outs SET cancelled_count = cancelled_count + 1, updated_at = ? WHERE id = ?",
+				now, *job.FanOutID,
+			).Error; err != nil {
+				return err
+			}
+
+			if err := tx.First(&fanOut, "id = ?", *job.FanOutID).Error; err != nil {
+				return err
+			}
+			hasFanOut = true
 			return nil
-		}
-
-		// Only cancel if in a cancellable state
-		if job.Status == core.StatusCompleted || job.Status == core.StatusFailed || job.Status == core.StatusCancelled {
-			return nil
-		}
-
-		// Cancel the job
-		now := time.Now()
-		if err := tx.Model(&core.Job{}).
-			Where("id = ? AND status NOT IN ?", jobID, []core.JobStatus{core.StatusCompleted, core.StatusFailed, core.StatusCancelled}).
-			Updates(map[string]any{
-				"status":       core.StatusCancelled,
-				"completed_at": now,
-				"updated_at":   now,
-			}).Error; err != nil {
-			return err
-		}
-
-		// Increment cancelled count on the fan-out
-		if err := tx.Exec(
-			"UPDATE fan_outs SET cancelled_count = cancelled_count + 1, updated_at = ? WHERE id = ?",
-			now, *job.FanOutID,
-		).Error; err != nil {
-			return err
-		}
-
-		if err := tx.First(&fanOut, "id = ?", *job.FanOutID).Error; err != nil {
-			return err
-		}
-		hasFanOut = true
-		return nil
+		})
 	})
 
 	if err != nil {
@@ -1048,7 +1067,8 @@ func (s *GormStorage) GetWaitingJobsToResume(ctx context.Context) ([]*core.Job, 
 			WHERE f2.parent_job_id = j.id
 			AND f2.status = ?
 		)
-	`, core.StatusWaiting, core.FanOutCompleted, core.FanOutFailed, core.FanOutPending).Scan(&jobs).Error
+		LIMIT ?
+	`, core.StatusWaiting, core.FanOutCompleted, core.FanOutFailed, core.FanOutPending, maxResumeBatch).Scan(&jobs).Error
 	return jobs, err
 }
 
@@ -1092,78 +1112,82 @@ func (s *GormStorage) SaveJobResult(ctx context.Context, jobID string, workerID 
 // Only pending and waiting jobs can be paused. Running jobs cannot be paused
 // because the worker holds the lock and clearing it would corrupt state.
 func (s *GormStorage) PauseJob(ctx context.Context, jobID string) error {
-	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		var job core.Job
-		if err := tx.First(&job, "id = ?", jobID).Error; err != nil {
-			if errors.Is(err, gorm.ErrRecordNotFound) {
-				return fmt.Errorf("job not found: %s", jobID)
+	return s.withSerializationRetry(ctx, func() error {
+		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			var job core.Job
+			if err := tx.First(&job, "id = ?", jobID).Error; err != nil {
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					return fmt.Errorf("job not found: %s", jobID)
+				}
+				return err
 			}
-			return err
-		}
 
-		// Check if already paused
-		if job.Status == core.StatusPaused {
-			return core.ErrJobAlreadyPaused
-		}
+			// Check if already paused
+			if job.Status == core.StatusPaused {
+				return core.ErrJobAlreadyPaused
+			}
 
-		now := time.Now()
+			now := time.Now()
 
-		switch job.Status {
-		case core.StatusPending, core.StatusWaiting:
-			// Pause: store previous status for restoration on unpause
-			return tx.Model(&core.Job{}).
-				Where("id = ?", jobID).
-				Updates(map[string]any{
-					"status":          core.StatusPaused,
-					"previous_status": job.Status,
-					"updated_at":      now,
-				}).Error
-		case core.StatusRunning:
-			// Cancel: running jobs transition directly to cancelled
-			return tx.Model(&core.Job{}).
-				Where("id = ?", jobID).
-				Updates(map[string]any{
-					"status":       core.StatusCancelled,
-					"completed_at": now,
-					"updated_at":   now,
-					"last_error":   "cancelled by user",
-					"locked_by":    "",
-					"locked_until": nil,
-				}).Error
-		default:
-			return core.ErrCannotPauseStatus
-		}
+			switch job.Status {
+			case core.StatusPending, core.StatusWaiting:
+				// Pause: store previous status for restoration on unpause
+				return tx.Model(&core.Job{}).
+					Where("id = ?", jobID).
+					Updates(map[string]any{
+						"status":          core.StatusPaused,
+						"previous_status": job.Status,
+						"updated_at":      now,
+					}).Error
+			case core.StatusRunning:
+				// Cancel: running jobs transition directly to cancelled
+				return tx.Model(&core.Job{}).
+					Where("id = ?", jobID).
+					Updates(map[string]any{
+						"status":       core.StatusCancelled,
+						"completed_at": now,
+						"updated_at":   now,
+						"last_error":   "cancelled by user",
+						"locked_by":    "",
+						"locked_until": nil,
+					}).Error
+			default:
+				return core.ErrCannotPauseStatus
+			}
+		})
 	})
 }
 
 // UnpauseJob resumes a paused job back to its previous status.
 func (s *GormStorage) UnpauseJob(ctx context.Context, jobID string) error {
-	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		var job core.Job
-		if err := tx.First(&job, "id = ?", jobID).Error; err != nil {
-			if errors.Is(err, gorm.ErrRecordNotFound) {
-				return fmt.Errorf("job not found: %s", jobID)
+	return s.withSerializationRetry(ctx, func() error {
+		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			var job core.Job
+			if err := tx.First(&job, "id = ?", jobID).Error; err != nil {
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					return fmt.Errorf("job not found: %s", jobID)
+				}
+				return err
 			}
-			return err
-		}
 
-		if job.Status != core.StatusPaused {
-			return core.ErrJobNotPaused
-		}
+			if job.Status != core.StatusPaused {
+				return core.ErrJobNotPaused
+			}
 
-		// Restore to previous status, default to pending if not set
-		restoreStatus := job.PreviousStatus
-		if restoreStatus == "" {
-			restoreStatus = core.StatusPending
-		}
+			// Restore to previous status, default to pending if not set
+			restoreStatus := job.PreviousStatus
+			if restoreStatus == "" {
+				restoreStatus = core.StatusPending
+			}
 
-		return tx.Model(&core.Job{}).
-			Where("id = ?", jobID).
-			Updates(map[string]any{
-				"status":          restoreStatus,
-				"previous_status": "",
-				"updated_at":      time.Now(),
-			}).Error
+			return tx.Model(&core.Job{}).
+				Where("id = ?", jobID).
+				Updates(map[string]any{
+					"status":          restoreStatus,
+					"previous_status": "",
+					"updated_at":      time.Now(),
+				}).Error
+		})
 	})
 }
 
