@@ -334,7 +334,7 @@ func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 			// Job is already in StatusWaiting; just return
 			return
 		}
-		w.handleError(ctx, job, err)
+		w.handleError(ctx, jobCtx, job, err)
 	} else {
 		if resultBytes != nil {
 			if saveErr := w.queue.Storage().SaveJobResult(ctx, job.ID, w.config.WorkerID, resultBytes); saveErr != nil {
@@ -358,7 +358,7 @@ func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 			// we couldn't mark it in the DB. Without this, the fan-out
 			// counter never increments and the parent stays in 'waiting'.
 		} else {
-			w.queue.CallCompleteHooks(ctx, job)
+			w.queue.CallCompleteHooks(jobCtx, job)
 			// Emit completion event
 			w.queue.Emit(&core.JobCompleted{Job: job, Duration: time.Since(startTime), Timestamp: time.Now()})
 		}
@@ -526,7 +526,7 @@ func (w *Worker) executeHandler(ctx context.Context, job *core.Job, h *handler.H
 	return h.Execute(jobCtx, job.Args)
 }
 
-func (w *Worker) handleError(ctx context.Context, job *core.Job, err error) {
+func (w *Worker) handleError(ctx context.Context, jobCtx context.Context, job *core.Job, err error) {
 	// Decide the disposition: a scheduled retry (retryAt != nil) or a terminal
 	// failure (retryAt == nil). NoRetry always wins; otherwise we retry while
 	// attempts remain. This mirrors the original branch-by-branch logic.
@@ -560,13 +560,13 @@ func (w *Worker) handleError(ctx context.Context, job *core.Job, err error) {
 	}
 
 	if retryAt != nil {
-		w.queue.CallRetryHooks(ctx, job, job.Attempt, err)
+		w.queue.CallRetryHooks(jobCtx, job, job.Attempt, err)
 		w.queue.Emit(&core.JobRetrying{Job: job, Attempt: job.Attempt, Error: err, NextRunAt: *retryAt, Timestamp: time.Now()})
 		return
 	}
 
 	// Terminal failure.
-	w.queue.CallFailHooks(ctx, job, err)
+	w.queue.CallFailHooks(jobCtx, job, err)
 	w.queue.Emit(&core.JobFailed{Job: job, Error: err, Timestamp: time.Now()})
 	// Handle sub-job failure (resume parent if needed).
 	if handleErr := w.handleSubJobCompletion(ctx, job, false); handleErr != nil {
