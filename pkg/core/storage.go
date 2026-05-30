@@ -92,6 +92,7 @@ type Storage interface {
 	SuspendJob(ctx context.Context, jobID string, workerID string) error
 	ResumeJob(ctx context.Context, jobID string) (bool, error)
 	GetWaitingJobsToResume(ctx context.Context) ([]*Job, error)
+	GetStalledFanOutParents(ctx context.Context, olderThan time.Time) ([]*Job, error)
 
 	// Result storage
 	SaveJobResult(ctx context.Context, jobID string, workerID string, result []byte) error

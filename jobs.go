@@ -455,6 +455,14 @@ func WithStaleLockAge(d time.Duration) WorkerOption {
 	return worker.WithStaleLockAge(d)
 }
 
+// WithFanOutRecoveryStaleAge sets how old a pending fan-out must be before the
+// worker resumes a parent that crashed mid-enqueue (recovery for an
+// incompletely-enqueued fan-out). Default is 2 minutes; non-positive keeps the
+// default (recovery cannot be disabled).
+func WithFanOutRecoveryStaleAge(d time.Duration) WorkerOption {
+	return worker.WithFanOutRecoveryStaleAge(d)
+}
+
 // DefaultRetryConfig returns the default retry configuration.
 func DefaultRetryConfig() RetryConfig {
 	return worker.DefaultRetryConfig()

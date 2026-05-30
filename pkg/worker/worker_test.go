@@ -36,6 +36,7 @@ type mockStorage struct {
 	heartbeatFunc   func(ctx context.Context, jobID string, workerID string) error
 	checkpointFunc  func(ctx context.Context, jobID string) ([]core.Checkpoint, error)
 	waitingJobsFunc func(ctx context.Context) ([]*core.Job, error)
+	stalledJobsFunc func(ctx context.Context, olderThan time.Time) ([]*core.Job, error)
 
 	// fan-out control hooks
 	incrementCompletedFunc func(ctx context.Context, fanOutID string) (*core.FanOut, error)
@@ -204,6 +205,13 @@ func (m *mockStorage) ResumeJob(ctx context.Context, jobID string) (bool, error)
 func (m *mockStorage) GetWaitingJobsToResume(ctx context.Context) ([]*core.Job, error) {
 	if m.waitingJobsFunc != nil {
 		return m.waitingJobsFunc(ctx)
+	}
+	return nil, nil
+}
+
+func (m *mockStorage) GetStalledFanOutParents(ctx context.Context, olderThan time.Time) ([]*core.Job, error) {
+	if m.stalledJobsFunc != nil {
+		return m.stalledJobsFunc(ctx, olderThan)
 	}
 	return nil, nil
 }
@@ -602,6 +610,14 @@ func TestWithStaleLockAge_SetsValue(t *testing.T) {
 	WithStaleLockAge(30 * time.Minute).ApplyWorker(&config)
 
 	assert.Equal(t, 30*time.Minute, config.StaleLockAge)
+}
+
+func TestWithFanOutRecoveryStaleAge_SetsValue(t *testing.T) {
+	config := WorkerConfig{}
+
+	WithFanOutRecoveryStaleAge(30 * time.Second).ApplyWorker(&config)
+
+	assert.Equal(t, 30*time.Second, config.FanOutRecoveryStaleAge)
 }
 
 func TestWithLockDuration_SetsValue(t *testing.T) {
@@ -1150,6 +1166,7 @@ func TestNewWorker_DefaultsApplied(t *testing.T) {
 	assert.NotNil(t, w.config.DequeueRetry)
 	assert.Equal(t, 5*time.Minute, w.config.StaleLockInterval)
 	assert.Equal(t, 45*time.Minute, w.config.StaleLockAge)
+	assert.Equal(t, 2*time.Minute, w.config.FanOutRecoveryStaleAge)
 	assert.Equal(t, map[string]int{"default": 10}, w.config.Queues)
 }
 
@@ -1562,6 +1579,40 @@ func TestWorker_PollWaitingJobs_ExitsOnContextCancel(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("pollWaitingJobs did not exit after context cancellation")
 	}
+}
+
+func TestWorker_PollWaitingJobs_ResumesStalledFanOutParent(t *testing.T) {
+	stalledParent := &core.Job{ID: "stalled-parent", Status: core.StatusWaiting}
+	resumed := make(chan string, 1)
+	var sawCutoff atomic.Bool
+
+	mock := &mockStorage{
+		stalledJobsFunc: func(_ context.Context, olderThan time.Time) ([]*core.Job, error) {
+			if olderThan.Before(time.Now().Add(-25 * time.Second)) {
+				sawCutoff.Store(true)
+			}
+			return []*core.Job{stalledParent}, nil
+		},
+		resumeJobFunc: func(_ context.Context, jobID string) (bool, error) {
+			resumed <- jobID
+			return true, nil
+		},
+	}
+	q := queue.New(mock)
+	w := NewWorker(q,
+		WithStorageRetry(RetryConfig{MaxAttempts: 1}),
+		WithFanOutRecoveryStaleAge(30*time.Second),
+	)
+
+	w.pollWaitingJobsOnce(context.Background())
+
+	select {
+	case jobID := <-resumed:
+		assert.Equal(t, "stalled-parent", jobID)
+	case <-time.After(time.Second):
+		t.Fatal("ResumeJob was not called for stalled fan-out parent")
+	}
+	assert.True(t, sawCutoff.Load(), "stalled fan-out query should use configured stale age cutoff")
 }
 
 // ---------------------------------------------------------------------------
@@ -2826,6 +2877,26 @@ func TestStaleLockInterval_IntervalConfiguration(t *testing.T) {
 		w := NewWorker(q, WithStaleLockInterval(0))
 		assert.Equal(t, 5*time.Minute, w.config.StaleLockInterval,
 			"WithStaleLockInterval(0) must not disable the reaper; the default applies")
+	})
+}
+
+func TestFanOutRecoveryStaleAge_Configuration(t *testing.T) {
+	q := queue.New(&mockStorage{})
+
+	t.Run("unset applies 2m default", func(t *testing.T) {
+		w := NewWorker(q)
+		assert.Equal(t, 2*time.Minute, w.config.FanOutRecoveryStaleAge)
+	})
+
+	t.Run("explicit value is honored", func(t *testing.T) {
+		w := NewWorker(q, WithFanOutRecoveryStaleAge(30*time.Second))
+		assert.Equal(t, 30*time.Second, w.config.FanOutRecoveryStaleAge)
+	})
+
+	t.Run("non-positive cannot disable; falls back to default", func(t *testing.T) {
+		w := NewWorker(q, WithFanOutRecoveryStaleAge(0))
+		assert.Equal(t, 2*time.Minute, w.config.FanOutRecoveryStaleAge,
+			"WithFanOutRecoveryStaleAge(0) must not disable recovery; the default applies")
 	})
 }
 

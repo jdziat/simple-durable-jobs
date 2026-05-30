@@ -201,6 +201,9 @@ func runWorker(parent context.Context, a *app) error {
 		jobs.WithPollInterval(50*time.Millisecond),
 		jobs.WithStaleLockInterval(2*time.Second),
 		jobs.WithStaleLockAge(2*time.Second),
+		// Recover parents wedged mid-fan-out fast (default is 2m) so the
+		// harness sees INV-NO-WEDGE clear within the drain window.
+		jobs.WithFanOutRecoveryStaleAge(3*time.Second),
 	)
 	log.Printf("chaostest worker started")
 	err := w.Start(ctx)

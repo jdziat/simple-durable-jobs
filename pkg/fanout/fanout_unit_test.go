@@ -178,6 +178,9 @@ func (s *minimalStorage) ResumeJob(ctx context.Context, jobID string) (bool, err
 func (s *minimalStorage) GetWaitingJobsToResume(ctx context.Context) ([]*core.Job, error) {
 	return nil, nil
 }
+func (s *minimalStorage) GetStalledFanOutParents(ctx context.Context, olderThan time.Time) ([]*core.Job, error) {
+	return nil, nil
+}
 func (s *minimalStorage) SaveJobResult(ctx context.Context, jobID, workerID string, result []byte) error {
 	return nil
 }

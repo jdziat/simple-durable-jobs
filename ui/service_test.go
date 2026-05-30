@@ -100,7 +100,10 @@ func (m *mockStorage) CancelSubJob(_ context.Context, _ string) (*core.FanOut, e
 func (m *mockStorage) SuspendJob(_ context.Context, _, _ string) error               { return nil }
 func (m *mockStorage) ResumeJob(_ context.Context, _ string) (bool, error)           { return false, nil }
 func (m *mockStorage) GetWaitingJobsToResume(_ context.Context) ([]*core.Job, error) { return nil, nil }
-func (m *mockStorage) SaveJobResult(_ context.Context, _, _ string, _ []byte) error  { return nil }
+func (m *mockStorage) GetStalledFanOutParents(_ context.Context, _ time.Time) ([]*core.Job, error) {
+	return nil, nil
+}
+func (m *mockStorage) SaveJobResult(_ context.Context, _, _ string, _ []byte) error { return nil }
 func (m *mockStorage) PauseJob(ctx context.Context, id string) error {
 	if m.pauseJobFn != nil {
 		return m.pauseJobFn(ctx, id)

@@ -90,6 +90,9 @@ func NewWorker(q *queue.Queue, opts ...WorkerOption) *Worker {
 	if config.StaleLockAge == 0 {
 		config.StaleLockAge = 45 * time.Minute
 	}
+	if config.FanOutRecoveryStaleAge <= 0 {
+		config.FanOutRecoveryStaleAge = 2 * time.Minute
+	}
 
 	// Propagate lock duration to the storage backend if supported.
 	// The storage must implement SetLockDuration(time.Duration) for this to take effect.
@@ -792,29 +795,58 @@ func (w *Worker) pollWaitingJobs(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			var jobs []*core.Job
-			err := retryWithBackoff(ctx, *w.config.StorageRetry, func() error {
-				var queryErr error
-				jobs, queryErr = w.queue.Storage().GetWaitingJobsToResume(ctx)
-				return queryErr
-			})
-			if err != nil {
-				if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-					w.logger.Error("failed to get waiting jobs after retries", "error", err)
-				}
-				continue
-			}
-			for _, job := range jobs {
-				resumeErr := retryWithBackoff(ctx, *w.config.StorageRetry, func() error {
-					_, err := w.queue.Storage().ResumeJob(ctx, job.ID)
-					return err
-				})
-				if resumeErr != nil {
-					w.logger.Error("failed to resume waiting job after retries", "job_id", job.ID, "error", resumeErr)
-				} else {
-					w.logger.Info("resumed waiting job via polling fallback", "job_id", job.ID)
-				}
-			}
+			w.pollWaitingJobsOnce(ctx)
+		}
+	}
+}
+
+func (w *Worker) pollWaitingJobsOnce(ctx context.Context) {
+	var jobs []*core.Job
+	err := retryWithBackoff(ctx, *w.config.StorageRetry, func() error {
+		var queryErr error
+		jobs, queryErr = w.queue.Storage().GetWaitingJobsToResume(ctx)
+		return queryErr
+	})
+	if err != nil {
+		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+			w.logger.Error("failed to get waiting jobs after retries", "error", err)
+		}
+		return
+	}
+	for _, job := range jobs {
+		resumeErr := retryWithBackoff(ctx, *w.config.StorageRetry, func() error {
+			_, err := w.queue.Storage().ResumeJob(ctx, job.ID)
+			return err
+		})
+		if resumeErr != nil {
+			w.logger.Error("failed to resume waiting job after retries", "job_id", job.ID, "error", resumeErr)
+		} else {
+			w.logger.Info("resumed waiting job via polling fallback", "job_id", job.ID)
+		}
+	}
+
+	stalledCutoff := time.Now().Add(-w.config.FanOutRecoveryStaleAge)
+	var stalled []*core.Job
+	err = retryWithBackoff(ctx, *w.config.StorageRetry, func() error {
+		var queryErr error
+		stalled, queryErr = w.queue.Storage().GetStalledFanOutParents(ctx, stalledCutoff)
+		return queryErr
+	})
+	if err != nil {
+		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+			w.logger.Error("failed to get stalled fan-out parents after retries", "error", err)
+		}
+		return
+	}
+	for _, job := range stalled {
+		resumeErr := retryWithBackoff(ctx, *w.config.StorageRetry, func() error {
+			_, err := w.queue.Storage().ResumeJob(ctx, job.ID)
+			return err
+		})
+		if resumeErr != nil {
+			w.logger.Error("failed to resume stalled fan-out parent after retries", "job_id", job.ID, "error", resumeErr)
+		} else {
+			w.logger.Info("resumed stalled fan-out parent via polling fallback", "job_id", job.ID)
 		}
 	}
 }

@@ -160,6 +160,10 @@ func (m *mockStorage) GetWaitingJobsToResume(ctx context.Context) ([]*core.Job, 
 	return nil, nil
 }
 
+func (m *mockStorage) GetStalledFanOutParents(ctx context.Context, olderThan time.Time) ([]*core.Job, error) {
+	return nil, nil
+}
+
 func (m *mockStorage) SaveJobResult(ctx context.Context, jobID string, workerID string, result []byte) error {
 	return nil
 }

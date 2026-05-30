@@ -1015,6 +1015,25 @@ func (s *GormStorage) GetWaitingJobsToResume(ctx context.Context) ([]*core.Job, 
 	return jobs, err
 }
 
+// GetStalledFanOutParents finds waiting parents whose pending fan-out never
+// finished persisting its sub-jobs. The caller supplies olderThan so the query
+// stays portable across SQLite, PostgreSQL, and MySQL.
+func (s *GormStorage) GetStalledFanOutParents(ctx context.Context, olderThan time.Time) ([]*core.Job, error) {
+	var jobs []*core.Job
+	err := s.db.WithContext(ctx).Raw(`
+		SELECT DISTINCT j.* FROM jobs j
+		INNER JOIN fan_outs f ON j.id = f.parent_job_id
+		WHERE j.status = ?
+		AND f.status = ?
+		AND f.created_at < ?
+		AND (
+			SELECT count(*) FROM jobs s
+			WHERE s.fan_out_id = f.id
+		) < f.total_count
+	`, core.StatusWaiting, core.FanOutPending, olderThan).Scan(&jobs).Error
+	return jobs, err
+}
+
 // SaveJobResult stores the serialized result for a job.
 func (s *GormStorage) SaveJobResult(ctx context.Context, jobID string, workerID string, result []byte) error {
 	return s.db.WithContext(ctx).

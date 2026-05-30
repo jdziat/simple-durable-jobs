@@ -50,6 +50,12 @@ type WorkerConfig struct {
 	// it is reclaimed (reset to pending). Default: 45 minutes (matches lock duration).
 	StaleLockAge time.Duration
 
+	// FanOutRecoveryStaleAge is how old a pending fan-out must be before a
+	// waiting parent is treated as wedged because not all sub-jobs were
+	// persisted. The recovery loop cannot be disabled; non-positive values
+	// fall back to the default. Default: 2 minutes.
+	FanOutRecoveryStaleAge time.Duration
+
 	// OwnershipAuditInterval is how often the worker checks whether any of
 	// its in-flight jobs have been cancelled (e.g. by a fan-out failure on
 	// another worker) or reclaimed (e.g. by a stale-lock reaper running on
@@ -183,6 +189,16 @@ func WithStaleLockInterval(d time.Duration) WorkerOption {
 func WithStaleLockAge(d time.Duration) WorkerOption {
 	return workerOptionFunc(func(c *WorkerConfig) {
 		c.StaleLockAge = d
+	})
+}
+
+// WithFanOutRecoveryStaleAge sets how old a pending fan-out must be before
+// the waiting parent is resumed for replay-based recovery. This recovery
+// cannot be disabled; a non-positive duration is treated as the default by
+// NewWorker.
+func WithFanOutRecoveryStaleAge(d time.Duration) WorkerOption {
+	return workerOptionFunc(func(c *WorkerConfig) {
+		c.FanOutRecoveryStaleAge = d
 	})
 }
 

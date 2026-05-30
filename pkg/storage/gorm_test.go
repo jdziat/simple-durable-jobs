@@ -1774,6 +1774,64 @@ func TestGetWaitingJobsToResume_DeduplicatesParentsWithMultipleTerminatedFanOuts
 	assert.Equal(t, parent.ID, waiting[0].ID)
 }
 
+func TestGetStalledFanOutParents(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	old := time.Now().Add(-10 * time.Minute)
+	recent := time.Now()
+	cutoff := time.Now().Add(-2 * time.Minute)
+
+	oldIncompleteParent := &core.Job{Type: "workflow.old-incomplete", Queue: "default", Status: core.StatusWaiting}
+	require.NoError(t, s.Enqueue(ctx, oldIncompleteParent))
+	oldIncompleteFanOut := &core.FanOut{
+		ParentJobID: oldIncompleteParent.ID,
+		TotalCount:  3,
+		Status:      core.FanOutPending,
+		CreatedAt:   old,
+	}
+	require.NoError(t, s.CreateFanOut(ctx, oldIncompleteFanOut))
+
+	recentParent := &core.Job{Type: "workflow.recent", Queue: "default", Status: core.StatusWaiting}
+	require.NoError(t, s.Enqueue(ctx, recentParent))
+	recentFanOut := &core.FanOut{
+		ParentJobID: recentParent.ID,
+		TotalCount:  3,
+		Status:      core.FanOutPending,
+		CreatedAt:   recent,
+	}
+	require.NoError(t, s.CreateFanOut(ctx, recentFanOut))
+
+	completeParent := &core.Job{Type: "workflow.complete", Queue: "default", Status: core.StatusWaiting}
+	require.NoError(t, s.Enqueue(ctx, completeParent))
+	completeFanOut := &core.FanOut{
+		ParentJobID: completeParent.ID,
+		TotalCount:  2,
+		Status:      core.FanOutPending,
+		CreatedAt:   old,
+	}
+	require.NoError(t, s.CreateFanOut(ctx, completeFanOut))
+	require.NoError(t, s.EnqueueBatch(ctx, []*core.Job{
+		{Type: "sub", Queue: "default", FanOutID: &completeFanOut.ID, FanOutIndex: 0},
+		{Type: "sub", Queue: "default", FanOutID: &completeFanOut.ID, FanOutIndex: 1},
+	}))
+
+	terminalParent := &core.Job{Type: "workflow.terminal", Queue: "default", Status: core.StatusWaiting}
+	require.NoError(t, s.Enqueue(ctx, terminalParent))
+	terminalFanOut := &core.FanOut{
+		ParentJobID: terminalParent.ID,
+		TotalCount:  3,
+		Status:      core.FanOutCompleted,
+		CreatedAt:   old,
+	}
+	require.NoError(t, s.CreateFanOut(ctx, terminalFanOut))
+
+	stalled, err := s.GetStalledFanOutParents(ctx, cutoff)
+	require.NoError(t, err)
+	require.Len(t, stalled, 1)
+	assert.Equal(t, oldIncompleteParent.ID, stalled[0].ID)
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // EnqueueBatch — additional edge cases
 // ──────────────────────────────────────────────────────────────────────────────
