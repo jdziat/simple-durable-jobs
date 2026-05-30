@@ -57,7 +57,19 @@ Harness MUST be RED on current code (reproduce ≥2 defect classes) and GREEN-ab
 
 | Packet | Status | Commit | Notes |
 |---|---|---|---|
-| H0 | dispatched | — | distributed chaos/load harness (RED baseline) |
-| P1–P14 | pending | — | |
+| H0 | ✅ committed | `469c6d0` | harness verified RED: INV-EXACTLY-ONCE phase_reexec=50, INV-SCHED immediate_burst |
+| P1 | ✅ committed | `b827971` | 0.1/0.2/3.3/5.3 — INV-EXACTLY-ONCE flipped to PASS (phase_reexec=0) |
+| P2 | 🔄 in progress | — | unique constraint (0.4) |
+| P3–P14 | pending | — | |
 
 Status legend: pending → dispatched → review → verified → committed.
+
+**Gating note (important for resumption):** the chaos harness exits RED until ALL
+distributed packets land, so the per-packet gate is the *specific* invariant, not the
+script exit code. Map: P1→INV-EXACTLY-ONCE ✅ · P2→INV-UNIQUE · P3→INV-NO-WEDGE ·
+P8a→INV-FANOUT-COUNTS · P4→INV-SCHED. P3 (0.3) and P8a (2.2) already observed RED under
+chaos (INV-NO-WEDGE waiting=1, INV-FANOUT-COUNTS mismatched=1) — expected until those land.
+
+**Carry-over for the testing packet:** `TestIntegration_ConcurrentWorkers` is flaky
+(shutdown race; 5/5 pass isolated, fails under full-suite contention) — the review's
+"test theater". Fix it when the testing-quality work happens.
