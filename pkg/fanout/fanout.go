@@ -42,7 +42,7 @@ func FanOut[T any](ctx context.Context, subJobs []SubJob, opts ...Option) ([]Res
 	cs.Mu.Lock()
 	callIndex := cs.CallIndex
 	cs.CallIndex++
-	checkpoint, hasCheckpoint := cs.Checkpoints[callIndex]
+	checkpoint, hasCheckpoint := cs.Checkpoints[intctx.CheckpointKey{Index: callIndex, Type: "fanout"}]
 	cs.Mu.Unlock()
 
 	var fanOutID string

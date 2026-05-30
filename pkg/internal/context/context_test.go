@@ -148,10 +148,10 @@ func TestWithCallStateAndGetCallState(t *testing.T) {
 		if len(cs.Checkpoints) != 2 {
 			t.Fatalf("expected 2 checkpoints, got %d", len(cs.Checkpoints))
 		}
-		if cp0 := cs.Checkpoints[0]; cp0 != nil && cp0.CallType != "fetch" {
+		if cp0 := cs.Checkpoints[CheckpointKey{Index: 0, Type: "fetch"}]; cp0 != nil && cp0.CallType != "fetch" {
 			t.Errorf("expected call type %q, got %q", "fetch", cp0.CallType)
 		}
-		if cp1 := cs.Checkpoints[1]; cp1 != nil && cp1.CallType != "process" {
+		if cp1 := cs.Checkpoints[CheckpointKey{Index: 1, Type: "process"}]; cp1 != nil && cp1.CallType != "process" {
 			t.Errorf("expected call type %q, got %q", "process", cp1.CallType)
 		}
 	})
@@ -212,7 +212,7 @@ func TestWithCallStateAndGetCallState(t *testing.T) {
 		}
 	})
 
-	t.Run("maps checkpoints by call index", func(t *testing.T) {
+	t.Run("maps checkpoints by call index and type", func(t *testing.T) {
 		// Arrange
 		baseCtx := context.Background()
 		checkpoints := []core.Checkpoint{
@@ -235,15 +235,38 @@ func TestWithCallStateAndGetCallState(t *testing.T) {
 		cs := GetCallState(ctx)
 
 		// Assert
-		if cp, ok := cs.Checkpoints[5]; !ok {
+		if cp, ok := cs.Checkpoints[CheckpointKey{Index: 5, Type: "nested"}]; !ok {
 			t.Fatal("expected checkpoint at index 5")
 		} else if cp.CallType != "nested" {
 			t.Errorf("expected call type %q, got %q", "nested", cp.CallType)
 		}
-		if cp, ok := cs.Checkpoints[10]; !ok {
+		if cp, ok := cs.Checkpoints[CheckpointKey{Index: 10, Type: "other"}]; !ok {
 			t.Fatal("expected checkpoint at index 10")
 		} else if cp.CallType != "other" {
 			t.Errorf("expected call type %q, got %q", "other", cp.CallType)
+		}
+	})
+
+	t.Run("preserves checkpoints with same index and different type", func(t *testing.T) {
+		baseCtx := context.Background()
+		checkpoints := []core.Checkpoint{
+			{ID: "phase-1", JobID: "job-1", CallIndex: -1, CallType: "phase1", Result: []byte(`"one"`)},
+			{ID: "phase-2", JobID: "job-1", CallIndex: -1, CallType: "phase2", Result: []byte(`"two"`)},
+			{ID: "call-0", JobID: "job-1", CallIndex: 0, CallType: "call", Result: []byte(`"call"`)},
+			{ID: "fanout-0", JobID: "job-1", CallIndex: 0, CallType: "fanout", Result: []byte(`{}`)},
+		}
+
+		ctx := WithCallState(baseCtx, checkpoints)
+		cs := GetCallState(ctx)
+
+		if len(cs.Checkpoints) != 4 {
+			t.Fatalf("expected 4 checkpoints, got %d", len(cs.Checkpoints))
+		}
+		for _, cp := range checkpoints {
+			key := CheckpointKey{Index: cp.CallIndex, Type: cp.CallType}
+			if cs.Checkpoints[key] == nil {
+				t.Fatalf("expected checkpoint for key %+v", key)
+			}
 		}
 	})
 
@@ -308,15 +331,17 @@ func TestContextIsolation(t *testing.T) {
 		// Assert
 		cs1 := GetCallState(ctx1)
 		cs2 := GetCallState(ctx2)
-		if cs1 != nil && cs1.Checkpoints != nil && cs1.Checkpoints[0] != nil {
-			if cs1.Checkpoints[0].CallType != "call1" {
+		key1 := CheckpointKey{Index: 0, Type: "call1"}
+		if cs1 != nil && cs1.Checkpoints != nil && cs1.Checkpoints[key1] != nil {
+			if cs1.Checkpoints[key1].CallType != "call1" {
 				t.Error("ctx1 call state was modified")
 			}
 		} else {
 			t.Fatal("ctx1 call state not properly set")
 		}
-		if cs2 != nil && cs2.Checkpoints != nil && cs2.Checkpoints[0] != nil {
-			if cs2.Checkpoints[0].CallType != "call2" {
+		key2 := CheckpointKey{Index: 0, Type: "call2"}
+		if cs2 != nil && cs2.Checkpoints != nil && cs2.Checkpoints[key2] != nil {
+			if cs2.Checkpoints[key2].CallType != "call2" {
 				t.Error("ctx2 call state was modified")
 			}
 		} else {
@@ -346,7 +371,7 @@ func TestCallStatePointerReferences(t *testing.T) {
 		cs := GetCallState(ctx)
 
 		// Assert
-		storedCP := cs.Checkpoints[0]
+		storedCP := cs.Checkpoints[CheckpointKey{Index: 0, Type: "fetch"}]
 		if storedCP == nil {
 			t.Fatal("expected checkpoint pointer")
 		}

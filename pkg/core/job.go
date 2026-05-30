@@ -58,13 +58,15 @@ type Job struct {
 
 // Checkpoint stores the result of a durable Call() for replay.
 type Checkpoint struct {
-	ID        string    `gorm:"primaryKey;size:36"`
-	JobID     string    `gorm:"index;uniqueIndex:idx_checkpoints_job_call,priority:1;size:36;not null"`
-	CallIndex int       `gorm:"uniqueIndex:idx_checkpoints_job_call,priority:2;not null"`
-	CallType  string    `gorm:"uniqueIndex:idx_checkpoints_job_call,priority:3;size:255;not null"`
-	Result    []byte    `gorm:"type:bytes"`
-	Error     string    `gorm:"type:text"`
-	CreatedAt time.Time `gorm:"autoCreateTime"`
+	ID              string    `gorm:"primaryKey;size:36"`
+	JobID           string    `gorm:"index;uniqueIndex:idx_checkpoints_job_call,priority:1;size:36;not null"`
+	CallIndex       int       `gorm:"uniqueIndex:idx_checkpoints_job_call,priority:2;not null"`
+	CallType        string    `gorm:"uniqueIndex:idx_checkpoints_job_call,priority:3;size:255;not null"`
+	Result          []byte    `gorm:"type:bytes"`
+	Error           string    `gorm:"type:text"`
+	ErrorKind       string    `gorm:"size:64"`
+	ErrorDelayNanos int64     `gorm:"default:0"`
+	CreatedAt       time.Time `gorm:"autoCreateTime"`
 }
 
 // FanOutCheckpoint stores fan-out state for job replay.

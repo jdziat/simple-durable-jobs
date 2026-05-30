@@ -4,11 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/jdziat/simple-durable-jobs/pkg/core"
 	intctx "github.com/jdziat/simple-durable-jobs/pkg/internal/context"
 	"github.com/jdziat/simple-durable-jobs/pkg/internal/handler"
+	"github.com/jdziat/simple-durable-jobs/pkg/security"
 )
 
 func TestCallWithoutJobContext(t *testing.T) {
@@ -181,6 +184,57 @@ func TestCallWithCachedCheckpoint(t *testing.T) {
 		}
 		if result != "" {
 			t.Errorf("expected zero value, got %q", result)
+		}
+	})
+
+	t.Run("returns determinism violation for checkpoint at same index with different type", func(t *testing.T) {
+		baseCtx := context.Background()
+		checkpoints := []core.Checkpoint{
+			{
+				ID:        "cp-1",
+				JobID:     "job-1",
+				CallIndex: 0,
+				CallType:  "old-step",
+				Result:    []byte(`"wrong-result"`),
+			},
+		}
+
+		handlerCalled := false
+		testHandler := func(ctx context.Context, args any) (string, error) {
+			handlerCalled = true
+			return "new-result", nil
+		}
+		h, err := handler.NewHandler(testHandler)
+		if err != nil {
+			t.Fatalf("failed to create handler: %v", err)
+		}
+
+		jobCtx := &intctx.JobContext{
+			Job: &core.Job{ID: "job-1"},
+			HandlerLookup: func(name string) (any, bool) {
+				return h, true
+			},
+			SaveCheckpoint: func(ctx context.Context, cp *core.Checkpoint) error {
+				t.Fatal("checkpoint should not be saved after determinism violation")
+				return nil
+			},
+		}
+
+		ctx := intctx.WithJobContext(baseCtx, jobCtx)
+		ctx = intctx.WithCallState(ctx, checkpoints)
+
+		result, err := Call[string](ctx, "new-step", nil)
+		if err == nil {
+			t.Fatal("expected determinism violation")
+		}
+		if !contains(err.Error(), "determinism violation") {
+			t.Fatalf("expected determinism violation, got %v", err)
+		}
+		if result != "" {
+			t.Fatalf("expected zero result, got %q", result)
+		}
+		if handlerCalled {
+			t.Fatal("handler must not execute after determinism violation")
 		}
 	})
 }
@@ -462,6 +516,132 @@ func TestCallPropagatesHandlerErrors(t *testing.T) {
 			t.Errorf("expected zero value, got %d", result)
 		}
 	})
+
+	t.Run("checkpointed typed errors preserve identity on replay", func(t *testing.T) {
+		tests := []struct {
+			name   string
+			err    error
+			assert func(*testing.T, error)
+		}{
+			{
+				name: "no retry",
+				err:  core.NoRetry(errors.New("permanent failure")),
+				assert: func(t *testing.T, err error) {
+					var noRetry *core.NoRetryError
+					if !errors.As(err, &noRetry) {
+						t.Fatalf("expected NoRetryError, got %T %v", err, err)
+					}
+				},
+			},
+			{
+				name: "retry after",
+				err:  core.RetryAfter(2*time.Second, errors.New("temporary failure")),
+				assert: func(t *testing.T, err error) {
+					var retryAfter *core.RetryAfterError
+					if !errors.As(err, &retryAfter) {
+						t.Fatalf("expected RetryAfterError, got %T %v", err, err)
+					}
+					if retryAfter.Delay != 2*time.Second {
+						t.Fatalf("expected delay 2s, got %v", retryAfter.Delay)
+					}
+				},
+			},
+			{
+				name: "sentinel",
+				err:  core.ErrInvalidQueueName,
+				assert: func(t *testing.T, err error) {
+					if !errors.Is(err, core.ErrInvalidQueueName) {
+						t.Fatalf("expected ErrInvalidQueueName identity, got %T %v", err, err)
+					}
+				},
+			},
+		}
+
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				testHandler := func(ctx context.Context, args string) (string, error) {
+					return "", tt.err
+				}
+				h, err := handler.NewHandler(testHandler)
+				if err != nil {
+					t.Fatalf("failed to create handler: %v", err)
+				}
+
+				var saved *core.Checkpoint
+				jobCtx := &intctx.JobContext{
+					Job: &core.Job{ID: "job-1"},
+					HandlerLookup: func(name string) (any, bool) {
+						return h, true
+					},
+					SaveCheckpoint: func(ctx context.Context, cp *core.Checkpoint) error {
+						cpCopy := *cp
+						saved = &cpCopy
+						return nil
+					},
+				}
+
+				ctx := intctx.WithJobContext(context.Background(), jobCtx)
+				ctx = intctx.WithCallState(ctx, []core.Checkpoint{})
+
+				_, err = Call[string](ctx, "fail", "arg")
+				if err == nil {
+					t.Fatal("expected first-run error")
+				}
+				tt.assert(t, err)
+				if saved == nil {
+					t.Fatal("expected checkpoint to be saved")
+				}
+				if saved.ErrorKind == "" {
+					t.Fatal("expected checkpoint error kind")
+				}
+
+				replayCtx := intctx.WithJobContext(context.Background(), jobCtx)
+				replayCtx = intctx.WithCallState(replayCtx, []core.Checkpoint{*saved})
+
+				_, replayErr := Call[string](replayCtx, "fail", "arg")
+				if replayErr == nil {
+					t.Fatal("expected replay error")
+				}
+				tt.assert(t, replayErr)
+				if replayErr.Error() != err.Error() {
+					t.Fatalf("expected replay error %q, got %q", err.Error(), replayErr.Error())
+				}
+			})
+		}
+	})
+}
+
+func TestCallRejectsOversizedArgsBeforeExecutingHandler(t *testing.T) {
+	testHandler := func(ctx context.Context, args string) (string, error) {
+		t.Fatal("handler should not execute for oversized args")
+		return "", nil
+	}
+	h, err := handler.NewHandler(testHandler)
+	if err != nil {
+		t.Fatalf("failed to create handler: %v", err)
+	}
+
+	jobCtx := &intctx.JobContext{
+		Job: &core.Job{ID: "job-1"},
+		HandlerLookup: func(name string) (any, bool) {
+			return h, true
+		},
+		SaveCheckpoint: func(ctx context.Context, cp *core.Checkpoint) error {
+			t.Fatal("checkpoint should not be saved for oversized args")
+			return nil
+		},
+	}
+
+	ctx := intctx.WithJobContext(context.Background(), jobCtx)
+	ctx = intctx.WithCallState(ctx, []core.Checkpoint{})
+
+	_, err = Call[string](ctx, "oversized", strings.Repeat("x", security.MaxJobArgsSize+1))
+	if err == nil {
+		t.Fatal("expected oversized args error")
+	}
+	if !errors.Is(err, core.ErrJobArgsTooLarge) {
+		t.Fatalf("expected ErrJobArgsTooLarge, got %v", err)
+	}
 }
 
 func TestCallIntegration(t *testing.T) {

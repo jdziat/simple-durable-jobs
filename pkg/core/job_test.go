@@ -73,8 +73,10 @@ func TestCheckpoint_WithError(t *testing.T) {
 		CallIndex: 1,
 		CallType:  "api-call",
 		Error:     "connection refused",
+		ErrorKind: CheckpointErrorKindNoRetry,
 	}
 
 	assert.Empty(t, cp.Result)
 	assert.Equal(t, "connection refused", cp.Error)
+	assert.Equal(t, CheckpointErrorKindNoRetry, cp.ErrorKind)
 }

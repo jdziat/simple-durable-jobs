@@ -38,11 +38,17 @@ func WithJobContext(ctx context.Context, jc *JobContext) context.Context {
 // CallStateKey is the key for storing call state in context.Context.
 type CallStateKey struct{}
 
+// CheckpointKey identifies a durable checkpoint by both call position and type.
+type CheckpointKey struct {
+	Index int
+	Type  string
+}
+
 // CallState tracks the current call index for replay.
 type CallState struct {
 	Mu          sync.Mutex
 	CallIndex   int
-	Checkpoints map[int]*core.Checkpoint
+	Checkpoints map[CheckpointKey]*core.Checkpoint
 }
 
 // GetCallState retrieves the call state from a context.Context.
@@ -56,10 +62,11 @@ func GetCallState(ctx context.Context) *CallState {
 // WithCallState adds call state to a context.Context.
 func WithCallState(ctx context.Context, checkpoints []core.Checkpoint) context.Context {
 	cs := &CallState{
-		Checkpoints: make(map[int]*core.Checkpoint),
+		Checkpoints: make(map[CheckpointKey]*core.Checkpoint),
 	}
 	for i := range checkpoints {
-		cs.Checkpoints[checkpoints[i].CallIndex] = &checkpoints[i]
+		key := CheckpointKey{Index: checkpoints[i].CallIndex, Type: checkpoints[i].CallType}
+		cs.Checkpoints[key] = &checkpoints[i]
 	}
 	return context.WithValue(ctx, CallStateKey{}, cs)
 }
