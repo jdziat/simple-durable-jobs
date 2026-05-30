@@ -80,6 +80,10 @@ func (m *mockStorage) GetDueJobs(ctx context.Context, queues []string, limit int
 	return nil, nil
 }
 
+func (m *mockStorage) ClaimScheduledFire(ctx context.Context, name string, fireTime time.Time) (bool, error) {
+	return true, nil
+}
+
 func (m *mockStorage) Heartbeat(ctx context.Context, jobID, workerID string) error {
 	return nil
 }

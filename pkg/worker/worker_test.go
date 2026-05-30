@@ -37,6 +37,7 @@ type mockStorage struct {
 	checkpointFunc  func(ctx context.Context, jobID string) ([]core.Checkpoint, error)
 	waitingJobsFunc func(ctx context.Context) ([]*core.Job, error)
 	stalledJobsFunc func(ctx context.Context, olderThan time.Time) ([]*core.Job, error)
+	claimFireFunc   func(ctx context.Context, name string, fireTime time.Time) (bool, error)
 
 	// fan-out control hooks
 	incrementCompletedFunc func(ctx context.Context, fanOutID string) (*core.FanOut, error)
@@ -59,9 +60,10 @@ type mockStorage struct {
 
 func (m *mockStorage) Migrate(_ context.Context) error { return nil }
 
-func (m *mockStorage) Enqueue(_ context.Context, _ *core.Job) error {
+func (m *mockStorage) Enqueue(_ context.Context, job *core.Job) error {
 	m.enqueueMu.Lock()
 	m.enqueueCount++
+	m.enqueuedJobs = append(m.enqueuedJobs, job)
 	m.enqueueMu.Unlock()
 	return nil
 }
@@ -119,6 +121,13 @@ func (m *mockStorage) DeleteCheckpoints(_ context.Context, _ string) error { ret
 
 func (m *mockStorage) GetDueJobs(_ context.Context, _ []string, _ int) ([]*core.Job, error) {
 	return nil, nil
+}
+
+func (m *mockStorage) ClaimScheduledFire(ctx context.Context, name string, fireTime time.Time) (bool, error) {
+	if m.claimFireFunc != nil {
+		return m.claimFireFunc(ctx, name, fireTime)
+	}
+	return true, nil
 }
 
 func (m *mockStorage) Heartbeat(ctx context.Context, jobID string, workerID string) error {
@@ -1928,7 +1937,7 @@ func TestWorker_RunScheduler_EnqueuesDueJob(t *testing.T) {
 		"scheduler should enqueue at least one due job")
 }
 
-func TestWorker_RunScheduler_ForwardsArgsOptionsAndDeterministicUniqueKey(t *testing.T) {
+func TestWorker_RunScheduler_ForwardsArgsOptionsAndUserUniqueKey(t *testing.T) {
 	mock := &mockStorage{}
 	q := queue.New(mock)
 	q.Register("scheduled-task", func(_ context.Context, _ map[string]string) error {
@@ -1944,6 +1953,7 @@ func TestWorker_RunScheduler_ForwardsArgsOptionsAndDeterministicUniqueKey(t *tes
 		queue.Retries(5),
 		queue.At(runAt),
 		queue.Timeout(time.Second),
+		queue.Unique("user:scheduled-task"),
 	)
 
 	w := NewWorker(q, WithStaleLockInterval(0))
@@ -1969,16 +1979,16 @@ func TestWorker_RunScheduler_ForwardsArgsOptionsAndDeterministicUniqueKey(t *tes
 	assert.Equal(t, 5, job.MaxRetries)
 	require.NotNil(t, job.RunAt)
 	assert.Equal(t, runAt, *job.RunAt)
-	wantKey := "sched:scheduled-task:" + fire.UTC().Format(time.RFC3339)
-	assert.Equal(t, wantKey, mock.enqueuedKeys[0])
-	assert.Equal(t, wantKey, job.UniqueKey)
+	assert.Equal(t, "user:scheduled-task", mock.enqueuedKeys[0])
+	assert.Equal(t, "user:scheduled-task", job.UniqueKey)
 }
 
-func TestWorker_RunScheduler_AdvancesAfterDuplicateJob(t *testing.T) {
-	mock := &mockStorage{
-		enqueueUniqueFunc: func(context.Context, *core.Job, string) error {
-			return core.ErrDuplicateJob
-		},
+func TestWorker_RunScheduler_ClaimRefusalAdvancesBoundary(t *testing.T) {
+	var claimCalls atomic.Int32
+	mock := &mockStorage{}
+	mock.claimFireFunc = func(context.Context, string, time.Time) (bool, error) {
+		claimCalls.Add(1)
+		return false, nil
 	}
 	q := queue.New(mock)
 	q.Register("scheduled-task", func(_ context.Context, _ struct{}) error {
@@ -1996,10 +2006,37 @@ func TestWorker_RunScheduler_AdvancesAfterDuplicateJob(t *testing.T) {
 
 	<-ctx.Done()
 
+	assert.Equal(t, int32(1), claimCalls.Load(), "refused claim should advance lastRun past the boundary")
+	assert.Equal(t, int64(0), mock.getEnqueueCount())
+}
+
+func TestWorker_RunScheduler_ClaimedBoundaryEnqueuesOnce(t *testing.T) {
+	var claimCalls atomic.Int32
+	mock := &mockStorage{}
+	mock.claimFireFunc = func(context.Context, string, time.Time) (bool, error) {
+		return claimCalls.Add(1) == 1, nil
+	}
+	q := queue.New(mock)
+	q.Register("scheduled-task", func(_ context.Context, _ struct{}) error {
+		return nil
+	})
+
+	fire := time.Now().Add(250 * time.Millisecond)
+	q.Schedule("scheduled-task", nil, fixedBoundarySchedule{fire: fire})
+
+	w := NewWorker(q, WithStaleLockInterval(0))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 650*time.Millisecond)
+	defer cancel()
+	go func() { w.runScheduler(ctx) }()
+
+	<-ctx.Done()
+
+	assert.Equal(t, int32(1), claimCalls.Load(), "claimed boundary should advance lastRun")
+	assert.Equal(t, int64(1), mock.getEnqueueCount())
 	mock.enqueueMu.Lock()
 	defer mock.enqueueMu.Unlock()
-	assert.Len(t, mock.enqueuedKeys, 1)
-	assert.Equal(t, "sched:scheduled-task:"+fire.UTC().Format(time.RFC3339), mock.enqueuedKeys[0])
+	assert.Empty(t, mock.enqueuedKeys, "scheduler must not inject a sched: unique key")
 }
 
 // ---------------------------------------------------------------------------

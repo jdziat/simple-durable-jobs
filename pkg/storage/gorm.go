@@ -78,7 +78,7 @@ func (s *GormStorage) DB() *gorm.DB {
 // Migrate creates the necessary tables.
 func (s *GormStorage) Migrate(ctx context.Context) error {
 	db := s.db.WithContext(ctx)
-	if err := db.AutoMigrate(&core.Job{}, &core.Checkpoint{}, &core.FanOut{}, &core.QueueState{}); err != nil {
+	if err := db.AutoMigrate(&core.Job{}, &core.Checkpoint{}, &core.FanOut{}, &core.QueueState{}, &core.ScheduledFire{}); err != nil {
 		return err
 	}
 
@@ -521,6 +521,26 @@ func (s *GormStorage) GetDueJobs(ctx context.Context, queues []string, limit int
 		Find(&jobList).Error
 
 	return jobList, err
+}
+
+// ClaimScheduledFire atomically advances a schedule's last claimed fire time.
+// Exactly one caller can claim a given (name, fireTime) boundary; later
+// boundaries can claim again, while equal or earlier boundaries are refused.
+func (s *GormStorage) ClaimScheduledFire(ctx context.Context, name string, fireTime time.Time) (bool, error) {
+	err := s.db.WithContext(ctx).Clauses(clause.OnConflict{DoNothing: true}).
+		Create(&core.ScheduledFire{Name: name, LastFireAt: time.Unix(0, 0).UTC()}).Error
+	if err != nil {
+		return false, err
+	}
+
+	result := s.db.WithContext(ctx).
+		Model(&core.ScheduledFire{}).
+		Where("name = ? AND last_fire_at < ?", name, fireTime).
+		Update("last_fire_at", fireTime)
+	if result.Error != nil {
+		return false, result.Error
+	}
+	return result.RowsAffected == 1, nil
 }
 
 // Heartbeat extends the lock on a running job.

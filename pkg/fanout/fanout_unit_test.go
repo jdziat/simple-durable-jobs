@@ -95,6 +95,9 @@ func (s *minimalStorage) DeleteCheckpoints(ctx context.Context, jobID string) er
 func (s *minimalStorage) GetDueJobs(ctx context.Context, queues []string, limit int) ([]*core.Job, error) {
 	return nil, nil
 }
+func (s *minimalStorage) ClaimScheduledFire(ctx context.Context, name string, fireTime time.Time) (bool, error) {
+	return true, nil
+}
 func (s *minimalStorage) Heartbeat(ctx context.Context, jobID, workerID string) error { return nil }
 func (s *minimalStorage) ReleaseStaleLocks(ctx context.Context, d time.Duration) ([]string, error) {
 	return nil, nil

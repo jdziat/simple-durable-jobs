@@ -1497,6 +1497,68 @@ func TestEnqueueUnique_Concurrent_NoDuplicates(t *testing.T) {
 	assert.EqualValues(t, 1, count, "concurrent EnqueueUnique produced duplicate rows")
 }
 
+func TestClaimScheduledFire_ConcurrentExactlyOnceAndTimeOrdering(t *testing.T) {
+	ctx := context.Background()
+	s := newConcurrentTestStorage(t)
+
+	const concurrency = 20
+	const name = "daily-report"
+	fireTime := time.Now().UTC().Truncate(time.Millisecond)
+
+	start := make(chan struct{})
+	results := make(chan bool, concurrency)
+	errs := make(chan error, concurrency)
+	var wg sync.WaitGroup
+
+	for range concurrency {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			claimed, err := s.ClaimScheduledFire(ctx, name, fireTime)
+			if err != nil {
+				errs <- err
+				return
+			}
+			results <- claimed
+		}()
+	}
+
+	close(start)
+	wg.Wait()
+	close(results)
+	close(errs)
+
+	for err := range errs {
+		require.NoError(t, err)
+	}
+
+	claims := 0
+	for claimed := range results {
+		if claimed {
+			claims++
+		}
+	}
+	assert.Equal(t, 1, claims, "exactly one caller should claim a schedule boundary")
+
+	claimed, err := s.ClaimScheduledFire(ctx, name, fireTime)
+	require.NoError(t, err)
+	assert.False(t, claimed, "equal fire time should not claim again")
+
+	claimed, err = s.ClaimScheduledFire(ctx, name, fireTime.Add(-time.Second))
+	require.NoError(t, err)
+	assert.False(t, claimed, "earlier fire time should not claim")
+
+	later := fireTime.Add(time.Second)
+	claimed, err = s.ClaimScheduledFire(ctx, name, later)
+	require.NoError(t, err)
+	assert.True(t, claimed, "strictly later fire time should claim")
+
+	claimed, err = s.ClaimScheduledFire(ctx, name, later)
+	require.NoError(t, err)
+	assert.False(t, claimed, "later boundary should also be claimed only once")
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Suspend / Resume
 // ──────────────────────────────────────────────────────────────────────────────

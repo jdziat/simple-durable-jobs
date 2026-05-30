@@ -772,11 +772,23 @@ func (w *Worker) runScheduler(ctx context.Context) {
 				}
 				nextRun := sj.Schedule.Next(lastRun[name])
 				if now.After(nextRun) || now.Equal(nextRun) {
+					claimed, err := w.queue.Storage().ClaimScheduledFire(ctx, name, nextRun)
+					if err != nil {
+						w.logger.Error("failed to claim scheduled fire", "name", name, "fire_time", nextRun, "error", err)
+						continue
+					}
+					if !claimed {
+						lastRun[name] = nextRun
+						continue
+					}
+					lastRun[name] = nextRun
 					opts := []queue.Option{
 						queue.QueueOpt(sj.Options.Queue),
 						queue.Priority(sj.Options.Priority),
 						queue.Retries(sj.Options.MaxRetries),
-						queue.Unique("sched:" + name + ":" + nextRun.UTC().Format(time.RFC3339)),
+					}
+					if sj.Options.UniqueKey != "" {
+						opts = append(opts, queue.Unique(sj.Options.UniqueKey))
 					}
 					if sj.Options.Delay > 0 {
 						opts = append(opts, queue.Delay(sj.Options.Delay))
@@ -787,12 +799,10 @@ func (w *Worker) runScheduler(ctx context.Context) {
 					if sj.Options.Timeout > 0 {
 						opts = append(opts, queue.Timeout(sj.Options.Timeout))
 					}
-					_, err := w.queue.Enqueue(ctx, sj.Name, sj.Args,
+					_, err = w.queue.Enqueue(ctx, sj.Name, sj.Args,
 						opts...,
 					)
-					if err == nil || errors.Is(err, core.ErrDuplicateJob) {
-						lastRun[name] = nextRun
-					} else {
+					if err != nil {
 						w.logger.Error("failed to enqueue scheduled job", "name", name, "error", err)
 					}
 				}

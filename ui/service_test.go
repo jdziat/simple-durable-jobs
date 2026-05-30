@@ -55,6 +55,9 @@ func (m *mockStorage) DeleteCheckpoints(_ context.Context, _ string) error      
 func (m *mockStorage) GetDueJobs(_ context.Context, _ []string, _ int) ([]*core.Job, error) {
 	return nil, nil
 }
+func (m *mockStorage) ClaimScheduledFire(_ context.Context, _ string, _ time.Time) (bool, error) {
+	return true, nil
+}
 func (m *mockStorage) Heartbeat(_ context.Context, _, _ string) error { return nil }
 func (m *mockStorage) ReleaseStaleLocks(_ context.Context, _ time.Duration) ([]string, error) {
 	return nil, nil
