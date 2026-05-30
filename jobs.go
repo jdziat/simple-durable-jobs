@@ -225,6 +225,7 @@ var (
 	ErrQueueAlreadyPaused = core.ErrQueueAlreadyPaused
 	ErrQueueNotPaused     = core.ErrQueueNotPaused
 	ErrCannotPauseStatus  = core.ErrCannotPauseStatus
+	ErrNoResult           = core.ErrNoResult
 )
 
 // Default values
@@ -461,6 +462,13 @@ func WithStaleLockAge(d time.Duration) WorkerOption {
 	return worker.WithStaleLockAge(d)
 }
 
+// WithLockDuration configures how long jobs are locked via the storage
+// backend's SetLockDuration. GormStorage implements SetLockDuration; custom
+// Storage backends must implement SetLockDuration(time.Duration) to honor it.
+func WithLockDuration(d time.Duration) WorkerOption {
+	return worker.WithLockDuration(d)
+}
+
 // WithFanOutRecoveryStaleAge sets how old a pending fan-out must be before the
 // worker resumes a parent that crashed mid-enqueue (recovery for an
 // incompletely-enqueued fan-out). Default is 2 minutes; non-positive keeps the
@@ -527,11 +535,7 @@ func FanOut[T any](ctx context.Context, subJobs []SubJob, opts ...FanOutOption) 
 }
 
 // FanOutResult wraps a sub-job result with its index and potential error.
-type FanOutResult[T any] struct {
-	Index int
-	Value T
-	Err   error
-}
+type FanOutResult[T any] = fanout.Result[T]
 
 // Values extracts values from successful fan-out results.
 func Values[T any](results []fanout.Result[T]) []T {
@@ -618,8 +622,7 @@ func IsSuspendError(err error) bool {
 // Returns:
 //   - ErrJobNotCompleted if the job has not reached a terminal state.
 //   - An error containing job.LastError if the job failed.
-//   - The zero value of T with nil error if the job completed but the
-//     handler returned only an error (no result value).
+//   - ErrNoResult if the job completed but has no persisted result value.
 //   - An error wrapping the JSON decode failure if Result cannot be unmarshaled into T.
 func LoadResult[T any](ctx context.Context, q *Queue, jobID string) (T, error) {
 	var zero T
@@ -633,7 +636,7 @@ func LoadResult[T any](ctx context.Context, q *Queue, jobID string) (T, error) {
 	switch job.Status {
 	case core.StatusCompleted:
 		if job.Result == nil {
-			return zero, nil
+			return zero, core.ErrNoResult
 		}
 		var out T
 		if err := json.Unmarshal(job.Result, &out); err != nil {

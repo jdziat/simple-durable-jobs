@@ -193,6 +193,18 @@ func TestQueue_Register_ValidHandler(t *testing.T) {
 	assert.True(t, q.HasHandler("test-job"))
 }
 
+func TestQueue_RegisterE_ValidHandler(t *testing.T) {
+	store := newMockStorage()
+	q := New(store)
+
+	err := q.RegisterE("test-job", func(ctx context.Context, args string) error {
+		return nil
+	})
+
+	require.NoError(t, err)
+	assert.True(t, q.HasHandler("test-job"))
+}
+
 func TestQueue_Register_InvalidName_Panics(t *testing.T) {
 	store := newMockStorage()
 	q := New(store)
@@ -204,6 +216,19 @@ func TestQueue_Register_InvalidName_Panics(t *testing.T) {
 	})
 }
 
+func TestQueue_RegisterE_InvalidName_ReturnsError(t *testing.T) {
+	store := newMockStorage()
+	q := New(store)
+
+	err := q.RegisterE("", func(ctx context.Context, args string) error {
+		return nil
+	})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid handler name")
+	assert.False(t, q.HasHandler(""))
+}
+
 func TestQueue_Register_InvalidHandler_Panics(t *testing.T) {
 	store := newMockStorage()
 	q := New(store)
@@ -211,6 +236,17 @@ func TestQueue_Register_InvalidHandler_Panics(t *testing.T) {
 	assert.Panics(t, func() {
 		q.Register("test-job", "not a function")
 	})
+}
+
+func TestQueue_RegisterE_InvalidHandler_ReturnsError(t *testing.T) {
+	store := newMockStorage()
+	q := New(store)
+
+	err := q.RegisterE("test-job", "not a function")
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "handler for")
+	assert.False(t, q.HasHandler("test-job"))
 }
 
 func TestQueue_Enqueue_UnregisteredHandler(t *testing.T) {

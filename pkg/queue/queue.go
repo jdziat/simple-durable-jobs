@@ -73,15 +73,28 @@ func New(s core.Storage) *Queue {
 // Register registers a job handler function.
 // The function must have signature: func(ctx context.Context, args T) error
 // Job type names must be alphanumeric (starting with a letter), max 255 chars.
+// Register panics on invalid input; use RegisterE for configuration-driven
+// registration that should return validation errors instead.
 func (q *Queue) Register(name string, fn any, opts ...Option) {
+	if err := q.RegisterE(name, fn, opts...); err != nil {
+		panic(err)
+	}
+}
+
+// RegisterE registers a job handler function and returns validation errors
+// instead of panicking.
+//
+// The function must have signature: func(ctx context.Context, args T) error.
+// Job type names must be alphanumeric (starting with a letter), max 255 chars.
+func (q *Queue) RegisterE(name string, fn any, opts ...Option) error {
 	// Validate job type name
 	if err := security.ValidateJobTypeName(name); err != nil {
-		panic(fmt.Sprintf("jobs: invalid handler name %q: %v", name, err))
+		return fmt.Errorf("jobs: invalid handler name %q: %w", name, err)
 	}
 
 	h, err := handler.NewHandler(fn)
 	if err != nil {
-		panic(fmt.Sprintf("jobs: handler for %q: %v", name, err))
+		return fmt.Errorf("jobs: handler for %q: %w", name, err)
 	}
 
 	// Apply registration options (e.g. Timeout)
@@ -96,6 +109,7 @@ func (q *Queue) Register(name string, fn any, opts ...Option) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.handlers[name] = h
+	return nil
 }
 
 // HasHandler checks if a handler is registered.

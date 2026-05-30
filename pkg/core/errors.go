@@ -23,6 +23,7 @@ var (
 	ErrQueueNotPaused     = errors.New("jobs: queue is not paused")
 	ErrCannotPauseStatus  = errors.New("jobs: cannot pause job in current status")
 	ErrJobNotCompleted    = errors.New("jobs: job has not completed")
+	ErrNoResult           = errors.New("jobs: completed job has no result")
 )
 
 // NoRetryError indicates an error that should not be retried.
@@ -129,6 +130,7 @@ func SentinelErrorByMessage(message string) error {
 		ErrQueueNotPaused,
 		ErrCannotPauseStatus,
 		ErrJobNotCompleted,
+		ErrNoResult,
 	} {
 		if err.Error() == message {
 			return err

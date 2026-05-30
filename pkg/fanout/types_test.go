@@ -63,10 +63,20 @@ func TestSub_ZeroPriorityOptionIgnored(t *testing.T) {
 	assert.Equal(t, 0, sj.Priority)
 }
 
-func TestSub_ZeroRetriesOptionUsesDefault(t *testing.T) {
-	// When Retries option is 0, Sub falls back to DefaultJobRetries.
+func TestSub_ZeroRetriesOptionIsHonored(t *testing.T) {
 	sj := Sub("job", "args", queue.Retries(0))
-	assert.Equal(t, queue.DefaultJobRetries, sj.Retries)
+	assert.Equal(t, 0, sj.Retries)
+}
+
+func TestSub_RetriesOptions(t *testing.T) {
+	assert.Equal(t, queue.DefaultJobRetries, Sub("job", "args").Retries)
+	assert.Equal(t, 0, Sub("job", "args", queue.Retries(0)).Retries)
+	assert.Equal(t, 5, Sub("job", "args", queue.Retries(5)).Retries)
+}
+
+func TestSub_QueueOnlySetWhenNonEmpty(t *testing.T) {
+	sj := Sub("job", "args", queue.QueueOpt(""))
+	assert.Empty(t, sj.Queue)
 }
 
 // ---------------------------------------------------------------------------

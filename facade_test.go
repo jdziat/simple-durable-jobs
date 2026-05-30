@@ -187,6 +187,11 @@ func TestFacadeWorkerCreation_StaleLockAgeOption(t *testing.T) {
 	assert.NotNil(t, opt)
 }
 
+func TestFacadeWorkerCreation_LockDurationOption(t *testing.T) {
+	opt := jobs.WithLockDuration(30 * time.Minute)
+	assert.NotNil(t, opt)
+}
+
 func TestFacadeWorkerCreation_NewWorkerWithAllOptions(t *testing.T) {
 	q, _ := setupTestStorage(t)
 	w := jobs.NewWorker(q,
@@ -430,13 +435,22 @@ func TestFacadeFanOut_SubWithOptions(t *testing.T) {
 }
 
 func TestFacadeFanOut_ValuesExtractsSuccesses(t *testing.T) {
-	results := []fanout.Result[int]{
+	results := []jobs.FanOutResult[int]{
 		{Index: 0, Value: 1, Err: nil},
 		{Index: 1, Value: 2, Err: errors.New("fail")},
 		{Index: 2, Value: 3, Err: nil},
 	}
 	vals := jobs.Values(results)
 	assert.Equal(t, []int{1, 3}, vals)
+}
+
+func TestFacadeFanOut_ResultAliasMatchesFanOutResult(t *testing.T) {
+	acceptFacadeResults := func(results []jobs.FanOutResult[int]) int {
+		return len(results)
+	}
+
+	results := []fanout.Result[int]{{Index: 0, Value: 42}}
+	assert.Equal(t, 1, acceptFacadeResults(results))
 }
 
 func TestFacadeFanOut_ValuesEmpty(t *testing.T) {
@@ -591,6 +605,24 @@ func TestLoadResult_DecodesCompletedJob(t *testing.T) {
 	assert.Equal(t, want, got)
 }
 
+func TestLoadResult_DecodesZeroValueResult(t *testing.T) {
+	q, store := setupTestStorage(t)
+
+	resultBytes, err := json.Marshal(0)
+	require.NoError(t, err)
+
+	require.NoError(t, store.Enqueue(context.Background(), &jobs.Job{
+		ID:     "job-zero-result",
+		Type:   "x",
+		Status: jobs.StatusCompleted,
+		Result: resultBytes,
+	}))
+
+	got, err := jobs.LoadResult[int](context.Background(), q, "job-zero-result")
+	require.NoError(t, err)
+	assert.Equal(t, 0, got)
+}
+
 func TestLoadResult_NotCompleted(t *testing.T) {
 	q, store := setupTestStorage(t)
 	require.NoError(t, store.Enqueue(context.Background(), &jobs.Job{
@@ -626,6 +658,6 @@ func TestLoadResult_CompletedWithNilResult(t *testing.T) {
 	}))
 
 	got, err := jobs.LoadResult[string](context.Background(), q, "job-no-result")
-	require.NoError(t, err)
+	require.ErrorIs(t, err, jobs.ErrNoResult)
 	assert.Equal(t, "", got)
 }
