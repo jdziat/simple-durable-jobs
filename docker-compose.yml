@@ -37,3 +37,28 @@ services:
       interval: 3s
       timeout: 3s
       retries: 40
+
+  # Containerized test runner: builds the frontend + Go code (see
+  # Dockerfile.test) and runs the suite against the backend(s) named as its
+  # command — sqlite | postgres | mysql | all. It reaches the databases over
+  # the compose network by service name, so it ignores the host port overrides
+  # above. Used by CI; locally, e.g.:
+  #
+  #   docker compose run --rm tests all
+  #   docker compose run --rm tests postgres
+  #
+  # Coverage profiles land in ./coverage on the host.
+  tests:
+    build:
+      context: .
+      dockerfile: test.Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mysql:
+        condition: service_healthy
+    environment:
+      GO_TEST_FLAGS: ${GO_TEST_FLAGS:--short -race -p=1}
+    volumes:
+      - ./coverage:/src/coverage
+    command: ["sqlite"]

@@ -10,139 +10,35 @@ permissions:
   contents: write
 
 jobs:
-  test-sqlite:
-    name: Test (SQLite)
+  test-backends:
+    name: Tests (containerized)
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: '1.25'
+      # Build the test image once (frontend assets + Go toolchain + source),
+      # then run the suite against every backend inside the container. The Go
+      # build cache is shared across the three runs within a single container
+      # invocation, so the code compiles once.
+      - name: Build test image
+        run: docker compose build tests
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
+      - name: Start databases
+        run: docker compose up -d --wait postgres mysql
 
-      - name: Build frontend
-        working-directory: ui/frontend
-        run: npm install && npm run build
+      - name: Run tests (sqlite, postgres, mysql)
+        run: docker compose run --rm tests all
 
-      - name: Download dependencies
-        run: go mod download
-
-      - name: Run tests
-        run: go test -v -short -race -coverprofile=coverage.out $(go list ./... | grep -v /examples/ | grep -v /ui/cmd/ | grep -v /ui/gen/)
+      - name: Stop databases
+        if: always()
+        run: docker compose down -v
 
       - name: Upload coverage
         uses: codecov/codecov-action@v4
+        if: always()
         with:
-          files: ./coverage.out
-          flags: sqlite
-          fail_ci_if_error: false
-
-  test-postgres:
-    name: Test (PostgreSQL)
-    runs-on: ubuntu-latest
-
-    services:
-      postgres:
-        image: postgres:16-alpine
-        env:
-          POSTGRES_DB: jobs_test
-          POSTGRES_USER: jobs
-          POSTGRES_PASSWORD: jobs
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U jobs -d jobs_test"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 5
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: '1.25'
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
-      - name: Build frontend
-        working-directory: ui/frontend
-        run: npm install && npm run build
-
-      - name: Download dependencies
-        run: go mod download
-
-      - name: Run tests
-        env:
-          TEST_DATABASE_URL: postgres://jobs:jobs@localhost:5432/jobs_test?sslmode=disable
-        run: go test -v -short -race -p=1 -coverprofile=coverage-pg.out $(go list ./... | grep -v /examples/ | grep -v /ui/cmd/ | grep -v /ui/gen/)
-
-      - name: Upload coverage
-        uses: codecov/codecov-action@v4
-        with:
-          files: ./coverage-pg.out
-          flags: postgres
-          fail_ci_if_error: false
-
-  test-mysql:
-    name: Test (MySQL)
-    runs-on: ubuntu-latest
-
-    services:
-      mysql:
-        image: mysql:8.0
-        env:
-          MYSQL_DATABASE: jobs_test
-          MYSQL_ROOT_PASSWORD: jobs
-        ports:
-          - 3306:3306
-        options: >-
-          --health-cmd "mysqladmin ping -h localhost"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 5
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: '1.25'
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
-      - name: Build frontend
-        working-directory: ui/frontend
-        run: npm install && npm run build
-
-      - name: Download dependencies
-        run: go mod download
-
-      - name: Run tests
-        env:
-          TEST_MYSQL_URL: root:jobs@tcp(localhost:3306)/jobs_test?parseTime=true
-        run: go test -v -short -race -p=1 -coverprofile=coverage-mysql.out $(go list ./... | grep -v /examples/ | grep -v /ui/cmd/ | grep -v /ui/gen/)
-
-      - name: Upload coverage
-        uses: codecov/codecov-action@v4
-        with:
-          files: ./coverage-mysql.out
-          flags: mysql
+          directory: ./coverage
           fail_ci_if_error: false
 
   test-e2e:
@@ -215,7 +111,7 @@ jobs:
   build:
     name: Build
     runs-on: ubuntu-latest
-    needs: [test-sqlite, test-postgres, test-mysql, lint]
+    needs: [test-backends, lint]
     steps:
       - uses: actions/checkout@v4
 

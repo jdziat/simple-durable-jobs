@@ -1,0 +1,10 @@
+# Keep the build context small and reproducible. The frontend stage rebuilds
+# node_modules and dist from source, so never ship the host copies.
+.git
+**/node_modules
+ui/frontend/dist
+coverage
+*.out
+*.test
+.claude
+.codex-dispatch
