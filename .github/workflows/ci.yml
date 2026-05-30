@@ -11,34 +11,49 @@ permissions:
 
 jobs:
   test-backends:
-    name: Tests (containerized)
+    name: Tests (${{ matrix.backend }})
     runs-on: ubuntu-latest
+
+    # One parallel job per backend. Each builds the test image (frontend assets
+    # + Go toolchain + source) and runs the suite in a container via docker
+    # compose. fail-fast is off so a failure in one backend doesn't cancel the
+    # others.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - backend: sqlite
+            db: ""
+          - backend: postgres
+            db: postgres
+          - backend: mysql
+            db: mysql
 
     steps:
       - uses: actions/checkout@v4
 
-      # Build the test image once (frontend assets + Go toolchain + source),
-      # then run the suite against every backend inside the container. The Go
-      # build cache is shared across the three runs within a single container
-      # invocation, so the code compiles once.
       - name: Build test image
         run: docker compose build tests
 
-      - name: Start databases
-        run: docker compose up -d --wait postgres mysql
+      # SQLite is in-process and needs no service; the DB backends start only
+      # the one they need (--no-deps on the run keeps the other from starting).
+      - name: Start database
+        if: matrix.db != ''
+        run: docker compose up -d --wait ${{ matrix.db }}
 
-      - name: Run tests (sqlite, postgres, mysql)
-        run: docker compose run --rm tests all
+      - name: Run tests
+        run: docker compose run --rm --no-deps tests ${{ matrix.backend }}
 
-      - name: Stop databases
-        if: always()
+      - name: Stop database
+        if: always() && matrix.db != ''
         run: docker compose down -v
 
       - name: Upload coverage
         uses: codecov/codecov-action@v4
         if: always()
         with:
-          directory: ./coverage
+          files: ./coverage/coverage-${{ matrix.backend }}.out
+          flags: ${{ matrix.backend }}
           fail_ci_if_error: false
 
   test-e2e:
