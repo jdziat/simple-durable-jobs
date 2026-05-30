@@ -12,6 +12,8 @@ import (
 	jobsv1 "github.com/jdziat/simple-durable-jobs/ui/gen/jobs/v1"
 )
 
+const maxUISearchLength = 256
+
 // GetQueueStats returns per-queue job counts grouped by status.
 func (s *GormStorage) GetQueueStats(ctx context.Context) ([]*jobsv1.QueueStats, error) {
 	type row struct {
@@ -81,12 +83,16 @@ func (s *GormStorage) SearchJobs(ctx context.Context, filter core.JobFilter) ([]
 		q = q.Where("type = ?", filter.Type)
 	}
 	if filter.Search != "" {
-		search := "%" + filter.Search + "%"
+		searchTerm := filter.Search
+		if len(searchTerm) > maxUISearchLength {
+			searchTerm = searchTerm[:maxUISearchLength]
+		}
+		search := "%" + escapeLikePattern(searchTerm) + "%"
 		argsExpr := "CAST(args AS TEXT)"
 		if strings.Contains(strings.ToLower(s.db.Name()), "mysql") {
 			argsExpr = "CONVERT(args USING utf8mb4)"
 		}
-		q = q.Where("id LIKE ? OR "+argsExpr+" LIKE ?", search, search)
+		q = q.Where("id LIKE ? ESCAPE '\\' OR "+argsExpr+" LIKE ? ESCAPE '\\'", search, search)
 	}
 	if !filter.Since.IsZero() {
 		q = q.Where("created_at >= ?", filter.Since)
@@ -114,6 +120,19 @@ func (s *GormStorage) SearchJobs(ctx context.Context, filter core.JobFilter) ([]
 	}
 
 	return jobs, total, nil
+}
+
+func escapeLikePattern(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		switch r {
+		case '\\', '%', '_':
+			b.WriteByte('\\')
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
 }
 
 // RetryJob resets a failed or cancelled job back to pending for re-execution.

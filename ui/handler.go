@@ -2,6 +2,7 @@ package ui
 
 import (
 	"context"
+	"errors"
 	"io/fs"
 	"net/http"
 	"strings"
@@ -54,7 +55,7 @@ func Handler(storage core.Storage, opts ...Option) http.Handler {
 	// Register Connect-RPC handler
 	path, handler := jobsv1connect.NewJobsServiceHandler(
 		svc,
-		connect.WithInterceptors(),
+		connect.WithInterceptors(writeAuthInterceptor(cfg.middleware != nil || cfg.insecureAllowUnauthenticatedWrites)),
 	)
 	mux.Handle(path, handler)
 
@@ -90,6 +91,29 @@ func Handler(storage core.Storage, opts ...Option) http.Handler {
 	}
 
 	return h2cHandler
+}
+
+var mutatingProcedures = map[string]struct{}{
+	jobsv1connect.JobsServiceRetryJobProcedure:       {},
+	jobsv1connect.JobsServiceDeleteJobProcedure:      {},
+	jobsv1connect.JobsServiceBulkRetryJobsProcedure:  {},
+	jobsv1connect.JobsServiceBulkDeleteJobsProcedure: {},
+	jobsv1connect.JobsServicePauseJobProcedure:       {},
+	jobsv1connect.JobsServiceResumeJobProcedure:      {},
+	jobsv1connect.JobsServicePauseQueueProcedure:     {},
+	jobsv1connect.JobsServiceResumeQueueProcedure:    {},
+	jobsv1connect.JobsServicePurgeQueueProcedure:     {},
+}
+
+func writeAuthInterceptor(allowWrites bool) connect.Interceptor {
+	return connect.UnaryInterceptorFunc(func(next connect.UnaryFunc) connect.UnaryFunc {
+		return connect.UnaryFunc(func(ctx context.Context, req connect.AnyRequest) (connect.AnyResponse, error) {
+			if _, mutates := mutatingProcedures[req.Spec().Procedure]; mutates && !allowWrites {
+				return nil, connect.NewError(connect.CodePermissionDenied, errors.New("jobs UI write RPCs require auth middleware or explicit insecure opt-in"))
+			}
+			return next(ctx, req)
+		})
+	})
 }
 
 const placeholderHTML = `<!DOCTYPE html>

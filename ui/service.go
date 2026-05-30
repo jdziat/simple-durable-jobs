@@ -17,7 +17,10 @@ import (
 	"github.com/jdziat/simple-durable-jobs/ui/gen/jobs/v1/jobsv1connect"
 )
 
-const maxWatchStreams = 50
+const (
+	maxWatchStreams = 50
+	maxBulkJobIDs   = 1000
+)
 
 // jobsService implements the JobsService Connect-RPC service.
 type jobsService struct {
@@ -185,6 +188,10 @@ func (s *jobsService) DeleteJob(ctx context.Context, req *connect.Request[jobsv1
 
 // BulkRetryJobs retries multiple jobs.
 func (s *jobsService) BulkRetryJobs(ctx context.Context, req *connect.Request[jobsv1.BulkRetryJobsRequest]) (*connect.Response[jobsv1.BulkRetryJobsResponse], error) {
+	if len(req.Msg.Ids) > maxBulkJobIDs {
+		return nil, connect.NewError(connect.CodeInvalidArgument, fmt.Errorf("too many job IDs: max %d", maxBulkJobIDs))
+	}
+
 	count := 0
 	for _, id := range req.Msg.Ids {
 		if _, err := s.retryJob(ctx, id); err == nil {
@@ -198,6 +205,10 @@ func (s *jobsService) BulkRetryJobs(ctx context.Context, req *connect.Request[jo
 
 // BulkDeleteJobs deletes multiple jobs.
 func (s *jobsService) BulkDeleteJobs(ctx context.Context, req *connect.Request[jobsv1.BulkDeleteJobsRequest]) (*connect.Response[jobsv1.BulkDeleteJobsResponse], error) {
+	if len(req.Msg.Ids) > maxBulkJobIDs {
+		return nil, connect.NewError(connect.CodeInvalidArgument, fmt.Errorf("too many job IDs: max %d", maxBulkJobIDs))
+	}
+
 	count := 0
 	for _, id := range req.Msg.Ids {
 		if err := s.deleteJob(ctx, id); err == nil {

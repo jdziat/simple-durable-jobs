@@ -111,6 +111,29 @@ func TestSanitizeErrorMessage_Truncation(t *testing.T) {
 	assert.True(t, strings.HasSuffix(result, "..."))
 }
 
+func TestSanitizeErrorMessage_RedactsSecrets(t *testing.T) {
+	msg := "request failed: bearer abcdefghijklmnopqrstuvwxyz012345 and dsn postgres://app:secret@db.example/jobs"
+
+	result := SanitizeErrorMessage(msg)
+
+	assert.Contains(t, result, "request failed:")
+	assert.Contains(t, result, "bearer [REDACTED]")
+	assert.Contains(t, result, "postgres://app:[REDACTED]@db.example/jobs")
+	assert.NotContains(t, result, "abcdefghijklmnopqrstuvwxyz012345")
+	assert.NotContains(t, result, ":secret@")
+}
+
+func TestSanitizeErrorMessage_RedactsPasswordKeysAndOpaqueTokens(t *testing.T) {
+	msg := "query failed password=hunter2 token=0123456789abcdef0123456789abcdef"
+
+	result := SanitizeErrorMessage(msg)
+
+	assert.Contains(t, result, "password=[REDACTED]")
+	assert.Contains(t, result, "token=[REDACTED]")
+	assert.NotContains(t, result, "hunter2")
+	assert.NotContains(t, result, "0123456789abcdef0123456789abcdef")
+}
+
 func TestClampRetries(t *testing.T) {
 	tests := []struct {
 		input    int

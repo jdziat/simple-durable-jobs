@@ -3,6 +3,8 @@ package ui
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -18,6 +20,7 @@ import (
 	"github.com/jdziat/simple-durable-jobs/pkg/schedule"
 	storagepackage "github.com/jdziat/simple-durable-jobs/pkg/storage"
 	jobsv1 "github.com/jdziat/simple-durable-jobs/ui/gen/jobs/v1"
+	"github.com/jdziat/simple-durable-jobs/ui/gen/jobs/v1/jobsv1connect"
 )
 
 // ---------------------------------------------------------------------------
@@ -263,6 +266,97 @@ func sampleJob(id, queue, jobType string, status core.JobStatus) *core.Job {
 		Args:       []byte(`{"key":"val"}`),
 		CreatedAt:  time.Now(),
 	}
+}
+
+func jobIDs(n int) []string {
+	ids := make([]string, n)
+	for i := range ids {
+		ids[i] = "job"
+	}
+	return ids
+}
+
+// ---------------------------------------------------------------------------
+// Handler write authorization tests
+// ---------------------------------------------------------------------------
+
+func TestHandler_MutatingRPCDeniedWithoutAuthOrOptIn(t *testing.T) {
+	called := false
+	store := &mockUIStorage{
+		retryJobFn: func(_ context.Context, _ string) (*core.Job, error) {
+			called = true
+			return sampleJob("j1", "default", "work", core.StatusPending), nil
+		},
+	}
+	server := httptest.NewServer(Handler(store))
+	defer server.Close()
+
+	client := jobsv1connect.NewJobsServiceClient(server.Client(), server.URL)
+	_, err := client.RetryJob(context.Background(), connect.NewRequest(&jobsv1.RetryJobRequest{Id: "j1"}))
+
+	require.Error(t, err)
+	assert.Equal(t, connect.CodePermissionDenied, connect.CodeOf(err))
+	assert.False(t, called)
+}
+
+func TestHandler_MutatingRPCAllowedWithInsecureOptIn(t *testing.T) {
+	called := false
+	store := &mockUIStorage{
+		retryJobFn: func(_ context.Context, _ string) (*core.Job, error) {
+			called = true
+			return sampleJob("j1", "default", "work", core.StatusPending), nil
+		},
+	}
+	server := httptest.NewServer(Handler(store, WithInsecureAllowUnauthenticatedWrites()))
+	defer server.Close()
+
+	client := jobsv1connect.NewJobsServiceClient(server.Client(), server.URL)
+	resp, err := client.RetryJob(context.Background(), connect.NewRequest(&jobsv1.RetryJobRequest{Id: "j1"}))
+
+	require.NoError(t, err)
+	require.NotNil(t, resp.Msg.Job)
+	assert.Equal(t, "j1", resp.Msg.Job.Id)
+	assert.True(t, called)
+}
+
+func TestHandler_MutatingRPCAllowedWithMiddleware(t *testing.T) {
+	called := false
+	store := &mockUIStorage{
+		deleteJobFn: func(_ context.Context, _ string) error {
+			called = true
+			return nil
+		},
+	}
+	middleware := func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			next.ServeHTTP(w, r)
+		})
+	}
+	server := httptest.NewServer(Handler(store, WithMiddleware(middleware)))
+	defer server.Close()
+
+	client := jobsv1connect.NewJobsServiceClient(server.Client(), server.URL)
+	_, err := client.DeleteJob(context.Background(), connect.NewRequest(&jobsv1.DeleteJobRequest{Id: "j1"}))
+
+	require.NoError(t, err)
+	assert.True(t, called)
+}
+
+func TestHandler_ReadOnlyRPCAllowedWithoutAuth(t *testing.T) {
+	store := &mockUIStorage{
+		searchJobsFn: func(_ context.Context, _ JobFilter) ([]*core.Job, int64, error) {
+			return []*core.Job{sampleJob("j1", "default", "work", core.StatusPending)}, 1, nil
+		},
+	}
+	server := httptest.NewServer(Handler(store))
+	defer server.Close()
+
+	client := jobsv1connect.NewJobsServiceClient(server.Client(), server.URL)
+	resp, err := client.ListJobs(context.Background(), connect.NewRequest(&jobsv1.ListJobsRequest{}))
+
+	require.NoError(t, err)
+	require.Len(t, resp.Msg.Jobs, 1)
+	assert.Equal(t, "j1", resp.Msg.Jobs[0].Id)
 }
 
 // ---------------------------------------------------------------------------
@@ -905,6 +999,15 @@ func TestBulkRetryJobs_EmptyList(t *testing.T) {
 	assert.Equal(t, int32(0), resp.Msg.Count)
 }
 
+func TestBulkRetryJobs_TooManyIDs(t *testing.T) {
+	svc := newServiceWithUIStorage(&mockUIStorage{})
+	_, err := svc.BulkRetryJobs(context.Background(), connect.NewRequest(&jobsv1.BulkRetryJobsRequest{
+		Ids: jobIDs(maxBulkJobIDs + 1),
+	}))
+	require.Error(t, err)
+	assert.Equal(t, connect.CodeInvalidArgument, connect.CodeOf(err))
+}
+
 // ---------------------------------------------------------------------------
 // BulkDeleteJobs tests
 // ---------------------------------------------------------------------------
@@ -945,6 +1048,15 @@ func TestBulkDeleteJobs_EmptyList(t *testing.T) {
 	resp, err := svc.BulkDeleteJobs(context.Background(), connect.NewRequest(&jobsv1.BulkDeleteJobsRequest{}))
 	require.NoError(t, err)
 	assert.Equal(t, int32(0), resp.Msg.Count)
+}
+
+func TestBulkDeleteJobs_TooManyIDs(t *testing.T) {
+	svc := newServiceWithUIStorage(&mockUIStorage{})
+	_, err := svc.BulkDeleteJobs(context.Background(), connect.NewRequest(&jobsv1.BulkDeleteJobsRequest{
+		Ids: jobIDs(maxBulkJobIDs + 1),
+	}))
+	require.Error(t, err)
+	assert.Equal(t, connect.CodeInvalidArgument, connect.CodeOf(err))
 }
 
 // ---------------------------------------------------------------------------
