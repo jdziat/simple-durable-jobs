@@ -575,12 +575,25 @@ func TestWithStaleLockInterval_SetsValue(t *testing.T) {
 	assert.Equal(t, 10*time.Minute, config.StaleLockInterval)
 }
 
-func TestWithStaleLockInterval_ZeroDisablesReaper(t *testing.T) {
+func TestWithStaleLockInterval_NonPositiveIsIgnored(t *testing.T) {
+	// The reaper cannot be disabled, so a non-positive interval must leave the
+	// existing value untouched rather than zeroing it.
 	config := WorkerConfig{StaleLockInterval: 5 * time.Minute}
 
 	WithStaleLockInterval(0).ApplyWorker(&config)
+	assert.Equal(t, 5*time.Minute, config.StaleLockInterval, "zero must be ignored")
 
-	assert.Equal(t, time.Duration(0), config.StaleLockInterval)
+	WithStaleLockInterval(-1).ApplyWorker(&config)
+	assert.Equal(t, 5*time.Minute, config.StaleLockInterval, "negative must be ignored")
+}
+
+func TestWithStaleLockInterval_ClampsBelowFloor(t *testing.T) {
+	config := WorkerConfig{}
+
+	WithStaleLockInterval(10 * time.Millisecond).ApplyWorker(&config)
+
+	assert.Equal(t, minStaleLockInterval, config.StaleLockInterval,
+		"a sub-floor interval must be clamped up to the floor")
 }
 
 func TestWithStaleLockAge_SetsValue(t *testing.T) {
@@ -752,11 +765,9 @@ func TestWorker_StaleLockReaperCallsReleaseStaleLocks(t *testing.T) {
 	mock := &mockStorage{releasedIDs: nil, releaseErr: nil}
 	q := queue.New(mock)
 
-	// Use a very short interval so the reaper fires quickly.
-	w := NewWorker(q,
-		WithStaleLockInterval(30*time.Millisecond),
-		WithStaleLockAge(1*time.Minute),
-	)
+	w := NewWorker(q, WithStaleLockAge(1*time.Minute))
+	// Drive the reaper fast (the public option floors at 1s; set directly).
+	w.config.StaleLockInterval = 30 * time.Millisecond
 
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
@@ -771,22 +782,31 @@ func TestWorker_StaleLockReaperCallsReleaseStaleLocks(t *testing.T) {
 		"ReleaseStaleLocks should have been called at least once")
 }
 
-func TestWorker_StaleLockReaperZeroIntervalDisabled(t *testing.T) {
+func TestWorker_StaleLockReaperAlwaysRuns(t *testing.T) {
 	mock := &mockStorage{}
 	q := queue.New(mock)
 
-	// Explicitly disable the reaper.
+	// WithStaleLockInterval(0) cannot disable the reaper — it is the only
+	// recovery path for crashed workers. The option is ignored and the 5m
+	// default applies, so the reaper is still scheduled (it just won't fire
+	// within this short window).
 	w := NewWorker(q, WithStaleLockInterval(0))
+	assert.Equal(t, 5*time.Minute, w.config.StaleLockInterval,
+		"a non-positive interval must fall back to the default, not disable the reaper")
 
-	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	// Prove it actually runs by driving it fast directly.
+	w.config.StaleLockInterval = 20 * time.Millisecond
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 
 	go func() { _ = w.Start(ctx) }()
 
-	<-ctx.Done()
+	time.Sleep(80 * time.Millisecond)
+	cancel()
 
-	assert.Equal(t, int64(0), mock.getReleaseCount(),
-		"ReleaseStaleLocks must not be called when interval is 0")
+	assert.GreaterOrEqual(t, mock.getReleaseCount(), int64(1),
+		"the stale-lock reaper must run; it cannot be disabled")
 }
 
 // ---------------------------------------------------------------------------
@@ -1181,10 +1201,9 @@ func TestWorker_StaleLockReaper_StopsOnContextCancel(t *testing.T) {
 	mock := &mockStorage{releaseDelay: 5 * time.Millisecond}
 
 	q := queue.New(mock)
-	w := NewWorker(q,
-		WithStaleLockInterval(20*time.Millisecond),
-		WithStaleLockAge(1*time.Minute),
-	)
+	w := NewWorker(q, WithStaleLockAge(1*time.Minute))
+	// Drive the reaper fast (the public option floors at 1s; set directly).
+	w.config.StaleLockInterval = 20 * time.Millisecond
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -1234,13 +1253,12 @@ func TestWorker_QueuesWithCapacity_MissingCounterTreatedAsAvailable(t *testing.T
 func TestWorker_StaleLockReaper_ErrorPathContinues(t *testing.T) {
 	mock := &mockStorage{
 		releasedIDs: nil,
-		releaseErr:    errors.New("db unavailable"),
+		releaseErr:  errors.New("db unavailable"),
 	}
 	q := queue.New(mock)
-	w := NewWorker(q,
-		WithStaleLockInterval(30*time.Millisecond),
-		WithStaleLockAge(1*time.Minute),
-	)
+	w := NewWorker(q, WithStaleLockAge(1*time.Minute))
+	// Drive the reaper fast (the public option floors at 1s; set directly).
+	w.config.StaleLockInterval = 30 * time.Millisecond
 
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
@@ -1255,14 +1273,13 @@ func TestWorker_StaleLockReaper_ErrorPathContinues(t *testing.T) {
 
 func TestWorker_StaleLockReaper_LogsWhenJobsReleased(t *testing.T) {
 	mock := &mockStorage{
-		releasedIDs: []string{"job-a","job-b","job-c"}, // pretend 3 jobs were released
-		releaseErr:    nil,
+		releasedIDs: []string{"job-a", "job-b", "job-c"}, // pretend 3 jobs were released
+		releaseErr:  nil,
 	}
 	q := queue.New(mock)
-	w := NewWorker(q,
-		WithStaleLockInterval(30*time.Millisecond),
-		WithStaleLockAge(1*time.Minute),
-	)
+	w := NewWorker(q, WithStaleLockAge(1*time.Minute))
+	// Drive the reaper fast (the public option floors at 1s; set directly).
+	w.config.StaleLockInterval = 30 * time.Millisecond
 
 	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
 	defer cancel()
@@ -2619,18 +2636,18 @@ func TestReapStaleLocks_CancelsLocalHandlersOfReleasedJobs(t *testing.T) {
 	mock.releasedIDs = []string{"orphan-1", "orphan-2"}
 
 	q := queue.New(mock)
-	w := NewWorker(q,
-		DisableRetry(),
-		WithStaleLockInterval(10*time.Millisecond),
-	)
+	w := NewWorker(q, DisableRetry())
+	// Drive the reaper fast. The public WithStaleLockInterval enforces a 1s
+	// floor, so set the cadence directly (the reaper reads config at startup).
+	w.config.StaleLockInterval = 10 * time.Millisecond
 
-	cancelled := make(map[string]int)
-	for _, id := range []string{"orphan-1", "orphan-2"} {
-		id := id
-		w.runningJobsMu.Lock()
-		w.runningJobs[id] = func() { cancelled[id]++ }
-		w.runningJobsMu.Unlock()
-	}
+	// Counters are incremented from the reaper goroutine (via CancelJob's
+	// stored func) and read from the test goroutine, so they must be atomic.
+	var orphan1, orphan2 atomic.Int32
+	w.runningJobsMu.Lock()
+	w.runningJobs["orphan-1"] = func() { orphan1.Add(1) }
+	w.runningJobs["orphan-2"] = func() { orphan2.Add(1) }
+	w.runningJobsMu.Unlock()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -2640,10 +2657,8 @@ func TestReapStaleLocks_CancelsLocalHandlersOfReleasedJobs(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	cancel()
 
-	w.runningJobsMu.Lock()
-	defer w.runningJobsMu.Unlock()
-	assert.GreaterOrEqual(t, cancelled["orphan-1"], 1, "orphan-1 should have been cancelled")
-	assert.GreaterOrEqual(t, cancelled["orphan-2"], 1, "orphan-2 should have been cancelled")
+	assert.GreaterOrEqual(t, orphan1.Load(), int32(1), "orphan-1 should have been cancelled")
+	assert.GreaterOrEqual(t, orphan2.Load(), int32(1), "orphan-2 should have been cancelled")
 }
 
 // ---------------------------------------------------------------------------
@@ -2676,10 +2691,12 @@ func TestOwnershipAudit_CancelsOrphanedLocalHandlers(t *testing.T) {
 		WithOwnershipAuditInterval(10*time.Millisecond),
 	)
 
-	mineCancelled, stolenCancelled := 0, 0
+	// Counters are incremented from the audit goroutine (via CancelJob's
+	// stored func) and read from the test goroutine, so they must be atomic.
+	var mineCancelled, stolenCancelled atomic.Int32
 	w.runningJobsMu.Lock()
-	w.runningJobs["job-mine"] = func() { mineCancelled++ }
-	w.runningJobs["job-stolen"] = func() { stolenCancelled++ }
+	w.runningJobs["job-mine"] = func() { mineCancelled.Add(1) }
+	w.runningJobs["job-stolen"] = func() { stolenCancelled.Add(1) }
 	w.runningJobsMu.Unlock()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -2690,8 +2707,8 @@ func TestOwnershipAudit_CancelsOrphanedLocalHandlers(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	cancel()
 
-	assert.GreaterOrEqual(t, stolenCancelled, 1, "stolen job's context should have been cancelled")
-	assert.Equal(t, 0, mineCancelled, "still-owned job's context must not have been touched")
+	assert.GreaterOrEqual(t, stolenCancelled.Load(), int32(1), "stolen job's context should have been cancelled")
+	assert.Equal(t, int32(0), mineCancelled.Load(), "still-owned job's context must not have been touched")
 }
 
 // TestOwnershipAudit_NoOpWhenNoOrphans confirms the audit doesn't gratuitously
@@ -2780,11 +2797,12 @@ func TestOwnershipAudit_IntervalConfiguration(t *testing.T) {
 	})
 }
 
-// TestStaleLockInterval_IntervalConfiguration locks in the documented contract
-// for StaleLockInterval: unset → 5m default, explicit value honored, and an
-// explicit 0 actually disables the reaper. Like the ownership audit, NewWorker
-// used to clobber a deliberate 0 back to 5m, so "set to 0 to disable" silently
-// kept the reaper enabled.
+// TestStaleLockInterval_IntervalConfiguration locks in the contract for
+// StaleLockInterval: unset → 5m default, an explicit value above the floor is
+// honored, sub-floor values clamp up to the floor, and a non-positive value
+// CANNOT disable the reaper (it falls back to the default). The reaper is the
+// only recovery path for crashed workers, so it is intentionally not
+// disable-able.
 func TestStaleLockInterval_IntervalConfiguration(t *testing.T) {
 	q := queue.New(&mockStorage{})
 
@@ -2793,15 +2811,21 @@ func TestStaleLockInterval_IntervalConfiguration(t *testing.T) {
 		assert.Equal(t, 5*time.Minute, w.config.StaleLockInterval)
 	})
 
-	t.Run("explicit value is honored", func(t *testing.T) {
+	t.Run("explicit value above the floor is honored", func(t *testing.T) {
 		w := NewWorker(q, WithStaleLockInterval(30*time.Second))
 		assert.Equal(t, 30*time.Second, w.config.StaleLockInterval)
 	})
 
-	t.Run("explicit zero disables the reaper", func(t *testing.T) {
+	t.Run("sub-floor value clamps up to the floor", func(t *testing.T) {
+		w := NewWorker(q, WithStaleLockInterval(10*time.Millisecond))
+		assert.Equal(t, minStaleLockInterval, w.config.StaleLockInterval,
+			"a positive interval below the floor must be clamped up, not accepted as-is")
+	})
+
+	t.Run("non-positive cannot disable; falls back to default", func(t *testing.T) {
 		w := NewWorker(q, WithStaleLockInterval(0))
-		assert.Equal(t, time.Duration(0), w.config.StaleLockInterval,
-			"WithStaleLockInterval(0) must keep the interval at 0 so Start() skips the reaper goroutine")
+		assert.Equal(t, 5*time.Minute, w.config.StaleLockInterval,
+			"WithStaleLockInterval(0) must not disable the reaper; the default applies")
 	})
 }
 

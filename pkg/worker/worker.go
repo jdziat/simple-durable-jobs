@@ -81,10 +81,10 @@ func NewWorker(q *queue.Queue, opts ...WorkerOption) *Worker {
 		config.DequeueRetry = &dequeueCfg
 	}
 
-	// Set default stale lock reaper config. Default to 5m only when the
-	// interval was never set — an explicit WithStaleLockInterval(0) is
-	// honored as "disable the reaper" (the Start guard skips the goroutine).
-	if !config.staleLockIntervalSet && config.StaleLockInterval == 0 {
+	// Set default stale lock reaper cadence. The reaper always runs (it
+	// recovers jobs from crashed workers and cannot be disabled), so a
+	// non-positive interval simply falls back to the 5m default.
+	if config.StaleLockInterval <= 0 {
 		config.StaleLockInterval = 5 * time.Minute
 	}
 	if config.StaleLockAge == 0 {
@@ -146,10 +146,10 @@ func (w *Worker) Start(ctx context.Context) error {
 	// Start polling for waiting jobs (fan-out fallback)
 	go w.pollWaitingJobs(ctx)
 
-	// Start stale lock reaper to reclaim stuck running jobs
-	if w.config.StaleLockInterval > 0 {
-		go w.reapStaleLocks(ctx)
-	}
+	// Start the stale-lock reaper to reclaim jobs whose owning worker died.
+	// This always runs — it's the only recovery path for crashed workers, so
+	// it cannot be disabled (NewWorker guarantees a positive interval).
+	go w.reapStaleLocks(ctx)
 
 	// Start ownership audit to cancel local handlers for jobs cancelled
 	// or reclaimed by other workers. Same-worker cancellation is handled
@@ -275,7 +275,9 @@ func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 	h, ok := w.queue.GetHandler(job.Type)
 	if !ok {
 		w.logger.Error("no handler for job", "type", job.Type)
-		w.failWithRetry(ctx, job.ID, fmt.Sprintf("no handler for %s", job.Type), nil)
+		// No fan-out side effects here, so the lost-ownership return value is
+		// not actionable — failWithRetry already logs any real failure.
+		_ = w.failWithRetry(ctx, job.ID, fmt.Sprintf("no handler for %s", job.Type), nil)
 		return
 	}
 
@@ -823,7 +825,14 @@ func (w *Worker) pollWaitingJobs(ctx context.Context) {
 // - Complete/Fail failed due to ErrJobNotOwned (lock expired during processing)
 // - A handler hung and the heartbeat eventually stopped
 func (w *Worker) reapStaleLocks(ctx context.Context) {
-	ticker := time.NewTicker(w.config.StaleLockInterval)
+	// Defensive: NewWorker guarantees a positive interval, but guard against a
+	// zero value (which would panic time.NewTicker) in case the config field
+	// is set directly.
+	interval := w.config.StaleLockInterval
+	if interval <= 0 {
+		interval = 5 * time.Minute
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for {
