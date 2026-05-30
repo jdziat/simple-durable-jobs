@@ -767,16 +767,33 @@ func (w *Worker) runScheduler(ctx context.Context) {
 
 			now := time.Now()
 			for name, sj := range scheduled {
+				if _, ok := lastRun[name]; !ok {
+					lastRun[name] = now
+				}
 				nextRun := sj.Schedule.Next(lastRun[name])
 				if now.After(nextRun) || now.Equal(nextRun) {
-					_, err := w.queue.Enqueue(ctx, sj.Name, sj.Args,
+					opts := []queue.Option{
 						queue.QueueOpt(sj.Options.Queue),
 						queue.Priority(sj.Options.Priority),
+						queue.Retries(sj.Options.MaxRetries),
+						queue.Unique("sched:" + name + ":" + nextRun.UTC().Format(time.RFC3339)),
+					}
+					if sj.Options.Delay > 0 {
+						opts = append(opts, queue.Delay(sj.Options.Delay))
+					}
+					if sj.Options.RunAt != nil {
+						opts = append(opts, queue.At(*sj.Options.RunAt))
+					}
+					if sj.Options.Timeout > 0 {
+						opts = append(opts, queue.Timeout(sj.Options.Timeout))
+					}
+					_, err := w.queue.Enqueue(ctx, sj.Name, sj.Args,
+						opts...,
 					)
-					if err != nil {
-						w.logger.Error("failed to enqueue scheduled job", "name", name, "error", err)
+					if err == nil || errors.Is(err, core.ErrDuplicateJob) {
+						lastRun[name] = nextRun
 					} else {
-						lastRun[name] = now
+						w.logger.Error("failed to enqueue scheduled job", "name", name, "error", err)
 					}
 				}
 			}

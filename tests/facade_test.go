@@ -172,5 +172,5 @@ func TestFacade_ScheduleFunctions(t *testing.T) {
 	_ = jobs.Every(time.Minute)
 	_ = jobs.Daily(9, 0)
 	_ = jobs.Weekly(time.Monday, 9, 0)
-	_ = jobs.Cron("* * * * *")
+	_ = jobs.MustCron("* * * * *")
 }

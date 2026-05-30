@@ -486,8 +486,13 @@ func Weekly(day time.Weekday, hour, minute int) Schedule {
 }
 
 // Cron creates a schedule from a cron expression.
-func Cron(expr string) Schedule {
+func Cron(expr string) (Schedule, error) {
 	return schedule.Cron(expr)
+}
+
+// MustCron creates a schedule from a cron expression and panics if invalid.
+func MustCron(expr string) Schedule {
+	return schedule.MustCron(expr)
 }
 
 // JobFromContext returns the current Job from context, or nil if not in a job handler.

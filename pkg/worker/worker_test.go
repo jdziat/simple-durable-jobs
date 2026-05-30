@@ -47,8 +47,11 @@ type mockStorage struct {
 	findOrphanedFunc       func(jobIDs []string) ([]string, error)
 
 	// enqueue tracking
-	enqueueMu    sync.Mutex
-	enqueueCount int64 // incremented on each Enqueue call
+	enqueueMu         sync.Mutex
+	enqueueCount      int64 // incremented on each Enqueue call
+	enqueueUniqueFunc func(ctx context.Context, job *core.Job, uniqueKey string) error
+	enqueuedJobs      []*core.Job
+	enqueuedKeys      []string
 
 	// result tracking
 	savedResults map[string][]byte
@@ -90,7 +93,18 @@ func (m *mockStorage) Fail(ctx context.Context, jobID string, workerID string, e
 	return nil
 }
 
-func (m *mockStorage) EnqueueUnique(_ context.Context, _ *core.Job, _ string) error { return nil }
+func (m *mockStorage) EnqueueUnique(ctx context.Context, job *core.Job, uniqueKey string) error {
+	m.enqueueMu.Lock()
+	job.UniqueKey = uniqueKey
+	m.enqueueCount++
+	m.enqueuedJobs = append(m.enqueuedJobs, job)
+	m.enqueuedKeys = append(m.enqueuedKeys, uniqueKey)
+	m.enqueueMu.Unlock()
+	if m.enqueueUniqueFunc != nil {
+		return m.enqueueUniqueFunc(ctx, job, uniqueKey)
+	}
+	return nil
+}
 
 func (m *mockStorage) SaveCheckpoint(_ context.Context, _ *core.Checkpoint) error { return nil }
 
@@ -1787,6 +1801,25 @@ func TestWorker_HandleError_RetryAfterExhausted(t *testing.T) {
 // runScheduler tests
 // ---------------------------------------------------------------------------
 
+type offsetSchedule struct {
+	offset time.Duration
+}
+
+func (s offsetSchedule) Next(from time.Time) time.Time {
+	return from.Add(s.offset)
+}
+
+type fixedBoundarySchedule struct {
+	fire time.Time
+}
+
+func (s fixedBoundarySchedule) Next(from time.Time) time.Time {
+	if from.Before(s.fire) {
+		return s.fire
+	}
+	return s.fire.Add(time.Hour)
+}
+
 // TestWorker_RunScheduler_ExitsOnContextCancel verifies that runScheduler
 // returns promptly when its context is cancelled.
 func TestWorker_RunScheduler_ExitsOnContextCancel(t *testing.T) {
@@ -1844,6 +1877,24 @@ func TestWorker_RunScheduler_NilScheduledJobsIsNoop(t *testing.T) {
 	assert.Equal(t, int64(0), mock.getEnqueueCount())
 }
 
+func TestWorker_RunScheduler_DoesNotFireFutureScheduleOnStartup(t *testing.T) {
+	mock := &mockStorage{}
+	q := queue.New(mock)
+	q.Register("scheduled-task", func(_ context.Context, _ struct{}) error {
+		return nil
+	})
+	q.Schedule("scheduled-task", nil, offsetSchedule{offset: time.Hour})
+
+	w := NewWorker(q, WithStaleLockInterval(0))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	go func() { w.runScheduler(ctx) }()
+
+	<-ctx.Done()
+	assert.Equal(t, int64(0), mock.getEnqueueCount())
+}
+
 // TestWorker_RunScheduler_EnqueuesDueJob verifies that a scheduled job whose
 // next run time is in the past gets enqueued by the scheduler goroutine.
 func TestWorker_RunScheduler_EnqueuesDueJob(t *testing.T) {
@@ -1857,7 +1908,7 @@ func TestWorker_RunScheduler_EnqueuesDueJob(t *testing.T) {
 
 	// Register a schedule that always returns a time in the past so the
 	// scheduler immediately considers the job due.
-	q.Schedule("scheduled-task", schedule.Every(1*time.Millisecond))
+	q.Schedule("scheduled-task", nil, schedule.Every(1*time.Millisecond))
 
 	w := NewWorker(q, WithStaleLockInterval(0))
 
@@ -1875,6 +1926,80 @@ func TestWorker_RunScheduler_EnqueuesDueJob(t *testing.T) {
 		return len(jobs) > 0
 	}, 1500*time.Millisecond, 20*time.Millisecond,
 		"scheduler should enqueue at least one due job")
+}
+
+func TestWorker_RunScheduler_ForwardsArgsOptionsAndDeterministicUniqueKey(t *testing.T) {
+	mock := &mockStorage{}
+	q := queue.New(mock)
+	q.Register("scheduled-task", func(_ context.Context, _ map[string]string) error {
+		return nil
+	})
+
+	fire := time.Now().Add(300 * time.Millisecond)
+	runAt := fire.Add(time.Minute)
+	args := map[string]string{"tenant": "acme"}
+	q.Schedule("scheduled-task", args, fixedBoundarySchedule{fire: fire},
+		queue.QueueOpt("scheduled"),
+		queue.Priority(9),
+		queue.Retries(5),
+		queue.At(runAt),
+		queue.Timeout(time.Second),
+	)
+
+	w := NewWorker(q, WithStaleLockInterval(0))
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	go func() { w.runScheduler(ctx) }()
+
+	require.Eventually(t, func() bool {
+		mock.enqueueMu.Lock()
+		defer mock.enqueueMu.Unlock()
+		return len(mock.enqueuedJobs) == 1
+	}, 900*time.Millisecond, 20*time.Millisecond)
+
+	mock.enqueueMu.Lock()
+	defer mock.enqueueMu.Unlock()
+	require.Len(t, mock.enqueuedJobs, 1)
+	job := mock.enqueuedJobs[0]
+	assert.Equal(t, "scheduled-task", job.Type)
+	assert.JSONEq(t, `{"tenant":"acme"}`, string(job.Args))
+	assert.Equal(t, "scheduled", job.Queue)
+	assert.Equal(t, 9, job.Priority)
+	assert.Equal(t, 5, job.MaxRetries)
+	require.NotNil(t, job.RunAt)
+	assert.Equal(t, runAt, *job.RunAt)
+	wantKey := "sched:scheduled-task:" + fire.UTC().Format(time.RFC3339)
+	assert.Equal(t, wantKey, mock.enqueuedKeys[0])
+	assert.Equal(t, wantKey, job.UniqueKey)
+}
+
+func TestWorker_RunScheduler_AdvancesAfterDuplicateJob(t *testing.T) {
+	mock := &mockStorage{
+		enqueueUniqueFunc: func(context.Context, *core.Job, string) error {
+			return core.ErrDuplicateJob
+		},
+	}
+	q := queue.New(mock)
+	q.Register("scheduled-task", func(_ context.Context, _ struct{}) error {
+		return nil
+	})
+
+	fire := time.Now().Add(250 * time.Millisecond)
+	q.Schedule("scheduled-task", nil, fixedBoundarySchedule{fire: fire})
+
+	w := NewWorker(q, WithStaleLockInterval(0))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 650*time.Millisecond)
+	defer cancel()
+	go func() { w.runScheduler(ctx) }()
+
+	<-ctx.Done()
+
+	mock.enqueueMu.Lock()
+	defer mock.enqueueMu.Unlock()
+	assert.Len(t, mock.enqueuedKeys, 1)
+	assert.Equal(t, "sched:scheduled-task:"+fire.UTC().Format(time.RFC3339), mock.enqueuedKeys[0])
 }
 
 // ---------------------------------------------------------------------------

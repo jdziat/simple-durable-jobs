@@ -260,7 +260,7 @@ func TestFacadeScheduleBuilders_Weekly(t *testing.T) {
 }
 
 func TestFacadeScheduleBuilders_Cron(t *testing.T) {
-	s := jobs.Cron("* * * * *")
+	s := jobs.MustCron("* * * * *")
 	require.NotNil(t, s)
 	next := s.Next(time.Now())
 	assert.False(t, next.IsZero())

@@ -265,12 +265,27 @@ func TestQueue_Schedule(t *testing.T) {
 
 	// Mock schedule
 	mockSched := &mockSchedule{}
-	q.Schedule("scheduled-job", mockSched, QueueOpt("scheduled"))
+	args := map[string]string{"tenant": "acme"}
+	runAt := time.Now().Add(time.Hour)
+	q.Schedule("scheduled-job", args, mockSched,
+		QueueOpt("scheduled"),
+		Priority(7),
+		Retries(4),
+		Delay(time.Minute),
+		At(runAt),
+		Timeout(30*time.Second),
+	)
 
 	scheduled := q.GetScheduledJobs()
 	require.NotNil(t, scheduled)
 	assert.Contains(t, scheduled, "scheduled-job")
+	assert.Equal(t, args, scheduled["scheduled-job"].Args)
 	assert.Equal(t, "scheduled", scheduled["scheduled-job"].Options.Queue)
+	assert.Equal(t, 7, scheduled["scheduled-job"].Options.Priority)
+	assert.Equal(t, 4, scheduled["scheduled-job"].Options.MaxRetries)
+	assert.Equal(t, time.Minute, scheduled["scheduled-job"].Options.Delay)
+	assert.Equal(t, runAt, *scheduled["scheduled-job"].Options.RunAt)
+	assert.Equal(t, 30*time.Second, scheduled["scheduled-job"].Options.Timeout)
 }
 
 type mockSchedule struct{}
@@ -1045,7 +1060,7 @@ func TestQueue_GetScheduledJobs_ReturnsCopy(t *testing.T) {
 	store := newMockStorage()
 	q := New(store)
 
-	q.Schedule("job-a", nil)
+	q.Schedule("job-a", nil, nil)
 	scheduled := q.GetScheduledJobs()
 	require.Contains(t, scheduled, "job-a")
 

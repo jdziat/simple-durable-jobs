@@ -187,7 +187,7 @@ func registerHandlers(q *jobs.Queue, db *gorm.DB) {
 	q.Register("chaos.tick", func(ctx context.Context, _ struct{}) error {
 		return db.WithContext(ctx).Exec(`INSERT INTO chaos_ticks DEFAULT VALUES`).Error
 	})
-	q.Schedule("chaos.tick", jobs.Every(5*time.Second), jobs.Retries(0))
+	q.Schedule("chaos.tick", nil, jobs.Every(5*time.Second), jobs.Retries(0))
 }
 
 func runWorker(parent context.Context, a *app) error {
@@ -266,7 +266,6 @@ func resetHarnessData(ctx context.Context, db *gorm.DB) error {
 }
 
 func runCheck(ctx context.Context, a *app) error {
-	start := time.Now()
 	if err := waitForDrain(ctx, a.db, 120*time.Second, 10*time.Second); err != nil {
 		fmt.Printf("drain wait: %v\n", err)
 	}
@@ -276,7 +275,7 @@ func runCheck(ctx context.Context, a *app) error {
 		checkNoWedge(ctx, a.db),
 		checkFanOutCounts(ctx, a.db),
 		checkUnique(ctx, a.db),
-		checkSchedule(ctx, a.db, time.Since(start), 4),
+		checkSchedule(ctx, a.db),
 	}
 
 	hardFailed := 0
@@ -375,17 +374,31 @@ func checkUnique(ctx context.Context, db *gorm.DB) invariant {
 	}
 }
 
-func checkSchedule(ctx context.Context, db *gorm.DB, elapsed time.Duration, replicas int) invariant {
-	var ticks int64
-	db.WithContext(ctx).Raw(`SELECT count(*) FROM chaos_ticks`).Scan(&ticks)
-	maxPlausible := int64(elapsed/(5*time.Second))*int64(replicas) + int64(replicas*2)
-	immediateBurst := ticks > int64(replicas*2) && elapsed < 15*time.Second
-	pass := ticks <= maxPlausible && !immediateBurst
+func checkSchedule(ctx context.Context, db *gorm.DB) invariant {
+	// Measure the steady-state fire rate over a fresh window while the worker
+	// replicas are still running. A correctly fleet-deduplicated scheduler
+	// fires the 5s tick ~once per period regardless of replica count; without
+	// dedup, N replicas each fire (and a scheduler that boot-storms re-fires on
+	// every chaos respawn). Counting over a window — rather than total ticks
+	// since seed — avoids the earlier drain-time accounting error.
+	const window = 12 * time.Second
+	const period = 5 * time.Second
+	var before, after int64
+	db.WithContext(ctx).Raw(`SELECT count(*) FROM chaos_ticks`).Scan(&before)
+	select {
+	case <-ctx.Done():
+	case <-time.After(window):
+	}
+	db.WithContext(ctx).Raw(`SELECT count(*) FROM chaos_ticks`).Scan(&after)
+	got := after - before
+	// One logical scheduler: floor(window/period) boundaries, +2 slack for
+	// boundary alignment and a tick landing at each edge of the window.
+	maxExpected := int64(window/period) + 2
 	return invariant{
 		name:   "INV-SCHED",
 		level:  "INFO",
-		pass:   pass,
-		detail: fmt.Sprintf("ticks=%d elapsed=%s max_plausible_for_%d_replicas=%d immediate_burst=%t", ticks, elapsed.Truncate(time.Second), replicas, maxPlausible, immediateBurst),
+		pass:   got <= maxExpected,
+		detail: fmt.Sprintf("ticks_in_%s_window=%d max_expected_single_scheduler=%d", window, got, maxExpected),
 	}
 }
 

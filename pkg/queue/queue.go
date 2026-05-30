@@ -151,7 +151,11 @@ func (q *Queue) enqueue(ctx context.Context, name string, args any, opts ...Opti
 	for _, opt := range opts {
 		opt.Apply(options)
 	}
+	return q.enqueueWithOptions(ctx, name, args, options)
+}
 
+// enqueueWithOptions adds a job using a pre-built Options value.
+func (q *Queue) enqueueWithOptions(ctx context.Context, name string, args any, options *Options) (string, error) {
 	// Validate queue name
 	if err := security.ValidateQueueName(options.Queue); err != nil {
 		return "", err
@@ -236,7 +240,7 @@ func (q *Queue) runEnqueueMiddleware(ctx context.Context, job *core.Job, persist
 }
 
 // Schedule registers a recurring job.
-func (q *Queue) Schedule(name string, sched schedule.Schedule, opts ...Option) {
+func (q *Queue) Schedule(name string, args any, sched schedule.Schedule, opts ...Option) {
 	options := NewOptions()
 	for _, opt := range opts {
 		opt.Apply(options)
@@ -249,6 +253,7 @@ func (q *Queue) Schedule(name string, sched schedule.Schedule, opts ...Option) {
 	q.scheduledJobs[name] = &ScheduledJob{
 		Name:     name,
 		Schedule: sched,
+		Args:     args,
 		Options:  options,
 	}
 	q.mu.Unlock()

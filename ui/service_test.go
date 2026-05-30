@@ -1137,7 +1137,7 @@ func TestListScheduledJobs_WithScheduledJobs(t *testing.T) {
 	svc, q := setupServiceWithQueue(t)
 
 	// Register a scheduled job using the every-schedule (no String() method).
-	q.Schedule("daily-report", schedule.Every(24*time.Hour))
+	q.Schedule("daily-report", nil, schedule.Every(24*time.Hour))
 
 	resp, err := svc.ListScheduledJobs(context.Background(), connect.NewRequest(&jobsv1.ListScheduledJobsRequest{}))
 	require.NoError(t, err)
@@ -1154,7 +1154,7 @@ func (s *stringerSchedule) String() string                { return s.label }
 func TestListScheduledJobs_WithStringerSchedule(t *testing.T) {
 	svc, q := setupServiceWithQueue(t)
 
-	q.Schedule("hourly-sync", &stringerSchedule{label: "every 1h"})
+	q.Schedule("hourly-sync", nil, &stringerSchedule{label: "every 1h"})
 
 	resp, err := svc.ListScheduledJobs(context.Background(), connect.NewRequest(&jobsv1.ListScheduledJobsRequest{}))
 	require.NoError(t, err)

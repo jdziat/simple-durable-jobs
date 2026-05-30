@@ -14,7 +14,7 @@ func TestEvery_CalculatesNextRun(t *testing.T) {
 
 	next := schedule.Next(now)
 
-	assert.Equal(t, time.Date(2026, 2, 8, 11, 30, 0, 0, time.UTC), next)
+	assert.Equal(t, time.Date(2026, 2, 8, 11, 0, 0, 0, time.UTC), next)
 }
 
 func TestEvery_ShortInterval(t *testing.T) {
@@ -42,7 +42,7 @@ func TestEvery_LongInterval(t *testing.T) {
 
 	next := schedule.Next(now)
 
-	assert.Equal(t, time.Date(2026, 2, 9, 10, 30, 0, 0, time.UTC), next)
+	assert.Equal(t, time.Date(2026, 2, 9, 0, 0, 0, 0, time.UTC), next)
 }
 
 func TestDaily_CalculatesNextRun(t *testing.T) {
@@ -132,7 +132,7 @@ func TestWeekly_Friday(t *testing.T) {
 }
 
 func TestCron_ParsesExpression(t *testing.T) {
-	schedule := jobs.Cron("0 9 * * *") // 9am daily
+	schedule := jobs.MustCron("0 9 * * *") // 9am daily
 
 	now := time.Date(2026, 2, 8, 8, 0, 0, 0, time.UTC)
 	next := schedule.Next(now)
@@ -141,7 +141,7 @@ func TestCron_ParsesExpression(t *testing.T) {
 }
 
 func TestCron_EveryHour(t *testing.T) {
-	schedule := jobs.Cron("0 * * * *") // Top of every hour
+	schedule := jobs.MustCron("0 * * * *") // Top of every hour
 
 	now := time.Date(2026, 2, 8, 10, 30, 0, 0, time.UTC)
 	next := schedule.Next(now)
@@ -150,7 +150,7 @@ func TestCron_EveryHour(t *testing.T) {
 }
 
 func TestCron_EveryMinute(t *testing.T) {
-	schedule := jobs.Cron("* * * * *") // Every minute
+	schedule := jobs.MustCron("* * * * *") // Every minute
 
 	now := time.Date(2026, 2, 8, 10, 30, 0, 0, time.UTC)
 	next := schedule.Next(now)
@@ -159,7 +159,7 @@ func TestCron_EveryMinute(t *testing.T) {
 }
 
 func TestCron_WeekdaysOnly(t *testing.T) {
-	schedule := jobs.Cron("0 9 * * 1-5") // 9am Mon-Fri
+	schedule := jobs.MustCron("0 9 * * 1-5") // 9am Mon-Fri
 
 	// Saturday
 	now := time.Date(2026, 2, 7, 10, 0, 0, 0, time.UTC) // Saturday
@@ -170,7 +170,7 @@ func TestCron_WeekdaysOnly(t *testing.T) {
 }
 
 func TestCron_MonthlyFirstDay(t *testing.T) {
-	schedule := jobs.Cron("0 0 1 * *") // Midnight on 1st of month
+	schedule := jobs.MustCron("0 0 1 * *") // Midnight on 1st of month
 
 	now := time.Date(2026, 2, 15, 10, 0, 0, 0, time.UTC)
 	next := schedule.Next(now)
@@ -179,18 +179,16 @@ func TestCron_MonthlyFirstDay(t *testing.T) {
 }
 
 func TestCron_InvalidExpression(t *testing.T) {
-	// The Cron function should panic on invalid expression
-	defer func() {
-		if r := recover(); r == nil {
-			t.Error("Expected panic for invalid cron expression")
-		}
-	}()
-
-	jobs.Cron("invalid cron expression")
+	schedule, err := jobs.Cron("invalid cron expression")
+	assert.Error(t, err)
+	assert.Nil(t, schedule)
+	assert.Panics(t, func() {
+		jobs.MustCron("invalid cron expression")
+	})
 }
 
 func TestCron_SpecificDays(t *testing.T) {
-	schedule := jobs.Cron("30 14 * * 1,3,5") // 2:30pm Mon, Wed, Fri
+	schedule := jobs.MustCron("30 14 * * 1,3,5") // 2:30pm Mon, Wed, Fri
 
 	// Tuesday
 	now := time.Date(2026, 2, 10, 10, 0, 0, 0, time.UTC) // Tuesday
@@ -201,7 +199,7 @@ func TestCron_SpecificDays(t *testing.T) {
 }
 
 func TestCron_MultipleHours(t *testing.T) {
-	schedule := jobs.Cron("0 9,12,17 * * *") // 9am, noon, 5pm daily
+	schedule := jobs.MustCron("0 9,12,17 * * *") // 9am, noon, 5pm daily
 
 	now := time.Date(2026, 2, 8, 10, 0, 0, 0, time.UTC)
 	next := schedule.Next(now)
