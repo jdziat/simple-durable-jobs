@@ -2754,3 +2754,115 @@ func TestOwnershipAudit_SkipsQueryWhenNoRunningJobs(t *testing.T) {
 	assert.Equal(t, int32(0), queries.Load(),
 		"audit must not call FindOrphanedJobs when runningJobs is empty")
 }
+
+// TestOwnershipAudit_IntervalConfiguration locks in the documented contract
+// for OwnershipAuditInterval: unset → 5s default, explicit value honored,
+// and an explicit 0 actually disables the audit. The last case is the
+// regression: NewWorker used to clobber a deliberate 0 back to 5s, so
+// "set to 0 to disable" never worked and the goroutine always ran.
+func TestOwnershipAudit_IntervalConfiguration(t *testing.T) {
+	q := queue.New(&mockStorage{})
+
+	t.Run("unset applies 5s default", func(t *testing.T) {
+		w := NewWorker(q)
+		assert.Equal(t, 5*time.Second, w.config.OwnershipAuditInterval)
+	})
+
+	t.Run("explicit value is honored", func(t *testing.T) {
+		w := NewWorker(q, WithOwnershipAuditInterval(250*time.Millisecond))
+		assert.Equal(t, 250*time.Millisecond, w.config.OwnershipAuditInterval)
+	})
+
+	t.Run("explicit zero disables the audit", func(t *testing.T) {
+		w := NewWorker(q, WithOwnershipAuditInterval(0))
+		assert.Equal(t, time.Duration(0), w.config.OwnershipAuditInterval,
+			"WithOwnershipAuditInterval(0) must keep the interval at 0 so Start() skips the audit goroutine")
+	})
+}
+
+// TestStaleLockInterval_IntervalConfiguration locks in the documented contract
+// for StaleLockInterval: unset → 5m default, explicit value honored, and an
+// explicit 0 actually disables the reaper. Like the ownership audit, NewWorker
+// used to clobber a deliberate 0 back to 5m, so "set to 0 to disable" silently
+// kept the reaper enabled.
+func TestStaleLockInterval_IntervalConfiguration(t *testing.T) {
+	q := queue.New(&mockStorage{})
+
+	t.Run("unset applies 5m default", func(t *testing.T) {
+		w := NewWorker(q)
+		assert.Equal(t, 5*time.Minute, w.config.StaleLockInterval)
+	})
+
+	t.Run("explicit value is honored", func(t *testing.T) {
+		w := NewWorker(q, WithStaleLockInterval(30*time.Second))
+		assert.Equal(t, 30*time.Second, w.config.StaleLockInterval)
+	})
+
+	t.Run("explicit zero disables the reaper", func(t *testing.T) {
+		w := NewWorker(q, WithStaleLockInterval(0))
+		assert.Equal(t, time.Duration(0), w.config.StaleLockInterval,
+			"WithStaleLockInterval(0) must keep the interval at 0 so Start() skips the reaper goroutine")
+	})
+}
+
+// ---------------------------------------------------------------------------
+// Lost-ownership side-effect suppression (finding A)
+// ---------------------------------------------------------------------------
+
+// TestHandleError_NotOwnedSkipsFanOutAccounting verifies that when a handler
+// errors — e.g. because its context was cancelled by the orphan-abandon or
+// ownership-audit path — and storage reports the job is no longer owned by
+// this worker, handleError does NOT touch the fan-out counters. Otherwise the
+// orphaned worker would race the new owner and double-count the fan-out, the
+// exact corruption this branch's cancellation work aims to end.
+func TestHandleError_NotOwnedSkipsFanOutAccounting(t *testing.T) {
+	mock := &mockStorage{}
+	mock.failFunc = func(_ context.Context, _, _, _ string, _ *time.Time) error {
+		return core.ErrJobNotOwned
+	}
+	var incrementCalled atomic.Int32
+	mock.incrementFailedFunc = func(_ context.Context, _ string) (*core.FanOut, error) {
+		incrementCalled.Add(1)
+		return nil, nil
+	}
+
+	q := queue.New(mock)
+	w := NewWorker(q, DisableRetry())
+
+	fanOutID := "fo-1"
+	// Attempt >= MaxRetries → terminal path (the one that does fan-out accounting).
+	job := &core.Job{ID: "sub-1", FanOutID: &fanOutID, Attempt: 5, MaxRetries: 3}
+
+	w.handleError(context.Background(), job, errors.New("boom"))
+
+	assert.Equal(t, int32(0), incrementCalled.Load(),
+		"a job we no longer own must not write to the fan-out counters")
+}
+
+// TestHandleError_OwnedStillAccountsFanOut guards the refactor: when the job IS
+// still owned (Fail succeeds), the terminal path must still record the failure
+// against the fan-out so the parent isn't left stuck in 'waiting'.
+func TestHandleError_OwnedStillAccountsFanOut(t *testing.T) {
+	mock := &mockStorage{}
+	mock.failFunc = func(_ context.Context, _, _, _ string, _ *time.Time) error {
+		return nil // owned: Fail succeeds
+	}
+	var incrementCalled atomic.Int32
+	mock.incrementFailedFunc = func(_ context.Context, _ string) (*core.FanOut, error) {
+		incrementCalled.Add(1)
+		// Return a fan-out that is NOT yet complete so checkFanOutCompletion
+		// is a no-op and we don't pull in the completeFanOut machinery.
+		return &core.FanOut{ID: "fo-1", TotalCount: 5, FailedCount: 1, Strategy: core.StrategyCollectAll}, nil
+	}
+
+	q := queue.New(mock)
+	w := NewWorker(q, DisableRetry())
+
+	fanOutID := "fo-1"
+	job := &core.Job{ID: "sub-1", FanOutID: &fanOutID, Attempt: 5, MaxRetries: 3}
+
+	w.handleError(context.Background(), job, errors.New("boom"))
+
+	assert.Equal(t, int32(1), incrementCalled.Load(),
+		"a job we still own must record its failure against the fan-out")
+}

@@ -5,6 +5,8 @@ import (
 	"errors"
 	"math/rand"
 	"time"
+
+	"github.com/jdziat/simple-durable-jobs/pkg/core"
 )
 
 // RetryConfig holds configuration for retry with backoff.
@@ -53,8 +55,12 @@ func retryWithBackoff(ctx context.Context, config RetryConfig, operation func() 
 			return nil
 		}
 
-		// Don't retry on context cancellation
-		if errors.Is(lastErr, context.Canceled) || errors.Is(lastErr, context.DeadlineExceeded) {
+		// Don't retry on context cancellation, or when the job is no longer
+		// owned by this worker — retrying can't reacquire ownership, so it
+		// only delays the caller's lost-ownership handling and hammers the DB.
+		if errors.Is(lastErr, context.Canceled) ||
+			errors.Is(lastErr, context.DeadlineExceeded) ||
+			errors.Is(lastErr, core.ErrJobNotOwned) {
 			return lastErr
 		}
 
@@ -96,6 +102,12 @@ func IsRetryableError(err error) bool {
 
 	// Context errors are not retryable
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+
+	// Lost ownership is permanent for this worker — another worker now owns
+	// the job. Retrying the operation will keep failing the same way.
+	if errors.Is(err, core.ErrJobNotOwned) {
 		return false
 	}
 

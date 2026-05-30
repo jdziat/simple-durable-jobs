@@ -81,8 +81,10 @@ func NewWorker(q *queue.Queue, opts ...WorkerOption) *Worker {
 		config.DequeueRetry = &dequeueCfg
 	}
 
-	// Set default stale lock reaper config
-	if config.StaleLockInterval == 0 {
+	// Set default stale lock reaper config. Default to 5m only when the
+	// interval was never set — an explicit WithStaleLockInterval(0) is
+	// honored as "disable the reaper" (the Start guard skips the goroutine).
+	if !config.staleLockIntervalSet && config.StaleLockInterval == 0 {
 		config.StaleLockInterval = 5 * time.Minute
 	}
 	if config.StaleLockAge == 0 {
@@ -106,9 +108,11 @@ func NewWorker(q *queue.Queue, opts ...WorkerOption) *Worker {
 		queueRunning[name] = &atomic.Int32{}
 	}
 
-	// Default OwnershipAuditInterval to 5s if unset (zero is honored as
-	// "disabled" via the option helper; the NewWorker default is enabled).
-	if config.OwnershipAuditInterval == 0 {
+	// Default OwnershipAuditInterval to 5s only when it was never set. An
+	// explicit WithOwnershipAuditInterval(0) is honored as "disable" (the
+	// Start guard below skips the goroutine); without the ownershipAuditSet
+	// flag we couldn't tell that apart from "unset".
+	if !config.ownershipAuditSet && config.OwnershipAuditInterval == 0 {
 		config.OwnershipAuditInterval = 5 * time.Second
 	}
 
@@ -334,6 +338,15 @@ func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 			}
 		}
 		completeErr := w.completeWithRetry(ctx, job.ID)
+		if errors.Is(completeErr, core.ErrJobNotOwned) {
+			// The job was reclaimed, cancelled, or already completed by
+			// another path while this handler was running. The worker that
+			// now owns it is responsible for fan-out accounting; doing it
+			// here would double-count the fan-out and race the new owner.
+			w.logger.Warn("job no longer owned at completion; skipping completion handling",
+				"job_id", job.ID)
+			return
+		}
 		if completeErr != nil {
 			w.logger.Error("failed to complete job after retries", "job_id", job.ID, "error", completeErr)
 			// Still handle sub-job completion — the work is done even if
@@ -348,6 +361,7 @@ func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 		// Handle sub-job completion (resume parent if needed) — always run
 		// regardless of whether Complete() succeeded, to prevent orphaned
 		// parent jobs stuck in 'waiting' with all sub-jobs actually done.
+		// (The lost-ownership case returned above.)
 		if err := w.handleSubJobCompletion(ctx, job, completeErr == nil); err != nil {
 			w.logger.Error("failed to handle sub-job completion", "job_id", job.ID, "error", err)
 		}
@@ -508,62 +522,66 @@ func (w *Worker) executeHandler(ctx context.Context, job *core.Job, h *handler.H
 }
 
 func (w *Worker) handleError(ctx context.Context, job *core.Job, err error) {
-	// Check for NoRetry
+	// Decide the disposition: a scheduled retry (retryAt != nil) or a terminal
+	// failure (retryAt == nil). NoRetry always wins; otherwise we retry while
+	// attempts remain. This mirrors the original branch-by-branch logic.
+	var retryAt *time.Time
 	var noRetry *core.NoRetryError
-	if errors.As(err, &noRetry) {
-		w.failWithRetry(ctx, job.ID, err.Error(), nil)
-		w.queue.CallFailHooks(ctx, job, err)
-		// Emit failure event
-		w.queue.Emit(&core.JobFailed{Job: job, Error: err, Timestamp: time.Now()})
-		// Handle sub-job failure (resume parent if needed)
-		if handleErr := w.handleSubJobCompletion(ctx, job, false); handleErr != nil {
-			w.logger.Error("failed to handle sub-job failure", "job_id", job.ID, "error", handleErr)
-		}
+	var retryAfter *core.RetryAfterError
+	switch {
+	case errors.As(err, &noRetry):
+		// terminal — NoRetry overrides any remaining attempts.
+	case errors.As(err, &retryAfter) && job.Attempt < job.MaxRetries:
+		t := time.Now().Add(retryAfter.Delay)
+		retryAt = &t
+	case job.Attempt < job.MaxRetries:
+		t := time.Now().Add(w.calculateBackoff(job.Attempt))
+		retryAt = &t
+	default:
+		// terminal — attempts exhausted.
+	}
+
+	// Persist the outcome first. If storage reports the job is no longer owned
+	// by this worker, it was reclaimed or cancelled by another path (the
+	// stale-lock reaper, a fan-out cancel, or another worker in the fleet —
+	// often the very reason this handler's context was cancelled). The owner
+	// is now responsible for hooks, events, and fan-out accounting; running
+	// them here would race the new owner's state writes and double-count the
+	// fan-out. So skip all side effects when ownership is lost.
+	if failErr := w.failWithRetry(ctx, job.ID, err.Error(), retryAt); errors.Is(failErr, core.ErrJobNotOwned) {
+		w.logger.Warn("job no longer owned by this worker; skipping failure handling",
+			"job_id", job.ID, "error", err)
 		return
 	}
 
-	// Check for RetryAfter
-	var retryAfter *core.RetryAfterError
-	if errors.As(err, &retryAfter) {
-		if job.Attempt < job.MaxRetries {
-			retryAt := time.Now().Add(retryAfter.Delay)
-			w.failWithRetry(ctx, job.ID, err.Error(), &retryAt)
-			w.queue.CallRetryHooks(ctx, job, job.Attempt, err)
-			// Emit retry event
-			w.queue.Emit(&core.JobRetrying{Job: job, Attempt: job.Attempt, Error: err, NextRunAt: retryAt, Timestamp: time.Now()})
-			return
-		}
+	if retryAt != nil {
+		w.queue.CallRetryHooks(ctx, job, job.Attempt, err)
+		w.queue.Emit(&core.JobRetrying{Job: job, Attempt: job.Attempt, Error: err, NextRunAt: *retryAt, Timestamp: time.Now()})
+		return
 	}
 
-	// Normal retry logic
-	if job.Attempt < job.MaxRetries {
-		backoff := w.calculateBackoff(job.Attempt)
-		retryAt := time.Now().Add(backoff)
-		w.failWithRetry(ctx, job.ID, err.Error(), &retryAt)
-		w.queue.CallRetryHooks(ctx, job, job.Attempt, err)
-		// Emit retry event
-		w.queue.Emit(&core.JobRetrying{Job: job, Attempt: job.Attempt, Error: err, NextRunAt: retryAt, Timestamp: time.Now()})
-	} else {
-		w.failWithRetry(ctx, job.ID, err.Error(), nil)
-		w.queue.CallFailHooks(ctx, job, err)
-		// Emit failure event
-		w.queue.Emit(&core.JobFailed{Job: job, Error: err, Timestamp: time.Now()})
-
-		// Handle sub-job failure (resume parent if needed)
-		if handleErr := w.handleSubJobCompletion(ctx, job, false); handleErr != nil {
-			w.logger.Error("failed to handle sub-job failure", "job_id", job.ID, "error", handleErr)
-		}
+	// Terminal failure.
+	w.queue.CallFailHooks(ctx, job, err)
+	w.queue.Emit(&core.JobFailed{Job: job, Error: err, Timestamp: time.Now()})
+	// Handle sub-job failure (resume parent if needed).
+	if handleErr := w.handleSubJobCompletion(ctx, job, false); handleErr != nil {
+		w.logger.Error("failed to handle sub-job failure", "job_id", job.ID, "error", handleErr)
 	}
 }
 
 // failWithRetry marks a job as failed with retry on transient storage failures.
-func (w *Worker) failWithRetry(ctx context.Context, jobID string, errMsg string, retryAt *time.Time) {
+// It returns the final storage error so callers can detect a lost-ownership
+// outcome (core.ErrJobNotOwned) and skip downstream side effects.
+func (w *Worker) failWithRetry(ctx context.Context, jobID string, errMsg string, retryAt *time.Time) error {
 	err := retryWithBackoff(ctx, *w.config.StorageRetry, func() error {
 		return w.queue.Storage().Fail(ctx, jobID, w.config.WorkerID, errMsg, retryAt)
 	})
-	if err != nil {
+	// ErrJobNotOwned is an expected, caller-handled outcome — don't log it as
+	// an error here (the caller decides what to do about lost ownership).
+	if err != nil && !errors.Is(err, core.ErrJobNotOwned) {
 		w.logger.Error("failed to mark job as failed after retries", "job_id", jobID, "error", err)
 	}
+	return err
 }
 
 // handleSubJobCompletion updates fan-out counters and resumes parent if needed.
@@ -852,12 +870,11 @@ func (w *Worker) reapStaleLocks(ctx context.Context) {
 // The query cost is one row per running job per tick — bounded by THIS
 // worker's concurrency, not by the size of the fleet.
 //
-// A grace window protects newly-acquired jobs from being mis-flagged
-// during the brief gap between Dequeue (which sets locked_by) and the
-// audit's read. In practice GORM's WithContext().First() commits the
-// update before returning, so the gap is sub-microsecond and a grace
-// window isn't strictly needed — but the snapshot-then-query pattern
-// below makes a transient inconsistency vanish on the next tick anyway.
+// No grace window is needed for newly-acquired jobs: a job only enters
+// runningJobs (in processJob) after Dequeue has returned, and Dequeue
+// commits locked_by=this-worker before returning. So any ID in the
+// snapshot already has its ownership row persisted, and a freshly
+// dequeued job can't be mis-flagged as orphaned.
 func (w *Worker) runOwnershipAudit(ctx context.Context) {
 	ticker := time.NewTicker(w.config.OwnershipAuditInterval)
 	defer ticker.Stop()

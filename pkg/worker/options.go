@@ -37,6 +37,12 @@ type WorkerConfig struct {
 	// Default: 5 minutes. Set to 0 to disable.
 	StaleLockInterval time.Duration
 
+	// staleLockIntervalSet records whether StaleLockInterval was provided
+	// explicitly (via WithStaleLockInterval). NewWorker needs this to tell
+	// "unset" (apply the 5m default) apart from an explicit 0, which the
+	// documented contract treats as "disable the stale-lock reaper".
+	staleLockIntervalSet bool
+
 	// StaleLockAge is how long a running job's lock must be expired before
 	// it is reclaimed (reset to pending). Default: 45 minutes (matches lock duration).
 	StaleLockAge time.Duration
@@ -53,6 +59,12 @@ type WorkerConfig struct {
 	// query rate; the query is bounded by len(runningJobs), so the cost
 	// scales with concurrency, not fleet size.
 	OwnershipAuditInterval time.Duration
+
+	// ownershipAuditSet records whether OwnershipAuditInterval was provided
+	// explicitly (via WithOwnershipAuditInterval). NewWorker needs this to
+	// tell "unset" (apply the 5s default) apart from an explicit 0, which
+	// the documented contract treats as "disable the audit".
+	ownershipAuditSet bool
 
 	// LockDuration is how long a job is locked when dequeued or heartbeated.
 	// Default: 45 minutes. If non-zero, the worker will configure the storage
@@ -151,6 +163,7 @@ func WithPollInterval(d time.Duration) WorkerOption {
 func WithStaleLockInterval(d time.Duration) WorkerOption {
 	return workerOptionFunc(func(c *WorkerConfig) {
 		c.StaleLockInterval = d
+		c.staleLockIntervalSet = true
 	})
 }
 
@@ -181,5 +194,6 @@ func WithLockDuration(d time.Duration) WorkerOption {
 func WithOwnershipAuditInterval(d time.Duration) WorkerOption {
 	return workerOptionFunc(func(c *WorkerConfig) {
 		c.OwnershipAuditInterval = d
+		c.ownershipAuditSet = true
 	})
 }
