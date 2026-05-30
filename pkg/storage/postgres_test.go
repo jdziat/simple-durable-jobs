@@ -6,9 +6,11 @@ import (
 	"os"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 
 	"github.com/jdziat/simple-durable-jobs/pkg/core"
 )
@@ -138,6 +140,117 @@ func TestDequeue_PostgreSQL_PriorityOrdering(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, got)
 	assert.Equal(t, "high-prio", got.Type, "higher priority job should be dequeued first")
+}
+
+func TestCancelSubJobs_PostgreSQL_ConcurrentCompletionKeepsFanOutCountsConsistent(t *testing.T) {
+	skipIfNotPostgres(t)
+
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	const subQueue = "cancel-race-q"
+	fanOut := &core.FanOut{ID: "fo-cancel-race", ParentJobID: "parent", TotalCount: 3}
+	require.NoError(t, s.CreateFanOut(ctx, fanOut))
+
+	subs := []*core.Job{
+		{Type: "sub", Queue: subQueue, FanOutID: &fanOut.ID, FanOutIndex: 0},
+		{Type: "sub", Queue: subQueue, FanOutID: &fanOut.ID, FanOutIndex: 1},
+		{Type: "sub", Queue: subQueue, FanOutID: &fanOut.ID, FanOutIndex: 2},
+	}
+	require.NoError(t, s.EnqueueBatch(ctx, subs))
+
+	alreadyCompleted, err := s.Dequeue(ctx, []string{subQueue}, "worker-completed")
+	require.NoError(t, err)
+	require.NotNil(t, alreadyCompleted)
+	require.NoError(t, s.Complete(ctx, alreadyCompleted.ID, "worker-completed"))
+	_, err = s.IncrementFanOutCompleted(ctx, fanOut.ID)
+	require.NoError(t, err)
+
+	racing, err := s.Dequeue(ctx, []string{subQueue}, "worker-racing")
+	require.NoError(t, err)
+	require.NotNil(t, racing)
+
+	type hookKey struct{}
+	type updateHook struct {
+		ready   chan struct{}
+		proceed chan struct{}
+		once    sync.Once
+	}
+	hook := &updateHook{
+		ready:   make(chan struct{}),
+		proceed: make(chan struct{}),
+	}
+	const callbackName = "cancel_sub_jobs_race_pause"
+	require.NoError(t, s.DB().Callback().Update().Before("gorm:update").Register(callbackName, func(tx *gorm.DB) {
+		h, ok := tx.Statement.Context.Value(hookKey{}).(*updateHook)
+		if !ok || tx.Statement.Table != "jobs" {
+			return
+		}
+		h.once.Do(func() { close(h.ready) })
+		<-h.proceed
+	}))
+	t.Cleanup(func() {
+		_ = s.DB().Callback().Update().Remove(callbackName)
+	})
+
+	cancelCtx := context.WithValue(ctx, hookKey{}, hook)
+	cancelDone := make(chan error, 1)
+	go func() {
+		_, err := s.CancelSubJobs(cancelCtx, fanOut.ID)
+		cancelDone <- err
+	}()
+
+	select {
+	case <-hook.ready:
+	case <-time.After(2 * time.Second):
+		t.Fatal("CancelSubJobs did not reach the hooked job update")
+	}
+
+	completeDone := make(chan error, 1)
+	go func() {
+		if err := s.Complete(ctx, racing.ID, "worker-racing"); err != nil {
+			completeDone <- err
+			return
+		}
+		_, err := s.IncrementFanOutCompleted(ctx, fanOut.ID)
+		completeDone <- err
+	}()
+
+	var completeErr error
+	completedBeforeCancel := false
+	select {
+	case completeErr = <-completeDone:
+		completedBeforeCancel = true
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(hook.proceed)
+	require.NoError(t, <-cancelDone)
+
+	if !completedBeforeCancel {
+		completeErr = <-completeDone
+	}
+	if completeErr != nil {
+		require.ErrorIs(t, completeErr, core.ErrJobNotOwned)
+	}
+
+	completedRow, err := s.GetJob(ctx, alreadyCompleted.ID)
+	require.NoError(t, err)
+	require.NotNil(t, completedRow)
+	assert.Equal(t, core.StatusCompleted, completedRow.Status)
+
+	updatedFanOut, err := s.GetFanOut(ctx, fanOut.ID)
+	require.NoError(t, err)
+	require.NotNil(t, updatedFanOut)
+	sum := updatedFanOut.CompletedCount + updatedFanOut.FailedCount + updatedFanOut.CancelledCount
+	assert.LessOrEqual(t, sum, updatedFanOut.TotalCount)
+
+	if completeErr == nil {
+		racingRow, err := s.GetJob(ctx, racing.ID)
+		require.NoError(t, err)
+		require.NotNil(t, racingRow)
+		assert.Equal(t, core.StatusCompleted, racingRow.Status)
+	}
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

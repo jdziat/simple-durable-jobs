@@ -307,7 +307,15 @@ func (s *GormStorage) Dequeue(ctx context.Context, queues []string, workerID str
 		job.StartedAt = &now
 		job.Attempt++
 
-		return tx.Save(&job).Error
+		return tx.Model(&core.Job{}).
+			Where("id = ?", job.ID).
+			Updates(map[string]any{
+				"status":       core.StatusRunning,
+				"locked_by":    workerID,
+				"locked_until": lockUntil,
+				"started_at":   now,
+				"attempt":      job.Attempt,
+			}).Error
 	})
 
 	if err != nil {
@@ -550,7 +558,7 @@ func (s *GormStorage) Heartbeat(ctx context.Context, jobID string, workerID stri
 	lockUntil := now.Add(s.lockDuration)
 	result := s.db.WithContext(ctx).
 		Model(&core.Job{}).
-		Where("id = ? AND locked_by = ?", jobID, workerID).
+		Where("id = ? AND locked_by = ? AND status = ?", jobID, workerID, core.StatusRunning).
 		Updates(map[string]any{
 			"locked_until":      lockUntil,
 			"last_heartbeat_at": now,
@@ -624,7 +632,7 @@ func (s *GormStorage) ReleaseStaleLocks(ctx context.Context, staleDuration time.
 			Where("id IN ?", released).
 			Updates(map[string]any{
 				"status":       core.StatusPending,
-				"locked_by":    nil,
+				"locked_by":    "",
 				"locked_until": nil,
 			}).Error
 	})
@@ -870,9 +878,13 @@ func (s *GormStorage) CancelSubJobs(ctx context.Context, fanOutID string) ([]str
 		// Capture the IDs of sub-jobs we're about to cancel. Done before
 		// the UPDATE so we get the in-flight set, not just rows that
 		// happen to remain pending after the update.
-		if err := tx.Model(&core.Job{}).
+		query := tx.Model(&core.Job{}).
 			Where("fan_out_id = ? AND status IN ?", fanOutID, []core.JobStatus{core.StatusPending, core.StatusRunning}).
-			Pluck("id", &cancelled).Error; err != nil {
+			Order("fan_out_index ASC")
+		if !s.isSQLite {
+			query = query.Clauses(clause.Locking{Strength: "UPDATE"})
+		}
+		if err := query.Pluck("id", &cancelled).Error; err != nil {
 			return err
 		}
 		if len(cancelled) == 0 {
@@ -880,19 +892,24 @@ func (s *GormStorage) CancelSubJobs(ctx context.Context, fanOutID string) ([]str
 		}
 
 		now := time.Now()
-		if err := tx.Model(&core.Job{}).
+		result := tx.Model(&core.Job{}).
 			Where("id IN ?", cancelled).
+			Where("status IN ?", []core.JobStatus{core.StatusPending, core.StatusRunning}).
 			Updates(map[string]any{
 				"status":     core.StatusCancelled,
 				"updated_at": now,
-			}).Error; err != nil {
-			return err
+			})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 0 {
+			return nil
 		}
 
 		// Update the fan-out's cancelled count to match.
 		return tx.Exec(
 			"UPDATE fan_outs SET cancelled_count = cancelled_count + ?, updated_at = ? WHERE id = ?",
-			len(cancelled), now, fanOutID,
+			result.RowsAffected, now, fanOutID,
 		).Error
 	})
 	if err != nil {
@@ -1056,10 +1073,17 @@ func (s *GormStorage) GetStalledFanOutParents(ctx context.Context, olderThan tim
 
 // SaveJobResult stores the serialized result for a job.
 func (s *GormStorage) SaveJobResult(ctx context.Context, jobID string, workerID string, result []byte) error {
-	return s.db.WithContext(ctx).
+	update := s.db.WithContext(ctx).
 		Model(&core.Job{}).
-		Where("id = ? AND locked_by = ?", jobID, workerID).
-		Update("result", result).Error
+		Where("id = ? AND locked_by = ? AND status = ?", jobID, workerID, core.StatusRunning).
+		Update("result", result)
+	if update.Error != nil {
+		return update.Error
+	}
+	if update.RowsAffected == 0 {
+		return core.ErrJobNotOwned
+	}
+	return nil
 }
 
 // --- Job pause operations ---

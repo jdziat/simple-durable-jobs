@@ -194,6 +194,38 @@ func TestDequeue_ReturnsPendingJobAndSetsRunning(t *testing.T) {
 	assert.Equal(t, 1, got.Attempt, "Attempt should be incremented to 1")
 }
 
+func TestDequeue_PreservesPayloadColumns(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	args := []byte(`{"large":"args"}`)
+	result := []byte(`{"previous":"result"}`)
+	traceContext := []byte(`trace-context`)
+	job := &core.Job{
+		Type:         "task.run",
+		Queue:        "default",
+		Args:         args,
+		Result:       result,
+		TraceContext: traceContext,
+	}
+	require.NoError(t, s.Enqueue(ctx, job))
+
+	got, err := s.Dequeue(ctx, []string{"default"}, "worker-1")
+	require.NoError(t, err)
+	require.NotNil(t, got)
+
+	assert.Equal(t, args, got.Args)
+	assert.Equal(t, result, got.Result)
+	assert.Equal(t, traceContext, got.TraceContext)
+
+	row, err := s.GetJob(ctx, got.ID)
+	require.NoError(t, err)
+	require.NotNil(t, row)
+	assert.Equal(t, args, row.Args)
+	assert.Equal(t, result, row.Result)
+	assert.Equal(t, traceContext, row.TraceContext)
+}
+
 func TestDequeue_RespectsQueueFilter(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStorage(t)
@@ -527,6 +559,32 @@ func TestHeartbeat_FailsWhenWorkerDoesNotOwnJob(t *testing.T) {
 	assert.True(t, errors.Is(err, core.ErrJobNotOwned))
 }
 
+func TestHeartbeat_FailsWhenJobIsNoLongerRunning(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	require.NoError(t, s.Enqueue(ctx, newTestJob("default", "task.run")))
+
+	got, err := s.Dequeue(ctx, []string{"default"}, "worker-1")
+	require.NoError(t, err)
+	require.NotNil(t, got)
+
+	before := *got.LockedUntil
+	require.NoError(t, s.db.Model(&core.Job{}).
+		Where("id = ?", got.ID).
+		Update("status", core.StatusCompleted).Error)
+
+	err = s.Heartbeat(ctx, got.ID, "worker-1")
+	require.ErrorIs(t, err, core.ErrJobNotOwned)
+
+	after, err := s.GetJob(ctx, got.ID)
+	require.NoError(t, err)
+	require.NotNil(t, after)
+	require.NotNil(t, after.LockedUntil)
+	assert.WithinDuration(t, before, *after.LockedUntil, time.Millisecond)
+	assert.Nil(t, after.LastHeartbeatAt)
+}
+
 func TestReleaseStaleLocks_ResetsExpiredRunningJobsToPending(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStorage(t)
@@ -555,6 +613,37 @@ func TestReleaseStaleLocks_ResetsExpiredRunningJobsToPending(t *testing.T) {
 	assert.Equal(t, core.StatusPending, row.Status)
 	assert.Empty(t, row.LockedBy)
 	assert.Nil(t, row.LockedUntil)
+}
+
+func TestReleaseStaleLocks_ReapedJobIsOrphanedAndDequeuable(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	require.NoError(t, s.Enqueue(ctx, newTestJob("default", "task.run")))
+
+	got, err := s.Dequeue(ctx, []string{"default"}, "worker-1")
+	require.NoError(t, err)
+	require.NotNil(t, got)
+
+	past := time.Now().Add(-2 * time.Hour)
+	require.NoError(t, s.db.Model(&core.Job{}).
+		Where("id = ?", got.ID).
+		Update("locked_until", past).Error)
+
+	released, err := s.ReleaseStaleLocks(ctx, time.Hour)
+	require.NoError(t, err)
+	require.Equal(t, []string{got.ID}, released)
+
+	orphaned, err := s.FindOrphanedJobs(ctx, []string{got.ID}, "worker-1")
+	require.NoError(t, err)
+	require.Equal(t, []string{got.ID}, orphaned)
+
+	reacquired, err := s.Dequeue(ctx, []string{"default"}, "worker-2")
+	require.NoError(t, err)
+	require.NotNil(t, reacquired)
+	assert.Equal(t, got.ID, reacquired.ID)
+	assert.Equal(t, core.StatusRunning, reacquired.Status)
+	assert.Equal(t, "worker-2", reacquired.LockedBy)
 }
 
 func TestReleaseStaleLocks_DoesNotTouchFreshLocks(t *testing.T) {
@@ -1276,6 +1365,32 @@ func TestSaveJobResult_AndRetrieveViaGetJob(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, refreshed)
 	assert.Equal(t, result, refreshed.Result)
+}
+
+func TestSaveJobResult_DoesNotOverwriteCompletedJob(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	job := newTestJob("default", "task.run")
+	require.NoError(t, s.Enqueue(ctx, job))
+
+	got, err := s.Dequeue(ctx, []string{"default"}, "worker-1")
+	require.NoError(t, err)
+	require.NotNil(t, got)
+
+	original := []byte(`{"value":"original"}`)
+	require.NoError(t, s.SaveJobResult(ctx, got.ID, "worker-1", original))
+	require.NoError(t, s.db.Model(&core.Job{}).
+		Where("id = ?", got.ID).
+		Update("status", core.StatusCompleted).Error)
+
+	err = s.SaveJobResult(ctx, got.ID, "worker-1", []byte(`{"value":"overwrite"}`))
+	require.ErrorIs(t, err, core.ErrJobNotOwned)
+
+	refreshed, err := s.GetJob(ctx, got.ID)
+	require.NoError(t, err)
+	require.NotNil(t, refreshed)
+	assert.Equal(t, original, refreshed.Result)
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
