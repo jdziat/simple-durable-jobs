@@ -62,8 +62,13 @@ Harness MUST be RED on current code (reproduce ≥2 defect classes) and GREEN-ab
 | P2 | ✅ committed | `73e6d09` | 0.4 + partial 2.5 — partial active-unique index (PG+sqlite) + MySQL deadlock-retry; verified on all 3 engines |
 | P3 | ✅ committed | `28a0291` | 0.3 mode-b + 5.1/5.2 — resume-path idempotent re-enqueue + sub-job validation |
 | P3b | ✅ committed | `b8769ca` | 0.3 mode-a — GetStalledFanOutParents recovery; chaos harness ALL HARD invariants green (PG+MySQL verified) |
-| P4 | 🔄 in progress | — | scheduler (0.5/1.1/5.5/5.6) |
-| P5–P14 | pending | — | |
+| P4 | ✅ committed | `a086779` | 0.5 boot-storm/1.1/5.5/5.6 — seed lastRun, options+args, UTC, Cron error+MustCron |
+| P4b | ✅ committed | `e6cc15a` | 0.5 exactly-once — atomic ClaimScheduledFire CAS; chaos INV-SCHED 6→2; PG+MySQL verified |
+| P5 | 🔄 in progress | — | OTel terminal-hook ctx (0.6) |
+| P6–P14 | pending | — | |
+
+**Milestone (after P4b):** chaos harness FULLY GREEN — all 4 HARD invariants + INV-SCHED PASS under SIGKILL chaos on Postgres. All harness-reproducible distributed findings (0.1/0.3/0.4/0.5 + 2.2-so-far) closed. Remaining packets (P5–P14) are unit-test-gated (OTel, backoff, lifecycle, storage guards, UI, API) — not distributed-correctness invariants.
+Findings closed: 0.1 0.2 0.3 0.4 0.5 1.1 3.3 5.1 5.2 5.3 5.5 5.6 + partial 2.5.
 
 **Milestone (after P3b):** chaos harness reports NO HARD failures — INV-EXACTLY-ONCE / NO-WEDGE / FANOUT-COUNTS / UNIQUE all PASS under SIGKILL chaos. Only INV-SCHED (INFO, finding 0.5) still RED → P4. Distributed-correctness Tier-0 (0.1/0.3/0.4) closed.
 
