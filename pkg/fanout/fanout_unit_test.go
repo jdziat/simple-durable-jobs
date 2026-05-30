@@ -158,7 +158,8 @@ func (s *minimalStorage) GetSubJobs(ctx context.Context, fanOutID string) ([]*co
 func (s *minimalStorage) GetSubJobResults(ctx context.Context, fanOutID string) ([]*core.Job, error) {
 	var out []*core.Job
 	for _, j := range s.jobs {
-		if j.FanOutID != nil && *j.FanOutID == fanOutID {
+		if j.FanOutID != nil && *j.FanOutID == fanOutID &&
+			(j.Status == core.StatusCompleted || j.Status == core.StatusFailed) {
 			out = append(out, j)
 		}
 	}
@@ -551,6 +552,48 @@ func TestCollectResults_CompletedFanOut_ReturnsValues(t *testing.T) {
 	assert.Equal(t, 99, results[0].Value)
 }
 
+func TestCollectResults_CancelledSubJobAtNonZeroIndex_ReturnsCancelledErr(t *testing.T) {
+	store := newMinimalStorage()
+	parentID := "parent-cancelled-sub"
+	jc := makeJobCtx(store, parentID, "default")
+	ctx := buildCtx(jc, nil)
+
+	fanOutID := "fo-cancelled-sub"
+	successBytes, _ := json.Marshal("ok")
+	store.fanOuts[fanOutID] = &core.FanOut{
+		ID:             fanOutID,
+		ParentJobID:    parentID,
+		TotalCount:     3,
+		CompletedCount: 1,
+		CancelledCount: 1,
+		Status:         core.FanOutCompleted,
+	}
+	store.jobs["sub-success"] = &core.Job{
+		ID:          "sub-success",
+		FanOutID:    &fanOutID,
+		FanOutIndex: 0,
+		Status:      core.StatusCompleted,
+		Result:      successBytes,
+	}
+	store.jobs["sub-cancelled"] = &core.Job{
+		ID:          "sub-cancelled",
+		FanOutID:    &fanOutID,
+		FanOutIndex: 2,
+		Status:      core.StatusCancelled,
+	}
+
+	results, err := CollectResults[string](ctx, fanOutID)
+	require.NoError(t, err)
+	require.Len(t, results, 3)
+	assert.Equal(t, 0, results[0].Index)
+	assert.Equal(t, "ok", results[0].Value)
+	assert.NoError(t, results[0].Err)
+	assert.Equal(t, 2, results[2].Index)
+	assert.ErrorIs(t, results[2].Err, ErrSubJobCancelled)
+	assert.Equal(t, 1, results[1].Index)
+	assert.ErrorIs(t, results[1].Err, ErrSubJobIncomplete)
+}
+
 func TestCollectResults_FailedFanOut_ReturnsErrorWithResults(t *testing.T) {
 	store := newMinimalStorage()
 	parentID := "parent-failed-fo"
@@ -583,6 +626,9 @@ func TestCollectResults_FailedFanOut_ReturnsErrorWithResults(t *testing.T) {
 	var foErr *Error
 	assert.True(t, errors.As(err, &foErr))
 	assert.Equal(t, 1, foErr.FailedCount)
+
+	var noRetryErr *core.NoRetryError
+	assert.True(t, errors.As(err, &noRetryErr))
 }
 
 func TestCollectResults_BadResultJSON_ReturnsDecodeError(t *testing.T) {

@@ -274,29 +274,39 @@ func CollectResults[T any](ctx context.Context, fanOutID string) ([]Result[T], e
 		return nil, fmt.Errorf("fan-out not found: %s", fanOutID)
 	}
 
-	jobs, err := jc.Storage.GetSubJobResults(ctx, fanOutID)
+	jobs, err := jc.Storage.GetSubJobs(ctx, fanOutID)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get sub-job results: %w", err)
+		return nil, fmt.Errorf("failed to get sub-jobs: %w", err)
 	}
 
-	// Pre-allocate results slice with correct size
 	results := make([]Result[T], fanOut.TotalCount)
+	for i := range results {
+		results[i].Index = i
+		results[i].Err = ErrSubJobIncomplete
+	}
+
 	for _, job := range jobs {
-		if job.FanOutIndex >= len(results) {
+		if job.FanOutIndex < 0 || job.FanOutIndex >= len(results) {
 			continue
 		}
-		results[job.FanOutIndex] = Result[T]{
-			Index: job.FanOutIndex,
-		}
-		if job.Status == core.StatusFailed {
-			results[job.FanOutIndex].Err = fmt.Errorf("%s", job.LastError)
-		} else if job.Result != nil {
-			var value T
-			if err := json.Unmarshal(job.Result, &value); err != nil {
-				results[job.FanOutIndex].Err = fmt.Errorf("failed to unmarshal result: %w", err)
-			} else {
-				results[job.FanOutIndex].Value = value
+		results[job.FanOutIndex].Index = job.FanOutIndex
+		switch job.Status {
+		case core.StatusCompleted:
+			results[job.FanOutIndex].Err = nil
+			if job.Result != nil {
+				var value T
+				if err := json.Unmarshal(job.Result, &value); err != nil {
+					results[job.FanOutIndex].Err = fmt.Errorf("failed to unmarshal result: %w", err)
+				} else {
+					results[job.FanOutIndex].Value = value
+				}
 			}
+		case core.StatusFailed:
+			results[job.FanOutIndex].Err = fmt.Errorf("%s", job.LastError)
+		case core.StatusCancelled:
+			results[job.FanOutIndex].Err = ErrSubJobCancelled
+		default:
+			results[job.FanOutIndex].Err = ErrSubJobIncomplete
 		}
 	}
 
@@ -313,13 +323,13 @@ func CollectResults[T any](ctx context.Context, fanOutID string) ([]Result[T], e
 				})
 			}
 		}
-		return results, &Error{
+		return results, core.NoRetry(&Error{
 			FanOutID:    fanOutID,
 			TotalCount:  fanOut.TotalCount,
 			FailedCount: fanOut.FailedCount,
 			Strategy:    fanOut.Strategy,
 			Failures:    failures,
-		}
+		})
 	}
 
 	return results, nil
