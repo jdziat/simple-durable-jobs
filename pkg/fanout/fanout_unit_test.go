@@ -11,6 +11,7 @@ import (
 
 	"github.com/jdziat/simple-durable-jobs/pkg/core"
 	intctx "github.com/jdziat/simple-durable-jobs/pkg/internal/context"
+	"github.com/jdziat/simple-durable-jobs/pkg/queue"
 	"github.com/jdziat/simple-durable-jobs/pkg/security"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -375,6 +376,28 @@ func TestFanOut_WithTimeout_SetsTimeoutAt(t *testing.T) {
 	for _, fo := range store.fanOuts {
 		assert.NotNil(t, fo.TimeoutAt, "expected TimeoutAt to be set")
 	}
+}
+
+func TestFanOut_SubJobTimeout_SetsJobTimeout(t *testing.T) {
+	store := newMinimalStorage()
+	jc := makeJobCtx(store, "parent-sub-timeout", "default")
+	ctx := buildCtx(jc, nil)
+
+	subs := []SubJob{
+		Sub("do-work", "x", queue.Timeout(45*time.Second)),
+		{Type: "do-work", Args: "y", Timeout: 90 * time.Second},
+	}
+	_, err := FanOut[string](ctx, subs)
+	require.Error(t, err)
+	require.True(t, IsWaitingError(err))
+
+	var timeouts []time.Duration
+	for _, job := range store.jobs {
+		if job.ParentJobID != nil {
+			timeouts = append(timeouts, job.Timeout)
+		}
+	}
+	require.ElementsMatch(t, []time.Duration{45 * time.Second, 90 * time.Second}, timeouts)
 }
 
 func TestFanOut_ResumeWithCompletedFanOut_ReturnsResults(t *testing.T) {

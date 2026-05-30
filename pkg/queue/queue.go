@@ -144,6 +144,8 @@ func (q *Queue) CallDirect(ctx context.Context, name string, argsJSON []byte) er
 }
 
 // Enqueue adds a job to the queue. The job type must have a registered handler.
+// A Timeout option bounds this job's handler execution and overrides the
+// handler's registration-time timeout for this job.
 func (q *Queue) Enqueue(ctx context.Context, name string, args any, opts ...Option) (string, error) {
 	q.mu.RLock()
 	_, ok := q.handlers[name]
@@ -200,6 +202,9 @@ func (q *Queue) enqueueWithOptions(ctx context.Context, name string, args any, o
 		Status:     core.StatusPending,
 	}
 
+	if options.Timeout > 0 {
+		job.Timeout = options.Timeout
+	}
 	if options.Delay > 0 {
 		runAt := time.Now().Add(options.Delay)
 		job.RunAt = &runAt

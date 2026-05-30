@@ -4,7 +4,8 @@ import (
 	"github.com/jdziat/simple-durable-jobs/pkg/queue"
 )
 
-// Sub creates a sub-job definition.
+// Sub creates a sub-job definition. A queue.Timeout option bounds this
+// sub-job's handler execution.
 func Sub(jobType string, args any, opts ...queue.Option) SubJob {
 	sj := SubJob{
 		Type:    jobType,
@@ -24,6 +25,7 @@ func Sub(jobType string, args any, opts ...queue.Option) SubJob {
 		}
 		sj.Priority = queueOpts.Priority
 		sj.Retries = queueOpts.MaxRetries
+		sj.Timeout = queueOpts.Timeout
 	}
 
 	return sj

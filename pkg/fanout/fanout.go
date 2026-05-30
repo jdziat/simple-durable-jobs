@@ -218,6 +218,7 @@ func buildSubJobs(subJobs []SubJob, cfg *config, jc *intctx.JobContext, fanOutID
 			Queue:       queue,
 			Priority:    priority,
 			MaxRetries:  retries,
+			Timeout:     sj.Timeout,
 			ParentJobID: &parentID,
 			RootJobID:   rootID,
 			FanOutID:    &fanOutID,

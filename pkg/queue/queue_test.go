@@ -289,6 +289,7 @@ func TestQueue_Enqueue_WithOptions(t *testing.T) {
 		QueueOpt("high-priority"),
 		Priority(100),
 		Retries(5),
+		Timeout(30*time.Second),
 	)
 	require.NoError(t, err)
 
@@ -297,6 +298,7 @@ func TestQueue_Enqueue_WithOptions(t *testing.T) {
 	assert.Equal(t, "high-priority", job.Queue)
 	assert.Equal(t, 100, job.Priority)
 	assert.Equal(t, 5, job.MaxRetries)
+	assert.Equal(t, 30*time.Second, job.Timeout)
 }
 
 func TestQueue_Schedule(t *testing.T) {

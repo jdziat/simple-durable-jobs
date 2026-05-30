@@ -24,6 +24,7 @@ func TestJob_Defaults(t *testing.T) {
 	assert.Equal(t, JobStatus(""), job.Status)
 	assert.Equal(t, 0, job.Attempt)
 	assert.Equal(t, 0, job.MaxRetries)
+	assert.Equal(t, time.Duration(0), job.Timeout)
 }
 
 func TestJob_WithValues(t *testing.T) {
@@ -37,6 +38,7 @@ func TestJob_WithValues(t *testing.T) {
 		Status:     StatusPending,
 		Attempt:    0,
 		MaxRetries: 3,
+		Timeout:    30 * time.Second,
 		RunAt:      &now,
 	}
 
@@ -45,6 +47,7 @@ func TestJob_WithValues(t *testing.T) {
 	assert.Equal(t, "emails", job.Queue)
 	assert.Equal(t, 10, job.Priority)
 	assert.Equal(t, StatusPending, job.Status)
+	assert.Equal(t, 30*time.Second, job.Timeout)
 	assert.NotNil(t, job.RunAt)
 }
 

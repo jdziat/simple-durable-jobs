@@ -17,6 +17,7 @@ import (
 	"gorm.io/gorm/logger"
 
 	"github.com/jdziat/simple-durable-jobs/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/pkg/fanout"
 	"github.com/jdziat/simple-durable-jobs/pkg/queue"
 	"github.com/jdziat/simple-durable-jobs/pkg/schedule"
 	"github.com/jdziat/simple-durable-jobs/pkg/storage"
@@ -1487,6 +1488,148 @@ func TestWorker_CompleteWithRetry_SuccessfulJob(t *testing.T) {
 		// completeWithRetry was exercised via the successful job completion path.
 	case <-time.After(2 * time.Second):
 		t.Fatal("job did not complete")
+	}
+}
+
+func TestWorker_PerJobTimeoutCancelsHandlerContext(t *testing.T) {
+	q, cleanup := newSQLiteQueue(t)
+	defer cleanup()
+
+	const jobTimeout = 60 * time.Millisecond
+	started := make(chan struct{})
+	cancelled := make(chan time.Duration, 1)
+
+	q.Register("per-job-timeout", func(ctx context.Context, args struct{}) error {
+		start := time.Now()
+		close(started)
+		<-ctx.Done()
+		cancelled <- time.Since(start)
+		return ctx.Err()
+	})
+
+	_, err := q.Enqueue(context.Background(), "per-job-timeout", struct{}{},
+		queue.Timeout(jobTimeout),
+		queue.Retries(0),
+	)
+	require.NoError(t, err)
+
+	w := NewWorker(q, WithPollInterval(10*time.Millisecond), WithStaleLockInterval(0), WithOwnershipAuditInterval(0))
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	go func() { _ = w.Start(ctx) }()
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("job did not start")
+	}
+
+	select {
+	case elapsed := <-cancelled:
+		assert.GreaterOrEqual(t, elapsed, jobTimeout-10*time.Millisecond)
+		assert.Less(t, elapsed, 500*time.Millisecond)
+	case <-time.After(time.Second):
+		t.Fatal("job context was not cancelled by per-job timeout")
+	}
+}
+
+func TestWorker_SubJobTimeoutCancelsHandlerContext(t *testing.T) {
+	q, cleanup := newSQLiteQueue(t)
+	defer cleanup()
+
+	const subTimeout = 60 * time.Millisecond
+	subStarted := make(chan struct{})
+	subCancelled := make(chan time.Duration, 1)
+
+	q.Register("sub-timeout-child", func(ctx context.Context, args string) error {
+		start := time.Now()
+		close(subStarted)
+		<-ctx.Done()
+		subCancelled <- time.Since(start)
+		return ctx.Err()
+	})
+	q.Register("sub-timeout-parent", func(ctx context.Context, args struct{}) error {
+		_, err := fanout.FanOut[string](ctx, []fanout.SubJob{
+			fanout.Sub("sub-timeout-child", "x", queue.Timeout(subTimeout), queue.Retries(0)),
+		})
+		return err
+	})
+
+	_, err := q.Enqueue(context.Background(), "sub-timeout-parent", struct{}{}, queue.Retries(0))
+	require.NoError(t, err)
+
+	w := NewWorker(q, WithPollInterval(10*time.Millisecond), WithStaleLockInterval(0), WithOwnershipAuditInterval(0))
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	go func() { _ = w.Start(ctx) }()
+
+	select {
+	case <-subStarted:
+	case <-time.After(time.Second):
+		t.Fatal("sub-job did not start")
+	}
+
+	select {
+	case elapsed := <-subCancelled:
+		assert.GreaterOrEqual(t, elapsed, subTimeout-10*time.Millisecond)
+		assert.Less(t, elapsed, 500*time.Millisecond)
+	case <-time.After(time.Second):
+		t.Fatal("sub-job context was not cancelled by sub-job timeout")
+	}
+}
+
+func TestWorker_HandlerTimeoutFallbackAndNoTimeout(t *testing.T) {
+	q, cleanup := newSQLiteQueue(t)
+	defer cleanup()
+
+	const handlerTimeout = 60 * time.Millisecond
+	fallbackStarted := make(chan struct{})
+	fallbackCancelled := make(chan time.Duration, 1)
+	noTimeoutRan := make(chan struct{})
+
+	q.Register("handler-timeout", func(ctx context.Context, args struct{}) error {
+		start := time.Now()
+		close(fallbackStarted)
+		<-ctx.Done()
+		fallbackCancelled <- time.Since(start)
+		return ctx.Err()
+	}, queue.Timeout(handlerTimeout))
+	q.Register("no-timeout", func(ctx context.Context, args struct{}) error {
+		if _, ok := ctx.Deadline(); ok {
+			return errors.New("unexpected deadline")
+		}
+		close(noTimeoutRan)
+		return nil
+	})
+
+	_, err := q.Enqueue(context.Background(), "handler-timeout", struct{}{}, queue.Retries(0))
+	require.NoError(t, err)
+	_, err = q.Enqueue(context.Background(), "no-timeout", struct{}{}, queue.Retries(0))
+	require.NoError(t, err)
+
+	w := NewWorker(q, WithPollInterval(10*time.Millisecond), WithStaleLockInterval(0), WithOwnershipAuditInterval(0))
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	go func() { _ = w.Start(ctx) }()
+
+	select {
+	case <-fallbackStarted:
+	case <-time.After(time.Second):
+		t.Fatal("handler-timeout job did not start")
+	}
+
+	select {
+	case elapsed := <-fallbackCancelled:
+		assert.GreaterOrEqual(t, elapsed, handlerTimeout-10*time.Millisecond)
+		assert.Less(t, elapsed, 500*time.Millisecond)
+	case <-time.After(time.Second):
+		t.Fatal("handler timeout fallback did not cancel context")
+	}
+
+	select {
+	case <-noTimeoutRan:
+	case <-time.After(time.Second):
+		t.Fatal("no-timeout handler did not run without deadline")
 	}
 }
 

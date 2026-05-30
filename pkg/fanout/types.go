@@ -22,7 +22,8 @@ type SubJob struct {
 	Queue    string
 	Priority int
 	Retries  int
-	Timeout  time.Duration
+	// Timeout bounds this sub-job's handler execution.
+	Timeout time.Duration
 }
 
 // Result wraps a sub-job result with its index and potential error.

@@ -324,11 +324,15 @@ func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 		return
 	}
 
-	// Create context for this job — with timeout if handler specifies one
+	// Create context for this job — per-job timeout overrides handler default.
 	var jobCtx context.Context
 	var cancelJob context.CancelFunc
-	if h.Timeout > 0 {
-		jobCtx, cancelJob = context.WithTimeout(ctx, h.Timeout)
+	effectiveTimeout := h.Timeout
+	if job.Timeout > 0 {
+		effectiveTimeout = job.Timeout
+	}
+	if effectiveTimeout > 0 {
+		jobCtx, cancelJob = context.WithTimeout(ctx, effectiveTimeout)
 	} else {
 		jobCtx, cancelJob = context.WithCancel(ctx)
 	}
