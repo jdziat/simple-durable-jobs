@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"os"
 	"sync"
 	"testing"
@@ -184,6 +185,56 @@ func TestEnqueueUnique_PostgreSQL_ForUpdate(t *testing.T) {
 	}
 	assert.Equal(t, 1, successes, "exactly one enqueue should succeed")
 	assert.Equal(t, concurrency-1, duplicates, "remaining should be duplicates")
+}
+
+func TestEnqueueUnique_PostgreSQL_Concurrent_NoDuplicates(t *testing.T) {
+	skipIfNotPostgres(t)
+
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	const concurrency = 20
+	const key = "unique-key-pg-concurrent"
+
+	start := make(chan struct{})
+	errs := make(chan error, concurrency)
+	var wg sync.WaitGroup
+
+	for range concurrency {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			job := newTestJob("unique-q", "unique-task")
+			<-start
+			errs <- s.EnqueueUnique(ctx, job, key)
+		}()
+	}
+
+	close(start)
+	wg.Wait()
+	close(errs)
+
+	successes := 0
+	duplicates := 0
+	for err := range errs {
+		switch {
+		case err == nil:
+			successes++
+		case errors.Is(err, core.ErrDuplicateJob):
+			duplicates++
+		default:
+			require.NoError(t, err)
+		}
+	}
+
+	assert.Equal(t, 1, successes, "exactly one concurrent enqueue should succeed")
+	assert.Equal(t, concurrency-1, duplicates, "all remaining enqueues should report duplicates")
+
+	var count int64
+	require.NoError(t, s.DB().Model(&core.Job{}).
+		Where("unique_key = ?", key).
+		Count(&count).Error)
+	assert.EqualValues(t, 1, count, "concurrent EnqueueUnique produced duplicate rows")
 }
 
 func TestEnqueueUnique_PostgreSQL_AllowsAfterCompletion(t *testing.T) {

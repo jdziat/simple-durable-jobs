@@ -37,7 +37,9 @@ type GormStorage struct {
 	lockDuration time.Duration
 }
 
-// NewGormStorage creates a new GORM-backed storage.
+// NewGormStorage creates a new GORM-backed storage. For SQLite, callers should
+// open the database with _txlock=immediate&_busy_timeout=5000; this library
+// receives an already-opened DB and cannot set _txlock itself.
 func NewGormStorage(db *gorm.DB, opts ...GormStorageOption) *GormStorage {
 	// Detect SQLite by checking the dialect name
 	isSQLite := false
@@ -46,6 +48,9 @@ func NewGormStorage(db *gorm.DB, opts ...GormStorageOption) *GormStorage {
 		isSQLite = strings.Contains(strings.ToLower(dialector), "sqlite")
 	}
 	s := &GormStorage{db: db, isSQLite: isSQLite, lockDuration: defaultLockDuration}
+	if s.isSQLite {
+		_ = db.Exec("PRAGMA busy_timeout = 5000").Error
+	}
 	for _, opt := range opts {
 		opt(s)
 	}
@@ -72,7 +77,24 @@ func (s *GormStorage) DB() *gorm.DB {
 
 // Migrate creates the necessary tables.
 func (s *GormStorage) Migrate(ctx context.Context) error {
-	return s.db.WithContext(ctx).AutoMigrate(&core.Job{}, &core.Checkpoint{}, &core.FanOut{}, &core.QueueState{})
+	db := s.db.WithContext(ctx)
+	if err := db.AutoMigrate(&core.Job{}, &core.Checkpoint{}, &core.FanOut{}, &core.QueueState{}); err != nil {
+		return err
+	}
+
+	// SQLite and PostgreSQL support partial indexes, which are needed to
+	// enforce active-job uniqueness while freeing the key after terminal
+	// states. MySQL is intentionally skipped because it does not support
+	// partial indexes, and its FOR UPDATE gap locks protect concurrent
+	// first-time inserts under the default REPEATABLE READ isolation.
+	if s.isSQLite || strings.EqualFold(s.db.Name(), "postgres") {
+		return db.Exec(`
+			CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_active_unique
+			ON jobs (unique_key)
+			WHERE unique_key <> '' AND status IN ('pending','running')
+		`).Error
+	}
+	return nil
 }
 
 // Enqueue adds a job to the queue.
@@ -86,7 +108,18 @@ func (s *GormStorage) Enqueue(ctx context.Context, job *core.Job) error {
 	if job.Queue == "" {
 		job.Queue = "default"
 	}
-	return s.db.WithContext(ctx).Create(job).Error
+	db := s.db.WithContext(ctx)
+	if job.UniqueKey == "" {
+		return db.Create(job).Error
+	}
+	result := db.Clauses(clause.OnConflict{DoNothing: true}).Create(job)
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		return core.ErrDuplicateJob
+	}
+	return nil
 }
 
 // withSerializationRetry runs fn and retries it on transient serialization
@@ -154,31 +187,48 @@ func (s *GormStorage) EnqueueUnique(ctx context.Context, job *core.Job, uniqueKe
 	}
 	job.UniqueKey = uniqueKey
 
-	// Use transaction with row-level locking to prevent race conditions
-	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		query := tx.Where("unique_key = ?", uniqueKey).
-			Where("status IN ?", []core.JobStatus{core.StatusPending, core.StatusRunning})
+	// Retry on serialization/deadlock failures. Under MySQL REPEATABLE READ,
+	// many callers racing the same unique key take conflicting gap locks on the
+	// FOR UPDATE below and deadlock (error 1213); on retry the winner's row is
+	// visible so we return ErrDuplicateJob cleanly instead of surfacing a raw
+	// 1213. ErrDuplicateJob is not a serialization failure, so it is returned
+	// without further retry. (Same wrapper EnqueueBatch uses — finding 2.5.)
+	return s.withSerializationRetry(ctx, func() error {
+		// Use transaction with row-level locking to prevent race conditions
+		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			query := tx.Where("unique_key = ?", uniqueKey).
+				Where("status IN ?", []core.JobStatus{core.StatusPending, core.StatusRunning})
 
-		// SQLite doesn't support FOR UPDATE, but its serializable transactions
-		// provide equivalent protection for single-process scenarios
-		if !s.isSQLite {
-			query = query.Clauses(clause.Locking{Strength: "UPDATE"})
-		}
+			// SQLite doesn't support FOR UPDATE, but its serializable transactions
+			// provide equivalent protection for single-process scenarios
+			if !s.isSQLite {
+				query = query.Clauses(clause.Locking{Strength: "UPDATE"})
+			}
 
-		var existing core.Job
-		err := query.First(&existing).Error
+			var existing core.Job
+			err := query.First(&existing).Error
 
-		if err == nil {
-			// Found existing job with same unique key
-			return core.ErrDuplicateJob
-		}
-		if !errors.Is(err, gorm.ErrRecordNotFound) {
-			// Unexpected error
-			return err
-		}
+			if err == nil {
+				// Found existing job with same unique key
+				return core.ErrDuplicateJob
+			}
+			if !errors.Is(err, gorm.ErrRecordNotFound) {
+				// Unexpected error
+				return err
+			}
 
-		// No existing job found, safe to create
-		return tx.Create(job).Error
+			// No existing active job found. The database-level partial unique
+			// index is the final backstop for PostgreSQL's absent-row FOR
+			// UPDATE gap.
+			result := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(job)
+			if result.Error != nil {
+				return result.Error
+			}
+			if uniqueKey != "" && result.RowsAffected == 0 {
+				return core.ErrDuplicateJob
+			}
+			return nil
+		})
 	})
 }
 
@@ -765,7 +815,7 @@ func (s *GormStorage) enqueueBatchTx(ctx context.Context, jobs []*core.Job) erro
 		if len(toCreate) == 0 {
 			return nil
 		}
-		return tx.Create(toCreate).Error
+		return tx.Clauses(clause.OnConflict{DoNothing: true}).Create(toCreate).Error
 	})
 }
 
