@@ -1,0 +1,11 @@
+services:
+  worker:
+    build:
+      context: .
+      dockerfile: chaostest.Dockerfile
+    environment:
+      TEST_DATABASE_URL: postgres://jobs:jobs@postgres:5432/jobs_test?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["worker"]

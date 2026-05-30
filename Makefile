@@ -44,6 +44,10 @@ test-mysql:
 test-backends:
 	./scripts/test-backends.sh
 
+.PHONY: chaos-test
+chaos-test:
+	bash scripts/chaos-test.sh
+
 .PHONY: compose-up
 compose-up:
 	$(COMPOSE) up -d --wait postgres mysql
