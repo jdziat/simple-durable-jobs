@@ -21,16 +21,20 @@ const (
 
 // Job represents a unit of work to be processed.
 type Job struct {
-	ID              string    `gorm:"primaryKey;size:36"`
-	Type            string    `gorm:"index;size:255;not null"`
-	Args            []byte    `gorm:"type:bytes"`
-	Queue           string    `gorm:"index;size:255;default:'default'"`
-	Priority        int       `gorm:"index;default:0"`
-	Status          JobStatus `gorm:"index;size:20;default:'pending'"`
-	PreviousStatus  JobStatus `gorm:"size:20"` // Status before pause, for restoration
-	Attempt         int       `gorm:"default:0"`
-	MaxRetries      int       `gorm:"default:3"`
-	Timeout         time.Duration
+	ID             string    `gorm:"primaryKey;size:36"`
+	Type           string    `gorm:"index;size:255;not null"`
+	Args           []byte    `gorm:"type:bytes"`
+	Queue          string    `gorm:"index;size:255;default:'default'"`
+	Priority       int       `gorm:"index;default:0"`
+	Status         JobStatus `gorm:"index;size:20;default:'pending'"`
+	PreviousStatus JobStatus `gorm:"size:20"` // Status before pause, for restoration
+	Attempt        int       `gorm:"default:0"`
+	MaxRetries     int       `gorm:"default:3"`
+	Timeout        time.Duration
+	// Determinism is the replay strictness mode
+	// (0=ExplicitCheckpoints,1=Strict,2=BestEffort).
+	// BestEffort relaxes the Call replay type-mismatch guard.
+	Determinism     int
 	LastError       string     `gorm:"type:text"`
 	RunAt           *time.Time `gorm:"index"`
 	StartedAt       *time.Time

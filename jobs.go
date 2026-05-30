@@ -109,7 +109,7 @@ type (
 	// Options holds configuration for job enqueueing and registration.
 	Options = queue.Options
 
-	// DeterminismMode controls replay strictness.
+	// DeterminismMode controls Call replay strictness.
 	DeterminismMode = queue.DeterminismMode
 
 	// ScheduledJob holds configuration for a recurring job.
@@ -191,7 +191,8 @@ const (
 	FanOutFailed    = core.FanOutFailed
 )
 
-// Determinism mode constants
+// Determinism mode constants. ExplicitCheckpoints and Strict error on replay
+// checkpoint type mismatches; BestEffort logs and re-executes the call.
 const (
 	ExplicitCheckpoints = queue.ExplicitCheckpoints
 	Strict              = queue.Strict
@@ -397,7 +398,7 @@ func Unique(key string) Option {
 	return queue.Unique(key)
 }
 
-// Determinism sets the replay mode.
+// Determinism sets the Call replay mode.
 func Determinism(mode DeterminismMode) Option {
 	return queue.Determinism(mode)
 }

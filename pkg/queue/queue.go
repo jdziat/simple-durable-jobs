@@ -191,15 +191,20 @@ func (q *Queue) enqueueWithOptions(ctx context.Context, name string, args any, o
 
 	// Clamp retries to maximum
 	maxRetries := security.ClampRetries(options.MaxRetries)
+	effDet := options.Determinism
+	if effDet == ExplicitCheckpoints {
+		effDet = q.determinism
+	}
 
 	job := &core.Job{
-		ID:         uuid.New().String(),
-		Type:       name,
-		Args:       argsBytes,
-		Queue:      options.Queue,
-		Priority:   options.Priority,
-		MaxRetries: maxRetries,
-		Status:     core.StatusPending,
+		ID:          uuid.New().String(),
+		Type:        name,
+		Args:        argsBytes,
+		Queue:       options.Queue,
+		Priority:    options.Priority,
+		MaxRetries:  maxRetries,
+		Determinism: int(effDet),
+		Status:      core.StatusPending,
 	}
 
 	if options.Timeout > 0 {

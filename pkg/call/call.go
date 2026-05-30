@@ -62,7 +62,13 @@ func Call[T any](ctx context.Context, name string, args any) (T, error) {
 		return result, nil
 	}
 	if mismatched != nil {
-		return zero, fmt.Errorf("jobs.Call determinism violation at index %d: checkpoint type %q does not match requested call %q", callIndex, mismatched.CallType, name)
+		if !jc.BestEffortReplay {
+			return zero, fmt.Errorf("jobs.Call determinism violation at index %d: checkpoint type %q does not match requested call %q", callIndex, mismatched.CallType, name)
+		}
+		if jc.Logger != nil {
+			jc.Logger.Warn("jobs.Call best-effort replay: checkpoint type mismatch, re-executing",
+				"index", callIndex, "checkpoint_type", mismatched.CallType, "requested", name, "job_id", jc.Job.ID)
+		}
 	}
 
 	// Execute the nested call

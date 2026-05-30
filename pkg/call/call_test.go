@@ -237,6 +237,71 @@ func TestCallWithCachedCheckpoint(t *testing.T) {
 			t.Fatal("handler must not execute after determinism violation")
 		}
 	})
+
+	t.Run("best effort re-executes checkpoint at same index with different type", func(t *testing.T) {
+		baseCtx := context.Background()
+		checkpoints := []core.Checkpoint{
+			{
+				ID:        "cp-1",
+				JobID:     "job-1",
+				CallIndex: 0,
+				CallType:  "old-step",
+				Result:    []byte(`"old-result"`),
+			},
+		}
+
+		handlerCalled := false
+		testHandler := func(ctx context.Context, args any) (string, error) {
+			handlerCalled = true
+			return "new-result", nil
+		}
+		h, err := handler.NewHandler(testHandler)
+		if err != nil {
+			t.Fatalf("failed to create handler: %v", err)
+		}
+
+		checkpointSaved := false
+		jobCtx := &intctx.JobContext{
+			Job:              &core.Job{ID: "job-1"},
+			BestEffortReplay: true,
+			HandlerLookup: func(name string) (any, bool) {
+				if name != "new-step" {
+					return nil, false
+				}
+				return h, true
+			},
+			SaveCheckpoint: func(ctx context.Context, cp *core.Checkpoint) error {
+				checkpointSaved = true
+				if cp.CallIndex != 0 {
+					t.Fatalf("expected checkpoint index 0, got %d", cp.CallIndex)
+				}
+				if cp.CallType != "new-step" {
+					t.Fatalf("expected checkpoint type new-step, got %q", cp.CallType)
+				}
+				return nil
+			},
+		}
+
+		ctx := intctx.WithJobContext(baseCtx, jobCtx)
+		ctx = intctx.WithCallState(ctx, checkpoints)
+
+		result, err := Call[string](ctx, "new-step", "arg")
+		if err != nil {
+			if contains(err.Error(), "determinism violation") {
+				t.Fatalf("best effort must not return determinism violation: %v", err)
+			}
+			t.Fatalf("expected no error, got %v", err)
+		}
+		if result != "new-result" {
+			t.Fatalf("expected freshly executed result, got %q", result)
+		}
+		if !handlerCalled {
+			t.Fatal("expected handler to execute in best effort mode")
+		}
+		if !checkpointSaved {
+			t.Fatal("expected fresh checkpoint to be saved in best effort mode")
+		}
+	})
 }
 
 func TestCallWithMissingHandler(t *testing.T) {

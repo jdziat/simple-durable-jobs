@@ -3,6 +3,7 @@ package context
 
 import (
 	"context"
+	"log/slog"
 	"sync"
 
 	"github.com/jdziat/simple-durable-jobs/pkg/core"
@@ -13,9 +14,12 @@ type JobContextKey struct{}
 
 // JobContext holds the current job and queue reference.
 type JobContext struct {
-	Job      *core.Job
-	Storage  core.Storage
-	WorkerID string
+	Job              *core.Job
+	Storage          core.Storage
+	WorkerID         string
+	BestEffortReplay bool // when true, Call relaxes the replay type-mismatch guard
+	// Logger is optional and may be nil.
+	Logger *slog.Logger
 	// HandlerLookup is a function to look up handlers by name
 	HandlerLookup func(name string) (any, bool)
 	// SaveCheckpoint saves a checkpoint to storage

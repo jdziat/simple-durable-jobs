@@ -90,16 +90,19 @@ func Unique(key string) Option {
 	})
 }
 
-// DeterminismMode controls replay strictness.
+// DeterminismMode controls Call replay strictness.
 type DeterminismMode int
 
 const (
+	// ExplicitCheckpoints errors on replay checkpoint type mismatches.
 	ExplicitCheckpoints DeterminismMode = iota
+	// Strict errors on replay checkpoint type mismatches.
 	Strict
+	// BestEffort logs replay checkpoint type mismatches and re-executes the call.
 	BestEffort
 )
 
-// Determinism sets the replay mode.
+// Determinism sets the Call replay mode.
 func Determinism(mode DeterminismMode) Option {
 	return optionFunc(func(o *Options) {
 		o.Determinism = mode

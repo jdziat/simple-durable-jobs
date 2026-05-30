@@ -68,10 +68,17 @@ Harness MUST be RED on current code (reproduce ≥2 defect classes) and GREEN-ab
 | P6 | ✅ committed | `eaa0c59` | 1.2/5.4 — overflow-safe backoff + empty-args NoRetry |
 | P7a | ✅ committed | `55108cd` | 1.7 — aux goroutines joined to wg |
 | P7b | ✅ committed | `0d4b08a` | 1.8 — graceful drain (WithoutCancel + DrainTimeout); chaos regression green |
-| P8a | 🔄 in progress | — | storage status guards + sentinel (2.1/2.2/2.3) |
-| P8b–P14 | pending | — | |
+| P8a | ✅ committed | `a85c7d2` | 2.1/2.2/2.3 — ownership/status guards + sentinel + targeted dequeue; INV-FANOUT-COUNTS green |
+| P8b | ✅ committed | `223672d` | 2.4/2.5 — bounded resume query (LIMIT+index) + serialization-retry sweep |
+| P9 | ✅ committed | `6e80c33` | 3.1/3.2 — faithful per-index fan-out results + non-retryable terminal failure |
+| P10 | ✅ committed | `6569daa` | 1.3/1.5/1.6 — LIKE escaping, fail-closed writes, secret redaction |
+| P11 | ✅ committed | `2bcac17`+`7a64895` | 4.1–4.7 — N+1 elimination, aggregate depth, honest totals, symmetric resume, dropped-event counter, collector error handling |
+| P12 | ✅ committed | `f04eddf` | 1.4 — atomic stats upsert + single collector per DB |
+| P13 | ✅ committed | `c0ea18c` | Tier-6 API footguns — dead/inert surface removed/wired/documented; RegisterE added |
+| P14a | ✅ committed | `db77baa` | Tier-6 — per-job/sub-job execution Timeout wired; PG+MySQL column migrate + chaos green |
+| P14b | 🔄 verifying | — | Determinism wiring — ExplicitCheckpoints/Strict guard replay, BestEffort logs+re-executes; per-job `core.Job.Determinism` + queue default; local build/vet/short green, PG/MySQL+chaos in progress |
 
-Findings closed: 0.1 0.2 0.3 0.4 0.5 1.1 1.2 1.7 1.8 3.3 5.1 5.2 5.3 5.4 5.5 5.6 + partial 2.5. Remaining: 2.1 2.2 2.3 2.4 2.5(rest) 3.1 3.2 4.x 1.3 1.4 1.5 1.6 + Tier-6 API + Determinism/Timeout.
+Findings closed: 0.1 0.2 0.3 0.4 0.5 1.1 1.2 1.3 1.4 1.5 1.6 1.7 1.8 2.1 2.2 2.3 2.4 2.5 3.1 3.2 3.3 4.1 4.2 4.3 4.4 4.5 4.6 4.7 5.1 5.2 5.3 5.4 5.5 5.6 + Tier-6 API + per-job Timeout. Remaining: Determinism wiring (P14b — last finding, verifying).
 
 **Milestone (after P4b):** chaos harness FULLY GREEN — all 4 HARD invariants + INV-SCHED PASS under SIGKILL chaos on Postgres. All harness-reproducible distributed findings (0.1/0.3/0.4/0.5 + 2.2-so-far) closed. Remaining packets (P5–P14) are unit-test-gated (OTel, backoff, lifecycle, storage guards, UI, API) — not distributed-correctness invariants.
 Findings closed: 0.1 0.2 0.3 0.4 0.5 1.1 3.3 5.1 5.2 5.3 5.5 5.6 + partial 2.5.

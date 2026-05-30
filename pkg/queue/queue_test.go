@@ -301,6 +301,55 @@ func TestQueue_Enqueue_WithOptions(t *testing.T) {
 	assert.Equal(t, 30*time.Second, job.Timeout)
 }
 
+func TestQueue_Enqueue_DeterminismOption(t *testing.T) {
+	store := newMockStorage()
+	q := New(store)
+
+	q.Register("test-job", func(ctx context.Context, args string) error {
+		return nil
+	})
+
+	jobID, err := q.Enqueue(context.Background(), "test-job", "hello", Determinism(BestEffort))
+	require.NoError(t, err)
+
+	job, err := store.GetJob(context.Background(), jobID)
+	require.NoError(t, err)
+	assert.Equal(t, int(BestEffort), job.Determinism)
+}
+
+func TestQueue_Enqueue_DeterminismQueueDefault(t *testing.T) {
+	store := newMockStorage()
+	q := New(store)
+	q.SetDeterminism(BestEffort)
+
+	q.Register("test-job", func(ctx context.Context, args string) error {
+		return nil
+	})
+
+	jobID, err := q.Enqueue(context.Background(), "test-job", "hello")
+	require.NoError(t, err)
+
+	job, err := store.GetJob(context.Background(), jobID)
+	require.NoError(t, err)
+	assert.Equal(t, int(BestEffort), job.Determinism)
+}
+
+func TestQueue_Enqueue_DeterminismDefault(t *testing.T) {
+	store := newMockStorage()
+	q := New(store)
+
+	q.Register("test-job", func(ctx context.Context, args string) error {
+		return nil
+	})
+
+	jobID, err := q.Enqueue(context.Background(), "test-job", "hello")
+	require.NoError(t, err)
+
+	job, err := store.GetJob(context.Background(), jobID)
+	require.NoError(t, err)
+	assert.Equal(t, int(ExplicitCheckpoints), job.Determinism)
+}
+
 func TestQueue_Schedule(t *testing.T) {
 	store := newMockStorage()
 	q := New(store)

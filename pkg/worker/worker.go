@@ -554,9 +554,11 @@ func (w *Worker) executeHandler(ctx context.Context, job *core.Job, h *handler.H
 
 	// Create job context with all necessary references
 	jc := &intctx.JobContext{
-		Job:      job,
-		Storage:  w.queue.Storage(),
-		WorkerID: w.config.WorkerID,
+		Job:              job,
+		Storage:          w.queue.Storage(),
+		WorkerID:         w.config.WorkerID,
+		BestEffortReplay: job.Determinism == int(queue.BestEffort),
+		Logger:           w.logger,
 		HandlerLookup: func(name string) (any, bool) {
 			return w.queue.GetHandler(name)
 		},
@@ -860,6 +862,7 @@ func (w *Worker) runScheduler(ctx context.Context) {
 					if sj.Options.Timeout > 0 {
 						opts = append(opts, queue.Timeout(sj.Options.Timeout))
 					}
+					opts = append(opts, queue.Determinism(sj.Options.Determinism))
 					_, err = w.queue.Enqueue(ctx, sj.Name, sj.Args,
 						opts...,
 					)
