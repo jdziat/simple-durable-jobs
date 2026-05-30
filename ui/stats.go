@@ -8,8 +8,8 @@ import (
 // JobStat stores per-queue statistics bucketed by minute.
 type JobStat struct {
 	ID        uint      `gorm:"primaryKey"`
-	Queue     string    `gorm:"index:idx_job_stats_queue_ts;size:255;not null"`
-	Timestamp time.Time `gorm:"index:idx_job_stats_queue_ts;not null"`
+	Queue     string    `gorm:"uniqueIndex:idx_job_stats_queue_ts;size:255;not null"`
+	Timestamp time.Time `gorm:"uniqueIndex:idx_job_stats_queue_ts;not null"`
 	Pending   int64     `gorm:"default:0"`
 	Running   int64     `gorm:"default:0"`
 	Completed int64     `gorm:"default:0"`
