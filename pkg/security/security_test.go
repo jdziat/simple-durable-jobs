@@ -266,6 +266,7 @@ func TestClampConcurrency(t *testing.T) {
 func TestConstants(t *testing.T) {
 	assert.Equal(t, 255, MaxJobTypeNameLength)
 	assert.Equal(t, 1<<20, MaxJobArgsSize) // 1MB
+	assert.Equal(t, 1<<20, MaxResultSize)  // 1MB
 	assert.Equal(t, 100, MaxRetries)
 	assert.Equal(t, 1000, MaxConcurrency)
 	assert.Equal(t, 4096, MaxErrorMessageLength)

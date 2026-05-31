@@ -17,6 +17,9 @@ const (
 	// MaxJobArgsSize is the maximum size in bytes for job arguments (1MB)
 	MaxJobArgsSize = 1 << 20
 
+	// MaxResultSize is the maximum size in bytes for job results (1MB)
+	MaxResultSize = 1 << 20
+
 	// MaxRetries is the hard limit for retry attempts
 	MaxRetries = 100
 

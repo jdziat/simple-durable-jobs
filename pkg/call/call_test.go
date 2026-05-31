@@ -709,6 +709,50 @@ func TestCallRejectsOversizedArgsBeforeExecutingHandler(t *testing.T) {
 	}
 }
 
+func TestCall_OversizedResultFailsTerminally(t *testing.T) {
+	testHandler := func(ctx context.Context, args string) (string, error) {
+		return strings.Repeat("x", security.MaxResultSize), nil
+	}
+	h, err := handler.NewHandler(testHandler)
+	if err != nil {
+		t.Fatalf("failed to create handler: %v", err)
+	}
+
+	checkpointStore := &testCheckpointStore{}
+	jobCtx := &intctx.JobContext{
+		Job: &core.Job{ID: "job-1"},
+		HandlerLookup: func(name string) (any, bool) {
+			if name != "oversized-result" {
+				return nil, false
+			}
+			return h, true
+		},
+		SaveCheckpoint: checkpointStore.SaveCheckpoint,
+	}
+
+	ctx := intctx.WithJobContext(context.Background(), jobCtx)
+	ctx = intctx.WithCallState(ctx, []core.Checkpoint{})
+
+	result, err := Call[string](ctx, "oversized-result", "arg")
+	if err == nil {
+		t.Fatal("expected oversized result error")
+	}
+	var noRetry *core.NoRetryError
+	if !errors.As(err, &noRetry) {
+		t.Fatalf("expected NoRetryError, got %T %v", err, err)
+	}
+	if result != "" {
+		t.Fatalf("expected zero result, got %q", result)
+	}
+	checkpoints, getErr := checkpointStore.GetCheckpoints(context.Background(), "job-1")
+	if getErr != nil {
+		t.Fatalf("failed to get checkpoints: %v", getErr)
+	}
+	if len(checkpoints) != 0 {
+		t.Fatalf("expected no checkpoint to be persisted, got %d", len(checkpoints))
+	}
+}
+
 func TestCallIntegration(t *testing.T) {
 	t.Run("full flow: multiple calls with mix of cached and new", func(t *testing.T) {
 		// Arrange
@@ -845,4 +889,24 @@ func hasSubstring(s, substr string) bool {
 		}
 	}
 	return false
+}
+
+type testCheckpointStore struct {
+	checkpoints []core.Checkpoint
+}
+
+func (s *testCheckpointStore) SaveCheckpoint(ctx context.Context, cp *core.Checkpoint) error {
+	cpCopy := *cp
+	s.checkpoints = append(s.checkpoints, cpCopy)
+	return nil
+}
+
+func (s *testCheckpointStore) GetCheckpoints(ctx context.Context, jobID string) ([]core.Checkpoint, error) {
+	var checkpoints []core.Checkpoint
+	for _, cp := range s.checkpoints {
+		if cp.JobID == jobID {
+			checkpoints = append(checkpoints, cp)
+		}
+	}
+	return checkpoints, nil
 }

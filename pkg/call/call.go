@@ -110,6 +110,9 @@ func Call[T any](ctx context.Context, name string, args any) (T, error) {
 		if marshalErr != nil {
 			return zero, fmt.Errorf("failed to marshal result: %w", marshalErr)
 		}
+		if len(resultBytes) > security.MaxResultSize {
+			return zero, core.NoRetry(fmt.Errorf("jobs: call %q result is %d bytes, limit is %d", name, len(resultBytes), security.MaxResultSize))
+		}
 		cp.Result = resultBytes
 	}
 

@@ -6,12 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/jdziat/simple-durable-jobs/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/pkg/security"
 )
 
 // ---------------------------------------------------------------------------
@@ -190,7 +192,7 @@ func TestHandler_Execute_BadJSON(t *testing.T) {
 	assert.Contains(t, err.Error(), "unmarshal")
 }
 
-func TestHandler_Execute_EmptyArgsForTypedHandlerReturnsNoRetry(t *testing.T) {
+func TestExecute_EmptyArgsStillRejectedForRequiredStruct(t *testing.T) {
 	called := false
 	fn := func(_ context.Context, _ testArgs) error {
 		called = true
@@ -209,6 +211,71 @@ func TestHandler_Execute_EmptyArgsForTypedHandlerReturnsNoRetry(t *testing.T) {
 	}
 }
 
+func TestExecute_EmptyArgsAcceptedForNilableKinds(t *testing.T) {
+	type ptrArgs struct {
+		Value int
+	}
+
+	tests := []struct {
+		name string
+		fn   any
+		want string
+	}{
+		{
+			name: "slice",
+			fn: func(_ context.Context, args []int) (string, error) {
+				require.Nil(t, args)
+				return "slice", nil
+			},
+			want: `"slice"`,
+		},
+		{
+			name: "map",
+			fn: func(_ context.Context, args map[string]int) (string, error) {
+				require.Nil(t, args)
+				return "map", nil
+			},
+			want: `"map"`,
+		},
+		{
+			name: "pointer",
+			fn: func(_ context.Context, args *ptrArgs) (string, error) {
+				require.Nil(t, args)
+				return "pointer", nil
+			},
+			want: `"pointer"`,
+		},
+		{
+			name: "interface",
+			fn: func(_ context.Context, args any) (string, error) {
+				require.Nil(t, args)
+				return "interface", nil
+			},
+			want: `"interface"`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name+"/nil", func(t *testing.T) {
+			h, err := NewHandler(tt.fn)
+			require.NoError(t, err)
+
+			resultBytes, err := h.Execute(context.Background(), nil)
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, string(resultBytes))
+		})
+
+		t.Run(tt.name+"/empty", func(t *testing.T) {
+			h, err := NewHandler(tt.fn)
+			require.NoError(t, err)
+
+			resultBytes, err := h.Execute(context.Background(), []byte{})
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, string(resultBytes))
+		})
+	}
+}
+
 func TestHandler_Execute_NonEmptyMalformedArgsRemainRetryable(t *testing.T) {
 	fn := func(_ context.Context, _ testArgs) error { return nil }
 	h, err := NewHandler(fn)
@@ -222,15 +289,17 @@ func TestHandler_Execute_NonEmptyMalformedArgsRemainRetryable(t *testing.T) {
 }
 
 func TestHandler_Execute_EmptyStructArgsEmptyInputUnchanged(t *testing.T) {
-	fn := func(_ context.Context, _ struct{}) error { return nil }
+	called := false
+	fn := func(_ context.Context, _ struct{}) error {
+		called = true
+		return nil
+	}
 	h, err := NewHandler(fn)
 	require.NoError(t, err)
 
 	_, err = h.Execute(context.Background(), nil)
-	require.Error(t, err)
-
-	var noRetry *core.NoRetryError
-	assert.False(t, errors.As(err, &noRetry), "struct{} empty-input behavior should remain a plain unmarshal error")
+	require.NoError(t, err)
+	assert.True(t, called, "struct{} should accept empty input as zero value")
 }
 
 // ---------------------------------------------------------------------------
@@ -743,6 +812,22 @@ func TestHandler_Execute_TwoReturnValues_ReturnsResultBytes(t *testing.T) {
 	require.NoError(t, json.Unmarshal(resultBytes, &got))
 	assert.Equal(t, "video-42", got.Name)
 	assert.Equal(t, 7, got.Code)
+}
+
+func TestExecute_OversizedResultIsNoRetry(t *testing.T) {
+	fn := func(ctx context.Context, in struct{}) (string, error) {
+		return strings.Repeat("x", security.MaxResultSize), nil
+	}
+	h, err := NewHandler(fn)
+	require.NoError(t, err)
+
+	resultBytes, err := h.Execute(context.Background(), []byte("{}"))
+	require.Error(t, err)
+	assert.Nil(t, resultBytes)
+
+	var noRetry *core.NoRetryError
+	assert.True(t, errors.As(err, &noRetry), "oversized handler result must be terminal")
+	assert.Contains(t, err.Error(), "handler result")
 }
 
 func TestHandler_Execute_ErrorOnly_ReturnsNilBytes(t *testing.T) {

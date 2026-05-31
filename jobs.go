@@ -203,6 +203,7 @@ const (
 const (
 	MaxJobTypeNameLength  = security.MaxJobTypeNameLength
 	MaxJobArgsSize        = security.MaxJobArgsSize
+	MaxResultSize         = security.MaxResultSize
 	MaxRetries            = security.MaxRetries
 	MaxConcurrency        = security.MaxConcurrency
 	MaxErrorMessageLength = security.MaxErrorMessageLength
