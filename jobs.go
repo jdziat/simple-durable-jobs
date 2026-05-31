@@ -227,6 +227,7 @@ var (
 	ErrQueueAlreadyPaused = core.ErrQueueAlreadyPaused
 	ErrQueueNotPaused     = core.ErrQueueNotPaused
 	ErrCannotPauseStatus  = core.ErrCannotPauseStatus
+	ErrJobNotFound        = core.ErrJobNotFound
 	ErrNoResult           = core.ErrNoResult
 )
 
@@ -633,7 +634,7 @@ func LoadResult[T any](ctx context.Context, q *Queue, jobID string) (T, error) {
 		return zero, err
 	}
 	if job == nil {
-		return zero, fmt.Errorf("jobs: job not found: %s", jobID)
+		return zero, fmt.Errorf("%w: %s", core.ErrJobNotFound, jobID)
 	}
 	switch job.Status {
 	case core.StatusCompleted:

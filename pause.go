@@ -29,7 +29,8 @@ func PauseJob(ctx context.Context, q *Queue, jobID string, opts ...PauseOption) 
 	return q.PauseJob(ctx, jobID, opts...)
 }
 
-// ResumeJob resumes a paused job.
+// ResumeJob resumes a paused job using storage only.
+// It does not emit a JobResumed event; callers wanting events should use Queue.ResumeJob.
 func ResumeJob(ctx context.Context, storage Storage, jobID string) error {
 	return storage.UnpauseJob(ctx, jobID)
 }

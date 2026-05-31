@@ -319,7 +319,7 @@ func (q *Queue) LoadStatus(ctx context.Context, jobID string) (core.JobStatus, e
 		return "", err
 	}
 	if job == nil {
-		return "", fmt.Errorf("jobs: job not found: %s", jobID)
+		return "", fmt.Errorf("%w: %s", core.ErrJobNotFound, jobID)
 	}
 	return job.Status, nil
 }

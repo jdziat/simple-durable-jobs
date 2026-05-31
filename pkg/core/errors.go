@@ -22,6 +22,7 @@ var (
 	ErrQueueAlreadyPaused = errors.New("jobs: queue is already paused")
 	ErrQueueNotPaused     = errors.New("jobs: queue is not paused")
 	ErrCannotPauseStatus  = errors.New("jobs: cannot pause job in current status")
+	ErrJobNotFound        = errors.New("jobs: job not found")
 	ErrJobNotCompleted    = errors.New("jobs: job has not completed")
 	ErrNoResult           = errors.New("jobs: completed job has no result")
 )
@@ -123,6 +124,7 @@ func SentinelErrorByMessage(message string) error {
 		ErrQueueAlreadyPaused,
 		ErrQueueNotPaused,
 		ErrCannotPauseStatus,
+		ErrJobNotFound,
 		ErrJobNotCompleted,
 		ErrNoResult,
 	} {

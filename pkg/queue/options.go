@@ -17,8 +17,9 @@ type Options struct {
 	UniqueKey      string
 	Determinism    DeterminismMode
 	determinismSet bool
-	Timezone       *time.Location
-	Timeout        time.Duration // max wall time for handler execution; 0 means no limit
+	// Timezone is reserved for future use and is currently ignored; schedules evaluate in UTC.
+	Timezone *time.Location
+	Timeout  time.Duration // max wall time for handler execution; 0 means no limit
 }
 
 // NewOptions creates Options with defaults.

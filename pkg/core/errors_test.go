@@ -2,6 +2,7 @@ package core
 
 import (
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -60,6 +61,13 @@ func TestPauseErrors(t *testing.T) {
 func TestErrJobNotCompleted_Defined(t *testing.T) {
 	require.Error(t, ErrJobNotCompleted)
 	assert.Contains(t, ErrJobNotCompleted.Error(), "not completed")
+}
+
+func TestErrJobNotFound_IsMatchable(t *testing.T) {
+	wrapped := fmt.Errorf("%w: abc", ErrJobNotFound)
+
+	assert.True(t, errors.Is(wrapped, ErrJobNotFound))
+	assert.Equal(t, ErrJobNotFound, SentinelErrorByMessage(ErrJobNotFound.Error()))
 }
 
 func TestRehydrate_NoSentinelSwapForPlainUserError(t *testing.T) {
