@@ -296,6 +296,13 @@ func (s *jobsService) ListQueues(ctx context.Context, req *connect.Request[jobsv
 
 // PurgeQueue deletes jobs from a queue by status.
 func (s *jobsService) PurgeQueue(ctx context.Context, req *connect.Request[jobsv1.PurgeQueueRequest]) (*connect.Response[jobsv1.PurgeQueueResponse], error) {
+	if req.Msg.Name == "" {
+		return nil, connect.NewError(connect.CodeInvalidArgument, fmt.Errorf("queue name is required"))
+	}
+	if !isValidPurgeStatus(req.Msg.Status) {
+		return nil, connect.NewError(connect.CodeInvalidArgument, fmt.Errorf("invalid purge status %q", req.Msg.Status))
+	}
+
 	deleted, err := s.purgeQueue(ctx, req.Msg.Name, req.Msg.Status)
 	if err != nil {
 		return nil, connect.NewError(connect.CodeInternal, err)
@@ -410,16 +417,17 @@ func (s *jobsService) ListWorkflows(ctx context.Context, req *connect.Request[jo
 			// Use strategy from the first fan-out as representative.
 			summary.Strategy = string(fanOuts[0].Strategy)
 
-			var totalJobs, completedJobs, failedJobs int32
+			var totalJobs, completedJobs, failedJobs, cancelledJobs int32
 			for _, fo := range fanOuts {
 				totalJobs += int32(fo.TotalCount)
 				completedJobs += int32(fo.CompletedCount)
 				failedJobs += int32(fo.FailedCount)
+				cancelledJobs += int32(fo.CancelledCount)
 			}
 			summary.TotalJobs = totalJobs
 			summary.CompletedJobs = completedJobs
 			summary.FailedJobs = failedJobs
-			summary.RunningJobs = totalJobs - completedJobs - failedJobs
+			summary.RunningJobs = totalJobs - completedJobs - failedJobs - cancelledJobs
 			if summary.RunningJobs < 0 {
 				summary.RunningJobs = 0
 			}
@@ -726,6 +734,22 @@ func (s *jobsService) purgeQueue(ctx context.Context, queueName, status string) 
 		return ui.PurgeJobs(ctx, queueName, core.JobStatus(status))
 	}
 	return 0, connect.NewError(connect.CodeUnimplemented, nil)
+}
+
+func isValidPurgeStatus(status string) bool {
+	switch core.JobStatus(status) {
+	case core.StatusPending,
+		core.StatusRunning,
+		core.StatusCompleted,
+		core.StatusFailed,
+		core.StatusRetrying,
+		core.StatusWaiting,
+		core.StatusCancelled,
+		core.StatusPaused:
+		return true
+	default:
+		return false
+	}
 }
 
 // Conversion helpers
