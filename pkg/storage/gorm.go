@@ -85,6 +85,23 @@ func (s *GormStorage) Migrate(ctx context.Context) error {
 		return err
 	}
 
+	if strings.EqualFold(s.db.Name(), "mysql") {
+		err := db.Exec(`
+			CREATE INDEX idx_jobs_dequeue
+			ON jobs (status, queue, priority, created_at)
+		`).Error
+		if err != nil && !strings.Contains(err.Error(), "Duplicate key name") && !strings.Contains(err.Error(), "Error 1061") {
+			return err
+		}
+	} else {
+		if err := db.Exec(`
+			CREATE INDEX IF NOT EXISTS idx_jobs_dequeue
+			ON jobs (status, queue, priority DESC, created_at ASC)
+		`).Error; err != nil {
+			return err
+		}
+	}
+
 	// SQLite and PostgreSQL support partial indexes, which are needed to
 	// enforce active-job uniqueness while freeing the key after terminal
 	// states. MySQL is intentionally skipped because it does not support
@@ -163,13 +180,20 @@ func isSerializationFailure(err error) bool {
 	msg := err.Error()
 	switch {
 	case strings.Contains(msg, "Error 1213"), // MySQL deadlock
-		strings.Contains(msg, "Deadlock found"),      // MySQL deadlock (text)
-		strings.Contains(msg, "Error 1205"),          // MySQL lock wait timeout
-		strings.Contains(msg, "Lock wait timeout"),   // MySQL (text)
-		strings.Contains(msg, "SQLSTATE 40001"),      // serialization_failure
-		strings.Contains(msg, "SQLSTATE 40P01"),      // deadlock_detected (pg)
-		strings.Contains(msg, "could not serialize"), // pg text
-		strings.Contains(msg, "deadlock detected"):   // pg text
+		strings.Contains(msg, "Deadlock found"),           // MySQL deadlock (text)
+		strings.Contains(msg, "Error 1205"),               // MySQL lock wait timeout
+		strings.Contains(msg, "Lock wait timeout"),        // MySQL (text)
+		strings.Contains(msg, "SQLSTATE 40001"),           // serialization_failure
+		strings.Contains(msg, "SQLSTATE 40P01"),           // deadlock_detected (pg)
+		strings.Contains(msg, "could not serialize"),      // pg text
+		strings.Contains(msg, "deadlock detected"),        // pg text
+		strings.Contains(msg, "database is locked"),       // SQLite SQLITE_BUSY (5)
+		strings.Contains(msg, "database table is locked"), // SQLite SQLITE_LOCKED (6)
+		strings.Contains(msg, "SQLITE_BUSY"),              // SQLite (wrapped form)
+		strings.Contains(msg, "SQLITE_LOCKED"):            // SQLite (wrapped form)
+		// SQLite returns BUSY/LOCKED immediately on write-write contention that
+		// busy_timeout cannot resolve (one writer must abort); these are
+		// transient and safe to retry, mirroring the MySQL/PG deadlock handling.
 		return true
 	}
 	return false
@@ -465,7 +489,7 @@ func (s *GormStorage) Fail(ctx context.Context, jobID string, workerID string, e
 
 // SaveCheckpoint stores a checkpoint for a durable call.
 // If a checkpoint with the same (job_id, call_index, call_type) already exists,
-// the result, error, and created_at fields are updated in place (upsert).
+// the latest result and error fields are updated in place (upsert).
 func (s *GormStorage) SaveCheckpoint(ctx context.Context, cp *core.Checkpoint) error {
 	if cp.ID == "" {
 		cp.ID = uuid.New().String()
@@ -473,7 +497,7 @@ func (s *GormStorage) SaveCheckpoint(ctx context.Context, cp *core.Checkpoint) e
 	return s.db.WithContext(ctx).
 		Clauses(clause.OnConflict{
 			Columns:   []clause.Column{{Name: "job_id"}, {Name: "call_index"}, {Name: "call_type"}},
-			DoUpdates: clause.AssignmentColumns([]string{"result", "error", "created_at"}),
+			DoUpdates: clause.AssignmentColumns([]string{"result", "error", "error_kind", "error_delay_nanos"}),
 		}).
 		Create(cp).Error
 }

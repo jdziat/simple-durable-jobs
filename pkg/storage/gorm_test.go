@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -113,6 +114,37 @@ func TestNewGormStorage_NilDB(t *testing.T) {
 	assert.False(t, s.IsSQLite(), "nil db should not claim SQLite")
 }
 
+func TestMigrate_DequeueIndexExists(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+	s := NewGormStorage(db)
+
+	require.NoError(t, s.Migrate(ctx))
+	require.NoError(t, s.Migrate(ctx), "migrate should be idempotent")
+
+	var indexName string
+	switch {
+	case s.IsSQLite():
+		require.NoError(t, s.DB().Raw(
+			"SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?",
+			"idx_jobs_dequeue",
+		).Scan(&indexName).Error)
+	case strings.EqualFold(s.DB().Name(), "postgres"):
+		require.NoError(t, s.DB().Raw(
+			"SELECT indexname FROM pg_indexes WHERE tablename = ? AND indexname = ?",
+			"jobs", "idx_jobs_dequeue",
+		).Scan(&indexName).Error)
+	case strings.EqualFold(s.DB().Name(), "mysql"):
+		require.NoError(t, s.DB().Raw(
+			"SELECT index_name FROM information_schema.statistics WHERE table_schema = DATABASE() AND table_name = ? AND index_name = ? LIMIT 1",
+			"jobs", "idx_jobs_dequeue",
+		).Scan(&indexName).Error)
+	default:
+		t.Fatalf("unsupported test dialect %q", s.DB().Name())
+	}
+	assert.Equal(t, "idx_jobs_dequeue", indexName)
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Enqueue
 // ──────────────────────────────────────────────────────────────────────────────
@@ -169,6 +201,37 @@ func TestEnqueue_PreservesExistingStatus(t *testing.T) {
 	}
 	require.NoError(t, s.Enqueue(ctx, job))
 	assert.Equal(t, core.StatusWaiting, job.Status)
+}
+
+func TestJobTimeoutDeterminism_RoundTripZero(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	zero := &core.Job{
+		Type:        "task.zero",
+		Timeout:     0,
+		Determinism: 0,
+	}
+	require.NoError(t, s.Enqueue(ctx, zero))
+
+	zeroReloaded, err := s.GetJob(ctx, zero.ID)
+	require.NoError(t, err)
+	require.NotNil(t, zeroReloaded)
+	assert.Equal(t, time.Duration(0), zeroReloaded.Timeout)
+	assert.Equal(t, 0, zeroReloaded.Determinism)
+
+	nonZero := &core.Job{
+		Type:        "task.nonzero",
+		Timeout:     30 * time.Second,
+		Determinism: 2,
+	}
+	require.NoError(t, s.Enqueue(ctx, nonZero))
+
+	nonZeroReloaded, err := s.GetJob(ctx, nonZero.ID)
+	require.NoError(t, err)
+	require.NotNil(t, nonZeroReloaded)
+	assert.Equal(t, 30*time.Second, nonZeroReloaded.Timeout)
+	assert.Equal(t, 2, nonZeroReloaded.Determinism)
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -838,6 +901,52 @@ func TestSaveCheckpoint_UpsertsOnSameJobCallIndexCallType(t *testing.T) {
 
 	// The result should be the updated value.
 	assert.Equal(t, `{"results":{"0":{"text":"tile 0"},"1":{"text":"tile 1"}}}`, string(checkpoints[0].Result))
+}
+
+func TestSaveCheckpoint_PreservesCreatedAtOnResave(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	job := newTestJob("default", "task.run")
+	require.NoError(t, s.Enqueue(ctx, job))
+
+	cp1 := &core.Checkpoint{
+		JobID:           job.ID,
+		CallIndex:       7,
+		CallType:        "step",
+		Result:          []byte(`{"value":"first"}`),
+		Error:           "first error",
+		ErrorKind:       "transient",
+		ErrorDelayNanos: int64(time.Second),
+	}
+	require.NoError(t, s.SaveCheckpoint(ctx, cp1))
+
+	checkpoints, err := s.GetCheckpoints(ctx, job.ID)
+	require.NoError(t, err)
+	require.Len(t, checkpoints, 1)
+	createdAt := checkpoints[0].CreatedAt
+
+	time.Sleep(time.Millisecond)
+
+	cp2 := &core.Checkpoint{
+		JobID:           job.ID,
+		CallIndex:       7,
+		CallType:        "step",
+		Result:          []byte(`{"value":"second"}`),
+		Error:           "second error",
+		ErrorKind:       "permanent",
+		ErrorDelayNanos: int64(2 * time.Second),
+	}
+	require.NoError(t, s.SaveCheckpoint(ctx, cp2))
+
+	checkpoints, err = s.GetCheckpoints(ctx, job.ID)
+	require.NoError(t, err)
+	require.Len(t, checkpoints, 1)
+	assert.True(t, checkpoints[0].CreatedAt.Equal(createdAt), "created_at should remain the first creation time")
+	assert.Equal(t, `{"value":"second"}`, string(checkpoints[0].Result))
+	assert.Equal(t, "second error", checkpoints[0].Error)
+	assert.Equal(t, "permanent", checkpoints[0].ErrorKind)
+	assert.Equal(t, int64(2*time.Second), checkpoints[0].ErrorDelayNanos)
 }
 
 func TestGetCheckpoints_ReturnsEmptySliceForUnknownJob(t *testing.T) {
