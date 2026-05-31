@@ -1349,8 +1349,12 @@ func TestGetFanOut_ReturnsNilForMissing(t *testing.T) {
 
 func p2bID(t *testing.T, suffix string) string {
 	t.Helper()
-	name := strings.NewReplacer("/", "-", " ", "-").Replace(t.Name())
-	return fmt.Sprintf("%s-%s-%d", name, suffix, time.Now().UnixNano())
+	// Must fit the varchar(36) id columns (Job.ID, FanOut.ID/ParentJobID). The
+	// previous t.Name() prefix overflowed on Postgres/MySQL ("value too long for
+	// type character varying(36)", SQLSTATE 22001); SQLite does not enforce
+	// varchar length so it masked the bug. suffix ("fo"/"parent"/"job") + UnixNano
+	// is ~26 chars, unique across shared-DB runs, and distinct within a call.
+	return fmt.Sprintf("%s-%d", suffix, time.Now().UnixNano())
 }
 
 func createRunningP2BJob(t *testing.T, ctx context.Context, s *GormStorage, fanOutID *string, workerID string) *core.Job {
