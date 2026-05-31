@@ -51,6 +51,14 @@ type scheduledFireReader interface {
 	GetScheduledFireTime(context.Context, string) (time.Time, bool, error)
 }
 
+type completeWithResultStorage interface {
+	CompleteWithResult(ctx context.Context, jobID, workerID string, result []byte) (*core.FanOut, error)
+}
+
+type failTerminalWithResultStorage interface {
+	FailTerminalWithResult(ctx context.Context, jobID, workerID, errMsg string) (*core.FanOut, error)
+}
+
 // NewWorker creates a new worker for the given queue.
 func NewWorker(q *queue.Queue, opts ...WorkerOption) *Worker {
 	config := WorkerConfig{
@@ -340,6 +348,23 @@ func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 	h, ok := w.queue.GetHandler(job.Type)
 	if !ok {
 		w.logger.Error("no handler for job", "type", job.Type)
+		if failer, ok := w.queue.Storage().(failTerminalWithResultStorage); ok {
+			fo, err := w.failTerminalWithResult(ctx, failer, job.ID, fmt.Sprintf("no handler for %s", job.Type))
+			if errors.Is(err, core.ErrJobNotOwned) {
+				w.logger.Warn("job no longer owned after no-handler failure; skipping sub-job completion",
+					"job_id", job.ID)
+				return
+			}
+			if err != nil {
+				w.logger.Error("failed to terminally fail no-handler job after retries", "job_id", job.ID, "error", err)
+				w.releaseAfterTerminalWriteError(ctx, job.ID, "no-handler failure")
+				return
+			}
+			if err := w.checkFanOutCompletion(ctx, fo); err != nil {
+				w.logger.Error("failed to handle no-handler sub-job failure", "job_id", job.ID, "error", err)
+			}
+			return
+		}
 		if err := w.failWithRetry(ctx, job.ID, fmt.Sprintf("no handler for %s", job.Type), nil); errors.Is(err, core.ErrJobNotOwned) {
 			w.logger.Warn("job no longer owned after no-handler failure; skipping sub-job completion",
 				"job_id", job.ID)
@@ -395,18 +420,42 @@ func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 
 	resultBytes, err := w.executeHandler(jobCtx, job, h)
 
-	// Stop heartbeat before completing/failing the job
-	cancelHeartbeat()
-
 	if err != nil {
 		// Check for WaitingError - job is waiting for sub-jobs
 		if fanout.IsWaitingError(err) {
 			w.logger.Info("job waiting for sub-jobs", "job_id", job.ID)
+			cancelHeartbeat()
 			// Job is already in StatusWaiting; just return
 			return
 		}
 		w.handleError(ctx, jobCtx, job, err)
+		cancelHeartbeat()
 	} else {
+		if completer, ok := w.queue.Storage().(completeWithResultStorage); ok {
+			fo, completeErr := w.completeWithResult(ctx, completer, job.ID, resultBytes)
+			cancelHeartbeat()
+			if errors.Is(completeErr, core.ErrJobNotOwned) {
+				w.logger.Warn("job no longer owned at completion; skipping completion handling",
+					"job_id", job.ID)
+				return
+			}
+			if completeErr != nil {
+				w.logger.Error("failed to complete job after retries", "job_id", job.ID, "error", completeErr)
+				w.releaseAfterTerminalWriteError(ctx, job.ID, "completion")
+				return
+			}
+
+			w.queue.CallCompleteHooks(jobCtx, job)
+			w.queue.Emit(&core.JobCompleted{Job: job, Duration: time.Since(startTime), Timestamp: time.Now()})
+			if err := w.checkFanOutCompletion(ctx, fo); err != nil {
+				w.logger.Error("failed to handle sub-job completion", "job_id", job.ID, "error", err)
+			}
+			return
+		}
+
+		// Legacy storage path: keep the original split result/complete/fan-out
+		// writes for storages that do not implement CompleteWithResult.
+		cancelHeartbeat()
 		if resultBytes != nil {
 			if saveErr := w.queue.Storage().SaveJobResult(ctx, job.ID, w.config.WorkerID, resultBytes); saveErr != nil {
 				w.logger.Error("failed to persist job result", "job_id", job.ID, "error", saveErr)
@@ -449,6 +498,35 @@ func (w *Worker) completeWithRetry(ctx context.Context, jobID string) error {
 	return retryWithBackoff(ctx, *w.config.StorageRetry, func() error {
 		return w.queue.Storage().Complete(ctx, jobID, w.config.WorkerID)
 	})
+}
+
+func (w *Worker) completeWithResult(ctx context.Context, storage completeWithResultStorage, jobID string, result []byte) (*core.FanOut, error) {
+	var fo *core.FanOut
+	err := retryWithBackoff(ctx, *w.config.StorageRetry, func() error {
+		var completeErr error
+		fo, completeErr = storage.CompleteWithResult(ctx, jobID, w.config.WorkerID, result)
+		return completeErr
+	})
+	return fo, err
+}
+
+func (w *Worker) failTerminalWithResult(ctx context.Context, storage failTerminalWithResultStorage, jobID string, errMsg string) (*core.FanOut, error) {
+	var fo *core.FanOut
+	err := retryWithBackoff(ctx, *w.config.StorageRetry, func() error {
+		var failErr error
+		fo, failErr = storage.FailTerminalWithResult(ctx, jobID, w.config.WorkerID, errMsg)
+		return failErr
+	})
+	return fo, err
+}
+
+func (w *Worker) releaseAfterTerminalWriteError(ctx context.Context, jobID string, action string) {
+	if err := w.queue.Storage().Release(ctx, jobID, w.config.WorkerID); err != nil && !errors.Is(err, core.ErrJobNotOwned) {
+		w.logger.Warn("failed to release job after transient terminal write error",
+			"job_id", jobID,
+			"action", action,
+			"error", err)
+	}
 }
 
 // orphanHeartbeatThreshold is the number of consecutive Heartbeat calls
@@ -619,22 +697,45 @@ func (w *Worker) handleError(ctx context.Context, jobCtx context.Context, job *c
 		// terminal — attempts exhausted.
 	}
 
-	// Persist the outcome first. If storage reports the job is no longer owned
-	// by this worker, it was reclaimed or cancelled by another path (the
-	// stale-lock reaper, a fan-out cancel, or another worker in the fleet —
-	// often the very reason this handler's context was cancelled). The owner
-	// is now responsible for hooks, events, and fan-out accounting; running
-	// them here would race the new owner's state writes and double-count the
-	// fan-out. So skip all side effects when ownership is lost.
-	if failErr := w.failWithRetry(ctx, job.ID, err.Error(), retryAt); errors.Is(failErr, core.ErrJobNotOwned) {
-		w.logger.Warn("job no longer owned by this worker; skipping failure handling",
-			"job_id", job.ID, "error", err)
+	if retryAt != nil {
+		// Persist the retry first. If storage reports the job is no longer owned
+		// by this worker, it was reclaimed or cancelled by another path. The owner
+		// is now responsible for hooks, events, and fan-out accounting.
+		if failErr := w.failWithRetry(ctx, job.ID, err.Error(), retryAt); errors.Is(failErr, core.ErrJobNotOwned) {
+			w.logger.Warn("job no longer owned by this worker; skipping failure handling",
+				"job_id", job.ID, "error", err)
+			return
+		}
+		w.queue.CallRetryHooks(jobCtx, job, job.Attempt, err)
+		w.queue.Emit(&core.JobRetrying{Job: job, Attempt: job.Attempt, Error: err, NextRunAt: *retryAt, Timestamp: time.Now()})
 		return
 	}
 
-	if retryAt != nil {
-		w.queue.CallRetryHooks(jobCtx, job, job.Attempt, err)
-		w.queue.Emit(&core.JobRetrying{Job: job, Attempt: job.Attempt, Error: err, NextRunAt: *retryAt, Timestamp: time.Now()})
+	if failer, ok := w.queue.Storage().(failTerminalWithResultStorage); ok {
+		fo, failErr := w.failTerminalWithResult(ctx, failer, job.ID, err.Error())
+		if errors.Is(failErr, core.ErrJobNotOwned) {
+			w.logger.Warn("job no longer owned by this worker; skipping failure handling",
+				"job_id", job.ID, "error", err)
+			return
+		}
+		if failErr != nil {
+			w.logger.Error("failed to terminally fail job after retries", "job_id", job.ID, "error", failErr)
+			w.releaseAfterTerminalWriteError(ctx, job.ID, "terminal failure")
+			return
+		}
+		w.queue.CallFailHooks(jobCtx, job, err)
+		w.queue.Emit(&core.JobFailed{Job: job, Error: err, Timestamp: time.Now()})
+		if handleErr := w.checkFanOutCompletion(ctx, fo); handleErr != nil {
+			w.logger.Error("failed to handle sub-job failure", "job_id", job.ID, "error", handleErr)
+		}
+		return
+	}
+
+	// Legacy storage path: terminal failures use the original split
+	// Fail+fan-out accounting sequence.
+	if failErr := w.failWithRetry(ctx, job.ID, err.Error(), nil); errors.Is(failErr, core.ErrJobNotOwned) {
+		w.logger.Warn("job no longer owned by this worker; skipping failure handling",
+			"job_id", job.ID, "error", err)
 		return
 	}
 
@@ -701,6 +802,9 @@ func (w *Worker) handleSubJobCompletion(ctx context.Context, job *core.Job, succ
 
 // checkFanOutCompletion checks if a fan-out is complete and resumes parent.
 func (w *Worker) checkFanOutCompletion(ctx context.Context, fo *core.FanOut) error {
+	if fo == nil {
+		return nil
+	}
 	done, status := fo.TerminalStatus()
 	if !done {
 		return nil

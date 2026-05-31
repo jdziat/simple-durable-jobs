@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"sync"
@@ -1344,6 +1345,229 @@ func TestGetFanOut_ReturnsNilForMissing(t *testing.T) {
 	got, err := s.GetFanOut(ctx, "no-such-fanout")
 	require.NoError(t, err)
 	assert.Nil(t, got)
+}
+
+func p2bID(t *testing.T, suffix string) string {
+	t.Helper()
+	name := strings.NewReplacer("/", "-", " ", "-").Replace(t.Name())
+	return fmt.Sprintf("%s-%s-%d", name, suffix, time.Now().UnixNano())
+}
+
+func createRunningP2BJob(t *testing.T, ctx context.Context, s *GormStorage, fanOutID *string, workerID string) *core.Job {
+	t.Helper()
+	lockUntil := time.Now().Add(time.Hour)
+	job := &core.Job{
+		ID:          p2bID(t, "job"),
+		Type:        "p2b.sub",
+		Queue:       "p2b",
+		Status:      core.StatusRunning,
+		LockedBy:    workerID,
+		LockedUntil: &lockUntil,
+		FanOutID:    fanOutID,
+	}
+	require.NoError(t, s.Enqueue(ctx, job))
+	return job
+}
+
+func createP2BFanOut(t *testing.T, ctx context.Context, s *GormStorage, status core.FanOutStatus) *core.FanOut {
+	t.Helper()
+	fo := &core.FanOut{
+		ID:          p2bID(t, "fo"),
+		ParentJobID: p2bID(t, "parent"),
+		TotalCount:  2,
+		Strategy:    core.StrategyCollectAll,
+		Status:      status,
+	}
+	require.NoError(t, s.CreateFanOut(ctx, fo))
+	return fo
+}
+
+func TestCompleteWithResult_AtomicIncrementOnce(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+	fo := createP2BFanOut(t, ctx, s, core.FanOutPending)
+	job := createRunningP2BJob(t, ctx, s, &fo.ID, "worker-1")
+	result := []byte(`{"ok":true}`)
+
+	updated, err := s.CompleteWithResult(ctx, job.ID, "worker-1", result)
+	require.NoError(t, err)
+	require.NotNil(t, updated)
+	assert.Equal(t, 1, updated.CompletedCount)
+	assert.Equal(t, 0, updated.FailedCount)
+
+	row, err := s.GetJob(ctx, job.ID)
+	require.NoError(t, err)
+	require.NotNil(t, row)
+	assert.Equal(t, core.StatusCompleted, row.Status)
+	assert.Equal(t, result, row.Result)
+	assert.Empty(t, row.LockedBy)
+	assert.Nil(t, row.LockedUntil)
+	assert.NotNil(t, row.CompletedAt)
+
+	updated, err = s.CompleteWithResult(ctx, job.ID, "worker-1", result)
+	require.ErrorIs(t, err, core.ErrJobNotOwned)
+	assert.Nil(t, updated)
+
+	after, err := s.GetFanOut(ctx, fo.ID)
+	require.NoError(t, err)
+	require.NotNil(t, after)
+	assert.Equal(t, 1, after.CompletedCount)
+}
+
+func TestCompleteWithResult_NotOwned_NoIncrement(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+	fo := createP2BFanOut(t, ctx, s, core.FanOutPending)
+	job := createRunningP2BJob(t, ctx, s, &fo.ID, "worker-1")
+
+	updated, err := s.CompleteWithResult(ctx, job.ID, "worker-2", []byte(`{"wrong":true}`))
+	require.ErrorIs(t, err, core.ErrJobNotOwned)
+	assert.Nil(t, updated)
+
+	row, err := s.GetJob(ctx, job.ID)
+	require.NoError(t, err)
+	require.NotNil(t, row)
+	assert.Equal(t, core.StatusRunning, row.Status)
+	assert.Equal(t, "worker-1", row.LockedBy)
+	assert.Empty(t, row.Result)
+
+	after, err := s.GetFanOut(ctx, fo.ID)
+	require.NoError(t, err)
+	require.NotNil(t, after)
+	assert.Equal(t, 0, after.CompletedCount)
+}
+
+func TestCompleteWithResult_NonFanout(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+	job := createRunningP2BJob(t, ctx, s, nil, "worker-1")
+	result := []byte(`{"standalone":true}`)
+
+	updated, err := s.CompleteWithResult(ctx, job.ID, "worker-1", result)
+	require.NoError(t, err)
+	assert.Nil(t, updated)
+
+	row, err := s.GetJob(ctx, job.ID)
+	require.NoError(t, err)
+	require.NotNil(t, row)
+	assert.Equal(t, core.StatusCompleted, row.Status)
+	assert.Equal(t, result, row.Result)
+}
+
+func TestCompleteWithResult_LivenessGuard_NoCountOnTerminalFanOut(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+	fo := createP2BFanOut(t, ctx, s, core.FanOutFailed)
+	job := createRunningP2BJob(t, ctx, s, &fo.ID, "worker-1")
+
+	updated, err := s.CompleteWithResult(ctx, job.ID, "worker-1", []byte(`{"late":true}`))
+	require.NoError(t, err)
+	require.NotNil(t, updated)
+	assert.Equal(t, core.FanOutFailed, updated.Status)
+	assert.Equal(t, 0, updated.CompletedCount)
+
+	row, err := s.GetJob(ctx, job.ID)
+	require.NoError(t, err)
+	require.NotNil(t, row)
+	assert.Equal(t, core.StatusCompleted, row.Status)
+
+	after, err := s.GetFanOut(ctx, fo.ID)
+	require.NoError(t, err)
+	require.NotNil(t, after)
+	assert.Equal(t, 0, after.CompletedCount)
+}
+
+func TestFailTerminalWithResult_AtomicIncrementOnce(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+	fo := createP2BFanOut(t, ctx, s, core.FanOutPending)
+	job := createRunningP2BJob(t, ctx, s, &fo.ID, "worker-1")
+
+	updated, err := s.FailTerminalWithResult(ctx, job.ID, "worker-1", "something broke")
+	require.NoError(t, err)
+	require.NotNil(t, updated)
+	assert.Equal(t, 1, updated.FailedCount)
+	assert.Equal(t, 0, updated.CompletedCount)
+
+	row, err := s.GetJob(ctx, job.ID)
+	require.NoError(t, err)
+	require.NotNil(t, row)
+	assert.Equal(t, core.StatusFailed, row.Status)
+	assert.Equal(t, "something broke", row.LastError)
+	assert.Empty(t, row.LockedBy)
+	assert.Nil(t, row.LockedUntil)
+	assert.NotNil(t, row.CompletedAt)
+
+	updated, err = s.FailTerminalWithResult(ctx, job.ID, "worker-1", "again")
+	require.ErrorIs(t, err, core.ErrJobNotOwned)
+	assert.Nil(t, updated)
+
+	after, err := s.GetFanOut(ctx, fo.ID)
+	require.NoError(t, err)
+	require.NotNil(t, after)
+	assert.Equal(t, 1, after.FailedCount)
+}
+
+func TestFailTerminalWithResult_NotOwned_NoIncrement(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+	fo := createP2BFanOut(t, ctx, s, core.FanOutPending)
+	job := createRunningP2BJob(t, ctx, s, &fo.ID, "worker-1")
+
+	updated, err := s.FailTerminalWithResult(ctx, job.ID, "worker-2", "wrong worker")
+	require.ErrorIs(t, err, core.ErrJobNotOwned)
+	assert.Nil(t, updated)
+
+	row, err := s.GetJob(ctx, job.ID)
+	require.NoError(t, err)
+	require.NotNil(t, row)
+	assert.Equal(t, core.StatusRunning, row.Status)
+	assert.Equal(t, "worker-1", row.LockedBy)
+	assert.Empty(t, row.LastError)
+
+	after, err := s.GetFanOut(ctx, fo.ID)
+	require.NoError(t, err)
+	require.NotNil(t, after)
+	assert.Equal(t, 0, after.FailedCount)
+}
+
+func TestFailTerminalWithResult_NonFanout(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+	job := createRunningP2BJob(t, ctx, s, nil, "worker-1")
+
+	updated, err := s.FailTerminalWithResult(ctx, job.ID, "worker-1", "standalone failed")
+	require.NoError(t, err)
+	assert.Nil(t, updated)
+
+	row, err := s.GetJob(ctx, job.ID)
+	require.NoError(t, err)
+	require.NotNil(t, row)
+	assert.Equal(t, core.StatusFailed, row.Status)
+	assert.Equal(t, "standalone failed", row.LastError)
+}
+
+func TestFailTerminalWithResult_LivenessGuard_NoCountOnTerminalFanOut(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+	fo := createP2BFanOut(t, ctx, s, core.FanOutFailed)
+	job := createRunningP2BJob(t, ctx, s, &fo.ID, "worker-1")
+
+	updated, err := s.FailTerminalWithResult(ctx, job.ID, "worker-1", "late fail")
+	require.NoError(t, err)
+	require.NotNil(t, updated)
+	assert.Equal(t, core.FanOutFailed, updated.Status)
+	assert.Equal(t, 0, updated.FailedCount)
+
+	row, err := s.GetJob(ctx, job.ID)
+	require.NoError(t, err)
+	require.NotNil(t, row)
+	assert.Equal(t, core.StatusFailed, row.Status)
+
+	after, err := s.GetFanOut(ctx, fo.ID)
+	require.NoError(t, err)
+	require.NotNil(t, after)
+	assert.Equal(t, 0, after.FailedCount)
 }
 
 func TestCreateFanOut_PreservesExistingID(t *testing.T) {

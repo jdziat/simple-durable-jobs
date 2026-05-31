@@ -307,6 +307,26 @@ func (m *mockStorage) getReleasedJobIDs() []string {
 	return append([]string(nil), m.releasedJobIDs...)
 }
 
+type atomicMockStorage struct {
+	*mockStorage
+	completeWithResultFunc     func(ctx context.Context, jobID, workerID string, result []byte) (*core.FanOut, error)
+	failTerminalWithResultFunc func(ctx context.Context, jobID, workerID, errMsg string) (*core.FanOut, error)
+}
+
+func (m *atomicMockStorage) CompleteWithResult(ctx context.Context, jobID, workerID string, result []byte) (*core.FanOut, error) {
+	if m.completeWithResultFunc != nil {
+		return m.completeWithResultFunc(ctx, jobID, workerID, result)
+	}
+	return nil, nil
+}
+
+func (m *atomicMockStorage) FailTerminalWithResult(ctx context.Context, jobID, workerID, errMsg string) (*core.FanOut, error) {
+	if m.failTerminalWithResultFunc != nil {
+		return m.failTerminalWithResultFunc(ctx, jobID, workerID, errMsg)
+	}
+	return nil, nil
+}
+
 func TestWorkerConfig_Defaults(t *testing.T) {
 	config := WorkerConfig{
 		Queues:       nil,
@@ -2193,6 +2213,269 @@ func TestWorker_NoHandlerSubJobAccountsToFanOut(t *testing.T) {
 	})
 
 	assert.Equal(t, int32(1), failedIncrements.Load())
+}
+
+func TestWorker_TransientCompleteError_ReleasesForRerun(t *testing.T) {
+	fanOutID := "fo-transient-complete"
+	transientErr := errors.New("complete unavailable")
+	var completeCalls atomic.Int32
+	var legacyCompleted atomic.Int32
+	var legacyFailed atomic.Int32
+
+	base := &mockStorage{
+		incrementCompletedFunc: func(context.Context, string) (*core.FanOut, error) {
+			legacyCompleted.Add(1)
+			return nil, nil
+		},
+		incrementFailedFunc: func(context.Context, string) (*core.FanOut, error) {
+			legacyFailed.Add(1)
+			return nil, nil
+		},
+	}
+	store := &atomicMockStorage{mockStorage: base}
+	store.completeWithResultFunc = func(_ context.Context, _ string, _ string, _ []byte) (*core.FanOut, error) {
+		if completeCalls.Add(1) == 1 {
+			return nil, transientErr
+		}
+		return &core.FanOut{
+			ID:             fanOutID,
+			ParentJobID:    "parent",
+			TotalCount:     2,
+			CompletedCount: 1,
+			Strategy:       core.StrategyCollectAll,
+		}, nil
+	}
+
+	q := queue.New(store)
+	q.Register("atomic-success", func(context.Context, struct{}) error { return nil })
+	w := NewWorker(q, DisableRetry(), WithStorageRetry(RetryConfig{MaxAttempts: 1}))
+
+	job := &core.Job{ID: "sub-transient", Type: "atomic-success", Queue: "default", FanOutID: &fanOutID}
+	w.processJob(context.Background(), job)
+
+	assert.Equal(t, []string{job.ID}, store.getReleasedJobIDs())
+	assert.Equal(t, int32(0), legacyCompleted.Load())
+	assert.Equal(t, int32(0), legacyFailed.Load(), "transient complete must not be counted as a failed sub-job")
+	assert.Equal(t, int32(1), completeCalls.Load())
+
+	w.processJob(context.Background(), job)
+
+	assert.Equal(t, []string{job.ID}, store.getReleasedJobIDs(), "successful rerun should not release again")
+	assert.Equal(t, int32(2), completeCalls.Load())
+	assert.Equal(t, int32(0), legacyCompleted.Load())
+	assert.Equal(t, int32(0), legacyFailed.Load())
+}
+
+func TestWorker_CompleteWithResult_Success_IncrementsAndResumes(t *testing.T) {
+	fanOutID := "fo-atomic-success"
+	parentID := "parent-atomic-success"
+	resultSeen := make(chan []byte, 1)
+	resumed := make(chan string, 1)
+	statusUpdated := make(chan core.FanOutStatus, 1)
+
+	base := &mockStorage{
+		updateFanOutStatusFunc: func(_ context.Context, gotFanOutID string, status core.FanOutStatus) (bool, error) {
+			assert.Equal(t, fanOutID, gotFanOutID)
+			statusUpdated <- status
+			return true, nil
+		},
+		resumeJobFunc: func(_ context.Context, jobID string) (bool, error) {
+			resumed <- jobID
+			return true, nil
+		},
+	}
+	store := &atomicMockStorage{mockStorage: base}
+	store.completeWithResultFunc = func(_ context.Context, jobID, workerID string, result []byte) (*core.FanOut, error) {
+		assert.Equal(t, "sub-atomic-success", jobID)
+		assert.NotEmpty(t, workerID)
+		resultSeen <- append([]byte(nil), result...)
+		return &core.FanOut{
+			ID:             fanOutID,
+			ParentJobID:    parentID,
+			TotalCount:     1,
+			CompletedCount: 1,
+			Strategy:       core.StrategyCollectAll,
+		}, nil
+	}
+
+	q := queue.New(store)
+	q.Register("return-result", func(context.Context, string) (map[string]string, error) {
+		return map[string]string{"value": "ok"}, nil
+	})
+	completed := make(chan struct{}, 1)
+	q.OnJobComplete(func(context.Context, *core.Job) { completed <- struct{}{} })
+	w := NewWorker(q, DisableRetry(), WithStorageRetry(RetryConfig{MaxAttempts: 1}))
+
+	fanOutIDCopy := fanOutID
+	w.processJob(context.Background(), &core.Job{
+		ID:       "sub-atomic-success",
+		Type:     "return-result",
+		Queue:    "default",
+		Args:     []byte(`"input"`),
+		FanOutID: &fanOutIDCopy,
+	})
+
+	select {
+	case result := <-resultSeen:
+		assert.JSONEq(t, `{"value":"ok"}`, string(result))
+	case <-time.After(time.Second):
+		t.Fatal("CompleteWithResult was not called with the handler result")
+	}
+	select {
+	case <-completed:
+	case <-time.After(time.Second):
+		t.Fatal("completion hook was not called")
+	}
+	select {
+	case status := <-statusUpdated:
+		assert.Equal(t, core.FanOutCompleted, status)
+	case <-time.After(time.Second):
+		t.Fatal("fan-out status was not updated")
+	}
+	select {
+	case gotParent := <-resumed:
+		assert.Equal(t, parentID, gotParent)
+	case <-time.After(time.Second):
+		t.Fatal("parent was not resumed")
+	}
+}
+
+func TestWorker_HeartbeatHeldUntilAfterComplete(t *testing.T) {
+	completeEntered := make(chan struct{})
+	heartbeatDuringComplete := make(chan struct{})
+	allowComplete := make(chan struct{})
+	var entered atomic.Bool
+	var completeOnce sync.Once
+	var heartbeatOnce sync.Once
+
+	base := &mockStorage{
+		heartbeatFunc: func(context.Context, string, string) error {
+			if entered.Load() {
+				heartbeatOnce.Do(func() { close(heartbeatDuringComplete) })
+			}
+			return nil
+		},
+	}
+	store := &atomicMockStorage{mockStorage: base}
+	store.completeWithResultFunc = func(context.Context, string, string, []byte) (*core.FanOut, error) {
+		entered.Store(true)
+		completeOnce.Do(func() { close(completeEntered) })
+		select {
+		case <-heartbeatDuringComplete:
+		case <-time.After(time.Second):
+			t.Fatal("heartbeat stopped before CompleteWithResult returned")
+		}
+		close(allowComplete)
+		return nil, nil
+	}
+
+	q := queue.New(store)
+	q.Register("quick-success", func(context.Context, struct{}) error { return nil })
+	w := NewWorker(q, DisableRetry(), WithStorageRetry(RetryConfig{MaxAttempts: 1}))
+	w.heartbeatInterval = 5 * time.Millisecond
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		w.processJob(context.Background(), &core.Job{ID: "hb-through-complete", Type: "quick-success", Queue: "default"})
+	}()
+
+	select {
+	case <-completeEntered:
+	case <-time.After(time.Second):
+		t.Fatal("CompleteWithResult was not entered")
+	}
+	select {
+	case <-allowComplete:
+	case <-time.After(2 * time.Second):
+		t.Fatal("CompleteWithResult did not observe an active heartbeat")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("processJob did not return after CompleteWithResult")
+	}
+}
+
+func TestWorker_FailTerminalWithResult_Atomicity(t *testing.T) {
+	fanOutID := "fo-terminal-fail"
+	parentID := "parent-terminal-fail"
+	var legacyFailed atomic.Int32
+	failCalled := make(chan string, 1)
+	statusUpdated := make(chan core.FanOutStatus, 1)
+	resumed := make(chan string, 1)
+
+	base := &mockStorage{
+		incrementFailedFunc: func(context.Context, string) (*core.FanOut, error) {
+			legacyFailed.Add(1)
+			return nil, nil
+		},
+		updateFanOutStatusFunc: func(_ context.Context, gotFanOutID string, status core.FanOutStatus) (bool, error) {
+			assert.Equal(t, fanOutID, gotFanOutID)
+			statusUpdated <- status
+			return true, nil
+		},
+		resumeJobFunc: func(_ context.Context, jobID string) (bool, error) {
+			resumed <- jobID
+			return true, nil
+		},
+	}
+	store := &atomicMockStorage{mockStorage: base}
+	store.failTerminalWithResultFunc = func(_ context.Context, jobID, workerID, errMsg string) (*core.FanOut, error) {
+		assert.Equal(t, "sub-terminal-fail", jobID)
+		assert.NotEmpty(t, workerID)
+		failCalled <- errMsg
+		return &core.FanOut{
+			ID:          fanOutID,
+			ParentJobID: parentID,
+			TotalCount:  1,
+			FailedCount: 1,
+			Strategy:    core.StrategyCollectAll,
+		}, nil
+	}
+
+	q := queue.New(store)
+	q.Register("terminal-error", func(context.Context, struct{}) error {
+		return core.NoRetry(errors.New("terminal boom"))
+	})
+	failed := make(chan struct{}, 1)
+	q.OnJobFail(func(context.Context, *core.Job, error) { failed <- struct{}{} })
+	w := NewWorker(q, DisableRetry(), WithStorageRetry(RetryConfig{MaxAttempts: 1}))
+
+	fanOutIDCopy := fanOutID
+	w.processJob(context.Background(), &core.Job{
+		ID:         "sub-terminal-fail",
+		Type:       "terminal-error",
+		Queue:      "default",
+		FanOutID:   &fanOutIDCopy,
+		Attempt:    1,
+		MaxRetries: 1,
+	})
+
+	select {
+	case msg := <-failCalled:
+		assert.Contains(t, msg, "terminal boom")
+	case <-time.After(time.Second):
+		t.Fatal("FailTerminalWithResult was not called")
+	}
+	assert.Equal(t, int32(0), legacyFailed.Load(), "atomic terminal fail path must not use legacy failed increment")
+	select {
+	case <-failed:
+	case <-time.After(time.Second):
+		t.Fatal("failure hook was not called")
+	}
+	select {
+	case status := <-statusUpdated:
+		assert.Equal(t, core.FanOutCompleted, status)
+	case <-time.After(time.Second):
+		t.Fatal("fan-out status was not updated")
+	}
+	select {
+	case gotParent := <-resumed:
+		assert.Equal(t, parentID, gotParent)
+	case <-time.After(time.Second):
+		t.Fatal("parent was not resumed")
+	}
 }
 
 // ---------------------------------------------------------------------------

@@ -451,6 +451,68 @@ func (s *GormStorage) Complete(ctx context.Context, jobID string, workerID strin
 	return nil
 }
 
+// CompleteWithResult marks a job completed and, when it is a sub-job, accounts
+// for its fan-out completion in the same ownership-guarded transaction.
+func (s *GormStorage) CompleteWithResult(ctx context.Context, jobID, workerID string, result []byte) (*core.FanOut, error) {
+	var fanOut core.FanOut
+	var hasFanOut bool
+
+	err := s.withSerializationRetry(ctx, func() error {
+		fanOut = core.FanOut{}
+		hasFanOut = false
+
+		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			now := time.Now()
+			updates := map[string]any{
+				"status":       core.StatusCompleted,
+				"completed_at": now,
+				"locked_by":    "",
+				"locked_until": nil,
+			}
+			if result != nil {
+				updates["result"] = result
+			}
+
+			update := tx.Model(&core.Job{}).
+				Where("id = ? AND locked_by = ? AND status = ?", jobID, workerID, core.StatusRunning).
+				Updates(updates)
+			if update.Error != nil {
+				return update.Error
+			}
+			if update.RowsAffected == 0 {
+				return core.ErrJobNotOwned
+			}
+
+			var job core.Job
+			if err := tx.Select("fan_out_id").First(&job, "id = ?", jobID).Error; err != nil {
+				return err
+			}
+			if job.FanOutID == nil || *job.FanOutID == "" {
+				return nil
+			}
+
+			if err := tx.Exec(
+				"UPDATE fan_outs SET completed_count = completed_count + 1, updated_at = ? WHERE id = ? AND status = ?",
+				now, *job.FanOutID, core.FanOutPending,
+			).Error; err != nil {
+				return err
+			}
+			if err := tx.First(&fanOut, "id = ?", *job.FanOutID).Error; err != nil {
+				return err
+			}
+			hasFanOut = true
+			return nil
+		})
+	})
+	if err != nil {
+		return nil, err
+	}
+	if !hasFanOut {
+		return nil, nil
+	}
+	return &fanOut, nil
+}
+
 // Fail marks a job as failed, optionally scheduling a retry.
 // Validates that the worker owns the job before failing.
 // Error messages are sanitized before storage.
@@ -485,6 +547,66 @@ func (s *GormStorage) Fail(ctx context.Context, jobID string, workerID string, e
 		return core.ErrJobNotOwned
 	}
 	return nil
+}
+
+// FailTerminalWithResult marks a job terminally failed and, when it is a
+// sub-job, accounts for its fan-out failure in the same ownership-guarded
+// transaction. Retryable failures must continue to use Fail.
+func (s *GormStorage) FailTerminalWithResult(ctx context.Context, jobID, workerID, errMsg string) (*core.FanOut, error) {
+	sanitizedErr := security.SanitizeErrorMessage(errMsg)
+	var fanOut core.FanOut
+	var hasFanOut bool
+
+	err := s.withSerializationRetry(ctx, func() error {
+		fanOut = core.FanOut{}
+		hasFanOut = false
+
+		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			now := time.Now()
+			update := tx.Model(&core.Job{}).
+				Where("id = ? AND locked_by = ? AND status = ?", jobID, workerID, core.StatusRunning).
+				Updates(map[string]any{
+					"last_error":   sanitizedErr,
+					"status":       core.StatusFailed,
+					"completed_at": now,
+					"locked_by":    "",
+					"locked_until": nil,
+				})
+			if update.Error != nil {
+				return update.Error
+			}
+			if update.RowsAffected == 0 {
+				return core.ErrJobNotOwned
+			}
+
+			var job core.Job
+			if err := tx.Select("fan_out_id").First(&job, "id = ?", jobID).Error; err != nil {
+				return err
+			}
+			if job.FanOutID == nil || *job.FanOutID == "" {
+				return nil
+			}
+
+			if err := tx.Exec(
+				"UPDATE fan_outs SET failed_count = failed_count + 1, updated_at = ? WHERE id = ? AND status = ?",
+				now, *job.FanOutID, core.FanOutPending,
+			).Error; err != nil {
+				return err
+			}
+			if err := tx.First(&fanOut, "id = ?", *job.FanOutID).Error; err != nil {
+				return err
+			}
+			hasFanOut = true
+			return nil
+		})
+	})
+	if err != nil {
+		return nil, err
+	}
+	if !hasFanOut {
+		return nil, nil
+	}
+	return &fanOut, nil
 }
 
 // SaveCheckpoint stores a checkpoint for a durable call.
