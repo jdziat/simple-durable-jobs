@@ -821,6 +821,20 @@ func (w *Worker) runScheduler(ctx context.Context) {
 			now := time.Now()
 			for name, sj := range scheduled {
 				if _, ok := lastRun[name]; !ok {
+					// First sight of this schedule. Default to now (anti-boot-storm:
+					// a brand-new schedule must not fire immediately). But if a real
+					// prior fire is persisted, seed from it so a boundary that elapsed
+					// while the whole fleet was down is not skipped.
+					//
+					// Catch-up is at-least-once, not exactly-once: Schedule.Next
+					// advances by one boundary per call and this loop fires one
+					// boundary per tick, so a gap spanning N boundaries replays N
+					// fires (paced one per tick, each de-duplicated fleet-wide by
+					// ClaimScheduledFire's monotonic last_fire_at CAS — no duplicate
+					// execution, no wedge). A short-interval schedule down a long time
+					// therefore backfills its missed boundaries; handlers for such
+					// schedules should be idempotent. (Coalescing a long gap to a
+					// single fire is tracked as a follow-up.)
 					lastRun[name] = now
 					if reader, ok := w.queue.Storage().(scheduledFireReader); ok {
 						persistedLastFireAt, found, err := reader.GetScheduledFireTime(ctx, name)
