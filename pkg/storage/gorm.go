@@ -647,6 +647,9 @@ func (s *GormStorage) ReleaseStaleLocks(ctx context.Context, staleDuration time.
 	err := s.withSerializationRetry(ctx, func() error {
 		released = nil
 		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			// Unordered LIMIT: the reaper is idempotent and self-draining (a
+			// stale lock stays running+expired until released), so a per-tick
+			// cap bounds the IN-list update without needing a stable sort.
 			if err := tx.Model(&core.Job{}).
 				Where("status = ?", core.StatusRunning).
 				Where("locked_until < ?", cutoff).
@@ -1115,6 +1118,11 @@ func (s *GormStorage) GetWaitingJobsToResume(ctx context.Context) ([]*core.Job, 
 // GetStalledFanOutParents finds waiting parents whose pending fan-out never
 // finished persisting its sub-jobs. The caller supplies olderThan so the query
 // stays portable across SQLite, PostgreSQL, and MySQL.
+//
+// The LIMIT is intentionally unordered: recovery is idempotent and self-draining
+// (a qualifying parent stays waiting+pending until resumed, so any row not picked
+// this tick is picked on a later one), so a per-tick cap bounds work without
+// needing a stable sort. maxResumeBatch matches GetWaitingJobsToResume.
 func (s *GormStorage) GetStalledFanOutParents(ctx context.Context, olderThan time.Time) ([]*core.Job, error) {
 	var jobs []*core.Job
 	err := s.db.WithContext(ctx).Raw(`

@@ -124,7 +124,7 @@ phase-name distinct-collision (triple-keyed).
 | P2 | ✅ committed | 6ce8187 | Release()+shutdown-release + no-handler fan-in accounting. Gate: full race suite green, go vet ./... clean, chaos all-HARD-PASS, multi-backend PG+MySQL green, 4 new tests RED→GREEN, 10x APPROVE. (Interface change broke 3 test mocks fanout/queue/ui — parent added no-op Release; queue mock fix amended in.) |
 | P2b | pending | — | DEFERRED to pair with P4: SaveJobResult/Complete partial-failure wedge + reaper-vs-Complete window (need PauseJob cancel-accounting from P4 first) |
 | P3 | pending | — | |
-| P4a | ✅ committed | (pending-sha) | storage fan-in correctness (gorm.go): cancelled_count over-count guard, Increment* nil-on-error, completed_at parity, LIMIT recovery queries. Gate: race units + 5 RED→GREEN tests + multi-backend PG(ok 8.6s)+MySQL(ok 6.2s) + 10x APPROVE. (Optional follow-up nit: ORDER BY on recovery queries for FIFO/starvation-proof.) |
+| P4a | ✅ committed | 02e77a5 | storage fan-in correctness (gorm.go): cancelled_count over-count guard, Increment* nil-on-error, completed_at parity, LIMIT recovery queries. Gate: race units + 5 RED→GREEN tests + multi-backend PG(ok 8.6s)+MySQL(ok 6.2s) + 10x APPROVE. (Optional follow-up nit: ORDER BY on recovery queries for FIFO/starvation-proof.) |
 | P4b | pending | — | schema: Job.Timeout/Determinism gorm tags, composite dequeue index, SaveCheckpoint created_at, dequeue status guard, migration drift doc |
 | P5 | pending | — | |
 | P6 | dispatching | — | parallel-safe (running concurrently with P4a); provider-key redaction + bounded sanitize |
