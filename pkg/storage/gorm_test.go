@@ -1868,17 +1868,28 @@ func TestGetScheduledFireTime(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStorage(t)
 
-	got, found, err := s.GetScheduledFireTime(ctx, "missing-schedule")
+	// Use schedule names unique to this test. The external PG/MySQL test DBs are
+	// shared across runs and scheduled_fires is never truncated (the integration
+	// cleanup omits it), so reusing a name shared with another test
+	// (e.g. "daily-report" from TestClaimScheduledFire_*) leaves a row whose
+	// monotonic last_fire_at would refuse this test's claim. Scope by name and
+	// clear any residue first so the assertions are deterministic on a shared DB.
+	const missingName = "getfire-missing-schedule"
+	const claimName = "getfire-daily-report"
+	require.NoError(t, s.DB().Where("name IN ?", []string{missingName, claimName}).
+		Delete(&core.ScheduledFire{}).Error)
+
+	got, found, err := s.GetScheduledFireTime(ctx, missingName)
 	require.NoError(t, err)
 	assert.False(t, found)
 	assert.True(t, got.IsZero())
 
 	t1 := time.Now().UTC().Truncate(time.Millisecond)
-	claimed, err := s.ClaimScheduledFire(ctx, "daily-report", t1)
+	claimed, err := s.ClaimScheduledFire(ctx, claimName, t1)
 	require.NoError(t, err)
 	require.True(t, claimed)
 
-	got, found, err = s.GetScheduledFireTime(ctx, "daily-report")
+	got, found, err = s.GetScheduledFireTime(ctx, claimName)
 	require.NoError(t, err)
 	require.True(t, found)
 	assert.True(t, got.Equal(t1), "got %v, want %v", got, t1)
