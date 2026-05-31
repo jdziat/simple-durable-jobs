@@ -43,6 +43,8 @@ type mockStorage struct {
 	waitingJobsFunc func(ctx context.Context) ([]*core.Job, error)
 	stalledJobsFunc func(ctx context.Context, olderThan time.Time) ([]*core.Job, error)
 	claimFireFunc   func(ctx context.Context, name string, fireTime time.Time) (bool, error)
+	fireTimeFunc    func(ctx context.Context, name string) (time.Time, bool, error)
+	fireTimes       map[string]time.Time
 
 	// fan-out control hooks
 	incrementCompletedFunc func(ctx context.Context, fanOutID string) (*core.FanOut, error)
@@ -133,6 +135,14 @@ func (m *mockStorage) ClaimScheduledFire(ctx context.Context, name string, fireT
 		return m.claimFireFunc(ctx, name, fireTime)
 	}
 	return true, nil
+}
+
+func (m *mockStorage) GetScheduledFireTime(ctx context.Context, name string) (time.Time, bool, error) {
+	if m.fireTimeFunc != nil {
+		return m.fireTimeFunc(ctx, name)
+	}
+	t, ok := m.fireTimes[name]
+	return t, ok, nil
 }
 
 func (m *mockStorage) Heartbeat(ctx context.Context, jobID string, workerID string) error {
@@ -2536,6 +2546,61 @@ func TestWorker_RunScheduler_ClaimedBoundaryEnqueuesOnce(t *testing.T) {
 	mock.enqueueMu.Lock()
 	defer mock.enqueueMu.Unlock()
 	assert.Empty(t, mock.enqueuedKeys, "scheduler must not inject a sched: unique key")
+}
+
+func TestScheduler_CatchUpAfterFleetGap(t *testing.T) {
+	period := time.Hour
+	now := time.Now().UTC()
+	catchUpLastFireAt := now.Add(-period)
+	freshLastFireAt := now
+
+	var claimCalls atomic.Int32
+	claimedNames := make(chan string, 4)
+	mock := &mockStorage{
+		fireTimes: map[string]time.Time{
+			"catch-up-task": catchUpLastFireAt,
+			"fresh-task":    freshLastFireAt,
+		},
+	}
+	mock.claimFireFunc = func(_ context.Context, name string, fireTime time.Time) (bool, error) {
+		claimCalls.Add(1)
+		claimedNames <- name
+		assert.Equal(t, "catch-up-task", name, "fresh schedule must preserve anti-boot-storm")
+		assert.WithinDuration(t, catchUpLastFireAt.Add(period), fireTime, time.Second)
+		return true, nil
+	}
+
+	q := queue.New(mock)
+	q.Register("catch-up-task", func(_ context.Context, _ struct{}) error { return nil })
+	q.Register("fresh-task", func(_ context.Context, _ struct{}) error { return nil })
+	q.Schedule("catch-up-task", nil, offsetSchedule{offset: period})
+	q.Schedule("fresh-task", nil, offsetSchedule{offset: period})
+
+	w := NewWorker(q, WithStaleLockInterval(0))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { w.runScheduler(ctx) }()
+
+	select {
+	case name := <-claimedNames:
+		assert.Equal(t, "catch-up-task", name)
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("scheduler did not catch up the missed boundary shortly after start")
+	}
+
+	require.Eventually(t, func() bool {
+		return mock.getEnqueueCount() == 1
+	}, time.Second, 10*time.Millisecond)
+
+	time.Sleep(250 * time.Millisecond)
+	cancel()
+
+	assert.Equal(t, int32(1), claimCalls.Load(), "only the missed boundary should claim; fresh schedule must not fire")
+	assert.Equal(t, int64(1), mock.getEnqueueCount(), "catch-up must enqueue exactly once")
+	mock.enqueueMu.Lock()
+	defer mock.enqueueMu.Unlock()
+	require.Len(t, mock.enqueuedJobs, 1)
+	assert.Equal(t, "catch-up-task", mock.enqueuedJobs[0].Type)
 }
 
 // ---------------------------------------------------------------------------

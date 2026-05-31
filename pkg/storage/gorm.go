@@ -578,6 +578,19 @@ func (s *GormStorage) ClaimScheduledFire(ctx context.Context, name string, fireT
 	return result.RowsAffected == 1, nil
 }
 
+// GetScheduledFireTime returns the latest persisted fire boundary for a schedule.
+func (s *GormStorage) GetScheduledFireTime(ctx context.Context, name string) (time.Time, bool, error) {
+	var fire core.ScheduledFire
+	err := s.db.WithContext(ctx).First(&fire, "name = ?", name).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return time.Time{}, false, nil
+	}
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	return fire.LastFireAt, true, nil
+}
+
 // Heartbeat extends the lock on a running job.
 // Returns ErrJobNotOwned if the job is no longer owned by this worker.
 func (s *GormStorage) Heartbeat(ctx context.Context, jobID string, workerID string) error {

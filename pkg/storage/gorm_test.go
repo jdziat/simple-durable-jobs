@@ -1864,6 +1864,26 @@ func TestClaimScheduledFire_ConcurrentExactlyOnceAndTimeOrdering(t *testing.T) {
 	assert.False(t, claimed, "later boundary should also be claimed only once")
 }
 
+func TestGetScheduledFireTime(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	got, found, err := s.GetScheduledFireTime(ctx, "missing-schedule")
+	require.NoError(t, err)
+	assert.False(t, found)
+	assert.True(t, got.IsZero())
+
+	t1 := time.Now().UTC().Truncate(time.Millisecond)
+	claimed, err := s.ClaimScheduledFire(ctx, "daily-report", t1)
+	require.NoError(t, err)
+	require.True(t, claimed)
+
+	got, found, err = s.GetScheduledFireTime(ctx, "daily-report")
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.True(t, got.Equal(t1), "got %v, want %v", got, t1)
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Suspend / Resume
 // ──────────────────────────────────────────────────────────────────────────────

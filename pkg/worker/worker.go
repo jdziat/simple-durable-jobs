@@ -47,6 +47,10 @@ type Worker struct {
 	heartbeatInterval time.Duration
 }
 
+type scheduledFireReader interface {
+	GetScheduledFireTime(context.Context, string) (time.Time, bool, error)
+}
+
 // NewWorker creates a new worker for the given queue.
 func NewWorker(q *queue.Queue, opts ...WorkerOption) *Worker {
 	config := WorkerConfig{
@@ -818,6 +822,14 @@ func (w *Worker) runScheduler(ctx context.Context) {
 			for name, sj := range scheduled {
 				if _, ok := lastRun[name]; !ok {
 					lastRun[name] = now
+					if reader, ok := w.queue.Storage().(scheduledFireReader); ok {
+						persistedLastFireAt, found, err := reader.GetScheduledFireTime(ctx, name)
+						if err != nil {
+							w.logger.Error("failed to read scheduled fire time", "name", name, "error", err)
+						} else if found && persistedLastFireAt.After(time.Unix(0, 0).UTC()) {
+							lastRun[name] = persistedLastFireAt
+						}
+					}
 				}
 				nextRun := sj.Schedule.Next(lastRun[name])
 				if now.After(nextRun) || now.Equal(nextRun) {
