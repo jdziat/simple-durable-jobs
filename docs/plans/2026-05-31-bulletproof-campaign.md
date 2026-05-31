@@ -118,6 +118,17 @@ phase-name distinct-collision (triple-keyed).
 
 ## Progress
 
+**✅ CAMPAIGN P1–P9 COMPLETE + CERTIFIED (2026-05-31, branch `fix/bulletproof-audit`, ~31 commits, not yet PR'd).**
+Full-branch certification: SQLite suite 14 ok/0 fail (`-race`); Postgres storage+`tests/` ok; MySQL
+storage+`tests/` ok; chaos harness under SIGKILL — ALL HARD invariants PASS (EXACTLY-ONCE / NO-WEDGE /
+FANOUT-COUNTS / UNIQUE) + INV-SCHED; `go vet ./...` clean. Cert caught one cross-backend TEST-isolation
+bug (`TestGetScheduledFireTime` vs shared non-truncated `scheduled_fires`) — fixed (`4f8d1c2`); the
+sqlite-masks-PG/MySQL lesson again. **Note: commit SHAs in the rows below drifted from the real history
+during a garbled-tool-channel session — trust commit MESSAGES + content, not these SHAs.**
+Deferred (low/med, none blocking): P2b (partial-failure wedge + reaper-vs-Complete), P3b (coalesce
+long-gap catch-up to one fire), P7c (Call determinism/at-least-once docs + Call[T]-on-error-only guard),
+P8b (read-path redaction + dead q.events), P9b (Sub zero-priority).
+
 | Packet | Status | Commit | Notes |
 |---|---|---|---|
 | P1 | ✅ committed | 6c7479b | core.FanOut.TerminalStatus() unifies worker+queue; threshold doomed-gate; CancelSubJob local-cancel. Gate: race units + 10x APPROVE + chaos INV-FANOUT-COUNTS green (20 fan-outs, 0 mismatch) |
