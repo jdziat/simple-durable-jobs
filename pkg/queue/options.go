@@ -9,15 +9,16 @@ import (
 
 // Options holds configuration for job enqueueing and registration.
 type Options struct {
-	Queue       string
-	Priority    int
-	MaxRetries  int
-	Delay       time.Duration
-	RunAt       *time.Time
-	UniqueKey   string
-	Determinism DeterminismMode
-	Timezone    *time.Location
-	Timeout     time.Duration // max wall time for handler execution; 0 means no limit
+	Queue          string
+	Priority       int
+	MaxRetries     int
+	Delay          time.Duration
+	RunAt          *time.Time
+	UniqueKey      string
+	Determinism    DeterminismMode
+	determinismSet bool
+	Timezone       *time.Location
+	Timeout        time.Duration // max wall time for handler execution; 0 means no limit
 }
 
 // NewOptions creates Options with defaults.
@@ -106,6 +107,7 @@ const (
 func Determinism(mode DeterminismMode) Option {
 	return optionFunc(func(o *Options) {
 		o.Determinism = mode
+		o.determinismSet = true
 	})
 }
 

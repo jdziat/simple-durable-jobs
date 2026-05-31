@@ -192,8 +192,10 @@ func (q *Queue) enqueueWithOptions(ctx context.Context, name string, args any, o
 	// Clamp retries to maximum
 	maxRetries := security.ClampRetries(options.MaxRetries)
 	effDet := options.Determinism
-	if effDet == ExplicitCheckpoints {
+	if !options.determinismSet {
+		q.mu.RLock()
 		effDet = q.determinism
+		q.mu.RUnlock()
 	}
 
 	job := &core.Job{
@@ -324,6 +326,8 @@ func (q *Queue) LoadStatus(ctx context.Context, jobID string) (core.JobStatus, e
 
 // SetDeterminism sets the default determinism mode.
 func (q *Queue) SetDeterminism(mode DeterminismMode) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
 	q.determinism = mode
 }
 
