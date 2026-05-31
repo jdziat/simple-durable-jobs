@@ -674,47 +674,10 @@ func (w *Worker) handleSubJobCompletion(ctx context.Context, job *core.Job, succ
 
 // checkFanOutCompletion checks if a fan-out is complete and resumes parent.
 func (w *Worker) checkFanOutCompletion(ctx context.Context, fo *core.FanOut) error {
-	total := fo.CompletedCount + fo.FailedCount + fo.CancelledCount
-	if total < fo.TotalCount {
-		// Not all sub-jobs done yet
-
-		// Check fail-fast
-		if fo.Strategy == core.StrategyFailFast && fo.FailedCount > 0 {
-			return w.completeFanOut(ctx, fo, core.FanOutFailed)
-		}
-
-		// Check threshold
-		if fo.Strategy == core.StrategyThreshold {
-			maxFailures := int(float64(fo.TotalCount) * (1 - fo.Threshold))
-			if fo.FailedCount > maxFailures {
-				return w.completeFanOut(ctx, fo, core.FanOutFailed)
-			}
-		}
-
+	done, status := fo.TerminalStatus()
+	if !done {
 		return nil
 	}
-
-	// All sub-jobs done (completed + failed + cancelled = total)
-	status := core.FanOutCompleted
-	if fo.Strategy == core.StrategyFailFast && (fo.FailedCount > 0 || fo.CancelledCount > 0) {
-		status = core.FanOutFailed
-	} else if fo.Strategy == core.StrategyThreshold {
-		activeTotal := fo.CompletedCount + fo.FailedCount
-		if activeTotal > 0 {
-			successRate := float64(fo.CompletedCount) / float64(activeTotal)
-			if successRate < fo.Threshold {
-				status = core.FanOutFailed
-			}
-		} else {
-			// All jobs cancelled, no successes
-			status = core.FanOutFailed
-		}
-	} else if fo.CancelledCount > 0 && fo.CompletedCount == 0 {
-		// All jobs cancelled with no completions
-		status = core.FanOutFailed
-	}
-	// CollectAll always marks as completed - error is returned to parent
-
 	return w.completeFanOut(ctx, fo, status)
 }
 

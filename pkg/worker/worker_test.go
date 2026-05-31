@@ -2562,9 +2562,9 @@ func TestWorker_CheckFanOutCompletion_FailFastTriggersEarly(t *testing.T) {
 	}
 }
 
-// TestWorker_CheckFanOutCompletion_ThresholdExceeded exercises the threshold
-// strategy early-exit when failures exceed the allowed maximum.
-func TestWorker_CheckFanOutCompletion_ThresholdExceeded(t *testing.T) {
+// TestWorker_CheckFanOutCompletion_ThresholdDoomed exercises the threshold
+// strategy early-exit when the remaining in-flight jobs cannot meet the requirement.
+func TestWorker_CheckFanOutCompletion_ThresholdDoomed(t *testing.T) {
 	fanOutUpdated := make(chan core.FanOutStatus, 1)
 
 	mock := &mockStorage{
@@ -2579,13 +2579,13 @@ func TestWorker_CheckFanOutCompletion_ThresholdExceeded(t *testing.T) {
 	q := queue.New(mock)
 	w := NewWorker(q, WithStorageRetry(RetryConfig{MaxAttempts: 1}))
 
-	// Threshold = 0.8 (80% success required). TotalCount=10, maxFailures = 10*(1-0.8) = 2.
-	// FailedCount=3 > 2 so threshold is breached even though 7 jobs remain.
+	// Threshold = 0.8 (80% success required). With 4 completed, 3 failed, and
+	// 3 in flight, the best possible result is 7 successes, below the required 8.
 	fo := &core.FanOut{
 		ID:             "fo-4",
 		ParentJobID:    "parent-job-4",
 		TotalCount:     10,
-		CompletedCount: 3,
+		CompletedCount: 4,
 		FailedCount:    3,
 		CancelledCount: 0,
 		Strategy:       core.StrategyThreshold,
@@ -2603,8 +2603,9 @@ func TestWorker_CheckFanOutCompletion_ThresholdExceeded(t *testing.T) {
 	}
 }
 
-// TestWorker_CheckFanOutCompletion_AllCancelledNoCompletions exercises the branch
-// where all sub-jobs are cancelled and completedCount == 0, resulting in FanOutFailed.
+// TestWorker_CheckFanOutCompletion_AllCancelledNoCompletions exercises CollectAll's
+// all-accounted path. CollectAll terminal status is completed even when every
+// sub-job was cancelled; per-index errors are surfaced by CollectResults.
 func TestWorker_CheckFanOutCompletion_AllCancelledNoCompletions(t *testing.T) {
 	fanOutUpdated := make(chan core.FanOutStatus, 1)
 
@@ -2635,7 +2636,7 @@ func TestWorker_CheckFanOutCompletion_AllCancelledNoCompletions(t *testing.T) {
 
 	select {
 	case status := <-fanOutUpdated:
-		assert.Equal(t, core.FanOutFailed, status)
+		assert.Equal(t, core.FanOutCompleted, status)
 	case <-time.After(time.Second):
 		t.Fatal("UpdateFanOutStatus was not called")
 	}

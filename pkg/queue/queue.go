@@ -677,15 +677,15 @@ func (q *Queue) CancelSubJob(ctx context.Context, jobID string) (*core.FanOut, e
 		return nil, nil // Not a sub-job
 	}
 
-	// Check if all sub-jobs are now accounted for
-	total := fo.CompletedCount + fo.FailedCount + fo.CancelledCount
-	if total >= fo.TotalCount && fo.Status == core.FanOutPending {
-		// Mark fan-out as completed/failed
-		status := core.FanOutCompleted
-		if fo.FailedCount > 0 || (fo.CancelledCount > 0 && fo.CompletedCount == 0) {
-			status = core.FanOutFailed
-		}
+	q.runningJobsMu.Lock()
+	cancel, runningLocally := q.runningJobs[jobID]
+	q.runningJobsMu.Unlock()
+	if runningLocally {
+		cancel()
+	}
 
+	done, status := fo.TerminalStatus()
+	if done && fo.Status == core.FanOutPending {
 		updated, err := q.storage.UpdateFanOutStatus(ctx, fo.ID, status)
 		if err != nil {
 			return fo, fmt.Errorf("update fan-out status: %w", err)

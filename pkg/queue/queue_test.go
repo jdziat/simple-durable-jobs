@@ -978,7 +978,12 @@ func TestQueue_CancelSubJob_NotASubJob_ReturnsNil(t *testing.T) {
 // CancelSubJob so we can exercise the completion-check logic.
 type cancelSubJobStorage struct {
 	*mockStorage
-	fanOut *core.FanOut
+	fanOut        *core.FanOut
+	updateCalled  bool
+	updatedID     string
+	updatedStatus core.FanOutStatus
+	resumeCalled  bool
+	resumedID     string
 }
 
 func (c *cancelSubJobStorage) CancelSubJob(ctx context.Context, jobID string) (*core.FanOut, error) {
@@ -986,10 +991,15 @@ func (c *cancelSubJobStorage) CancelSubJob(ctx context.Context, jobID string) (*
 }
 
 func (c *cancelSubJobStorage) UpdateFanOutStatus(ctx context.Context, fanOutID string, status core.FanOutStatus) (bool, error) {
+	c.updateCalled = true
+	c.updatedID = fanOutID
+	c.updatedStatus = status
 	return true, nil
 }
 
 func (c *cancelSubJobStorage) ResumeJob(ctx context.Context, jobID string) (bool, error) {
+	c.resumeCalled = true
+	c.resumedID = jobID
 	return true, nil
 }
 
@@ -1002,6 +1012,7 @@ func TestQueue_CancelSubJob_FanOutComplete_ResumesParent(t *testing.T) {
 		CompletedCount: 1,
 		CancelledCount: 1,
 		FailedCount:    0,
+		Strategy:       core.StrategyCollectAll,
 		Status:         core.FanOutPending,
 	}
 	store := &cancelSubJobStorage{mockStorage: base, fanOut: fo}
@@ -1013,6 +1024,9 @@ func TestQueue_CancelSubJob_FanOutComplete_ResumesParent(t *testing.T) {
 	require.NoError(t, err)
 	assert.NotNil(t, result)
 	assert.Equal(t, "fo-1", result.ID)
+	assert.True(t, store.updateCalled)
+	assert.Equal(t, core.FanOutCompleted, store.updatedStatus)
+	assert.True(t, store.resumeCalled)
 }
 
 func TestQueue_CancelSubJob_FanOutIncomplete_DoesNotResume(t *testing.T) {
@@ -1024,6 +1038,7 @@ func TestQueue_CancelSubJob_FanOutIncomplete_DoesNotResume(t *testing.T) {
 		CompletedCount: 1,
 		CancelledCount: 1,
 		FailedCount:    0,
+		Strategy:       core.StrategyCollectAll,
 		Status:         core.FanOutPending,
 	}
 	store := &cancelSubJobStorage{mockStorage: base, fanOut: fo}
@@ -1034,6 +1049,8 @@ func TestQueue_CancelSubJob_FanOutIncomplete_DoesNotResume(t *testing.T) {
 	result, err := q.CancelSubJob(ctx, "sub-job-id")
 	require.NoError(t, err)
 	assert.NotNil(t, result)
+	assert.False(t, store.updateCalled)
+	assert.False(t, store.resumeCalled)
 }
 
 func TestQueue_CancelSubJob_AllFailed_StatusFailed(t *testing.T) {
@@ -1045,6 +1062,7 @@ func TestQueue_CancelSubJob_AllFailed_StatusFailed(t *testing.T) {
 		CompletedCount: 0,
 		FailedCount:    0,
 		CancelledCount: 2,
+		Strategy:       core.StrategyFailFast,
 		Status:         core.FanOutPending,
 	}
 	store := &cancelSubJobStorage{mockStorage: base, fanOut: fo}
@@ -1055,6 +1073,56 @@ func TestQueue_CancelSubJob_AllFailed_StatusFailed(t *testing.T) {
 	result, err := q.CancelSubJob(ctx, "sub-job-id")
 	require.NoError(t, err)
 	assert.NotNil(t, result)
+	assert.True(t, store.updateCalled)
+	assert.Equal(t, core.FanOutFailed, store.updatedStatus)
+}
+
+func TestQueueCancelSubJob_UsesStrategyAwareStatus(t *testing.T) {
+	base := newMockStorage()
+	fo := &core.FanOut{
+		ID:             "fo-collect-all",
+		ParentJobID:    "parent-job",
+		TotalCount:     2,
+		CompletedCount: 1,
+		CancelledCount: 1,
+		Strategy:       core.StrategyCollectAll,
+		Status:         core.FanOutPending,
+	}
+	store := &cancelSubJobStorage{mockStorage: base, fanOut: fo}
+
+	q := New(store)
+	result, err := q.CancelSubJob(context.Background(), "sub-job-id")
+	require.NoError(t, err)
+	require.NotNil(t, result)
+
+	assert.True(t, store.updateCalled)
+	assert.Equal(t, "fo-collect-all", store.updatedID)
+	assert.Equal(t, core.FanOutCompleted, store.updatedStatus)
+	assert.True(t, store.resumeCalled)
+	assert.Equal(t, "parent-job", store.resumedID)
+}
+
+func TestQueueCancelSubJob_CancelsLocalRunningHandler(t *testing.T) {
+	base := newMockStorage()
+	fo := &core.FanOut{
+		ID:             "fo-running",
+		ParentJobID:    "parent-job",
+		TotalCount:     3,
+		CancelledCount: 1,
+		Strategy:       core.StrategyCollectAll,
+		Status:         core.FanOutPending,
+	}
+	store := &cancelSubJobStorage{mockStorage: base, fanOut: fo}
+
+	q := New(store)
+	cancelled := false
+	q.RegisterRunningJob("sub-job-id", func() { cancelled = true })
+
+	result, err := q.CancelSubJob(context.Background(), "sub-job-id")
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assert.True(t, cancelled, "local running handler cancel function should be called")
+	assert.False(t, store.updateCalled, "incomplete fan-out should not be marked terminal")
 }
 
 // ---------------------------------------------------------------------------
