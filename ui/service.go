@@ -736,14 +736,17 @@ func (s *jobsService) purgeQueue(ctx context.Context, queueName, status string) 
 	return 0, connect.NewError(connect.CodeUnimplemented, nil)
 }
 
+// isValidPurgeStatus reports whether status names a terminal/idle job state that
+// is safe to bulk-purge. Running, retrying, and waiting are intentionally
+// excluded: purging a running/retrying job deletes a row a worker still holds
+// (locked_by/locked_until) so its later Complete/Fail/Heartbeat hits a vanished
+// row, and purging a waiting fan-out parent (or its in-flight sub-jobs) corrupts
+// fan-out accounting. Empty/unknown values are rejected.
 func isValidPurgeStatus(status string) bool {
 	switch core.JobStatus(status) {
 	case core.StatusPending,
-		core.StatusRunning,
 		core.StatusCompleted,
 		core.StatusFailed,
-		core.StatusRetrying,
-		core.StatusWaiting,
 		core.StatusCancelled,
 		core.StatusPaused:
 		return true

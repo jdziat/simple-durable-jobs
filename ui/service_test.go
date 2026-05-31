@@ -1090,6 +1090,18 @@ func TestPurgeQueue_RejectsEmptyNameAndStatus(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, int64(3), total)
 
+	// Non-terminal statuses must be rejected: purging a running/retrying job
+	// would orphan a worker's lock, and purging a waiting fan-out parent would
+	// corrupt fan-out accounting.
+	for _, badStatus := range []string{"running", "waiting", "retrying"} {
+		_, err = svc.PurgeQueue(ctx, connect.NewRequest(&jobsv1.PurgeQueueRequest{Name: "q", Status: badStatus}))
+		require.Error(t, err, "status %q must be rejected", badStatus)
+		assert.Equal(t, connect.CodeInvalidArgument, connect.CodeOf(err), "status %q", badStatus)
+	}
+	_, total, err = store.SearchJobs(ctx, JobFilter{Status: string(core.StatusFailed), Limit: 10})
+	require.NoError(t, err)
+	assert.Equal(t, int64(3), total)
+
 	resp, err := svc.PurgeQueue(ctx, connect.NewRequest(&jobsv1.PurgeQueueRequest{Name: "q", Status: "failed"}))
 	require.NoError(t, err)
 	assert.Equal(t, int64(2), resp.Msg.Deleted)
