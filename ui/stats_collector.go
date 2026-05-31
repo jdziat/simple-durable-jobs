@@ -2,6 +2,7 @@ package ui
 
 import (
 	"context"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -14,6 +15,7 @@ type StatsCollector struct {
 	queue     *queue.Queue
 	stats     StatsStorage
 	retention time.Duration
+	logger    *slog.Logger
 
 	mu       sync.Mutex
 	counters map[string]*statCounters
@@ -45,12 +47,22 @@ func WithStatsCollectorRetention(d time.Duration) StatsCollectorOption {
 	})
 }
 
+// WithStatsCollectorLogger sets the logger used for stats persistence errors.
+func WithStatsCollectorLogger(logger *slog.Logger) StatsCollectorOption {
+	return statsCollectorOptionFunc(func(sc *StatsCollector) {
+		if logger != nil {
+			sc.logger = logger
+		}
+	})
+}
+
 // NewStatsCollector creates a new StatsCollector.
 func NewStatsCollector(q *queue.Queue, stats StatsStorage, opts ...StatsCollectorOption) *StatsCollector {
 	sc := &StatsCollector{
 		queue:     q,
 		stats:     stats,
 		retention: 7 * 24 * time.Hour,
+		logger:    slog.Default(),
 		counters:  make(map[string]*statCounters),
 		ready:     make(chan struct{}),
 	}
@@ -128,8 +140,27 @@ func (sc *StatsCollector) Flush(ctx context.Context) {
 		if c.completed == 0 && c.failed == 0 && c.retried == 0 {
 			continue
 		}
-		_ = sc.stats.UpsertStatCounters(ctx, queueName, ts, c.completed, c.failed, c.retried)
+		if err := sc.stats.UpsertStatCounters(ctx, queueName, ts, c.completed, c.failed, c.retried); err != nil {
+			sc.logger.Error("failed to upsert stats counters",
+				"queue", queueName,
+				"completed", c.completed,
+				"failed", c.failed,
+				"retried", c.retried,
+				"error", err,
+			)
+			sc.remergeCounters(queueName, c)
+		}
 	}
+}
+
+func (sc *StatsCollector) remergeCounters(queueName string, failed *statCounters) {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+
+	c := sc.getCounters(queueName)
+	c.completed += failed.completed
+	c.failed += failed.failed
+	c.retried += failed.retried
 }
 
 func (sc *StatsCollector) snapshot(ctx context.Context) {
@@ -141,6 +172,7 @@ func (sc *StatsCollector) snapshot(ctx context.Context) {
 	for _, status := range []core.JobStatus{core.StatusPending, core.StatusRunning} {
 		jobs, err := storage.GetJobsByStatus(ctx, status, 10000)
 		if err != nil {
+			sc.logger.Error("failed to query jobs for stats snapshot", "status", status, "error", err)
 			continue
 		}
 		for _, job := range jobs {
@@ -159,12 +191,21 @@ func (sc *StatsCollector) snapshot(ctx context.Context) {
 	}
 
 	for queueName, d := range queueDepth {
-		_ = sc.stats.SnapshotQueueDepth(ctx, queueName, ts, d[0], d[1])
+		if err := sc.stats.SnapshotQueueDepth(ctx, queueName, ts, d[0], d[1]); err != nil {
+			sc.logger.Error("failed to snapshot queue depth",
+				"queue", queueName,
+				"pending", d[0],
+				"running", d[1],
+				"error", err,
+			)
+		}
 	}
 }
 
 func (sc *StatsCollector) prune(ctx context.Context) {
 	if sc.retention > 0 {
-		_, _ = sc.stats.PruneStats(ctx, time.Now().Add(-sc.retention))
+		if _, err := sc.stats.PruneStats(ctx, time.Now().Add(-sc.retention)); err != nil {
+			sc.logger.Error("failed to prune stats", "retention", sc.retention, "error", err)
+		}
 	}
 }

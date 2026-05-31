@@ -59,30 +59,30 @@ func main() {
 	// Schedule recurring jobs
 
 	// Health check every 5 seconds
-	queue.Schedule("health-check", jobs.Every(5*time.Second))
+	queue.Schedule("health-check", nil, jobs.Every(5*time.Second))
 	fmt.Println("Scheduled: health-check (every 5 seconds)")
 
 	// Cleanup every 10 seconds
-	queue.Schedule("cleanup-temp-files", jobs.Every(10*time.Second))
+	queue.Schedule("cleanup-temp-files", nil, jobs.Every(10*time.Second))
 	fmt.Println("Scheduled: cleanup-temp-files (every 10 seconds)")
 
 	// For demo purposes, using short intervals
 	// In production, you'd use Daily, Weekly, or Cron schedules:
 	//
 	// Daily report at 9:00 AM
-	// queue.Schedule("send-daily-report", jobs.Daily(9, 0))
+	// queue.Schedule("send-daily-report", nil, jobs.Daily(9, 0))
 	//
 	// Weekly backup on Sunday at 2:00 AM
-	// queue.Schedule("backup-database", jobs.Weekly(time.Sunday, 2, 0))
+	// queue.Schedule("backup-database", nil, jobs.Weekly(time.Sunday, 2, 0))
 	//
 	// Using cron expression (every hour at minute 0)
-	// queue.Schedule("health-check", jobs.Cron("0 * * * *"))
+	// queue.Schedule("health-check", nil, jobs.Cron("0 * * * *"))
 
 	// For demo, schedule these more frequently
-	queue.Schedule("send-daily-report", jobs.Every(15*time.Second))
+	queue.Schedule("send-daily-report", nil, jobs.Every(15*time.Second))
 	fmt.Println("Scheduled: send-daily-report (every 15 seconds for demo)")
 
-	queue.Schedule("backup-database", jobs.Every(20*time.Second))
+	queue.Schedule("backup-database", nil, jobs.Every(20*time.Second))
 	fmt.Println("Scheduled: backup-database (every 20 seconds for demo)")
 
 	// Start worker with scheduler enabled

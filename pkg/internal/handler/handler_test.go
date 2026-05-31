@@ -10,6 +10,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/jdziat/simple-durable-jobs/pkg/core"
 )
 
 // ---------------------------------------------------------------------------
@@ -186,6 +188,49 @@ func TestHandler_Execute_BadJSON(t *testing.T) {
 	_, err = h.Execute(context.Background(), []byte("not json"))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "unmarshal")
+}
+
+func TestHandler_Execute_EmptyArgsForTypedHandlerReturnsNoRetry(t *testing.T) {
+	called := false
+	fn := func(_ context.Context, _ testArgs) error {
+		called = true
+		return nil
+	}
+	h, err := NewHandler(fn)
+	require.NoError(t, err)
+
+	for _, argsJSON := range [][]byte{nil, []byte{}} {
+		_, err = h.Execute(context.Background(), argsJSON)
+		require.Error(t, err)
+
+		var noRetry *core.NoRetryError
+		assert.True(t, errors.As(err, &noRetry), "empty typed args must be classified as no-retry")
+		assert.False(t, called, "handler must not run when args cannot be decoded")
+	}
+}
+
+func TestHandler_Execute_NonEmptyMalformedArgsRemainRetryable(t *testing.T) {
+	fn := func(_ context.Context, _ testArgs) error { return nil }
+	h, err := NewHandler(fn)
+	require.NoError(t, err)
+
+	_, err = h.Execute(context.Background(), []byte("{bad}"))
+	require.Error(t, err)
+
+	var noRetry *core.NoRetryError
+	assert.False(t, errors.As(err, &noRetry), "malformed non-empty args should keep existing retry behavior")
+}
+
+func TestHandler_Execute_EmptyStructArgsEmptyInputUnchanged(t *testing.T) {
+	fn := func(_ context.Context, _ struct{}) error { return nil }
+	h, err := NewHandler(fn)
+	require.NoError(t, err)
+
+	_, err = h.Execute(context.Background(), nil)
+	require.Error(t, err)
+
+	var noRetry *core.NoRetryError
+	assert.False(t, errors.As(err, &noRetry), "struct{} empty-input behavior should remain a plain unmarshal error")
 }
 
 // ---------------------------------------------------------------------------

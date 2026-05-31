@@ -80,6 +80,10 @@ func (m *mockStorage) GetDueJobs(ctx context.Context, queues []string, limit int
 	return nil, nil
 }
 
+func (m *mockStorage) ClaimScheduledFire(ctx context.Context, name string, fireTime time.Time) (bool, error) {
+	return true, nil
+}
+
 func (m *mockStorage) Heartbeat(ctx context.Context, jobID, workerID string) error {
 	return nil
 }
@@ -160,6 +164,10 @@ func (m *mockStorage) GetWaitingJobsToResume(ctx context.Context) ([]*core.Job, 
 	return nil, nil
 }
 
+func (m *mockStorage) GetStalledFanOutParents(ctx context.Context, olderThan time.Time) ([]*core.Job, error) {
+	return nil, nil
+}
+
 func (m *mockStorage) SaveJobResult(ctx context.Context, jobID string, workerID string, result []byte) error {
 	return nil
 }
@@ -185,6 +193,18 @@ func TestQueue_Register_ValidHandler(t *testing.T) {
 	assert.True(t, q.HasHandler("test-job"))
 }
 
+func TestQueue_RegisterE_ValidHandler(t *testing.T) {
+	store := newMockStorage()
+	q := New(store)
+
+	err := q.RegisterE("test-job", func(ctx context.Context, args string) error {
+		return nil
+	})
+
+	require.NoError(t, err)
+	assert.True(t, q.HasHandler("test-job"))
+}
+
 func TestQueue_Register_InvalidName_Panics(t *testing.T) {
 	store := newMockStorage()
 	q := New(store)
@@ -196,6 +216,19 @@ func TestQueue_Register_InvalidName_Panics(t *testing.T) {
 	})
 }
 
+func TestQueue_RegisterE_InvalidName_ReturnsError(t *testing.T) {
+	store := newMockStorage()
+	q := New(store)
+
+	err := q.RegisterE("", func(ctx context.Context, args string) error {
+		return nil
+	})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid handler name")
+	assert.False(t, q.HasHandler(""))
+}
+
 func TestQueue_Register_InvalidHandler_Panics(t *testing.T) {
 	store := newMockStorage()
 	q := New(store)
@@ -203,6 +236,17 @@ func TestQueue_Register_InvalidHandler_Panics(t *testing.T) {
 	assert.Panics(t, func() {
 		q.Register("test-job", "not a function")
 	})
+}
+
+func TestQueue_RegisterE_InvalidHandler_ReturnsError(t *testing.T) {
+	store := newMockStorage()
+	q := New(store)
+
+	err := q.RegisterE("test-job", "not a function")
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "handler for")
+	assert.False(t, q.HasHandler("test-job"))
 }
 
 func TestQueue_Enqueue_UnregisteredHandler(t *testing.T) {
@@ -245,6 +289,7 @@ func TestQueue_Enqueue_WithOptions(t *testing.T) {
 		QueueOpt("high-priority"),
 		Priority(100),
 		Retries(5),
+		Timeout(30*time.Second),
 	)
 	require.NoError(t, err)
 
@@ -253,6 +298,56 @@ func TestQueue_Enqueue_WithOptions(t *testing.T) {
 	assert.Equal(t, "high-priority", job.Queue)
 	assert.Equal(t, 100, job.Priority)
 	assert.Equal(t, 5, job.MaxRetries)
+	assert.Equal(t, 30*time.Second, job.Timeout)
+}
+
+func TestQueue_Enqueue_DeterminismOption(t *testing.T) {
+	store := newMockStorage()
+	q := New(store)
+
+	q.Register("test-job", func(ctx context.Context, args string) error {
+		return nil
+	})
+
+	jobID, err := q.Enqueue(context.Background(), "test-job", "hello", Determinism(BestEffort))
+	require.NoError(t, err)
+
+	job, err := store.GetJob(context.Background(), jobID)
+	require.NoError(t, err)
+	assert.Equal(t, int(BestEffort), job.Determinism)
+}
+
+func TestQueue_Enqueue_DeterminismQueueDefault(t *testing.T) {
+	store := newMockStorage()
+	q := New(store)
+	q.SetDeterminism(BestEffort)
+
+	q.Register("test-job", func(ctx context.Context, args string) error {
+		return nil
+	})
+
+	jobID, err := q.Enqueue(context.Background(), "test-job", "hello")
+	require.NoError(t, err)
+
+	job, err := store.GetJob(context.Background(), jobID)
+	require.NoError(t, err)
+	assert.Equal(t, int(BestEffort), job.Determinism)
+}
+
+func TestQueue_Enqueue_DeterminismDefault(t *testing.T) {
+	store := newMockStorage()
+	q := New(store)
+
+	q.Register("test-job", func(ctx context.Context, args string) error {
+		return nil
+	})
+
+	jobID, err := q.Enqueue(context.Background(), "test-job", "hello")
+	require.NoError(t, err)
+
+	job, err := store.GetJob(context.Background(), jobID)
+	require.NoError(t, err)
+	assert.Equal(t, int(ExplicitCheckpoints), job.Determinism)
 }
 
 func TestQueue_Schedule(t *testing.T) {
@@ -261,12 +356,27 @@ func TestQueue_Schedule(t *testing.T) {
 
 	// Mock schedule
 	mockSched := &mockSchedule{}
-	q.Schedule("scheduled-job", mockSched, QueueOpt("scheduled"))
+	args := map[string]string{"tenant": "acme"}
+	runAt := time.Now().Add(time.Hour)
+	q.Schedule("scheduled-job", args, mockSched,
+		QueueOpt("scheduled"),
+		Priority(7),
+		Retries(4),
+		Delay(time.Minute),
+		At(runAt),
+		Timeout(30*time.Second),
+	)
 
 	scheduled := q.GetScheduledJobs()
 	require.NotNil(t, scheduled)
 	assert.Contains(t, scheduled, "scheduled-job")
+	assert.Equal(t, args, scheduled["scheduled-job"].Args)
 	assert.Equal(t, "scheduled", scheduled["scheduled-job"].Options.Queue)
+	assert.Equal(t, 7, scheduled["scheduled-job"].Options.Priority)
+	assert.Equal(t, 4, scheduled["scheduled-job"].Options.MaxRetries)
+	assert.Equal(t, time.Minute, scheduled["scheduled-job"].Options.Delay)
+	assert.Equal(t, runAt, *scheduled["scheduled-job"].Options.RunAt)
+	assert.Equal(t, 30*time.Second, scheduled["scheduled-job"].Options.Timeout)
 }
 
 type mockSchedule struct{}
@@ -320,6 +430,7 @@ func TestQueue_Emit_DropsWhenFull(t *testing.T) {
 
 	// Verify channel is full
 	assert.Len(t, ch, 100)
+	assert.Equal(t, uint64(1), q.DroppedEventCount())
 }
 
 func TestQueue_Unsubscribe_StopsDelivery(t *testing.T) {
@@ -605,6 +716,8 @@ func TestQueue_ResumeJob(t *testing.T) {
 	store := newMockStorage()
 	q := New(store)
 	ctx := context.Background()
+	events := q.Events()
+	defer q.Unsubscribe(events)
 
 	q.Register("test-job", func(ctx context.Context, args struct{}) error {
 		return nil
@@ -616,9 +729,25 @@ func TestQueue_ResumeJob(t *testing.T) {
 	// Pause then resume
 	err = q.PauseJob(ctx, jobID)
 	require.NoError(t, err)
+	select {
+	case event := <-events:
+		paused, ok := event.(*core.JobPaused)
+		require.True(t, ok)
+		assert.Equal(t, jobID, paused.Job.ID)
+	default:
+		t.Fatal("expected job paused event")
+	}
 
 	err = q.ResumeJob(ctx, jobID)
 	require.NoError(t, err)
+	select {
+	case event := <-events:
+		resumed, ok := event.(*core.JobResumed)
+		require.True(t, ok)
+		assert.Equal(t, jobID, resumed.Job.ID)
+	default:
+		t.Fatal("expected job resumed event")
+	}
 
 	paused, err := q.IsJobPaused(ctx, jobID)
 	require.NoError(t, err)
@@ -1041,7 +1170,7 @@ func TestQueue_GetScheduledJobs_ReturnsCopy(t *testing.T) {
 	store := newMockStorage()
 	q := New(store)
 
-	q.Schedule("job-a", nil)
+	q.Schedule("job-a", nil, nil)
 	scheduled := q.GetScheduledJobs()
 	require.Contains(t, scheduled, "job-a")
 

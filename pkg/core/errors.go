@@ -3,6 +3,7 @@ package core
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -22,6 +23,7 @@ var (
 	ErrQueueNotPaused     = errors.New("jobs: queue is not paused")
 	ErrCannotPauseStatus  = errors.New("jobs: cannot pause job in current status")
 	ErrJobNotCompleted    = errors.New("jobs: job has not completed")
+	ErrNoResult           = errors.New("jobs: completed job has no result")
 )
 
 // NoRetryError indicates an error that should not be retried.
@@ -59,4 +61,80 @@ func (e *RetryAfterError) Unwrap() error {
 // RetryAfter wraps an error to indicate it should be retried after a delay.
 func RetryAfter(d time.Duration, err error) error {
 	return &RetryAfterError{Err: err, Delay: d}
+}
+
+const (
+	CheckpointErrorKindNoRetry    = "no_retry"
+	CheckpointErrorKindRetryAfter = "retry_after"
+	CheckpointErrorKindSentinel   = "sentinel"
+)
+
+// CheckpointErrorKind returns the durable error discriminator for supported error types.
+func CheckpointErrorKind(err error) (kind string, delay time.Duration) {
+	var noRetry *NoRetryError
+	if errors.As(err, &noRetry) {
+		return CheckpointErrorKindNoRetry, 0
+	}
+
+	var retryAfter *RetryAfterError
+	if errors.As(err, &retryAfter) {
+		return CheckpointErrorKindRetryAfter, retryAfter.Delay
+	}
+
+	if SentinelErrorByMessage(err.Error()) != nil {
+		return CheckpointErrorKindSentinel, 0
+	}
+
+	return "", 0
+}
+
+// RehydrateCheckpointError reconstructs supported checkpointed error types.
+func RehydrateCheckpointError(message, kind string, delay time.Duration) error {
+	causeMessage := message
+	switch kind {
+	case CheckpointErrorKindNoRetry:
+		causeMessage = strings.TrimPrefix(message, "no retry: ")
+	case CheckpointErrorKindRetryAfter:
+		causeMessage = strings.TrimPrefix(message, fmt.Sprintf("retry after %v: ", delay))
+	}
+
+	base := SentinelErrorByMessage(causeMessage)
+	if base == nil {
+		base = errors.New(causeMessage)
+	}
+
+	switch kind {
+	case CheckpointErrorKindNoRetry:
+		return NoRetry(base)
+	case CheckpointErrorKindRetryAfter:
+		return RetryAfter(delay, base)
+	default:
+		return base
+	}
+}
+
+// SentinelErrorByMessage returns a known sentinel error with the same stored message.
+func SentinelErrorByMessage(message string) error {
+	for _, err := range []error{
+		ErrInvalidJobTypeName,
+		ErrJobTypeNameTooLong,
+		ErrInvalidQueueName,
+		ErrQueueNameTooLong,
+		ErrJobArgsTooLarge,
+		ErrJobNotOwned,
+		ErrDuplicateJob,
+		ErrUniqueKeyTooLong,
+		ErrJobAlreadyPaused,
+		ErrJobNotPaused,
+		ErrQueueAlreadyPaused,
+		ErrQueueNotPaused,
+		ErrCannotPauseStatus,
+		ErrJobNotCompleted,
+		ErrNoResult,
+	} {
+		if err.Error() == message {
+			return err
+		}
+	}
+	return nil
 }

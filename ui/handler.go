@@ -2,9 +2,12 @@ package ui
 
 import (
 	"context"
+	"errors"
 	"io/fs"
+	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 
 	"connectrpc.com/connect"
 	"golang.org/x/net/http2"
@@ -13,6 +16,14 @@ import (
 
 	"github.com/jdziat/simple-durable-jobs/pkg/core"
 	"github.com/jdziat/simple-durable-jobs/ui/gen/jobs/v1/jobsv1connect"
+)
+
+var (
+	statsCollectorMu      sync.Mutex
+	statsCollectorsByDB   = map[*gorm.DB]bool{}
+	startStatsCollectorFn = func(ctx context.Context, collector *StatsCollector) {
+		go collector.Start(ctx)
+	}
 )
 
 // Handler creates an http.Handler for the jobs UI dashboard.
@@ -33,16 +44,18 @@ func Handler(storage core.Storage, opts ...Option) http.Handler {
 	var statsStorage StatsStorage
 	if gs, ok := storage.(interface{ DB() *gorm.DB }); ok {
 		statsStore := NewGormStatsStorage(gs.DB())
-		_ = statsStore.MigrateStats(context.Background())
+		if err := statsStore.MigrateStats(context.Background()); err != nil {
+			slog.Default().Error("failed to migrate stats storage", "error", err)
+		}
 		statsStorage = statsStore
 
-		if cfg.queue != nil {
+		if cfg.queue != nil && registerStatsCollector(gs.DB()) {
 			var collectorOpts []StatsCollectorOption
 			if cfg.statsRetention > 0 {
 				collectorOpts = append(collectorOpts, WithStatsCollectorRetention(cfg.statsRetention))
 			}
 			collector := NewStatsCollector(cfg.queue, statsStorage, collectorOpts...)
-			go collector.Start(cfg.ctx)
+			startStatsCollectorFn(cfg.ctx, collector)
 		}
 	}
 
@@ -54,7 +67,7 @@ func Handler(storage core.Storage, opts ...Option) http.Handler {
 	// Register Connect-RPC handler
 	path, handler := jobsv1connect.NewJobsServiceHandler(
 		svc,
-		connect.WithInterceptors(),
+		connect.WithInterceptors(writeAuthInterceptor(cfg.middleware != nil || cfg.insecureAllowUnauthenticatedWrites)),
 	)
 	mux.Handle(path, handler)
 
@@ -90,6 +103,40 @@ func Handler(storage core.Storage, opts ...Option) http.Handler {
 	}
 
 	return h2cHandler
+}
+
+func registerStatsCollector(db *gorm.DB) bool {
+	statsCollectorMu.Lock()
+	defer statsCollectorMu.Unlock()
+
+	if statsCollectorsByDB[db] {
+		return false
+	}
+	statsCollectorsByDB[db] = true
+	return true
+}
+
+var mutatingProcedures = map[string]struct{}{
+	jobsv1connect.JobsServiceRetryJobProcedure:       {},
+	jobsv1connect.JobsServiceDeleteJobProcedure:      {},
+	jobsv1connect.JobsServiceBulkRetryJobsProcedure:  {},
+	jobsv1connect.JobsServiceBulkDeleteJobsProcedure: {},
+	jobsv1connect.JobsServicePauseJobProcedure:       {},
+	jobsv1connect.JobsServiceResumeJobProcedure:      {},
+	jobsv1connect.JobsServicePauseQueueProcedure:     {},
+	jobsv1connect.JobsServiceResumeQueueProcedure:    {},
+	jobsv1connect.JobsServicePurgeQueueProcedure:     {},
+}
+
+func writeAuthInterceptor(allowWrites bool) connect.Interceptor {
+	return connect.UnaryInterceptorFunc(func(next connect.UnaryFunc) connect.UnaryFunc {
+		return connect.UnaryFunc(func(ctx context.Context, req connect.AnyRequest) (connect.AnyResponse, error) {
+			if _, mutates := mutatingProcedures[req.Spec().Procedure]; mutates && !allowWrites {
+				return nil, connect.NewError(connect.CodePermissionDenied, errors.New("jobs UI write RPCs require auth middleware or explicit insecure opt-in"))
+			}
+			return next(ctx, req)
+		})
+	})
 }
 
 const placeholderHTML = `<!DOCTYPE html>

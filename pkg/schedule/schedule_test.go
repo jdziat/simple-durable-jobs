@@ -9,10 +9,10 @@ import (
 
 func TestEvery(t *testing.T) {
 	s := Every(5 * time.Minute)
-	now := time.Now()
+	now := time.Date(2024, 1, 1, 12, 2, 30, 0, time.UTC)
 	next := s.Next(now)
 
-	assert.Equal(t, now.Add(5*time.Minute), next)
+	assert.Equal(t, time.Date(2024, 1, 1, 12, 5, 0, 0, time.UTC), next)
 }
 
 func TestEvery_MultipleNext(t *testing.T) {
@@ -26,6 +26,16 @@ func TestEvery_MultipleNext(t *testing.T) {
 	assert.Equal(t, time.Date(2024, 1, 1, 13, 0, 0, 0, time.UTC), next1)
 	assert.Equal(t, time.Date(2024, 1, 1, 14, 0, 0, 0, time.UTC), next2)
 	assert.Equal(t, time.Date(2024, 1, 1, 15, 0, 0, 0, time.UTC), next3)
+}
+
+func TestEvery_NextAlignsToIntervalBoundary(t *testing.T) {
+	s := Every(5 * time.Minute)
+	fromA := time.Date(2024, 1, 1, 12, 2, 10, 0, time.UTC)
+	fromB := time.Date(2024, 1, 1, 12, 4, 59, 0, time.UTC)
+
+	want := time.Date(2024, 1, 1, 12, 5, 0, 0, time.UTC)
+	assert.Equal(t, want, s.Next(fromA))
+	assert.Equal(t, want, s.Next(fromB))
 }
 
 func TestDaily(t *testing.T) {
@@ -69,7 +79,8 @@ func TestWeekly_DifferentDay(t *testing.T) {
 }
 
 func TestCron(t *testing.T) {
-	s := Cron("0 9 * * *") // Every day at 9 AM
+	s, err := Cron("0 9 * * *") // Every day at 9 AM
+	assert.NoError(t, err)
 	from := time.Date(2024, 1, 1, 8, 0, 0, 0, time.UTC)
 	next := s.Next(from)
 
@@ -78,7 +89,8 @@ func TestCron(t *testing.T) {
 }
 
 func TestCron_MultipleFields(t *testing.T) {
-	s := Cron("30 14 * * 1-5")                          // 2:30 PM on weekdays
+	s, err := Cron("30 14 * * 1-5") // 2:30 PM on weekdays
+	assert.NoError(t, err)
 	from := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC) // Monday
 
 	next := s.Next(from)
@@ -86,10 +98,30 @@ func TestCron_MultipleFields(t *testing.T) {
 	assert.Equal(t, 30, next.Minute())
 }
 
-func TestCron_InvalidExpression_Panics(t *testing.T) {
+func TestCron_InvalidExpression_ReturnsError(t *testing.T) {
+	s, err := Cron("invalid cron")
+	assert.Error(t, err)
+	assert.Nil(t, s)
+}
+
+func TestMustCron_InvalidExpression_Panics(t *testing.T) {
 	assert.Panics(t, func() {
-		Cron("invalid cron")
+		MustCron("invalid cron")
 	})
+}
+
+func TestCron_UsesUTC(t *testing.T) {
+	t.Setenv("TZ", "America/Los_Angeles")
+	origLocal := time.Local
+	defer func() { time.Local = origLocal }()
+	time.Local = time.FixedZone("PST", -8*60*60)
+
+	cronSched, err := Cron("0 9 * * *")
+	assert.NoError(t, err)
+	dailySched := Daily(9, 0)
+	from := time.Date(2024, 1, 1, 8, 30, 0, 0, time.UTC)
+
+	assert.Equal(t, dailySched.Next(from), cronSched.Next(from))
 }
 
 func TestScheduleInterface(t *testing.T) {
@@ -97,5 +129,5 @@ func TestScheduleInterface(t *testing.T) {
 	var _ Schedule = Every(time.Minute)        //nolint:staticcheck // interface conformance check
 	var _ Schedule = Daily(9, 0)               //nolint:staticcheck // interface conformance check
 	var _ Schedule = Weekly(time.Monday, 9, 0) //nolint:staticcheck // interface conformance check
-	var _ Schedule = Cron("* * * * *")         //nolint:staticcheck // interface conformance check
+	var _ Schedule = MustCron("* * * * *")     //nolint:staticcheck // interface conformance check
 }

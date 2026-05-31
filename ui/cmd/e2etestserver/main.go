@@ -54,7 +54,7 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	handler := ui.Handler(store, ui.WithQueue(q), ui.WithContext(ctx))
+	handler := ui.Handler(store, ui.WithQueue(q), ui.WithContext(ctx), ui.WithInsecureAllowUnauthenticatedWrites())
 
 	ln, err := net.Listen("tcp", "127.0.0.1:"+*port)
 	if err != nil {
@@ -62,8 +62,8 @@ func main() {
 	}
 
 	addr := ln.Addr().(*net.TCPAddr)
-	fmt.Fprintf(os.Stdout, "E2E_BASE_URL=http://127.0.0.1:%d\n", addr.Port)
-	os.Stdout.Sync()
+	_, _ = fmt.Fprintf(os.Stdout, "E2E_BASE_URL=http://127.0.0.1:%d\n", addr.Port)
+	_ = os.Stdout.Sync()
 
 	srv := &http.Server{Handler: handler}
 	go func() {

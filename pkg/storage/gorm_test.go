@@ -194,6 +194,38 @@ func TestDequeue_ReturnsPendingJobAndSetsRunning(t *testing.T) {
 	assert.Equal(t, 1, got.Attempt, "Attempt should be incremented to 1")
 }
 
+func TestDequeue_PreservesPayloadColumns(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	args := []byte(`{"large":"args"}`)
+	result := []byte(`{"previous":"result"}`)
+	traceContext := []byte(`trace-context`)
+	job := &core.Job{
+		Type:         "task.run",
+		Queue:        "default",
+		Args:         args,
+		Result:       result,
+		TraceContext: traceContext,
+	}
+	require.NoError(t, s.Enqueue(ctx, job))
+
+	got, err := s.Dequeue(ctx, []string{"default"}, "worker-1")
+	require.NoError(t, err)
+	require.NotNil(t, got)
+
+	assert.Equal(t, args, got.Args)
+	assert.Equal(t, result, got.Result)
+	assert.Equal(t, traceContext, got.TraceContext)
+
+	row, err := s.GetJob(ctx, got.ID)
+	require.NoError(t, err)
+	require.NotNil(t, row)
+	assert.Equal(t, args, row.Args)
+	assert.Equal(t, result, row.Result)
+	assert.Equal(t, traceContext, row.TraceContext)
+}
+
 func TestDequeue_RespectsQueueFilter(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStorage(t)
@@ -527,6 +559,32 @@ func TestHeartbeat_FailsWhenWorkerDoesNotOwnJob(t *testing.T) {
 	assert.True(t, errors.Is(err, core.ErrJobNotOwned))
 }
 
+func TestHeartbeat_FailsWhenJobIsNoLongerRunning(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	require.NoError(t, s.Enqueue(ctx, newTestJob("default", "task.run")))
+
+	got, err := s.Dequeue(ctx, []string{"default"}, "worker-1")
+	require.NoError(t, err)
+	require.NotNil(t, got)
+
+	before := *got.LockedUntil
+	require.NoError(t, s.db.Model(&core.Job{}).
+		Where("id = ?", got.ID).
+		Update("status", core.StatusCompleted).Error)
+
+	err = s.Heartbeat(ctx, got.ID, "worker-1")
+	require.ErrorIs(t, err, core.ErrJobNotOwned)
+
+	after, err := s.GetJob(ctx, got.ID)
+	require.NoError(t, err)
+	require.NotNil(t, after)
+	require.NotNil(t, after.LockedUntil)
+	assert.WithinDuration(t, before, *after.LockedUntil, time.Millisecond)
+	assert.Nil(t, after.LastHeartbeatAt)
+}
+
 func TestReleaseStaleLocks_ResetsExpiredRunningJobsToPending(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStorage(t)
@@ -555,6 +613,37 @@ func TestReleaseStaleLocks_ResetsExpiredRunningJobsToPending(t *testing.T) {
 	assert.Equal(t, core.StatusPending, row.Status)
 	assert.Empty(t, row.LockedBy)
 	assert.Nil(t, row.LockedUntil)
+}
+
+func TestReleaseStaleLocks_ReapedJobIsOrphanedAndDequeuable(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	require.NoError(t, s.Enqueue(ctx, newTestJob("default", "task.run")))
+
+	got, err := s.Dequeue(ctx, []string{"default"}, "worker-1")
+	require.NoError(t, err)
+	require.NotNil(t, got)
+
+	past := time.Now().Add(-2 * time.Hour)
+	require.NoError(t, s.db.Model(&core.Job{}).
+		Where("id = ?", got.ID).
+		Update("locked_until", past).Error)
+
+	released, err := s.ReleaseStaleLocks(ctx, time.Hour)
+	require.NoError(t, err)
+	require.Equal(t, []string{got.ID}, released)
+
+	orphaned, err := s.FindOrphanedJobs(ctx, []string{got.ID}, "worker-1")
+	require.NoError(t, err)
+	require.Equal(t, []string{got.ID}, orphaned)
+
+	reacquired, err := s.Dequeue(ctx, []string{"default"}, "worker-2")
+	require.NoError(t, err)
+	require.NotNil(t, reacquired)
+	assert.Equal(t, got.ID, reacquired.ID)
+	assert.Equal(t, core.StatusRunning, reacquired.Status)
+	assert.Equal(t, "worker-2", reacquired.LockedBy)
 }
 
 func TestReleaseStaleLocks_DoesNotTouchFreshLocks(t *testing.T) {
@@ -1278,6 +1367,32 @@ func TestSaveJobResult_AndRetrieveViaGetJob(t *testing.T) {
 	assert.Equal(t, result, refreshed.Result)
 }
 
+func TestSaveJobResult_DoesNotOverwriteCompletedJob(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	job := newTestJob("default", "task.run")
+	require.NoError(t, s.Enqueue(ctx, job))
+
+	got, err := s.Dequeue(ctx, []string{"default"}, "worker-1")
+	require.NoError(t, err)
+	require.NotNil(t, got)
+
+	original := []byte(`{"value":"original"}`)
+	require.NoError(t, s.SaveJobResult(ctx, got.ID, "worker-1", original))
+	require.NoError(t, s.db.Model(&core.Job{}).
+		Where("id = ?", got.ID).
+		Update("status", core.StatusCompleted).Error)
+
+	err = s.SaveJobResult(ctx, got.ID, "worker-1", []byte(`{"value":"overwrite"}`))
+	require.ErrorIs(t, err, core.ErrJobNotOwned)
+
+	refreshed, err := s.GetJob(ctx, got.ID)
+	require.NoError(t, err)
+	require.NotNil(t, refreshed)
+	assert.Equal(t, original, refreshed.Result)
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // EnqueueBatch
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1447,6 +1562,116 @@ func TestEnqueueUnique_DifferentKeysCreateDifferentJobs(t *testing.T) {
 	require.NoError(t, s.EnqueueUnique(ctx, job1, "key:a"))
 	require.NoError(t, s.EnqueueUnique(ctx, job2, "key:b"))
 	assert.NotEqual(t, job1.ID, job2.ID)
+}
+
+func TestEnqueueUnique_Concurrent_NoDuplicates(t *testing.T) {
+	ctx := context.Background()
+	s := newConcurrentTestStorage(t)
+
+	const concurrency = 20
+	const key = "unique:concurrent:sqlite"
+
+	start := make(chan struct{})
+	errs := make(chan error, concurrency)
+	var wg sync.WaitGroup
+
+	for range concurrency {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			job := &core.Job{Type: "email.send", Queue: "default"}
+			<-start
+			errs <- s.EnqueueUnique(ctx, job, key)
+		}()
+	}
+
+	close(start)
+	wg.Wait()
+	close(errs)
+
+	successes := 0
+	duplicates := 0
+	for err := range errs {
+		switch {
+		case err == nil:
+			successes++
+		case errors.Is(err, core.ErrDuplicateJob):
+			duplicates++
+		default:
+			require.NoError(t, err)
+		}
+	}
+
+	assert.Equal(t, 1, successes, "exactly one concurrent enqueue should succeed")
+	assert.Equal(t, concurrency-1, duplicates, "all remaining enqueues should report duplicates")
+
+	var count int64
+	require.NoError(t, s.DB().Model(&core.Job{}).
+		Where("unique_key = ?", key).
+		Count(&count).Error)
+	assert.EqualValues(t, 1, count, "concurrent EnqueueUnique produced duplicate rows")
+}
+
+func TestClaimScheduledFire_ConcurrentExactlyOnceAndTimeOrdering(t *testing.T) {
+	ctx := context.Background()
+	s := newConcurrentTestStorage(t)
+
+	const concurrency = 20
+	const name = "daily-report"
+	fireTime := time.Now().UTC().Truncate(time.Millisecond)
+
+	start := make(chan struct{})
+	results := make(chan bool, concurrency)
+	errs := make(chan error, concurrency)
+	var wg sync.WaitGroup
+
+	for range concurrency {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			claimed, err := s.ClaimScheduledFire(ctx, name, fireTime)
+			if err != nil {
+				errs <- err
+				return
+			}
+			results <- claimed
+		}()
+	}
+
+	close(start)
+	wg.Wait()
+	close(results)
+	close(errs)
+
+	for err := range errs {
+		require.NoError(t, err)
+	}
+
+	claims := 0
+	for claimed := range results {
+		if claimed {
+			claims++
+		}
+	}
+	assert.Equal(t, 1, claims, "exactly one caller should claim a schedule boundary")
+
+	claimed, err := s.ClaimScheduledFire(ctx, name, fireTime)
+	require.NoError(t, err)
+	assert.False(t, claimed, "equal fire time should not claim again")
+
+	claimed, err = s.ClaimScheduledFire(ctx, name, fireTime.Add(-time.Second))
+	require.NoError(t, err)
+	assert.False(t, claimed, "earlier fire time should not claim")
+
+	later := fireTime.Add(time.Second)
+	claimed, err = s.ClaimScheduledFire(ctx, name, later)
+	require.NoError(t, err)
+	assert.True(t, claimed, "strictly later fire time should claim")
+
+	claimed, err = s.ClaimScheduledFire(ctx, name, later)
+	require.NoError(t, err)
+	assert.False(t, claimed, "later boundary should also be claimed only once")
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1724,6 +1949,83 @@ func TestGetWaitingJobsToResume_DeduplicatesParentsWithMultipleTerminatedFanOuts
 	require.NoError(t, err)
 	require.Len(t, waiting, 1)
 	assert.Equal(t, parent.ID, waiting[0].ID)
+}
+
+func TestGetWaitingJobsToResume_LimitsResumeBatch(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	for i := 0; i < maxResumeBatch+25; i++ {
+		parent := &core.Job{Type: "workflow.bulk", Queue: "default", Status: core.StatusWaiting}
+		require.NoError(t, s.Enqueue(ctx, parent))
+		require.NoError(t, s.CreateFanOut(ctx, &core.FanOut{
+			ParentJobID: parent.ID,
+			TotalCount:  1,
+			Status:      core.FanOutCompleted,
+		}))
+	}
+
+	waiting, err := s.GetWaitingJobsToResume(ctx)
+	require.NoError(t, err)
+	assert.Len(t, waiting, maxResumeBatch)
+}
+
+func TestGetStalledFanOutParents(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	old := time.Now().Add(-10 * time.Minute)
+	recent := time.Now()
+	cutoff := time.Now().Add(-2 * time.Minute)
+
+	oldIncompleteParent := &core.Job{Type: "workflow.old-incomplete", Queue: "default", Status: core.StatusWaiting}
+	require.NoError(t, s.Enqueue(ctx, oldIncompleteParent))
+	oldIncompleteFanOut := &core.FanOut{
+		ParentJobID: oldIncompleteParent.ID,
+		TotalCount:  3,
+		Status:      core.FanOutPending,
+		CreatedAt:   old,
+	}
+	require.NoError(t, s.CreateFanOut(ctx, oldIncompleteFanOut))
+
+	recentParent := &core.Job{Type: "workflow.recent", Queue: "default", Status: core.StatusWaiting}
+	require.NoError(t, s.Enqueue(ctx, recentParent))
+	recentFanOut := &core.FanOut{
+		ParentJobID: recentParent.ID,
+		TotalCount:  3,
+		Status:      core.FanOutPending,
+		CreatedAt:   recent,
+	}
+	require.NoError(t, s.CreateFanOut(ctx, recentFanOut))
+
+	completeParent := &core.Job{Type: "workflow.complete", Queue: "default", Status: core.StatusWaiting}
+	require.NoError(t, s.Enqueue(ctx, completeParent))
+	completeFanOut := &core.FanOut{
+		ParentJobID: completeParent.ID,
+		TotalCount:  2,
+		Status:      core.FanOutPending,
+		CreatedAt:   old,
+	}
+	require.NoError(t, s.CreateFanOut(ctx, completeFanOut))
+	require.NoError(t, s.EnqueueBatch(ctx, []*core.Job{
+		{Type: "sub", Queue: "default", FanOutID: &completeFanOut.ID, FanOutIndex: 0},
+		{Type: "sub", Queue: "default", FanOutID: &completeFanOut.ID, FanOutIndex: 1},
+	}))
+
+	terminalParent := &core.Job{Type: "workflow.terminal", Queue: "default", Status: core.StatusWaiting}
+	require.NoError(t, s.Enqueue(ctx, terminalParent))
+	terminalFanOut := &core.FanOut{
+		ParentJobID: terminalParent.ID,
+		TotalCount:  3,
+		Status:      core.FanOutCompleted,
+		CreatedAt:   old,
+	}
+	require.NoError(t, s.CreateFanOut(ctx, terminalFanOut))
+
+	stalled, err := s.GetStalledFanOutParents(ctx, cutoff)
+	require.NoError(t, err)
+	require.Len(t, stalled, 1)
+	assert.Equal(t, oldIncompleteParent.ID, stalled[0].ID)
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -2986,6 +3288,7 @@ func TestEnqueueBatch_ConcurrentUniqueKey_NoDuplicates(t *testing.T) {
 //   - locked_by changed (reclaimed by another worker)
 //   - locked_by IS NULL (stale-lock reaper released)
 //   - status terminal (cancelled by a fan-out or completed by a replay)
+//
 // and must NOT return jobs still legitimately owned by the caller.
 func TestFindOrphanedJobs_FlagsReclaimedAndCancelled(t *testing.T) {
 	ctx := context.Background()

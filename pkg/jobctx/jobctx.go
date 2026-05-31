@@ -70,19 +70,17 @@ func LoadPhaseCheckpoint[T any](ctx context.Context, phaseName string) (T, bool)
 		return zero, false
 	}
 
-	// Search checkpoints for matching phase name
 	cs.Mu.Lock()
-	defer cs.Mu.Unlock()
+	cp, ok := cs.Checkpoints[intctx.CheckpointKey{Index: -1, Type: phaseName}]
+	cs.Mu.Unlock()
 
-	for _, cp := range cs.Checkpoints {
-		if cp.CallType == phaseName && cp.CallIndex == -1 {
-			var result T
-			if err := json.Unmarshal(cp.Result, &result); err != nil {
-				return zero, false
-			}
-			return result, true
-		}
+	if !ok {
+		return zero, false
 	}
 
-	return zero, false
+	var result T
+	if err := json.Unmarshal(cp.Result, &result); err != nil {
+		return zero, false
+	}
+	return result, true
 }

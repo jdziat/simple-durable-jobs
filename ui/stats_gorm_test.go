@@ -2,18 +2,27 @@ package ui
 
 import (
 	"context"
+	"os"
+	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/driver/postgres"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 )
 
 func setupTestStatsDB(t *testing.T) *gormStatsStorage {
-	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{
+	return setupTestStatsDBWithDialector(t, sqlite.Open(":memory:"))
+}
+
+func setupTestStatsDBWithDialector(t *testing.T, dialector gorm.Dialector) *gormStatsStorage {
+	t.Helper()
+	db, err := gorm.Open(dialector, &gorm.Config{
 		Logger: logger.Default.LogMode(logger.Silent),
 	})
 	require.NoError(t, err)
@@ -22,6 +31,91 @@ func setupTestStatsDB(t *testing.T) *gormStatsStorage {
 	err = s.MigrateStats(context.Background())
 	require.NoError(t, err)
 	return s
+}
+
+func TestGormStatsStorage_MigrateCreatesUniqueQueueTimestampIndex(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "stats.db")
+	db, err := gorm.Open(sqlite.Open(dbPath), &gorm.Config{
+		Logger: logger.Default.LogMode(logger.Silent),
+	})
+	require.NoError(t, err)
+
+	s := &gormStatsStorage{db: db}
+	require.NoError(t, s.MigrateStats(context.Background()))
+
+	rows, err := db.Raw("PRAGMA index_list(job_stats)").Rows()
+	require.NoError(t, err)
+	defer func() { _ = rows.Close() }()
+
+	foundUnique := false
+	for rows.Next() {
+		var seq int
+		var name string
+		var unique int
+		var origin string
+		var partial int
+		require.NoError(t, rows.Scan(&seq, &name, &unique, &origin, &partial))
+		if name == "idx_job_stats_queue_ts" && unique == 1 {
+			foundUnique = true
+		}
+	}
+	require.NoError(t, rows.Err())
+	assert.True(t, foundUnique, "idx_job_stats_queue_ts should be unique")
+}
+
+func TestGormStatsStorage_ConcurrentUpsertStatCountersSQLite(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "stats.db")
+	s := setupTestStatsDBWithDialector(t, sqlite.Open(dbPath+"?_txlock=immediate&_busy_timeout=5000"))
+	runConcurrentUpsertStatCountersTest(t, s)
+}
+
+func TestGormStatsStorage_ConcurrentUpsertStatCountersPostgres(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL not set; orchestrator should run this against PostgreSQL externally")
+	}
+
+	s := setupTestStatsDBWithDialector(t, postgres.Open(dsn))
+	runConcurrentUpsertStatCountersTest(t, s)
+}
+
+func runConcurrentUpsertStatCountersTest(t *testing.T, s *gormStatsStorage) {
+	t.Helper()
+
+	ctx := context.Background()
+	const workers = 20
+	queue := "concurrent"
+	ts := time.Now().Truncate(time.Minute)
+
+	var wg sync.WaitGroup
+	errs := make(chan error, workers)
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs <- s.UpsertStatCounters(ctx, queue, ts, 1, 0, 0)
+		}()
+	}
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		require.NoError(t, err)
+	}
+
+	var count int64
+	require.NoError(t, s.db.WithContext(ctx).Model(&JobStat{}).
+		Where("queue = ? AND timestamp = ?", queue, ts).
+		Count(&count).Error)
+	require.Equal(t, int64(1), count)
+
+	var stat JobStat
+	require.NoError(t, s.db.WithContext(ctx).
+		Where("queue = ? AND timestamp = ?", queue, ts).
+		First(&stat).Error)
+	assert.Equal(t, int64(workers), stat.Completed)
+	assert.Equal(t, int64(0), stat.Failed)
+	assert.Equal(t, int64(0), stat.Retried)
 }
 
 func TestGormStatsStorage_UpsertAndQuery(t *testing.T) {

@@ -31,6 +31,7 @@ type Storage interface {
 
 	// Scheduling
 	GetDueJobs(ctx context.Context, queues []string, limit int) ([]*Job, error)
+	ClaimScheduledFire(ctx context.Context, name string, fireTime time.Time) (bool, error)
 
 	// Locking
 	Heartbeat(ctx context.Context, jobID string, workerID string) error
@@ -92,6 +93,7 @@ type Storage interface {
 	SuspendJob(ctx context.Context, jobID string, workerID string) error
 	ResumeJob(ctx context.Context, jobID string) (bool, error)
 	GetWaitingJobsToResume(ctx context.Context) ([]*Job, error)
+	GetStalledFanOutParents(ctx context.Context, olderThan time.Time) ([]*Job, error)
 
 	// Result storage
 	SaveJobResult(ctx context.Context, jobID string, workerID string, result []byte) error

@@ -251,7 +251,7 @@ func TestQueue_Schedule(t *testing.T) {
 		return nil
 	})
 
-	queue.Schedule("scheduled-task", jobs.Every(200*time.Millisecond))
+	queue.Schedule("scheduled-task", nil, jobs.Every(200*time.Millisecond))
 
 	worker := queue.NewWorker(jobs.WithScheduler(true))
 	workerCtx, cancel := context.WithTimeout(ctx, 1*time.Second)
@@ -273,7 +273,7 @@ func TestQueue_Schedule_WithOptions(t *testing.T) {
 		return nil
 	})
 
-	queue.Schedule("priority-scheduled", jobs.Every(100*time.Millisecond),
+	queue.Schedule("priority-scheduled", nil, jobs.Every(100*time.Millisecond),
 		jobs.QueueOpt("high-priority"),
 		jobs.Priority(100),
 	)

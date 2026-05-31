@@ -29,6 +29,11 @@ type WorkerConfig struct {
 	EnableScheduler bool
 	currentQueue    string // internal: scopes Concurrency to this queue
 
+	// DrainTimeout is how long Start waits after its context is cancelled for
+	// in-flight handlers to finish and persist their result before forcing
+	// cancellation. A non-positive value aborts immediately. Default: 30 seconds.
+	DrainTimeout time.Duration
+
 	// StorageRetry configures retry behavior for storage operations.
 	// If nil, uses DefaultRetryConfig().
 	StorageRetry *RetryConfig
@@ -49,6 +54,12 @@ type WorkerConfig struct {
 	// StaleLockAge is how long a running job's lock must be expired before
 	// it is reclaimed (reset to pending). Default: 45 minutes (matches lock duration).
 	StaleLockAge time.Duration
+
+	// FanOutRecoveryStaleAge is how old a pending fan-out must be before a
+	// waiting parent is treated as wedged because not all sub-jobs were
+	// persisted. The recovery loop cannot be disabled; non-positive values
+	// fall back to the default. Default: 2 minutes.
+	FanOutRecoveryStaleAge time.Duration
 
 	// OwnershipAuditInterval is how often the worker checks whether any of
 	// its in-flight jobs have been cancelled (e.g. by a fan-out failure on
@@ -161,6 +172,14 @@ func WithPollInterval(d time.Duration) WorkerOption {
 	})
 }
 
+// WithDrainTimeout sets how long Start waits for in-flight handlers to finish
+// after its context is cancelled. A non-positive duration aborts immediately.
+func WithDrainTimeout(d time.Duration) WorkerOption {
+	return workerOptionFunc(func(c *WorkerConfig) {
+		c.DrainTimeout = d
+	})
+}
+
 // WithStaleLockInterval sets how often the worker checks for stale running
 // jobs. The stale-lock reaper is what recovers jobs from crashed workers, so
 // it CANNOT be disabled: a non-positive duration is ignored (the default is
@@ -183,6 +202,16 @@ func WithStaleLockInterval(d time.Duration) WorkerOption {
 func WithStaleLockAge(d time.Duration) WorkerOption {
 	return workerOptionFunc(func(c *WorkerConfig) {
 		c.StaleLockAge = d
+	})
+}
+
+// WithFanOutRecoveryStaleAge sets how old a pending fan-out must be before
+// the waiting parent is resumed for replay-based recovery. This recovery
+// cannot be disabled; a non-positive duration is treated as the default by
+// NewWorker.
+func WithFanOutRecoveryStaleAge(d time.Duration) WorkerOption {
+	return workerOptionFunc(func(c *WorkerConfig) {
+		c.FanOutRecoveryStaleAge = d
 	})
 }
 

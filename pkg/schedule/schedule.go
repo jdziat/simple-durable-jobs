@@ -23,7 +23,10 @@ func Every(d time.Duration) Schedule {
 }
 
 func (s *everySchedule) Next(from time.Time) time.Time {
-	return from.Add(s.interval)
+	if s.interval <= 0 {
+		return from
+	}
+	return from.Truncate(s.interval).Add(s.interval)
 }
 
 // dailySchedule runs at a specific time each day.
@@ -81,13 +84,25 @@ type cronSchedule struct {
 }
 
 // Cron creates a schedule from a cron expression.
-func Cron(expr string) Schedule {
+func Cron(expr string) (Schedule, error) {
 	parser := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
 	schedule, err := parser.Parse(expr)
 	if err != nil {
+		return nil, err
+	}
+	if spec, ok := schedule.(*cron.SpecSchedule); ok {
+		spec.Location = time.UTC
+	}
+	return &cronSchedule{schedule: schedule}, nil
+}
+
+// MustCron creates a schedule from a cron expression and panics if invalid.
+func MustCron(expr string) Schedule {
+	schedule, err := Cron(expr)
+	if err != nil {
 		panic("invalid cron expression: " + err.Error())
 	}
-	return &cronSchedule{schedule: schedule}
+	return schedule
 }
 
 func (s *cronSchedule) Next(from time.Time) time.Time {

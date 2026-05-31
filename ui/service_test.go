@@ -3,6 +3,8 @@ package ui
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -18,6 +20,7 @@ import (
 	"github.com/jdziat/simple-durable-jobs/pkg/schedule"
 	storagepackage "github.com/jdziat/simple-durable-jobs/pkg/storage"
 	jobsv1 "github.com/jdziat/simple-durable-jobs/ui/gen/jobs/v1"
+	"github.com/jdziat/simple-durable-jobs/ui/gen/jobs/v1/jobsv1connect"
 )
 
 // ---------------------------------------------------------------------------
@@ -54,6 +57,9 @@ func (m *mockStorage) SaveCheckpoint(_ context.Context, _ *core.Checkpoint) erro
 func (m *mockStorage) DeleteCheckpoints(_ context.Context, _ string) error          { return nil }
 func (m *mockStorage) GetDueJobs(_ context.Context, _ []string, _ int) ([]*core.Job, error) {
 	return nil, nil
+}
+func (m *mockStorage) ClaimScheduledFire(_ context.Context, _ string, _ time.Time) (bool, error) {
+	return true, nil
 }
 func (m *mockStorage) Heartbeat(_ context.Context, _, _ string) error { return nil }
 func (m *mockStorage) ReleaseStaleLocks(_ context.Context, _ time.Duration) ([]string, error) {
@@ -100,7 +106,10 @@ func (m *mockStorage) CancelSubJob(_ context.Context, _ string) (*core.FanOut, e
 func (m *mockStorage) SuspendJob(_ context.Context, _, _ string) error               { return nil }
 func (m *mockStorage) ResumeJob(_ context.Context, _ string) (bool, error)           { return false, nil }
 func (m *mockStorage) GetWaitingJobsToResume(_ context.Context) ([]*core.Job, error) { return nil, nil }
-func (m *mockStorage) SaveJobResult(_ context.Context, _, _ string, _ []byte) error  { return nil }
+func (m *mockStorage) GetStalledFanOutParents(_ context.Context, _ time.Time) ([]*core.Job, error) {
+	return nil, nil
+}
+func (m *mockStorage) SaveJobResult(_ context.Context, _, _ string, _ []byte) error { return nil }
 func (m *mockStorage) PauseJob(ctx context.Context, id string) error {
 	if m.pauseJobFn != nil {
 		return m.pauseJobFn(ctx, id)
@@ -233,6 +242,46 @@ func (m *mockUIStorage) GetWorkflowRoots(ctx context.Context, status string, lim
 // Verify the interface is satisfied at compile time.
 var _ UIStorage = (*mockUIStorage)(nil)
 
+type mockWorkflowBatchStorage struct {
+	mockStorage
+	getFanOutsByParentsFn func(ctx context.Context, parentIDs []string) ([]*core.FanOut, error)
+	getSubJobsByFanOutsFn func(ctx context.Context, fanOutIDs []string) ([]*core.Job, error)
+}
+
+func (m *mockWorkflowBatchStorage) GetFanOutsByParents(ctx context.Context, parentIDs []string) ([]*core.FanOut, error) {
+	if m.getFanOutsByParentsFn != nil {
+		return m.getFanOutsByParentsFn(ctx, parentIDs)
+	}
+	return nil, nil
+}
+
+func (m *mockWorkflowBatchStorage) GetSubJobsByFanOuts(ctx context.Context, fanOutIDs []string) ([]*core.Job, error) {
+	if m.getSubJobsByFanOutsFn != nil {
+		return m.getSubJobsByFanOutsFn(ctx, fanOutIDs)
+	}
+	return nil, nil
+}
+
+type mockUIWorkflowBatchStorage struct {
+	mockUIStorage
+	getFanOutsByParentsFn func(ctx context.Context, parentIDs []string) ([]*core.FanOut, error)
+	getSubJobsByFanOutsFn func(ctx context.Context, fanOutIDs []string) ([]*core.Job, error)
+}
+
+func (m *mockUIWorkflowBatchStorage) GetFanOutsByParents(ctx context.Context, parentIDs []string) ([]*core.FanOut, error) {
+	if m.getFanOutsByParentsFn != nil {
+		return m.getFanOutsByParentsFn(ctx, parentIDs)
+	}
+	return nil, nil
+}
+
+func (m *mockUIWorkflowBatchStorage) GetSubJobsByFanOuts(ctx context.Context, fanOutIDs []string) ([]*core.Job, error) {
+	if m.getSubJobsByFanOutsFn != nil {
+		return m.getSubJobsByFanOutsFn(ctx, fanOutIDs)
+	}
+	return nil, nil
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -257,6 +306,97 @@ func sampleJob(id, queue, jobType string, status core.JobStatus) *core.Job {
 		Args:       []byte(`{"key":"val"}`),
 		CreatedAt:  time.Now(),
 	}
+}
+
+func jobIDs(n int) []string {
+	ids := make([]string, n)
+	for i := range ids {
+		ids[i] = "job"
+	}
+	return ids
+}
+
+// ---------------------------------------------------------------------------
+// Handler write authorization tests
+// ---------------------------------------------------------------------------
+
+func TestHandler_MutatingRPCDeniedWithoutAuthOrOptIn(t *testing.T) {
+	called := false
+	store := &mockUIStorage{
+		retryJobFn: func(_ context.Context, _ string) (*core.Job, error) {
+			called = true
+			return sampleJob("j1", "default", "work", core.StatusPending), nil
+		},
+	}
+	server := httptest.NewServer(Handler(store))
+	defer server.Close()
+
+	client := jobsv1connect.NewJobsServiceClient(server.Client(), server.URL)
+	_, err := client.RetryJob(context.Background(), connect.NewRequest(&jobsv1.RetryJobRequest{Id: "j1"}))
+
+	require.Error(t, err)
+	assert.Equal(t, connect.CodePermissionDenied, connect.CodeOf(err))
+	assert.False(t, called)
+}
+
+func TestHandler_MutatingRPCAllowedWithInsecureOptIn(t *testing.T) {
+	called := false
+	store := &mockUIStorage{
+		retryJobFn: func(_ context.Context, _ string) (*core.Job, error) {
+			called = true
+			return sampleJob("j1", "default", "work", core.StatusPending), nil
+		},
+	}
+	server := httptest.NewServer(Handler(store, WithInsecureAllowUnauthenticatedWrites()))
+	defer server.Close()
+
+	client := jobsv1connect.NewJobsServiceClient(server.Client(), server.URL)
+	resp, err := client.RetryJob(context.Background(), connect.NewRequest(&jobsv1.RetryJobRequest{Id: "j1"}))
+
+	require.NoError(t, err)
+	require.NotNil(t, resp.Msg.Job)
+	assert.Equal(t, "j1", resp.Msg.Job.Id)
+	assert.True(t, called)
+}
+
+func TestHandler_MutatingRPCAllowedWithMiddleware(t *testing.T) {
+	called := false
+	store := &mockUIStorage{
+		deleteJobFn: func(_ context.Context, _ string) error {
+			called = true
+			return nil
+		},
+	}
+	middleware := func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			next.ServeHTTP(w, r)
+		})
+	}
+	server := httptest.NewServer(Handler(store, WithMiddleware(middleware)))
+	defer server.Close()
+
+	client := jobsv1connect.NewJobsServiceClient(server.Client(), server.URL)
+	_, err := client.DeleteJob(context.Background(), connect.NewRequest(&jobsv1.DeleteJobRequest{Id: "j1"}))
+
+	require.NoError(t, err)
+	assert.True(t, called)
+}
+
+func TestHandler_ReadOnlyRPCAllowedWithoutAuth(t *testing.T) {
+	store := &mockUIStorage{
+		searchJobsFn: func(_ context.Context, _ JobFilter) ([]*core.Job, int64, error) {
+			return []*core.Job{sampleJob("j1", "default", "work", core.StatusPending)}, 1, nil
+		},
+	}
+	server := httptest.NewServer(Handler(store))
+	defer server.Close()
+
+	client := jobsv1connect.NewJobsServiceClient(server.Client(), server.URL)
+	resp, err := client.ListJobs(context.Background(), connect.NewRequest(&jobsv1.ListJobsRequest{}))
+
+	require.NoError(t, err)
+	require.Len(t, resp.Msg.Jobs, 1)
+	assert.Equal(t, "j1", resp.Msg.Jobs[0].Id)
 }
 
 // ---------------------------------------------------------------------------
@@ -472,6 +612,24 @@ func TestListJobs_WithUIStorage(t *testing.T) {
 	assert.Equal(t, int32(1), resp.Msg.Page)
 }
 
+func TestListJobs_TotalCanExceedPageSize(t *testing.T) {
+	jobs := []*core.Job{
+		sampleJob("j1", "default", "send-email", core.StatusPending),
+		sampleJob("j2", "default", "send-email", core.StatusPending),
+	}
+	store := &mockUIStorage{
+		searchJobsFn: func(_ context.Context, f JobFilter) ([]*core.Job, int64, error) {
+			assert.Equal(t, 2, f.Limit)
+			return jobs, 5, nil
+		},
+	}
+	svc := newServiceWithUIStorage(store)
+	resp, err := svc.ListJobs(context.Background(), connect.NewRequest(&jobsv1.ListJobsRequest{Limit: 2, Page: 1}))
+	require.NoError(t, err)
+	assert.Len(t, resp.Msg.Jobs, 2)
+	assert.Equal(t, int64(5), resp.Msg.Total)
+}
+
 func TestListJobs_DefaultsApplied(t *testing.T) {
 	var capturedFilter JobFilter
 	store := &mockUIStorage{
@@ -541,140 +699,11 @@ func TestListJobs_UIStorageError(t *testing.T) {
 	assert.Equal(t, connect.CodeInternal, connectErr.Code())
 }
 
-func TestListJobs_FallbackWithStatusFilter(t *testing.T) {
-	jobs := []*core.Job{sampleJob("j1", "default", "work", core.StatusFailed)}
-	store := &mockStorage{
-		getJobsByStatusFn: func(_ context.Context, _ core.JobStatus, _ int) ([]*core.Job, error) {
-			return jobs, nil
-		},
-	}
-	svc := newServiceWithBaseStorage(store)
-	resp, err := svc.ListJobs(context.Background(), connect.NewRequest(&jobsv1.ListJobsRequest{
-		Status: "failed",
-	}))
-	require.NoError(t, err)
-	assert.Len(t, resp.Msg.Jobs, 1)
-}
-
-func TestListJobs_FallbackWithQueueFilter(t *testing.T) {
-	jobs := []*core.Job{
-		sampleJob("j1", "emails", "work", core.StatusPending),
-		sampleJob("j2", "payments", "work", core.StatusPending),
-	}
-	store := &mockStorage{
-		getJobsByStatusFn: func(_ context.Context, status core.JobStatus, _ int) ([]*core.Job, error) {
-			if status == core.StatusPending {
-				return jobs, nil
-			}
-			return nil, nil
-		},
-	}
-	svc := newServiceWithBaseStorage(store)
-	resp, err := svc.ListJobs(context.Background(), connect.NewRequest(&jobsv1.ListJobsRequest{
-		Queue: "emails",
-	}))
-	require.NoError(t, err)
-	require.Len(t, resp.Msg.Jobs, 1)
-	assert.Equal(t, "emails", resp.Msg.Jobs[0].Queue)
-}
-
-func TestListJobs_FallbackWithTypeFilter(t *testing.T) {
-	jobs := []*core.Job{
-		sampleJob("j1", "default", "send-email", core.StatusPending),
-		sampleJob("j2", "default", "charge", core.StatusPending),
-	}
-	store := &mockStorage{
-		getJobsByStatusFn: func(_ context.Context, status core.JobStatus, _ int) ([]*core.Job, error) {
-			if status == core.StatusPending {
-				return jobs, nil
-			}
-			return nil, nil
-		},
-	}
-	svc := newServiceWithBaseStorage(store)
-	resp, err := svc.ListJobs(context.Background(), connect.NewRequest(&jobsv1.ListJobsRequest{
-		Type: "send-email",
-	}))
-	require.NoError(t, err)
-	require.Len(t, resp.Msg.Jobs, 1)
-	assert.Equal(t, "send-email", resp.Msg.Jobs[0].Type)
-}
-
-func TestListJobs_FallbackWithSearchFilter(t *testing.T) {
-	j1 := sampleJob("match-id", "default", "work", core.StatusPending)
-	j2 := sampleJob("other-id", "default", "work", core.StatusPending)
-	store := &mockStorage{
-		getJobsByStatusFn: func(_ context.Context, status core.JobStatus, _ int) ([]*core.Job, error) {
-			if status == core.StatusPending {
-				return []*core.Job{j1, j2}, nil
-			}
-			return nil, nil
-		},
-	}
-	svc := newServiceWithBaseStorage(store)
-	resp, err := svc.ListJobs(context.Background(), connect.NewRequest(&jobsv1.ListJobsRequest{
-		Search: "match",
-	}))
-	require.NoError(t, err)
-	require.Len(t, resp.Msg.Jobs, 1)
-	assert.Equal(t, "match-id", resp.Msg.Jobs[0].Id)
-}
-
-func TestListJobs_FallbackPagination(t *testing.T) {
-	// Build 10 jobs, request page 2 with limit 3.
-	var jobs []*core.Job
-	for i := 0; i < 10; i++ {
-		j := sampleJob("id", "default", "work", core.StatusPending)
-		j.ID = string(rune('a' + i))
-		j.CreatedAt = time.Now().Add(time.Duration(i) * time.Second)
-		jobs = append(jobs, j)
-	}
-	store := &mockStorage{
-		getJobsByStatusFn: func(_ context.Context, status core.JobStatus, _ int) ([]*core.Job, error) {
-			if status == core.StatusPending {
-				return jobs, nil
-			}
-			return nil, nil
-		},
-	}
-	svc := newServiceWithBaseStorage(store)
-	resp, err := svc.ListJobs(context.Background(), connect.NewRequest(&jobsv1.ListJobsRequest{
-		Limit: 3,
-		Page:  2,
-	}))
-	require.NoError(t, err)
-	assert.Len(t, resp.Msg.Jobs, 3)
-	assert.Equal(t, int64(10), resp.Msg.Total)
-}
-
-func TestListJobs_FallbackPaginationBeyondEnd(t *testing.T) {
-	jobs := []*core.Job{sampleJob("j1", "default", "work", core.StatusPending)}
-	store := &mockStorage{
-		getJobsByStatusFn: func(_ context.Context, status core.JobStatus, _ int) ([]*core.Job, error) {
-			if status == core.StatusPending {
-				return jobs, nil
-			}
-			return nil, nil
-		},
-	}
-	svc := newServiceWithBaseStorage(store)
-	resp, err := svc.ListJobs(context.Background(), connect.NewRequest(&jobsv1.ListJobsRequest{
-		Limit: 10,
-		Page:  99,
-	}))
-	require.NoError(t, err)
-	assert.Empty(t, resp.Msg.Jobs)
-}
-
-func TestListJobs_FallbackStorageError(t *testing.T) {
-	store := &mockStorage{
-		getJobsByStatusFn: func(_ context.Context, _ core.JobStatus, _ int) ([]*core.Job, error) {
-			return nil, errors.New("storage error")
-		},
-	}
-	svc := newServiceWithBaseStorage(store)
+func TestListJobs_FallbackWithoutUIStorageUnimplemented(t *testing.T) {
+	svc := newServiceWithBaseStorage(&mockStorage{})
 	_, err := svc.ListJobs(context.Background(), connect.NewRequest(&jobsv1.ListJobsRequest{}))
 	require.Error(t, err)
+	assert.Equal(t, connect.CodeUnimplemented, connect.CodeOf(err))
 }
 
 // ---------------------------------------------------------------------------
@@ -899,6 +928,15 @@ func TestBulkRetryJobs_EmptyList(t *testing.T) {
 	assert.Equal(t, int32(0), resp.Msg.Count)
 }
 
+func TestBulkRetryJobs_TooManyIDs(t *testing.T) {
+	svc := newServiceWithUIStorage(&mockUIStorage{})
+	_, err := svc.BulkRetryJobs(context.Background(), connect.NewRequest(&jobsv1.BulkRetryJobsRequest{
+		Ids: jobIDs(maxBulkJobIDs + 1),
+	}))
+	require.Error(t, err)
+	assert.Equal(t, connect.CodeInvalidArgument, connect.CodeOf(err))
+}
+
 // ---------------------------------------------------------------------------
 // BulkDeleteJobs tests
 // ---------------------------------------------------------------------------
@@ -939,6 +977,15 @@ func TestBulkDeleteJobs_EmptyList(t *testing.T) {
 	resp, err := svc.BulkDeleteJobs(context.Background(), connect.NewRequest(&jobsv1.BulkDeleteJobsRequest{}))
 	require.NoError(t, err)
 	assert.Equal(t, int32(0), resp.Msg.Count)
+}
+
+func TestBulkDeleteJobs_TooManyIDs(t *testing.T) {
+	svc := newServiceWithUIStorage(&mockUIStorage{})
+	_, err := svc.BulkDeleteJobs(context.Background(), connect.NewRequest(&jobsv1.BulkDeleteJobsRequest{
+		Ids: jobIDs(maxBulkJobIDs + 1),
+	}))
+	require.Error(t, err)
+	assert.Equal(t, connect.CodeInvalidArgument, connect.CodeOf(err))
 }
 
 // ---------------------------------------------------------------------------
@@ -1134,7 +1181,7 @@ func TestListScheduledJobs_WithScheduledJobs(t *testing.T) {
 	svc, q := setupServiceWithQueue(t)
 
 	// Register a scheduled job using the every-schedule (no String() method).
-	q.Schedule("daily-report", schedule.Every(24*time.Hour))
+	q.Schedule("daily-report", nil, schedule.Every(24*time.Hour))
 
 	resp, err := svc.ListScheduledJobs(context.Background(), connect.NewRequest(&jobsv1.ListScheduledJobsRequest{}))
 	require.NoError(t, err)
@@ -1151,7 +1198,7 @@ func (s *stringerSchedule) String() string                { return s.label }
 func TestListScheduledJobs_WithStringerSchedule(t *testing.T) {
 	svc, q := setupServiceWithQueue(t)
 
-	q.Schedule("hourly-sync", &stringerSchedule{label: "every 1h"})
+	q.Schedule("hourly-sync", nil, &stringerSchedule{label: "every 1h"})
 
 	resp, err := svc.ListScheduledJobs(context.Background(), connect.NewRequest(&jobsv1.ListScheduledJobsRequest{}))
 	require.NoError(t, err)
@@ -1309,6 +1356,89 @@ func TestGetWorkflow_WithFanOutsAndChildren(t *testing.T) {
 	assert.Len(t, resp.Msg.Children, 2)
 }
 
+func TestGetWorkflow_BatchedWorkflowTree(t *testing.T) {
+	now := time.Now()
+	root := &core.Job{ID: "root", Queue: "default", Type: "wf", Status: core.StatusCompleted, CreatedAt: now}
+	childA := &core.Job{ID: "child-a", Queue: "default", Type: "step", Status: core.StatusCompleted, CreatedAt: now}
+	childB := &core.Job{ID: "child-b", Queue: "default", Type: "step", Status: core.StatusCompleted, CreatedAt: now}
+	grandchild := &core.Job{ID: "grandchild", Queue: "default", Type: "step", Status: core.StatusCompleted, CreatedAt: now}
+	fo1 := &core.FanOut{ID: "fo-1", ParentJobID: "root", TotalCount: 2, CompletedCount: 2, Strategy: core.StrategyCollectAll, Status: core.FanOutCompleted, CreatedAt: now, UpdatedAt: now}
+	fo2 := &core.FanOut{ID: "fo-2", ParentJobID: "child-a", TotalCount: 1, CompletedCount: 1, Strategy: core.StrategyFailFast, Status: core.FanOutCompleted, CreatedAt: now, UpdatedAt: now}
+
+	var parentBatchCalls, subBatchCalls int
+	store := &mockWorkflowBatchStorage{
+		mockStorage: mockStorage{
+			getJobFn: func(_ context.Context, id string) (*core.Job, error) {
+				if id == "root" {
+					return root, nil
+				}
+				return nil, nil
+			},
+			getFanOutsByParentFn: func(_ context.Context, _ string) ([]*core.FanOut, error) {
+				t.Fatal("serial fan-out lookup should not be used")
+				return nil, nil
+			},
+			getSubJobsFn: func(_ context.Context, _ string) ([]*core.Job, error) {
+				t.Fatal("serial sub-job lookup should not be used")
+				return nil, nil
+			},
+		},
+		getFanOutsByParentsFn: func(_ context.Context, parentIDs []string) ([]*core.FanOut, error) {
+			parentBatchCalls++
+			switch parentBatchCalls {
+			case 1:
+				assert.Equal(t, []string{"root"}, parentIDs)
+				return []*core.FanOut{fo1}, nil
+			case 2:
+				assert.Equal(t, []string{"child-a", "child-b"}, parentIDs)
+				return []*core.FanOut{fo2}, nil
+			case 3:
+				assert.Equal(t, []string{"grandchild"}, parentIDs)
+				return nil, nil
+			default:
+				t.Fatalf("unexpected parent batch call %d", parentBatchCalls)
+			}
+			return nil, nil
+		},
+		getSubJobsByFanOutsFn: func(_ context.Context, fanOutIDs []string) ([]*core.Job, error) {
+			subBatchCalls++
+			switch subBatchCalls {
+			case 1:
+				assert.Equal(t, []string{"fo-1"}, fanOutIDs)
+				fanOutID := "fo-1"
+				childA.FanOutID = &fanOutID
+				childB.FanOutID = &fanOutID
+				return []*core.Job{childA, childB}, nil
+			case 2:
+				assert.Equal(t, []string{"fo-2"}, fanOutIDs)
+				fanOutID := "fo-2"
+				grandchild.FanOutID = &fanOutID
+				return []*core.Job{grandchild}, nil
+			case 3:
+				assert.Empty(t, fanOutIDs)
+				return nil, nil
+			default:
+				t.Fatalf("unexpected sub-job batch call %d", subBatchCalls)
+			}
+			return nil, nil
+		},
+	}
+
+	svc := newJobsService(store, nil, nil)
+	resp, err := svc.GetWorkflow(context.Background(), connect.NewRequest(&jobsv1.GetWorkflowRequest{JobId: "root"}))
+	require.NoError(t, err)
+	assert.Equal(t, "root", resp.Msg.Root.Id)
+	require.Len(t, resp.Msg.FanOuts, 2)
+	assert.Equal(t, "fo-1", resp.Msg.FanOuts[0].Id)
+	assert.Equal(t, "fo-2", resp.Msg.FanOuts[1].Id)
+	require.Len(t, resp.Msg.Children, 3)
+	assert.Equal(t, "child-a", resp.Msg.Children[0].Id)
+	assert.Equal(t, "child-b", resp.Msg.Children[1].Id)
+	assert.Equal(t, "grandchild", resp.Msg.Children[2].Id)
+	assert.Equal(t, 3, parentBatchCalls)
+	assert.Equal(t, 3, subBatchCalls)
+}
+
 func TestGetWorkflow_FanOutsByParentError(t *testing.T) {
 	root := sampleJob("root", "default", "wf", core.StatusCompleted)
 	store := &mockStorage{
@@ -1410,6 +1540,46 @@ func TestListWorkflows_Success(t *testing.T) {
 	assert.Equal(t, int32(2), resp.Msg.Workflows[0].FailedJobs)
 	assert.Equal(t, int32(1), resp.Msg.Workflows[0].RunningJobs)
 	assert.Equal(t, int64(1), resp.Msg.Total)
+}
+
+func TestListWorkflows_BatchesFanOutLookup(t *testing.T) {
+	now := time.Now()
+	rootA := &core.Job{ID: "root-a", Queue: "default", Type: "wf", Status: core.StatusCompleted, CreatedAt: now}
+	rootB := &core.Job{ID: "root-b", Queue: "default", Type: "wf", Status: core.StatusCompleted, CreatedAt: now}
+	foA := &core.FanOut{ID: "fo-a", ParentJobID: "root-a", TotalCount: 3, CompletedCount: 2, Strategy: core.StrategyCollectAll, Status: core.FanOutPending, CreatedAt: now, UpdatedAt: now}
+	foB := &core.FanOut{ID: "fo-b", ParentJobID: "root-b", TotalCount: 4, FailedCount: 1, Strategy: core.StrategyFailFast, Status: core.FanOutPending, CreatedAt: now, UpdatedAt: now}
+
+	var batchCalls int
+	store := &mockUIWorkflowBatchStorage{
+		mockUIStorage: mockUIStorage{
+			mockStorage: mockStorage{
+				getFanOutsByParentFn: func(_ context.Context, _ string) ([]*core.FanOut, error) {
+					t.Fatal("serial fan-out lookup should not be used")
+					return nil, nil
+				},
+			},
+			getWorkflowRootsFn: func(_ context.Context, _ string, _, _ int) ([]*core.Job, int64, error) {
+				return []*core.Job{rootA, rootB}, 2, nil
+			},
+		},
+		getFanOutsByParentsFn: func(_ context.Context, parentIDs []string) ([]*core.FanOut, error) {
+			batchCalls++
+			assert.Equal(t, []string{"root-a", "root-b"}, parentIDs)
+			return []*core.FanOut{foA, foB}, nil
+		},
+	}
+
+	svc := newJobsService(store, nil, nil)
+	resp, err := svc.ListWorkflows(context.Background(), connect.NewRequest(&jobsv1.ListWorkflowsRequest{Limit: 10, Page: 1}))
+	require.NoError(t, err)
+	require.Len(t, resp.Msg.Workflows, 2)
+	assert.Equal(t, "root-a", resp.Msg.Workflows[0].RootJob.Id)
+	assert.Equal(t, int32(3), resp.Msg.Workflows[0].TotalJobs)
+	assert.Equal(t, int32(1), resp.Msg.Workflows[0].RunningJobs)
+	assert.Equal(t, "root-b", resp.Msg.Workflows[1].RootJob.Id)
+	assert.Equal(t, int32(4), resp.Msg.Workflows[1].TotalJobs)
+	assert.Equal(t, int32(3), resp.Msg.Workflows[1].RunningJobs)
+	assert.Equal(t, 1, batchCalls)
 }
 
 func TestListWorkflows_DefaultPagination(t *testing.T) {
@@ -1684,12 +1854,20 @@ func TestResumeJob_Success(t *testing.T) {
 			return resumed, nil
 		},
 	}
-	svc := newJobsService(store, nil, nil)
+	q := queue.New(store)
+	svc := newJobsService(store, q, nil)
 
 	resp, err := svc.ResumeJob(context.Background(), connect.NewRequest(&jobsv1.ResumeJobRequest{Id: "j1"}))
 	require.NoError(t, err)
 	require.NotNil(t, resp.Msg.Job)
 	assert.Equal(t, "j1", resp.Msg.Job.Id)
+}
+
+func TestResumeJob_NilQueue_ReturnsUnimplemented(t *testing.T) {
+	svc := newJobsService(&mockStorage{}, nil, nil)
+	_, err := svc.ResumeJob(context.Background(), connect.NewRequest(&jobsv1.ResumeJobRequest{Id: "j1"}))
+	require.Error(t, err)
+	assert.Equal(t, connect.CodeUnimplemented, connect.CodeOf(err))
 }
 
 func TestResumeJob_UnpauseError(t *testing.T) {
@@ -1698,7 +1876,8 @@ func TestResumeJob_UnpauseError(t *testing.T) {
 			return errors.New("db error")
 		},
 	}
-	svc := newJobsService(store, nil, nil)
+	q := queue.New(store)
+	svc := newJobsService(store, q, nil)
 
 	_, err := svc.ResumeJob(context.Background(), connect.NewRequest(&jobsv1.ResumeJobRequest{Id: "j1"}))
 	require.Error(t, err)
@@ -1710,7 +1889,8 @@ func TestResumeJob_JobNotFoundAfterUnpause(t *testing.T) {
 		unpauseJobFn: func(_ context.Context, _ string) error { return nil },
 		getJobFn:     func(_ context.Context, _ string) (*core.Job, error) { return nil, nil },
 	}
-	svc := newJobsService(store, nil, nil)
+	q := queue.New(store)
+	svc := newJobsService(store, q, nil)
 
 	_, err := svc.ResumeJob(context.Background(), connect.NewRequest(&jobsv1.ResumeJobRequest{Id: "j1"}))
 	require.Error(t, err)
@@ -1730,12 +1910,20 @@ func TestPauseQueue_Success(t *testing.T) {
 			return nil
 		},
 	}
-	svc := newJobsService(store, nil, nil)
+	q := queue.New(store)
+	svc := newJobsService(store, q, nil)
 
 	resp, err := svc.PauseQueue(context.Background(), connect.NewRequest(&jobsv1.PauseQueueRequest{Name: "emails"}))
 	require.NoError(t, err)
 	assert.NotNil(t, resp)
 	assert.True(t, called)
+}
+
+func TestPauseQueue_NilQueue_ReturnsUnimplemented(t *testing.T) {
+	svc := newJobsService(&mockStorage{}, nil, nil)
+	_, err := svc.PauseQueue(context.Background(), connect.NewRequest(&jobsv1.PauseQueueRequest{Name: "emails"}))
+	require.Error(t, err)
+	assert.Equal(t, connect.CodeUnimplemented, connect.CodeOf(err))
 }
 
 func TestPauseQueue_StorageError(t *testing.T) {
@@ -1744,7 +1932,8 @@ func TestPauseQueue_StorageError(t *testing.T) {
 			return errors.New("db error")
 		},
 	}
-	svc := newJobsService(store, nil, nil)
+	q := queue.New(store)
+	svc := newJobsService(store, q, nil)
 
 	_, err := svc.PauseQueue(context.Background(), connect.NewRequest(&jobsv1.PauseQueueRequest{Name: "emails"}))
 	require.Error(t, err)
@@ -1764,12 +1953,20 @@ func TestResumeQueue_Success(t *testing.T) {
 			return nil
 		},
 	}
-	svc := newJobsService(store, nil, nil)
+	q := queue.New(store)
+	svc := newJobsService(store, q, nil)
 
 	resp, err := svc.ResumeQueue(context.Background(), connect.NewRequest(&jobsv1.ResumeQueueRequest{Name: "emails"}))
 	require.NoError(t, err)
 	assert.NotNil(t, resp)
 	assert.True(t, called)
+}
+
+func TestResumeQueue_NilQueue_ReturnsUnimplemented(t *testing.T) {
+	svc := newJobsService(&mockStorage{}, nil, nil)
+	_, err := svc.ResumeQueue(context.Background(), connect.NewRequest(&jobsv1.ResumeQueueRequest{Name: "emails"}))
+	require.Error(t, err)
+	assert.Equal(t, connect.CodeUnimplemented, connect.CodeOf(err))
 }
 
 func TestResumeQueue_StorageError(t *testing.T) {
@@ -1778,7 +1975,8 @@ func TestResumeQueue_StorageError(t *testing.T) {
 			return errors.New("db error")
 		},
 	}
-	svc := newJobsService(store, nil, nil)
+	q := queue.New(store)
+	svc := newJobsService(store, q, nil)
 
 	_, err := svc.ResumeQueue(context.Background(), connect.NewRequest(&jobsv1.ResumeQueueRequest{Name: "emails"}))
 	require.Error(t, err)

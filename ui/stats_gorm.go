@@ -2,9 +2,11 @@ package ui
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // gormStatsStorage implements StatsStorage using GORM.
@@ -24,29 +26,37 @@ func (s *gormStatsStorage) MigrateStats(ctx context.Context) error {
 func (s *gormStatsStorage) UpsertStatCounters(ctx context.Context, queue string, ts time.Time, completed, failed, retried int64) error {
 	ts = ts.Truncate(time.Minute)
 
-	var existing JobStat
-	result := s.db.WithContext(ctx).
-		Where("queue = ? AND timestamp = ?", queue, ts).
-		First(&existing)
+	for attempt := 0; attempt < 3; attempt++ {
+		result := s.db.WithContext(ctx).Model(&JobStat{}).
+			Where("queue = ? AND timestamp = ?", queue, ts).
+			Updates(map[string]any{
+				"completed": gorm.Expr("completed + ?", completed),
+				"failed":    gorm.Expr("failed + ?", failed),
+				"retried":   gorm.Expr("retried + ?", retried),
+			})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 1 {
+			return nil
+		}
 
-	if result.Error == gorm.ErrRecordNotFound {
-		return s.db.WithContext(ctx).Create(&JobStat{
+		insert := s.db.WithContext(ctx).Clauses(clause.OnConflict{DoNothing: true}).Create(&JobStat{
 			Queue:     queue,
 			Timestamp: ts,
 			Completed: completed,
 			Failed:    failed,
 			Retried:   retried,
-		}).Error
-	}
-	if result.Error != nil {
-		return result.Error
+		})
+		if insert.Error != nil {
+			return insert.Error
+		}
+		if insert.RowsAffected == 1 {
+			return nil
+		}
 	}
 
-	return s.db.WithContext(ctx).Model(&existing).Updates(map[string]any{
-		"completed": gorm.Expr("completed + ?", completed),
-		"failed":    gorm.Expr("failed + ?", failed),
-		"retried":   gorm.Expr("retried + ?", retried),
-	}).Error
+	return fmt.Errorf("upsert stat counters did not converge for queue %q at %s", queue, ts.Format(time.RFC3339))
 }
 
 func (s *gormStatsStorage) SnapshotQueueDepth(ctx context.Context, queue string, ts time.Time, pending, running int64) error {

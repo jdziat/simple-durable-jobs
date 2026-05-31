@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -38,8 +39,9 @@ type Queue struct {
 	enqueueMiddleware []EnqueueMiddleware
 
 	// Event stream
-	events    chan core.Event
-	eventSubs []chan core.Event
+	events        chan core.Event
+	eventSubs     []chan core.Event
+	droppedEvents atomic.Uint64
 
 	// Running job cancellation registry (used by workers to register cancel funcs)
 	runningJobs   map[string]context.CancelFunc
@@ -71,15 +73,28 @@ func New(s core.Storage) *Queue {
 // Register registers a job handler function.
 // The function must have signature: func(ctx context.Context, args T) error
 // Job type names must be alphanumeric (starting with a letter), max 255 chars.
+// Register panics on invalid input; use RegisterE for configuration-driven
+// registration that should return validation errors instead.
 func (q *Queue) Register(name string, fn any, opts ...Option) {
+	if err := q.RegisterE(name, fn, opts...); err != nil {
+		panic(err)
+	}
+}
+
+// RegisterE registers a job handler function and returns validation errors
+// instead of panicking.
+//
+// The function must have signature: func(ctx context.Context, args T) error.
+// Job type names must be alphanumeric (starting with a letter), max 255 chars.
+func (q *Queue) RegisterE(name string, fn any, opts ...Option) error {
 	// Validate job type name
 	if err := security.ValidateJobTypeName(name); err != nil {
-		panic(fmt.Sprintf("jobs: invalid handler name %q: %v", name, err))
+		return fmt.Errorf("jobs: invalid handler name %q: %w", name, err)
 	}
 
 	h, err := handler.NewHandler(fn)
 	if err != nil {
-		panic(fmt.Sprintf("jobs: handler for %q: %v", name, err))
+		return fmt.Errorf("jobs: handler for %q: %w", name, err)
 	}
 
 	// Apply registration options (e.g. Timeout)
@@ -94,6 +109,7 @@ func (q *Queue) Register(name string, fn any, opts ...Option) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.handlers[name] = h
+	return nil
 }
 
 // HasHandler checks if a handler is registered.
@@ -128,6 +144,8 @@ func (q *Queue) CallDirect(ctx context.Context, name string, argsJSON []byte) er
 }
 
 // Enqueue adds a job to the queue. The job type must have a registered handler.
+// A Timeout option bounds this job's handler execution and overrides the
+// handler's registration-time timeout for this job.
 func (q *Queue) Enqueue(ctx context.Context, name string, args any, opts ...Option) (string, error) {
 	q.mu.RLock()
 	_, ok := q.handlers[name]
@@ -151,7 +169,11 @@ func (q *Queue) enqueue(ctx context.Context, name string, args any, opts ...Opti
 	for _, opt := range opts {
 		opt.Apply(options)
 	}
+	return q.enqueueWithOptions(ctx, name, args, options)
+}
 
+// enqueueWithOptions adds a job using a pre-built Options value.
+func (q *Queue) enqueueWithOptions(ctx context.Context, name string, args any, options *Options) (string, error) {
 	// Validate queue name
 	if err := security.ValidateQueueName(options.Queue); err != nil {
 		return "", err
@@ -169,17 +191,25 @@ func (q *Queue) enqueue(ctx context.Context, name string, args any, opts ...Opti
 
 	// Clamp retries to maximum
 	maxRetries := security.ClampRetries(options.MaxRetries)
-
-	job := &core.Job{
-		ID:         uuid.New().String(),
-		Type:       name,
-		Args:       argsBytes,
-		Queue:      options.Queue,
-		Priority:   options.Priority,
-		MaxRetries: maxRetries,
-		Status:     core.StatusPending,
+	effDet := options.Determinism
+	if effDet == ExplicitCheckpoints {
+		effDet = q.determinism
 	}
 
+	job := &core.Job{
+		ID:          uuid.New().String(),
+		Type:        name,
+		Args:        argsBytes,
+		Queue:       options.Queue,
+		Priority:    options.Priority,
+		MaxRetries:  maxRetries,
+		Determinism: int(effDet),
+		Status:      core.StatusPending,
+	}
+
+	if options.Timeout > 0 {
+		job.Timeout = options.Timeout
+	}
 	if options.Delay > 0 {
 		runAt := time.Now().Add(options.Delay)
 		job.RunAt = &runAt
@@ -236,7 +266,7 @@ func (q *Queue) runEnqueueMiddleware(ctx context.Context, job *core.Job, persist
 }
 
 // Schedule registers a recurring job.
-func (q *Queue) Schedule(name string, sched schedule.Schedule, opts ...Option) {
+func (q *Queue) Schedule(name string, args any, sched schedule.Schedule, opts ...Option) {
 	options := NewOptions()
 	for _, opt := range opts {
 		opt.Apply(options)
@@ -249,6 +279,7 @@ func (q *Queue) Schedule(name string, sched schedule.Schedule, opts ...Option) {
 	q.scheduledJobs[name] = &ScheduledJob{
 		Name:     name,
 		Schedule: sched,
+		Args:     args,
 		Options:  options,
 	}
 	q.mu.Unlock()
@@ -341,7 +372,9 @@ func (q *Queue) OnRetry(fn func(context.Context, *core.Job, int, error)) {
 	q.mu.Unlock()
 }
 
-// Events returns a channel for receiving queue events.
+// Events returns a best-effort channel for receiving queue events.
+// Events may be dropped when a subscriber is slow and its buffer fills.
+// Clients that need a complete view should periodically resync from storage.
 // The caller must call Unsubscribe when done to prevent resource leaks.
 func (q *Queue) Events() <-chan core.Event {
 	ch := make(chan core.Event, 100)
@@ -365,7 +398,14 @@ func (q *Queue) Unsubscribe(ch <-chan core.Event) {
 	}
 }
 
-// Emit emits an event to all subscribers.
+// DroppedEventCount returns the number of subscriber event deliveries dropped
+// because a subscriber buffer was full.
+func (q *Queue) DroppedEventCount() uint64 {
+	return q.droppedEvents.Load()
+}
+
+// Emit emits an event to all subscribers on a best-effort basis.
+// If a subscriber buffer is full, that delivery is dropped and counted.
 func (q *Queue) Emit(e core.Event) {
 	q.mu.RLock()
 	// Make a copy of the slice to avoid race conditions
@@ -378,7 +418,8 @@ func (q *Queue) Emit(e core.Event) {
 		select {
 		case ch <- e:
 		default:
-			// Drop if full - this prevents blocking on slow consumers
+			// Drop if full - this prevents blocking on slow consumers.
+			q.droppedEvents.Add(1)
 		}
 	}
 }

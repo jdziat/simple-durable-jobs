@@ -3,6 +3,7 @@ package context
 
 import (
 	"context"
+	"log/slog"
 	"sync"
 
 	"github.com/jdziat/simple-durable-jobs/pkg/core"
@@ -13,9 +14,12 @@ type JobContextKey struct{}
 
 // JobContext holds the current job and queue reference.
 type JobContext struct {
-	Job      *core.Job
-	Storage  core.Storage
-	WorkerID string
+	Job              *core.Job
+	Storage          core.Storage
+	WorkerID         string
+	BestEffortReplay bool // when true, Call relaxes the replay type-mismatch guard
+	// Logger is optional and may be nil.
+	Logger *slog.Logger
 	// HandlerLookup is a function to look up handlers by name
 	HandlerLookup func(name string) (any, bool)
 	// SaveCheckpoint saves a checkpoint to storage
@@ -38,11 +42,17 @@ func WithJobContext(ctx context.Context, jc *JobContext) context.Context {
 // CallStateKey is the key for storing call state in context.Context.
 type CallStateKey struct{}
 
+// CheckpointKey identifies a durable checkpoint by both call position and type.
+type CheckpointKey struct {
+	Index int
+	Type  string
+}
+
 // CallState tracks the current call index for replay.
 type CallState struct {
 	Mu          sync.Mutex
 	CallIndex   int
-	Checkpoints map[int]*core.Checkpoint
+	Checkpoints map[CheckpointKey]*core.Checkpoint
 }
 
 // GetCallState retrieves the call state from a context.Context.
@@ -56,10 +66,11 @@ func GetCallState(ctx context.Context) *CallState {
 // WithCallState adds call state to a context.Context.
 func WithCallState(ctx context.Context, checkpoints []core.Checkpoint) context.Context {
 	cs := &CallState{
-		Checkpoints: make(map[int]*core.Checkpoint),
+		Checkpoints: make(map[CheckpointKey]*core.Checkpoint),
 	}
 	for i := range checkpoints {
-		cs.Checkpoints[checkpoints[i].CallIndex] = &checkpoints[i]
+		key := CheckpointKey{Index: checkpoints[i].CallIndex, Type: checkpoints[i].CallType}
+		cs.Checkpoints[key] = &checkpoints[i]
 	}
 	return context.WithValue(ctx, CallStateKey{}, cs)
 }

@@ -1,10 +1,18 @@
 package fanout
 
 import (
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/jdziat/simple-durable-jobs/pkg/core"
+)
+
+var (
+	// ErrSubJobCancelled marks a result slot whose sub-job was cancelled.
+	ErrSubJobCancelled = errors.New("fanout: sub-job cancelled")
+	// ErrSubJobIncomplete marks a result slot whose sub-job did not reach a terminal result state.
+	ErrSubJobIncomplete = errors.New("fanout: sub-job incomplete")
 )
 
 // SubJob represents a sub-job to be spawned.
@@ -14,7 +22,8 @@ type SubJob struct {
 	Queue    string
 	Priority int
 	Retries  int
-	Timeout  time.Duration
+	// Timeout bounds this sub-job's handler execution.
+	Timeout time.Duration
 }
 
 // Result wraps a sub-job result with its index and potential error.

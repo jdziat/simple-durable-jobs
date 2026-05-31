@@ -19,10 +19,11 @@ type optionFunc func(*config)
 func (f optionFunc) apply(c *config) { f(c) }
 
 type config struct {
-	ctx            context.Context
-	middleware     func(http.Handler) http.Handler
-	queue          *queue.Queue
-	statsRetention time.Duration
+	ctx                                context.Context
+	middleware                         func(http.Handler) http.Handler
+	queue                              *queue.Queue
+	statsRetention                     time.Duration
+	insecureAllowUnauthenticatedWrites bool
 }
 
 // WithMiddleware wraps the handler with middleware (auth, logging, etc.).
@@ -43,6 +44,14 @@ func WithQueue(q *queue.Queue) Option {
 func WithStatsRetention(d time.Duration) Option {
 	return optionFunc(func(c *config) {
 		c.statsRetention = d
+	})
+}
+
+// WithInsecureAllowUnauthenticatedWrites permits mutating RPCs without auth middleware.
+// This is intended for local development and tests only.
+func WithInsecureAllowUnauthenticatedWrites() Option {
+	return optionFunc(func(c *config) {
+		c.insecureAllowUnauthenticatedWrites = true
 	})
 }
 

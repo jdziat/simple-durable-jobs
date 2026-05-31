@@ -475,4 +475,47 @@ func TestLoadPhaseCheckpoint(t *testing.T) {
 			t.Errorf("expected %q, got %q", "result", result)
 		}
 	})
+
+	t.Run("loads multiple phase checkpoints after replay", func(t *testing.T) {
+		baseCtx := context.Background()
+
+		checkpoints := []core.Checkpoint{
+			{
+				ID:        "cp-phase-1",
+				JobID:     "job-1",
+				CallIndex: -1,
+				CallType:  "phase1",
+				Result:    []byte(`"result1"`),
+			},
+			{
+				ID:        "cp-phase-2",
+				JobID:     "job-1",
+				CallIndex: -1,
+				CallType:  "phase2",
+				Result:    []byte(`"result2"`),
+			},
+			{
+				ID:        "cp-phase-3",
+				JobID:     "job-1",
+				CallIndex: -1,
+				CallType:  "phase3",
+				Result:    []byte(`"result3"`),
+			},
+		}
+
+		jobCtx := &intctx.JobContext{Job: &core.Job{ID: "job-1"}}
+		ctx := intctx.WithJobContext(baseCtx, jobCtx)
+		ctx = intctx.WithCallState(ctx, checkpoints)
+
+		for i, phase := range []string{"phase1", "phase2", "phase3"} {
+			result, found := LoadPhaseCheckpoint[string](ctx, phase)
+			if !found {
+				t.Fatalf("expected %s checkpoint to be found", phase)
+			}
+			expected := "result" + string(rune('1'+i))
+			if result != expected {
+				t.Fatalf("expected %q, got %q", expected, result)
+			}
+		}
+	})
 }

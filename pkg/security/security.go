@@ -36,6 +36,13 @@ const (
 // validJobTypeName matches alphanumeric, hyphens, underscores, and dots
 var validJobTypeName = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9_\-\.]*$`)
 
+var (
+	authTokenPattern      = regexp.MustCompile(`(?i)\b(authorization|bearer)(\s*[:=]?\s*)\S+`)
+	passwordKVPattern     = regexp.MustCompile(`(?i)\b(password|pwd)=([^\s&;]+)`)
+	dsnPasswordPattern    = regexp.MustCompile(`(?i)\b([a-z][a-z0-9+.-]*://[^:/\s@]+:)([^@\s/]+)(@)`)
+	opaqueTokenRunPattern = regexp.MustCompile(`\b[A-Za-z0-9+/]{20,}={0,2}\b|\b[0-9a-fA-F]{20,}\b`)
+)
+
 // ValidateJobTypeName validates a job type name
 func ValidateJobTypeName(name string) error {
 	if name == "" {
@@ -70,6 +77,8 @@ func SanitizeErrorMessage(msg string) string {
 		return ""
 	}
 
+	msg = redactSecrets(msg)
+
 	// Remove any null bytes or control characters (except newlines)
 	var sanitized strings.Builder
 	sanitized.Grow(len(msg))
@@ -89,6 +98,58 @@ func SanitizeErrorMessage(msg string) string {
 	}
 
 	return result
+}
+
+func redactSecrets(msg string) string {
+	msg = authTokenPattern.ReplaceAllString(msg, `${1}${2}[REDACTED]`)
+	msg = passwordKVPattern.ReplaceAllString(msg, `${1}=[REDACTED]`)
+	msg = dsnPasswordPattern.ReplaceAllString(msg, `${1}[REDACTED]${3}`)
+	msg = opaqueTokenRunPattern.ReplaceAllStringFunc(msg, func(token string) string {
+		if isLikelyOpaqueToken(token) {
+			return "[REDACTED]"
+		}
+		return token
+	})
+	return msg
+}
+
+func isLikelyOpaqueToken(token string) bool {
+	if len(token) < 20 {
+		return false
+	}
+
+	hasDigit := false
+	hasUpper := false
+	hasLower := false
+	hasTokenSymbol := false
+	hexOnly := true
+
+	for _, r := range token {
+		switch {
+		case r >= '0' && r <= '9':
+			hasDigit = true
+		case r >= 'A' && r <= 'F':
+			hasUpper = true
+		case r >= 'G' && r <= 'Z':
+			hasUpper = true
+			hexOnly = false
+		case r >= 'a' && r <= 'f':
+			hasLower = true
+		case r >= 'g' && r <= 'z':
+			hasLower = true
+			hexOnly = false
+		case r == '+' || r == '/' || r == '=':
+			hasTokenSymbol = true
+			hexOnly = false
+		default:
+			return false
+		}
+	}
+
+	if hexOnly && hasDigit {
+		return true
+	}
+	return hasTokenSymbol || (hasDigit && hasUpper && hasLower)
 }
 
 // ClampRetries ensures retry count is within limits

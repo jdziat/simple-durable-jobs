@@ -264,6 +264,39 @@ func TestHandler_GormStorage_WithQueue(t *testing.T) {
 	assert.True(t, acceptable, "unexpected status %d", rw.Code)
 }
 
+func TestHandler_GormStorage_StartsSingleCollectorPerDB(t *testing.T) {
+	store := setupGormStorage(t)
+	q := queue.New(store)
+
+	statsCollectorMu.Lock()
+	originalCollectors := statsCollectorsByDB
+	originalStartFn := startStatsCollectorFn
+	statsCollectorsByDB = map[*gorm.DB]bool{}
+	starts := 0
+	startStatsCollectorFn = func(_ context.Context, _ *StatsCollector) {
+		starts++
+	}
+	statsCollectorMu.Unlock()
+	defer func() {
+		statsCollectorMu.Lock()
+		statsCollectorsByDB = originalCollectors
+		startStatsCollectorFn = originalStartFn
+		statsCollectorMu.Unlock()
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	require.NotNil(t, Handler(store, WithContext(ctx), WithQueue(q)))
+	require.NotNil(t, Handler(store, WithContext(ctx), WithQueue(q)))
+
+	assert.Equal(t, 1, starts)
+	statsCollectorMu.Lock()
+	assert.True(t, statsCollectorsByDB[store.DB()])
+	assert.Len(t, statsCollectorsByDB, 1)
+	statsCollectorMu.Unlock()
+}
+
 func TestHandler_GormStorage_WithQueue_NoRetention(t *testing.T) {
 	// Exercises the collector opts path without statsRetention set.
 	store := setupGormStorage(t)

@@ -401,7 +401,7 @@ func TestIntegration_SchedulerRecurringJobs(t *testing.T) {
 	})
 
 	// Schedule job to run every 200ms
-	queue.Schedule("recurring-task", jobs.Every(200*time.Millisecond))
+	queue.Schedule("recurring-task", nil, jobs.Every(200*time.Millisecond))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()

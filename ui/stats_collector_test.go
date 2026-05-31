@@ -3,6 +3,8 @@ package ui
 import (
 	"context"
 	"errors"
+	"io"
+	"log/slog"
 	"testing"
 	"time"
 
@@ -212,6 +214,37 @@ func TestStatsCollector_SnapshotStorageError(t *testing.T) {
 	assert.NotPanics(t, func() { collector.snapshot(ctx) })
 }
 
+func TestStatsCollector_FlushRetainsCountersOnUpsertError(t *testing.T) {
+	q := queue.New(&mockStorage{})
+	stats := &failingUpsertStatsStorage{failuresRemaining: 1}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	collector := NewStatsCollector(q, stats, WithStatsCollectorLogger(logger))
+	ctx := context.Background()
+
+	job := &core.Job{ID: "test-1", Queue: "default", Type: "test"}
+	collector.handleEvent(&core.JobCompleted{Job: job, Timestamp: time.Now()})
+	collector.handleEvent(&core.JobFailed{Job: job, Timestamp: time.Now()})
+	collector.handleEvent(&core.JobRetrying{Job: job, Attempt: 1, Timestamp: time.Now()})
+
+	collector.Flush(ctx)
+
+	collector.mu.Lock()
+	retained := collector.counters["default"]
+	require.NotNil(t, retained)
+	assert.Equal(t, int64(1), retained.completed)
+	assert.Equal(t, int64(1), retained.failed)
+	assert.Equal(t, int64(1), retained.retried)
+	collector.mu.Unlock()
+
+	collector.Flush(ctx)
+
+	require.Len(t, stats.upserts, 2)
+	assert.Equal(t, statCounters{completed: 1, failed: 1, retried: 1}, stats.upserts[1])
+	collector.mu.Lock()
+	assert.Empty(t, collector.counters)
+	collector.mu.Unlock()
+}
+
 // errStorage is a storage that returns errors for GetJobsByStatus.
 type errStorage struct{ mockStorage }
 
@@ -235,3 +268,18 @@ func (n *nopStatsStorage) GetStatsHistory(_ context.Context, _ string, _, _ time
 	return nil, nil
 }
 func (n *nopStatsStorage) PruneStats(_ context.Context, _ time.Time) (int64, error) { return 0, nil }
+
+type failingUpsertStatsStorage struct {
+	nopStatsStorage
+	failuresRemaining int
+	upserts           []statCounters
+}
+
+func (f *failingUpsertStatsStorage) UpsertStatCounters(_ context.Context, _ string, _ time.Time, completed, failed, retried int64) error {
+	f.upserts = append(f.upserts, statCounters{completed: completed, failed: failed, retried: retried})
+	if f.failuresRemaining > 0 {
+		f.failuresRemaining--
+		return errors.New("upsert failed")
+	}
+	return nil
+}

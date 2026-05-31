@@ -109,7 +109,7 @@ type (
 	// Options holds configuration for job enqueueing and registration.
 	Options = queue.Options
 
-	// DeterminismMode controls replay strictness.
+	// DeterminismMode controls Call replay strictness.
 	DeterminismMode = queue.DeterminismMode
 
 	// ScheduledJob holds configuration for a recurring job.
@@ -191,7 +191,8 @@ const (
 	FanOutFailed    = core.FanOutFailed
 )
 
-// Determinism mode constants
+// Determinism mode constants. ExplicitCheckpoints and Strict error on replay
+// checkpoint type mismatches; BestEffort logs and re-executes the call.
 const (
 	ExplicitCheckpoints = queue.ExplicitCheckpoints
 	Strict              = queue.Strict
@@ -225,6 +226,7 @@ var (
 	ErrQueueAlreadyPaused = core.ErrQueueAlreadyPaused
 	ErrQueueNotPaused     = core.ErrQueueNotPaused
 	ErrCannotPauseStatus  = core.ErrCannotPauseStatus
+	ErrNoResult           = core.ErrNoResult
 )
 
 // Default values
@@ -396,7 +398,7 @@ func Unique(key string) Option {
 	return queue.Unique(key)
 }
 
-// Determinism sets the replay mode.
+// Determinism sets the Call replay mode.
 func Determinism(mode DeterminismMode) Option {
 	return queue.Determinism(mode)
 }
@@ -445,6 +447,12 @@ func WithPollInterval(d time.Duration) WorkerOption {
 	return worker.WithPollInterval(d)
 }
 
+// WithDrainTimeout sets how long Start waits for in-flight handlers to finish
+// after its context is cancelled. A non-positive duration aborts immediately.
+func WithDrainTimeout(d time.Duration) WorkerOption {
+	return worker.WithDrainTimeout(d)
+}
+
 // WithStaleLockInterval sets how often the worker checks for stale running jobs.
 func WithStaleLockInterval(d time.Duration) WorkerOption {
 	return worker.WithStaleLockInterval(d)
@@ -453,6 +461,21 @@ func WithStaleLockInterval(d time.Duration) WorkerOption {
 // WithStaleLockAge sets how long a lock must be expired before reclaim.
 func WithStaleLockAge(d time.Duration) WorkerOption {
 	return worker.WithStaleLockAge(d)
+}
+
+// WithLockDuration configures how long jobs are locked via the storage
+// backend's SetLockDuration. GormStorage implements SetLockDuration; custom
+// Storage backends must implement SetLockDuration(time.Duration) to honor it.
+func WithLockDuration(d time.Duration) WorkerOption {
+	return worker.WithLockDuration(d)
+}
+
+// WithFanOutRecoveryStaleAge sets how old a pending fan-out must be before the
+// worker resumes a parent that crashed mid-enqueue (recovery for an
+// incompletely-enqueued fan-out). Default is 2 minutes; non-positive keeps the
+// default (recovery cannot be disabled).
+func WithFanOutRecoveryStaleAge(d time.Duration) WorkerOption {
+	return worker.WithFanOutRecoveryStaleAge(d)
 }
 
 // DefaultRetryConfig returns the default retry configuration.
@@ -478,8 +501,13 @@ func Weekly(day time.Weekday, hour, minute int) Schedule {
 }
 
 // Cron creates a schedule from a cron expression.
-func Cron(expr string) Schedule {
+func Cron(expr string) (Schedule, error) {
 	return schedule.Cron(expr)
+}
+
+// MustCron creates a schedule from a cron expression and panics if invalid.
+func MustCron(expr string) Schedule {
+	return schedule.MustCron(expr)
 }
 
 // JobFromContext returns the current Job from context, or nil if not in a job handler.
@@ -508,11 +536,7 @@ func FanOut[T any](ctx context.Context, subJobs []SubJob, opts ...FanOutOption) 
 }
 
 // FanOutResult wraps a sub-job result with its index and potential error.
-type FanOutResult[T any] struct {
-	Index int
-	Value T
-	Err   error
-}
+type FanOutResult[T any] = fanout.Result[T]
 
 // Values extracts values from successful fan-out results.
 func Values[T any](results []fanout.Result[T]) []T {
@@ -599,8 +623,7 @@ func IsSuspendError(err error) bool {
 // Returns:
 //   - ErrJobNotCompleted if the job has not reached a terminal state.
 //   - An error containing job.LastError if the job failed.
-//   - The zero value of T with nil error if the job completed but the
-//     handler returned only an error (no result value).
+//   - ErrNoResult if the job completed but has no persisted result value.
 //   - An error wrapping the JSON decode failure if Result cannot be unmarshaled into T.
 func LoadResult[T any](ctx context.Context, q *Queue, jobID string) (T, error) {
 	var zero T
@@ -614,7 +637,7 @@ func LoadResult[T any](ctx context.Context, q *Queue, jobID string) (T, error) {
 	switch job.Status {
 	case core.StatusCompleted:
 		if job.Result == nil {
-			return zero, nil
+			return zero, core.ErrNoResult
 		}
 		var out T
 		if err := json.Unmarshal(job.Result, &out); err != nil {

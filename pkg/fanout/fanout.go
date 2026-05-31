@@ -42,7 +42,7 @@ func FanOut[T any](ctx context.Context, subJobs []SubJob, opts ...Option) ([]Res
 	cs.Mu.Lock()
 	callIndex := cs.CallIndex
 	cs.CallIndex++
-	checkpoint, hasCheckpoint := cs.Checkpoints[callIndex]
+	checkpoint, hasCheckpoint := cs.Checkpoints[intctx.CheckpointKey{Index: callIndex, Type: "fanout"}]
 	cs.Mu.Unlock()
 
 	var fanOutID string
@@ -64,8 +64,29 @@ func FanOut[T any](ctx context.Context, subJobs []SubJob, opts ...Option) ([]Res
 			// Fan-out is done, collect results
 			return CollectResults[T](ctx, fanOutID)
 		}
+		if fanOut == nil {
+			return nil, fmt.Errorf("fan-out not found: %s", fanOutID)
+		}
 
-		// Fan-out not complete, mark waiting again
+		jobs, err := buildSubJobs(subJobs, cfg, jc, fanOutID)
+		if err != nil {
+			return nil, err
+		}
+		if len(jobs) != fanOut.TotalCount {
+			return nil, fmt.Errorf("fan-out %s expected %d sub-jobs, got %d", fanOutID, fanOut.TotalCount, len(jobs))
+		}
+
+		persistedSubJobs, err := jc.Storage.GetSubJobs(ctx, fanOutID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get sub-jobs: %w", err)
+		}
+		if len(persistedSubJobs) < fanOut.TotalCount {
+			if err := jc.Storage.EnqueueBatch(ctx, jobs); err != nil {
+				return nil, fmt.Errorf("failed to enqueue sub-jobs: %w", err)
+			}
+		}
+
+		// Fan-out not complete, mark waiting again.
 		if err := jc.Storage.SuspendJob(ctx, jc.Job.ID, jc.WorkerID); err != nil {
 			return nil, fmt.Errorf("failed to mark job waiting: %w", err)
 		}
@@ -74,14 +95,9 @@ func FanOut[T any](ctx context.Context, subJobs []SubJob, opts ...Option) ([]Res
 
 	// First execution: create fan-out and sub-jobs
 	fanOutID = uuid.New().String()
-
-	// Validate all sub-job types have registered handlers before creating anything
-	if jc.HandlerLookup != nil {
-		for _, sj := range subJobs {
-			if _, found := jc.HandlerLookup(sj.Type); !found {
-				return nil, fmt.Errorf("no handler registered for sub-job type %q", sj.Type)
-			}
-		}
+	jobs, err := buildSubJobs(subJobs, cfg, jc, fanOutID)
+	if err != nil {
+		return nil, err
 	}
 
 	// Create FanOut record
@@ -102,12 +118,64 @@ func FanOut[T any](ctx context.Context, subJobs []SubJob, opts ...Option) ([]Res
 		return nil, fmt.Errorf("failed to create fan-out: %w", err)
 	}
 
-	// Create sub-jobs
+	// Save checkpoint BEFORE suspending
+	cpData, _ := json.Marshal(core.FanOutCheckpoint{
+		FanOutID:  fanOutID,
+		CallIndex: callIndex,
+	})
+	cp := &core.Checkpoint{
+		ID:        uuid.New().String(),
+		JobID:     jc.Job.ID,
+		CallIndex: callIndex,
+		CallType:  "fanout",
+		Result:    cpData,
+	}
+	if err := jc.SaveCheckpoint(ctx, cp); err != nil {
+		return nil, fmt.Errorf("failed to save fan-out checkpoint: %w", err)
+	}
+
+	// CRITICAL: Mark parent waiting BEFORE enqueuing sub-jobs.
+	// If we enqueue first, a fast worker can complete a sub-job and call
+	// ResumeJob before we update the status — ResumeJob finds status=running
+	// instead of waiting, and the parent is stuck forever.
+	if err := jc.Storage.SuspendJob(ctx, jc.Job.ID, jc.WorkerID); err != nil {
+		return nil, fmt.Errorf("failed to mark job waiting: %w", err)
+	}
+
+	// Now enqueue sub-jobs — parent is already in waiting status,
+	// so ResumeJob will succeed when children complete.
+	if err := jc.Storage.EnqueueBatch(ctx, jobs); err != nil {
+		// If enqueue fails after marking waiting, resume the parent so
+		// it does not get stuck in waiting with no sub-jobs behind it.
+		if _, resumeErr := jc.Storage.ResumeJob(ctx, jc.Job.ID); resumeErr != nil {
+			// Log but don't mask the original error
+			_ = resumeErr
+		}
+		return nil, fmt.Errorf("failed to enqueue sub-jobs: %w", err)
+	}
+
+	// Signal to worker that this job should not continue
+	return nil, &WaitingError{FanOutID: fanOutID}
+}
+
+func buildSubJobs(subJobs []SubJob, cfg *config, jc *intctx.JobContext, fanOutID string) ([]*core.Job, error) {
 	jobs := make([]*core.Job, len(subJobs))
 	for i, sj := range subJobs {
+		if err := security.ValidateJobTypeName(sj.Type); err != nil {
+			return nil, fmt.Errorf("invalid sub-job type %q: %w", sj.Type, err)
+		}
+		if jc.HandlerLookup != nil {
+			if _, found := jc.HandlerLookup(sj.Type); !found {
+				return nil, fmt.Errorf("no handler registered for sub-job type %q", sj.Type)
+			}
+		}
+
 		args, err := json.Marshal(sj.Args)
 		if err != nil {
 			return nil, fmt.Errorf("failed to marshal sub-job args: %w", err)
+		}
+		if len(args) > security.MaxJobArgsSize {
+			return nil, fmt.Errorf("%w: sub-job type %q arguments are %d bytes, limit is %d", core.ErrJobArgsTooLarge, sj.Type, len(args), security.MaxJobArgsSize)
 		}
 
 		// Determine queue name with fallback chain
@@ -150,6 +218,7 @@ func FanOut[T any](ctx context.Context, subJobs []SubJob, opts ...Option) ([]Res
 			Queue:       queue,
 			Priority:    priority,
 			MaxRetries:  retries,
+			Timeout:     sj.Timeout,
 			ParentJobID: &parentID,
 			RootJobID:   rootID,
 			FanOutID:    &fanOutID,
@@ -157,45 +226,7 @@ func FanOut[T any](ctx context.Context, subJobs []SubJob, opts ...Option) ([]Res
 			UniqueKey:   fmt.Sprintf("fanout-%s-%d", fanOutID, i), // Prevent duplicate sub-jobs on replay
 		}
 	}
-
-	// Save checkpoint BEFORE suspending
-	cpData, _ := json.Marshal(core.FanOutCheckpoint{
-		FanOutID:  fanOutID,
-		CallIndex: callIndex,
-	})
-	cp := &core.Checkpoint{
-		ID:        uuid.New().String(),
-		JobID:     jc.Job.ID,
-		CallIndex: callIndex,
-		CallType:  "fanout",
-		Result:    cpData,
-	}
-	if err := jc.SaveCheckpoint(ctx, cp); err != nil {
-		return nil, fmt.Errorf("failed to save fan-out checkpoint: %w", err)
-	}
-
-	// CRITICAL: Mark parent waiting BEFORE enqueuing sub-jobs.
-	// If we enqueue first, a fast worker can complete a sub-job and call
-	// ResumeJob before we update the status — ResumeJob finds status=running
-	// instead of waiting, and the parent is stuck forever.
-	if err := jc.Storage.SuspendJob(ctx, jc.Job.ID, jc.WorkerID); err != nil {
-		return nil, fmt.Errorf("failed to mark job waiting: %w", err)
-	}
-
-	// Now enqueue sub-jobs — parent is already in waiting status,
-	// so ResumeJob will succeed when children complete.
-	if err := jc.Storage.EnqueueBatch(ctx, jobs); err != nil {
-		// If enqueue fails after marking waiting, resume the parent so
-		// it does not get stuck in waiting with no sub-jobs behind it.
-		if _, resumeErr := jc.Storage.ResumeJob(ctx, jc.Job.ID); resumeErr != nil {
-			// Log but don't mask the original error
-			_ = resumeErr
-		}
-		return nil, fmt.Errorf("failed to enqueue sub-jobs: %w", err)
-	}
-
-	// Signal to worker that this job should not continue
-	return nil, &WaitingError{FanOutID: fanOutID}
+	return jobs, nil
 }
 
 // WaitingError signals the worker that the job has moved into
@@ -244,29 +275,39 @@ func CollectResults[T any](ctx context.Context, fanOutID string) ([]Result[T], e
 		return nil, fmt.Errorf("fan-out not found: %s", fanOutID)
 	}
 
-	jobs, err := jc.Storage.GetSubJobResults(ctx, fanOutID)
+	jobs, err := jc.Storage.GetSubJobs(ctx, fanOutID)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get sub-job results: %w", err)
+		return nil, fmt.Errorf("failed to get sub-jobs: %w", err)
 	}
 
-	// Pre-allocate results slice with correct size
 	results := make([]Result[T], fanOut.TotalCount)
+	for i := range results {
+		results[i].Index = i
+		results[i].Err = ErrSubJobIncomplete
+	}
+
 	for _, job := range jobs {
-		if job.FanOutIndex >= len(results) {
+		if job.FanOutIndex < 0 || job.FanOutIndex >= len(results) {
 			continue
 		}
-		results[job.FanOutIndex] = Result[T]{
-			Index: job.FanOutIndex,
-		}
-		if job.Status == core.StatusFailed {
-			results[job.FanOutIndex].Err = fmt.Errorf("%s", job.LastError)
-		} else if job.Result != nil {
-			var value T
-			if err := json.Unmarshal(job.Result, &value); err != nil {
-				results[job.FanOutIndex].Err = fmt.Errorf("failed to unmarshal result: %w", err)
-			} else {
-				results[job.FanOutIndex].Value = value
+		results[job.FanOutIndex].Index = job.FanOutIndex
+		switch job.Status {
+		case core.StatusCompleted:
+			results[job.FanOutIndex].Err = nil
+			if job.Result != nil {
+				var value T
+				if err := json.Unmarshal(job.Result, &value); err != nil {
+					results[job.FanOutIndex].Err = fmt.Errorf("failed to unmarshal result: %w", err)
+				} else {
+					results[job.FanOutIndex].Value = value
+				}
 			}
+		case core.StatusFailed:
+			results[job.FanOutIndex].Err = fmt.Errorf("%s", job.LastError)
+		case core.StatusCancelled:
+			results[job.FanOutIndex].Err = ErrSubJobCancelled
+		default:
+			results[job.FanOutIndex].Err = ErrSubJobIncomplete
 		}
 	}
 
@@ -283,13 +324,13 @@ func CollectResults[T any](ctx context.Context, fanOutID string) ([]Result[T], e
 				})
 			}
 		}
-		return results, &Error{
+		return results, core.NoRetry(&Error{
 			FanOutID:    fanOutID,
 			TotalCount:  fanOut.TotalCount,
 			FailedCount: fanOut.FailedCount,
 			Strategy:    fanOut.Strategy,
 			Failures:    failures,
-		}
+		})
 	}
 
 	return results, nil

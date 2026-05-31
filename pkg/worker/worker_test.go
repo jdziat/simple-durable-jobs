@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -16,6 +17,7 @@ import (
 	"gorm.io/gorm/logger"
 
 	"github.com/jdziat/simple-durable-jobs/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/pkg/fanout"
 	"github.com/jdziat/simple-durable-jobs/pkg/queue"
 	"github.com/jdziat/simple-durable-jobs/pkg/schedule"
 	"github.com/jdziat/simple-durable-jobs/pkg/storage"
@@ -30,12 +32,15 @@ type mockStorage struct {
 	releasedIDs     []string      // IDs returned by ReleaseStaleLocks
 	releaseErr      error         // error returned by ReleaseStaleLocks
 	releaseDelay    time.Duration // optional artificial delay per call
+	releaseFunc     func(ctx context.Context, age time.Duration) ([]string, error)
 	dequeueFunc     func(ctx context.Context, queues []string, workerID string) (*core.Job, error)
 	completeFunc    func(ctx context.Context, jobID string, workerID string) error
 	failFunc        func(ctx context.Context, jobID string, workerID string, errMsg string, retryAt *time.Time) error
 	heartbeatFunc   func(ctx context.Context, jobID string, workerID string) error
 	checkpointFunc  func(ctx context.Context, jobID string) ([]core.Checkpoint, error)
 	waitingJobsFunc func(ctx context.Context) ([]*core.Job, error)
+	stalledJobsFunc func(ctx context.Context, olderThan time.Time) ([]*core.Job, error)
+	claimFireFunc   func(ctx context.Context, name string, fireTime time.Time) (bool, error)
 
 	// fan-out control hooks
 	incrementCompletedFunc func(ctx context.Context, fanOutID string) (*core.FanOut, error)
@@ -46,8 +51,11 @@ type mockStorage struct {
 	findOrphanedFunc       func(jobIDs []string) ([]string, error)
 
 	// enqueue tracking
-	enqueueMu    sync.Mutex
-	enqueueCount int64 // incremented on each Enqueue call
+	enqueueMu         sync.Mutex
+	enqueueCount      int64 // incremented on each Enqueue call
+	enqueueUniqueFunc func(ctx context.Context, job *core.Job, uniqueKey string) error
+	enqueuedJobs      []*core.Job
+	enqueuedKeys      []string
 
 	// result tracking
 	savedResults map[string][]byte
@@ -55,9 +63,10 @@ type mockStorage struct {
 
 func (m *mockStorage) Migrate(_ context.Context) error { return nil }
 
-func (m *mockStorage) Enqueue(_ context.Context, _ *core.Job) error {
+func (m *mockStorage) Enqueue(_ context.Context, job *core.Job) error {
 	m.enqueueMu.Lock()
 	m.enqueueCount++
+	m.enqueuedJobs = append(m.enqueuedJobs, job)
 	m.enqueueMu.Unlock()
 	return nil
 }
@@ -89,7 +98,18 @@ func (m *mockStorage) Fail(ctx context.Context, jobID string, workerID string, e
 	return nil
 }
 
-func (m *mockStorage) EnqueueUnique(_ context.Context, _ *core.Job, _ string) error { return nil }
+func (m *mockStorage) EnqueueUnique(ctx context.Context, job *core.Job, uniqueKey string) error {
+	m.enqueueMu.Lock()
+	job.UniqueKey = uniqueKey
+	m.enqueueCount++
+	m.enqueuedJobs = append(m.enqueuedJobs, job)
+	m.enqueuedKeys = append(m.enqueuedKeys, uniqueKey)
+	m.enqueueMu.Unlock()
+	if m.enqueueUniqueFunc != nil {
+		return m.enqueueUniqueFunc(ctx, job, uniqueKey)
+	}
+	return nil
+}
 
 func (m *mockStorage) SaveCheckpoint(_ context.Context, _ *core.Checkpoint) error { return nil }
 
@@ -106,6 +126,13 @@ func (m *mockStorage) GetDueJobs(_ context.Context, _ []string, _ int) ([]*core.
 	return nil, nil
 }
 
+func (m *mockStorage) ClaimScheduledFire(ctx context.Context, name string, fireTime time.Time) (bool, error) {
+	if m.claimFireFunc != nil {
+		return m.claimFireFunc(ctx, name, fireTime)
+	}
+	return true, nil
+}
+
 func (m *mockStorage) Heartbeat(ctx context.Context, jobID string, workerID string) error {
 	if m.heartbeatFunc != nil {
 		return m.heartbeatFunc(ctx, jobID, workerID)
@@ -113,13 +140,16 @@ func (m *mockStorage) Heartbeat(ctx context.Context, jobID string, workerID stri
 	return nil
 }
 
-func (m *mockStorage) ReleaseStaleLocks(_ context.Context, _ time.Duration) ([]string, error) {
+func (m *mockStorage) ReleaseStaleLocks(ctx context.Context, age time.Duration) ([]string, error) {
 	if m.releaseDelay > 0 {
 		time.Sleep(m.releaseDelay)
 	}
 	m.mu.Lock()
 	m.releaseCount++
 	m.mu.Unlock()
+	if m.releaseFunc != nil {
+		return m.releaseFunc(ctx, age)
+	}
 	return m.releasedIDs, m.releaseErr
 }
 
@@ -204,6 +234,13 @@ func (m *mockStorage) ResumeJob(ctx context.Context, jobID string) (bool, error)
 func (m *mockStorage) GetWaitingJobsToResume(ctx context.Context) ([]*core.Job, error) {
 	if m.waitingJobsFunc != nil {
 		return m.waitingJobsFunc(ctx)
+	}
+	return nil, nil
+}
+
+func (m *mockStorage) GetStalledFanOutParents(ctx context.Context, olderThan time.Time) ([]*core.Job, error) {
+	if m.stalledJobsFunc != nil {
+		return m.stalledJobsFunc(ctx, olderThan)
 	}
 	return nil, nil
 }
@@ -567,6 +604,14 @@ func TestWithPollInterval_SetsExactMinimum(t *testing.T) {
 	assert.Equal(t, 50*time.Millisecond, config.PollInterval)
 }
 
+func TestWithDrainTimeout_SetsValue(t *testing.T) {
+	config := WorkerConfig{}
+
+	WithDrainTimeout(5 * time.Second).ApplyWorker(&config)
+
+	assert.Equal(t, 5*time.Second, config.DrainTimeout)
+}
+
 func TestWithStaleLockInterval_SetsValue(t *testing.T) {
 	config := WorkerConfig{}
 
@@ -602,6 +647,14 @@ func TestWithStaleLockAge_SetsValue(t *testing.T) {
 	WithStaleLockAge(30 * time.Minute).ApplyWorker(&config)
 
 	assert.Equal(t, 30*time.Minute, config.StaleLockAge)
+}
+
+func TestWithFanOutRecoveryStaleAge_SetsValue(t *testing.T) {
+	config := WorkerConfig{}
+
+	WithFanOutRecoveryStaleAge(30 * time.Second).ApplyWorker(&config)
+
+	assert.Equal(t, 30*time.Second, config.FanOutRecoveryStaleAge)
 }
 
 func TestWithLockDuration_SetsValue(t *testing.T) {
@@ -807,6 +860,55 @@ func TestWorker_StaleLockReaperAlwaysRuns(t *testing.T) {
 
 	assert.GreaterOrEqual(t, mock.getReleaseCount(), int64(1),
 		"the stale-lock reaper must run; it cannot be disabled")
+}
+
+func TestWorker_StartWaitsForStaleLockReaperToFinish(t *testing.T) {
+	reaperEntered := make(chan struct{})
+	releaseReaper := make(chan struct{})
+	var enterOnce sync.Once
+
+	mock := &mockStorage{}
+	mock.releaseFunc = func(_ context.Context, _ time.Duration) ([]string, error) {
+		enterOnce.Do(func() { close(reaperEntered) })
+		<-releaseReaper
+		return nil, nil
+	}
+	q := queue.New(mock)
+	w := NewWorker(q,
+		WithPollInterval(50*time.Millisecond),
+		WithOwnershipAuditInterval(0),
+	)
+	w.config.StaleLockInterval = 10 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	startReturned := make(chan error, 1)
+	go func() {
+		startReturned <- w.Start(ctx)
+	}()
+
+	select {
+	case <-reaperEntered:
+	case <-time.After(time.Second):
+		t.Fatal("stale-lock reaper did not enter ReleaseStaleLocks")
+	}
+
+	cancel()
+
+	select {
+	case err := <-startReturned:
+		t.Fatalf("Start returned before ReleaseStaleLocks finished: %v", err)
+	case <-time.After(100 * time.Millisecond):
+		// Expected: Start is waiting for the blocked reaper goroutine.
+	}
+
+	close(releaseReaper)
+
+	select {
+	case err := <-startReturned:
+		assert.ErrorIs(t, err, context.Canceled)
+	case <-time.After(time.Second):
+		t.Fatal("Start did not return after ReleaseStaleLocks finished")
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -1148,8 +1250,10 @@ func TestNewWorker_DefaultsApplied(t *testing.T) {
 
 	assert.NotNil(t, w.config.StorageRetry)
 	assert.NotNil(t, w.config.DequeueRetry)
+	assert.Equal(t, 30*time.Second, w.config.DrainTimeout)
 	assert.Equal(t, 5*time.Minute, w.config.StaleLockInterval)
 	assert.Equal(t, 45*time.Minute, w.config.StaleLockAge)
+	assert.Equal(t, 2*time.Minute, w.config.FanOutRecoveryStaleAge)
 	assert.Equal(t, map[string]int{"default": 10}, w.config.Queues)
 }
 
@@ -1191,6 +1295,42 @@ func TestWorker_CalculateBackoff_CappedAtOneMinute(t *testing.T) {
 	b := w.calculateBackoff(10)
 
 	assert.Equal(t, time.Minute, b)
+}
+
+func TestWorker_CalculateBackoff_OverflowSafeForMaxRetryRange(t *testing.T) {
+	w := newTestWorker(t)
+
+	for _, attempt := range []int{0, 1, 2, 3, 4, 5, 30, 33, 63, 99, 100} {
+		t.Run(fmt.Sprintf("attempt_%d", attempt), func(t *testing.T) {
+			backoff := w.calculateBackoff(attempt)
+
+			assert.Greater(t, backoff, time.Duration(0))
+			assert.LessOrEqual(t, backoff, time.Minute)
+		})
+	}
+}
+
+func TestWorker_FailWithRetry_ClampsPastRetryAtToNow(t *testing.T) {
+	var captured *time.Time
+	mock := &mockStorage{
+		failFunc: func(_ context.Context, _ string, _ string, _ string, retryAt *time.Time) error {
+			require.NotNil(t, retryAt)
+			copy := *retryAt
+			captured = &copy
+			return nil
+		},
+	}
+	q := queue.New(mock)
+	w := NewWorker(q, WithStorageRetry(RetryConfig{MaxAttempts: 1}))
+
+	before := time.Now()
+	past := before.Add(-time.Hour)
+	err := w.failWithRetry(context.Background(), "job-1", "boom", &past)
+
+	require.NoError(t, err)
+	require.NotNil(t, captured)
+	assert.False(t, captured.Before(before), "retryAt must not be persisted in the past")
+	assert.WithinDuration(t, time.Now(), *captured, time.Second)
 }
 
 // ---------------------------------------------------------------------------
@@ -1349,6 +1489,317 @@ func TestWorker_CompleteWithRetry_SuccessfulJob(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("job did not complete")
 	}
+}
+
+func TestWorker_PerJobTimeoutCancelsHandlerContext(t *testing.T) {
+	q, cleanup := newSQLiteQueue(t)
+	defer cleanup()
+
+	const jobTimeout = 60 * time.Millisecond
+	started := make(chan struct{})
+	cancelled := make(chan time.Duration, 1)
+
+	q.Register("per-job-timeout", func(ctx context.Context, args struct{}) error {
+		start := time.Now()
+		close(started)
+		<-ctx.Done()
+		cancelled <- time.Since(start)
+		return ctx.Err()
+	})
+
+	_, err := q.Enqueue(context.Background(), "per-job-timeout", struct{}{},
+		queue.Timeout(jobTimeout),
+		queue.Retries(0),
+	)
+	require.NoError(t, err)
+
+	w := NewWorker(q, WithPollInterval(10*time.Millisecond), WithStaleLockInterval(0), WithOwnershipAuditInterval(0))
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	go func() { _ = w.Start(ctx) }()
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("job did not start")
+	}
+
+	select {
+	case elapsed := <-cancelled:
+		assert.GreaterOrEqual(t, elapsed, jobTimeout-10*time.Millisecond)
+		assert.Less(t, elapsed, 500*time.Millisecond)
+	case <-time.After(time.Second):
+		t.Fatal("job context was not cancelled by per-job timeout")
+	}
+}
+
+func TestWorker_SubJobTimeoutCancelsHandlerContext(t *testing.T) {
+	q, cleanup := newSQLiteQueue(t)
+	defer cleanup()
+
+	const subTimeout = 60 * time.Millisecond
+	subStarted := make(chan struct{})
+	subCancelled := make(chan time.Duration, 1)
+
+	q.Register("sub-timeout-child", func(ctx context.Context, args string) error {
+		start := time.Now()
+		close(subStarted)
+		<-ctx.Done()
+		subCancelled <- time.Since(start)
+		return ctx.Err()
+	})
+	q.Register("sub-timeout-parent", func(ctx context.Context, args struct{}) error {
+		_, err := fanout.FanOut[string](ctx, []fanout.SubJob{
+			fanout.Sub("sub-timeout-child", "x", queue.Timeout(subTimeout), queue.Retries(0)),
+		})
+		return err
+	})
+
+	_, err := q.Enqueue(context.Background(), "sub-timeout-parent", struct{}{}, queue.Retries(0))
+	require.NoError(t, err)
+
+	w := NewWorker(q, WithPollInterval(10*time.Millisecond), WithStaleLockInterval(0), WithOwnershipAuditInterval(0))
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	go func() { _ = w.Start(ctx) }()
+
+	select {
+	case <-subStarted:
+	case <-time.After(time.Second):
+		t.Fatal("sub-job did not start")
+	}
+
+	select {
+	case elapsed := <-subCancelled:
+		assert.GreaterOrEqual(t, elapsed, subTimeout-10*time.Millisecond)
+		assert.Less(t, elapsed, 500*time.Millisecond)
+	case <-time.After(time.Second):
+		t.Fatal("sub-job context was not cancelled by sub-job timeout")
+	}
+}
+
+func TestWorker_HandlerTimeoutFallbackAndNoTimeout(t *testing.T) {
+	q, cleanup := newSQLiteQueue(t)
+	defer cleanup()
+
+	const handlerTimeout = 60 * time.Millisecond
+	fallbackStarted := make(chan struct{})
+	fallbackCancelled := make(chan time.Duration, 1)
+	noTimeoutRan := make(chan struct{})
+
+	q.Register("handler-timeout", func(ctx context.Context, args struct{}) error {
+		start := time.Now()
+		close(fallbackStarted)
+		<-ctx.Done()
+		fallbackCancelled <- time.Since(start)
+		return ctx.Err()
+	}, queue.Timeout(handlerTimeout))
+	q.Register("no-timeout", func(ctx context.Context, args struct{}) error {
+		if _, ok := ctx.Deadline(); ok {
+			return errors.New("unexpected deadline")
+		}
+		close(noTimeoutRan)
+		return nil
+	})
+
+	_, err := q.Enqueue(context.Background(), "handler-timeout", struct{}{}, queue.Retries(0))
+	require.NoError(t, err)
+	_, err = q.Enqueue(context.Background(), "no-timeout", struct{}{}, queue.Retries(0))
+	require.NoError(t, err)
+
+	w := NewWorker(q, WithPollInterval(10*time.Millisecond), WithStaleLockInterval(0), WithOwnershipAuditInterval(0))
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	go func() { _ = w.Start(ctx) }()
+
+	select {
+	case <-fallbackStarted:
+	case <-time.After(time.Second):
+		t.Fatal("handler-timeout job did not start")
+	}
+
+	select {
+	case elapsed := <-fallbackCancelled:
+		assert.GreaterOrEqual(t, elapsed, handlerTimeout-10*time.Millisecond)
+		assert.Less(t, elapsed, 500*time.Millisecond)
+	case <-time.After(time.Second):
+		t.Fatal("handler timeout fallback did not cancel context")
+	}
+
+	select {
+	case <-noTimeoutRan:
+	case <-time.After(time.Second):
+		t.Fatal("no-timeout handler did not run without deadline")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Start drain behaviour
+// ---------------------------------------------------------------------------
+
+func TestWorker_StartGracefullyDrainsRunningHandlerOnContextCancel(t *testing.T) {
+	q, cleanup := newSQLiteQueue(t)
+	defer cleanup()
+
+	started := make(chan struct{})
+	completed := make(chan struct{})
+	var completeOnce sync.Once
+	var sideEffect atomic.Int32
+	var handlerCancelled atomic.Bool
+
+	q.Register("slow-success", func(ctx context.Context, args struct{}) error {
+		close(started)
+		select {
+		case <-time.After(200 * time.Millisecond):
+			sideEffect.Add(1)
+			return nil
+		case <-ctx.Done():
+			handlerCancelled.Store(true)
+			return ctx.Err()
+		}
+	})
+	q.OnJobComplete(func(_ context.Context, _ *core.Job) {
+		completeOnce.Do(func() { close(completed) })
+	})
+
+	jobID, err := q.Enqueue(context.Background(), "slow-success", struct{}{})
+	require.NoError(t, err)
+
+	w := NewWorker(q,
+		WithPollInterval(50*time.Millisecond),
+		WithDrainTimeout(2*time.Second),
+		WithOwnershipAuditInterval(0),
+	)
+	ctx, cancel := context.WithCancel(context.Background())
+	startReturned := make(chan error, 1)
+	go func() {
+		startReturned <- w.Start(ctx)
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("job did not start")
+	}
+
+	cancelStarted := time.Now()
+	cancel()
+
+	select {
+	case err := <-startReturned:
+		t.Fatalf("Start returned before the running handler completed: %v", err)
+	case <-time.After(100 * time.Millisecond):
+		// Expected: drain keeps the handler alive past Start context cancellation.
+	}
+
+	select {
+	case <-completed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("job did not complete during drain")
+	}
+
+	select {
+	case err := <-startReturned:
+		assert.ErrorIs(t, err, context.Canceled)
+	case <-time.After(time.Second):
+		t.Fatal("Start did not return after drained handler completed")
+	}
+
+	assert.GreaterOrEqual(t, time.Since(cancelStarted), 180*time.Millisecond)
+	assert.Equal(t, int32(1), sideEffect.Load())
+	assert.False(t, handlerCancelled.Load(), "handler context must survive Start context cancellation during drain")
+
+	job, err := q.Storage().GetJob(context.Background(), jobID)
+	require.NoError(t, err)
+	require.NotNil(t, job)
+	assert.Equal(t, core.StatusCompleted, job.Status)
+}
+
+func TestWorker_StartDrainTimeoutCancelsRunningHandler(t *testing.T) {
+	q, cleanup := newSQLiteQueue(t)
+	defer cleanup()
+
+	started := make(chan struct{})
+	cancelled := make(chan struct{})
+	var cancelOnce sync.Once
+
+	q.Register("blocked", func(ctx context.Context, args struct{}) error {
+		close(started)
+		<-ctx.Done()
+		cancelOnce.Do(func() { close(cancelled) })
+		return ctx.Err()
+	})
+
+	_, err := q.Enqueue(context.Background(), "blocked", struct{}{})
+	require.NoError(t, err)
+
+	drainTimeout := 80 * time.Millisecond
+	w := NewWorker(q,
+		WithPollInterval(50*time.Millisecond),
+		WithDrainTimeout(drainTimeout),
+		WithOwnershipAuditInterval(0),
+		DisableRetry(),
+	)
+	ctx, cancel := context.WithCancel(context.Background())
+	startReturned := make(chan error, 1)
+	go func() {
+		startReturned <- w.Start(ctx)
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("job did not start")
+	}
+
+	cancelStarted := time.Now()
+	cancel()
+
+	select {
+	case <-cancelled:
+	case <-time.After(time.Second):
+		t.Fatal("handler context was not cancelled after drain timeout")
+	}
+
+	select {
+	case err := <-startReturned:
+		assert.ErrorIs(t, err, context.Canceled)
+	case <-time.After(time.Second):
+		t.Fatal("Start did not return after drain timeout")
+	}
+
+	elapsed := time.Since(cancelStarted)
+	assert.GreaterOrEqual(t, elapsed, drainTimeout)
+	assert.Less(t, elapsed, 500*time.Millisecond)
+}
+
+func TestWorker_StartCancelIdleReturnsPromptly(t *testing.T) {
+	mock := &mockStorage{}
+	q := queue.New(mock)
+	w := NewWorker(q,
+		WithPollInterval(50*time.Millisecond),
+		WithDrainTimeout(2*time.Second),
+		WithOwnershipAuditInterval(0),
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	startReturned := make(chan error, 1)
+	go func() {
+		startReturned <- w.Start(ctx)
+	}()
+
+	time.Sleep(20 * time.Millisecond)
+	start := time.Now()
+	cancel()
+
+	select {
+	case err := <-startReturned:
+		assert.ErrorIs(t, err, context.Canceled)
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("idle worker waited for DrainTimeout on cancellation")
+	}
+
+	assert.Less(t, time.Since(start), 300*time.Millisecond)
 }
 
 func TestWorker_HandleError_NoRetryError(t *testing.T) {
@@ -1564,6 +2015,40 @@ func TestWorker_PollWaitingJobs_ExitsOnContextCancel(t *testing.T) {
 	}
 }
 
+func TestWorker_PollWaitingJobs_ResumesStalledFanOutParent(t *testing.T) {
+	stalledParent := &core.Job{ID: "stalled-parent", Status: core.StatusWaiting}
+	resumed := make(chan string, 1)
+	var sawCutoff atomic.Bool
+
+	mock := &mockStorage{
+		stalledJobsFunc: func(_ context.Context, olderThan time.Time) ([]*core.Job, error) {
+			if olderThan.Before(time.Now().Add(-25 * time.Second)) {
+				sawCutoff.Store(true)
+			}
+			return []*core.Job{stalledParent}, nil
+		},
+		resumeJobFunc: func(_ context.Context, jobID string) (bool, error) {
+			resumed <- jobID
+			return true, nil
+		},
+	}
+	q := queue.New(mock)
+	w := NewWorker(q,
+		WithStorageRetry(RetryConfig{MaxAttempts: 1}),
+		WithFanOutRecoveryStaleAge(30*time.Second),
+	)
+
+	w.pollWaitingJobsOnce(context.Background())
+
+	select {
+	case jobID := <-resumed:
+		assert.Equal(t, "stalled-parent", jobID)
+	case <-time.After(time.Second):
+		t.Fatal("ResumeJob was not called for stalled fan-out parent")
+	}
+	assert.True(t, sawCutoff.Load(), "stalled fan-out query should use configured stale age cutoff")
+}
+
 // ---------------------------------------------------------------------------
 // handleSubJobCompletion — cover the non-nil FanOut path
 // ---------------------------------------------------------------------------
@@ -1736,6 +2221,25 @@ func TestWorker_HandleError_RetryAfterExhausted(t *testing.T) {
 // runScheduler tests
 // ---------------------------------------------------------------------------
 
+type offsetSchedule struct {
+	offset time.Duration
+}
+
+func (s offsetSchedule) Next(from time.Time) time.Time {
+	return from.Add(s.offset)
+}
+
+type fixedBoundarySchedule struct {
+	fire time.Time
+}
+
+func (s fixedBoundarySchedule) Next(from time.Time) time.Time {
+	if from.Before(s.fire) {
+		return s.fire
+	}
+	return s.fire.Add(time.Hour)
+}
+
 // TestWorker_RunScheduler_ExitsOnContextCancel verifies that runScheduler
 // returns promptly when its context is cancelled.
 func TestWorker_RunScheduler_ExitsOnContextCancel(t *testing.T) {
@@ -1793,6 +2297,24 @@ func TestWorker_RunScheduler_NilScheduledJobsIsNoop(t *testing.T) {
 	assert.Equal(t, int64(0), mock.getEnqueueCount())
 }
 
+func TestWorker_RunScheduler_DoesNotFireFutureScheduleOnStartup(t *testing.T) {
+	mock := &mockStorage{}
+	q := queue.New(mock)
+	q.Register("scheduled-task", func(_ context.Context, _ struct{}) error {
+		return nil
+	})
+	q.Schedule("scheduled-task", nil, offsetSchedule{offset: time.Hour})
+
+	w := NewWorker(q, WithStaleLockInterval(0))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	go func() { w.runScheduler(ctx) }()
+
+	<-ctx.Done()
+	assert.Equal(t, int64(0), mock.getEnqueueCount())
+}
+
 // TestWorker_RunScheduler_EnqueuesDueJob verifies that a scheduled job whose
 // next run time is in the past gets enqueued by the scheduler goroutine.
 func TestWorker_RunScheduler_EnqueuesDueJob(t *testing.T) {
@@ -1806,7 +2328,7 @@ func TestWorker_RunScheduler_EnqueuesDueJob(t *testing.T) {
 
 	// Register a schedule that always returns a time in the past so the
 	// scheduler immediately considers the job due.
-	q.Schedule("scheduled-task", schedule.Every(1*time.Millisecond))
+	q.Schedule("scheduled-task", nil, schedule.Every(1*time.Millisecond))
 
 	w := NewWorker(q, WithStaleLockInterval(0))
 
@@ -1824,6 +2346,108 @@ func TestWorker_RunScheduler_EnqueuesDueJob(t *testing.T) {
 		return len(jobs) > 0
 	}, 1500*time.Millisecond, 20*time.Millisecond,
 		"scheduler should enqueue at least one due job")
+}
+
+func TestWorker_RunScheduler_ForwardsArgsOptionsAndUserUniqueKey(t *testing.T) {
+	mock := &mockStorage{}
+	q := queue.New(mock)
+	q.Register("scheduled-task", func(_ context.Context, _ map[string]string) error {
+		return nil
+	})
+
+	fire := time.Now().Add(300 * time.Millisecond)
+	runAt := fire.Add(time.Minute)
+	args := map[string]string{"tenant": "acme"}
+	q.Schedule("scheduled-task", args, fixedBoundarySchedule{fire: fire},
+		queue.QueueOpt("scheduled"),
+		queue.Priority(9),
+		queue.Retries(5),
+		queue.At(runAt),
+		queue.Timeout(time.Second),
+		queue.Unique("user:scheduled-task"),
+	)
+
+	w := NewWorker(q, WithStaleLockInterval(0))
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	go func() { w.runScheduler(ctx) }()
+
+	require.Eventually(t, func() bool {
+		mock.enqueueMu.Lock()
+		defer mock.enqueueMu.Unlock()
+		return len(mock.enqueuedJobs) == 1
+	}, 900*time.Millisecond, 20*time.Millisecond)
+
+	mock.enqueueMu.Lock()
+	defer mock.enqueueMu.Unlock()
+	require.Len(t, mock.enqueuedJobs, 1)
+	job := mock.enqueuedJobs[0]
+	assert.Equal(t, "scheduled-task", job.Type)
+	assert.JSONEq(t, `{"tenant":"acme"}`, string(job.Args))
+	assert.Equal(t, "scheduled", job.Queue)
+	assert.Equal(t, 9, job.Priority)
+	assert.Equal(t, 5, job.MaxRetries)
+	require.NotNil(t, job.RunAt)
+	assert.Equal(t, runAt, *job.RunAt)
+	assert.Equal(t, "user:scheduled-task", mock.enqueuedKeys[0])
+	assert.Equal(t, "user:scheduled-task", job.UniqueKey)
+}
+
+func TestWorker_RunScheduler_ClaimRefusalAdvancesBoundary(t *testing.T) {
+	var claimCalls atomic.Int32
+	mock := &mockStorage{}
+	mock.claimFireFunc = func(context.Context, string, time.Time) (bool, error) {
+		claimCalls.Add(1)
+		return false, nil
+	}
+	q := queue.New(mock)
+	q.Register("scheduled-task", func(_ context.Context, _ struct{}) error {
+		return nil
+	})
+
+	fire := time.Now().Add(250 * time.Millisecond)
+	q.Schedule("scheduled-task", nil, fixedBoundarySchedule{fire: fire})
+
+	w := NewWorker(q, WithStaleLockInterval(0))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 650*time.Millisecond)
+	defer cancel()
+	go func() { w.runScheduler(ctx) }()
+
+	<-ctx.Done()
+
+	assert.Equal(t, int32(1), claimCalls.Load(), "refused claim should advance lastRun past the boundary")
+	assert.Equal(t, int64(0), mock.getEnqueueCount())
+}
+
+func TestWorker_RunScheduler_ClaimedBoundaryEnqueuesOnce(t *testing.T) {
+	var claimCalls atomic.Int32
+	mock := &mockStorage{}
+	mock.claimFireFunc = func(context.Context, string, time.Time) (bool, error) {
+		return claimCalls.Add(1) == 1, nil
+	}
+	q := queue.New(mock)
+	q.Register("scheduled-task", func(_ context.Context, _ struct{}) error {
+		return nil
+	})
+
+	fire := time.Now().Add(250 * time.Millisecond)
+	q.Schedule("scheduled-task", nil, fixedBoundarySchedule{fire: fire})
+
+	w := NewWorker(q, WithStaleLockInterval(0))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 650*time.Millisecond)
+	defer cancel()
+	go func() { w.runScheduler(ctx) }()
+
+	<-ctx.Done()
+
+	assert.Equal(t, int32(1), claimCalls.Load(), "claimed boundary should advance lastRun")
+	assert.Equal(t, int64(1), mock.getEnqueueCount())
+	mock.enqueueMu.Lock()
+	defer mock.enqueueMu.Unlock()
+	assert.Empty(t, mock.enqueuedKeys, "scheduler must not inject a sched: unique key")
 }
 
 // ---------------------------------------------------------------------------
@@ -2829,6 +3453,26 @@ func TestStaleLockInterval_IntervalConfiguration(t *testing.T) {
 	})
 }
 
+func TestFanOutRecoveryStaleAge_Configuration(t *testing.T) {
+	q := queue.New(&mockStorage{})
+
+	t.Run("unset applies 2m default", func(t *testing.T) {
+		w := NewWorker(q)
+		assert.Equal(t, 2*time.Minute, w.config.FanOutRecoveryStaleAge)
+	})
+
+	t.Run("explicit value is honored", func(t *testing.T) {
+		w := NewWorker(q, WithFanOutRecoveryStaleAge(30*time.Second))
+		assert.Equal(t, 30*time.Second, w.config.FanOutRecoveryStaleAge)
+	})
+
+	t.Run("non-positive cannot disable; falls back to default", func(t *testing.T) {
+		w := NewWorker(q, WithFanOutRecoveryStaleAge(0))
+		assert.Equal(t, 2*time.Minute, w.config.FanOutRecoveryStaleAge,
+			"WithFanOutRecoveryStaleAge(0) must not disable recovery; the default applies")
+	})
+}
+
 // ---------------------------------------------------------------------------
 // Lost-ownership side-effect suppression (finding A)
 // ---------------------------------------------------------------------------
@@ -2857,7 +3501,8 @@ func TestHandleError_NotOwnedSkipsFanOutAccounting(t *testing.T) {
 	// Attempt >= MaxRetries → terminal path (the one that does fan-out accounting).
 	job := &core.Job{ID: "sub-1", FanOutID: &fanOutID, Attempt: 5, MaxRetries: 3}
 
-	w.handleError(context.Background(), job, errors.New("boom"))
+	ctx := context.Background()
+	w.handleError(ctx, ctx, job, errors.New("boom"))
 
 	assert.Equal(t, int32(0), incrementCalled.Load(),
 		"a job we no longer own must not write to the fan-out counters")
@@ -2885,7 +3530,8 @@ func TestHandleError_OwnedStillAccountsFanOut(t *testing.T) {
 	fanOutID := "fo-1"
 	job := &core.Job{ID: "sub-1", FanOutID: &fanOutID, Attempt: 5, MaxRetries: 3}
 
-	w.handleError(context.Background(), job, errors.New("boom"))
+	ctx := context.Background()
+	w.handleError(ctx, ctx, job, errors.New("boom"))
 
 	assert.Equal(t, int32(1), incrementCalled.Load(),
 		"a job we still own must record its failure against the fan-out")

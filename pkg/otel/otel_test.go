@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -14,8 +15,14 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	"go.opentelemetry.io/otel/trace"
+	"gorm.io/driver/sqlite"
+	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
 
 	"github.com/jdziat/simple-durable-jobs/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/pkg/queue"
+	"github.com/jdziat/simple-durable-jobs/pkg/storage"
+	"github.com/jdziat/simple-durable-jobs/pkg/worker"
 )
 
 // setupTracer creates a test tracer with an in-memory span recorder.
@@ -336,6 +343,79 @@ func TestMapCarrier(t *testing.T) {
 	assert.Equal(t, "00-abc-def-01", c.Get("traceparent"))
 	assert.Equal(t, "", c.Get("nonexistent"))
 	assert.ElementsMatch(t, []string{"traceparent", "tracestate"}, c.Keys())
+}
+
+func TestInstrumentedWorkerEndsProcessSpanOnComplete(t *testing.T) {
+	recorder := tracetest.NewSpanRecorder()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(recorder))
+	defer func() { _ = tp.Shutdown(context.Background()) }()
+
+	db, err := gorm.Open(sqlite.Open("file:"+t.Name()+"?mode=memory&cache=shared"), &gorm.Config{
+		Logger: logger.Default.LogMode(logger.Silent),
+	})
+	require.NoError(t, err)
+	if sqlDB, dbErr := db.DB(); dbErr == nil {
+		defer func() { _ = sqlDB.Close() }()
+	}
+
+	store := storage.NewGormStorage(db)
+	require.NoError(t, store.Migrate(context.Background()))
+
+	q := queue.New(store)
+	Instrument(q,
+		WithTracerProvider(tp),
+		WithPropagator(propagation.TraceContext{}),
+	)
+
+	q.Register("otel-complete-job", func(context.Context, struct{}) error {
+		return nil
+	})
+	completed := make(chan struct{})
+	q.OnJobComplete(func(context.Context, *core.Job) {
+		close(completed)
+	})
+
+	_, err = q.Enqueue(context.Background(), "otel-complete-job", struct{}{})
+	require.NoError(t, err)
+
+	w := worker.NewWorker(q, worker.WithPollInterval(50*time.Millisecond))
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	workerDone := make(chan struct{})
+	go func() {
+		defer close(workerDone)
+		_ = w.Start(ctx)
+	}()
+	defer func() {
+		cancel()
+		<-workerDone
+	}()
+
+	select {
+	case <-completed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("instrumented job did not complete")
+	}
+
+	require.Eventually(t, func() bool {
+		for _, span := range recorder.Ended() {
+			if span.Name() == "job.process otel-complete-job" && !span.EndTime().IsZero() {
+				return true
+			}
+		}
+		return false
+	}, 2*time.Second, 10*time.Millisecond, "worker completion path must end the job.process span")
+
+	var processSpan sdktrace.ReadOnlySpan
+	for _, span := range recorder.Ended() {
+		if span.Name() == "job.process otel-complete-job" {
+			processSpan = span
+			break
+		}
+	}
+	require.NotNil(t, processSpan)
+	assert.Equal(t, codes.Ok, processSpan.Status().Code)
+	assert.False(t, processSpan.EndTime().IsZero())
 }
 
 // spanAttrMap converts a slice of KeyValues into a string map for easy assertion.

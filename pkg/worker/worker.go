@@ -53,6 +53,7 @@ func NewWorker(q *queue.Queue, opts ...WorkerOption) *Worker {
 		Queues:       nil, // Will be set to default if no queue options provided
 		PollInterval: 100 * time.Millisecond,
 		WorkerID:     uuid.New().String(),
+		DrainTimeout: 30 * time.Second,
 	}
 
 	for _, opt := range opts {
@@ -89,6 +90,9 @@ func NewWorker(q *queue.Queue, opts ...WorkerOption) *Worker {
 	}
 	if config.StaleLockAge == 0 {
 		config.StaleLockAge = 45 * time.Minute
+	}
+	if config.FanOutRecoveryStaleAge <= 0 {
+		config.FanOutRecoveryStaleAge = 2 * time.Minute
 	}
 
 	// Propagate lock duration to the storage backend if supported.
@@ -137,31 +141,33 @@ func (w *Worker) Start(ctx context.Context) error {
 	}
 
 	jobsChan := make(chan *core.Job, totalConcurrency)
+	handlerBase, cancelHandlers := context.WithCancel(context.WithoutCancel(ctx))
+	defer cancelHandlers()
 
 	// Start scheduler if enabled
 	if w.config.EnableScheduler {
-		go w.runScheduler(ctx)
+		w.goTracked(func() { w.runScheduler(ctx) })
 	}
 
 	// Start polling for waiting jobs (fan-out fallback)
-	go w.pollWaitingJobs(ctx)
+	w.goTracked(func() { w.pollWaitingJobs(ctx) })
 
 	// Start the stale-lock reaper to reclaim jobs whose owning worker died.
 	// This always runs — it's the only recovery path for crashed workers, so
 	// it cannot be disabled (NewWorker guarantees a positive interval).
-	go w.reapStaleLocks(ctx)
+	w.goTracked(func() { w.reapStaleLocks(ctx) })
 
 	// Start ownership audit to cancel local handlers for jobs cancelled
 	// or reclaimed by other workers. Same-worker cancellation is handled
 	// directly by completeFanOut/reapStaleLocks; this is the cross-worker
 	// counterpart.
 	if w.config.OwnershipAuditInterval > 0 {
-		go w.runOwnershipAudit(ctx)
+		w.goTracked(func() { w.runOwnershipAudit(ctx) })
 	}
 
 	for i := 0; i < totalConcurrency; i++ {
 		w.wg.Add(1)
-		go w.processLoop(ctx, jobsChan)
+		go w.processLoop(handlerBase, jobsChan)
 	}
 
 	ticker := time.NewTicker(w.config.PollInterval)
@@ -171,7 +177,18 @@ func (w *Worker) Start(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			close(jobsChan)
-			w.wg.Wait()
+			if w.config.DrainTimeout <= 0 {
+				cancelHandlers()
+				w.wg.Wait()
+				return ctx.Err()
+			}
+			if !w.waitForDrain() {
+				w.logger.Warn("worker drain timeout reached; cancelling in-flight handlers",
+					"in_flight", w.RunningJobCount(),
+					"drain_timeout", w.config.DrainTimeout)
+				cancelHandlers()
+				w.wg.Wait()
+			}
 			return ctx.Err()
 		case <-ticker.C:
 			// Skip dequeue if paused
@@ -203,6 +220,32 @@ func (w *Worker) Start(ctx context.Context) error {
 			}
 		}
 	}
+}
+
+func (w *Worker) waitForDrain() bool {
+	done := make(chan struct{})
+	go func() {
+		w.wg.Wait()
+		close(done)
+	}()
+
+	timer := time.NewTimer(w.config.DrainTimeout)
+	defer timer.Stop()
+
+	select {
+	case <-done:
+		return true
+	case <-timer.C:
+		return false
+	}
+}
+
+func (w *Worker) goTracked(fn func()) {
+	w.wg.Add(1)
+	go func() {
+		defer w.wg.Done()
+		fn()
+	}()
 }
 
 // queuesWithCapacity returns queue names that haven't reached their concurrency limit.
@@ -281,11 +324,15 @@ func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 		return
 	}
 
-	// Create context for this job — with timeout if handler specifies one
+	// Create context for this job — per-job timeout overrides handler default.
 	var jobCtx context.Context
 	var cancelJob context.CancelFunc
-	if h.Timeout > 0 {
-		jobCtx, cancelJob = context.WithTimeout(ctx, h.Timeout)
+	effectiveTimeout := h.Timeout
+	if job.Timeout > 0 {
+		effectiveTimeout = job.Timeout
+	}
+	if effectiveTimeout > 0 {
+		jobCtx, cancelJob = context.WithTimeout(ctx, effectiveTimeout)
 	} else {
 		jobCtx, cancelJob = context.WithCancel(ctx)
 	}
@@ -331,7 +378,7 @@ func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 			// Job is already in StatusWaiting; just return
 			return
 		}
-		w.handleError(ctx, job, err)
+		w.handleError(ctx, jobCtx, job, err)
 	} else {
 		if resultBytes != nil {
 			if saveErr := w.queue.Storage().SaveJobResult(ctx, job.ID, w.config.WorkerID, resultBytes); saveErr != nil {
@@ -355,7 +402,7 @@ func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 			// we couldn't mark it in the DB. Without this, the fan-out
 			// counter never increments and the parent stays in 'waiting'.
 		} else {
-			w.queue.CallCompleteHooks(ctx, job)
+			w.queue.CallCompleteHooks(jobCtx, job)
 			// Emit completion event
 			w.queue.Emit(&core.JobCompleted{Job: job, Duration: time.Since(startTime), Timestamp: time.Now()})
 		}
@@ -507,9 +554,11 @@ func (w *Worker) executeHandler(ctx context.Context, job *core.Job, h *handler.H
 
 	// Create job context with all necessary references
 	jc := &intctx.JobContext{
-		Job:      job,
-		Storage:  w.queue.Storage(),
-		WorkerID: w.config.WorkerID,
+		Job:              job,
+		Storage:          w.queue.Storage(),
+		WorkerID:         w.config.WorkerID,
+		BestEffortReplay: job.Determinism == int(queue.BestEffort),
+		Logger:           w.logger,
 		HandlerLookup: func(name string) (any, bool) {
 			return w.queue.GetHandler(name)
 		},
@@ -523,7 +572,7 @@ func (w *Worker) executeHandler(ctx context.Context, job *core.Job, h *handler.H
 	return h.Execute(jobCtx, job.Args)
 }
 
-func (w *Worker) handleError(ctx context.Context, job *core.Job, err error) {
+func (w *Worker) handleError(ctx context.Context, jobCtx context.Context, job *core.Job, err error) {
 	// Decide the disposition: a scheduled retry (retryAt != nil) or a terminal
 	// failure (retryAt == nil). NoRetry always wins; otherwise we retry while
 	// attempts remain. This mirrors the original branch-by-branch logic.
@@ -557,13 +606,13 @@ func (w *Worker) handleError(ctx context.Context, job *core.Job, err error) {
 	}
 
 	if retryAt != nil {
-		w.queue.CallRetryHooks(ctx, job, job.Attempt, err)
+		w.queue.CallRetryHooks(jobCtx, job, job.Attempt, err)
 		w.queue.Emit(&core.JobRetrying{Job: job, Attempt: job.Attempt, Error: err, NextRunAt: *retryAt, Timestamp: time.Now()})
 		return
 	}
 
 	// Terminal failure.
-	w.queue.CallFailHooks(ctx, job, err)
+	w.queue.CallFailHooks(jobCtx, job, err)
 	w.queue.Emit(&core.JobFailed{Job: job, Error: err, Timestamp: time.Now()})
 	// Handle sub-job failure (resume parent if needed).
 	if handleErr := w.handleSubJobCompletion(ctx, job, false); handleErr != nil {
@@ -575,6 +624,13 @@ func (w *Worker) handleError(ctx context.Context, job *core.Job, err error) {
 // It returns the final storage error so callers can detect a lost-ownership
 // outcome (core.ErrJobNotOwned) and skip downstream side effects.
 func (w *Worker) failWithRetry(ctx context.Context, jobID string, errMsg string, retryAt *time.Time) error {
+	if retryAt != nil {
+		now := time.Now()
+		if !retryAt.After(now) {
+			retryAt = &now
+		}
+	}
+
 	err := retryWithBackoff(ctx, *w.config.StorageRetry, func() error {
 		return w.queue.Storage().Fail(ctx, jobID, w.config.WorkerID, errMsg, retryAt)
 	})
@@ -740,9 +796,19 @@ func (w *Worker) completeFanOut(ctx context.Context, fo *core.FanOut, status cor
 }
 
 func (w *Worker) calculateBackoff(attempt int) time.Duration {
-	base := time.Second
-	backoff := base * (1 << attempt)
-	return min(backoff, time.Minute)
+	shift := attempt
+	if shift < 0 {
+		shift = 0
+	}
+	if shift > 30 {
+		shift = 30
+	}
+
+	backoff := time.Second << uint(shift)
+	if backoff <= 0 || backoff > time.Minute {
+		return time.Minute
+	}
+	return backoff
 }
 
 func (w *Worker) runScheduler(ctx context.Context) {
@@ -764,16 +830,44 @@ func (w *Worker) runScheduler(ctx context.Context) {
 
 			now := time.Now()
 			for name, sj := range scheduled {
+				if _, ok := lastRun[name]; !ok {
+					lastRun[name] = now
+				}
 				nextRun := sj.Schedule.Next(lastRun[name])
 				if now.After(nextRun) || now.Equal(nextRun) {
-					_, err := w.queue.Enqueue(ctx, sj.Name, sj.Args,
+					claimed, err := w.queue.Storage().ClaimScheduledFire(ctx, name, nextRun)
+					if err != nil {
+						w.logger.Error("failed to claim scheduled fire", "name", name, "fire_time", nextRun, "error", err)
+						continue
+					}
+					if !claimed {
+						lastRun[name] = nextRun
+						continue
+					}
+					lastRun[name] = nextRun
+					opts := []queue.Option{
 						queue.QueueOpt(sj.Options.Queue),
 						queue.Priority(sj.Options.Priority),
+						queue.Retries(sj.Options.MaxRetries),
+					}
+					if sj.Options.UniqueKey != "" {
+						opts = append(opts, queue.Unique(sj.Options.UniqueKey))
+					}
+					if sj.Options.Delay > 0 {
+						opts = append(opts, queue.Delay(sj.Options.Delay))
+					}
+					if sj.Options.RunAt != nil {
+						opts = append(opts, queue.At(*sj.Options.RunAt))
+					}
+					if sj.Options.Timeout > 0 {
+						opts = append(opts, queue.Timeout(sj.Options.Timeout))
+					}
+					opts = append(opts, queue.Determinism(sj.Options.Determinism))
+					_, err = w.queue.Enqueue(ctx, sj.Name, sj.Args,
+						opts...,
 					)
 					if err != nil {
 						w.logger.Error("failed to enqueue scheduled job", "name", name, "error", err)
-					} else {
-						lastRun[name] = now
 					}
 				}
 			}
@@ -792,29 +886,58 @@ func (w *Worker) pollWaitingJobs(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			var jobs []*core.Job
-			err := retryWithBackoff(ctx, *w.config.StorageRetry, func() error {
-				var queryErr error
-				jobs, queryErr = w.queue.Storage().GetWaitingJobsToResume(ctx)
-				return queryErr
-			})
-			if err != nil {
-				if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-					w.logger.Error("failed to get waiting jobs after retries", "error", err)
-				}
-				continue
-			}
-			for _, job := range jobs {
-				resumeErr := retryWithBackoff(ctx, *w.config.StorageRetry, func() error {
-					_, err := w.queue.Storage().ResumeJob(ctx, job.ID)
-					return err
-				})
-				if resumeErr != nil {
-					w.logger.Error("failed to resume waiting job after retries", "job_id", job.ID, "error", resumeErr)
-				} else {
-					w.logger.Info("resumed waiting job via polling fallback", "job_id", job.ID)
-				}
-			}
+			w.pollWaitingJobsOnce(ctx)
+		}
+	}
+}
+
+func (w *Worker) pollWaitingJobsOnce(ctx context.Context) {
+	var jobs []*core.Job
+	err := retryWithBackoff(ctx, *w.config.StorageRetry, func() error {
+		var queryErr error
+		jobs, queryErr = w.queue.Storage().GetWaitingJobsToResume(ctx)
+		return queryErr
+	})
+	if err != nil {
+		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+			w.logger.Error("failed to get waiting jobs after retries", "error", err)
+		}
+		return
+	}
+	for _, job := range jobs {
+		resumeErr := retryWithBackoff(ctx, *w.config.StorageRetry, func() error {
+			_, err := w.queue.Storage().ResumeJob(ctx, job.ID)
+			return err
+		})
+		if resumeErr != nil {
+			w.logger.Error("failed to resume waiting job after retries", "job_id", job.ID, "error", resumeErr)
+		} else {
+			w.logger.Info("resumed waiting job via polling fallback", "job_id", job.ID)
+		}
+	}
+
+	stalledCutoff := time.Now().Add(-w.config.FanOutRecoveryStaleAge)
+	var stalled []*core.Job
+	err = retryWithBackoff(ctx, *w.config.StorageRetry, func() error {
+		var queryErr error
+		stalled, queryErr = w.queue.Storage().GetStalledFanOutParents(ctx, stalledCutoff)
+		return queryErr
+	})
+	if err != nil {
+		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+			w.logger.Error("failed to get stalled fan-out parents after retries", "error", err)
+		}
+		return
+	}
+	for _, job := range stalled {
+		resumeErr := retryWithBackoff(ctx, *w.config.StorageRetry, func() error {
+			_, err := w.queue.Storage().ResumeJob(ctx, job.ID)
+			return err
+		})
+		if resumeErr != nil {
+			w.logger.Error("failed to resume stalled fan-out parent after retries", "job_id", job.ID, "error", resumeErr)
+		} else {
+			w.logger.Info("resumed stalled fan-out parent via polling fallback", "job_id", job.ID)
 		}
 	}
 }
