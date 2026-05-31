@@ -3655,3 +3655,52 @@ func TestFindOrphanedJobs_UnknownIDsAreNotReturned(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, orphaned)
 }
+
+// TestIsSerializationFailure_RetryableErrors locks in the set of transient
+// driver errors that withSerializationRetry must retry. The SQLite BUSY/LOCKED
+// cases are a regression guard: the P1 local-handler-cancel can wake sibling
+// sub-job handlers into concurrent writes, and if a contended CancelSubJob /
+// Increment* surfaced SQLITE_BUSY instead of being retried, the sub-job would
+// go unaccounted and a CollectAll/Threshold parent would wedge in 'waiting'.
+func TestIsSerializationFailure_RetryableErrors(t *testing.T) {
+	retryable := []string{
+		// MySQL
+		"Error 1213: Deadlock found when trying to get lock",
+		"Deadlock found when trying to get lock; try restarting transaction",
+		"Error 1205: Lock wait timeout exceeded",
+		"Lock wait timeout exceeded; try restarting transaction",
+		// PostgreSQL
+		"ERROR: could not serialize access due to concurrent update (SQLSTATE 40001)",
+		"ERROR: deadlock detected (SQLSTATE 40P01)",
+		"could not serialize access due to read/write dependencies",
+		"deadlock detected",
+		// SQLite (regression guard)
+		"database is locked",
+		"database table is locked",
+		"SQLITE_BUSY: database is locked",
+		"SQLITE_LOCKED: database table is locked",
+	}
+	for _, msg := range retryable {
+		if !isSerializationFailure(errors.New(msg)) {
+			t.Errorf("expected %q to be treated as a retryable serialization failure", msg)
+		}
+	}
+
+	nonRetryable := []string{
+		"",
+		"record not found",
+		"UNIQUE constraint failed: jobs.unique_key",
+		"no such table: jobs",
+		"context canceled",
+		"jobs: job not owned by this worker",
+	}
+	for _, msg := range nonRetryable {
+		var err error
+		if msg != "" {
+			err = errors.New(msg)
+		}
+		if isSerializationFailure(err) {
+			t.Errorf("expected %q to NOT be treated as a serialization failure", msg)
+		}
+	}
+}

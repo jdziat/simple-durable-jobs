@@ -125,9 +125,10 @@ phase-name distinct-collision (triple-keyed).
 | P2b | pending | — | DEFERRED to pair with P4: SaveJobResult/Complete partial-failure wedge + reaper-vs-Complete window (need PauseJob cancel-accounting from P4 first) |
 | P3 | pending | — | |
 | P4a | ✅ committed | 02e77a5 | storage fan-in correctness (gorm.go): cancelled_count over-count guard, Increment* nil-on-error, completed_at parity, LIMIT recovery queries. Gate: race units + 5 RED→GREEN tests + multi-backend PG(ok 8.6s)+MySQL(ok 6.2s) + 10x APPROVE. (Optional follow-up nit: ORDER BY on recovery queries for FIFO/starvation-proof.) |
-| P4b | pending | — | schema: Job.Timeout/Determinism gorm tags, composite dequeue index, SaveCheckpoint created_at, dequeue status guard, migration drift doc |
+| P4b | ✅ committed | 4d6712f | schema: Job.Timeout/Determinism gorm `not null;default:0`; composite idx_jobs_dequeue (backend-aware, idempotent); SaveCheckpoint stops bumping created_at (adds error_kind/delay). **Bundles the P1 regression fix** (see REG below). Gate: race + 3 RED→GREEN + multi-backend PG/MySQL isolated (-p=1) + chaos all-HARD-PASS + 10x APPROVE-WITH-NITS. |
+| REG | ✅ committed | 4d6712f (+ lock-in test, this commit) | **P1 regression fix**: `isSerializationFailure` now retries SQLite BUSY/LOCKED. P1's CancelSubJob local-cancel woke sibling handlers into concurrent writes → SQLITE_BUSY that withSerializationRetry didn't retry → sub-job unaccounted → CollectAll/Threshold parent wedged in `waiting`. Caught by `tests/` integration pkg (NOT in my pkg-only P1/P4a gate — gap now closed: `tests/` added to gate). `TestFanOut_CancelledSubJobsCountTowardCompletion` 12/12 green after fix (was ~2/3 failing). Lock-in: `TestIsSerializationFailure_RetryableErrors` (RED→GREEN verified). |
 | P5 | pending | — | |
-| P6 | dispatching | — | parallel-safe (running concurrently with P4a); provider-key redaction + bounded sanitize |
+| P6 | ✅ committed | d132a01 | provider-key redaction (Stripe/GitHub/Slack/Google/AWS/JWT) + base64url charclass + bounded sanitize (cap before redact). Gate: race + 3 RED→GREEN (ProviderKeys/PreservesDiagnostics/BoundedForHugeInput) + 10x APPROVE-WITH-NITS. |
 | P7 | pending | — | after P6 |
 | P8 | pending | — | parallel-safe |
 | P9 | pending | — | |
