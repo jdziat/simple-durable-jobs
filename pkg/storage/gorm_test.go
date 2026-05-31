@@ -726,6 +726,27 @@ func TestReleaseStaleLocks_DoesNotTouchFreshLocks(t *testing.T) {
 	assert.Equal(t, core.StatusRunning, still.Status)
 }
 
+func TestReleaseStaleLocks_LimitsBatch(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	past := time.Now().Add(-2 * time.Hour)
+	for i := 0; i < maxResumeBatch+25; i++ {
+		job := &core.Job{
+			Type:        "task.stale",
+			Queue:       "default",
+			Status:      core.StatusRunning,
+			LockedBy:    "worker-stale",
+			LockedUntil: &past,
+		}
+		require.NoError(t, s.Enqueue(ctx, job))
+	}
+
+	released, err := s.ReleaseStaleLocks(ctx, time.Hour)
+	require.NoError(t, err)
+	assert.Len(t, released, maxResumeBatch)
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Checkpoints
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1878,6 +1899,35 @@ func TestCancelSubJob_CancelsSingleSubJob(t *testing.T) {
 	assert.Equal(t, core.StatusCancelled, got.Status)
 }
 
+func TestCancelSubJob_NoDoubleCountWhenAlreadyTerminal(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	parent := newTestJob("default", "workflow.run")
+	require.NoError(t, s.Enqueue(ctx, parent))
+
+	fanOut := &core.FanOut{ParentJobID: parent.ID, TotalCount: 1}
+	require.NoError(t, s.CreateFanOut(ctx, fanOut))
+
+	sub := &core.Job{Type: "sub", Queue: "default", FanOutID: &fanOut.ID, FanOutIndex: 0}
+	require.NoError(t, s.EnqueueBatch(ctx, []*core.Job{sub}))
+
+	first, err := s.CancelSubJob(ctx, sub.ID)
+	require.NoError(t, err)
+	require.NotNil(t, first)
+	assert.Equal(t, 1, first.CancelledCount)
+
+	second, err := s.CancelSubJob(ctx, sub.ID)
+	require.NoError(t, err)
+	assert.Nil(t, second, "already-terminal sub-job cancellation is a no-op")
+
+	got, err := s.GetFanOut(ctx, fanOut.ID)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, 1, got.CancelledCount)
+	assert.LessOrEqual(t, got.CompletedCount+got.FailedCount+got.CancelledCount, got.TotalCount)
+}
+
 func TestCancelSubJob_NonSubJobReturnsNil(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStorage(t)
@@ -1889,6 +1939,35 @@ func TestCancelSubJob_NonSubJobReturnsNil(t *testing.T) {
 	fo, err := s.CancelSubJob(ctx, job.ID)
 	require.NoError(t, err)
 	assert.Nil(t, fo, "non-sub-job should return nil FanOut")
+}
+
+func TestCancelSubJobs_SetsCompletedAt(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	parent := newTestJob("default", "workflow.run")
+	require.NoError(t, s.Enqueue(ctx, parent))
+
+	fanOut := &core.FanOut{ParentJobID: parent.ID, TotalCount: 2}
+	require.NoError(t, s.CreateFanOut(ctx, fanOut))
+
+	subs := []*core.Job{
+		{Type: "sub", Queue: "default", FanOutID: &fanOut.ID, FanOutIndex: 0},
+		{Type: "sub", Queue: "default", FanOutID: &fanOut.ID, FanOutIndex: 1},
+	}
+	require.NoError(t, s.EnqueueBatch(ctx, subs))
+
+	cancelledIDs, err := s.CancelSubJobs(ctx, fanOut.ID)
+	require.NoError(t, err)
+	require.Len(t, cancelledIDs, 2)
+
+	for _, sub := range subs {
+		got, err := s.GetJob(ctx, sub.ID)
+		require.NoError(t, err)
+		require.NotNil(t, got)
+		assert.Equal(t, core.StatusCancelled, got.Status)
+		assert.NotNil(t, got.CompletedAt)
+	}
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -2086,6 +2165,28 @@ func TestGetStalledFanOutParents(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, stalled, 1)
 	assert.Equal(t, oldIncompleteParent.ID, stalled[0].ID)
+}
+
+func TestGetStalledFanOutParents_LimitsBatch(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	old := time.Now().Add(-10 * time.Minute)
+	cutoff := time.Now().Add(-2 * time.Minute)
+	for i := 0; i < maxResumeBatch+25; i++ {
+		parent := &core.Job{Type: "workflow.stalled", Queue: "default", Status: core.StatusWaiting}
+		require.NoError(t, s.Enqueue(ctx, parent))
+		require.NoError(t, s.CreateFanOut(ctx, &core.FanOut{
+			ParentJobID: parent.ID,
+			TotalCount:  2,
+			Status:      core.FanOutPending,
+			CreatedAt:   old,
+		}))
+	}
+
+	stalled, err := s.GetStalledFanOutParents(ctx, cutoff)
+	require.NoError(t, err)
+	assert.Len(t, stalled, maxResumeBatch)
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -2893,20 +2994,39 @@ func TestGetDueJobs_DBError(t *testing.T) {
 
 func TestIncrementFanOutCompleted_DBError(t *testing.T) {
 	s := closedStorage(t)
-	_, err := s.IncrementFanOutCompleted(context.Background(), "fo1")
+	fo, err := s.IncrementFanOutCompleted(context.Background(), "fo1")
 	assert.Error(t, err)
+	assert.Nil(t, fo)
 }
 
 func TestIncrementFanOutFailed_DBError(t *testing.T) {
 	s := closedStorage(t)
-	_, err := s.IncrementFanOutFailed(context.Background(), "fo1")
+	fo, err := s.IncrementFanOutFailed(context.Background(), "fo1")
 	assert.Error(t, err)
+	assert.Nil(t, fo)
 }
 
 func TestIncrementFanOutCancelled_DBError(t *testing.T) {
 	s := closedStorage(t)
-	_, err := s.IncrementFanOutCancelled(context.Background(), "fo1")
+	fo, err := s.IncrementFanOutCancelled(context.Background(), "fo1")
 	assert.Error(t, err)
+	assert.Nil(t, fo)
+}
+
+func TestIncrementFanOut_DBError_ReturnsNilFanOut(t *testing.T) {
+	ctx := context.Background()
+
+	completed, err := closedStorage(t).IncrementFanOutCompleted(ctx, "fo1")
+	assert.Error(t, err)
+	assert.Nil(t, completed)
+
+	failed, err := closedStorage(t).IncrementFanOutFailed(ctx, "fo1")
+	assert.Error(t, err)
+	assert.Nil(t, failed)
+
+	cancelled, err := closedStorage(t).IncrementFanOutCancelled(ctx, "fo1")
+	assert.Error(t, err)
+	assert.Nil(t, cancelled)
 }
 
 func TestUpdateFanOutStatus_DBError(t *testing.T) {

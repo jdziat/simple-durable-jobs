@@ -650,6 +650,7 @@ func (s *GormStorage) ReleaseStaleLocks(ctx context.Context, staleDuration time.
 			if err := tx.Model(&core.Job{}).
 				Where("status = ?", core.StatusRunning).
 				Where("locked_until < ?", cutoff).
+				Limit(maxResumeBatch).
 				Pluck("id", &released).Error; err != nil {
 				return err
 			}
@@ -725,7 +726,10 @@ func (s *GormStorage) IncrementFanOutCompleted(ctx context.Context, fanOutID str
 			return tx.First(&fanOut, "id = ?", fanOutID).Error
 		})
 	})
-	return &fanOut, err
+	if err != nil {
+		return nil, err
+	}
+	return &fanOut, nil
 }
 
 // IncrementFanOutFailed atomically increments the failed count.
@@ -742,7 +746,10 @@ func (s *GormStorage) IncrementFanOutFailed(ctx context.Context, fanOutID string
 			return tx.First(&fanOut, "id = ?", fanOutID).Error
 		})
 	})
-	return &fanOut, err
+	if err != nil {
+		return nil, err
+	}
+	return &fanOut, nil
 }
 
 // IncrementFanOutCancelled atomically increments the cancelled count.
@@ -759,7 +766,10 @@ func (s *GormStorage) IncrementFanOutCancelled(ctx context.Context, fanOutID str
 			return tx.First(&fanOut, "id = ?", fanOutID).Error
 		})
 	})
-	return &fanOut, err
+	if err != nil {
+		return nil, err
+	}
+	return &fanOut, nil
 }
 
 // UpdateFanOutStatus atomically updates the status of a fan-out from pending.
@@ -933,8 +943,9 @@ func (s *GormStorage) CancelSubJobs(ctx context.Context, fanOutID string) ([]str
 				Where("id IN ?", cancelled).
 				Where("status IN ?", []core.JobStatus{core.StatusPending, core.StatusRunning}).
 				Updates(map[string]any{
-					"status":     core.StatusCancelled,
-					"updated_at": now,
+					"status":       core.StatusCancelled,
+					"completed_at": now,
+					"updated_at":   now,
 				})
 			if result.Error != nil {
 				return result.Error
@@ -985,14 +996,20 @@ func (s *GormStorage) CancelSubJob(ctx context.Context, jobID string) (*core.Fan
 
 			// Cancel the job
 			now := time.Now()
-			if err := tx.Model(&core.Job{}).
+			result := tx.Model(&core.Job{}).
 				Where("id = ? AND status NOT IN ?", jobID, []core.JobStatus{core.StatusCompleted, core.StatusFailed, core.StatusCancelled}).
 				Updates(map[string]any{
 					"status":       core.StatusCancelled,
 					"completed_at": now,
 					"updated_at":   now,
-				}).Error; err != nil {
-				return err
+				})
+			if result.Error != nil {
+				return result.Error
+			}
+			if result.RowsAffected == 0 {
+				// Another cancel/terminal transition won after our initial read.
+				// Treat this like the already-terminal no-op path above.
+				return nil
 			}
 
 			// Increment cancelled count on the fan-out
@@ -1110,7 +1127,8 @@ func (s *GormStorage) GetStalledFanOutParents(ctx context.Context, olderThan tim
 			SELECT count(*) FROM jobs s
 			WHERE s.fan_out_id = f.id
 		) < f.total_count
-	`, core.StatusWaiting, core.FanOutPending, olderThan).Scan(&jobs).Error
+		LIMIT ?
+	`, core.StatusWaiting, core.FanOutPending, olderThan, maxResumeBatch).Scan(&jobs).Error
 	return jobs, err
 }
 
