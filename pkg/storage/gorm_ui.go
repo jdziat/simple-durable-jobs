@@ -12,7 +12,10 @@ import (
 	jobsv1 "github.com/jdziat/simple-durable-jobs/ui/gen/jobs/v1"
 )
 
-const maxUISearchLength = 256
+const (
+	maxUISearchLength = 256
+	maxUIQueryLimit   = 200
+)
 
 // GetQueueStats returns per-queue job counts grouped by status.
 func (s *GormStorage) GetQueueStats(ctx context.Context) ([]*jobsv1.QueueStats, error) {
@@ -113,12 +116,9 @@ func (s *GormStorage) SearchJobs(ctx context.Context, filter core.JobFilter) ([]
 	}
 
 	var jobs []*core.Job
-	limit := filter.Limit
-	if limit <= 0 {
-		limit = 50
-	}
+	limit, offset := clampUIPagination(filter.Limit, filter.Offset)
 	err := q.Order("created_at DESC").
-		Offset(filter.Offset).
+		Offset(offset).
 		Limit(limit).
 		Find(&jobs).Error
 	if err != nil {
@@ -126,6 +126,18 @@ func (s *GormStorage) SearchJobs(ctx context.Context, filter core.JobFilter) ([]
 	}
 
 	return jobs, total, nil
+}
+
+func clampUIPagination(limit, offset int) (int, int) {
+	if limit <= 0 {
+		limit = 50
+	} else if limit > maxUIQueryLimit {
+		limit = maxUIQueryLimit
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	return limit, offset
 }
 
 func escapeLikePattern(s string) string {
@@ -192,12 +204,24 @@ func (s *GormStorage) DeleteJob(ctx context.Context, jobID string) error {
 
 // PurgeJobs deletes all jobs in a queue matching the given status.
 func (s *GormStorage) PurgeJobs(ctx context.Context, queue string, status core.JobStatus) (int64, error) {
-	q := s.db.WithContext(ctx).Where("status = ?", status)
-	if queue != "" {
-		q = q.Where("queue = ?", queue)
-	}
-	result := q.Delete(&core.Job{})
-	return result.RowsAffected, result.Error
+	var deleted int64
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		matchingJobs := tx.Model(&core.Job{}).Select("id").Where("status = ?", status)
+		deleteJobs := tx.Where("status = ?", status)
+		if queue != "" {
+			matchingJobs = matchingJobs.Where("queue = ?", queue)
+			deleteJobs = deleteJobs.Where("queue = ?", queue)
+		}
+
+		if err := tx.Where("job_id IN (?)", matchingJobs).Delete(&core.Checkpoint{}).Error; err != nil {
+			return err
+		}
+
+		result := deleteJobs.Delete(&core.Job{})
+		deleted = result.RowsAffected
+		return result.Error
+	})
+	return deleted, err
 }
 
 // GetWorkflowRoots returns root workflow jobs (jobs with children but no parent).
@@ -216,9 +240,7 @@ func (s *GormStorage) GetWorkflowRoots(ctx context.Context, status string, limit
 		return nil, 0, err
 	}
 
-	if limit <= 0 {
-		limit = 50
-	}
+	limit, offset = clampUIPagination(limit, offset)
 
 	var jobs []*core.Job
 	err := q.Order("created_at DESC").

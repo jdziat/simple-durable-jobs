@@ -1061,6 +1061,50 @@ func TestPurgeQueue_StorageError(t *testing.T) {
 	assert.Equal(t, connect.CodeInternal, connectErr.Code())
 }
 
+func TestPurgeQueue_RejectsEmptyNameAndStatus(t *testing.T) {
+	ctx := context.Background()
+	svc, _ := setupServiceWithQueue(t)
+	store := svc.storage.(UIStorage)
+	now := time.Now()
+	jobs := []*core.Job{
+		{ID: "q-failed-1", Type: "work", Queue: "q", Status: core.StatusFailed, Args: []byte(`{}`), CreatedAt: now},
+		{ID: "q-failed-2", Type: "work", Queue: "q", Status: core.StatusFailed, Args: []byte(`{}`), CreatedAt: now.Add(time.Second)},
+		{ID: "other-failed", Type: "work", Queue: "other", Status: core.StatusFailed, Args: []byte(`{}`), CreatedAt: now.Add(2 * time.Second)},
+		{ID: "q-completed", Type: "work", Queue: "q", Status: core.StatusCompleted, Args: []byte(`{}`), CreatedAt: now.Add(3 * time.Second)},
+	}
+	for _, job := range jobs {
+		require.NoError(t, svc.storage.Enqueue(ctx, job))
+	}
+
+	_, err := svc.PurgeQueue(ctx, connect.NewRequest(&jobsv1.PurgeQueueRequest{Name: "", Status: "failed"}))
+	require.Error(t, err)
+	assert.Equal(t, connect.CodeInvalidArgument, connect.CodeOf(err))
+	_, total, err := store.SearchJobs(ctx, JobFilter{Status: string(core.StatusFailed), Limit: 10})
+	require.NoError(t, err)
+	assert.Equal(t, int64(3), total)
+
+	_, err = svc.PurgeQueue(ctx, connect.NewRequest(&jobsv1.PurgeQueueRequest{Name: "q", Status: "bogus"}))
+	require.Error(t, err)
+	assert.Equal(t, connect.CodeInvalidArgument, connect.CodeOf(err))
+	_, total, err = store.SearchJobs(ctx, JobFilter{Status: string(core.StatusFailed), Limit: 10})
+	require.NoError(t, err)
+	assert.Equal(t, int64(3), total)
+
+	resp, err := svc.PurgeQueue(ctx, connect.NewRequest(&jobsv1.PurgeQueueRequest{Name: "q", Status: "failed"}))
+	require.NoError(t, err)
+	assert.Equal(t, int64(2), resp.Msg.Deleted)
+
+	remainingFailed, total, err := store.SearchJobs(ctx, JobFilter{Status: string(core.StatusFailed), Limit: 10})
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), total)
+	require.Len(t, remainingFailed, 1)
+	assert.Equal(t, "other", remainingFailed[0].Queue)
+
+	_, total, err = store.SearchJobs(ctx, JobFilter{Queue: "q", Status: string(core.StatusCompleted), Limit: 10})
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), total)
+}
+
 func TestPurgeQueue_FallbackWithoutUIStorage(t *testing.T) {
 	svc := newServiceWithBaseStorage(&mockStorage{})
 	_, err := svc.PurgeQueue(context.Background(), connect.NewRequest(&jobsv1.PurgeQueueRequest{Name: "emails", Status: "failed"}))
@@ -1541,6 +1585,34 @@ func TestListWorkflows_Success(t *testing.T) {
 	assert.Equal(t, int32(2), resp.Msg.Workflows[0].FailedJobs)
 	assert.Equal(t, int32(1), resp.Msg.Workflows[0].RunningJobs)
 	assert.Equal(t, int64(1), resp.Msg.Total)
+}
+
+func TestListWorkflows_RunningExcludesCancelled(t *testing.T) {
+	now := time.Now()
+	root := &core.Job{ID: "root-1", Queue: "default", Type: "wf", Status: core.StatusRunning, CreatedAt: now}
+	fo := &core.FanOut{
+		ID: "fo-1", ParentJobID: "root-1", TotalCount: 10, CompletedCount: 6, FailedCount: 1, CancelledCount: 2,
+		Strategy: core.StrategyCollectAll, Status: core.FanOutPending, CreatedAt: now, UpdatedAt: now,
+	}
+
+	store := &mockUIStorage{
+		mockStorage: mockStorage{
+			getFanOutsByParentFn: func(_ context.Context, _ string) ([]*core.FanOut, error) {
+				return []*core.FanOut{fo}, nil
+			},
+		},
+		getWorkflowRootsFn: func(_ context.Context, _ string, _, _ int) ([]*core.Job, int64, error) {
+			return []*core.Job{root}, 1, nil
+		},
+	}
+	svc := newJobsService(store, nil, nil)
+	resp, err := svc.ListWorkflows(context.Background(), connect.NewRequest(&jobsv1.ListWorkflowsRequest{Limit: 10, Page: 1}))
+	require.NoError(t, err)
+	require.Len(t, resp.Msg.Workflows, 1)
+	assert.Equal(t, int32(10), resp.Msg.Workflows[0].TotalJobs)
+	assert.Equal(t, int32(6), resp.Msg.Workflows[0].CompletedJobs)
+	assert.Equal(t, int32(1), resp.Msg.Workflows[0].FailedJobs)
+	assert.Equal(t, int32(1), resp.Msg.Workflows[0].RunningJobs)
 }
 
 func TestListWorkflows_BatchesFanOutLookup(t *testing.T) {
