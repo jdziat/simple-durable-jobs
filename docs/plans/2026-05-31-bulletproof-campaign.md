@@ -122,7 +122,9 @@ phase-name distinct-collision (triple-keyed).
 Full-branch certification: SQLite suite 14 ok/0 fail (`-race`); Postgres storage+`tests/` ok; MySQL
 storage+`tests/` ok; chaos harness under SIGKILL — ALL HARD invariants PASS (EXACTLY-ONCE / NO-WEDGE /
 FANOUT-COUNTS / UNIQUE) + INV-SCHED; `go vet ./...` clean. Cert caught one cross-backend TEST-isolation
-bug (`TestGetScheduledFireTime` vs shared non-truncated `scheduled_fires`) — fixed (`4f8d1c2`); the
+bug (`TestGetScheduledFireTime` reused schedule name "daily-report" on the shared, non-truncated
+`scheduled_fires` table, so a prior test's future `last_fire_at` made its claim a no-op) — fixed by
+scoping to unique names + self-clean (`7a9235b`); the
 sqlite-masks-PG/MySQL lesson again. **Note: commit SHAs in the rows below drifted from the real history
 during a garbled-tool-channel session — trust commit MESSAGES + content, not these SHAs.**
 Deferred (low/med, none blocking): P2b (partial-failure wedge + reaper-vs-Complete), P3b (coalesce
