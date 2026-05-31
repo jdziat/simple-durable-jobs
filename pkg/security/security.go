@@ -31,6 +31,9 @@ const (
 
 	// MaxUniqueKeyLength is the maximum length for unique keys
 	MaxUniqueKeyLength = 255
+
+	// maxErrorMessageInputLength bounds sanitization work for very large errors.
+	maxErrorMessageInputLength = MaxErrorMessageLength * 4
 )
 
 // validJobTypeName matches alphanumeric, hyphens, underscores, and dots
@@ -40,7 +43,14 @@ var (
 	authTokenPattern      = regexp.MustCompile(`(?i)\b(authorization|bearer)(\s*[:=]?\s*)\S+`)
 	passwordKVPattern     = regexp.MustCompile(`(?i)\b(password|pwd)=([^\s&;]+)`)
 	dsnPasswordPattern    = regexp.MustCompile(`(?i)\b([a-z][a-z0-9+.-]*://[^:/\s@]+:)([^@\s/]+)(@)`)
-	opaqueTokenRunPattern = regexp.MustCompile(`\b[A-Za-z0-9+/]{20,}={0,2}\b|\b[0-9a-fA-F]{20,}\b`)
+	stripeTokenPattern    = regexp.MustCompile(`(^|[^A-Za-z0-9_])((?:(?:sk_(?:live|test))|(?:rk_live))_[A-Za-z0-9_-]{16,})([^A-Za-z0-9_-]|$)`)
+	githubTokenPattern    = regexp.MustCompile(`(^|[^A-Za-z0-9_])(gh[pousr]_[A-Za-z0-9_]{20,})([^A-Za-z0-9_]|$)`)
+	slackTokenPattern     = regexp.MustCompile(`(^|[^A-Za-z0-9_])(xox[baprs]-[A-Za-z0-9-]{10,})([^A-Za-z0-9-]|$)`)
+	googleAPITokenPattern = regexp.MustCompile(`(^|[^A-Za-z0-9_])(AIza[A-Za-z0-9_-]{35})([^A-Za-z0-9_-]|$)`)
+	awsAccessKeyPattern   = regexp.MustCompile(`(^|[^A-Z0-9])((?:AKIA|ASIA)[A-Z0-9]{16})([^A-Z0-9]|$)`)
+	jwtTokenPattern       = regexp.MustCompile(`(^|[^A-Za-z0-9_])((?:eyJ[A-Za-z0-9_-]*)\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)([^A-Za-z0-9_.-]|$)`)
+	opaqueTokenRunPattern = regexp.MustCompile(`\b[A-Za-z0-9+/_-]{20,}={0,2}\b|\b[0-9a-fA-F]{20,}\b`)
+	uuidPattern           = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 )
 
 // ValidateJobTypeName validates a job type name
@@ -77,6 +87,7 @@ func SanitizeErrorMessage(msg string) string {
 		return ""
 	}
 
+	msg = capErrorMessageInput(msg)
 	msg = redactSecrets(msg)
 
 	// Remove any null bytes or control characters (except newlines)
@@ -104,6 +115,12 @@ func redactSecrets(msg string) string {
 	msg = authTokenPattern.ReplaceAllString(msg, `${1}${2}[REDACTED]`)
 	msg = passwordKVPattern.ReplaceAllString(msg, `${1}=[REDACTED]`)
 	msg = dsnPasswordPattern.ReplaceAllString(msg, `${1}[REDACTED]${3}`)
+	msg = stripeTokenPattern.ReplaceAllString(msg, `${1}[REDACTED]${3}`)
+	msg = githubTokenPattern.ReplaceAllString(msg, `${1}[REDACTED]${3}`)
+	msg = slackTokenPattern.ReplaceAllString(msg, `${1}[REDACTED]${3}`)
+	msg = googleAPITokenPattern.ReplaceAllString(msg, `${1}[REDACTED]${3}`)
+	msg = awsAccessKeyPattern.ReplaceAllString(msg, `${1}[REDACTED]${3}`)
+	msg = jwtTokenPattern.ReplaceAllString(msg, `${1}[REDACTED]${3}`)
 	msg = opaqueTokenRunPattern.ReplaceAllStringFunc(msg, func(token string) string {
 		if isLikelyOpaqueToken(token) {
 			return "[REDACTED]"
@@ -113,8 +130,23 @@ func redactSecrets(msg string) string {
 	return msg
 }
 
+func capErrorMessageInput(msg string) string {
+	if len(msg) <= maxErrorMessageInputLength {
+		return msg
+	}
+
+	msg = msg[:maxErrorMessageInputLength]
+	for len(msg) > 0 && !utf8.ValidString(msg) {
+		msg = msg[:len(msg)-1]
+	}
+	return msg
+}
+
 func isLikelyOpaqueToken(token string) bool {
 	if len(token) < 20 {
+		return false
+	}
+	if uuidPattern.MatchString(token) {
 		return false
 	}
 
@@ -122,6 +154,7 @@ func isLikelyOpaqueToken(token string) bool {
 	hasUpper := false
 	hasLower := false
 	hasTokenSymbol := false
+	hasBase64URLSymbol := false
 	hexOnly := true
 
 	for _, r := range token {
@@ -141,15 +174,24 @@ func isLikelyOpaqueToken(token string) bool {
 		case r == '+' || r == '/' || r == '=':
 			hasTokenSymbol = true
 			hexOnly = false
+		case r == '-' || r == '_':
+			hasBase64URLSymbol = true
+			hexOnly = false
 		default:
 			return false
 		}
 	}
 
+	if strings.Count(token, "/") >= 2 {
+		return false
+	}
+	if hexOnly && len(token) == 40 {
+		return false
+	}
 	if hexOnly && hasDigit {
 		return true
 	}
-	return hasTokenSymbol || (hasDigit && hasUpper && hasLower)
+	return hasTokenSymbol || (hasBase64URLSymbol && hasDigit && hasUpper && hasLower) || (hasDigit && hasUpper && hasLower)
 }
 
 // ClampRetries ensures retry count is within limits
