@@ -54,6 +54,13 @@ func (m *mockStorage) Complete(ctx context.Context, jobID, workerID string) erro
 	return nil
 }
 
+func (m *mockStorage) Release(ctx context.Context, jobID, workerID string) error {
+	if job, ok := m.jobs[jobID]; ok {
+		job.Status = core.StatusPending
+	}
+	return nil
+}
+
 func (m *mockStorage) Fail(ctx context.Context, jobID, workerID, errMsg string, retryAt *time.Time) error {
 	return nil
 }

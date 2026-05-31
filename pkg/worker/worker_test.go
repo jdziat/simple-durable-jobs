@@ -33,6 +33,8 @@ type mockStorage struct {
 	releaseErr      error         // error returned by ReleaseStaleLocks
 	releaseDelay    time.Duration // optional artificial delay per call
 	releaseFunc     func(ctx context.Context, age time.Duration) ([]string, error)
+	releasedJobIDs  []string // IDs passed to Release
+	releaseJobFunc  func(ctx context.Context, jobID string, workerID string) error
 	dequeueFunc     func(ctx context.Context, queues []string, workerID string) (*core.Job, error)
 	completeFunc    func(ctx context.Context, jobID string, workerID string) error
 	failFunc        func(ctx context.Context, jobID string, workerID string, errMsg string, retryAt *time.Time) error
@@ -136,6 +138,16 @@ func (m *mockStorage) ClaimScheduledFire(ctx context.Context, name string, fireT
 func (m *mockStorage) Heartbeat(ctx context.Context, jobID string, workerID string) error {
 	if m.heartbeatFunc != nil {
 		return m.heartbeatFunc(ctx, jobID, workerID)
+	}
+	return nil
+}
+
+func (m *mockStorage) Release(ctx context.Context, jobID string, workerID string) error {
+	m.mu.Lock()
+	m.releasedJobIDs = append(m.releasedJobIDs, jobID)
+	m.mu.Unlock()
+	if m.releaseJobFunc != nil {
+		return m.releaseJobFunc(ctx, jobID, workerID)
 	}
 	return nil
 }
@@ -277,6 +289,12 @@ func (m *mockStorage) getReleaseCount() int64 {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.releaseCount
+}
+
+func (m *mockStorage) getReleasedJobIDs() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]string(nil), m.releasedJobIDs...)
 }
 
 func TestWorkerConfig_Defaults(t *testing.T) {
@@ -1802,6 +1820,41 @@ func TestWorker_StartCancelIdleReturnsPromptly(t *testing.T) {
 	assert.Less(t, time.Since(start), 300*time.Millisecond)
 }
 
+func TestWorker_ShutdownReleasesDequeuedJobInsteadOfDropping(t *testing.T) {
+	job := &core.Job{
+		ID:     "dequeued-job",
+		Type:   "never-dispatched",
+		Queue:  "default",
+		Status: core.StatusRunning,
+	}
+
+	mock := &mockStorage{}
+	ctx, cancel := context.WithCancel(context.Background())
+	var once sync.Once
+	mock.dequeueFunc = func(_ context.Context, _ []string, _ string) (*core.Job, error) {
+		once.Do(cancel)
+		return job, nil
+	}
+
+	q := queue.New(mock)
+	w := NewWorker(q,
+		WithPollInterval(10*time.Millisecond),
+		WithDrainTimeout(2*time.Second),
+		WithOwnershipAuditInterval(0),
+		DisableRetry(),
+	)
+
+	err := w.Start(ctx)
+	require.ErrorIs(t, err, context.Canceled)
+
+	assert.Equal(t, []string{job.ID}, mock.getReleasedJobIDs())
+	assert.Equal(t, int32(0), w.queueRunning["default"].Load())
+	w.queueJobIDMu.Lock()
+	_, tracked := w.queueJobID[job.ID]
+	w.queueJobIDMu.Unlock()
+	assert.False(t, tracked, "shutdown release must untrack the per-queue job slot")
+}
+
 func TestWorker_HandleError_NoRetryError(t *testing.T) {
 	q, cleanup := newSQLiteQueue(t)
 	defer cleanup()
@@ -2095,6 +2148,41 @@ func TestWorker_HandleSubJobCompletion_WithFanOutID_IncrementFailed(t *testing.T
 	err := w.handleSubJobCompletion(ctx, job, true)
 	// Mock returns (nil, nil), so retryWithBackoff returns nil.
 	assert.NoError(t, err)
+}
+
+func TestWorker_NoHandlerSubJobAccountsToFanOut(t *testing.T) {
+	fanOutID := "fo-no-handler"
+	var failedIncrements atomic.Int32
+	mock := &mockStorage{
+		failFunc: func(_ context.Context, _ string, _ string, _ string, retryAt *time.Time) error {
+			require.Nil(t, retryAt)
+			return nil
+		},
+		incrementFailedFunc: func(_ context.Context, gotFanOutID string) (*core.FanOut, error) {
+			failedIncrements.Add(1)
+			assert.Equal(t, fanOutID, gotFanOutID)
+			return &core.FanOut{
+				ID:          gotFanOutID,
+				ParentJobID: "parent",
+				TotalCount:  2,
+				FailedCount: 1,
+				Strategy:    core.StrategyCollectAll,
+			}, nil
+		},
+	}
+	q := queue.New(mock)
+	w := NewWorker(q, DisableRetry())
+
+	w.processJob(context.Background(), &core.Job{
+		ID:         "sub-no-handler",
+		Type:       "missing-handler",
+		Queue:      "default",
+		FanOutID:   &fanOutID,
+		Attempt:    1,
+		MaxRetries: 1,
+	})
+
+	assert.Equal(t, int32(1), failedIncrements.Load())
 }
 
 // ---------------------------------------------------------------------------

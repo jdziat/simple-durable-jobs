@@ -72,6 +72,7 @@ func (s *minimalStorage) Dequeue(ctx context.Context, queues []string, workerID 
 	return nil, nil
 }
 func (s *minimalStorage) Complete(ctx context.Context, jobID, workerID string) error { return nil }
+func (s *minimalStorage) Release(ctx context.Context, jobID, workerID string) error  { return nil }
 func (s *minimalStorage) Fail(ctx context.Context, jobID, workerID, errMsg string, retryAt *time.Time) error {
 	return nil
 }

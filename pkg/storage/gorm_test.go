@@ -585,6 +585,66 @@ func TestHeartbeat_FailsWhenJobIsNoLongerRunning(t *testing.T) {
 	assert.Nil(t, after.LastHeartbeatAt)
 }
 
+func TestRelease_ReturnsRunningJobToPending(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	require.NoError(t, s.Enqueue(ctx, newTestJob("default", "task.run")))
+
+	got, err := s.Dequeue(ctx, []string{"default"}, "worker-1")
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	require.Equal(t, 1, got.Attempt)
+
+	require.NoError(t, s.Release(ctx, got.ID, "worker-1"))
+
+	row, err := s.GetJob(ctx, got.ID)
+	require.NoError(t, err)
+	require.NotNil(t, row)
+	assert.Equal(t, core.StatusPending, row.Status)
+	assert.Empty(t, row.LockedBy)
+	assert.Nil(t, row.LockedUntil)
+	assert.Nil(t, row.StartedAt)
+	assert.Equal(t, 0, row.Attempt)
+}
+
+func TestRelease_NotOwned_ReturnsErrJobNotOwned(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	require.NoError(t, s.Enqueue(ctx, newTestJob("default", "task.run")))
+
+	got, err := s.Dequeue(ctx, []string{"default"}, "worker-1")
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	beforeLock := got.LockedUntil
+	beforeStarted := got.StartedAt
+
+	err = s.Release(ctx, got.ID, "worker-2")
+	require.ErrorIs(t, err, core.ErrJobNotOwned)
+
+	row, err := s.GetJob(ctx, got.ID)
+	require.NoError(t, err)
+	require.NotNil(t, row)
+	assert.Equal(t, core.StatusRunning, row.Status)
+	assert.Equal(t, "worker-1", row.LockedBy)
+	require.NotNil(t, row.LockedUntil)
+	require.NotNil(t, row.StartedAt)
+	assert.WithinDuration(t, *beforeLock, *row.LockedUntil, time.Millisecond)
+	assert.WithinDuration(t, *beforeStarted, *row.StartedAt, time.Millisecond)
+	assert.Equal(t, 1, row.Attempt)
+
+	require.NoError(t, s.Complete(ctx, got.ID, "worker-1"))
+	err = s.Release(ctx, got.ID, "worker-1")
+	require.ErrorIs(t, err, core.ErrJobNotOwned)
+
+	completed, err := s.GetJob(ctx, got.ID)
+	require.NoError(t, err)
+	require.NotNil(t, completed)
+	assert.Equal(t, core.StatusCompleted, completed.Status)
+	assert.Equal(t, 1, completed.Attempt)
+}
+
 func TestReleaseStaleLocks_ResetsExpiredRunningJobsToPending(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStorage(t)

@@ -213,13 +213,31 @@ func (w *Worker) Start(ctx context.Context) error {
 				// Track this job against its queue's concurrency
 				w.trackQueueJob(job.ID, job.Queue)
 
+				if ctx.Err() != nil {
+					w.releaseDequeuedJobOnShutdown(ctx, job)
+					continue
+				}
+
 				select {
 				case jobsChan <- job:
 				case <-ctx.Done():
+					w.releaseDequeuedJobOnShutdown(ctx, job)
 				}
 			}
 		}
 	}
+}
+
+func (w *Worker) releaseDequeuedJobOnShutdown(ctx context.Context, job *core.Job) {
+	releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+
+	if err := w.queue.Storage().Release(releaseCtx, job.ID, w.config.WorkerID); err != nil && !errors.Is(err, core.ErrJobNotOwned) {
+		w.logger.Warn("failed to release dequeued job during shutdown",
+			"job_id", job.ID,
+			"error", err)
+	}
+	w.untrackQueueJob(job.ID)
 }
 
 func (w *Worker) waitForDrain() bool {
@@ -318,9 +336,14 @@ func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 	h, ok := w.queue.GetHandler(job.Type)
 	if !ok {
 		w.logger.Error("no handler for job", "type", job.Type)
-		// No fan-out side effects here, so the lost-ownership return value is
-		// not actionable — failWithRetry already logs any real failure.
-		_ = w.failWithRetry(ctx, job.ID, fmt.Sprintf("no handler for %s", job.Type), nil)
+		if err := w.failWithRetry(ctx, job.ID, fmt.Sprintf("no handler for %s", job.Type), nil); errors.Is(err, core.ErrJobNotOwned) {
+			w.logger.Warn("job no longer owned after no-handler failure; skipping sub-job completion",
+				"job_id", job.ID)
+			return
+		}
+		if err := w.handleSubJobCompletion(ctx, job, false); err != nil {
+			w.logger.Error("failed to handle no-handler sub-job failure", "job_id", job.ID, "error", err)
+		}
 		return
 	}
 

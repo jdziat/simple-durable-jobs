@@ -35,6 +35,11 @@ type Storage interface {
 
 	// Locking
 	Heartbeat(ctx context.Context, jobID string, workerID string) error
+	// Release returns an owned, still-running job to status=pending, clears
+	// locked_by/locked_until/started_at, so a dequeued-but-undelivered job
+	// (e.g. dropped at shutdown) is immediately re-runnable instead of
+	// waiting for the stale-lock reaper.
+	Release(ctx context.Context, jobID, workerID string) error
 	// ReleaseStaleLocks releases locks on jobs whose heartbeat is older than
 	// staleDuration and returns the IDs of the jobs that were reclaimed. The
 	// caller can use those IDs to cancel in-flight handler contexts on the

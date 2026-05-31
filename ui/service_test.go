@@ -51,6 +51,7 @@ func (m *mockStorage) Dequeue(_ context.Context, _ []string, _ string) (*core.Jo
 	return nil, nil
 }
 func (m *mockStorage) Complete(_ context.Context, _, _ string) error                { return nil }
+func (m *mockStorage) Release(_ context.Context, _, _ string) error                 { return nil }
 func (m *mockStorage) Fail(_ context.Context, _, _, _ string, _ *time.Time) error   { return nil }
 func (m *mockStorage) EnqueueUnique(_ context.Context, _ *core.Job, _ string) error { return nil }
 func (m *mockStorage) SaveCheckpoint(_ context.Context, _ *core.Checkpoint) error   { return nil }

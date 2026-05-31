@@ -575,6 +575,29 @@ func (s *GormStorage) Heartbeat(ctx context.Context, jobID string, workerID stri
 	return nil
 }
 
+// Release returns an owned, still-running job to pending so it can be
+// immediately dequeued by another worker after a local dispatch is abandoned.
+func (s *GormStorage) Release(ctx context.Context, jobID, workerID string) error {
+	result := s.db.WithContext(ctx).
+		Model(&core.Job{}).
+		Where("id = ? AND locked_by = ? AND status = ?", jobID, workerID, core.StatusRunning).
+		Updates(map[string]any{
+			"status":       core.StatusPending,
+			"locked_by":    "",
+			"locked_until": nil,
+			"started_at":   nil,
+			"attempt":      gorm.Expr("CASE WHEN attempt > 0 THEN attempt - 1 ELSE 0 END"),
+			"updated_at":   time.Now(),
+		})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		return core.ErrJobNotOwned
+	}
+	return nil
+}
+
 // FindOrphanedJobs returns the IDs from the input slice whose DB row
 // indicates the caller no longer owns the job. See core.Storage.FindOrphanedJobs
 // for the protocol — this is the implementation.
