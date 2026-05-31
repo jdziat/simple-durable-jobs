@@ -121,12 +121,13 @@ phase-name distinct-collision (triple-keyed).
 | Packet | Status | Commit | Notes |
 |---|---|---|---|
 | P1 | ✅ committed | 6c7479b | core.FanOut.TerminalStatus() unifies worker+queue; threshold doomed-gate; CancelSubJob local-cancel. Gate: race units + 10x APPROVE + chaos INV-FANOUT-COUNTS green (20 fan-outs, 0 mismatch) |
-| P2 | ✅ committed | (this commit) | Release()+shutdown-release + no-handler fan-in accounting. Gate: full race suite green (14 ok), go vet ./... clean, chaos all-HARD-PASS, multi-backend PG+MySQL green, 4 new tests RED→GREEN, 10x APPROVE (prod code; mocks fixed by parent). |
+| P2 | ✅ committed | 6ce8187 | Release()+shutdown-release + no-handler fan-in accounting. Gate: full race suite green, go vet ./... clean, chaos all-HARD-PASS, multi-backend PG+MySQL green, 4 new tests RED→GREEN, 10x APPROVE. (Interface change broke 3 test mocks fanout/queue/ui — parent added no-op Release; queue mock fix amended in.) |
 | P2b | pending | — | DEFERRED to pair with P4: SaveJobResult/Complete partial-failure wedge + reaper-vs-Complete window (need PauseJob cancel-accounting from P4 first) |
 | P3 | pending | — | |
-| P4 | pending | — | |
+| P4a | dispatching | — | storage fan-in correctness (gorm.go): cancelled_count over-count guard, Increment* nil-on-error, completed_at parity, LIMIT recovery queries |
+| P4b | pending | — | schema: Job.Timeout/Determinism gorm tags, composite dequeue index, SaveCheckpoint created_at, dequeue status guard, migration drift doc |
 | P5 | pending | — | |
-| P6 | pending | — | parallel-safe |
+| P6 | dispatching | — | parallel-safe (running concurrently with P4a); provider-key redaction + bounded sanitize |
 | P7 | pending | — | after P6 |
 | P8 | pending | — | parallel-safe |
 | P9 | pending | — | |
