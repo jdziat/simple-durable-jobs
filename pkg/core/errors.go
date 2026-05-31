@@ -81,7 +81,7 @@ func CheckpointErrorKind(err error) (kind string, delay time.Duration) {
 		return CheckpointErrorKindRetryAfter, retryAfter.Delay
 	}
 
-	if SentinelErrorByMessage(err.Error()) != nil {
+	if candidate := SentinelErrorByMessage(err.Error()); candidate != nil && errors.Is(err, candidate) {
 		return CheckpointErrorKindSentinel, 0
 	}
 
@@ -90,26 +90,20 @@ func CheckpointErrorKind(err error) (kind string, delay time.Duration) {
 
 // RehydrateCheckpointError reconstructs supported checkpointed error types.
 func RehydrateCheckpointError(message, kind string, delay time.Duration) error {
-	causeMessage := message
 	switch kind {
+	case CheckpointErrorKindSentinel:
+		if sentinel := SentinelErrorByMessage(message); sentinel != nil {
+			return sentinel
+		}
+		return errors.New(message)
 	case CheckpointErrorKindNoRetry:
-		causeMessage = strings.TrimPrefix(message, "no retry: ")
+		causeMessage := strings.TrimPrefix(message, "no retry: ")
+		return NoRetry(errors.New(causeMessage))
 	case CheckpointErrorKindRetryAfter:
-		causeMessage = strings.TrimPrefix(message, fmt.Sprintf("retry after %v: ", delay))
-	}
-
-	base := SentinelErrorByMessage(causeMessage)
-	if base == nil {
-		base = errors.New(causeMessage)
-	}
-
-	switch kind {
-	case CheckpointErrorKindNoRetry:
-		return NoRetry(base)
-	case CheckpointErrorKindRetryAfter:
-		return RetryAfter(delay, base)
+		causeMessage := strings.TrimPrefix(message, fmt.Sprintf("retry after %v: ", delay))
+		return RetryAfter(delay, errors.New(causeMessage))
 	default:
-		return base
+		return errors.New(message)
 	}
 }
 
