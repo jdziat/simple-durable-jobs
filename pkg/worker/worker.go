@@ -17,6 +17,7 @@ import (
 	intctx "github.com/jdziat/simple-durable-jobs/pkg/internal/context"
 	"github.com/jdziat/simple-durable-jobs/pkg/internal/handler"
 	"github.com/jdziat/simple-durable-jobs/pkg/queue"
+	"github.com/jdziat/simple-durable-jobs/pkg/schedule"
 )
 
 // Worker processes jobs from the queue.
@@ -905,6 +906,39 @@ func (w *Worker) calculateBackoff(attempt int) time.Duration {
 	return backoff
 }
 
+// maxCatchUpIterations bounds the seed scan so a pathologically dense schedule
+// (e.g. millisecond interval over a long outage) cannot spin. Real schedules
+// are far coarser; hitting the cap falls back to "no catch-up" (resume from now).
+const maxCatchUpIterations = 100_000
+
+// seedLastRun computes the lastRun cursor for a scheduled job so that the very
+// next schedule.Next(seedLastRun(...)) yields the most-recent boundary that is
+// already due (<= now) when one or more boundaries were missed, causing exactly
+// one catch-up fire, after which natural cadence resumes. When no boundary is
+// due (fresh start or no gap) it returns persisted unchanged. Pure: no clock,
+// no storage.
+func seedLastRun(schedule schedule.Schedule, persisted, now time.Time) time.Time {
+	next := schedule.Next(persisted)
+	if next.IsZero() || next.After(now) {
+		return persisted
+	}
+
+	prev := persisted
+	iter := 0
+	for {
+		n2 := schedule.Next(next)
+		if n2.IsZero() || n2.After(now) {
+			return prev
+		}
+		prev = next
+		next = n2
+		iter++
+		if iter >= maxCatchUpIterations {
+			return now
+		}
+	}
+}
+
 func (w *Worker) runScheduler(ctx context.Context) {
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
@@ -927,25 +961,15 @@ func (w *Worker) runScheduler(ctx context.Context) {
 				if _, ok := lastRun[name]; !ok {
 					// First sight of this schedule. Default to now (anti-boot-storm:
 					// a brand-new schedule must not fire immediately). But if a real
-					// prior fire is persisted, seed from it so a boundary that elapsed
-					// while the whole fleet was down is not skipped.
-					//
-					// Catch-up is at-least-once, not exactly-once: Schedule.Next
-					// advances by one boundary per call and this loop fires one
-					// boundary per tick, so a gap spanning N boundaries replays N
-					// fires (paced one per tick, each de-duplicated fleet-wide by
-					// ClaimScheduledFire's monotonic last_fire_at CAS — no duplicate
-					// execution, no wedge). A short-interval schedule down a long time
-					// therefore backfills its missed boundaries; handlers for such
-					// schedules should be idempotent. (Coalescing a long gap to a
-					// single fire is tracked as a follow-up.)
+					// prior fire is persisted, seed from it so the most recent missed
+					// boundary while the whole fleet was down fires once.
 					lastRun[name] = now
 					if reader, ok := w.queue.Storage().(scheduledFireReader); ok {
 						persistedLastFireAt, found, err := reader.GetScheduledFireTime(ctx, name)
 						if err != nil {
 							w.logger.Error("failed to read scheduled fire time", "name", name, "error", err)
 						} else if found && persistedLastFireAt.After(time.Unix(0, 0).UTC()) {
-							lastRun[name] = persistedLastFireAt
+							lastRun[name] = seedLastRun(sj.Schedule, persistedLastFireAt, now)
 						}
 					}
 				}

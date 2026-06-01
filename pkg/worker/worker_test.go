@@ -2621,6 +2621,52 @@ func (s fixedBoundarySchedule) Next(from time.Time) time.Time {
 	return s.fire.Add(time.Hour)
 }
 
+func TestSeedLastRun_NoGapReturnsPersisted(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 30, 0, time.UTC)
+	persisted := now
+	s := schedule.Every(time.Minute)
+
+	result := seedLastRun(s, persisted, now)
+
+	assert.Equal(t, persisted, result)
+}
+
+func TestSeedLastRun_SingleMissedBoundaryFiresOnce(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 30, 0, time.UTC)
+	persisted := now.Add(-90 * time.Second)
+	s := schedule.Every(time.Minute)
+
+	seed := seedLastRun(s, persisted, now)
+	fire := s.Next(seed)
+
+	assert.False(t, fire.After(now), "seeded next fire should be due")
+	assert.True(t, s.Next(fire).After(now), "only one catch-up boundary should be due")
+}
+
+func TestSeedLastRun_ManyMissedBoundariesClampToSingleFire(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 30, 0, time.UTC)
+	persisted := now.Add(-3 * time.Hour)
+	s := schedule.Every(time.Minute)
+
+	seed := seedLastRun(s, persisted, now)
+	fire := s.Next(seed)
+
+	assert.False(t, fire.After(now), "seeded next fire should be due")
+	assert.True(t, fire.After(now.Add(-time.Minute)), "fire should be the most recent due boundary")
+	assert.True(t, s.Next(fire).After(now), "the following boundary should not be due")
+}
+
+func TestSeedLastRun_PathologicalDensityFailsSafe(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 30, 0, time.UTC)
+	persisted := now.Add(-24 * time.Hour)
+	s := schedule.Every(time.Millisecond)
+
+	result := seedLastRun(s, persisted, now)
+
+	assert.Equal(t, now, result)
+	assert.True(t, s.Next(result).After(now), "fail-safe seed should skip catch-up")
+}
+
 // TestWorker_RunScheduler_ExitsOnContextCancel verifies that runScheduler
 // returns promptly when its context is cancelled.
 func TestWorker_RunScheduler_ExitsOnContextCancel(t *testing.T) {
@@ -2886,55 +2932,18 @@ func TestScheduler_CatchUpAfterFleetGap(t *testing.T) {
 	assert.Equal(t, "catch-up-task", mock.enqueuedJobs[0].Type)
 }
 
-// TestScheduler_CatchUpReplaysEachMissedBoundary documents the actual catch-up
-// contract for a real Schedule whose Next advances by a fixed step (schedule.Every):
-// a gap spanning N boundaries replays N fires (at-least-once, one per tick), each
-// claimed with a strictly increasing fire time — NOT a single coalesced fire. This
-// is the multi-boundary case offsetSchedule (offset==period) cannot exercise.
-func TestScheduler_CatchUpReplaysEachMissedBoundary(t *testing.T) {
-	period := 50 * time.Millisecond
-	now := time.Now().UTC()
-	// Seed the persisted last fire ~3 periods in the past so exactly 3 boundaries
-	// (Truncate(period)-aligned) are already due at boot.
-	persisted := now.Add(-3 * period).Truncate(period)
+func TestScheduler_ManyMissedBoundariesFireOnce(t *testing.T) {
+	period := time.Minute
+	now := time.Date(2026, 1, 1, 12, 0, 30, 0, time.UTC)
+	persisted := now.Add(-3 * time.Hour)
+	s := schedule.Every(period)
 
-	var claimedTimes []time.Time
-	var mu sync.Mutex
-	mock := &mockStorage{
-		fireTimes: map[string]time.Time{"backfill-task": persisted},
-	}
-	mock.claimFireFunc = func(_ context.Context, name string, fireTime time.Time) (bool, error) {
-		mu.Lock()
-		claimedTimes = append(claimedTimes, fireTime)
-		mu.Unlock()
-		return true, nil
-	}
+	seed := seedLastRun(s, persisted, now)
+	catchUpFire := s.Next(seed)
 
-	q := queue.New(mock)
-	q.Register("backfill-task", func(_ context.Context, _ struct{}) error { return nil })
-	q.Schedule("backfill-task", nil, schedule.Every(period))
-
-	w := NewWorker(q, WithStaleLockInterval(0))
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go func() { w.runScheduler(ctx) }()
-
-	// Let the scheduler drain the backlog (one boundary per 100ms tick) plus margin.
-	require.Eventually(t, func() bool {
-		mu.Lock()
-		defer mu.Unlock()
-		return len(claimedTimes) >= 3
-	}, 2*time.Second, 10*time.Millisecond, "expected the missed boundaries to be replayed")
-	cancel()
-
-	mu.Lock()
-	defer mu.Unlock()
-	require.GreaterOrEqual(t, len(claimedTimes), 3, "each missed boundary should fire once")
-	// Fire times must be strictly increasing (distinct boundaries, monotonic CAS).
-	for i := 1; i < len(claimedTimes); i++ {
-		assert.Truef(t, claimedTimes[i].After(claimedTimes[i-1]),
-			"claim %d (%v) must be after claim %d (%v)", i, claimedTimes[i], i-1, claimedTimes[i-1])
-	}
+	assert.False(t, catchUpFire.After(now), "the catch-up boundary should be due")
+	assert.True(t, catchUpFire.After(now.Add(-period)), "catch-up should use the most recent missed boundary")
+	assert.True(t, s.Next(catchUpFire).After(now), "only one catch-up fire should be due before natural cadence resumes")
 }
 
 // ---------------------------------------------------------------------------
