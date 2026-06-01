@@ -506,18 +506,41 @@ func TestExecuteCall_HandlerReturnsError(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// ExecuteCall – single-return (error only) handler, success path
+// ExecuteCall – single-return (error only) handler, concrete result guard
 // ---------------------------------------------------------------------------
 
-func TestExecuteCall_SingleReturn_Success(t *testing.T) {
+func TestExecuteCall_SingleReturn_ConcreteResultIsNoRetry(t *testing.T) {
 	fn := func(_ context.Context, _ testArgs) error { return nil }
 	h, err := NewHandler(fn)
 	require.NoError(t, err)
 
-	result, err := ExecuteCall[testResult](context.Background(), h, testArgs{})
+	result, err := ExecuteCall[string](context.Background(), h, testArgs{})
+	require.Error(t, err)
+	assert.Equal(t, "", result)
+	assert.Contains(t, err.Error(), "no result value")
+
+	var noRetry *core.NoRetryError
+	assert.True(t, errors.As(err, &noRetry), "error-only concrete result guard must be no-retry")
+}
+
+func TestExecuteCall_SingleReturn_AnyResultAllowed(t *testing.T) {
+	fn := func(_ context.Context, _ testArgs) error { return nil }
+	h, err := NewHandler(fn)
 	require.NoError(t, err)
-	// zero value returned when handler has no result
-	assert.Equal(t, testResult{}, result)
+
+	result, err := ExecuteCall[any](context.Background(), h, testArgs{})
+	require.NoError(t, err)
+	assert.Nil(t, result)
+}
+
+func TestExecuteCall_SingleReturn_EmptyStructResultAllowed(t *testing.T) {
+	fn := func(_ context.Context, _ testArgs) error { return nil }
+	h, err := NewHandler(fn)
+	require.NoError(t, err)
+
+	result, err := ExecuteCall[struct{}](context.Background(), h, testArgs{})
+	require.NoError(t, err)
+	assert.Equal(t, struct{}{}, result)
 }
 
 // ---------------------------------------------------------------------------
@@ -530,7 +553,7 @@ func TestExecuteCall_SingleReturn_Error(t *testing.T) {
 	h, err := NewHandler(fn)
 	require.NoError(t, err)
 
-	_, err = ExecuteCall[testResult](context.Background(), h, testArgs{})
+	_, err = ExecuteCall[string](context.Background(), h, testArgs{})
 	require.Error(t, err)
 	assert.Equal(t, sentinel, err)
 }

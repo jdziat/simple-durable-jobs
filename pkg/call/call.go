@@ -16,7 +16,23 @@ import (
 )
 
 // Call executes a durable nested job call.
-// Results are checkpointed; on replay, cached results are returned without re-execution.
+//
+// Call assigns a monotonic call index and checkpoints by both index and name.
+// It must be invoked from one goroutine in a deterministic order across
+// replays; concurrent Calls in one handler can assign indexes nondeterministically.
+// On replay, a checkpoint matches only when the call index and name both match.
+// Keep the sequence and names of Calls stable, or replay fails with a
+// determinism violation unless BestEffortReplay is enabled, in which case the
+// mismatch is logged and the call is re-executed.
+//
+// A nested Call result is checkpointed once, but handler execution is
+// at-least-once: a crash after the nested handler runs and before SaveCheckpoint
+// succeeds will run the handler again on replay. Called handlers with side
+// effects must be idempotent.
+//
+// Error-only handlers may be called only as Call[any] or Call[struct{}].
+// Requesting a concrete result type from an error-only handler returns a
+// non-retryable error.
 func Call[T any](ctx context.Context, name string, args any) (T, error) {
 	var zero T
 

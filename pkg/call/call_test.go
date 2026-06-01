@@ -492,6 +492,68 @@ func TestCallExecutesHandlerAndSavesCheckpoint(t *testing.T) {
 	})
 }
 
+func TestCall_ErrorOnlyHandlerResultTyping(t *testing.T) {
+	testHandler := func(ctx context.Context, args string) error {
+		return nil
+	}
+	h, err := handler.NewHandler(testHandler)
+	if err != nil {
+		t.Fatalf("failed to create handler: %v", err)
+	}
+
+	var savedCheckpoints []*core.Checkpoint
+	newContext := func() context.Context {
+		jobCtx := &intctx.JobContext{
+			Job: &core.Job{ID: "job-1"},
+			HandlerLookup: func(name string) (any, bool) {
+				if name != "error-only" {
+					return nil, false
+				}
+				return h, true
+			},
+			SaveCheckpoint: func(ctx context.Context, cp *core.Checkpoint) error {
+				savedCheckpoints = append(savedCheckpoints, cp)
+				return nil
+			},
+		}
+
+		ctx := intctx.WithJobContext(context.Background(), jobCtx)
+		return intctx.WithCallState(ctx, []core.Checkpoint{})
+	}
+
+	result, err := Call[string](newContext(), "error-only", "arg")
+	if err == nil {
+		t.Fatal("expected guard error")
+	}
+	if result != "" {
+		t.Fatalf("expected zero result, got %q", result)
+	}
+	if !contains(err.Error(), "no result value") {
+		t.Fatalf("expected no-result guard error, got %v", err)
+	}
+	var noRetry *core.NoRetryError
+	if !errors.As(err, &noRetry) {
+		t.Fatalf("expected NoRetryError, got %T %v", err, err)
+	}
+
+	anyResult, err := Call[any](newContext(), "error-only", "arg")
+	if err != nil {
+		t.Fatalf("expected Call[any] to succeed, got %v", err)
+	}
+	if anyResult != nil {
+		t.Fatalf("expected nil any result, got %#v", anyResult)
+	}
+	if len(savedCheckpoints) != 2 {
+		t.Fatalf("expected 2 checkpoints, got %d", len(savedCheckpoints))
+	}
+	if savedCheckpoints[0].ErrorKind != core.CheckpointErrorKindNoRetry {
+		t.Fatalf("expected first checkpoint to store no-retry error, got %q", savedCheckpoints[0].ErrorKind)
+	}
+	if savedCheckpoints[1].Error != "" {
+		t.Fatalf("expected second checkpoint to be successful, got error %q", savedCheckpoints[1].Error)
+	}
+}
+
 func TestCallPropagatesHandlerErrors(t *testing.T) {
 	t.Run("propagates handler error", func(t *testing.T) {
 		// Arrange

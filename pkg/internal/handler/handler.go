@@ -188,7 +188,11 @@ func ExecuteCall[T any](ctx context.Context, h *Handler, args any) (T, error) {
 		if !results[0].IsNil() {
 			return zero, results[0].Interface().(error)
 		}
-		return zero, nil
+		rt := reflect.TypeOf(&zero).Elem()
+		if rt.Kind() == reflect.Interface || isEmptyStructType(rt) {
+			return zero, nil
+		}
+		return zero, core.NoRetry(fmt.Errorf("jobs.Call: handler returns no result value (error-only handler) but a %s result was requested; use Call[any]/Call[struct{}] or a (result, error) handler", rt))
 	}
 
 	if numOut == 2 {
