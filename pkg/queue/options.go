@@ -17,6 +17,7 @@ type Options struct {
 	UniqueKey      string
 	Determinism    DeterminismMode
 	determinismSet bool
+	prioritySet    bool
 	// Timezone is reserved for future use and is currently ignored; schedules evaluate in UTC.
 	Timezone *time.Location
 	Timeout  time.Duration // max wall time for handler execution; 0 means no limit
@@ -51,8 +52,12 @@ func QueueOpt(name string) Option {
 func Priority(p int) Option {
 	return optionFunc(func(o *Options) {
 		o.Priority = p
+		o.prioritySet = true
 	})
 }
+
+// PrioritySet reports whether a Priority option was explicitly applied.
+func (o *Options) PrioritySet() bool { return o.prioritySet }
 
 // Retries sets the maximum retry count.
 // Values are clamped to [0, MaxRetries] (100).

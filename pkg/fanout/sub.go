@@ -24,6 +24,7 @@ func Sub(jobType string, args any, opts ...queue.Option) SubJob {
 			sj.Queue = queueOpts.Queue
 		}
 		sj.Priority = queueOpts.Priority
+		sj.PrioritySet = queueOpts.PrioritySet()
 		sj.Retries = queueOpts.MaxRetries
 		sj.Timeout = queueOpts.Timeout
 	}

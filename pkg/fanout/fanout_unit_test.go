@@ -401,6 +401,33 @@ func TestFanOut_SubJobTimeout_SetsJobTimeout(t *testing.T) {
 	require.ElementsMatch(t, []time.Duration{45 * time.Second, 90 * time.Second}, timeouts)
 }
 
+func TestFanOut_SubJobPriorityOverrideHonorsExplicitZero(t *testing.T) {
+	store := newMinimalStorage()
+	jc := makeJobCtx(store, "parent-sub-priority", "default")
+	ctx := buildCtx(jc, nil)
+
+	subs := []SubJob{
+		Sub("do-work", "explicit-zero", queue.Priority(0)),
+		Sub("do-work", "unset"),
+		Sub("do-work", "explicit-nine", queue.Priority(9)),
+	}
+	_, err := FanOut[string](ctx, subs, WithPriority(5))
+	require.Error(t, err)
+	require.True(t, IsWaitingError(err))
+
+	prioritiesByIndex := make(map[int]int)
+	for _, job := range store.jobs {
+		if job.ParentJobID != nil {
+			prioritiesByIndex[job.FanOutIndex] = job.Priority
+		}
+	}
+
+	require.Len(t, prioritiesByIndex, 3)
+	assert.Equal(t, 0, prioritiesByIndex[0])
+	assert.Equal(t, 5, prioritiesByIndex[1])
+	assert.Equal(t, 9, prioritiesByIndex[2])
+}
+
 func TestFanOut_ResumeWithCompletedFanOut_ReturnsResults(t *testing.T) {
 	store := newMinimalStorage()
 	parentID := "parent-resume"

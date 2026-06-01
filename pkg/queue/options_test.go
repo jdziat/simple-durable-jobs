@@ -30,6 +30,20 @@ func TestPriority(t *testing.T) {
 	Priority(10).Apply(opts)
 
 	assert.Equal(t, 10, opts.Priority)
+	assert.True(t, opts.PrioritySet())
+}
+
+func TestPrioritySet(t *testing.T) {
+	opts := NewOptions()
+	assert.False(t, opts.PrioritySet())
+
+	zeroOpts := NewOptions()
+	Priority(0).Apply(zeroOpts)
+	assert.Equal(t, 0, zeroOpts.Priority)
+	assert.True(t, zeroOpts.PrioritySet())
+
+	var empty Options
+	assert.False(t, empty.PrioritySet())
 }
 
 func TestRetries(t *testing.T) {

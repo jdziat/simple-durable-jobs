@@ -21,7 +21,11 @@ type SubJob struct {
 	Args     any
 	Queue    string
 	Priority int
-	Retries  int
+	// PrioritySet is true when the sub-job's Priority was set explicitly (via a
+	// Priority option), distinguishing an intentional Priority(0) from "unset"
+	// so an explicit 0 is NOT overridden by the fan-out default.
+	PrioritySet bool
+	Retries     int
 	// Timeout bounds this sub-job's handler execution.
 	Timeout time.Duration
 }
