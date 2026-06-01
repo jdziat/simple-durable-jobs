@@ -112,9 +112,11 @@ func TestFanOut_Empty(t *testing.T) {
 		_ = worker.Start(ctx)
 	}()
 
-	// Wait a bit for job to run
-	time.Sleep(500 * time.Millisecond)
-	assert.True(t, called.Load())
+	// Poll instead of a fixed wait: worker startup latency on a loaded CI runner
+	// can exceed a fixed 500ms window before the job runs.
+	require.Eventually(t, func() bool {
+		return called.Load()
+	}, 5*time.Second, 20*time.Millisecond)
 }
 
 func TestSub_DefaultValues(t *testing.T) {
