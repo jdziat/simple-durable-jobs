@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/jdziat/simple-durable-jobs/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/pkg/security"
 )
 
 // Handler holds metadata about a registered job handler.
@@ -93,12 +94,15 @@ func (h *Handler) Execute(ctx context.Context, argsJSON []byte) ([]byte, error) 
 
 	if h.ArgsType != nil {
 		argVal := reflect.New(h.ArgsType)
-		if err := json.Unmarshal(argsJSON, argVal.Interface()); err != nil {
-			wrapped := fmt.Errorf("failed to unmarshal args: %w", err)
-			if len(argsJSON) == 0 && !isEmptyStructType(h.ArgsType) {
-				return nil, core.NoRetry(wrapped)
+		if len(argsJSON) == 0 {
+			if !acceptsEmptyArgs(h.ArgsType) {
+				err := fmt.Errorf("failed to unmarshal args: unexpected end of JSON input")
+				return nil, core.NoRetry(err)
 			}
-			return nil, wrapped
+		} else {
+			if err := json.Unmarshal(argsJSON, argVal.Interface()); err != nil {
+				return nil, fmt.Errorf("failed to unmarshal args: %w", err)
+			}
 		}
 		args = append(args, argVal.Elem())
 	}
@@ -122,9 +126,23 @@ func (h *Handler) Execute(ctx context.Context, argsJSON []byte) ([]byte, error) 
 		if marshalErr != nil {
 			return nil, fmt.Errorf("failed to marshal handler result: %w", marshalErr)
 		}
+		if len(resultBytes) > security.MaxResultSize {
+			return nil, core.NoRetry(fmt.Errorf("jobs: handler result is %d bytes, limit is %d", len(resultBytes), security.MaxResultSize))
+		}
 		return resultBytes, nil
 	}
 	return nil, nil
+}
+
+func acceptsEmptyArgs(t reflect.Type) bool {
+	switch t.Kind() {
+	case reflect.Struct:
+		return isEmptyStructType(t)
+	case reflect.Slice, reflect.Map, reflect.Ptr, reflect.Interface:
+		return true
+	default:
+		return false
+	}
 }
 
 func isEmptyStructType(t reflect.Type) bool {
@@ -170,7 +188,11 @@ func ExecuteCall[T any](ctx context.Context, h *Handler, args any) (T, error) {
 		if !results[0].IsNil() {
 			return zero, results[0].Interface().(error)
 		}
-		return zero, nil
+		rt := reflect.TypeOf(&zero).Elem()
+		if rt.Kind() == reflect.Interface || isEmptyStructType(rt) {
+			return zero, nil
+		}
+		return zero, core.NoRetry(fmt.Errorf("jobs.Call: handler returns no result value (error-only handler) but a %s result was requested; use Call[any]/Call[struct{}] or a (result, error) handler", rt))
 	}
 
 	if numOut == 2 {

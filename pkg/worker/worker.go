@@ -17,6 +17,7 @@ import (
 	intctx "github.com/jdziat/simple-durable-jobs/pkg/internal/context"
 	"github.com/jdziat/simple-durable-jobs/pkg/internal/handler"
 	"github.com/jdziat/simple-durable-jobs/pkg/queue"
+	"github.com/jdziat/simple-durable-jobs/pkg/schedule"
 )
 
 // Worker processes jobs from the queue.
@@ -45,6 +46,18 @@ type Worker struct {
 	// contention semantics — the 2-minute default is paired with the
 	// 45-minute lock expiry assumed elsewhere.
 	heartbeatInterval time.Duration
+}
+
+type scheduledFireReader interface {
+	GetScheduledFireTime(context.Context, string) (time.Time, bool, error)
+}
+
+type completeWithResultStorage interface {
+	CompleteWithResult(ctx context.Context, jobID, workerID string, result []byte) (*core.FanOut, error)
+}
+
+type failTerminalWithResultStorage interface {
+	FailTerminalWithResult(ctx context.Context, jobID, workerID, errMsg string) (*core.FanOut, error)
 }
 
 // NewWorker creates a new worker for the given queue.
@@ -213,13 +226,31 @@ func (w *Worker) Start(ctx context.Context) error {
 				// Track this job against its queue's concurrency
 				w.trackQueueJob(job.ID, job.Queue)
 
+				if ctx.Err() != nil {
+					w.releaseDequeuedJobOnShutdown(ctx, job)
+					continue
+				}
+
 				select {
 				case jobsChan <- job:
 				case <-ctx.Done():
+					w.releaseDequeuedJobOnShutdown(ctx, job)
 				}
 			}
 		}
 	}
+}
+
+func (w *Worker) releaseDequeuedJobOnShutdown(ctx context.Context, job *core.Job) {
+	releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+
+	if err := w.queue.Storage().Release(releaseCtx, job.ID, w.config.WorkerID); err != nil && !errors.Is(err, core.ErrJobNotOwned) {
+		w.logger.Warn("failed to release dequeued job during shutdown",
+			"job_id", job.ID,
+			"error", err)
+	}
+	w.untrackQueueJob(job.ID)
 }
 
 func (w *Worker) waitForDrain() bool {
@@ -318,9 +349,31 @@ func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 	h, ok := w.queue.GetHandler(job.Type)
 	if !ok {
 		w.logger.Error("no handler for job", "type", job.Type)
-		// No fan-out side effects here, so the lost-ownership return value is
-		// not actionable — failWithRetry already logs any real failure.
-		_ = w.failWithRetry(ctx, job.ID, fmt.Sprintf("no handler for %s", job.Type), nil)
+		if failer, ok := w.queue.Storage().(failTerminalWithResultStorage); ok {
+			fo, err := w.failTerminalWithResult(ctx, failer, job.ID, fmt.Sprintf("no handler for %s", job.Type))
+			if errors.Is(err, core.ErrJobNotOwned) {
+				w.logger.Warn("job no longer owned after no-handler failure; skipping sub-job completion",
+					"job_id", job.ID)
+				return
+			}
+			if err != nil {
+				w.logger.Error("failed to terminally fail no-handler job after retries", "job_id", job.ID, "error", err)
+				w.releaseAfterTerminalWriteError(ctx, job.ID, "no-handler failure")
+				return
+			}
+			if err := w.checkFanOutCompletion(ctx, fo); err != nil {
+				w.logger.Error("failed to handle no-handler sub-job failure", "job_id", job.ID, "error", err)
+			}
+			return
+		}
+		if err := w.failWithRetry(ctx, job.ID, fmt.Sprintf("no handler for %s", job.Type), nil); errors.Is(err, core.ErrJobNotOwned) {
+			w.logger.Warn("job no longer owned after no-handler failure; skipping sub-job completion",
+				"job_id", job.ID)
+			return
+		}
+		if err := w.handleSubJobCompletion(ctx, job, false); err != nil {
+			w.logger.Error("failed to handle no-handler sub-job failure", "job_id", job.ID, "error", err)
+		}
 		return
 	}
 
@@ -368,18 +421,42 @@ func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 
 	resultBytes, err := w.executeHandler(jobCtx, job, h)
 
-	// Stop heartbeat before completing/failing the job
-	cancelHeartbeat()
-
 	if err != nil {
 		// Check for WaitingError - job is waiting for sub-jobs
 		if fanout.IsWaitingError(err) {
 			w.logger.Info("job waiting for sub-jobs", "job_id", job.ID)
+			cancelHeartbeat()
 			// Job is already in StatusWaiting; just return
 			return
 		}
 		w.handleError(ctx, jobCtx, job, err)
+		cancelHeartbeat()
 	} else {
+		if completer, ok := w.queue.Storage().(completeWithResultStorage); ok {
+			fo, completeErr := w.completeWithResult(ctx, completer, job.ID, resultBytes)
+			cancelHeartbeat()
+			if errors.Is(completeErr, core.ErrJobNotOwned) {
+				w.logger.Warn("job no longer owned at completion; skipping completion handling",
+					"job_id", job.ID)
+				return
+			}
+			if completeErr != nil {
+				w.logger.Error("failed to complete job after retries", "job_id", job.ID, "error", completeErr)
+				w.releaseAfterTerminalWriteError(ctx, job.ID, "completion")
+				return
+			}
+
+			w.queue.CallCompleteHooks(jobCtx, job)
+			w.queue.Emit(&core.JobCompleted{Job: job, Duration: time.Since(startTime), Timestamp: time.Now()})
+			if err := w.checkFanOutCompletion(ctx, fo); err != nil {
+				w.logger.Error("failed to handle sub-job completion", "job_id", job.ID, "error", err)
+			}
+			return
+		}
+
+		// Legacy storage path: keep the original split result/complete/fan-out
+		// writes for storages that do not implement CompleteWithResult.
+		cancelHeartbeat()
 		if resultBytes != nil {
 			if saveErr := w.queue.Storage().SaveJobResult(ctx, job.ID, w.config.WorkerID, resultBytes); saveErr != nil {
 				w.logger.Error("failed to persist job result", "job_id", job.ID, "error", saveErr)
@@ -422,6 +499,35 @@ func (w *Worker) completeWithRetry(ctx context.Context, jobID string) error {
 	return retryWithBackoff(ctx, *w.config.StorageRetry, func() error {
 		return w.queue.Storage().Complete(ctx, jobID, w.config.WorkerID)
 	})
+}
+
+func (w *Worker) completeWithResult(ctx context.Context, storage completeWithResultStorage, jobID string, result []byte) (*core.FanOut, error) {
+	var fo *core.FanOut
+	err := retryWithBackoff(ctx, *w.config.StorageRetry, func() error {
+		var completeErr error
+		fo, completeErr = storage.CompleteWithResult(ctx, jobID, w.config.WorkerID, result)
+		return completeErr
+	})
+	return fo, err
+}
+
+func (w *Worker) failTerminalWithResult(ctx context.Context, storage failTerminalWithResultStorage, jobID string, errMsg string) (*core.FanOut, error) {
+	var fo *core.FanOut
+	err := retryWithBackoff(ctx, *w.config.StorageRetry, func() error {
+		var failErr error
+		fo, failErr = storage.FailTerminalWithResult(ctx, jobID, w.config.WorkerID, errMsg)
+		return failErr
+	})
+	return fo, err
+}
+
+func (w *Worker) releaseAfterTerminalWriteError(ctx context.Context, jobID string, action string) {
+	if err := w.queue.Storage().Release(ctx, jobID, w.config.WorkerID); err != nil && !errors.Is(err, core.ErrJobNotOwned) {
+		w.logger.Warn("failed to release job after transient terminal write error",
+			"job_id", jobID,
+			"action", action,
+			"error", err)
+	}
 }
 
 // orphanHeartbeatThreshold is the number of consecutive Heartbeat calls
@@ -592,22 +698,45 @@ func (w *Worker) handleError(ctx context.Context, jobCtx context.Context, job *c
 		// terminal — attempts exhausted.
 	}
 
-	// Persist the outcome first. If storage reports the job is no longer owned
-	// by this worker, it was reclaimed or cancelled by another path (the
-	// stale-lock reaper, a fan-out cancel, or another worker in the fleet —
-	// often the very reason this handler's context was cancelled). The owner
-	// is now responsible for hooks, events, and fan-out accounting; running
-	// them here would race the new owner's state writes and double-count the
-	// fan-out. So skip all side effects when ownership is lost.
-	if failErr := w.failWithRetry(ctx, job.ID, err.Error(), retryAt); errors.Is(failErr, core.ErrJobNotOwned) {
-		w.logger.Warn("job no longer owned by this worker; skipping failure handling",
-			"job_id", job.ID, "error", err)
+	if retryAt != nil {
+		// Persist the retry first. If storage reports the job is no longer owned
+		// by this worker, it was reclaimed or cancelled by another path. The owner
+		// is now responsible for hooks, events, and fan-out accounting.
+		if failErr := w.failWithRetry(ctx, job.ID, err.Error(), retryAt); errors.Is(failErr, core.ErrJobNotOwned) {
+			w.logger.Warn("job no longer owned by this worker; skipping failure handling",
+				"job_id", job.ID, "error", err)
+			return
+		}
+		w.queue.CallRetryHooks(jobCtx, job, job.Attempt, err)
+		w.queue.Emit(&core.JobRetrying{Job: job, Attempt: job.Attempt, Error: err, NextRunAt: *retryAt, Timestamp: time.Now()})
 		return
 	}
 
-	if retryAt != nil {
-		w.queue.CallRetryHooks(jobCtx, job, job.Attempt, err)
-		w.queue.Emit(&core.JobRetrying{Job: job, Attempt: job.Attempt, Error: err, NextRunAt: *retryAt, Timestamp: time.Now()})
+	if failer, ok := w.queue.Storage().(failTerminalWithResultStorage); ok {
+		fo, failErr := w.failTerminalWithResult(ctx, failer, job.ID, err.Error())
+		if errors.Is(failErr, core.ErrJobNotOwned) {
+			w.logger.Warn("job no longer owned by this worker; skipping failure handling",
+				"job_id", job.ID, "error", err)
+			return
+		}
+		if failErr != nil {
+			w.logger.Error("failed to terminally fail job after retries", "job_id", job.ID, "error", failErr)
+			w.releaseAfterTerminalWriteError(ctx, job.ID, "terminal failure")
+			return
+		}
+		w.queue.CallFailHooks(jobCtx, job, err)
+		w.queue.Emit(&core.JobFailed{Job: job, Error: err, Timestamp: time.Now()})
+		if handleErr := w.checkFanOutCompletion(ctx, fo); handleErr != nil {
+			w.logger.Error("failed to handle sub-job failure", "job_id", job.ID, "error", handleErr)
+		}
+		return
+	}
+
+	// Legacy storage path: terminal failures use the original split
+	// Fail+fan-out accounting sequence.
+	if failErr := w.failWithRetry(ctx, job.ID, err.Error(), nil); errors.Is(failErr, core.ErrJobNotOwned) {
+		w.logger.Warn("job no longer owned by this worker; skipping failure handling",
+			"job_id", job.ID, "error", err)
 		return
 	}
 
@@ -674,47 +803,13 @@ func (w *Worker) handleSubJobCompletion(ctx context.Context, job *core.Job, succ
 
 // checkFanOutCompletion checks if a fan-out is complete and resumes parent.
 func (w *Worker) checkFanOutCompletion(ctx context.Context, fo *core.FanOut) error {
-	total := fo.CompletedCount + fo.FailedCount + fo.CancelledCount
-	if total < fo.TotalCount {
-		// Not all sub-jobs done yet
-
-		// Check fail-fast
-		if fo.Strategy == core.StrategyFailFast && fo.FailedCount > 0 {
-			return w.completeFanOut(ctx, fo, core.FanOutFailed)
-		}
-
-		// Check threshold
-		if fo.Strategy == core.StrategyThreshold {
-			maxFailures := int(float64(fo.TotalCount) * (1 - fo.Threshold))
-			if fo.FailedCount > maxFailures {
-				return w.completeFanOut(ctx, fo, core.FanOutFailed)
-			}
-		}
-
+	if fo == nil {
 		return nil
 	}
-
-	// All sub-jobs done (completed + failed + cancelled = total)
-	status := core.FanOutCompleted
-	if fo.Strategy == core.StrategyFailFast && (fo.FailedCount > 0 || fo.CancelledCount > 0) {
-		status = core.FanOutFailed
-	} else if fo.Strategy == core.StrategyThreshold {
-		activeTotal := fo.CompletedCount + fo.FailedCount
-		if activeTotal > 0 {
-			successRate := float64(fo.CompletedCount) / float64(activeTotal)
-			if successRate < fo.Threshold {
-				status = core.FanOutFailed
-			}
-		} else {
-			// All jobs cancelled, no successes
-			status = core.FanOutFailed
-		}
-	} else if fo.CancelledCount > 0 && fo.CompletedCount == 0 {
-		// All jobs cancelled with no completions
-		status = core.FanOutFailed
+	done, status := fo.TerminalStatus()
+	if !done {
+		return nil
 	}
-	// CollectAll always marks as completed - error is returned to parent
-
 	return w.completeFanOut(ctx, fo, status)
 }
 
@@ -811,6 +906,39 @@ func (w *Worker) calculateBackoff(attempt int) time.Duration {
 	return backoff
 }
 
+// maxCatchUpIterations bounds the seed scan so a pathologically dense schedule
+// (e.g. millisecond interval over a long outage) cannot spin. Real schedules
+// are far coarser; hitting the cap falls back to "no catch-up" (resume from now).
+const maxCatchUpIterations = 100_000
+
+// seedLastRun computes the lastRun cursor for a scheduled job so that the very
+// next schedule.Next(seedLastRun(...)) yields the most-recent boundary that is
+// already due (<= now) when one or more boundaries were missed, causing exactly
+// one catch-up fire, after which natural cadence resumes. When no boundary is
+// due (fresh start or no gap) it returns persisted unchanged. Pure: no clock,
+// no storage.
+func seedLastRun(schedule schedule.Schedule, persisted, now time.Time) time.Time {
+	next := schedule.Next(persisted)
+	if next.IsZero() || next.After(now) {
+		return persisted
+	}
+
+	prev := persisted
+	iter := 0
+	for {
+		n2 := schedule.Next(next)
+		if n2.IsZero() || n2.After(now) {
+			return prev
+		}
+		prev = next
+		next = n2
+		iter++
+		if iter >= maxCatchUpIterations {
+			return now
+		}
+	}
+}
+
 func (w *Worker) runScheduler(ctx context.Context) {
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
@@ -831,7 +959,19 @@ func (w *Worker) runScheduler(ctx context.Context) {
 			now := time.Now()
 			for name, sj := range scheduled {
 				if _, ok := lastRun[name]; !ok {
+					// First sight of this schedule. Default to now (anti-boot-storm:
+					// a brand-new schedule must not fire immediately). But if a real
+					// prior fire is persisted, seed from it so the most recent missed
+					// boundary while the whole fleet was down fires once.
 					lastRun[name] = now
+					if reader, ok := w.queue.Storage().(scheduledFireReader); ok {
+						persistedLastFireAt, found, err := reader.GetScheduledFireTime(ctx, name)
+						if err != nil {
+							w.logger.Error("failed to read scheduled fire time", "name", name, "error", err)
+						} else if found && persistedLastFireAt.After(time.Unix(0, 0).UTC()) {
+							lastRun[name] = seedLastRun(sj.Schedule, persistedLastFireAt, now)
+						}
+					}
 				}
 				nextRun := sj.Schedule.Next(lastRun[name])
 				if now.After(nextRun) || now.Equal(nextRun) {

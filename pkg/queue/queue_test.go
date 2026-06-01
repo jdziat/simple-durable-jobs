@@ -3,6 +3,7 @@ package queue
 import (
 	"context"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -50,6 +51,13 @@ func (m *mockStorage) Dequeue(ctx context.Context, queues []string, workerID str
 func (m *mockStorage) Complete(ctx context.Context, jobID, workerID string) error {
 	if job, ok := m.jobs[jobID]; ok {
 		job.Status = core.StatusCompleted
+	}
+	return nil
+}
+
+func (m *mockStorage) Release(ctx context.Context, jobID, workerID string) error {
+	if job, ok := m.jobs[jobID]; ok {
+		job.Status = core.StatusPending
 	}
 	return nil
 }
@@ -172,6 +180,41 @@ func (m *mockStorage) SaveJobResult(ctx context.Context, jobID string, workerID 
 	return nil
 }
 
+type raceSafeMockStorage struct {
+	*mockStorage
+	mu sync.Mutex
+}
+
+func newRaceSafeMockStorage() *raceSafeMockStorage {
+	return &raceSafeMockStorage{mockStorage: newMockStorage()}
+}
+
+func (m *raceSafeMockStorage) Enqueue(ctx context.Context, job *core.Job) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.jobs[job.ID] = job
+	return nil
+}
+
+func (m *raceSafeMockStorage) EnqueueUnique(ctx context.Context, job *core.Job, uniqueKey string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.jobs[job.ID] = job
+	return nil
+}
+
+func (m *raceSafeMockStorage) GetJob(ctx context.Context, jobID string) (*core.Job, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.jobs[jobID], nil
+}
+
+func currentDeterminism(q *Queue) DeterminismMode {
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+	return q.determinism
+}
+
 func TestNew_CreatesQueue(t *testing.T) {
 	store := newMockStorage()
 	q := New(store)
@@ -179,7 +222,7 @@ func TestNew_CreatesQueue(t *testing.T) {
 	require.NotNil(t, q)
 	assert.Equal(t, store, q.Storage())
 	assert.NotNil(t, q.handlers)
-	assert.Equal(t, ExplicitCheckpoints, q.determinism)
+	assert.Equal(t, ExplicitCheckpoints, currentDeterminism(q))
 }
 
 func TestQueue_Register_ValidHandler(t *testing.T) {
@@ -350,6 +393,40 @@ func TestQueue_Enqueue_DeterminismDefault(t *testing.T) {
 	assert.Equal(t, int(ExplicitCheckpoints), job.Determinism)
 }
 
+func TestDeterminism_ExplicitOverridesQueueDefault(t *testing.T) {
+	store := newMockStorage()
+	q := New(store)
+	q.SetDeterminism(BestEffort)
+
+	q.Register("test-job", func(ctx context.Context, args string) error {
+		return nil
+	})
+
+	explicitID, err := q.Enqueue(context.Background(), "test-job", "explicit", Determinism(ExplicitCheckpoints))
+	require.NoError(t, err)
+
+	inheritedID, err := q.Enqueue(context.Background(), "test-job", "inherited")
+	require.NoError(t, err)
+
+	strictID, err := q.Enqueue(context.Background(), "test-job", "strict", Determinism(Strict))
+	require.NoError(t, err)
+
+	explicitJob, err := store.GetJob(context.Background(), explicitID)
+	require.NoError(t, err)
+	require.NotNil(t, explicitJob)
+	assert.Equal(t, int(ExplicitCheckpoints), explicitJob.Determinism)
+
+	inheritedJob, err := store.GetJob(context.Background(), inheritedID)
+	require.NoError(t, err)
+	require.NotNil(t, inheritedJob)
+	assert.Equal(t, int(BestEffort), inheritedJob.Determinism)
+
+	strictJob, err := store.GetJob(context.Background(), strictID)
+	require.NoError(t, err)
+	require.NotNil(t, strictJob)
+	assert.Equal(t, int(Strict), strictJob.Determinism)
+}
+
 func TestQueue_Schedule(t *testing.T) {
 	store := newMockStorage()
 	q := New(store)
@@ -388,10 +465,51 @@ func TestQueue_SetDeterminism(t *testing.T) {
 	q := New(store)
 
 	q.SetDeterminism(Strict)
-	assert.Equal(t, Strict, q.determinism)
+	assert.Equal(t, Strict, currentDeterminism(q))
 
 	q.SetDeterminism(BestEffort)
-	assert.Equal(t, BestEffort, q.determinism)
+	assert.Equal(t, BestEffort, currentDeterminism(q))
+}
+
+func TestSetDeterminism_NoRace(t *testing.T) {
+	store := newRaceSafeMockStorage()
+	q := New(store)
+	q.Register("test-job", func(ctx context.Context, args int) error {
+		return nil
+	})
+
+	ctx := context.Background()
+	var wg sync.WaitGroup
+	errCh := make(chan error, 400)
+
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func(offset int) {
+			defer wg.Done()
+			modes := []DeterminismMode{ExplicitCheckpoints, Strict, BestEffort}
+			for j := 0; j < 100; j++ {
+				q.SetDeterminism(modes[(offset+j)%len(modes)])
+			}
+		}(i)
+	}
+
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func(offset int) {
+			defer wg.Done()
+			for j := 0; j < 100; j++ {
+				if _, err := q.Enqueue(ctx, "test-job", offset*100+j); err != nil {
+					errCh <- err
+				}
+			}
+		}(i)
+	}
+
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		require.NoError(t, err)
+	}
 }
 
 func TestQueue_Events(t *testing.T) {
@@ -978,7 +1096,12 @@ func TestQueue_CancelSubJob_NotASubJob_ReturnsNil(t *testing.T) {
 // CancelSubJob so we can exercise the completion-check logic.
 type cancelSubJobStorage struct {
 	*mockStorage
-	fanOut *core.FanOut
+	fanOut        *core.FanOut
+	updateCalled  bool
+	updatedID     string
+	updatedStatus core.FanOutStatus
+	resumeCalled  bool
+	resumedID     string
 }
 
 func (c *cancelSubJobStorage) CancelSubJob(ctx context.Context, jobID string) (*core.FanOut, error) {
@@ -986,10 +1109,15 @@ func (c *cancelSubJobStorage) CancelSubJob(ctx context.Context, jobID string) (*
 }
 
 func (c *cancelSubJobStorage) UpdateFanOutStatus(ctx context.Context, fanOutID string, status core.FanOutStatus) (bool, error) {
+	c.updateCalled = true
+	c.updatedID = fanOutID
+	c.updatedStatus = status
 	return true, nil
 }
 
 func (c *cancelSubJobStorage) ResumeJob(ctx context.Context, jobID string) (bool, error) {
+	c.resumeCalled = true
+	c.resumedID = jobID
 	return true, nil
 }
 
@@ -1002,6 +1130,7 @@ func TestQueue_CancelSubJob_FanOutComplete_ResumesParent(t *testing.T) {
 		CompletedCount: 1,
 		CancelledCount: 1,
 		FailedCount:    0,
+		Strategy:       core.StrategyCollectAll,
 		Status:         core.FanOutPending,
 	}
 	store := &cancelSubJobStorage{mockStorage: base, fanOut: fo}
@@ -1013,6 +1142,9 @@ func TestQueue_CancelSubJob_FanOutComplete_ResumesParent(t *testing.T) {
 	require.NoError(t, err)
 	assert.NotNil(t, result)
 	assert.Equal(t, "fo-1", result.ID)
+	assert.True(t, store.updateCalled)
+	assert.Equal(t, core.FanOutCompleted, store.updatedStatus)
+	assert.True(t, store.resumeCalled)
 }
 
 func TestQueue_CancelSubJob_FanOutIncomplete_DoesNotResume(t *testing.T) {
@@ -1024,6 +1156,7 @@ func TestQueue_CancelSubJob_FanOutIncomplete_DoesNotResume(t *testing.T) {
 		CompletedCount: 1,
 		CancelledCount: 1,
 		FailedCount:    0,
+		Strategy:       core.StrategyCollectAll,
 		Status:         core.FanOutPending,
 	}
 	store := &cancelSubJobStorage{mockStorage: base, fanOut: fo}
@@ -1034,6 +1167,8 @@ func TestQueue_CancelSubJob_FanOutIncomplete_DoesNotResume(t *testing.T) {
 	result, err := q.CancelSubJob(ctx, "sub-job-id")
 	require.NoError(t, err)
 	assert.NotNil(t, result)
+	assert.False(t, store.updateCalled)
+	assert.False(t, store.resumeCalled)
 }
 
 func TestQueue_CancelSubJob_AllFailed_StatusFailed(t *testing.T) {
@@ -1045,6 +1180,7 @@ func TestQueue_CancelSubJob_AllFailed_StatusFailed(t *testing.T) {
 		CompletedCount: 0,
 		FailedCount:    0,
 		CancelledCount: 2,
+		Strategy:       core.StrategyFailFast,
 		Status:         core.FanOutPending,
 	}
 	store := &cancelSubJobStorage{mockStorage: base, fanOut: fo}
@@ -1055,6 +1191,56 @@ func TestQueue_CancelSubJob_AllFailed_StatusFailed(t *testing.T) {
 	result, err := q.CancelSubJob(ctx, "sub-job-id")
 	require.NoError(t, err)
 	assert.NotNil(t, result)
+	assert.True(t, store.updateCalled)
+	assert.Equal(t, core.FanOutFailed, store.updatedStatus)
+}
+
+func TestQueueCancelSubJob_UsesStrategyAwareStatus(t *testing.T) {
+	base := newMockStorage()
+	fo := &core.FanOut{
+		ID:             "fo-collect-all",
+		ParentJobID:    "parent-job",
+		TotalCount:     2,
+		CompletedCount: 1,
+		CancelledCount: 1,
+		Strategy:       core.StrategyCollectAll,
+		Status:         core.FanOutPending,
+	}
+	store := &cancelSubJobStorage{mockStorage: base, fanOut: fo}
+
+	q := New(store)
+	result, err := q.CancelSubJob(context.Background(), "sub-job-id")
+	require.NoError(t, err)
+	require.NotNil(t, result)
+
+	assert.True(t, store.updateCalled)
+	assert.Equal(t, "fo-collect-all", store.updatedID)
+	assert.Equal(t, core.FanOutCompleted, store.updatedStatus)
+	assert.True(t, store.resumeCalled)
+	assert.Equal(t, "parent-job", store.resumedID)
+}
+
+func TestQueueCancelSubJob_CancelsLocalRunningHandler(t *testing.T) {
+	base := newMockStorage()
+	fo := &core.FanOut{
+		ID:             "fo-running",
+		ParentJobID:    "parent-job",
+		TotalCount:     3,
+		CancelledCount: 1,
+		Strategy:       core.StrategyCollectAll,
+		Status:         core.FanOutPending,
+	}
+	store := &cancelSubJobStorage{mockStorage: base, fanOut: fo}
+
+	q := New(store)
+	cancelled := false
+	q.RegisterRunningJob("sub-job-id", func() { cancelled = true })
+
+	result, err := q.CancelSubJob(context.Background(), "sub-job-id")
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assert.True(t, cancelled, "local running handler cancel function should be called")
+	assert.False(t, store.updateCalled, "incomplete fan-out should not be marked terminal")
 }
 
 // ---------------------------------------------------------------------------

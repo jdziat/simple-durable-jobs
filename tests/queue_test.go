@@ -254,15 +254,19 @@ func TestQueue_Schedule(t *testing.T) {
 	queue.Schedule("scheduled-task", nil, jobs.Every(200*time.Millisecond))
 
 	worker := queue.NewWorker(jobs.WithScheduler(true))
-	workerCtx, cancel := context.WithTimeout(ctx, 1*time.Second)
+	// Generous worker lifetime so the poll below has room when a loaded CI
+	// runner is slow to begin dispatching scheduled fires.
+	workerCtx, cancel := context.WithTimeout(ctx, 6*time.Second)
 	defer cancel()
 
 	go func() { _ = worker.Start(workerCtx) }()
 
-	time.Sleep(800 * time.Millisecond)
-
-	// Should have run at least once (relaxed for race detector)
-	assert.GreaterOrEqual(t, runCount.Load(), int32(1))
+	// Poll instead of a fixed 800ms window: scheduler/worker startup latency can
+	// delay the first fire past a fixed wait. Wait until the scheduled task has
+	// run at least once.
+	require.Eventually(t, func() bool {
+		return runCount.Load() >= 1
+	}, 5*time.Second, 20*time.Millisecond, "scheduled task should have run at least once")
 }
 
 func TestQueue_Schedule_WithOptions(t *testing.T) {

@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -73,4 +74,81 @@ func TestSearchJobs_OverlongSearchIsBounded(t *testing.T) {
 	assert.Equal(t, int64(1), total)
 	require.Len(t, matches, 1)
 	assert.Equal(t, "bounded-"+bounded, matches[0].ID)
+}
+
+func TestPurgeJobs_DeletesCheckpoints(t *testing.T) {
+	ctx := context.Background()
+	store := newUITestStorage(t)
+	job := &core.Job{
+		ID:        "failed-with-checkpoint",
+		Type:      "work",
+		Queue:     "q",
+		Status:    core.StatusFailed,
+		Args:      []byte(`{}`),
+		CreatedAt: time.Now(),
+	}
+	require.NoError(t, store.Enqueue(ctx, job))
+	require.NoError(t, store.SaveCheckpoint(ctx, &core.Checkpoint{
+		ID:        "checkpoint-1",
+		JobID:     job.ID,
+		CallIndex: 0,
+		CallType:  "test",
+		Result:    []byte(`"ok"`),
+		CreatedAt: time.Now(),
+	}))
+
+	deleted, err := store.PurgeJobs(ctx, "q", core.StatusFailed)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), deleted)
+
+	var checkpointCount int64
+	require.NoError(t, store.db.WithContext(ctx).Model(&core.Checkpoint{}).Count(&checkpointCount).Error)
+	assert.Equal(t, int64(0), checkpointCount)
+}
+
+func TestSearchJobs_ClampsOffsetAndLimit(t *testing.T) {
+	ctx := context.Background()
+	store := newUITestStorage(t)
+	now := time.Now()
+	for i := 0; i < maxUIQueryLimit+25; i++ {
+		require.NoError(t, store.Enqueue(ctx, &core.Job{
+			ID:        "job-" + strconv.Itoa(i),
+			Type:      "work",
+			Queue:     "default",
+			Status:    core.StatusPending,
+			Args:      []byte(`{}`),
+			CreatedAt: now.Add(time.Duration(i) * time.Second),
+		}))
+	}
+
+	jobs, total, err := store.SearchJobs(ctx, core.JobFilter{Limit: maxUIQueryLimit + 1000, Offset: -100})
+	require.NoError(t, err)
+	assert.Equal(t, int64(maxUIQueryLimit+25), total)
+	assert.Len(t, jobs, maxUIQueryLimit)
+
+	for i := 0; i < maxUIQueryLimit+25; i++ {
+		rootID := "root-" + strconv.Itoa(i)
+		require.NoError(t, store.Enqueue(ctx, &core.Job{
+			ID:        rootID,
+			Type:      "workflow",
+			Queue:     "default",
+			Status:    core.StatusRunning,
+			Args:      []byte(`{}`),
+			CreatedAt: now.Add(time.Duration(i) * time.Second),
+		}))
+		require.NoError(t, store.Enqueue(ctx, &core.Job{
+			ID:          "child-" + strconv.Itoa(i),
+			Type:        "step",
+			Queue:       "default",
+			Status:      core.StatusPending,
+			Args:        []byte(`{}`),
+			ParentJobID: &rootID,
+			CreatedAt:   now.Add(time.Duration(i) * time.Second),
+		}))
+	}
+
+	roots, workflowTotal, err := store.GetWorkflowRoots(ctx, "", maxUIQueryLimit+1000, -100)
+	require.NoError(t, err)
+	assert.Equal(t, int64(maxUIQueryLimit+25), workflowTotal)
+	assert.Len(t, roots, maxUIQueryLimit)
 }

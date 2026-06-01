@@ -134,6 +134,125 @@ func TestSanitizeErrorMessage_RedactsPasswordKeysAndOpaqueTokens(t *testing.T) {
 	assert.NotContains(t, result, "0123456789abcdef0123456789abcdef")
 }
 
+func TestRedactSecrets_ProviderKeys(t *testing.T) {
+	tests := []struct {
+		name   string
+		secret string
+	}{
+		{
+			name:   "stripe live secret key",
+			secret: "sk_live_1234567890abcdef",
+		},
+		{
+			name:   "stripe test secret key",
+			secret: "sk_test_abcdef1234567890",
+		},
+		{
+			name:   "stripe restricted live key",
+			secret: "rk_live_1234567890abcdef",
+		},
+		{
+			name:   "github token",
+			secret: "ghp_1234567890abcdefghij",
+		},
+		{
+			name:   "slack bot token",
+			secret: "xoxb-1234567890-ABCDEFGHIJabcdefghijkl",
+		},
+		{
+			name:   "google api key",
+			secret: "AIza" + strings.Repeat("A", 35),
+		},
+		{
+			name:   "aws access key id",
+			secret: "AKIA1234567890ABCDEF",
+		},
+		{
+			name:   "jwt",
+			secret: "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.sgn-x_y",
+		},
+		{
+			name:   "base64url opaque token",
+			secret: "abcDEF1234567890_-abcDEF",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			out := redactSecrets("request failed with token " + tt.secret + " while processing")
+
+			assert.Contains(t, out, "[REDACTED]")
+			assert.NotContains(t, out, tt.secret)
+		})
+	}
+}
+
+func TestRedactSecrets_PreservesDiagnostics(t *testing.T) {
+	tests := []string{
+		"git revision 0123456789abcdef0123456789abcdef01234567",
+		"failed to read /var/lib/pg/12345/base/67890",
+		"correlation id 550e8400-e29b-41d4-a716-446655440000",
+		"ordinary connection refused after retrying twice",
+	}
+
+	for _, input := range tests {
+		t.Run(input, func(t *testing.T) {
+			out := redactSecrets(input)
+
+			assert.Equal(t, input, out)
+			assert.NotContains(t, out, "[REDACTED]")
+		})
+	}
+}
+
+func TestSanitizeErrorMessage_BoundedForHugeInput(t *testing.T) {
+	secret := "sk_live_1234567890abcdef"
+	hugeInput := strings.Repeat("a", maxErrorMessageInputLength+MaxErrorMessageLength) + secret
+
+	result := SanitizeErrorMessage(hugeInput)
+
+	assert.LessOrEqual(t, len(result), MaxErrorMessageLength)
+	assert.NotContains(t, result, secret)
+
+	inputWithSecretInPrefix := "request failed " + secret + " " + strings.Repeat("b", maxErrorMessageInputLength*2)
+	result = SanitizeErrorMessage(inputWithSecretInPrefix)
+
+	assert.LessOrEqual(t, len(result), MaxErrorMessageLength)
+	assert.Contains(t, result, "[REDACTED]")
+	assert.NotContains(t, result, secret)
+}
+
+func TestRedactSecrets_ExportedRedactsProviderKey(t *testing.T) {
+	secret := "sk_live_1234567890abcdef"
+	input := "payload contains " + secret + " here"
+
+	result := RedactSecrets(input)
+
+	assert.Contains(t, result, "payload contains [REDACTED] here")
+	assert.NotContains(t, result, secret)
+}
+
+func TestRedactSecrets_DoesNotTruncateLargePayload(t *testing.T) {
+	secret := "ghp_1234567890abcdefghij"
+	sentinel := "TAIL_SENTINEL"
+	input := strings.Repeat("a", MaxErrorMessageLength+100) + " " + secret + " " + sentinel
+
+	result := RedactSecrets(input)
+
+	assert.Contains(t, result, "[REDACTED]")
+	assert.NotContains(t, result, secret)
+	assert.Contains(t, result, sentinel)
+	assert.Greater(t, len(result), MaxErrorMessageLength)
+}
+
+func TestRedactSecrets_ExportedLeavesSecretFreeStringUnchanged(t *testing.T) {
+	input := "ordinary connection refused after retrying twice"
+
+	result := RedactSecrets(input)
+
+	assert.Equal(t, input, result)
+}
+
 func TestClampRetries(t *testing.T) {
 	tests := []struct {
 		input    int
@@ -178,6 +297,7 @@ func TestClampConcurrency(t *testing.T) {
 func TestConstants(t *testing.T) {
 	assert.Equal(t, 255, MaxJobTypeNameLength)
 	assert.Equal(t, 1<<20, MaxJobArgsSize) // 1MB
+	assert.Equal(t, 1<<20, MaxResultSize)  // 1MB
 	assert.Equal(t, 100, MaxRetries)
 	assert.Equal(t, 1000, MaxConcurrency)
 	assert.Equal(t, 4096, MaxErrorMessageLength)

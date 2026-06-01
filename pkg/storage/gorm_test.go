@@ -3,7 +3,9 @@ package storage
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -113,6 +115,37 @@ func TestNewGormStorage_NilDB(t *testing.T) {
 	assert.False(t, s.IsSQLite(), "nil db should not claim SQLite")
 }
 
+func TestMigrate_DequeueIndexExists(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+	s := NewGormStorage(db)
+
+	require.NoError(t, s.Migrate(ctx))
+	require.NoError(t, s.Migrate(ctx), "migrate should be idempotent")
+
+	var indexName string
+	switch {
+	case s.IsSQLite():
+		require.NoError(t, s.DB().Raw(
+			"SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?",
+			"idx_jobs_dequeue",
+		).Scan(&indexName).Error)
+	case strings.EqualFold(s.DB().Name(), "postgres"):
+		require.NoError(t, s.DB().Raw(
+			"SELECT indexname FROM pg_indexes WHERE tablename = ? AND indexname = ?",
+			"jobs", "idx_jobs_dequeue",
+		).Scan(&indexName).Error)
+	case strings.EqualFold(s.DB().Name(), "mysql"):
+		require.NoError(t, s.DB().Raw(
+			"SELECT index_name FROM information_schema.statistics WHERE table_schema = DATABASE() AND table_name = ? AND index_name = ? LIMIT 1",
+			"jobs", "idx_jobs_dequeue",
+		).Scan(&indexName).Error)
+	default:
+		t.Fatalf("unsupported test dialect %q", s.DB().Name())
+	}
+	assert.Equal(t, "idx_jobs_dequeue", indexName)
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Enqueue
 // ──────────────────────────────────────────────────────────────────────────────
@@ -169,6 +202,37 @@ func TestEnqueue_PreservesExistingStatus(t *testing.T) {
 	}
 	require.NoError(t, s.Enqueue(ctx, job))
 	assert.Equal(t, core.StatusWaiting, job.Status)
+}
+
+func TestJobTimeoutDeterminism_RoundTripZero(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	zero := &core.Job{
+		Type:        "task.zero",
+		Timeout:     0,
+		Determinism: 0,
+	}
+	require.NoError(t, s.Enqueue(ctx, zero))
+
+	zeroReloaded, err := s.GetJob(ctx, zero.ID)
+	require.NoError(t, err)
+	require.NotNil(t, zeroReloaded)
+	assert.Equal(t, time.Duration(0), zeroReloaded.Timeout)
+	assert.Equal(t, 0, zeroReloaded.Determinism)
+
+	nonZero := &core.Job{
+		Type:        "task.nonzero",
+		Timeout:     30 * time.Second,
+		Determinism: 2,
+	}
+	require.NoError(t, s.Enqueue(ctx, nonZero))
+
+	nonZeroReloaded, err := s.GetJob(ctx, nonZero.ID)
+	require.NoError(t, err)
+	require.NotNil(t, nonZeroReloaded)
+	assert.Equal(t, 30*time.Second, nonZeroReloaded.Timeout)
+	assert.Equal(t, 2, nonZeroReloaded.Determinism)
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -585,6 +649,66 @@ func TestHeartbeat_FailsWhenJobIsNoLongerRunning(t *testing.T) {
 	assert.Nil(t, after.LastHeartbeatAt)
 }
 
+func TestRelease_ReturnsRunningJobToPending(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	require.NoError(t, s.Enqueue(ctx, newTestJob("default", "task.run")))
+
+	got, err := s.Dequeue(ctx, []string{"default"}, "worker-1")
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	require.Equal(t, 1, got.Attempt)
+
+	require.NoError(t, s.Release(ctx, got.ID, "worker-1"))
+
+	row, err := s.GetJob(ctx, got.ID)
+	require.NoError(t, err)
+	require.NotNil(t, row)
+	assert.Equal(t, core.StatusPending, row.Status)
+	assert.Empty(t, row.LockedBy)
+	assert.Nil(t, row.LockedUntil)
+	assert.Nil(t, row.StartedAt)
+	assert.Equal(t, 0, row.Attempt)
+}
+
+func TestRelease_NotOwned_ReturnsErrJobNotOwned(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	require.NoError(t, s.Enqueue(ctx, newTestJob("default", "task.run")))
+
+	got, err := s.Dequeue(ctx, []string{"default"}, "worker-1")
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	beforeLock := got.LockedUntil
+	beforeStarted := got.StartedAt
+
+	err = s.Release(ctx, got.ID, "worker-2")
+	require.ErrorIs(t, err, core.ErrJobNotOwned)
+
+	row, err := s.GetJob(ctx, got.ID)
+	require.NoError(t, err)
+	require.NotNil(t, row)
+	assert.Equal(t, core.StatusRunning, row.Status)
+	assert.Equal(t, "worker-1", row.LockedBy)
+	require.NotNil(t, row.LockedUntil)
+	require.NotNil(t, row.StartedAt)
+	assert.WithinDuration(t, *beforeLock, *row.LockedUntil, time.Millisecond)
+	assert.WithinDuration(t, *beforeStarted, *row.StartedAt, time.Millisecond)
+	assert.Equal(t, 1, row.Attempt)
+
+	require.NoError(t, s.Complete(ctx, got.ID, "worker-1"))
+	err = s.Release(ctx, got.ID, "worker-1")
+	require.ErrorIs(t, err, core.ErrJobNotOwned)
+
+	completed, err := s.GetJob(ctx, got.ID)
+	require.NoError(t, err)
+	require.NotNil(t, completed)
+	assert.Equal(t, core.StatusCompleted, completed.Status)
+	assert.Equal(t, 1, completed.Attempt)
+}
+
 func TestReleaseStaleLocks_ResetsExpiredRunningJobsToPending(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStorage(t)
@@ -664,6 +788,27 @@ func TestReleaseStaleLocks_DoesNotTouchFreshLocks(t *testing.T) {
 	still, err := s.GetJob(ctx, got.ID)
 	require.NoError(t, err)
 	assert.Equal(t, core.StatusRunning, still.Status)
+}
+
+func TestReleaseStaleLocks_LimitsBatch(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	past := time.Now().Add(-2 * time.Hour)
+	for i := 0; i < maxResumeBatch+25; i++ {
+		job := &core.Job{
+			Type:        "task.stale",
+			Queue:       "default",
+			Status:      core.StatusRunning,
+			LockedBy:    "worker-stale",
+			LockedUntil: &past,
+		}
+		require.NoError(t, s.Enqueue(ctx, job))
+	}
+
+	released, err := s.ReleaseStaleLocks(ctx, time.Hour)
+	require.NoError(t, err)
+	assert.Len(t, released, maxResumeBatch)
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -757,6 +902,52 @@ func TestSaveCheckpoint_UpsertsOnSameJobCallIndexCallType(t *testing.T) {
 
 	// The result should be the updated value.
 	assert.Equal(t, `{"results":{"0":{"text":"tile 0"},"1":{"text":"tile 1"}}}`, string(checkpoints[0].Result))
+}
+
+func TestSaveCheckpoint_PreservesCreatedAtOnResave(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	job := newTestJob("default", "task.run")
+	require.NoError(t, s.Enqueue(ctx, job))
+
+	cp1 := &core.Checkpoint{
+		JobID:           job.ID,
+		CallIndex:       7,
+		CallType:        "step",
+		Result:          []byte(`{"value":"first"}`),
+		Error:           "first error",
+		ErrorKind:       "transient",
+		ErrorDelayNanos: int64(time.Second),
+	}
+	require.NoError(t, s.SaveCheckpoint(ctx, cp1))
+
+	checkpoints, err := s.GetCheckpoints(ctx, job.ID)
+	require.NoError(t, err)
+	require.Len(t, checkpoints, 1)
+	createdAt := checkpoints[0].CreatedAt
+
+	time.Sleep(time.Millisecond)
+
+	cp2 := &core.Checkpoint{
+		JobID:           job.ID,
+		CallIndex:       7,
+		CallType:        "step",
+		Result:          []byte(`{"value":"second"}`),
+		Error:           "second error",
+		ErrorKind:       "permanent",
+		ErrorDelayNanos: int64(2 * time.Second),
+	}
+	require.NoError(t, s.SaveCheckpoint(ctx, cp2))
+
+	checkpoints, err = s.GetCheckpoints(ctx, job.ID)
+	require.NoError(t, err)
+	require.Len(t, checkpoints, 1)
+	assert.True(t, checkpoints[0].CreatedAt.Equal(createdAt), "created_at should remain the first creation time")
+	assert.Equal(t, `{"value":"second"}`, string(checkpoints[0].Result))
+	assert.Equal(t, "second error", checkpoints[0].Error)
+	assert.Equal(t, "permanent", checkpoints[0].ErrorKind)
+	assert.Equal(t, int64(2*time.Second), checkpoints[0].ErrorDelayNanos)
 }
 
 func TestGetCheckpoints_ReturnsEmptySliceForUnknownJob(t *testing.T) {
@@ -1154,6 +1345,266 @@ func TestGetFanOut_ReturnsNilForMissing(t *testing.T) {
 	got, err := s.GetFanOut(ctx, "no-such-fanout")
 	require.NoError(t, err)
 	assert.Nil(t, got)
+}
+
+func p2bID(t *testing.T, suffix string) string {
+	t.Helper()
+	// Must fit the varchar(36) id columns (Job.ID, FanOut.ID/ParentJobID). The
+	// previous t.Name() prefix overflowed on Postgres/MySQL ("value too long for
+	// type character varying(36)", SQLSTATE 22001); SQLite does not enforce
+	// varchar length so it masked the bug. suffix ("fo"/"parent"/"job") + UnixNano
+	// is ~26 chars, unique across shared-DB runs, and distinct within a call.
+	return fmt.Sprintf("%s-%d", suffix, time.Now().UnixNano())
+}
+
+func createRunningP2BJob(t *testing.T, ctx context.Context, s *GormStorage, fanOutID *string, workerID string) *core.Job {
+	t.Helper()
+	lockUntil := time.Now().Add(time.Hour)
+	job := &core.Job{
+		ID:          p2bID(t, "job"),
+		Type:        "p2b.sub",
+		Queue:       "p2b",
+		Status:      core.StatusRunning,
+		LockedBy:    workerID,
+		LockedUntil: &lockUntil,
+		FanOutID:    fanOutID,
+	}
+	require.NoError(t, s.Enqueue(ctx, job))
+	return job
+}
+
+func createP2BFanOut(t *testing.T, ctx context.Context, s *GormStorage, status core.FanOutStatus) *core.FanOut {
+	t.Helper()
+	fo := &core.FanOut{
+		ID:          p2bID(t, "fo"),
+		ParentJobID: p2bID(t, "parent"),
+		TotalCount:  2,
+		Strategy:    core.StrategyCollectAll,
+		Status:      status,
+	}
+	require.NoError(t, s.CreateFanOut(ctx, fo))
+	return fo
+}
+
+func TestCompleteWithResult_AtomicIncrementOnce(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+	fo := createP2BFanOut(t, ctx, s, core.FanOutPending)
+	job := createRunningP2BJob(t, ctx, s, &fo.ID, "worker-1")
+	result := []byte(`{"ok":true}`)
+
+	updated, err := s.CompleteWithResult(ctx, job.ID, "worker-1", result)
+	require.NoError(t, err)
+	require.NotNil(t, updated)
+	assert.Equal(t, 1, updated.CompletedCount)
+	assert.Equal(t, 0, updated.FailedCount)
+
+	row, err := s.GetJob(ctx, job.ID)
+	require.NoError(t, err)
+	require.NotNil(t, row)
+	assert.Equal(t, core.StatusCompleted, row.Status)
+	assert.Equal(t, result, row.Result)
+	assert.Empty(t, row.LockedBy)
+	assert.Nil(t, row.LockedUntil)
+	assert.NotNil(t, row.CompletedAt)
+
+	updated, err = s.CompleteWithResult(ctx, job.ID, "worker-1", result)
+	require.ErrorIs(t, err, core.ErrJobNotOwned)
+	assert.Nil(t, updated)
+
+	after, err := s.GetFanOut(ctx, fo.ID)
+	require.NoError(t, err)
+	require.NotNil(t, after)
+	assert.Equal(t, 1, after.CompletedCount)
+}
+
+func TestCompleteWithResult_ConcurrentWithReaper(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+	fo := createP2BFanOut(t, ctx, s, core.FanOutPending)
+	job := createRunningP2BJob(t, ctx, s, &fo.ID, "worker-1")
+	result := []byte(`{"ok":true}`)
+
+	updated, err := s.CompleteWithResult(ctx, job.ID, "worker-1", result)
+	require.NoError(t, err)
+	require.NotNil(t, updated)
+	assert.Equal(t, 1, updated.CompletedCount)
+
+	released, err := s.ReleaseStaleLocks(ctx, 0)
+	require.NoError(t, err)
+	assert.Empty(t, released)
+
+	updated, err = s.CompleteWithResult(ctx, job.ID, "worker-1", []byte(`{"ok":true}`))
+	require.ErrorIs(t, err, core.ErrJobNotOwned)
+	assert.Nil(t, updated)
+
+	after, err := s.GetFanOut(ctx, fo.ID)
+	require.NoError(t, err)
+	require.NotNil(t, after)
+	assert.Equal(t, 1, after.CompletedCount)
+	assert.Equal(t, core.FanOutPending, after.Status)
+
+	row, err := s.GetJob(ctx, job.ID)
+	require.NoError(t, err)
+	require.NotNil(t, row)
+	assert.Equal(t, core.StatusCompleted, row.Status)
+	assert.Equal(t, result, row.Result)
+}
+
+func TestCompleteWithResult_NotOwned_NoIncrement(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+	fo := createP2BFanOut(t, ctx, s, core.FanOutPending)
+	job := createRunningP2BJob(t, ctx, s, &fo.ID, "worker-1")
+
+	updated, err := s.CompleteWithResult(ctx, job.ID, "worker-2", []byte(`{"wrong":true}`))
+	require.ErrorIs(t, err, core.ErrJobNotOwned)
+	assert.Nil(t, updated)
+
+	row, err := s.GetJob(ctx, job.ID)
+	require.NoError(t, err)
+	require.NotNil(t, row)
+	assert.Equal(t, core.StatusRunning, row.Status)
+	assert.Equal(t, "worker-1", row.LockedBy)
+	assert.Empty(t, row.Result)
+
+	after, err := s.GetFanOut(ctx, fo.ID)
+	require.NoError(t, err)
+	require.NotNil(t, after)
+	assert.Equal(t, 0, after.CompletedCount)
+}
+
+func TestCompleteWithResult_NonFanout(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+	job := createRunningP2BJob(t, ctx, s, nil, "worker-1")
+	result := []byte(`{"standalone":true}`)
+
+	updated, err := s.CompleteWithResult(ctx, job.ID, "worker-1", result)
+	require.NoError(t, err)
+	assert.Nil(t, updated)
+
+	row, err := s.GetJob(ctx, job.ID)
+	require.NoError(t, err)
+	require.NotNil(t, row)
+	assert.Equal(t, core.StatusCompleted, row.Status)
+	assert.Equal(t, result, row.Result)
+}
+
+func TestCompleteWithResult_LivenessGuard_NoCountOnTerminalFanOut(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+	fo := createP2BFanOut(t, ctx, s, core.FanOutFailed)
+	job := createRunningP2BJob(t, ctx, s, &fo.ID, "worker-1")
+
+	updated, err := s.CompleteWithResult(ctx, job.ID, "worker-1", []byte(`{"late":true}`))
+	require.NoError(t, err)
+	require.NotNil(t, updated)
+	assert.Equal(t, core.FanOutFailed, updated.Status)
+	assert.Equal(t, 0, updated.CompletedCount)
+
+	row, err := s.GetJob(ctx, job.ID)
+	require.NoError(t, err)
+	require.NotNil(t, row)
+	assert.Equal(t, core.StatusCompleted, row.Status)
+
+	after, err := s.GetFanOut(ctx, fo.ID)
+	require.NoError(t, err)
+	require.NotNil(t, after)
+	assert.Equal(t, 0, after.CompletedCount)
+}
+
+func TestFailTerminalWithResult_AtomicIncrementOnce(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+	fo := createP2BFanOut(t, ctx, s, core.FanOutPending)
+	job := createRunningP2BJob(t, ctx, s, &fo.ID, "worker-1")
+
+	updated, err := s.FailTerminalWithResult(ctx, job.ID, "worker-1", "something broke")
+	require.NoError(t, err)
+	require.NotNil(t, updated)
+	assert.Equal(t, 1, updated.FailedCount)
+	assert.Equal(t, 0, updated.CompletedCount)
+
+	row, err := s.GetJob(ctx, job.ID)
+	require.NoError(t, err)
+	require.NotNil(t, row)
+	assert.Equal(t, core.StatusFailed, row.Status)
+	assert.Equal(t, "something broke", row.LastError)
+	assert.Empty(t, row.LockedBy)
+	assert.Nil(t, row.LockedUntil)
+	assert.NotNil(t, row.CompletedAt)
+
+	updated, err = s.FailTerminalWithResult(ctx, job.ID, "worker-1", "again")
+	require.ErrorIs(t, err, core.ErrJobNotOwned)
+	assert.Nil(t, updated)
+
+	after, err := s.GetFanOut(ctx, fo.ID)
+	require.NoError(t, err)
+	require.NotNil(t, after)
+	assert.Equal(t, 1, after.FailedCount)
+}
+
+func TestFailTerminalWithResult_NotOwned_NoIncrement(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+	fo := createP2BFanOut(t, ctx, s, core.FanOutPending)
+	job := createRunningP2BJob(t, ctx, s, &fo.ID, "worker-1")
+
+	updated, err := s.FailTerminalWithResult(ctx, job.ID, "worker-2", "wrong worker")
+	require.ErrorIs(t, err, core.ErrJobNotOwned)
+	assert.Nil(t, updated)
+
+	row, err := s.GetJob(ctx, job.ID)
+	require.NoError(t, err)
+	require.NotNil(t, row)
+	assert.Equal(t, core.StatusRunning, row.Status)
+	assert.Equal(t, "worker-1", row.LockedBy)
+	assert.Empty(t, row.LastError)
+
+	after, err := s.GetFanOut(ctx, fo.ID)
+	require.NoError(t, err)
+	require.NotNil(t, after)
+	assert.Equal(t, 0, after.FailedCount)
+}
+
+func TestFailTerminalWithResult_NonFanout(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+	job := createRunningP2BJob(t, ctx, s, nil, "worker-1")
+
+	updated, err := s.FailTerminalWithResult(ctx, job.ID, "worker-1", "standalone failed")
+	require.NoError(t, err)
+	assert.Nil(t, updated)
+
+	row, err := s.GetJob(ctx, job.ID)
+	require.NoError(t, err)
+	require.NotNil(t, row)
+	assert.Equal(t, core.StatusFailed, row.Status)
+	assert.Equal(t, "standalone failed", row.LastError)
+}
+
+func TestFailTerminalWithResult_LivenessGuard_NoCountOnTerminalFanOut(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+	fo := createP2BFanOut(t, ctx, s, core.FanOutFailed)
+	job := createRunningP2BJob(t, ctx, s, &fo.ID, "worker-1")
+
+	updated, err := s.FailTerminalWithResult(ctx, job.ID, "worker-1", "late fail")
+	require.NoError(t, err)
+	require.NotNil(t, updated)
+	assert.Equal(t, core.FanOutFailed, updated.Status)
+	assert.Equal(t, 0, updated.FailedCount)
+
+	row, err := s.GetJob(ctx, job.ID)
+	require.NoError(t, err)
+	require.NotNil(t, row)
+	assert.Equal(t, core.StatusFailed, row.Status)
+
+	after, err := s.GetFanOut(ctx, fo.ID)
+	require.NoError(t, err)
+	require.NotNil(t, after)
+	assert.Equal(t, 0, after.FailedCount)
 }
 
 func TestCreateFanOut_PreservesExistingID(t *testing.T) {
@@ -1674,6 +2125,37 @@ func TestClaimScheduledFire_ConcurrentExactlyOnceAndTimeOrdering(t *testing.T) {
 	assert.False(t, claimed, "later boundary should also be claimed only once")
 }
 
+func TestGetScheduledFireTime(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	// Use schedule names unique to this test. The external PG/MySQL test DBs are
+	// shared across runs and scheduled_fires is never truncated (the integration
+	// cleanup omits it), so reusing a name shared with another test
+	// (e.g. "daily-report" from TestClaimScheduledFire_*) leaves a row whose
+	// monotonic last_fire_at would refuse this test's claim. Scope by name and
+	// clear any residue first so the assertions are deterministic on a shared DB.
+	const missingName = "getfire-missing-schedule"
+	const claimName = "getfire-daily-report"
+	require.NoError(t, s.DB().Where("name IN ?", []string{missingName, claimName}).
+		Delete(&core.ScheduledFire{}).Error)
+
+	got, found, err := s.GetScheduledFireTime(ctx, missingName)
+	require.NoError(t, err)
+	assert.False(t, found)
+	assert.True(t, got.IsZero())
+
+	t1 := time.Now().UTC().Truncate(time.Millisecond)
+	claimed, err := s.ClaimScheduledFire(ctx, claimName, t1)
+	require.NoError(t, err)
+	require.True(t, claimed)
+
+	got, found, err = s.GetScheduledFireTime(ctx, claimName)
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.True(t, got.Equal(t1), "got %v, want %v", got, t1)
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Suspend / Resume
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1818,6 +2300,35 @@ func TestCancelSubJob_CancelsSingleSubJob(t *testing.T) {
 	assert.Equal(t, core.StatusCancelled, got.Status)
 }
 
+func TestCancelSubJob_NoDoubleCountWhenAlreadyTerminal(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	parent := newTestJob("default", "workflow.run")
+	require.NoError(t, s.Enqueue(ctx, parent))
+
+	fanOut := &core.FanOut{ParentJobID: parent.ID, TotalCount: 1}
+	require.NoError(t, s.CreateFanOut(ctx, fanOut))
+
+	sub := &core.Job{Type: "sub", Queue: "default", FanOutID: &fanOut.ID, FanOutIndex: 0}
+	require.NoError(t, s.EnqueueBatch(ctx, []*core.Job{sub}))
+
+	first, err := s.CancelSubJob(ctx, sub.ID)
+	require.NoError(t, err)
+	require.NotNil(t, first)
+	assert.Equal(t, 1, first.CancelledCount)
+
+	second, err := s.CancelSubJob(ctx, sub.ID)
+	require.NoError(t, err)
+	assert.Nil(t, second, "already-terminal sub-job cancellation is a no-op")
+
+	got, err := s.GetFanOut(ctx, fanOut.ID)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, 1, got.CancelledCount)
+	assert.LessOrEqual(t, got.CompletedCount+got.FailedCount+got.CancelledCount, got.TotalCount)
+}
+
 func TestCancelSubJob_NonSubJobReturnsNil(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStorage(t)
@@ -1829,6 +2340,35 @@ func TestCancelSubJob_NonSubJobReturnsNil(t *testing.T) {
 	fo, err := s.CancelSubJob(ctx, job.ID)
 	require.NoError(t, err)
 	assert.Nil(t, fo, "non-sub-job should return nil FanOut")
+}
+
+func TestCancelSubJobs_SetsCompletedAt(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	parent := newTestJob("default", "workflow.run")
+	require.NoError(t, s.Enqueue(ctx, parent))
+
+	fanOut := &core.FanOut{ParentJobID: parent.ID, TotalCount: 2}
+	require.NoError(t, s.CreateFanOut(ctx, fanOut))
+
+	subs := []*core.Job{
+		{Type: "sub", Queue: "default", FanOutID: &fanOut.ID, FanOutIndex: 0},
+		{Type: "sub", Queue: "default", FanOutID: &fanOut.ID, FanOutIndex: 1},
+	}
+	require.NoError(t, s.EnqueueBatch(ctx, subs))
+
+	cancelledIDs, err := s.CancelSubJobs(ctx, fanOut.ID)
+	require.NoError(t, err)
+	require.Len(t, cancelledIDs, 2)
+
+	for _, sub := range subs {
+		got, err := s.GetJob(ctx, sub.ID)
+		require.NoError(t, err)
+		require.NotNil(t, got)
+		assert.Equal(t, core.StatusCancelled, got.Status)
+		assert.NotNil(t, got.CompletedAt)
+	}
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -2026,6 +2566,28 @@ func TestGetStalledFanOutParents(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, stalled, 1)
 	assert.Equal(t, oldIncompleteParent.ID, stalled[0].ID)
+}
+
+func TestGetStalledFanOutParents_LimitsBatch(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	old := time.Now().Add(-10 * time.Minute)
+	cutoff := time.Now().Add(-2 * time.Minute)
+	for i := 0; i < maxResumeBatch+25; i++ {
+		parent := &core.Job{Type: "workflow.stalled", Queue: "default", Status: core.StatusWaiting}
+		require.NoError(t, s.Enqueue(ctx, parent))
+		require.NoError(t, s.CreateFanOut(ctx, &core.FanOut{
+			ParentJobID: parent.ID,
+			TotalCount:  2,
+			Status:      core.FanOutPending,
+			CreatedAt:   old,
+		}))
+	}
+
+	stalled, err := s.GetStalledFanOutParents(ctx, cutoff)
+	require.NoError(t, err)
+	assert.Len(t, stalled, maxResumeBatch)
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -2833,20 +3395,39 @@ func TestGetDueJobs_DBError(t *testing.T) {
 
 func TestIncrementFanOutCompleted_DBError(t *testing.T) {
 	s := closedStorage(t)
-	_, err := s.IncrementFanOutCompleted(context.Background(), "fo1")
+	fo, err := s.IncrementFanOutCompleted(context.Background(), "fo1")
 	assert.Error(t, err)
+	assert.Nil(t, fo)
 }
 
 func TestIncrementFanOutFailed_DBError(t *testing.T) {
 	s := closedStorage(t)
-	_, err := s.IncrementFanOutFailed(context.Background(), "fo1")
+	fo, err := s.IncrementFanOutFailed(context.Background(), "fo1")
 	assert.Error(t, err)
+	assert.Nil(t, fo)
 }
 
 func TestIncrementFanOutCancelled_DBError(t *testing.T) {
 	s := closedStorage(t)
-	_, err := s.IncrementFanOutCancelled(context.Background(), "fo1")
+	fo, err := s.IncrementFanOutCancelled(context.Background(), "fo1")
 	assert.Error(t, err)
+	assert.Nil(t, fo)
+}
+
+func TestIncrementFanOut_DBError_ReturnsNilFanOut(t *testing.T) {
+	ctx := context.Background()
+
+	completed, err := closedStorage(t).IncrementFanOutCompleted(ctx, "fo1")
+	assert.Error(t, err)
+	assert.Nil(t, completed)
+
+	failed, err := closedStorage(t).IncrementFanOutFailed(ctx, "fo1")
+	assert.Error(t, err)
+	assert.Nil(t, failed)
+
+	cancelled, err := closedStorage(t).IncrementFanOutCancelled(ctx, "fo1")
+	assert.Error(t, err)
+	assert.Nil(t, cancelled)
 }
 
 func TestUpdateFanOutStatus_DBError(t *testing.T) {
@@ -3365,4 +3946,53 @@ func TestFindOrphanedJobs_UnknownIDsAreNotReturned(t *testing.T) {
 	orphaned, err := s.FindOrphanedJobs(ctx, []string{"does-not-exist-1", "does-not-exist-2"}, "worker-A")
 	require.NoError(t, err)
 	assert.Empty(t, orphaned)
+}
+
+// TestIsSerializationFailure_RetryableErrors locks in the set of transient
+// driver errors that withSerializationRetry must retry. The SQLite BUSY/LOCKED
+// cases are a regression guard: the P1 local-handler-cancel can wake sibling
+// sub-job handlers into concurrent writes, and if a contended CancelSubJob /
+// Increment* surfaced SQLITE_BUSY instead of being retried, the sub-job would
+// go unaccounted and a CollectAll/Threshold parent would wedge in 'waiting'.
+func TestIsSerializationFailure_RetryableErrors(t *testing.T) {
+	retryable := []string{
+		// MySQL
+		"Error 1213: Deadlock found when trying to get lock",
+		"Deadlock found when trying to get lock; try restarting transaction",
+		"Error 1205: Lock wait timeout exceeded",
+		"Lock wait timeout exceeded; try restarting transaction",
+		// PostgreSQL
+		"ERROR: could not serialize access due to concurrent update (SQLSTATE 40001)",
+		"ERROR: deadlock detected (SQLSTATE 40P01)",
+		"could not serialize access due to read/write dependencies",
+		"deadlock detected",
+		// SQLite (regression guard)
+		"database is locked",
+		"database table is locked",
+		"SQLITE_BUSY: database is locked",
+		"SQLITE_LOCKED: database table is locked",
+	}
+	for _, msg := range retryable {
+		if !isSerializationFailure(errors.New(msg)) {
+			t.Errorf("expected %q to be treated as a retryable serialization failure", msg)
+		}
+	}
+
+	nonRetryable := []string{
+		"",
+		"record not found",
+		"UNIQUE constraint failed: jobs.unique_key",
+		"no such table: jobs",
+		"context canceled",
+		"jobs: job not owned by this worker",
+	}
+	for _, msg := range nonRetryable {
+		var err error
+		if msg != "" {
+			err = errors.New(msg)
+		}
+		if isSerializationFailure(err) {
+			t.Errorf("expected %q to NOT be treated as a serialization failure", msg)
+		}
+	}
 }

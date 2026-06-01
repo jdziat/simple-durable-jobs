@@ -193,7 +193,7 @@ func buildSubJobs(subJobs []SubJob, cfg *config, jc *intctx.JobContext, fanOutID
 		}
 
 		priority := sj.Priority
-		if priority == 0 {
+		if !sj.PrioritySet {
 			priority = cfg.priority
 		}
 

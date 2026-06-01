@@ -1,6 +1,7 @@
 package core
 
 import (
+	"math"
 	"time"
 )
 
@@ -37,4 +38,50 @@ type FanOut struct {
 	CancelOnFail   bool           `gorm:"default:false"`
 	CreatedAt      time.Time      `gorm:"autoCreateTime"`
 	UpdatedAt      time.Time      `gorm:"autoUpdateTime"`
+}
+
+// TerminalStatus returns whether the fan-out has reached a terminal state and,
+// when done is true, the status that should be persisted.
+func (f *FanOut) TerminalStatus() (done bool, status FanOutStatus) {
+	accounted := f.CompletedCount + f.FailedCount + f.CancelledCount
+	inFlight := f.TotalCount - accounted
+
+	switch f.Strategy {
+	case StrategyCollectAll:
+		if accounted >= f.TotalCount {
+			return true, FanOutCompleted
+		}
+	case StrategyThreshold:
+		required := int(math.Ceil(float64(f.TotalCount) * f.Threshold))
+		if f.Threshold <= 0 {
+			required = 0
+		} else if f.Threshold >= 1 {
+			required = f.TotalCount
+		}
+		if required < 0 {
+			required = 0
+		}
+		if required > f.TotalCount {
+			required = f.TotalCount
+		}
+
+		if f.CompletedCount+inFlight < required {
+			return true, FanOutFailed
+		}
+		if accounted >= f.TotalCount {
+			if f.CompletedCount >= required {
+				return true, FanOutCompleted
+			}
+			return true, FanOutFailed
+		}
+	default:
+		if f.FailedCount > 0 || f.CancelledCount > 0 {
+			return true, FanOutFailed
+		}
+		if accounted >= f.TotalCount {
+			return true, FanOutCompleted
+		}
+	}
+
+	return false, ""
 }

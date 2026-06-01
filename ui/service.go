@@ -13,6 +13,7 @@ import (
 
 	"github.com/jdziat/simple-durable-jobs/pkg/core"
 	"github.com/jdziat/simple-durable-jobs/pkg/queue"
+	"github.com/jdziat/simple-durable-jobs/pkg/security"
 	jobsv1 "github.com/jdziat/simple-durable-jobs/ui/gen/jobs/v1"
 	"github.com/jdziat/simple-durable-jobs/ui/gen/jobs/v1/jobsv1connect"
 )
@@ -296,6 +297,13 @@ func (s *jobsService) ListQueues(ctx context.Context, req *connect.Request[jobsv
 
 // PurgeQueue deletes jobs from a queue by status.
 func (s *jobsService) PurgeQueue(ctx context.Context, req *connect.Request[jobsv1.PurgeQueueRequest]) (*connect.Response[jobsv1.PurgeQueueResponse], error) {
+	if req.Msg.Name == "" {
+		return nil, connect.NewError(connect.CodeInvalidArgument, fmt.Errorf("queue name is required"))
+	}
+	if !isValidPurgeStatus(req.Msg.Status) {
+		return nil, connect.NewError(connect.CodeInvalidArgument, fmt.Errorf("invalid purge status %q", req.Msg.Status))
+	}
+
 	deleted, err := s.purgeQueue(ctx, req.Msg.Name, req.Msg.Status)
 	if err != nil {
 		return nil, connect.NewError(connect.CodeInternal, err)
@@ -410,16 +418,17 @@ func (s *jobsService) ListWorkflows(ctx context.Context, req *connect.Request[jo
 			// Use strategy from the first fan-out as representative.
 			summary.Strategy = string(fanOuts[0].Strategy)
 
-			var totalJobs, completedJobs, failedJobs int32
+			var totalJobs, completedJobs, failedJobs, cancelledJobs int32
 			for _, fo := range fanOuts {
 				totalJobs += int32(fo.TotalCount)
 				completedJobs += int32(fo.CompletedCount)
 				failedJobs += int32(fo.FailedCount)
+				cancelledJobs += int32(fo.CancelledCount)
 			}
 			summary.TotalJobs = totalJobs
 			summary.CompletedJobs = completedJobs
 			summary.FailedJobs = failedJobs
-			summary.RunningJobs = totalJobs - completedJobs - failedJobs
+			summary.RunningJobs = totalJobs - completedJobs - failedJobs - cancelledJobs
 			if summary.RunningJobs < 0 {
 				summary.RunningJobs = 0
 			}
@@ -728,7 +737,35 @@ func (s *jobsService) purgeQueue(ctx context.Context, queueName, status string) 
 	return 0, connect.NewError(connect.CodeUnimplemented, nil)
 }
 
+// isValidPurgeStatus reports whether status names a terminal/idle job state that
+// is safe to bulk-purge. Running, retrying, and waiting are intentionally
+// excluded: purging a running/retrying job deletes a row a worker still holds
+// (locked_by/locked_until) so its later Complete/Fail/Heartbeat hits a vanished
+// row, and purging a waiting fan-out parent (or its in-flight sub-jobs) corrupts
+// fan-out accounting. Empty/unknown values are rejected.
+func isValidPurgeStatus(status string) bool {
+	switch core.JobStatus(status) {
+	case core.StatusPending,
+		core.StatusCompleted,
+		core.StatusFailed,
+		core.StatusCancelled,
+		core.StatusPaused:
+		return true
+	default:
+		return false
+	}
+}
+
 // Conversion helpers
+
+// redactBytes redacts secret-shaped substrings from a payload without
+// truncating it (payloads may be large). nil in -> nil out.
+func redactBytes(b []byte) []byte {
+	if len(b) == 0 {
+		return b
+	}
+	return []byte(security.RedactSecrets(string(b)))
+}
 
 func jobToProto(j *core.Job) *jobsv1.Job {
 	pb := &jobsv1.Job{
@@ -739,11 +776,11 @@ func jobToProto(j *core.Job) *jobsv1.Job {
 		Priority:    int32(j.Priority),
 		Attempt:     int32(j.Attempt),
 		MaxRetries:  int32(j.MaxRetries),
-		Args:        j.Args,
-		LastError:   j.LastError,
+		Args:        redactBytes(j.Args),
+		LastError:   security.SanitizeErrorMessage(j.LastError),
 		CreatedAt:   timestamppb.New(j.CreatedAt),
 		FanOutIndex: int32(j.FanOutIndex),
-		Result:      j.Result,
+		Result:      redactBytes(j.Result),
 	}
 	if j.StartedAt != nil {
 		pb.StartedAt = timestamppb.New(*j.StartedAt)
@@ -793,8 +830,8 @@ func checkpointToProto(cp *core.Checkpoint) *jobsv1.Checkpoint {
 		JobId:     cp.JobID,
 		CallIndex: int32(cp.CallIndex),
 		CallType:  cp.CallType,
-		Result:    cp.Result,
-		Error:     cp.Error,
+		Result:    redactBytes(cp.Result),
+		Error:     security.SanitizeErrorMessage(cp.Error),
 		CreatedAt: timestamppb.New(cp.CreatedAt),
 	}
 	return pb

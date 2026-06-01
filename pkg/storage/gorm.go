@@ -85,6 +85,23 @@ func (s *GormStorage) Migrate(ctx context.Context) error {
 		return err
 	}
 
+	if strings.EqualFold(s.db.Name(), "mysql") {
+		err := db.Exec(`
+			CREATE INDEX idx_jobs_dequeue
+			ON jobs (status, queue, priority, created_at)
+		`).Error
+		if err != nil && !strings.Contains(err.Error(), "Duplicate key name") && !strings.Contains(err.Error(), "Error 1061") {
+			return err
+		}
+	} else {
+		if err := db.Exec(`
+			CREATE INDEX IF NOT EXISTS idx_jobs_dequeue
+			ON jobs (status, queue, priority DESC, created_at ASC)
+		`).Error; err != nil {
+			return err
+		}
+	}
+
 	// SQLite and PostgreSQL support partial indexes, which are needed to
 	// enforce active-job uniqueness while freeing the key after terminal
 	// states. MySQL is intentionally skipped because it does not support
@@ -163,13 +180,20 @@ func isSerializationFailure(err error) bool {
 	msg := err.Error()
 	switch {
 	case strings.Contains(msg, "Error 1213"), // MySQL deadlock
-		strings.Contains(msg, "Deadlock found"),      // MySQL deadlock (text)
-		strings.Contains(msg, "Error 1205"),          // MySQL lock wait timeout
-		strings.Contains(msg, "Lock wait timeout"),   // MySQL (text)
-		strings.Contains(msg, "SQLSTATE 40001"),      // serialization_failure
-		strings.Contains(msg, "SQLSTATE 40P01"),      // deadlock_detected (pg)
-		strings.Contains(msg, "could not serialize"), // pg text
-		strings.Contains(msg, "deadlock detected"):   // pg text
+		strings.Contains(msg, "Deadlock found"),           // MySQL deadlock (text)
+		strings.Contains(msg, "Error 1205"),               // MySQL lock wait timeout
+		strings.Contains(msg, "Lock wait timeout"),        // MySQL (text)
+		strings.Contains(msg, "SQLSTATE 40001"),           // serialization_failure
+		strings.Contains(msg, "SQLSTATE 40P01"),           // deadlock_detected (pg)
+		strings.Contains(msg, "could not serialize"),      // pg text
+		strings.Contains(msg, "deadlock detected"),        // pg text
+		strings.Contains(msg, "database is locked"),       // SQLite SQLITE_BUSY (5)
+		strings.Contains(msg, "database table is locked"), // SQLite SQLITE_LOCKED (6)
+		strings.Contains(msg, "SQLITE_BUSY"),              // SQLite (wrapped form)
+		strings.Contains(msg, "SQLITE_LOCKED"):            // SQLite (wrapped form)
+		// SQLite returns BUSY/LOCKED immediately on write-write contention that
+		// busy_timeout cannot resolve (one writer must abort); these are
+		// transient and safe to retry, mirroring the MySQL/PG deadlock handling.
 		return true
 	}
 	return false
@@ -427,6 +451,20 @@ func (s *GormStorage) Complete(ctx context.Context, jobID string, workerID strin
 	return nil
 }
 
+// CompleteWithResult marks a job completed and, when it is a sub-job, accounts
+// for its fan-out completion in the same ownership-guarded transaction.
+func (s *GormStorage) CompleteWithResult(ctx context.Context, jobID, workerID string, result []byte) (*core.FanOut, error) {
+	updates := map[string]any{
+		"status":       core.StatusCompleted,
+		"locked_by":    "",
+		"locked_until": nil,
+	}
+	if result != nil {
+		updates["result"] = result
+	}
+	return s.accountTerminalWithFanOut(ctx, jobID, workerID, updates, "completed_count")
+}
+
 // Fail marks a job as failed, optionally scheduling a retry.
 // Validates that the worker owns the job before failing.
 // Error messages are sanitized before storage.
@@ -463,9 +501,86 @@ func (s *GormStorage) Fail(ctx context.Context, jobID string, workerID string, e
 	return nil
 }
 
+// FailTerminalWithResult marks a job terminally failed and, when it is a
+// sub-job, accounts for its fan-out failure in the same ownership-guarded
+// transaction. Retryable failures must continue to use Fail.
+func (s *GormStorage) FailTerminalWithResult(ctx context.Context, jobID, workerID, errMsg string) (*core.FanOut, error) {
+	sanitizedErr := security.SanitizeErrorMessage(errMsg)
+	updates := map[string]any{
+		"last_error":   sanitizedErr,
+		"status":       core.StatusFailed,
+		"locked_by":    "",
+		"locked_until": nil,
+	}
+	return s.accountTerminalWithFanOut(ctx, jobID, workerID, updates, "failed_count")
+}
+
+// accountTerminalWithFanOut performs the ownership-guarded terminal job UPDATE
+// described by jobUpdates and, when the job is a sub-job of a still-pending
+// fan-out, atomically increments fanOutCounterCol in the same transaction
+// (liveness-guarded on status='pending'). Returns the fan-out row when the job
+// has a fan-out, or nil. Increments nothing and returns core.ErrJobNotOwned if the
+// worker no longer owns the running job.
+//
+// Note: this mutates jobUpdates by setting "completed_at"; callers must pass a
+// freshly-allocated map (not a shared or package-level one).
+func (s *GormStorage) accountTerminalWithFanOut(ctx context.Context, jobID, workerID string, jobUpdates map[string]any, fanOutCounterCol string) (*core.FanOut, error) {
+	var fanOut core.FanOut
+	var hasFanOut bool
+
+	err := s.withSerializationRetry(ctx, func() error {
+		fanOut = core.FanOut{}
+		hasFanOut = false
+
+		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			now := time.Now()
+			jobUpdates["completed_at"] = now
+
+			update := tx.Model(&core.Job{}).
+				Where("id = ? AND locked_by = ? AND status = ?", jobID, workerID, core.StatusRunning).
+				Updates(jobUpdates)
+			if update.Error != nil {
+				return update.Error
+			}
+			if update.RowsAffected == 0 {
+				return core.ErrJobNotOwned
+			}
+
+			var job core.Job
+			if err := tx.Select("fan_out_id").First(&job, "id = ?", jobID).Error; err != nil {
+				return err
+			}
+			if job.FanOutID == nil || *job.FanOutID == "" {
+				return nil
+			}
+
+			// fanOutCounterCol is a hardcoded caller constant, not user input.
+			counterSQL := fmt.Sprintf("UPDATE fan_outs SET %s = %s + 1, updated_at = ? WHERE id = ? AND status = ?", fanOutCounterCol, fanOutCounterCol)
+			if err := tx.Exec(
+				counterSQL,
+				now, *job.FanOutID, core.FanOutPending,
+			).Error; err != nil {
+				return err
+			}
+			if err := tx.First(&fanOut, "id = ?", *job.FanOutID).Error; err != nil {
+				return err
+			}
+			hasFanOut = true
+			return nil
+		})
+	})
+	if err != nil {
+		return nil, err
+	}
+	if !hasFanOut {
+		return nil, nil
+	}
+	return &fanOut, nil
+}
+
 // SaveCheckpoint stores a checkpoint for a durable call.
 // If a checkpoint with the same (job_id, call_index, call_type) already exists,
-// the result, error, and created_at fields are updated in place (upsert).
+// the latest result and error fields are updated in place (upsert).
 func (s *GormStorage) SaveCheckpoint(ctx context.Context, cp *core.Checkpoint) error {
 	if cp.ID == "" {
 		cp.ID = uuid.New().String()
@@ -473,7 +588,7 @@ func (s *GormStorage) SaveCheckpoint(ctx context.Context, cp *core.Checkpoint) e
 	return s.db.WithContext(ctx).
 		Clauses(clause.OnConflict{
 			Columns:   []clause.Column{{Name: "job_id"}, {Name: "call_index"}, {Name: "call_type"}},
-			DoUpdates: clause.AssignmentColumns([]string{"result", "error", "created_at"}),
+			DoUpdates: clause.AssignmentColumns([]string{"result", "error", "error_kind", "error_delay_nanos"}),
 		}).
 		Create(cp).Error
 }
@@ -554,6 +669,19 @@ func (s *GormStorage) ClaimScheduledFire(ctx context.Context, name string, fireT
 	return result.RowsAffected == 1, nil
 }
 
+// GetScheduledFireTime returns the latest persisted fire boundary for a schedule.
+func (s *GormStorage) GetScheduledFireTime(ctx context.Context, name string) (time.Time, bool, error) {
+	var fire core.ScheduledFire
+	err := s.db.WithContext(ctx).First(&fire, "name = ?", name).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return time.Time{}, false, nil
+	}
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	return fire.LastFireAt, true, nil
+}
+
 // Heartbeat extends the lock on a running job.
 // Returns ErrJobNotOwned if the job is no longer owned by this worker.
 func (s *GormStorage) Heartbeat(ctx context.Context, jobID string, workerID string) error {
@@ -565,6 +693,29 @@ func (s *GormStorage) Heartbeat(ctx context.Context, jobID string, workerID stri
 		Updates(map[string]any{
 			"locked_until":      lockUntil,
 			"last_heartbeat_at": now,
+		})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		return core.ErrJobNotOwned
+	}
+	return nil
+}
+
+// Release returns an owned, still-running job to pending so it can be
+// immediately dequeued by another worker after a local dispatch is abandoned.
+func (s *GormStorage) Release(ctx context.Context, jobID, workerID string) error {
+	result := s.db.WithContext(ctx).
+		Model(&core.Job{}).
+		Where("id = ? AND locked_by = ? AND status = ?", jobID, workerID, core.StatusRunning).
+		Updates(map[string]any{
+			"status":       core.StatusPending,
+			"locked_by":    "",
+			"locked_until": nil,
+			"started_at":   nil,
+			"attempt":      gorm.Expr("CASE WHEN attempt > 0 THEN attempt - 1 ELSE 0 END"),
+			"updated_at":   time.Now(),
 		})
 	if result.Error != nil {
 		return result.Error
@@ -624,9 +775,13 @@ func (s *GormStorage) ReleaseStaleLocks(ctx context.Context, staleDuration time.
 	err := s.withSerializationRetry(ctx, func() error {
 		released = nil
 		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			// Unordered LIMIT: the reaper is idempotent and self-draining (a
+			// stale lock stays running+expired until released), so a per-tick
+			// cap bounds the IN-list update without needing a stable sort.
 			if err := tx.Model(&core.Job{}).
 				Where("status = ?", core.StatusRunning).
 				Where("locked_until < ?", cutoff).
+				Limit(maxResumeBatch).
 				Pluck("id", &released).Error; err != nil {
 				return err
 			}
@@ -702,7 +857,10 @@ func (s *GormStorage) IncrementFanOutCompleted(ctx context.Context, fanOutID str
 			return tx.First(&fanOut, "id = ?", fanOutID).Error
 		})
 	})
-	return &fanOut, err
+	if err != nil {
+		return nil, err
+	}
+	return &fanOut, nil
 }
 
 // IncrementFanOutFailed atomically increments the failed count.
@@ -719,7 +877,10 @@ func (s *GormStorage) IncrementFanOutFailed(ctx context.Context, fanOutID string
 			return tx.First(&fanOut, "id = ?", fanOutID).Error
 		})
 	})
-	return &fanOut, err
+	if err != nil {
+		return nil, err
+	}
+	return &fanOut, nil
 }
 
 // IncrementFanOutCancelled atomically increments the cancelled count.
@@ -736,7 +897,10 @@ func (s *GormStorage) IncrementFanOutCancelled(ctx context.Context, fanOutID str
 			return tx.First(&fanOut, "id = ?", fanOutID).Error
 		})
 	})
-	return &fanOut, err
+	if err != nil {
+		return nil, err
+	}
+	return &fanOut, nil
 }
 
 // UpdateFanOutStatus atomically updates the status of a fan-out from pending.
@@ -910,8 +1074,9 @@ func (s *GormStorage) CancelSubJobs(ctx context.Context, fanOutID string) ([]str
 				Where("id IN ?", cancelled).
 				Where("status IN ?", []core.JobStatus{core.StatusPending, core.StatusRunning}).
 				Updates(map[string]any{
-					"status":     core.StatusCancelled,
-					"updated_at": now,
+					"status":       core.StatusCancelled,
+					"completed_at": now,
+					"updated_at":   now,
 				})
 			if result.Error != nil {
 				return result.Error
@@ -962,14 +1127,20 @@ func (s *GormStorage) CancelSubJob(ctx context.Context, jobID string) (*core.Fan
 
 			// Cancel the job
 			now := time.Now()
-			if err := tx.Model(&core.Job{}).
+			result := tx.Model(&core.Job{}).
 				Where("id = ? AND status NOT IN ?", jobID, []core.JobStatus{core.StatusCompleted, core.StatusFailed, core.StatusCancelled}).
 				Updates(map[string]any{
 					"status":       core.StatusCancelled,
 					"completed_at": now,
 					"updated_at":   now,
-				}).Error; err != nil {
-				return err
+				})
+			if result.Error != nil {
+				return result.Error
+			}
+			if result.RowsAffected == 0 {
+				// Another cancel/terminal transition won after our initial read.
+				// Treat this like the already-terminal no-op path above.
+				return nil
 			}
 
 			// Increment cancelled count on the fan-out
@@ -1075,6 +1246,11 @@ func (s *GormStorage) GetWaitingJobsToResume(ctx context.Context) ([]*core.Job, 
 // GetStalledFanOutParents finds waiting parents whose pending fan-out never
 // finished persisting its sub-jobs. The caller supplies olderThan so the query
 // stays portable across SQLite, PostgreSQL, and MySQL.
+//
+// The LIMIT is intentionally unordered: recovery is idempotent and self-draining
+// (a qualifying parent stays waiting+pending until resumed, so any row not picked
+// this tick is picked on a later one), so a per-tick cap bounds work without
+// needing a stable sort. maxResumeBatch matches GetWaitingJobsToResume.
 func (s *GormStorage) GetStalledFanOutParents(ctx context.Context, olderThan time.Time) ([]*core.Job, error) {
 	var jobs []*core.Job
 	err := s.db.WithContext(ctx).Raw(`
@@ -1087,7 +1263,8 @@ func (s *GormStorage) GetStalledFanOutParents(ctx context.Context, olderThan tim
 			SELECT count(*) FROM jobs s
 			WHERE s.fan_out_id = f.id
 		) < f.total_count
-	`, core.StatusWaiting, core.FanOutPending, olderThan).Scan(&jobs).Error
+		LIMIT ?
+	`, core.StatusWaiting, core.FanOutPending, olderThan, maxResumeBatch).Scan(&jobs).Error
 	return jobs, err
 }
 

@@ -38,9 +38,11 @@ func TestHooks_OnJobStart(t *testing.T) {
 	worker := queue.NewWorker()
 	go func() { _ = worker.Start(ctx) }()
 
-	time.Sleep(300 * time.Millisecond)
-
-	assert.True(t, started.Load())
+	// Poll rather than fixed-sleep: a loaded CI runner can take >300ms just to
+	// start the job, which flakes the assertion (see TestHooks_MultipleHooks).
+	require.Eventually(t, func() bool {
+		return started.Load()
+	}, 5*time.Second, 20*time.Millisecond)
 }
 
 func TestHooks_OnJobComplete(t *testing.T) {
@@ -64,9 +66,9 @@ func TestHooks_OnJobComplete(t *testing.T) {
 	worker := queue.NewWorker()
 	go func() { _ = worker.Start(ctx) }()
 
-	time.Sleep(300 * time.Millisecond)
-
-	assert.True(t, completed.Load())
+	require.Eventually(t, func() bool {
+		return completed.Load()
+	}, 5*time.Second, 20*time.Millisecond)
 }
 
 func TestHooks_OnJobFail(t *testing.T) {
@@ -90,9 +92,9 @@ func TestHooks_OnJobFail(t *testing.T) {
 	worker := queue.NewWorker()
 	go func() { _ = worker.Start(ctx) }()
 
-	time.Sleep(300 * time.Millisecond)
-
-	assert.True(t, failed.Load())
+	require.Eventually(t, func() bool {
+		return failed.Load()
+	}, 5*time.Second, 20*time.Millisecond)
 }
 
 func TestHooks_OnRetry(t *testing.T) {
@@ -163,7 +165,13 @@ func TestHooks_MultipleHooks(t *testing.T) {
 	worker := queue.NewWorker()
 	go func() { _ = worker.Start(ctx) }()
 
-	time.Sleep(300 * time.Millisecond)
+	// Poll instead of a fixed sleep: on a loaded CI runner the job may not even
+	// start within a fixed 300ms window, which flaked this test (observed
+	// start/complete counts of 0 on the sqlite CI job). Wait until both hook
+	// pairs have fired (or the test times out).
+	require.Eventually(t, func() bool {
+		return startCount.Load() == 2 && completeCount.Load() == 2
+	}, 5*time.Second, 20*time.Millisecond)
 
 	assert.Equal(t, int32(2), startCount.Load())
 	assert.Equal(t, int32(2), completeCount.Load())

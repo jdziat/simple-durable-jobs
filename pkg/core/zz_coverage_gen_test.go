@@ -98,8 +98,9 @@ func TestRehydrateCheckpointError_NoRetry_SentinelCause(t *testing.T) {
 
 	var noRetry *NoRetryError
 	require.True(t, errors.As(rehydrated, &noRetry))
-	// Cause should be resolved back to the exact sentinel.
-	assert.True(t, errors.Is(rehydrated, ErrJobNotOwned))
+	// Wrapper kinds reconstruct plain causes instead of guessing sentinel identity from message text.
+	assert.False(t, errors.Is(rehydrated, ErrJobNotOwned))
+	assert.Equal(t, ErrJobNotOwned.Error(), noRetry.Unwrap().Error())
 	assert.Equal(t, orig.Error(), rehydrated.Error())
 }
 
@@ -125,7 +126,8 @@ func TestRehydrateCheckpointError_RetryAfter_SentinelCause(t *testing.T) {
 	var retryAfter *RetryAfterError
 	require.True(t, errors.As(rehydrated, &retryAfter))
 	assert.Equal(t, d, retryAfter.Delay)
-	assert.True(t, errors.Is(rehydrated, ErrNoResult))
+	assert.False(t, errors.Is(rehydrated, ErrNoResult))
+	assert.Equal(t, ErrNoResult.Error(), retryAfter.Unwrap().Error())
 	assert.Equal(t, orig.Error(), rehydrated.Error())
 }
 
@@ -161,9 +163,10 @@ func TestRehydrateCheckpointError_DefaultUnknownKind_PlainMessage(t *testing.T) 
 }
 
 func TestRehydrateCheckpointError_DefaultKind_SentinelMessage(t *testing.T) {
-	// Default path with a message that matches a sentinel resolves to it.
+	// Default path with a message that matches a sentinel remains a plain error.
 	rehydrated := RehydrateCheckpointError(ErrDuplicateJob.Error(), "", 0)
-	assert.True(t, errors.Is(rehydrated, ErrDuplicateJob))
+	assert.False(t, errors.Is(rehydrated, ErrDuplicateJob))
+	assert.Equal(t, ErrDuplicateJob.Error(), rehydrated.Error())
 }
 
 func TestRehydrateCheckpointError_FullRoundTripMatrix(t *testing.T) {
