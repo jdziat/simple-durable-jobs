@@ -3832,6 +3832,60 @@ func TestOwnershipAudit_CancelsOrphanedLocalHandlers(t *testing.T) {
 	assert.Equal(t, int32(0), mineCancelled.Load(), "still-owned job's context must not have been touched")
 }
 
+// TestOwnershipAudit_DoesNotCancelSelfSuspendedJob is the worker-level
+// regression test for the ownership-audit false-cancel. It uses a REAL
+// GormStorage (not the mock) because the bug lived in FindOrphanedJobs' SQL:
+// a parent that calls FanOut/Call suspends ITSELF via SuspendJob (status=
+// 'waiting', locked_by=""), but remains in runningJobs until the handler
+// returns. Before the fix, the audit's FindOrphanedJobs flagged that row
+// (locked_by="" != workerID) and CancelJob fired on the worker's own live
+// handler — turning the WaitingError into a context.Canceled failure and
+// replaying the whole handler. The audit must leave a self-suspended job alone.
+func TestOwnershipAudit_DoesNotCancelSelfSuspendedJob(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{
+		Logger: logger.Default.LogMode(logger.Silent),
+	})
+	require.NoError(t, err)
+	store := storage.NewGormStorage(db)
+	require.NoError(t, store.Migrate(context.Background()))
+	q := queue.New(store)
+
+	w := NewWorker(q,
+		DisableRetry(),
+		WithOwnershipAuditInterval(10*time.Millisecond),
+	)
+	// Use the worker's own (auto-generated) ID so Dequeue/SuspendJob and the
+	// audit all agree on ownership — the audit calls FindOrphanedJobs with
+	// w.config.WorkerID.
+	workerID := w.config.WorkerID
+
+	ctx := context.Background()
+	require.NoError(t, store.Enqueue(ctx, &core.Job{Type: "t", Queue: "default"}))
+	job, err := store.Dequeue(ctx, []string{"default"}, workerID)
+	require.NoError(t, err)
+	require.NotNil(t, job)
+
+	// The handler is mid-flight and registered in runningJobs; it then suspends
+	// its own parent to wait on a fan-out (the real production transition).
+	var cancelled atomic.Int32
+	w.runningJobsMu.Lock()
+	w.runningJobs[job.ID] = func() { cancelled.Add(1) }
+	w.runningJobsMu.Unlock()
+	require.NoError(t, store.SuspendJob(ctx, job.ID, workerID))
+
+	auditCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go w.runOwnershipAudit(auditCtx)
+
+	// Several audit ticks must pass without the self-suspended handler being
+	// cancelled.
+	time.Sleep(60 * time.Millisecond)
+	cancel()
+
+	assert.Equal(t, int32(0), cancelled.Load(),
+		"ownership audit must not cancel a job the worker suspended for its own fan-out")
+}
+
 // TestOwnershipAudit_NoOpWhenNoOrphans confirms the audit doesn't gratuitously
 // cancel anything when FindOrphanedJobs returns empty. Defense against a
 // regression that would falsely flag healthy jobs and shred the running set.

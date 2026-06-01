@@ -3948,6 +3948,61 @@ func TestFindOrphanedJobs_UnknownIDsAreNotReturned(t *testing.T) {
 	assert.Empty(t, orphaned)
 }
 
+// TestFindOrphanedJobs_DoesNotFlagSelfSuspended is the regression test for the
+// ownership-audit false-cancel. When a handler calls FanOut/Call it suspends
+// its OWN parent job via SuspendJob, which sets status='waiting' and clears
+// locked_by to "". The parent is still in the worker's runningJobs map until
+// the handler returns, so the ownership audit queries FindOrphanedJobs for it.
+// Before the fix, locked_by="" matched "locked_by != workerID" and the audit
+// cancelled the worker's own in-flight handler → the WaitingError became a
+// context.Canceled failure and the whole handler replayed from its checkpoints.
+// A waiting (or paused) job has no running handler to cancel, so it must never
+// be reported as orphaned.
+func TestFindOrphanedJobs_DoesNotFlagSelfSuspended(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	require.NoError(t, s.Enqueue(ctx, newTestJob("default", "t")))
+	job, err := s.Dequeue(ctx, []string{"default"}, "worker-A")
+	require.NoError(t, err)
+	require.NotNil(t, job)
+
+	// Drive the real production transition: the handler suspends its own
+	// parent to wait on a fan-out. This sets status=waiting, locked_by="".
+	require.NoError(t, s.SuspendJob(ctx, job.ID, "worker-A"))
+
+	// The audit must NOT flag the job the worker just suspended for itself.
+	orphaned, err := s.FindOrphanedJobs(ctx, []string{job.ID}, "worker-A")
+	require.NoError(t, err)
+	assert.NotContains(t, orphaned, job.ID,
+		"a self-suspended (waiting) job must not be reported as orphaned to its own worker")
+}
+
+// TestFindOrphanedJobs_DoesNotFlagPaused mirrors the self-suspend case for the
+// paused state: PauseJob also clears locked_by, and a paused job has no live
+// handler, so it must not be flagged as orphaned either.
+func TestFindOrphanedJobs_DoesNotFlagPaused(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	require.NoError(t, s.Enqueue(ctx, newTestJob("default", "t")))
+	job, err := s.Dequeue(ctx, []string{"default"}, "worker-A")
+	require.NoError(t, err)
+	require.NotNil(t, job)
+
+	// Pause the running job (transitions running → cancelled? no: PauseJob on a
+	// running job cancels it; use a pending job's pause path instead). Set the
+	// row directly to the paused/cleared-lock shape the pause path produces.
+	require.NoError(t, s.db.Model(&core.Job{}).
+		Where("id = ?", job.ID).
+		Updates(map[string]any{"status": core.StatusPaused, "locked_by": "", "locked_until": nil}).Error)
+
+	orphaned, err := s.FindOrphanedJobs(ctx, []string{job.ID}, "worker-A")
+	require.NoError(t, err)
+	assert.NotContains(t, orphaned, job.ID,
+		"a paused job must not be reported as orphaned")
+}
+
 // TestIsSerializationFailure_RetryableErrors locks in the set of transient
 // driver errors that withSerializationRetry must retry. The SQLite BUSY/LOCKED
 // cases are a regression guard: the P1 local-handler-cancel can wake sibling

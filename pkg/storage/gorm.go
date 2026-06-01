@@ -730,10 +730,24 @@ func (s *GormStorage) Release(ctx context.Context, jobID, workerID string) error
 // indicates the caller no longer owns the job. See core.Storage.FindOrphanedJobs
 // for the protocol — this is the implementation.
 //
-// A job is considered orphaned to workerID when ANY of these is true:
+// A job is considered orphaned to workerID when it is NOT in a self-suspended
+// state AND any of these is true:
 //   - locked_by != workerID  (another worker took the lock)
 //   - locked_by IS NULL      (lock was released, no new owner)
 //   - status IN ('cancelled','completed','failed')  (job is done by some path)
+//
+// The status NOT IN ('waiting','paused') guard is essential: a parent that
+// calls FanOut/Call from inside its handler suspends ITSELF via SuspendJob,
+// which sets status='waiting' and clears locked_by to the empty string. During
+// the window between SuspendJob and the handler returning the WaitingError, the
+// parent is still present in the worker's runningJobs map, yet its row has
+// locked_by="" — which would otherwise match "locked_by != workerID" and make
+// the ownership audit cancel the worker's own in-flight handler. That spurious
+// cancel turns the WaitingError into a context.Canceled failure, reschedules the
+// job, and replays the whole handler from its checkpoints. A waiting/paused job
+// has, by construction, no running handler to cancel, so it is never an orphan
+// the audit should act on. (A paused job is in the same shape: locked_by is
+// already cleared, and a paused row is not reclaimable while paused.)
 //
 // Returns an empty slice (not nil) when no jobs are orphaned, so callers
 // can len()-test without nil-checking.
@@ -745,6 +759,7 @@ func (s *GormStorage) FindOrphanedJobs(ctx context.Context, jobIDs []string, wor
 	err := s.db.WithContext(ctx).
 		Model(&core.Job{}).
 		Where("id IN ?", jobIDs).
+		Where("status NOT IN ?", []core.JobStatus{core.StatusWaiting, core.StatusPaused}).
 		Where(
 			s.db.Where("locked_by IS NULL").
 				Or("locked_by != ?", workerID).
