@@ -54,6 +54,14 @@ type Storage interface {
 	// (cancelled/completed/failed). The caller is expected to cancel each
 	// orphaned job's local handler context via Worker.CancelJob.
 	//
+	// Jobs in 'waiting' or 'paused' status are NEVER reported, even though
+	// they have a cleared locked_by: such a job has no running handler to
+	// cancel (a parent that calls FanOut/Call suspends itself to 'waiting'
+	// AFTER its handler has yielded), and is not reclaimable by another
+	// worker while in that state (Dequeue takes only 'pending', the reaper
+	// only 'running'). Reporting them would make the audit cancel the
+	// worker's own about-to-return handler.
+	//
 	// This is the cross-worker counterpart of the cancellation that
 	// completeFanOut and reapStaleLocks perform directly: when another
 	// worker in the fleet cancels a sub-job (e.g. via fan-out failure) or
