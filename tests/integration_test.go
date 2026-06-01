@@ -403,18 +403,24 @@ func TestIntegration_SchedulerRecurringJobs(t *testing.T) {
 	// Schedule job to run every 200ms
 	queue.Schedule("recurring-task", nil, jobs.Every(200*time.Millisecond))
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	// Worker lifetime is generous so the poll below has room even when a loaded
+	// CI runner is slow to begin dispatching scheduled fires.
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
 	defer cancel()
 
 	// Start worker with scheduler enabled
 	worker := queue.NewWorker(jobs.WithScheduler(true))
 	go func() { _ = worker.Start(ctx) }()
 
-	// Wait for multiple executions
-	time.Sleep(1 * time.Second)
-
+	// Poll for multiple executions rather than asserting after a fixed 1s
+	// window: with a 200ms interval three fires take ~400-600ms of steady
+	// running, but worker startup latency on a loaded runner can push the first
+	// fire well past 1s, which flaked this test (observed count=1). Wait until
+	// at least three executions have happened (or time out).
+	require.Eventually(t, func() bool {
+		return executionCount.Load() >= 3
+	}, 5*time.Second, 20*time.Millisecond, "Should have multiple executions")
 	count := executionCount.Load()
-	// Should have executed at least 3 times in 1 second with 200ms interval
 	assert.GreaterOrEqual(t, count, int32(3), "Should have multiple executions")
 
 	// Verify executions are spaced apart. Startup jitter (worker pickup
