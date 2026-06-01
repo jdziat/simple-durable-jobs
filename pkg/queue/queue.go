@@ -39,7 +39,6 @@ type Queue struct {
 	enqueueMiddleware []EnqueueMiddleware
 
 	// Event stream
-	events        chan core.Event
 	eventSubs     []chan core.Event
 	droppedEvents atomic.Uint64
 
@@ -65,7 +64,6 @@ func New(s core.Storage) *Queue {
 		storage:     s,
 		handlers:    make(map[string]*handler.Handler),
 		determinism: ExplicitCheckpoints,
-		events:      make(chan core.Event, 1000),
 		runningJobs: make(map[string]context.CancelFunc),
 	}
 }

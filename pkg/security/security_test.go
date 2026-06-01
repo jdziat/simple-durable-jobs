@@ -222,6 +222,37 @@ func TestSanitizeErrorMessage_BoundedForHugeInput(t *testing.T) {
 	assert.NotContains(t, result, secret)
 }
 
+func TestRedactSecrets_ExportedRedactsProviderKey(t *testing.T) {
+	secret := "sk_live_1234567890abcdef"
+	input := "payload contains " + secret + " here"
+
+	result := RedactSecrets(input)
+
+	assert.Contains(t, result, "payload contains [REDACTED] here")
+	assert.NotContains(t, result, secret)
+}
+
+func TestRedactSecrets_DoesNotTruncateLargePayload(t *testing.T) {
+	secret := "ghp_1234567890abcdefghij"
+	sentinel := "TAIL_SENTINEL"
+	input := strings.Repeat("a", MaxErrorMessageLength+100) + " " + secret + " " + sentinel
+
+	result := RedactSecrets(input)
+
+	assert.Contains(t, result, "[REDACTED]")
+	assert.NotContains(t, result, secret)
+	assert.Contains(t, result, sentinel)
+	assert.Greater(t, len(result), MaxErrorMessageLength)
+}
+
+func TestRedactSecrets_ExportedLeavesSecretFreeStringUnchanged(t *testing.T) {
+	input := "ordinary connection refused after retrying twice"
+
+	result := RedactSecrets(input)
+
+	assert.Equal(t, input, result)
+}
+
 func TestClampRetries(t *testing.T) {
 	tests := []struct {
 		input    int

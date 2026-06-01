@@ -13,6 +13,7 @@ import (
 
 	"github.com/jdziat/simple-durable-jobs/pkg/core"
 	"github.com/jdziat/simple-durable-jobs/pkg/queue"
+	"github.com/jdziat/simple-durable-jobs/pkg/security"
 	jobsv1 "github.com/jdziat/simple-durable-jobs/ui/gen/jobs/v1"
 	"github.com/jdziat/simple-durable-jobs/ui/gen/jobs/v1/jobsv1connect"
 )
@@ -757,6 +758,15 @@ func isValidPurgeStatus(status string) bool {
 
 // Conversion helpers
 
+// redactBytes redacts secret-shaped substrings from a payload without
+// truncating it (payloads may be large). nil in -> nil out.
+func redactBytes(b []byte) []byte {
+	if len(b) == 0 {
+		return b
+	}
+	return []byte(security.RedactSecrets(string(b)))
+}
+
 func jobToProto(j *core.Job) *jobsv1.Job {
 	pb := &jobsv1.Job{
 		Id:          j.ID,
@@ -766,11 +776,11 @@ func jobToProto(j *core.Job) *jobsv1.Job {
 		Priority:    int32(j.Priority),
 		Attempt:     int32(j.Attempt),
 		MaxRetries:  int32(j.MaxRetries),
-		Args:        j.Args,
-		LastError:   j.LastError,
+		Args:        redactBytes(j.Args),
+		LastError:   security.SanitizeErrorMessage(j.LastError),
 		CreatedAt:   timestamppb.New(j.CreatedAt),
 		FanOutIndex: int32(j.FanOutIndex),
-		Result:      j.Result,
+		Result:      redactBytes(j.Result),
 	}
 	if j.StartedAt != nil {
 		pb.StartedAt = timestamppb.New(*j.StartedAt)
@@ -820,8 +830,8 @@ func checkpointToProto(cp *core.Checkpoint) *jobsv1.Checkpoint {
 		JobId:     cp.JobID,
 		CallIndex: int32(cp.CallIndex),
 		CallType:  cp.CallType,
-		Result:    cp.Result,
-		Error:     cp.Error,
+		Result:    redactBytes(cp.Result),
+		Error:     security.SanitizeErrorMessage(cp.Error),
 		CreatedAt: timestamppb.New(cp.CreatedAt),
 	}
 	return pb

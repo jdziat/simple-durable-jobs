@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -1159,6 +1160,26 @@ func TestCheckpointToProto(t *testing.T) {
 	assert.NotNil(t, pb.CreatedAt)
 }
 
+func TestCheckpointToProto_RedactsResultWithoutTruncating(t *testing.T) {
+	secret := "sk_live_1234567890abcdef"
+	sentinel := "CHECKPOINT_TAIL_SENTINEL"
+	cp := &core.Checkpoint{
+		ID:        "cp1",
+		JobID:     "j1",
+		CallIndex: 1,
+		CallType:  "http.get",
+		Result:    []byte(strings.Repeat("c", 5000) + " " + secret + " " + sentinel),
+		CreatedAt: time.Now(),
+	}
+
+	pb := checkpointToProto(cp)
+
+	assert.NotContains(t, string(pb.Result), secret)
+	assert.Contains(t, string(pb.Result), "[REDACTED]")
+	assert.Contains(t, string(pb.Result), sentinel)
+	assert.Greater(t, len(pb.Result), 5000)
+}
+
 // ---------------------------------------------------------------------------
 // jobToProto field coverage
 // ---------------------------------------------------------------------------
@@ -1187,6 +1208,27 @@ func TestJobToProto_OptionalFieldsSet(t *testing.T) {
 	assert.NotNil(t, pb.RunAt)
 	assert.Equal(t, "oops", pb.LastError)
 	assert.Equal(t, []byte(`{"x":1}`), pb.Args)
+}
+
+func TestJobToProto_RedactsPayloadsWithoutTruncating(t *testing.T) {
+	argsSecret := "ghp_1234567890abcdefghij"
+	resultSecret := "sk_live_1234567890abcdef"
+	sentinel := "RESULT_TAIL_SENTINEL"
+	job := sampleJob("j1", "default", "work", core.StatusCompleted)
+	job.Args = []byte(`{"token":"` + argsSecret + `"}`)
+	job.Result = []byte(strings.Repeat("r", 5000) + " " + resultSecret + " " + sentinel)
+	job.LastError = "request failed bearer abcdefghijklmnopqrstuvwxyz012345"
+
+	pb := jobToProto(job)
+
+	assert.NotContains(t, string(pb.Args), argsSecret)
+	assert.Contains(t, string(pb.Args), "[REDACTED]")
+	assert.NotContains(t, string(pb.Result), resultSecret)
+	assert.Contains(t, string(pb.Result), "[REDACTED]")
+	assert.Contains(t, string(pb.Result), sentinel)
+	assert.Greater(t, len(pb.Result), 5000)
+	assert.NotContains(t, pb.LastError, "abcdefghijklmnopqrstuvwxyz012345")
+	assert.Contains(t, pb.LastError, "bearer [REDACTED]")
 }
 
 // ---------------------------------------------------------------------------
