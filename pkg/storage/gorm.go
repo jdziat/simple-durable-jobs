@@ -454,63 +454,15 @@ func (s *GormStorage) Complete(ctx context.Context, jobID string, workerID strin
 // CompleteWithResult marks a job completed and, when it is a sub-job, accounts
 // for its fan-out completion in the same ownership-guarded transaction.
 func (s *GormStorage) CompleteWithResult(ctx context.Context, jobID, workerID string, result []byte) (*core.FanOut, error) {
-	var fanOut core.FanOut
-	var hasFanOut bool
-
-	err := s.withSerializationRetry(ctx, func() error {
-		fanOut = core.FanOut{}
-		hasFanOut = false
-
-		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-			now := time.Now()
-			updates := map[string]any{
-				"status":       core.StatusCompleted,
-				"completed_at": now,
-				"locked_by":    "",
-				"locked_until": nil,
-			}
-			if result != nil {
-				updates["result"] = result
-			}
-
-			update := tx.Model(&core.Job{}).
-				Where("id = ? AND locked_by = ? AND status = ?", jobID, workerID, core.StatusRunning).
-				Updates(updates)
-			if update.Error != nil {
-				return update.Error
-			}
-			if update.RowsAffected == 0 {
-				return core.ErrJobNotOwned
-			}
-
-			var job core.Job
-			if err := tx.Select("fan_out_id").First(&job, "id = ?", jobID).Error; err != nil {
-				return err
-			}
-			if job.FanOutID == nil || *job.FanOutID == "" {
-				return nil
-			}
-
-			if err := tx.Exec(
-				"UPDATE fan_outs SET completed_count = completed_count + 1, updated_at = ? WHERE id = ? AND status = ?",
-				now, *job.FanOutID, core.FanOutPending,
-			).Error; err != nil {
-				return err
-			}
-			if err := tx.First(&fanOut, "id = ?", *job.FanOutID).Error; err != nil {
-				return err
-			}
-			hasFanOut = true
-			return nil
-		})
-	})
-	if err != nil {
-		return nil, err
+	updates := map[string]any{
+		"status":       core.StatusCompleted,
+		"locked_by":    "",
+		"locked_until": nil,
 	}
-	if !hasFanOut {
-		return nil, nil
+	if result != nil {
+		updates["result"] = result
 	}
-	return &fanOut, nil
+	return s.accountTerminalWithFanOut(ctx, jobID, workerID, updates, "completed_count")
 }
 
 // Fail marks a job as failed, optionally scheduling a retry.
@@ -554,6 +506,25 @@ func (s *GormStorage) Fail(ctx context.Context, jobID string, workerID string, e
 // transaction. Retryable failures must continue to use Fail.
 func (s *GormStorage) FailTerminalWithResult(ctx context.Context, jobID, workerID, errMsg string) (*core.FanOut, error) {
 	sanitizedErr := security.SanitizeErrorMessage(errMsg)
+	updates := map[string]any{
+		"last_error":   sanitizedErr,
+		"status":       core.StatusFailed,
+		"locked_by":    "",
+		"locked_until": nil,
+	}
+	return s.accountTerminalWithFanOut(ctx, jobID, workerID, updates, "failed_count")
+}
+
+// accountTerminalWithFanOut performs the ownership-guarded terminal job UPDATE
+// described by jobUpdates and, when the job is a sub-job of a still-pending
+// fan-out, atomically increments fanOutCounterCol in the same transaction
+// (liveness-guarded on status='pending'). Returns the fan-out row when the job
+// has a fan-out, or nil. Increments nothing and returns core.ErrJobNotOwned if the
+// worker no longer owns the running job.
+//
+// Note: this mutates jobUpdates by setting "completed_at"; callers must pass a
+// freshly-allocated map (not a shared or package-level one).
+func (s *GormStorage) accountTerminalWithFanOut(ctx context.Context, jobID, workerID string, jobUpdates map[string]any, fanOutCounterCol string) (*core.FanOut, error) {
 	var fanOut core.FanOut
 	var hasFanOut bool
 
@@ -563,15 +534,11 @@ func (s *GormStorage) FailTerminalWithResult(ctx context.Context, jobID, workerI
 
 		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 			now := time.Now()
+			jobUpdates["completed_at"] = now
+
 			update := tx.Model(&core.Job{}).
 				Where("id = ? AND locked_by = ? AND status = ?", jobID, workerID, core.StatusRunning).
-				Updates(map[string]any{
-					"last_error":   sanitizedErr,
-					"status":       core.StatusFailed,
-					"completed_at": now,
-					"locked_by":    "",
-					"locked_until": nil,
-				})
+				Updates(jobUpdates)
 			if update.Error != nil {
 				return update.Error
 			}
@@ -587,8 +554,10 @@ func (s *GormStorage) FailTerminalWithResult(ctx context.Context, jobID, workerI
 				return nil
 			}
 
+			// fanOutCounterCol is a hardcoded caller constant, not user input.
+			counterSQL := fmt.Sprintf("UPDATE fan_outs SET %s = %s + 1, updated_at = ? WHERE id = ? AND status = ?", fanOutCounterCol, fanOutCounterCol)
 			if err := tx.Exec(
-				"UPDATE fan_outs SET failed_count = failed_count + 1, updated_at = ? WHERE id = ? AND status = ?",
+				counterSQL,
 				now, *job.FanOutID, core.FanOutPending,
 			).Error; err != nil {
 				return err

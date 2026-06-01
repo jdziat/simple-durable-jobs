@@ -1418,6 +1418,39 @@ func TestCompleteWithResult_AtomicIncrementOnce(t *testing.T) {
 	assert.Equal(t, 1, after.CompletedCount)
 }
 
+func TestCompleteWithResult_ConcurrentWithReaper(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+	fo := createP2BFanOut(t, ctx, s, core.FanOutPending)
+	job := createRunningP2BJob(t, ctx, s, &fo.ID, "worker-1")
+	result := []byte(`{"ok":true}`)
+
+	updated, err := s.CompleteWithResult(ctx, job.ID, "worker-1", result)
+	require.NoError(t, err)
+	require.NotNil(t, updated)
+	assert.Equal(t, 1, updated.CompletedCount)
+
+	released, err := s.ReleaseStaleLocks(ctx, 0)
+	require.NoError(t, err)
+	assert.Empty(t, released)
+
+	updated, err = s.CompleteWithResult(ctx, job.ID, "worker-1", []byte(`{"ok":true}`))
+	require.ErrorIs(t, err, core.ErrJobNotOwned)
+	assert.Nil(t, updated)
+
+	after, err := s.GetFanOut(ctx, fo.ID)
+	require.NoError(t, err)
+	require.NotNil(t, after)
+	assert.Equal(t, 1, after.CompletedCount)
+	assert.Equal(t, core.FanOutPending, after.Status)
+
+	row, err := s.GetJob(ctx, job.ID)
+	require.NoError(t, err)
+	require.NotNil(t, row)
+	assert.Equal(t, core.StatusCompleted, row.Status)
+	assert.Equal(t, result, row.Result)
+}
+
 func TestCompleteWithResult_NotOwned_NoIncrement(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStorage(t)
