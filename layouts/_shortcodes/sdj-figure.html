@@ -1,0 +1,30 @@
+{{- /*
+  Themed figure: light/dark screenshot with an optional caption and optional
+  browser-window chrome.
+  @param light  Image path relative to baseURL (e.g. "images/dashboard/dashboard-light.png")
+  @param dark   Optional dark-theme variant (defaults to light)
+  @param alt    Alt text
+  @param caption Optional caption (markdown)
+  @param chrome  Optional "true" to wrap the image in browser-window chrome
+  @param title   Optional window title (shown in the chrome bar)
+  @example {{< sdj-figure light="images/dashboard/jobs-light.png" dark="images/dashboard/jobs-dark.png" alt="Job browser" chrome="true" caption="The **Jobs** view." >}}
+*/ -}}
+{{- $light := .Get "light" -}}
+{{- $dark := .Get "dark" | default $light -}}
+{{- $alt := .Get "alt" | default "" -}}
+{{- $caption := .Get "caption" -}}
+{{- $chrome := .Get "chrome" -}}
+{{- $title := .Get "title" -}}
+<figure class="sdj-fig not-prose">
+  {{- if $chrome -}}
+  <div class="sdj-window">
+    <div class="sdj-window__bar"><span></span><span></span><span></span>{{ with $title }}<span class="sdj-window__title">{{ . }}</span>{{ end }}</div>
+    <img class="hx:block hx:dark:hidden" src="{{ $light | relURL }}" alt="{{ $alt }}" loading="lazy" />
+    <img class="hx:hidden hx:dark:block" src="{{ $dark | relURL }}" alt="{{ $alt }}" loading="lazy" />
+  </div>
+  {{- else -}}
+  <img class="sdj-shot hx:block hx:dark:hidden" src="{{ $light | relURL }}" alt="{{ $alt }}" loading="lazy" />
+  <img class="sdj-shot hx:hidden hx:dark:block" src="{{ $dark | relURL }}" alt="{{ $alt }}" loading="lazy" />
+  {{- end -}}
+  {{- with $caption }}<figcaption>{{ . | markdownify }}</figcaption>{{- end }}
+</figure>

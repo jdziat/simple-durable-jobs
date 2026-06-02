@@ -1,0 +1,29 @@
+{{- /* Home scroll-reveal motion. Adds `sdj-motion` to <html> before paint so the
+   targeted home elements start hidden (no flash), then reveals them as they enter
+   the viewport. Respects prefers-reduced-motion, no-ops when IntersectionObserver
+   is missing, and has a safety timeout so nothing can stay hidden. */ -}}
+<script>
+(function () {
+  try {
+    if (!('IntersectionObserver' in window)) return;
+    if (window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+    document.documentElement.classList.add('sdj-motion');
+    var reveal = function () {
+      try {
+        var sel = '.sdj-home .hextra-feature-card, .sdj-home .sdj-shot-wrap, .sdj-home .sdj-section-label, .sdj-home .hextra-code-block';
+        var els = Array.prototype.slice.call(document.querySelectorAll(sel));
+        if (!els.length) { document.documentElement.classList.remove('sdj-motion'); return; }
+        var io = new IntersectionObserver(function (entries) {
+          entries.forEach(function (e) {
+            if (e.isIntersecting) { e.target.classList.add('sdj-in'); io.unobserve(e.target); }
+          });
+        }, { threshold: 0.12, rootMargin: '0px 0px -6% 0px' });
+        els.forEach(function (el, i) { el.style.transitionDelay = Math.min(i * 45, 260) + 'ms'; io.observe(el); });
+        setTimeout(function () { els.forEach(function (el) { el.classList.add('sdj-in'); }); }, 1800);
+      } catch (e) { document.documentElement.classList.remove('sdj-motion'); }
+    };
+    if (document.readyState !== 'loading') reveal();
+    else document.addEventListener('DOMContentLoaded', reveal);
+  } catch (e) {}
+})();
+</script>

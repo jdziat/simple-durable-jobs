@@ -3,7 +3,22 @@ title: "API Reference"
 weight: 2
 ---
 
-Complete API documentation for Simple Durable Jobs.
+Complete API documentation for Simple Durable Jobs. This is a single-page reference — use the **search box** (top of the page) or your browser's find, the **"On this page"** outline on the right, or the jump grid below.
+
+{{< cards cols="3" >}}
+  {{< card link="#queue" title="Queue" icon="collection" subtitle="Enqueue, Register, Schedule, Call, hooks, events." >}}
+  {{< card link="#worker" title="Worker" icon="cog" subtitle="Start, pause/resume, concurrency, scheduler." >}}
+  {{< card link="#durable-calls" title="Durable Calls" icon="refresh" subtitle="Call and checkpointing inside workflows." >}}
+  {{< card link="#fan-outfan-in" title="Fan-Out / Fan-In" icon="share" subtitle="FanOut, SubJob, result helpers, strategies." >}}
+  {{< card link="#job-options" title="Job Options" icon="adjustments" subtitle="Priority, Retries, Delay, Queue, Unique, Timeout." >}}
+  {{< card link="#worker-options" title="Worker Options" icon="adjustments" subtitle="Concurrency, queues, scheduler, stale-lock, retry." >}}
+  {{< card link="#types" title="Types" icon="cube" subtitle="Job, JobStatus, Result, Schedule, RetryConfig." >}}
+  {{< card link="#schedules" title="Schedules" icon="clock" subtitle="Every, Daily, Weekly, Cron." >}}
+  {{< card link="#events" title="Events & Hooks" icon="bell" subtitle="Event stream, event types, lifecycle hooks." >}}
+  {{< card link="#error-handling" title="Error Handling" icon="exclamation-circle" subtitle="NoRetry, RetryAfter, error variables." >}}
+  {{< card link="#opentelemetry-tracing" title="OpenTelemetry" icon="chart-bar" subtitle="OTelInstrument and tracing options." >}}
+  {{< card link="#storage" title="Storage" icon="database" subtitle="GormStorage, pool config, Storage interface." >}}
+{{< /cards >}}
 
 ## Package `jobs`
 

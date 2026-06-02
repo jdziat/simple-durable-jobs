@@ -1,0 +1,32 @@
+{{- /* Project footer: brand + real project/doc links (replaces Powered-by-Hextra). */ -}}
+{{- $gh := "https://github.com/jdziat/simple-durable-jobs" -}}
+<div class="sdj-footer">
+  <div class="sdj-footer__brand">
+    <div class="sdj-footer__mark">
+      <img src="{{ "images/logo.svg" | relURL }}" alt="Simple Durable Jobs" width="24" height="24" />
+      <span>Simple Durable Jobs</span>
+    </div>
+    <p class="sdj-footer__tagline">A Go library for durable job queues with checkpointed workflows, fan-out/fan-in, crash recovery, and an embedded web dashboard.</p>
+    <p class="sdj-footer__legal">© {{ now.Year }} Jordan Dziat · MIT License</p>
+  </div>
+
+  <div class="sdj-footer__cols">
+    <div class="sdj-footer__col">
+      <h4>Documentation</h4>
+      <a href="{{ "docs/getting-started/" | relURL }}">Getting Started</a>
+      <a href="{{ "docs/api-reference/" | relURL }}">API Reference</a>
+      <a href="{{ "docs/examples/" | relURL }}">Examples</a>
+      <a href="{{ "docs/embedded-ui/" | relURL }}">Embedded Web UI</a>
+      <a href="{{ "docs/live-demo/" | relURL }}">Live Demo</a>
+      <a href="{{ "docs/advanced/" | relURL }}">Advanced Topics</a>
+    </div>
+    <div class="sdj-footer__col">
+      <h4>Project</h4>
+      <a href="{{ $gh }}" target="_blank" rel="noopener">GitHub</a>
+      <a href="https://pkg.go.dev/github.com/jdziat/simple-durable-jobs" target="_blank" rel="noopener">pkg.go.dev</a>
+      <a href="{{ $gh }}/releases" target="_blank" rel="noopener">Releases</a>
+      <a href="{{ $gh }}/issues" target="_blank" rel="noopener">Issues</a>
+      <a href="{{ $gh }}/blob/main/LICENSE" target="_blank" rel="noopener">License</a>
+    </div>
+  </div>
+</div>

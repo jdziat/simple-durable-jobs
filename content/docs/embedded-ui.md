@@ -5,6 +5,14 @@ weight: 4
 
 The `ui` package provides a full-featured monitoring dashboard that embeds directly into your Go application. It serves a Svelte SPA frontend alongside a Connect-RPC API, giving you real-time visibility into job queues, execution history, and worker status without deploying a separate service.
 
+{{< sdj-figure
+  chrome="true"
+  title="localhost:8080/jobs/"
+  light="images/dashboard/dashboard-light.png"
+  dark="images/dashboard/dashboard-dark.png"
+  alt="The embedded dashboard: live Pending/Running/Completed/Failed counts, a throughput chart, and a per-queue table."
+  caption="The dashboard overview. **Want to click around first?** Open the [interactive live demo]({{< relref \"live-demo\" >}})." >}}
+
 ## Setup
 
 Import the `ui` package and mount the handler on any `http.ServeMux` or router.
@@ -135,6 +143,13 @@ A paginated, filterable view of all jobs. You can filter by:
 - **Type** -- filter by job type name.
 - **Search** -- free-text search across job ID and arguments.
 
+{{< sdj-figure
+  chrome="true"
+  light="images/dashboard/jobs-light.png"
+  dark="images/dashboard/jobs-dark.png"
+  alt="The Jobs view: a filterable table of jobs with ID, type, queue, status, attempts, and per-row Retry/Delete actions."
+  caption="The **Jobs** browser — filter by status, queue, or type, and retry or delete jobs inline." >}}
+
 ### Job Detail
 
 Selecting a job shows its full details including arguments, timing, error messages, retry count, and all checkpoints recorded during workflow execution.
@@ -151,6 +166,17 @@ From the UI you can perform management actions on jobs:
 ### Scheduled Jobs
 
 When `WithQueue` is provided, the dashboard lists all registered scheduled jobs with their schedule expressions and target queues.
+
+### Workflows
+
+Fan-out/fan-in jobs get a dedicated view showing each parent workflow, its strategy (`fail_fast`, `collect_all`, or `threshold`), a progress bar of completed/failed children, and live status.
+
+{{< sdj-figure
+  chrome="true"
+  light="images/dashboard/workflows-light.png"
+  dark="images/dashboard/workflows-dark.png"
+  alt="The Workflows view: fan-out/fan-in parents with strategy badges, completed/failed progress bars, and status."
+  caption="The **Workflows** view — track fan-out/fan-in progress and strategy at a glance." >}}
 
 ### Historical Charts
 

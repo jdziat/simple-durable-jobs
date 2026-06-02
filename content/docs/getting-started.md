@@ -5,6 +5,23 @@ weight: 1
 
 This guide walks you through setting up Simple Durable Jobs in your Go application.
 
+## How a job flows
+
+Every job moves through the same lifecycle. You enqueue work; a worker leases it, runs your handler, and the result is recorded durably. Failures are retried with backoff until they succeed or exhaust their attempts — and if a worker crashes mid-run, the stale-lock reaper returns the job to the queue so another worker can pick it up.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Pending: Enqueue
+    Pending --> Running: worker leases job
+    Running --> Completed: handler returns nil
+    Running --> Retrying: handler returns error
+    Retrying --> Pending: backoff elapses
+    Running --> Failed: retries exhausted / NoRetry
+    Running --> Pending: worker crash<br/>(stale-lock reaper)
+    Completed --> [*]
+    Failed --> [*]
+```
+
 ## Installation
 
 ```bash
@@ -310,44 +327,14 @@ Run multiple workers for horizontal scaling:
 
 Each worker will process jobs from the queue without duplicates.
 
-### Stale Lock Reaper
+### Hardening for production
 
-Workers automatically reclaim jobs stuck in "running" status when their lock expires (e.g., after a worker crash). This runs in the background with configurable intervals:
+Two knobs matter most once you're running multiple workers against a shared database. Both have sensible defaults, so reach for them when you're tuning — the dedicated pages cover the trade-offs in depth:
 
-```go
-worker := queue.NewWorker(
-    jobs.WithStaleLockInterval(5 * time.Minute), // How often to check (default: 5min)
-    jobs.WithStaleLockAge(45 * time.Minute),      // How old a lock must be (default: 45min)
-)
-```
-
-Set `WithStaleLockInterval(0)` to disable the reaper.
-
-### Connection Pool Configuration
-
-For production deployments, tune the database connection pool:
-
-```go
-// Use a preset
-storage, err := jobs.NewGormStorageWithPool(db, jobs.HighConcurrencyPoolConfig())
-
-// Or customize individual settings
-storage, err := jobs.NewGormStorageWithPool(db,
-    jobs.MaxOpenConns(50),
-    jobs.MaxIdleConns(20),
-    jobs.ConnMaxLifetime(10 * time.Minute),
-    jobs.ConnMaxIdleTime(2 * time.Minute),
-)
-```
-
-Available presets:
-
-| Preset | MaxOpen | MaxIdle | MaxLifetime | MaxIdleTime | Use Case |
-|--------|---------|---------|-------------|-------------|----------|
-| `DefaultPoolConfig()` | 25 | 10 | 5min | 1min | General purpose |
-| `HighConcurrencyPoolConfig()` | 100 | 25 | 10min | 2min | 50+ workers, high volume |
-| `LowLatencyPoolConfig()` | 50 | 40 | 15min | 5min | Latency-sensitive |
-| `ResourceConstrainedPoolConfig()` | 10 | 5 | 3min | 30s | Limited DB resources |
+{{< cards >}}
+  {{< card link="../advanced/stale-lock-reaper/" title="Stale Lock Reaper" icon="refresh" subtitle="Workers automatically reclaim jobs stuck in 'running' after a crash. Tune with WithStaleLockInterval and WithStaleLockAge." >}}
+  {{< card link="../advanced/pool-configuration/" title="Connection Pool" icon="adjustments" subtitle="Match the DB connection pool to your worker count with a preset (e.g. HighConcurrencyPoolConfig) or custom options." >}}
+{{< /cards >}}
 
 ## Next Steps
 

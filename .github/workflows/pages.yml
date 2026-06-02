@@ -61,6 +61,17 @@ jobs:
       - name: Build with Hugo
         run: hugo --minify
 
+      - name: Verify live demo serves the SPA (not the docs shell)
+        run: |
+          # /demo/ must serve the Svelte dashboard bundle, not a Hugo-rendered
+          # page. A content page named demo.md would shadow static/demo/ and
+          # produce a recursive, empty iframe. Guard against that regression.
+          if ! grep -q 'id="app"' public/demo/index.html; then
+            echo "::error::public/demo/index.html does not contain the SPA mount (id=\"app\"). Did a content page shadow static/demo/?"
+            exit 1
+          fi
+          echo "OK: /demo/ serves the SPA bundle."
+
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
