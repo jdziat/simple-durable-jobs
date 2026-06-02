@@ -5,8 +5,9 @@
 //
 // Basic usage:
 //
-//	// Create storage and queue
-//	db, _ := gorm.Open(sqlite.Open("jobs.db"), &gorm.Config{})
+//	// Create storage and queue. The SQLite DSN parameters are required for safe
+//	// concurrent workers (WAL + busy_timeout + immediate transactions).
+//	db, _ := gorm.Open(sqlite.Open("jobs.db?_journal_mode=WAL&_busy_timeout=5000&_txlock=immediate"), &gorm.Config{})
 //	store := jobs.NewGormStorage(db)
 //	store.Migrate(context.Background())
 //	queue := jobs.New(store)

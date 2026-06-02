@@ -67,9 +67,23 @@ func openIntegrationDB(t *testing.T) *gorm.DB {
 
 	n := dbCounter.Add(1)
 	dbPath := fmt.Sprintf("/tmp/jobs_test_%d_%d.db", os.Getpid(), n)
-	t.Cleanup(func() { _ = os.Remove(dbPath) })
+	t.Cleanup(func() {
+		// WAL mode leaves -wal/-shm sidecar files next to the db.
+		for _, suffix := range []string{"", "-wal", "-shm"} {
+			_ = os.Remove(dbPath + suffix)
+		}
+	})
 
-	db, err := gorm.Open(sqlite.Open(dbPath), &gorm.Config{
+	// Open with the concurrency-safe DSN the library documents (gorm.go) and
+	// stress_test.go uses. A bare DSN runs in rollback-journal mode with an
+	// unbounded connection pool whose per-connection busy_timeout is unset, so
+	// concurrent workers race the single SQLite writer lock and completion
+	// writes transiently fail with SQLITE_BUSY ("database is locked") or
+	// SQLITE_READONLY ("attempt to write a readonly database"), exhausting the
+	// worker retry budget and dropping a job from the completed set. WAL +
+	// busy_timeout (applied to every pooled connection via the DSN, unlike a
+	// one-shot PRAGMA) + txlock=immediate serialize writers cleanly.
+	db, err := gorm.Open(sqlite.Open(dbPath+"?_journal_mode=WAL&_busy_timeout=5000&_txlock=immediate"), &gorm.Config{
 		Logger: logger.Default.LogMode(logger.Silent),
 	})
 	require.NoError(t, err, "open sqlite integration db")

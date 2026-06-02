@@ -4026,6 +4026,11 @@ func TestIsSerializationFailure_RetryableErrors(t *testing.T) {
 		"database table is locked",
 		"SQLITE_BUSY: database is locked",
 		"SQLITE_LOCKED: database table is locked",
+		// SQLite SQLITE_READONLY: surfaces transiently under write contention
+		// (a hot-journal rollback blocked by a concurrent writer). Dropping it
+		// from the retry set reintroduces the 19/20 ConcurrentWorkers flake.
+		"attempt to write a readonly database",
+		"SQLITE_READONLY: attempt to write a readonly database",
 	}
 	for _, msg := range retryable {
 		if !isSerializationFailure(errors.New(msg)) {

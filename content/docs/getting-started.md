@@ -39,8 +39,9 @@ import (
 )
 
 func main() {
-    // Open database connection
-    db, err := gorm.Open(sqlite.Open("jobs.db"), &gorm.Config{})
+    // Open database connection. The SQLite DSN parameters are required for safe
+    // concurrent workers (see the SQLite concurrency note below).
+    db, err := gorm.Open(sqlite.Open("jobs.db?_journal_mode=WAL&_busy_timeout=5000&_txlock=immediate"), &gorm.Config{})
     if err != nil {
         panic(err)
     }
@@ -57,6 +58,16 @@ func main() {
     queue := jobs.New(storage)
 }
 ```
+
+{{< callout type="warning" >}}
+**SQLite concurrency.** Always open SQLite with `?_journal_mode=WAL&_busy_timeout=5000&_txlock=immediate`.
+SQLite allows only one writer at a time; with a bare DSN (rollback-journal mode, no busy timeout)
+concurrent workers race the writer lock and completion writes can transiently fail with
+`SQLITE_BUSY` ("database is locked") or `SQLITE_READONLY` ("attempt to write a readonly database"),
+which can leave a job unmarked as completed. WAL plus a busy timeout (applied to every pooled
+connection via the DSN) and immediate transactions make writers wait and serialize cleanly.
+For heavy multi-process concurrency, use PostgreSQL or MySQL.
+{{< /callout >}}
 
 ### 2. Register Job Handlers
 

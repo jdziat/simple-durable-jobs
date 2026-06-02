@@ -16,8 +16,9 @@ import (
 )
 
 func main() {
-	// Setup database
-	db, err := gorm.Open(sqlite.Open("scheduled.db"), &gorm.Config{})
+	// Setup database. WAL + busy_timeout + immediate transactions keep SQLite
+	// safe under concurrent workers (avoids transient SQLITE_BUSY/SQLITE_READONLY).
+	db, err := gorm.Open(sqlite.Open("scheduled.db?_journal_mode=WAL&_busy_timeout=5000&_txlock=immediate"), &gorm.Config{})
 	if err != nil {
 		log.Fatal(err)
 	}

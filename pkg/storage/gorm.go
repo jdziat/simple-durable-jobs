@@ -40,9 +40,19 @@ type GormStorage struct {
 	lockDuration time.Duration
 }
 
-// NewGormStorage creates a new GORM-backed storage. For SQLite, callers should
-// open the database with _txlock=immediate&_busy_timeout=5000; this library
-// receives an already-opened DB and cannot set _txlock itself.
+// NewGormStorage creates a new GORM-backed storage. For SQLite under concurrent
+// workers, callers MUST open the database with a concurrency-safe DSN, e.g.
+//
+//	sqlite.Open("jobs.db?_journal_mode=WAL&_busy_timeout=5000&_txlock=immediate")
+//
+// These DSN parameters are applied by the driver to every connection the pool
+// opens. WAL lets readers and the single writer proceed without blocking each
+// other; _busy_timeout makes writers wait for the lock instead of failing
+// immediately; _txlock=immediate takes the write lock up front so deferred
+// transactions cannot deadlock on a lock upgrade. Without them, concurrent
+// completion writes transiently fail with SQLITE_BUSY/SQLITE_READONLY and can
+// exhaust the worker retry budget. This library receives an already-opened DB
+// and cannot set these itself — the PRAGMA below is only a best-effort fallback.
 func NewGormStorage(db *gorm.DB, opts ...GormStorageOption) *GormStorage {
 	// Detect SQLite by checking the dialect name
 	isSQLite := false
@@ -52,6 +62,9 @@ func NewGormStorage(db *gorm.DB, opts ...GormStorageOption) *GormStorage {
 	}
 	s := &GormStorage{db: db, isSQLite: isSQLite, lockDuration: defaultLockDuration}
 	if s.isSQLite {
+		// NOTE: a one-shot PRAGMA only affects the single pooled connection it
+		// runs on; connections the pool opens later default to busy_timeout=0.
+		// The DSN parameters above are the reliable, pool-wide mechanism.
 		_ = db.Exec("PRAGMA busy_timeout = 5000").Error
 	}
 	for _, opt := range opts {
@@ -180,20 +193,29 @@ func isSerializationFailure(err error) bool {
 	msg := err.Error()
 	switch {
 	case strings.Contains(msg, "Error 1213"), // MySQL deadlock
-		strings.Contains(msg, "Deadlock found"),           // MySQL deadlock (text)
-		strings.Contains(msg, "Error 1205"),               // MySQL lock wait timeout
-		strings.Contains(msg, "Lock wait timeout"),        // MySQL (text)
-		strings.Contains(msg, "SQLSTATE 40001"),           // serialization_failure
-		strings.Contains(msg, "SQLSTATE 40P01"),           // deadlock_detected (pg)
-		strings.Contains(msg, "could not serialize"),      // pg text
-		strings.Contains(msg, "deadlock detected"),        // pg text
-		strings.Contains(msg, "database is locked"),       // SQLite SQLITE_BUSY (5)
-		strings.Contains(msg, "database table is locked"), // SQLite SQLITE_LOCKED (6)
-		strings.Contains(msg, "SQLITE_BUSY"),              // SQLite (wrapped form)
-		strings.Contains(msg, "SQLITE_LOCKED"):            // SQLite (wrapped form)
+		strings.Contains(msg, "Deadlock found"),                       // MySQL deadlock (text)
+		strings.Contains(msg, "Error 1205"),                           // MySQL lock wait timeout
+		strings.Contains(msg, "Lock wait timeout"),                    // MySQL (text)
+		strings.Contains(msg, "SQLSTATE 40001"),                       // serialization_failure
+		strings.Contains(msg, "SQLSTATE 40P01"),                       // deadlock_detected (pg)
+		strings.Contains(msg, "could not serialize"),                  // pg text
+		strings.Contains(msg, "deadlock detected"),                    // pg text
+		strings.Contains(msg, "database is locked"),                   // SQLite SQLITE_BUSY (5)
+		strings.Contains(msg, "database table is locked"),             // SQLite SQLITE_LOCKED (6)
+		strings.Contains(msg, "SQLITE_BUSY"),                          // SQLite (wrapped form)
+		strings.Contains(msg, "SQLITE_LOCKED"),                        // SQLite (wrapped form)
+		strings.Contains(msg, "attempt to write a readonly database"), // SQLite SQLITE_READONLY (8)
+		strings.Contains(msg, "SQLITE_READONLY"):                      // SQLite (wrapped form)
 		// SQLite returns BUSY/LOCKED immediately on write-write contention that
 		// busy_timeout cannot resolve (one writer must abort); these are
 		// transient and safe to retry, mirroring the MySQL/PG deadlock handling.
+		//
+		// SQLITE_READONLY surfaces transiently in rollback-journal mode when a
+		// connection encounters a hot journal it must roll back (a write) but
+		// cannot acquire the lock to do so because a concurrent writer holds it.
+		// It clears once the other writer commits, so it is retryable too. A
+		// genuinely read-only database (file permissions) simply exhausts the
+		// bounded retries and surfaces the same error — no worse than before.
 		return true
 	}
 	return false
