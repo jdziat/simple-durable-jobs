@@ -3,7 +3,19 @@ title: "Examples"
 weight: 3
 ---
 
-Complete code examples for common use cases.
+Complete, copy-paste-runnable code examples for common use cases. Jump to what you need:
+
+{{< cards cols="3" >}}
+  {{< card link="#basic-job-processing" title="Basic Job Processing" icon="play" subtitle="Fire-and-forget jobs." >}}
+  {{< card link="#durable-workflows" title="Durable Workflows" icon="refresh" subtitle="Checkpointed multi-step work." >}}
+  {{< card link="#fan-outfan-in" title="Fan-Out / Fan-In" icon="share" subtitle="Parallel sub-jobs + aggregation." >}}
+  {{< card link="#scheduled-jobs" title="Scheduled Jobs" icon="clock" subtitle="Cron and interval schedules." >}}
+  {{< card link="#priority-queues" title="Priority Queues" icon="sort-descending" subtitle="Ordering and multiple queues." >}}
+  {{< card link="#error-handling" title="Error Handling" icon="exclamation-circle" subtitle="NoRetry, RetryAfter, backoff." >}}
+  {{< card link="#observability" title="Observability" icon="chart-bar" subtitle="Hooks and the event stream." >}}
+  {{< card link="#distributed-workers" title="Distributed Workers" icon="server" subtitle="Scale out across processes." >}}
+  {{< card link="#pauseresume" title="Pause / Resume" icon="pause" subtitle="Pause jobs, queues, or workers." >}}
+{{< /cards >}}
 
 ## Basic Job Processing
 
@@ -136,7 +148,18 @@ type Order struct {
 
 ## Fan-Out/Fan-In
 
-Process items in parallel using sub-jobs, then aggregate results.
+Process items in parallel using sub-jobs, then aggregate results. A parent job spawns N children, the worker runs them in parallel, and the parent resumes once the chosen strategy (`fail_fast`, `collect_all`, or `threshold`) is satisfied:
+
+```mermaid
+flowchart LR
+    P([Parent job]) -->|FanOut| C1[Sub-job 1]
+    P -->|FanOut| C2[Sub-job 2]
+    P -->|FanOut| C3[Sub-job 3]
+    C1 --> J{{Fan-in<br/>strategy}}
+    C2 --> J
+    C3 --> J
+    J -->|results| R([Parent resumes])
+```
 
 ```go
 package main

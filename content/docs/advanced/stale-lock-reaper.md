@@ -7,6 +7,22 @@ When a worker crashes mid-job, the job stays in "running" status with no one to
 complete or fail it. The stale lock reaper is a background mechanism that detects
 these abandoned jobs and resets them so another worker can pick them up.
 
+```mermaid
+sequenceDiagram
+    participant A as Worker A (crashes)
+    participant DB as Storage
+    participant R as Reaper (Worker B)
+    A->>DB: dequeue job → LockedBy=A, LockedUntil=now+45m
+    A--xA: crash (no heartbeat, lock not cleared)
+    Note over DB: lock silently expires at LockedUntil
+    loop every WithStaleLockInterval (default 5m)
+        R->>DB: find jobs running with expired lock<br/>older than WithStaleLockAge
+        DB-->>R: job stuck on dead Worker A
+        R->>DB: reset to Pending, clear lock
+    end
+    R->>DB: dequeue & run the recovered job
+```
+
 ## How Job Locking Works
 
 Every time a worker dequeues a job, it acquires an exclusive lock on the job

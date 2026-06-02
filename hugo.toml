@@ -12,19 +12,60 @@ title = "Simple Durable Jobs"
 [markup.highlight]
   noClasses = false
 
+[params]
+  description = "A Go library for durable job queues with checkpointed workflows, fan-out/fan-in, crash recovery, and an embedded web dashboard."
+  images = ["images/og-image.png"]
+
+  [params.navbar]
+    displayTitle = true
+    displayLogo = true
+    [params.navbar.logo]
+      path = "images/logo.svg"
+      dark = "images/logo.svg"
+      width = 24
+      height = 24
+
+  [params.footer]
+    displayPoweredBy = false
+    displayCopyright = false
+    width = "normal"
+
+  [params.theme]
+    default = "system"
+    displayToggle = true
+
+  [params.search]
+    enable = true
+    type = "flexsearch"
+    [params.search.flexsearch]
+      index = "content"
+
+  [params.highlight]
+    [params.highlight.copy]
+      enable = true
+
+  [params.editURL]
+    enable = false
+
 [[menu.main]]
   name = "Documentation"
   pageRef = "/docs"
   weight = 1
 
 [[menu.main]]
-  name = "Examples"
-  url = "https://github.com/jdziat/simple-durable-jobs/tree/main/examples"
+  name = "Live Demo"
+  pageRef = "/docs/live-demo"
   weight = 2
+
+[[menu.main]]
+  name = "Search"
+  weight = 3
+  [menu.main.params]
+    type = "search"
 
 [[menu.main]]
   name = "GitHub"
   url = "https://github.com/jdziat/simple-durable-jobs"
-  weight = 3
+  weight = 4
   [menu.main.params]
     icon = "github"

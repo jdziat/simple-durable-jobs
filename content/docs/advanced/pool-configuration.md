@@ -61,7 +61,7 @@ Each preset returns a `PoolConfig` struct with values tuned for a specific
 deployment scenario:
 
 | Preset | MaxOpen | MaxIdle | MaxLifetime | MaxIdleTime | Use Case |
-|--------|---------|---------|-------------|-------------|----------|
+|--------|--------:|--------:|------------:|------------:|----------|
 | `DefaultPoolConfig()` | 25 | 10 | 5 min | 1 min | General purpose |
 | `HighConcurrencyPoolConfig()` | 100 | 25 | 10 min | 2 min | 50+ workers, high throughput |
 | `LowLatencyPoolConfig()` | 50 | 40 | 15 min | 5 min | Latency-sensitive workloads |

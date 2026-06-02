@@ -1,0 +1,234 @@
+/* =========================================================================
+   Simple Durable Jobs — brand + readability layer over Hextra.
+   This file is concatenated into the compiled CSS by Hextra (plain CSS only;
+   no @apply / hx: utilities here). Targets Hextra's rendered class names.
+   ========================================================================= */
+
+/* ---- Brand accent (indigo, replaces default Hextra blue) ----------------- */
+:root {
+  --primary-hue: 245deg;
+  --primary-saturation: 72%;
+  --primary-lightness: 58%;
+  --sdj-accent: #5b54e0;
+  --sdj-accent-strong: #4338ca;
+}
+.dark {
+  --primary-hue: 246deg;
+  --primary-saturation: 85%;
+  --primary-lightness: 72%;
+  --sdj-accent: #9a8ff5;
+}
+
+/* ---- Readability: cap the prose measure, keep code/tables/cards wide ------ */
+.content :where(p, ul, ol, blockquote) {
+  max-width: 46rem;
+}
+
+/* ---- Headings: stronger hierarchy + scannable H3 (API reference) ---------- */
+.content :where(h2) {
+  letter-spacing: -0.02em;
+}
+.content :where(h3) {
+  padding-left: 0.6rem;
+  border-left: 3px solid var(--sdj-accent);
+  line-height: 1.25;
+}
+.content :where(h3) > code {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  font-size: 0.92em;
+  color: var(--sdj-accent-strong);
+}
+.dark .content :where(h3) > code { color: var(--sdj-accent); }
+
+/* ---- Tables: zebra, stronger header, numeric alignment, scroll affordance - */
+.content :where(table) {
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  border-radius: 10px;
+  box-shadow: inset -14px 0 10px -13px rgba(15, 23, 42, 0.10);
+}
+.content :where(table) thead th {
+  background: rgba(91, 84, 224, 0.08);
+  font-weight: 600;
+  white-space: nowrap;
+}
+.dark .content :where(table) thead th { background: rgba(154, 143, 245, 0.22); }
+.content :where(table) tbody tr:nth-child(even) {
+  background: rgba(100, 116, 139, 0.06);
+}
+.dark .content :where(table) tbody tr:nth-child(even) {
+  background: rgba(148, 163, 184, 0.12);
+}
+.content :where(table) td, .content :where(table) th { vertical-align: top; }
+/* Right-align numeric preset columns when markdown marks them with `--:` */
+.content :where(table) td[align="right"],
+.content :where(table) th[align="right"] {
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---- Callouts: weight by severity (classes added via shortcode override) -- */
+.content .sdj-callout {
+  border-width: 1px;
+  border-left-width: 4px;
+  align-items: flex-start;
+}
+.content .sdj-callout--warning,
+.content .sdj-callout--error,
+.content .sdj-callout--important {
+  border-left-width: 5px;
+}
+.content .sdj-callout--warning { border-left-color: #d97706; }
+.content .sdj-callout--error   { border-left-color: #dc2626; }
+.content .sdj-callout--important { border-left-color: #7c3aed; }
+.content .sdj-callout--info    { border-left-color: #2563eb; }
+
+/* ---- Feature cards (home): hover lift + accent edge ----------------------- */
+.hextra-feature-card {
+  transition: transform 0.15s ease, border-color 0.15s ease, box-shadow 0.15s ease;
+}
+.hextra-feature-card:hover {
+  transform: translateY(-3px);
+  border-color: var(--sdj-accent) !important;
+  box-shadow: 0 12px 28px -12px rgba(67, 56, 202, 0.35);
+}
+.hextra-feature-card h3 svg,
+.hextra-feature-card h3 img { color: var(--sdj-accent); }
+
+/* ---- Custom footer (rendered by layouts/_partials/custom/footer.html) ----- */
+.sdj-footer {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2.5rem 4rem;
+  justify-content: space-between;
+  width: 100%;
+  padding: 3rem 0 2.5rem;
+}
+.sdj-footer__brand { max-width: 22rem; }
+.sdj-footer__mark { display: flex; align-items: center; gap: 0.6rem; font-weight: 700; font-size: 1.05rem; }
+.sdj-footer__mark img { width: 24px; height: 24px; }
+.sdj-footer__tagline { margin-top: 0.6rem; font-size: 0.875rem; line-height: 1.5; opacity: 0.85; }
+.sdj-footer__legal { margin-top: 1rem; font-size: 0.8rem; opacity: 0.7; }
+.sdj-footer__cols { display: flex; flex-wrap: wrap; gap: 2.5rem 3.5rem; }
+.sdj-footer__col h4 {
+  font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.08em;
+  font-weight: 700; opacity: 0.6; margin-bottom: 0.75rem;
+}
+.sdj-footer__col a { display: block; font-size: 0.875rem; padding: 0.2rem 0; color: inherit; text-decoration: none; opacity: 0.85; }
+.sdj-footer__col a:hover { color: var(--sdj-accent); opacity: 1; }
+
+/* ---- Home: install/snippet + backends band + CTA ------------------------- */
+.sdj-install {
+  max-width: 640px;
+  margin: 0 auto 1.5rem;
+}
+/* One restrained trust band: badges row + a single muted backends line. */
+.sdj-badges { display: flex; flex-wrap: wrap; gap: 0.4rem; justify-content: center; margin: 0.25rem 0 0; }
+.sdj-badges img { height: 20px; }
+.sdj-backends {
+  margin: 0.55rem 0 0; font-size: 0.8rem; color: #64748b;
+  display: flex; flex-wrap: wrap; gap: 0.35rem; justify-content: center; align-items: center;
+}
+.dark .sdj-backends { color: #94a3b8; }
+.sdj-backends b { font-weight: 600; color: inherit; }
+.sdj-backends span { white-space: nowrap; }
+.sdj-backends span + span::before { content: "·"; margin-right: 0.35rem; opacity: 0.6; }
+.sdj-shot { border: 1px solid rgba(148,163,184,0.35); border-radius: 12px; box-shadow: 0 20px 40px -20px rgba(15,23,42,0.4); }
+
+/* Browser-window chrome for product screenshots. */
+.sdj-window {
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  border-radius: 12px;
+  overflow: hidden;
+  box-shadow: 0 24px 50px -24px rgba(15, 23, 42, 0.45);
+  background: #ffffff;
+}
+.dark .sdj-window { background: #0f172a; border-color: rgba(148, 163, 184, 0.22); }
+.sdj-window__bar {
+  display: flex; align-items: center; gap: 7px;
+  padding: 10px 14px;
+  background: #f1f5f9;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.3);
+}
+.dark .sdj-window__bar { background: #1e293b; border-bottom-color: rgba(148, 163, 184, 0.18); }
+.sdj-window__bar span { width: 11px; height: 11px; border-radius: 50%; display: inline-block; }
+.sdj-window__bar span:nth-child(1) { background: #f87171; }
+.sdj-window__bar span:nth-child(2) { background: #fbbf24; }
+.sdj-window__bar span:nth-child(3) { background: #34d399; }
+.sdj-window__bar .sdj-window__title {
+  margin-left: 8px; font-size: 12px; color: #64748b; font-weight: 500;
+}
+.dark .sdj-window__bar .sdj-window__title { color: #94a3b8; }
+/* Width only — visibility/display is controlled by the hx:block/hx:hidden
+   theme classes on each img so the light/dark swap keeps working (a
+   display:block here would override hx:hidden and show both variants). */
+.sdj-window img { width: 100%; height: auto; vertical-align: middle; }
+
+/* Home scroll-reveal (only active when JS adds html.sdj-motion). */
+@media (prefers-reduced-motion: no-preference) {
+  html.sdj-motion .sdj-home .hextra-feature-card,
+  html.sdj-motion .sdj-home .sdj-shot-wrap,
+  html.sdj-motion .sdj-home .sdj-section-label,
+  html.sdj-motion .sdj-home .hextra-code-block {
+    opacity: 0;
+    transform: translateY(18px);
+    transition: opacity 0.55s ease, transform 0.55s ease;
+    will-change: opacity, transform;
+  }
+  html.sdj-motion .sdj-home .sdj-in {
+    opacity: 1 !important;
+    transform: none !important;
+  }
+}
+
+/* ---- Home: code sample + section styling (hextra-home isn't .content) ----- */
+.sdj-home { width: 100%; }
+.sdj-home > * { width: 100%; }
+.sdj-home .sdj-hero-buttons {
+  display: flex; gap: 0.75rem; flex-wrap: wrap; justify-content: center; margin: 0.5rem 0 1.75rem;
+}
+.sdj-home .highlight,
+.sdj-home pre {
+  max-width: 720px;
+  margin: 0 auto;
+  text-align: left;
+}
+.sdj-home .highlight > pre,
+.sdj-home pre > code {
+  display: block;
+  background: #0f172a;
+  color: #e2e8f0;
+  border: 1px solid rgba(148,163,184,0.25);
+  border-radius: 12px;
+  padding: 1.1rem 1.25rem;
+  overflow-x: auto;
+  font-size: 0.86rem;
+  line-height: 1.55;
+}
+.sdj-home .hextra-code-block { max-width: 720px; margin: 0 auto; text-align: left; }
+.sdj-home .sdj-section-label {
+  font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.1em;
+  font-weight: 700; color: var(--sdj-accent); margin: 3.5rem 0 0.5rem;
+}
+.sdj-home .sdj-shot-wrap { max-width: 960px; margin: 1.25rem auto 0; }
+.sdj-home .sdj-shot-wrap img { width: 100%; height: auto; }
+.sdj-home .sdj-quietlink { display:inline-block; margin-top: 0.75rem; font-size: 0.9rem; color: var(--sdj-accent); text-decoration: none; }
+.sdj-home .sdj-quietlink:hover { text-decoration: underline; }
+.sdj-home .hextra-feature-grid { margin-top: 1rem; }
+
+/* ---- Doc figures (themed screenshots) ------------------------------------ */
+.sdj-fig { margin: 1.75rem 0; }
+/* width only — let hx:block/hx:hidden drive the light/dark swap (see .sdj-window img) */
+.sdj-fig .sdj-shot { width: 100%; height: auto; vertical-align: middle; }
+.sdj-fig figcaption {
+  margin-top: 0.6rem; font-size: 0.82rem; line-height: 1.4;
+  color: #64748b; text-align: center;
+}
+.dark .sdj-fig figcaption { color: #94a3b8; }
+
+/* ---- Mobile niceties ----------------------------------------------------- */
+@media (max-width: 768px) {
+  .content :where(p, ul, ol, blockquote) { max-width: 100%; }
+  .content :where(table) { box-shadow: inset -14px 0 10px -12px rgba(15,23,42,0.25); }
+  .sdj-footer { gap: 2rem; }
+}

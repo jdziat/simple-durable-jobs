@@ -1,0 +1,11 @@
+{
+  "name": "Simple Durable Jobs",
+  "short_name": "Durable Jobs",
+  "icons": [
+    { "src": "/simple-durable-jobs/favicon-32x32.png", "sizes": "32x32", "type": "image/png" },
+    { "src": "/simple-durable-jobs/apple-touch-icon.png", "sizes": "180x180", "type": "image/png" }
+  ],
+  "theme_color": "#4f46e5",
+  "background_color": "#0b0b0d",
+  "display": "standalone"
+}
