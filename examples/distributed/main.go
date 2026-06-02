@@ -26,8 +26,10 @@ func main() {
 	numJobs := flag.Int("jobs", 10, "Number of jobs to enqueue")
 	flag.Parse()
 
-	// Setup database (use PostgreSQL in production for better concurrency)
-	db, err := gorm.Open(sqlite.Open("distributed.db?_journal_mode=WAL"), &gorm.Config{})
+	// Setup database (use PostgreSQL in production for better concurrency).
+	// busy_timeout + immediate transactions complete the WAL config so concurrent
+	// workers don't hit transient SQLITE_BUSY/SQLITE_READONLY on completion writes.
+	db, err := gorm.Open(sqlite.Open("distributed.db?_journal_mode=WAL&_busy_timeout=5000&_txlock=immediate"), &gorm.Config{})
 	if err != nil {
 		log.Fatal(err)
 	}

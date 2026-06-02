@@ -25,7 +25,7 @@ import (
 )
 
 func main() {
-    db, _ := gorm.Open(sqlite.Open("jobs.db"), &gorm.Config{})
+    db, _ := gorm.Open(sqlite.Open("jobs.db?_journal_mode=WAL&_busy_timeout=5000&_txlock=immediate"), &gorm.Config{})
     storage := jobs.NewGormStorage(db)
     storage.Migrate(context.Background())
     queue := jobs.New(storage)
