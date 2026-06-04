@@ -15,8 +15,8 @@ local development. Conceptually inspired by [River](https://riverqueue.com/) and
 An **in-process, embeddable** job system: import a package, point it at a GORM
 database, register handlers, run workers. No separate server, broker, or control
 plane to operate. You get durable background jobs, checkpointed multi-step
-workflows, fan-out/fan-in, scheduling, and an optional embedded dashboard — in
-one dependency.
+workflows, fan-out/fan-in, durable signals, scheduling, and an optional embedded
+dashboard — in one dependency.
 
 ### When to choose it
 
@@ -26,7 +26,7 @@ one dependency.
   footprint.
 
 Reach for **Temporal** instead if you need full deterministic workflow replay,
-signals/queries, and versioning at scale; for **River** if you want a
+workflow queries, and versioning at scale; for **River** if you want a
 Postgres-only, single-purpose job queue with a larger team behind it. This
 library deliberately trades some of that surface area for "one import, your
 existing database."

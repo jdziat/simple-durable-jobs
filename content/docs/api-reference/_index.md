@@ -10,6 +10,7 @@ Complete API documentation for Simple Durable Jobs, split by area. Use the **sea
   {{< card link="queue/" title="Queue" icon="collection" subtitle="New, Register, Enqueue, Schedule, NewWorker, context helpers." >}}
   {{< card link="worker/" title="Worker" icon="cog" subtitle="Start, pause/resume, concurrency, scheduler, stale-lock, retry." >}}
   {{< card link="workflows/" title="Durable Workflows & Fan-Out" icon="refresh" subtitle="Call, checkpoints, FanOut, SubJob, result helpers, strategies." >}}
+  {{< card link="signals/" title="Workflow Signals" icon="bell" subtitle="Signal, WaitForSignal, WaitForSignalTimeout, CheckSignal, DrainSignals." >}}
   {{< card link="job-options/" title="Job Options" icon="adjustments" subtitle="Priority, Retries, Delay, At, Queue, Unique, Timeout, Determinism." >}}
   {{< card link="types/" title="Types" icon="cube" subtitle="Job, JobStatus, Result, RetryConfig, SubJobFailure, error variables." >}}
   {{< card link="scheduling/" title="Scheduling" icon="clock" subtitle="Every, Daily, Weekly, Cron." >}}

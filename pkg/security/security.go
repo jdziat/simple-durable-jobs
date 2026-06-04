@@ -35,6 +35,10 @@ const (
 	// MaxUniqueKeyLength is the maximum length for unique keys
 	MaxUniqueKeyLength = 255
 
+	// MaxSignalNameLength is the maximum length for signal names. It matches the
+	// signals.name column size; keep the two in sync.
+	MaxSignalNameLength = 255
+
 	// maxErrorMessageInputLength bounds sanitization work for very large errors.
 	maxErrorMessageInputLength = MaxErrorMessageLength * 4
 )

@@ -40,6 +40,7 @@ import (
 	"github.com/jdziat/simple-durable-jobs/pkg/queue"
 	"github.com/jdziat/simple-durable-jobs/pkg/schedule"
 	"github.com/jdziat/simple-durable-jobs/pkg/security"
+	"github.com/jdziat/simple-durable-jobs/pkg/signal"
 	"github.com/jdziat/simple-durable-jobs/pkg/storage"
 	"github.com/jdziat/simple-durable-jobs/pkg/worker"
 )
@@ -91,6 +92,9 @@ type (
 
 	// CheckpointSaved is emitted when a checkpoint is saved.
 	CheckpointSaved = core.CheckpointSaved
+
+	// SignalDelivered is emitted when a signal is persisted for a job.
+	SignalDelivered = core.SignalDelivered
 
 	// NoRetryError indicates an error that should not be retried.
 	NoRetryError = core.NoRetryError
@@ -213,6 +217,7 @@ const (
 	MaxErrorMessageLength = security.MaxErrorMessageLength
 	MaxQueueNameLength    = security.MaxQueueNameLength
 	MaxUniqueKeyLength    = security.MaxUniqueKeyLength
+	MaxSignalNameLength   = security.MaxSignalNameLength
 )
 
 // Error variables
@@ -234,6 +239,8 @@ var (
 	ErrJobNotFound         = core.ErrJobNotFound
 	ErrNoResult            = core.ErrNoResult
 	ErrCannotRequeueSubJob = core.ErrCannotRequeueSubJob
+	ErrSignalNameTooLong   = core.ErrSignalNameTooLong
+	ErrStorageNoSignals    = core.ErrStorageNoSignals
 )
 
 // Default values
@@ -656,6 +663,93 @@ func Requeue(ctx context.Context, q *Queue, jobID string) (bool, error) {
 		return false, fmt.Errorf("jobs: storage backend does not support Requeue")
 	}
 	return r.Requeue(ctx, jobID)
+}
+
+// Signal delivers a named signal carrying payload to a job (workflow). The
+// signal is buffered durably, so it is not lost if sent before the handler
+// waits for it; and if the target job is currently waiting on a signal, this
+// resumes it promptly (a recovery poll is the backstop). Delivery is FIFO per
+// (job, name).
+//
+// The handler receives signals with WaitForSignal / WaitForSignalTimeout /
+// CheckSignal / DrainSignals. Returns ErrJobNotFound if the job does not exist,
+// ErrStorageNoSignals if the backend lacks signal support, or ErrSignalNameTooLong.
+func Signal(ctx context.Context, q *Queue, jobID, name string, payload any) error {
+	if name == "" {
+		return fmt.Errorf("jobs: signal name must not be empty")
+	}
+	if len(name) > MaxSignalNameLength {
+		return core.ErrSignalNameTooLong
+	}
+	type signalSender interface {
+		SendSignal(ctx context.Context, jobID, name string, payload []byte) error
+	}
+	sender, ok := q.Storage().(signalSender)
+	if !ok {
+		return core.ErrStorageNoSignals
+	}
+
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("jobs: marshal signal payload: %w", err)
+	}
+	if len(data) > security.MaxResultSize {
+		return fmt.Errorf("jobs: signal %q payload is %d bytes, limit is %d", name, len(data), security.MaxResultSize)
+	}
+
+	job, err := q.Storage().GetJob(ctx, jobID)
+	if err != nil {
+		return err
+	}
+	if job == nil {
+		return fmt.Errorf("%w: %s", core.ErrJobNotFound, jobID)
+	}
+
+	if err := sender.SendSignal(ctx, jobID, name, data); err != nil {
+		return err
+	}
+	q.Emit(&core.SignalDelivered{JobID: jobID, Name: name, Timestamp: time.Now()})
+
+	// Fast path: wake a job that's currently waiting. ResumeSignalWaitingJob
+	// matches StatusWaiting only (its WHERE guard closes the TOCTOU where the job
+	// is paused between the GetJob read above and the resume), so a producer can
+	// never un-pause an operator-paused job. The signal-resume poll backstops the
+	// deliver-vs-suspend race for anything this fast path misses.
+	if job.Status == core.StatusWaiting {
+		type signalResumer interface {
+			ResumeSignalWaitingJob(ctx context.Context, jobID string) (bool, error)
+		}
+		if r, ok := q.Storage().(signalResumer); ok {
+			if _, err := r.ResumeSignalWaitingJob(ctx, jobID); err != nil {
+				return fmt.Errorf("jobs: signal sent but resume failed (poll will recover): %w", err)
+			}
+		}
+	}
+	return nil
+}
+
+// WaitForSignal consumes the oldest pending signal of name from within a job
+// handler, suspending the job until one arrives. See pkg/signal.
+func WaitForSignal[T any](ctx context.Context, name string) (T, error) {
+	return signal.WaitForSignal[T](ctx, name)
+}
+
+// WaitForSignalTimeout is WaitForSignal with a deadline: returns (zero, false)
+// if no signal arrives within d.
+func WaitForSignalTimeout[T any](ctx context.Context, name string, d time.Duration) (T, bool, error) {
+	return signal.WaitForSignalTimeout[T](ctx, name, d)
+}
+
+// CheckSignal reports the oldest pending signal of name without consuming it
+// (non-blocking). Returns (zero, false) when none is pending.
+func CheckSignal[T any](ctx context.Context, name string) (T, bool, error) {
+	return signal.CheckSignal[T](ctx, name)
+}
+
+// DrainSignals consumes and returns all currently-pending signals of name
+// (non-blocking), in FIFO order.
+func DrainSignals[T any](ctx context.Context, name string) ([]T, error) {
+	return signal.DrainSignals[T](ctx, name)
 }
 
 // LoadResult decodes the persisted return value of a completed job into T.

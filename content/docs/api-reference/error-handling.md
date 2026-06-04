@@ -1,6 +1,6 @@
 ---
 title: "Error Handling"
-weight: 8
+weight: 9
 ---
 
 ### `NoRetry(err error) error`

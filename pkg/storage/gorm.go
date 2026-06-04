@@ -119,6 +119,7 @@ func (s *GormStorage) Migrate(ctx context.Context) error {
 			&core.QueueState{},
 			&core.ScheduledFire{},
 			&core.Lease{},
+			&core.Signal{},
 			&core.SchemaMigration{},
 		); err != nil {
 			return err
@@ -1336,13 +1337,38 @@ func (s *GormStorage) SuspendJob(ctx context.Context, jobID string, workerID str
 // Returns (true, nil) if resumed, (false, nil) if job was not in a resumable status.
 func (s *GormStorage) ResumeJob(ctx context.Context, jobID string) (bool, error) {
 	// Accept both waiting and paused status — paused jobs should also be
-	// resumable when their fan-out completes.
+	// resumable when their fan-out completes. run_at is deliberately left
+	// untouched so a delayed job that was paused before its run_at and then
+	// resumed still honors its original schedule. (Signal-waiting jobs use
+	// ResumeSignalWaitingJob instead, which clears the timeout wake deadline.)
 	result := s.db.WithContext(ctx).
 		Model(&core.Job{}).
 		Where("id = ? AND status IN (?, ?)", jobID, core.StatusWaiting, core.StatusPaused).
 		Updates(map[string]any{
 			"status":     core.StatusPending,
 			"attempt":    gorm.Expr("CASE WHEN attempt > 0 THEN attempt - 1 ELSE 0 END"),
+			"updated_at": time.Now(),
+		})
+	if result.Error != nil {
+		return false, result.Error
+	}
+	return result.RowsAffected > 0, nil
+}
+
+// ResumeSignalWaitingJob resumes a job that is waiting on a signal. Unlike the
+// general ResumeJob it matches StatusWaiting ONLY (never paused — a producer
+// must not be able to un-pause an operator-paused job), and it clears run_at:
+// WaitForSignalTimeout parks a future run_at as its wake deadline, so when a
+// signal arrives early the resume must not leave a future run_at that would
+// block Dequeue until that deadline. Returns whether a row was resumed.
+func (s *GormStorage) ResumeSignalWaitingJob(ctx context.Context, jobID string) (bool, error) {
+	result := s.db.WithContext(ctx).
+		Model(&core.Job{}).
+		Where("id = ? AND status = ?", jobID, core.StatusWaiting).
+		Updates(map[string]any{
+			"status":     core.StatusPending,
+			"attempt":    gorm.Expr("CASE WHEN attempt > 0 THEN attempt - 1 ELSE 0 END"),
+			"run_at":     nil,
 			"updated_at": time.Now(),
 		})
 	if result.Error != nil {

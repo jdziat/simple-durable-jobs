@@ -13,7 +13,6 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/jdziat/simple-durable-jobs/pkg/core"
-	"github.com/jdziat/simple-durable-jobs/pkg/fanout"
 	intctx "github.com/jdziat/simple-durable-jobs/pkg/internal/context"
 	"github.com/jdziat/simple-durable-jobs/pkg/internal/handler"
 	"github.com/jdziat/simple-durable-jobs/pkg/queue"
@@ -67,6 +66,17 @@ type completeWithResultStorage interface {
 
 type failTerminalWithResultStorage interface {
 	FailTerminalWithResult(ctx context.Context, jobID, workerID, errMsg string) (*core.FanOut, error)
+}
+
+// signalResumeStorage is implemented by backends that buffer signals; the
+// recovery poll uses it to wake jobs whose awaited signal has arrived or whose
+// wait deadline has passed. Optional — backends without it simply don't poll.
+type signalResumeStorage interface {
+	GetSignalWaitingJobsToResume(ctx context.Context) ([]*core.Job, error)
+	// ResumeSignalWaitingJob resumes a waiting (never paused) job and clears its
+	// timeout wake deadline. Distinct from ResumeJob so the signal backstop can't
+	// un-pause an operator-paused job or strip a delayed job's schedule.
+	ResumeSignalWaitingJob(ctx context.Context, jobID string) (bool, error)
 }
 
 // recoveryLeaser is implemented by storage backends that can elect a single
@@ -461,9 +471,10 @@ func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 	}
 
 	if err != nil {
-		// Check for WaitingError - job is waiting for sub-jobs
-		if fanout.IsWaitingError(err) {
-			w.logger.Info("job waiting for sub-jobs", "job_id", job.ID)
+		// Self-suspension signal — the handler moved its job to StatusWaiting
+		// (fan-out or signal wait) and returned. Not a failure: just stop.
+		if core.IsWaiting(err) {
+			w.logger.Info("job waiting", "job_id", job.ID)
 			cancelHeartbeat()
 			// Job is already in StatusWaiting; just return
 			return
@@ -661,8 +672,8 @@ func (w *Worker) executeHandler(ctx context.Context, job *core.Job, h *handler.H
 			// Check if the panicked value is an error - preserve type for special errors
 			// like WaitingError that need type-based detection
 			if e, ok := r.(error); ok {
-				// Check if this is a waiting signal (expected behavior from fan-out)
-				if fanout.IsWaitingError(e) {
+				// Self-suspension signal raised via panic (fan-out or signal wait)
+				if core.IsWaiting(e) {
 					// Don't log as panic - this is expected behavior
 					w.logger.Debug("job handler signaled waiting via panic",
 						"job_id", job.ID,
@@ -1207,6 +1218,36 @@ func (w *Worker) pollWaitingJobsOnce(ctx context.Context) {
 			w.logger.Error("failed to resume stalled fan-out parent after retries", "job_id", job.ID, "error", resumeErr)
 		} else {
 			w.logger.Info("resumed stalled fan-out parent via polling fallback", "job_id", job.ID)
+		}
+	}
+
+	// Resume jobs waiting on a signal that has arrived (or whose timeout wake
+	// deadline has passed). This is the backstop for the deliver-vs-suspend
+	// race — a signal delivered just before SuspendJob commits would otherwise
+	// miss the event-driven resume and leave the job waiting forever.
+	if sr, ok := w.queue.Storage().(signalResumeStorage); ok {
+		var sigWaiting []*core.Job
+		err = retryWithBackoff(ctx, *w.config.StorageRetry, func() error {
+			var queryErr error
+			sigWaiting, queryErr = sr.GetSignalWaitingJobsToResume(ctx)
+			return queryErr
+		})
+		if err != nil {
+			if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+				w.logger.Error("failed to get signal-waiting jobs after retries", "error", err)
+			}
+			return
+		}
+		for _, job := range sigWaiting {
+			resumeErr := retryWithBackoff(ctx, *w.config.StorageRetry, func() error {
+				_, err := sr.ResumeSignalWaitingJob(ctx, job.ID)
+				return err
+			})
+			if resumeErr != nil {
+				w.logger.Error("failed to resume signal-waiting job after retries", "job_id", job.ID, "error", resumeErr)
+			} else {
+				w.logger.Info("resumed signal-waiting job via polling fallback", "job_id", job.ID)
+			}
 		}
 	}
 }

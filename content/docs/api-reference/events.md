@@ -1,6 +1,6 @@
 ---
 title: "Events & Hooks"
-weight: 7
+weight: 8
 ---
 
 ## Events

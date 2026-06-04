@@ -1,6 +1,6 @@
 ---
 title: "Scheduling"
-weight: 6
+weight: 7
 ---
 
 ## Schedules

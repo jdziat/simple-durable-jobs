@@ -194,8 +194,11 @@ func (s *GormStorage) RetryJob(ctx context.Context, jobID string) (*core.Job, er
 // DeleteJob permanently removes a job from the database.
 func (s *GormStorage) DeleteJob(ctx context.Context, jobID string) error {
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		// Delete checkpoints first
+		// Delete checkpoints and any buffered signals first
 		if err := tx.Where("job_id = ?", jobID).Delete(&core.Checkpoint{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("job_id = ?", jobID).Delete(&core.Signal{}).Error; err != nil {
 			return err
 		}
 		return tx.Where("id = ?", jobID).Delete(&core.Job{}).Error
