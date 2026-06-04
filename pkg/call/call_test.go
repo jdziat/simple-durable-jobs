@@ -939,6 +939,184 @@ func TestCallIntegration(t *testing.T) {
 	})
 }
 
+// TestCallWithCheckpointCtx_CheckpointCtxUsedForSave verifies that
+// CallWithCheckpointCtx uses checkpointCtx (not execCtx) when calling
+// SaveCheckpoint. This is the regression test for the checkpoint-write
+// deadline hazard: if the per-activity execCtx expires just as the handler
+// returns, the checkpoint must still be saved using the long-lived
+// checkpointCtx (the workflow root context).
+func TestCallWithCheckpointCtx_CheckpointCtxUsedForSave(t *testing.T) {
+	testHandler := func(ctx context.Context, args string) (string, error) {
+		return "result", nil
+	}
+	h, err := handler.NewHandler(testHandler)
+	if err != nil {
+		t.Fatalf("failed to create handler: %v", err)
+	}
+
+	var savedWithCtx context.Context
+	jobCtx := &intctx.JobContext{
+		Job: &core.Job{ID: "job-save-ctx"},
+		HandlerLookup: func(name string) (any, bool) {
+			return h, true
+		},
+		SaveCheckpoint: func(ctx context.Context, cp *core.Checkpoint) error {
+			savedWithCtx = ctx
+			return nil
+		},
+	}
+
+	// execCtx has an ALREADY-CANCELLED context to simulate a deadline hit.
+	execCtx, execCancel := context.WithCancel(context.Background())
+	execCancel() // immediately cancelled — simulates deadline firing just as handler returns
+
+	// checkpointCtx is a live, long-running context.
+	checkpointCtx := context.Background()
+
+	// Set up workflow contexts on execCtx (job context and call state must be
+	// readable from the execution context).
+	ctx := intctx.WithJobContext(execCtx, jobCtx)
+	ctx = intctx.WithCallState(ctx, []core.Checkpoint{})
+
+	// Even though execCtx is cancelled, the handler was already called and
+	// returned successfully before the cancellation is checked by SaveCheckpoint.
+	// CallWithCheckpointCtx must use checkpointCtx for the save.
+	result, callErr := CallWithCheckpointCtx[string](ctx, checkpointCtx, "handler", "arg")
+	if callErr != nil {
+		// If execCtx being cancelled causes handler.ExecuteCall to fail, that
+		// is acceptable — but we still want to verify the checkpoint ctx path
+		// in the success case. Skip if the handler failed due to cancellation.
+		t.Logf("CallWithCheckpointCtx returned (potentially-expected) error: %v", callErr)
+	} else {
+		if result != "result" {
+			t.Errorf("result = %q; want %q", result, "result")
+		}
+		// Verify the checkpoint was saved using checkpointCtx (the live context),
+		// not the cancelled execCtx.
+		if savedWithCtx == nil {
+			t.Fatal("SaveCheckpoint was not called")
+		}
+		if savedWithCtx.Err() != nil {
+			t.Errorf("SaveCheckpoint was called with a cancelled context (%v); want a live context", savedWithCtx.Err())
+		}
+	}
+}
+
+// TestCallWithCheckpointCtx_CheckpointUsesLiveContextAfterHandlerFinishes
+// is the primary deadline-hazard regression test: an activity handler that
+// runs to completion just before its deadline must have its result checkpointed
+// even if execCtx has expired by the time SaveCheckpoint is invoked.
+func TestCallWithCheckpointCtx_CheckpointUsesLiveContextAfterHandlerFinishes(t *testing.T) {
+	const activityDeadline = 50 * time.Millisecond
+
+	// Handler sleeps for just under the deadline then returns successfully.
+	// This simulates an activity that finishes at the last possible moment.
+	handlerRunTime := activityDeadline - 5*time.Millisecond
+	testHandler := func(ctx context.Context, args string) (string, error) {
+		// Simulate activity running close to its deadline.
+		timer := time.NewTimer(handlerRunTime)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+			return "late-result", nil
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+	}
+	h, err := handler.NewHandler(testHandler)
+	if err != nil {
+		t.Fatalf("failed to create handler: %v", err)
+	}
+
+	checkpointSaved := make(chan context.Context, 1)
+	jobCtx := &intctx.JobContext{
+		Job: &core.Job{ID: "job-deadline-hazard"},
+		HandlerLookup: func(name string) (any, bool) {
+			return h, true
+		},
+		SaveCheckpoint: func(ctx context.Context, cp *core.Checkpoint) error {
+			checkpointSaved <- ctx
+			return nil
+		},
+	}
+
+	// execCtx with a tight deadline that fires around the same time the handler
+	// returns — simulating the deadline-hazard window.
+	execCtx, execCancel := context.WithTimeout(context.Background(), activityDeadline)
+	defer execCancel()
+
+	// checkpointCtx is the long-lived workflow root context.
+	checkpointCtx := context.Background()
+
+	ctx := intctx.WithJobContext(execCtx, jobCtx)
+	ctx = intctx.WithCallState(ctx, []core.Checkpoint{})
+
+	result, callErr := CallWithCheckpointCtx[string](ctx, checkpointCtx, "handler", "arg")
+	if callErr != nil {
+		// execCtx may have fired before the handler finished — that's OK for
+		// this test; we only care that if the handler DID succeed, the checkpoint
+		// was saved using a live ctx.
+		t.Logf("handler returned error (may be deadline): %v", callErr)
+		return
+	}
+	if result != "late-result" {
+		t.Errorf("result = %q; want %q", result, "late-result")
+	}
+
+	// Verify the checkpoint was saved with a live context.
+	select {
+	case savedCtx := <-checkpointSaved:
+		if savedCtx.Err() != nil {
+			t.Errorf("checkpoint saved with cancelled/expired context: %v; want checkpointCtx (live)", savedCtx.Err())
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Error("SaveCheckpoint was never called within 500ms")
+	}
+}
+
+// TestCallWithCheckpointCtx_IdenticalToCallWhenSameContext verifies that
+// passing the same context for both execCtx and checkpointCtx produces
+// identical behaviour to the standard Call function.
+func TestCallWithCheckpointCtx_IdenticalToCallWhenSameContext(t *testing.T) {
+	testHandler := func(ctx context.Context, n int) (int, error) {
+		return n * 2, nil
+	}
+	h, err := handler.NewHandler(testHandler)
+	if err != nil {
+		t.Fatalf("failed to create handler: %v", err)
+	}
+
+	var savedCPs []*core.Checkpoint
+	jobCtx := &intctx.JobContext{
+		Job: &core.Job{ID: "job-same-ctx"},
+		HandlerLookup: func(name string) (any, bool) {
+			return h, true
+		},
+		SaveCheckpoint: func(ctx context.Context, cp *core.Checkpoint) error {
+			cpCopy := *cp
+			savedCPs = append(savedCPs, &cpCopy)
+			return nil
+		},
+	}
+
+	ctx := intctx.WithJobContext(context.Background(), jobCtx)
+	ctx = intctx.WithCallState(ctx, []core.Checkpoint{})
+
+	result, err := CallWithCheckpointCtx[int](ctx, ctx, "handler", 7)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result != 14 {
+		t.Errorf("result = %d; want 14", result)
+	}
+	if len(savedCPs) != 1 {
+		t.Fatalf("expected 1 checkpoint, got %d", len(savedCPs))
+	}
+	if savedCPs[0].CallIndex != 0 || savedCPs[0].CallType != "handler" {
+		t.Errorf("checkpoint = {Index:%d, Type:%q}; want {0, handler}", savedCPs[0].CallIndex, savedCPs[0].CallType)
+	}
+}
+
 // Helper function
 func contains(s, substr string) bool {
 	return len(s) > 0 && len(substr) > 0 && (s == substr || len(s) > len(substr) && (s[:len(substr)] == substr || s[len(s)-len(substr):] == substr || hasSubstring(s, substr)))

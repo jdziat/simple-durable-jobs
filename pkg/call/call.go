@@ -34,14 +34,32 @@ import (
 // Requesting a concrete result type from an error-only handler returns a
 // non-retryable error.
 func Call[T any](ctx context.Context, name string, args any) (T, error) {
+	return CallWithCheckpointCtx[T](ctx, ctx, name, args)
+}
+
+// CallWithCheckpointCtx is like Call but accepts separate contexts for
+// handler execution and checkpoint persistence.
+//
+// execCtx governs the nested handler call — cancellation and deadline from
+// execCtx propagate to the activity. checkpointCtx is used only for the
+// SaveCheckpoint write after the handler returns. Separating the two allows
+// callers to apply a per-activity deadline (via execCtx) while ensuring the
+// checkpoint write always uses a long-lived context (checkpointCtx = the
+// workflow's root context) so a deadline hit at the end of a long activity
+// does not cause a successful result to be lost.
+//
+// When execCtx == checkpointCtx the behaviour is identical to Call.
+func CallWithCheckpointCtx[T any](execCtx, checkpointCtx context.Context, name string, args any) (T, error) {
 	var zero T
 
-	jc := intctx.GetJobContext(ctx)
+	// Retrieve job context and call state from execCtx (the execution context
+	// carries the workflow state injected by the worker).
+	jc := intctx.GetJobContext(execCtx)
 	if jc == nil {
 		return zero, fmt.Errorf("jobs.Call must be used within a job handler")
 	}
 
-	cs := intctx.GetCallState(ctx)
+	cs := intctx.GetCallState(execCtx)
 	if cs == nil {
 		return zero, fmt.Errorf("jobs.Call: call state not initialized")
 	}
@@ -88,7 +106,8 @@ func Call[T any](ctx context.Context, name string, args any) (T, error) {
 		}
 	}
 
-	// Execute the nested call
+	// Execute the nested call using execCtx so deadline/cancellation applies to
+	// the handler, not to the checkpoint write.
 	h, ok := jc.HandlerLookup(name)
 	if !ok {
 		return zero, fmt.Errorf("no handler registered for %q", name)
@@ -107,9 +126,12 @@ func Call[T any](ctx context.Context, name string, args any) (T, error) {
 		return zero, fmt.Errorf("%w: call %q arguments are %d bytes, limit is %d", core.ErrJobArgsTooLarge, name, len(argsBytes), security.MaxJobArgsSize)
 	}
 
-	result, err := handler.ExecuteCall[T](ctx, hnd, args)
+	result, err := handler.ExecuteCall[T](execCtx, hnd, args)
 
-	// Save checkpoint
+	// Save checkpoint using checkpointCtx. When checkpointCtx != execCtx the
+	// caller has provided a longer-lived context (e.g. the workflow root) so
+	// the write succeeds even if execCtx's deadline fired just after the handler
+	// returned.
 	cp := &core.Checkpoint{
 		ID:        uuid.New().String(),
 		JobID:     jc.Job.ID,
@@ -134,7 +156,7 @@ func Call[T any](ctx context.Context, name string, args any) (T, error) {
 		cp.Result = resultBytes
 	}
 
-	if saveErr := jc.SaveCheckpoint(ctx, cp); saveErr != nil {
+	if saveErr := jc.SaveCheckpoint(checkpointCtx, cp); saveErr != nil {
 		return zero, fmt.Errorf("failed to save checkpoint: %w", saveErr)
 	}
 
