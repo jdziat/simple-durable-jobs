@@ -21,6 +21,12 @@ import (
 const (
 	defaultLockDuration = 45 * time.Minute
 	maxResumeBatch      = 100
+	// maxFanOutTreeDepth bounds the fan-out subtree walk in Requeue. Real
+	// workflows nest only a few levels; this is insurance against pathologically
+	// deep (or cyclically corrupt) data, not a normal limit. Per-level deletion
+	// already makes a cycle impossible to loop on (visited rows are gone), so
+	// this is belt-and-suspenders.
+	maxFanOutTreeDepth = 256
 )
 
 // GormStorageOption configures a GormStorage.
@@ -1362,8 +1368,9 @@ func (s *GormStorage) ResumeJob(ctx context.Context, jobID string) (bool, error)
 //
 // A fan-out sub-job cannot be requeued directly (it would double-count its
 // parent); ErrCannotRequeueSubJob is returned in that case. Requeuing a fan-out
-// PARENT deletes its old fan-out records and their sub-jobs so the replay
-// re-dispatches a fresh batch instead of orphaning the old one.
+// PARENT deletes its entire fan-out subtree — every descendant fan-out record,
+// sub-job, and their checkpoints, at any nesting depth — so the replay
+// re-dispatches a fresh tree instead of orphaning the old one.
 //
 // Returns true if a job was requeued, false if it was not found or not in a
 // requeuable (failed/cancelled) state.
@@ -1412,30 +1419,70 @@ func (s *GormStorage) Requeue(ctx context.Context, jobID string) (bool, error) {
 				return err
 			}
 
-			// If this job is a fan-out parent, delete its old fan-out batch
-			// (records + sub-jobs) so the replay's FanOut() re-dispatches a
-			// fresh batch rather than leaving orphaned rows and stale counters.
-			var fanOutIDs []string
-			if err := tx.Model(&core.FanOut{}).
-				Where("parent_job_id = ?", jobID).
-				Pluck("id", &fanOutIDs).Error; err != nil {
-				return err
-			}
-			if len(fanOutIDs) > 0 {
-				if err := tx.Where("fan_out_id IN ?", fanOutIDs).Delete(&core.Job{}).Error; err != nil {
-					return err
-				}
-				if err := tx.Where("parent_job_id = ?", jobID).Delete(&core.FanOut{}).Error; err != nil {
-					return err
-				}
-			}
-			return nil
+			// If this job is a fan-out parent, delete its entire fan-out
+			// subtree (records + sub-jobs + their checkpoints, at every depth)
+			// so the replay's FanOut() re-dispatches a fresh tree rather than
+			// leaving orphaned rows and stale counters — including under nested
+			// workflows where a sub-job is itself a fan-out parent.
+			return s.deleteFanOutSubtree(tx, jobID)
 		})
 	})
 	if err != nil {
 		return false, err
 	}
 	return requeued, nil
+}
+
+// deleteFanOutSubtree deletes the entire fan-out tree rooted at rootJobID: every
+// fan-out it spawned directly or transitively, all of those sub-jobs, and their
+// checkpoints. The root job row itself is NOT touched. Used by Requeue so
+// replaying a parent re-dispatches a fresh tree instead of orphaning the old one
+// at any depth (a sub-job may itself be a fan-out parent).
+//
+// It descends level by level, deleting each level before expanding the next.
+// parent_job_id/fan_out_id are plain columns (no FK), so a child fan-out is
+// still findable by its (now-deleted) parent sub-job's id; and because each
+// level's rows are deleted as it is visited, even cyclically corrupt data cannot
+// loop (the depth cap is just extra insurance). IN-lists stay bounded to one
+// level's width rather than the whole tree.
+func (s *GormStorage) deleteFanOutSubtree(tx *gorm.DB, rootJobID string) error {
+	frontier := []string{rootJobID}
+	for depth := 0; len(frontier) > 0 && depth < maxFanOutTreeDepth; depth++ {
+		var fanOutIDs []string
+		if err := tx.Model(&core.FanOut{}).
+			Where("parent_job_id IN ?", frontier).
+			Pluck("id", &fanOutIDs).Error; err != nil {
+			return err
+		}
+		if len(fanOutIDs) == 0 {
+			return nil // reached the leaves
+		}
+
+		var subJobIDs []string
+		if err := tx.Model(&core.Job{}).
+			Where("fan_out_id IN ?", fanOutIDs).
+			Pluck("id", &subJobIDs).Error; err != nil {
+			return err
+		}
+
+		if len(subJobIDs) > 0 {
+			if err := tx.Where("job_id IN ?", subJobIDs).Delete(&core.Checkpoint{}).Error; err != nil {
+				return err
+			}
+			if err := tx.Where("id IN ?", subJobIDs).Delete(&core.Job{}).Error; err != nil {
+				return err
+			}
+		}
+		if err := tx.Where("id IN ?", fanOutIDs).Delete(&core.FanOut{}).Error; err != nil {
+			return err
+		}
+
+		// Sub-jobs just deleted may themselves have spawned fan-outs; expand
+		// into them next. Their child fan-out rows are still present and remain
+		// findable by parent_job_id (a plain column).
+		frontier = subJobIDs
+	}
+	return nil
 }
 
 // GetWaitingJobsToResume finds waiting jobs whose fan-out is complete.

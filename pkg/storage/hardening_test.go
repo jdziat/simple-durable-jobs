@@ -86,7 +86,9 @@ func TestRequeue_FanOutHandling(t *testing.T) {
 	s := newTestStorage(t)
 	ctx := context.Background()
 
-	// Parent + a fan-out batch with two terminal sub-jobs.
+	// Parent → fo-1 → {sub-0, sub-1}; sub-0 is itself a nested fan-out parent
+	// → fo-2 → {grand-0, grand-1}. Requeuing the parent must clear the WHOLE
+	// subtree, including the grandchildren and their checkpoints.
 	require.NoError(t, s.db.WithContext(ctx).Create(&core.Job{
 		ID: "parent", Type: "wf", Queue: "default", Status: core.StatusFailed,
 	}).Error)
@@ -100,12 +102,36 @@ func TestRequeue_FanOutHandling(t *testing.T) {
 			Status: st, FanOutID: &foID, FanOutIndex: i,
 		}).Error)
 	}
+	// Nested level under sub-0.
+	require.NoError(t, s.CreateFanOut(ctx, &core.FanOut{
+		ID: "fo-2", ParentJobID: "sub-0", TotalCount: 2, CompletedCount: 2,
+	}))
+	fo2 := "fo-2"
+	// grand-0 failed (so the sub-job-rejection path is reachable), grand-1 done.
+	for i, st := range []core.JobStatus{core.StatusFailed, core.StatusCompleted} {
+		gid := fmt.Sprintf("grand-%d", i)
+		require.NoError(t, s.db.WithContext(ctx).Create(&core.Job{
+			ID: gid, Type: "wf.grand", Queue: "default",
+			Status: st, FanOutID: &fo2, FanOutIndex: i,
+		}).Error)
+		require.NoError(t, s.SaveCheckpoint(ctx, &core.Checkpoint{
+			JobID: gid, CallIndex: 0, CallType: "g", Result: []byte(`"ok"`),
+		}))
+	}
+
+	// An unrelated parent that must be left untouched.
+	require.NoError(t, s.db.WithContext(ctx).Create(&core.Job{
+		ID: "other", Type: "wf", Queue: "default", Status: core.StatusFailed,
+	}).Error)
+	require.NoError(t, s.CreateFanOut(ctx, &core.FanOut{ID: "fo-other", ParentJobID: "other", TotalCount: 1}))
 
 	// A sub-job cannot be requeued directly.
 	_, err := s.Requeue(ctx, "sub-1")
 	require.ErrorIs(t, err, core.ErrCannotRequeueSubJob)
+	_, err = s.Requeue(ctx, "grand-0")
+	require.ErrorIs(t, err, core.ErrCannotRequeueSubJob)
 
-	// Requeuing the parent resets it and clears the old fan-out batch.
+	// Requeuing the parent resets it and clears the whole fan-out subtree.
 	requeued, err := s.Requeue(ctx, "parent")
 	require.NoError(t, err)
 	assert.True(t, requeued)
@@ -116,10 +142,28 @@ func TestRequeue_FanOutHandling(t *testing.T) {
 
 	fos, err := s.GetFanOutsByParent(ctx, "parent")
 	require.NoError(t, err)
-	assert.Empty(t, fos, "old fan-out records cleared")
+	assert.Empty(t, fos, "level-1 fan-out records cleared")
 	subs, err := s.GetSubJobs(ctx, "fo-1")
 	require.NoError(t, err)
-	assert.Empty(t, subs, "old sub-jobs cleared")
+	assert.Empty(t, subs, "level-1 sub-jobs cleared")
+
+	// Nested level cleared too.
+	nestedFOs, err := s.GetFanOutsByParent(ctx, "sub-0")
+	require.NoError(t, err)
+	assert.Empty(t, nestedFOs, "nested fan-out records cleared")
+	grands, err := s.GetSubJobs(ctx, "fo-2")
+	require.NoError(t, err)
+	assert.Empty(t, grands, "grandchild sub-jobs cleared")
+	for i := 0; i < 2; i++ {
+		gcps, err := s.GetCheckpoints(ctx, fmt.Sprintf("grand-%d", i))
+		require.NoError(t, err)
+		assert.Empty(t, gcps, "grandchild checkpoints cleared")
+	}
+
+	// The unrelated parent is untouched.
+	otherFOs, err := s.GetFanOutsByParent(ctx, "other")
+	require.NoError(t, err)
+	assert.Len(t, otherFOs, 1, "unrelated parent's fan-out must be left intact")
 }
 
 // TestRequeue_ClearsCheckpoints verifies Requeue resets the job AND drops its

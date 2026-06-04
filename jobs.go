@@ -632,8 +632,8 @@ func IsSuspendError(err error) bool {
 // replays from the beginning (handlers must be idempotent regardless), which is
 // the safe behavior when the usual reason to requeue is a code or dependency
 // fix that changes the workflow's steps. Requeuing a fan-out parent also clears
-// its immediate sub-job batch so the replay re-dispatches cleanly (a sub-job
-// that is itself a nested fan-out parent is not recursed into).
+// its entire fan-out subtree (descendant fan-outs and sub-jobs at every depth,
+// including nested workflows) so the replay re-dispatches cleanly.
 //
 // Returns true if the job was requeued, false if it was not found or not in a
 // requeuable (failed/cancelled) state. Returns ErrCannotRequeueSubJob for a
