@@ -75,3 +75,20 @@ func TestWorker_StrictDeterminism_FailsOnDroppedCall(t *testing.T) {
 		})
 	}
 }
+
+// TestWithMaxRetryBackoff covers the option and the calculateBackoff cap.
+func TestWithMaxRetryBackoff(t *testing.T) {
+	var c WorkerConfig
+	WithMaxRetryBackoff(5 * time.Minute).ApplyWorker(&c)
+	assert.Equal(t, 5*time.Minute, c.MaxRetryBackoff)
+
+	// Non-positive is ignored (keeps the prior value).
+	WithMaxRetryBackoff(0).ApplyWorker(&c)
+	WithMaxRetryBackoff(-time.Second).ApplyWorker(&c)
+	assert.Equal(t, 5*time.Minute, c.MaxRetryBackoff)
+
+	// calculateBackoff honors the configured cap.
+	w := &Worker{config: WorkerConfig{MaxRetryBackoff: 5 * time.Minute}}
+	assert.Equal(t, 5*time.Minute, w.calculateBackoff(30), "large attempt clamps to the cap")
+	assert.Equal(t, time.Second, w.calculateBackoff(0), "first retry is 1s")
+}

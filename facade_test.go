@@ -670,3 +670,24 @@ func TestLoadResult_CompletedWithNilResult(t *testing.T) {
 	require.ErrorIs(t, err, jobs.ErrNoResult)
 	assert.Equal(t, "", got)
 }
+
+func TestRequeue_FacadeResetsFailedJob(t *testing.T) {
+	q, store := setupTestStorage(t)
+	ctx := context.Background()
+	require.NoError(t, store.Enqueue(ctx, &jobs.Job{
+		ID: "job-rq", Type: "x", Status: jobs.StatusFailed, LastError: "boom",
+	}))
+
+	ok, err := jobs.Requeue(ctx, q, "job-rq")
+	require.NoError(t, err)
+	assert.True(t, ok)
+
+	got, err := store.GetJob(ctx, "job-rq")
+	require.NoError(t, err)
+	assert.Equal(t, jobs.StatusPending, got.Status)
+
+	// A missing job is reported as not requeued, without error.
+	ok, err = jobs.Requeue(ctx, q, "does-not-exist")
+	require.NoError(t, err)
+	assert.False(t, ok)
+}

@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -12,6 +13,47 @@ import (
 
 	"github.com/jdziat/simple-durable-jobs/pkg/core"
 )
+
+// TestIsBenignDDLError covers the MySQL "already applied by a concurrent worker"
+// error classifier directly — it only fires on a real DDL race otherwise.
+func TestIsBenignDDLError(t *testing.T) {
+	for _, c := range []struct {
+		msg  string
+		want bool
+	}{
+		{"Error 1061 (42000): Duplicate key name 'idx_jobs_dequeue'", true},
+		{"Duplicate key name 'idx'", true},
+		{"Error 1060 (42S21): Duplicate column name 'active_unique_key'", true},
+		{"Duplicate column name 'x'", true},
+		{"Error 1091 (42000): Can't DROP 'idx'; check that column/key exists", true},
+		{"check that column/key exists", true},
+		{"Error 1146: Table doesn't exist", false},
+		{"some unrelated error", false},
+		{"", false},
+	} {
+		var err error
+		if c.msg != "" {
+			err = errors.New(c.msg)
+		}
+		assert.Equalf(t, c.want, isBenignDDLError(err), "msg=%q", c.msg)
+	}
+}
+
+// TestFanOutCounterStmt confirms the allow-list maps the two real counters and
+// rejects anything else (the defense against SQL injection via the column name).
+func TestFanOutCounterStmt(t *testing.T) {
+	stmt, ok := fanOutCounterStmt("completed_count")
+	assert.True(t, ok)
+	assert.Contains(t, stmt, "completed_count = completed_count + 1")
+
+	stmt, ok = fanOutCounterStmt("failed_count")
+	assert.True(t, ok)
+	assert.Contains(t, stmt, "failed_count = failed_count + 1")
+
+	stmt, ok = fanOutCounterStmt("cancelled_count; DROP TABLE jobs")
+	assert.False(t, ok)
+	assert.Empty(t, stmt)
+}
 
 // TestRunMigrations_ConcurrentSafe simulates a fleet calling Migrate() at once
 // against a not-yet-migrated database. Before the concurrency fix this crashed
