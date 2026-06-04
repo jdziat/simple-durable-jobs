@@ -17,7 +17,7 @@ import (
 // opens a fresh in-memory SQLite instance.
 // PostgreSQL connections are pool-limited and closed on test cleanup to
 // avoid exceeding max_connections.
-func openTestDB(t *testing.T) *gorm.DB {
+func openTestDB(t testing.TB) *gorm.DB {
 	t.Helper()
 
 	if dsn := os.Getenv("TEST_MYSQL_URL"); dsn != "" {
@@ -67,7 +67,7 @@ func openTestDB(t *testing.T) *gorm.DB {
 
 // cleanupExternalDB deletes all rows from tables after each test
 // so tests are isolated without requiring a fresh database per test.
-func cleanupExternalDB(t *testing.T, db *gorm.DB) {
+func cleanupExternalDB(t testing.TB, db *gorm.DB) {
 	t.Helper()
 	// Order matters: respect foreign key constraints.
 	tables := []string{"checkpoints", "fan_outs", "queue_states", "jobs"}

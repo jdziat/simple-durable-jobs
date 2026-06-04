@@ -1,0 +1,11 @@
+services:
+  worker:
+    build:
+      context: .
+      dockerfile: chaostest.Dockerfile
+    environment:
+      TEST_MYSQL_URL: root:jobs@tcp(mysql:3306)/jobs_test?parseTime=true
+    depends_on:
+      mysql:
+        condition: service_healthy
+    command: ["worker"]

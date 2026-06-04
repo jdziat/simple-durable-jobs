@@ -70,38 +70,118 @@ const (
 	CheckpointErrorKindSentinel   = "sentinel"
 )
 
+// sentinelsByKey maps a stable, durable key to each sentinel error. The key —
+// not the message — is what gets persisted for sentinel checkpoints, so a
+// future change to a sentinel's wording cannot mis-resolve an old checkpoint,
+// and two sentinels could never collide on identical text. Keep the keys
+// stable forever; they are written to the database.
+var sentinelsByKey = map[string]error{
+	"ErrInvalidJobTypeName": ErrInvalidJobTypeName,
+	"ErrJobTypeNameTooLong": ErrJobTypeNameTooLong,
+	"ErrInvalidQueueName":   ErrInvalidQueueName,
+	"ErrQueueNameTooLong":   ErrQueueNameTooLong,
+	"ErrJobArgsTooLarge":    ErrJobArgsTooLarge,
+	"ErrJobNotOwned":        ErrJobNotOwned,
+	"ErrDuplicateJob":       ErrDuplicateJob,
+	"ErrUniqueKeyTooLong":   ErrUniqueKeyTooLong,
+	"ErrJobAlreadyPaused":   ErrJobAlreadyPaused,
+	"ErrJobNotPaused":       ErrJobNotPaused,
+	"ErrQueueAlreadyPaused": ErrQueueAlreadyPaused,
+	"ErrQueueNotPaused":     ErrQueueNotPaused,
+	"ErrCannotPauseStatus":  ErrCannotPauseStatus,
+	"ErrJobNotFound":        ErrJobNotFound,
+	"ErrJobNotCompleted":    ErrJobNotCompleted,
+	"ErrNoResult":           ErrNoResult,
+}
+
+// sentinelKey returns the stable key for err if it is (or wraps) a known
+// sentinel. Each sentinel is independent, so at most one matches.
+func sentinelKey(err error) (string, bool) {
+	for key, sentinel := range sentinelsByKey {
+		if errors.Is(err, sentinel) {
+			return key, true
+		}
+	}
+	return "", false
+}
+
 // CheckpointErrorKind returns the durable error discriminator for supported error types.
 func CheckpointErrorKind(err error) (kind string, delay time.Duration) {
+	_, _, kind, delay = CheckpointErrorFields(err)
+	return kind, delay
+}
+
+// CheckpointErrorFields returns the durable fields for persisting err in a
+// checkpoint: the full message (for display/logging), the reconstruction cause
+// (inner cause message for no_retry/retry_after, or the stable sentinel key for
+// sentinel errors), the kind discriminator, and any retry delay. Storing cause
+// explicitly is what lets RehydrateCheckpointError rebuild the original error
+// without parsing the formatted message prefix.
+func CheckpointErrorFields(err error) (message, cause, kind string, delay time.Duration) {
+	if err == nil {
+		return "", "", "", 0
+	}
+	message = err.Error()
+
 	var noRetry *NoRetryError
 	if errors.As(err, &noRetry) {
-		return CheckpointErrorKindNoRetry, 0
+		if noRetry.Err != nil {
+			cause = noRetry.Err.Error()
+		}
+		return message, cause, CheckpointErrorKindNoRetry, 0
 	}
 
 	var retryAfter *RetryAfterError
 	if errors.As(err, &retryAfter) {
-		return CheckpointErrorKindRetryAfter, retryAfter.Delay
+		if retryAfter.Err != nil {
+			cause = retryAfter.Err.Error()
+		}
+		return message, cause, CheckpointErrorKindRetryAfter, retryAfter.Delay
 	}
 
-	if candidate := SentinelErrorByMessage(err.Error()); candidate != nil && errors.Is(err, candidate) {
-		return CheckpointErrorKindSentinel, 0
+	if key, ok := sentinelKey(err); ok {
+		return message, key, CheckpointErrorKindSentinel, 0
 	}
 
-	return "", 0
+	return message, "", "", 0
 }
 
-// RehydrateCheckpointError reconstructs supported checkpointed error types.
+// RehydrateCheckpointError reconstructs a checkpointed error from the legacy
+// (message, kind, delay) fields by parsing the message prefix. Retained for
+// backward compatibility and for checkpoints written before the cause column
+// existed; new code should call RehydrateCheckpointErrorWithCause.
 func RehydrateCheckpointError(message, kind string, delay time.Duration) error {
+	return RehydrateCheckpointErrorWithCause(message, "", kind, delay)
+}
+
+// RehydrateCheckpointErrorWithCause reconstructs a checkpointed error using the
+// explicit cause when present, falling back to message parsing for checkpoints
+// written before the cause column existed (cause == "").
+func RehydrateCheckpointErrorWithCause(message, cause, kind string, delay time.Duration) error {
 	switch kind {
 	case CheckpointErrorKindSentinel:
+		// Prefer the stable key written by newer checkpoints; fall back to
+		// matching the message for older ones.
+		if cause != "" {
+			if sentinel, ok := sentinelsByKey[cause]; ok {
+				return sentinel
+			}
+		}
 		if sentinel := SentinelErrorByMessage(message); sentinel != nil {
 			return sentinel
 		}
 		return errors.New(message)
 	case CheckpointErrorKindNoRetry:
-		causeMessage := strings.TrimPrefix(message, "no retry: ")
+		causeMessage := cause
+		if causeMessage == "" {
+			causeMessage = strings.TrimPrefix(message, "no retry: ")
+		}
 		return NoRetry(errors.New(causeMessage))
 	case CheckpointErrorKindRetryAfter:
-		causeMessage := strings.TrimPrefix(message, fmt.Sprintf("retry after %v: ", delay))
+		causeMessage := cause
+		if causeMessage == "" {
+			causeMessage = strings.TrimPrefix(message, fmt.Sprintf("retry after %v: ", delay))
+		}
 		return RetryAfter(delay, errors.New(causeMessage))
 	default:
 		return errors.New(message)
@@ -110,24 +190,7 @@ func RehydrateCheckpointError(message, kind string, delay time.Duration) error {
 
 // SentinelErrorByMessage returns a known sentinel error with the same stored message.
 func SentinelErrorByMessage(message string) error {
-	for _, err := range []error{
-		ErrInvalidJobTypeName,
-		ErrJobTypeNameTooLong,
-		ErrInvalidQueueName,
-		ErrQueueNameTooLong,
-		ErrJobArgsTooLarge,
-		ErrJobNotOwned,
-		ErrDuplicateJob,
-		ErrUniqueKeyTooLong,
-		ErrJobAlreadyPaused,
-		ErrJobNotPaused,
-		ErrQueueAlreadyPaused,
-		ErrQueueNotPaused,
-		ErrCannotPauseStatus,
-		ErrJobNotFound,
-		ErrJobNotCompleted,
-		ErrNoResult,
-	} {
+	for _, err := range sentinelsByKey {
 		if err.Error() == message {
 			return err
 		}

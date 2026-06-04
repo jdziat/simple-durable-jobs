@@ -123,6 +123,20 @@ jobs:
           install-mode: goinstall
           args: --timeout=5m
 
+  chaos-smoke:
+    name: Chaos smoke (Postgres)
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    # A short multi-worker crash/recovery run on every PR so regressions in the
+    # lock/heartbeat/reaper/ownership paths are caught before merge, not just by
+    # the nightly Stress & Chaos workflow. The full PG+MySQL chaos runs nightly.
+    env:
+      CHAOS_DURATION: "25"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run chaos smoke
+        run: bash scripts/chaos-test.sh postgres
+
   build:
     name: Build
     runs-on: ubuntu-latest

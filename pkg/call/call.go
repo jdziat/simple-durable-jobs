@@ -65,8 +65,9 @@ func Call[T any](ctx context.Context, name string, args any) (T, error) {
 	// If we have a checkpoint, return the cached result
 	if hasCheckpoint {
 		if checkpoint.Error != "" {
-			return zero, core.RehydrateCheckpointError(
+			return zero, core.RehydrateCheckpointErrorWithCause(
 				checkpoint.Error,
+				checkpoint.ErrorCause,
 				checkpoint.ErrorKind,
 				time.Duration(checkpoint.ErrorDelayNanos),
 			)
@@ -117,8 +118,9 @@ func Call[T any](ctx context.Context, name string, args any) (T, error) {
 	}
 
 	if err != nil {
-		cp.Error = err.Error()
-		kind, delay := core.CheckpointErrorKind(err)
+		message, cause, kind, delay := core.CheckpointErrorFields(err)
+		cp.Error = message
+		cp.ErrorCause = cause
 		cp.ErrorKind = kind
 		cp.ErrorDelayNanos = int64(delay)
 	} else {

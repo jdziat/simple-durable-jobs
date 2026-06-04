@@ -2626,7 +2626,7 @@ func TestSeedLastRun_NoGapReturnsPersisted(t *testing.T) {
 	persisted := now
 	s := schedule.Every(time.Minute)
 
-	result := seedLastRun(s, persisted, now)
+	result, _ := seedLastRun(s, persisted, now)
 
 	assert.Equal(t, persisted, result)
 }
@@ -2636,7 +2636,7 @@ func TestSeedLastRun_SingleMissedBoundaryFiresOnce(t *testing.T) {
 	persisted := now.Add(-90 * time.Second)
 	s := schedule.Every(time.Minute)
 
-	seed := seedLastRun(s, persisted, now)
+	seed, _ := seedLastRun(s, persisted, now)
 	fire := s.Next(seed)
 
 	assert.False(t, fire.After(now), "seeded next fire should be due")
@@ -2648,7 +2648,7 @@ func TestSeedLastRun_ManyMissedBoundariesClampToSingleFire(t *testing.T) {
 	persisted := now.Add(-3 * time.Hour)
 	s := schedule.Every(time.Minute)
 
-	seed := seedLastRun(s, persisted, now)
+	seed, _ := seedLastRun(s, persisted, now)
 	fire := s.Next(seed)
 
 	assert.False(t, fire.After(now), "seeded next fire should be due")
@@ -2661,7 +2661,7 @@ func TestSeedLastRun_PathologicalDensityFailsSafe(t *testing.T) {
 	persisted := now.Add(-24 * time.Hour)
 	s := schedule.Every(time.Millisecond)
 
-	result := seedLastRun(s, persisted, now)
+	result, _ := seedLastRun(s, persisted, now)
 
 	assert.Equal(t, now, result)
 	assert.True(t, s.Next(result).After(now), "fail-safe seed should skip catch-up")
@@ -2938,7 +2938,7 @@ func TestScheduler_ManyMissedBoundariesFireOnce(t *testing.T) {
 	persisted := now.Add(-3 * time.Hour)
 	s := schedule.Every(period)
 
-	seed := seedLastRun(s, persisted, now)
+	seed, _ := seedLastRun(s, persisted, now)
 	catchUpFire := s.Next(seed)
 
 	assert.False(t, catchUpFire.After(now), "the catch-up boundary should be due")

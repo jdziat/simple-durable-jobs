@@ -97,15 +97,24 @@ func Unique(key string) Option {
 	})
 }
 
-// DeterminismMode controls Call replay strictness.
+// DeterminismMode controls how strictly Call replay is validated against the
+// recorded checkpoints. The three modes form an increasing-strictness ladder.
 type DeterminismMode int
 
 const (
-	// ExplicitCheckpoints errors on replay checkpoint type mismatches.
+	// ExplicitCheckpoints (default) errors when a replayed Call's type does not
+	// match the checkpoint recorded at that index. Extra Calls that were not in
+	// the original run execute fresh, and recorded checkpoints the replay does
+	// not reach are tolerated.
 	ExplicitCheckpoints DeterminismMode = iota
-	// Strict errors on replay checkpoint type mismatches.
+	// Strict applies the ExplicitCheckpoints type check AND additionally
+	// requires that every recorded Call checkpoint is replayed. If the handler
+	// issues fewer or reordered Calls than the run that produced the
+	// checkpoints, the job fails terminally (non-retryable) after the handler
+	// returns. Use this to catch nondeterministic handlers early.
 	Strict
-	// BestEffort logs replay checkpoint type mismatches and re-executes the call.
+	// BestEffort logs replay checkpoint type mismatches and re-executes the
+	// call instead of erroring. The most permissive mode.
 	BestEffort
 )
 

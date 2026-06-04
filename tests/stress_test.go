@@ -3,7 +3,6 @@ package jobs_test
 import (
 	"context"
 	"fmt"
-	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -12,30 +11,26 @@ import (
 	"github.com/jdziat/simple-durable-jobs"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"gorm.io/driver/sqlite"
-	"gorm.io/gorm"
-	"gorm.io/gorm/logger"
 )
+
+// stressWorkerTimeout bounds how long a stress test waits for its workload to
+// drain. It is generous on purpose: under the race detector the slowest backend
+// (single-writer SQLite) processes a thousand jobs several times slower than
+// without it, and this internal deadline must not trip before the work
+// genuinely finishes. The outer `go test -timeout` is the real backstop.
+const stressWorkerTimeout = 8 * time.Minute
 
 func TestStress_ThousandJobs(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping stress test in short mode")
 	}
 
-	dbPath := fmt.Sprintf("/tmp/jobs_stress_test_%d.db", os.Getpid())
-	t.Cleanup(func() {
-		_ = os.Remove(dbPath)
-	})
-
-	// Use WAL mode for better concurrent performance
-	db, err := gorm.Open(sqlite.Open(dbPath+"?_journal_mode=WAL&_busy_timeout=5000"), &gorm.Config{
-		Logger: logger.Default.LogMode(logger.Silent),
-	})
-	require.NoError(t, err)
-
+	// Runs against the backend selected by TEST_DATABASE_URL / TEST_MYSQL_URL,
+	// falling back to a concurrency-safe file SQLite — so the stress matrix
+	// actually exercises Postgres and MySQL, not SQLite three times.
+	db := openIntegrationDB(t)
 	store := jobs.NewGormStorage(db)
-	err = store.Migrate(context.Background())
-	require.NoError(t, err)
+	require.NoError(t, store.Migrate(context.Background()))
 
 	queue := jobs.New(store)
 
@@ -66,7 +61,7 @@ func TestStress_ThousandJobs(t *testing.T) {
 	// Start workers
 	// Note: SQLite has limited concurrency for writes. For production, use PostgreSQL.
 	// Extended timeout to account for polling overhead from fan-out feature
-	workerCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
+	workerCtx, cancel := context.WithTimeout(ctx, stressWorkerTimeout)
 	defer cancel()
 
 	numWorkers := 1
@@ -130,19 +125,9 @@ func TestStress_WorkflowsWithCheckpoints(t *testing.T) {
 		t.Skip("Skipping stress test in short mode")
 	}
 
-	dbPath := fmt.Sprintf("/tmp/jobs_stress_workflow_%d.db", os.Getpid())
-	t.Cleanup(func() {
-		_ = os.Remove(dbPath)
-	})
-
-	db, err := gorm.Open(sqlite.Open(dbPath+"?_journal_mode=WAL&_busy_timeout=5000"), &gorm.Config{
-		Logger: logger.Default.LogMode(logger.Silent),
-	})
-	require.NoError(t, err)
-
+	db := openIntegrationDB(t)
 	store := jobs.NewGormStorage(db)
-	err = store.Migrate(context.Background())
-	require.NoError(t, err)
+	require.NoError(t, store.Migrate(context.Background()))
 
 	queue := jobs.New(store)
 
@@ -203,7 +188,7 @@ func TestStress_WorkflowsWithCheckpoints(t *testing.T) {
 
 	// Start workers
 	// Note: Using single worker due to SQLite concurrency limitations
-	workerCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
+	workerCtx, cancel := context.WithTimeout(ctx, stressWorkerTimeout)
 	defer cancel()
 
 	numWorkers := 1
@@ -262,19 +247,8 @@ func TestStress_MixedPriorities(t *testing.T) {
 		t.Skip("Skipping stress test in short mode")
 	}
 
-	dbPath := fmt.Sprintf("/tmp/jobs_stress_priorities_%d.db", os.Getpid())
-	t.Cleanup(func() {
-		_ = os.Remove(dbPath)
-	})
-
-	db, err := gorm.Open(sqlite.Open(dbPath+"?_journal_mode=WAL&_busy_timeout=5000"), &gorm.Config{
-		Logger: logger.Default.LogMode(logger.Silent),
-	})
-	require.NoError(t, err)
-
-	store := jobs.NewGormStorage(db)
-	err = store.Migrate(context.Background())
-	require.NoError(t, err)
+	store := jobs.NewGormStorage(openIntegrationDB(t))
+	require.NoError(t, store.Migrate(context.Background()))
 
 	queue := jobs.New(store)
 
@@ -318,7 +292,7 @@ func TestStress_MixedPriorities(t *testing.T) {
 
 	// Start single worker with concurrency 1 to see priority ordering
 	// Extended timeout: 1000 jobs at ~10 jobs/sec = ~100s, plus overhead
-	workerCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
+	workerCtx, cancel := context.WithTimeout(ctx, stressWorkerTimeout)
 	defer cancel()
 
 	worker := queue.NewWorker(jobs.WorkerQueue("default", jobs.Concurrency(1)))

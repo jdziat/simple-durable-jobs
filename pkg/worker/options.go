@@ -84,6 +84,12 @@ type WorkerConfig struct {
 	// Default: 45 minutes. If non-zero, the worker will configure the storage
 	// backend with this duration at startup.
 	LockDuration time.Duration
+
+	// MaxRetryBackoff caps the exponential backoff between automatic retries of
+	// a failing job (RetryAfter delays set by the handler are honored as-is).
+	// Default: 1 minute. Raising it backs off harder on a persistently failing
+	// dependency instead of re-attempting every minute until retries exhaust.
+	MaxRetryBackoff time.Duration
 }
 
 // Concurrency sets the concurrency for a queue.
@@ -221,6 +227,16 @@ func WithFanOutRecoveryStaleAge(d time.Duration) WorkerOption {
 func WithLockDuration(d time.Duration) WorkerOption {
 	return workerOptionFunc(func(c *WorkerConfig) {
 		c.LockDuration = d
+	})
+}
+
+// WithMaxRetryBackoff caps the exponential backoff between automatic retries of
+// a failing job. Default is 1 minute. Non-positive values keep the default.
+func WithMaxRetryBackoff(d time.Duration) WorkerOption {
+	return workerOptionFunc(func(c *WorkerConfig) {
+		if d > 0 {
+			c.MaxRetryBackoff = d
+		}
 	})
 }
 

@@ -5,7 +5,40 @@
 [![Go Report Card](https://goreportcard.com/badge/github.com/jdziat/simple-durable-jobs)](https://goreportcard.com/report/github.com/jdziat/simple-durable-jobs)
 [![codecov](https://codecov.io/gh/jdziat/simple-durable-jobs/branch/main/graph/badge.svg)](https://codecov.io/gh/jdziat/simple-durable-jobs)
 
-A Go library for durable job queues with checkpointed workflows, inspired by [River](https://riverqueue.com/), [Temporal](https://temporal.io/), and async patterns.
+A Go library for durable, checkpointed background jobs and workflows that runs
+on the database you already have — PostgreSQL or MySQL in production, SQLite for
+local development. Conceptually inspired by [River](https://riverqueue.com/) and
+[Temporal](https://temporal.io/).
+
+### What it is
+
+An **in-process, embeddable** job system: import a package, point it at a GORM
+database, register handlers, run workers. No separate server, broker, or control
+plane to operate. You get durable background jobs, checkpointed multi-step
+workflows, fan-out/fan-in, scheduling, and an optional embedded dashboard — in
+one dependency.
+
+### When to choose it
+
+- You're a **Go team already on Postgres/MySQL** and want durable jobs and light
+  workflows without standing up Temporal or another service.
+- You want crash-safe, checkpointed multi-step jobs with a small operational
+  footprint.
+
+Reach for **Temporal** instead if you need full deterministic workflow replay,
+signals/queries, and versioning at scale; for **River** if you want a
+Postgres-only, single-purpose job queue with a larger team behind it. This
+library deliberately trades some of that surface area for "one import, your
+existing database."
+
+### What it guarantees (and asks of you)
+
+Execution is **at-least-once**: handlers and `Call()` steps re-run from their
+last checkpoint after a crash, so **handlers must be idempotent**. Jobs are
+durable and never silently lost, and a job has a single active owner — lock
+timing is anchored to the database clock, so worker clock skew can't reclaim a
+live lock. See **[Guarantees & Production Readiness](https://jdziat.github.io/simple-durable-jobs/docs/advanced/guarantees/)**
+for the full contract, backend support tiers, and crash-recovery tuning.
 
 ## Documentation
 
@@ -14,6 +47,7 @@ A Go library for durable job queues with checkpointed workflows, inspired by [Ri
 - [Examples](https://jdziat.github.io/simple-durable-jobs/docs/examples/)
 - [Embedded Web UI](https://jdziat.github.io/simple-durable-jobs/docs/embedded-ui/)
 - [Live Demo](https://jdziat.github.io/simple-durable-jobs/docs/live-demo/)
+- [Guarantees & Production Readiness](https://jdziat.github.io/simple-durable-jobs/docs/advanced/guarantees/) - Execution semantics, backend tiers, crash-recovery tuning
 - [Advanced Topics](https://jdziat.github.io/simple-durable-jobs/docs/advanced/) - Stale lock reaper, pool configuration, storage retry
 
 ## Features

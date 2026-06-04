@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -17,10 +19,17 @@ import (
 	"gorm.io/gorm/logger"
 )
 
-// setupTestStorage creates an in-memory SQLite storage for use in tests.
+// facadeTestDBSeq gives each setupTestStorage call a distinct in-memory database
+// name so tests (and repeated -count runs) don't share state. cache=shared lets
+// the pool's connections see the same named DB; a unique name keeps it isolated
+// per test. Without this, fixed-ID inserts collide on the second run.
+var facadeTestDBSeq atomic.Uint64
+
+// setupTestStorage creates an isolated in-memory SQLite storage for use in tests.
 func setupTestStorage(t *testing.T) (*jobs.Queue, jobs.Storage) {
 	t.Helper()
-	db, err := gorm.Open(sqlite.Open("file::memory:?cache=shared&_busy_timeout=5000"), &gorm.Config{
+	dsn := fmt.Sprintf("file:facadetest_%d?mode=memory&cache=shared&_busy_timeout=5000", facadeTestDBSeq.Add(1))
+	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{
 		Logger: logger.Default.LogMode(logger.Silent),
 	})
 	require.NoError(t, err)
