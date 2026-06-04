@@ -625,10 +625,12 @@ func IsSuspendError(err error) bool {
 }
 
 // Requeue resets a terminally failed or cancelled job back to pending so it
-// runs again. Failed jobs are the dead-letter set — there is no separate DLQ
-// table; query them with q.Storage().GetJobsByStatus(StatusFailed) and replay
-// one with Requeue. Existing checkpoints are preserved, so a workflow resumes
-// from its last successful step rather than repeating completed work.
+// runs again from scratch. Failed jobs are the dead-letter set — there is no
+// separate DLQ table; query them with q.Storage().GetJobsByStatus(StatusFailed)
+// and replay one with Requeue. The job's checkpoints are cleared so a workflow
+// replays from the beginning (handlers must be idempotent regardless), which is
+// the safe behavior when the usual reason to requeue is a code or dependency
+// fix that changes the workflow's steps.
 //
 // Returns true if the job was requeued, false if it was not found or not in a
 // requeuable (failed/cancelled) state. Returns an error if the storage backend

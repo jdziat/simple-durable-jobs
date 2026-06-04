@@ -101,33 +101,40 @@ func (s *GormStorage) DB() *gorm.DB {
 // records each applied version in the schema_migrations ledger so it runs at
 // most once per database.
 func (s *GormStorage) Migrate(ctx context.Context) error {
-	db := s.db.WithContext(ctx)
-	if err := db.AutoMigrate(
-		&core.Job{},
-		&core.Checkpoint{},
-		&core.FanOut{},
-		&core.QueueState{},
-		&core.ScheduledFire{},
-		&core.Lease{},
-	); err != nil {
-		return err
-	}
-
-	// SQLite and PostgreSQL enforce active-job uniqueness with a partial unique
-	// index, which frees the key once a job reaches a terminal status. MySQL has
-	// no partial indexes; it gets an equivalent generated-column unique index in
-	// migration 2 (mysql_active_unique_key).
-	if s.isSQLite || s.dialect() == dialectPostgres {
-		if err := db.Exec(`
-			CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_active_unique
-			ON jobs (unique_key)
-			WHERE unique_key <> '' AND status IN ('pending','running')
-		`).Error; err != nil {
+	// Hold a fleet-wide lock for the whole migration so concurrent Migrate()
+	// calls from every worker serialize rather than racing on DDL (gorm's
+	// AutoMigrate does check-then-create, which is not concurrency-safe on its
+	// own — two workers can both try to CREATE the same table/index).
+	return s.withMigrationLock(ctx, func() error {
+		db := s.db.WithContext(ctx)
+		if err := db.AutoMigrate(
+			&core.Job{},
+			&core.Checkpoint{},
+			&core.FanOut{},
+			&core.QueueState{},
+			&core.ScheduledFire{},
+			&core.Lease{},
+			&core.SchemaMigration{},
+		); err != nil {
 			return err
 		}
-	}
 
-	return s.runMigrations(ctx)
+		// SQLite and PostgreSQL enforce active-job uniqueness with a partial
+		// unique index, which frees the key once a job reaches a terminal
+		// status. MySQL has no partial indexes; it gets an equivalent
+		// generated-column unique index in migration 2 (mysql_active_unique_key).
+		if s.isSQLite || s.dialect() == dialectPostgres {
+			if err := db.Exec(`
+				CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_active_unique
+				ON jobs (unique_key)
+				WHERE unique_key <> '' AND status IN ('pending','running')
+			`).Error; err != nil {
+				return err
+			}
+		}
+
+		return s.runMigrations(ctx)
+	})
 }
 
 // Enqueue adds a job to the queue.
@@ -326,10 +333,17 @@ func (s *GormStorage) Dequeue(ctx context.Context, queues []string, workerID str
 	//
 	// Lock timing is anchored to the DATABASE clock, not this worker's wall
 	// clock: the freshness predicates and the locked_until/started_at writes all
-	// evaluate NOW() server-side (within one transaction, so they share a single
-	// consistent snapshot). This is what makes the lock safe across a fleet — the
-	// reaper on another worker compares locked_until against the same DB clock,
-	// so clock skew can never cause a live lock to be reclaimed early.
+	// evaluate NOW() server-side. This is what makes the lock safe across a
+	// fleet — the reaper on another worker compares locked_until against the same
+	// DB clock, so clock skew can never cause a live lock to be reclaimed early.
+	//
+	// Note on snapshot semantics: on Postgres NOW() is transaction_timestamp(),
+	// constant for the whole transaction. On MySQL NOW(6) is the per-STATEMENT
+	// time, so the SELECT's freshness check and the UPDATE's locked_until read
+	// slightly different instants. That is still correct: the UPDATE always runs
+	// after the SELECT, so locked_until is anchored to a time >= the freshness
+	// check — it can never make a just-taken lock look already expired. Do not
+	// add a predicate that assumes the two reads are equal.
 	nowExpr := s.nowExpr()
 	lockUntilExpr := s.offsetExpr(s.lockDuration)
 	silentDB := s.db.Session(&gorm.Session{Logger: s.db.Logger.LogMode(logger.Silent)})
@@ -1333,35 +1347,56 @@ func (s *GormStorage) ResumeJob(ctx context.Context, jobID string) (bool, error)
 }
 
 // Requeue resets a terminally failed or cancelled job back to pending so it can
-// run again. Failed jobs are this library's dead-letter set — there is no
-// separate DLQ table; a job that exhausts its retries (or is cancelled) stays
-// queryable via GetJobsByStatus(StatusFailed) and Requeue is how an operator
-// replays one. The attempt counter and error/lock fields are reset and run_at
-// is cleared so the job is immediately eligible; any existing checkpoints are
-// left intact, so a workflow resumes from its last successful step rather than
-// repeating completed, possibly side-effecting work.
+// run again from scratch. Failed jobs are this library's dead-letter set — there
+// is no separate DLQ table; a job that exhausts its retries (or is cancelled)
+// stays queryable via GetJobsByStatus(StatusFailed) and Requeue is how an
+// operator replays one.
+//
+// The attempt counter, error, lock, and result fields are reset, run_at is
+// cleared (immediately eligible), AND the job's checkpoints are deleted so the
+// run starts fresh. Clearing checkpoints is deliberate: the usual reason to
+// requeue is a code or dependency fix, which can change a workflow's Call
+// sequence — resuming into checkpoints recorded by the old run would skip the
+// wrong steps and, under Strict determinism, falsely trip the
+// unconsumed-checkpoint guard. Handlers must be idempotent regardless (the
+// execution contract is at-least-once), so a full replay is safe.
 //
 // Returns true if a job was requeued, false if it was not found or not in a
 // requeuable (failed/cancelled) state.
 func (s *GormStorage) Requeue(ctx context.Context, jobID string) (bool, error) {
-	result := s.db.WithContext(ctx).
-		Model(&core.Job{}).
-		Where("id = ? AND status IN (?, ?)", jobID, core.StatusFailed, core.StatusCancelled).
-		Updates(map[string]any{
-			"status":       core.StatusPending,
-			"attempt":      0,
-			"last_error":   "",
-			"locked_by":    "",
-			"locked_until": nil,
-			"started_at":   nil,
-			"completed_at": nil,
-			"run_at":       nil,
-			"updated_at":   time.Now(),
+	var requeued bool
+	err := s.withSerializationRetry(ctx, func() error {
+		requeued = false
+		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			result := tx.Model(&core.Job{}).
+				Where("id = ? AND status IN (?, ?)", jobID, core.StatusFailed, core.StatusCancelled).
+				Updates(map[string]any{
+					"status":       core.StatusPending,
+					"attempt":      0,
+					"last_error":   "",
+					"result":       nil,
+					"locked_by":    "",
+					"locked_until": nil,
+					"started_at":   nil,
+					"completed_at": nil,
+					"run_at":       nil,
+					"updated_at":   time.Now(),
+				})
+			if result.Error != nil {
+				return result.Error
+			}
+			if result.RowsAffected == 0 {
+				return nil // not found or not in a requeuable state
+			}
+			requeued = true
+			// Replay from scratch: drop checkpoints recorded by the prior run.
+			return tx.Where("job_id = ?", jobID).Delete(&core.Checkpoint{}).Error
 		})
-	if result.Error != nil {
-		return false, result.Error
+	})
+	if err != nil {
+		return false, err
 	}
-	return result.RowsAffected > 0, nil
+	return requeued, nil
 }
 
 // GetWaitingJobsToResume finds waiting jobs whose fan-out is complete.
