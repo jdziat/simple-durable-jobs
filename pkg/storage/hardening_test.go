@@ -31,12 +31,13 @@ func TestRunMigrations_ConcurrentSafe(t *testing.T) {
 	require.NoError(t, s.db.Migrator().DropTable(&core.SchemaMigration{}))
 	_ = s.db.Migrator().DropIndex(&core.Job{}, "idx_jobs_dequeue")
 
-	// In production each worker process has its own pool; here all goroutines
-	// share one, and each one waiting on the migration lock parks a connection.
-	// Give the pool enough headroom for every waiter plus the holder's work.
+	// Deliberately SMALL pool: the migration work runs on the lock-holding
+	// connection, so far more concurrent callers than connections must still
+	// serialize cleanly and NOT deadlock (an earlier fix held the lock on a
+	// dedicated conn and deadlocked here).
 	const workers = 6
 	if sqlDB, err := s.db.DB(); err == nil {
-		sqlDB.SetMaxOpenConns(workers * 4)
+		sqlDB.SetMaxOpenConns(2)
 	}
 
 	var wg sync.WaitGroup
@@ -61,6 +62,64 @@ func TestRunMigrations_ConcurrentSafe(t *testing.T) {
 	require.NoError(t, s.db.Model(&core.SchemaMigration{}).Order("version").Pluck("version", &versions).Error)
 	assert.Equal(t, []int{1, 2}, versions, "every migration recorded exactly once")
 	assert.True(t, s.db.Migrator().HasIndex(&core.Job{}, "idx_jobs_dequeue"), "reworked index present")
+
+	// Pathological single-connection pool must not deadlock (lock + work share
+	// the one connection). Guard with a deadline so a regression fails fast.
+	if sqlDB, err := s.db.DB(); err == nil {
+		sqlDB.SetMaxOpenConns(1)
+	}
+	require.NoError(t, s.db.Migrator().DropTable(&core.SchemaMigration{}))
+	done := make(chan error, 1)
+	go func() { done <- s.Migrate(ctx) }()
+	select {
+	case err := <-done:
+		require.NoError(t, err, "Migrate at MaxOpenConns=1 must succeed")
+	case <-time.After(30 * time.Second):
+		t.Fatal("Migrate deadlocked at MaxOpenConns=1")
+	}
+}
+
+// TestRequeue_FanOutHandling verifies Requeue's fan-out rules: a sub-job is
+// rejected (would double-count its parent), and requeuing a parent clears its
+// old fan-out batch so the replay re-dispatches cleanly.
+func TestRequeue_FanOutHandling(t *testing.T) {
+	s := newTestStorage(t)
+	ctx := context.Background()
+
+	// Parent + a fan-out batch with two terminal sub-jobs.
+	require.NoError(t, s.db.WithContext(ctx).Create(&core.Job{
+		ID: "parent", Type: "wf", Queue: "default", Status: core.StatusFailed,
+	}).Error)
+	require.NoError(t, s.CreateFanOut(ctx, &core.FanOut{
+		ID: "fo-1", ParentJobID: "parent", TotalCount: 2, CompletedCount: 1, FailedCount: 1,
+	}))
+	foID := "fo-1"
+	for i, st := range []core.JobStatus{core.StatusCompleted, core.StatusFailed} {
+		require.NoError(t, s.db.WithContext(ctx).Create(&core.Job{
+			ID: fmt.Sprintf("sub-%d", i), Type: "wf.sub", Queue: "default",
+			Status: st, FanOutID: &foID, FanOutIndex: i,
+		}).Error)
+	}
+
+	// A sub-job cannot be requeued directly.
+	_, err := s.Requeue(ctx, "sub-1")
+	require.ErrorIs(t, err, core.ErrCannotRequeueSubJob)
+
+	// Requeuing the parent resets it and clears the old fan-out batch.
+	requeued, err := s.Requeue(ctx, "parent")
+	require.NoError(t, err)
+	assert.True(t, requeued)
+
+	parent, err := s.GetJob(ctx, "parent")
+	require.NoError(t, err)
+	assert.Equal(t, core.StatusPending, parent.Status)
+
+	fos, err := s.GetFanOutsByParent(ctx, "parent")
+	require.NoError(t, err)
+	assert.Empty(t, fos, "old fan-out records cleared")
+	subs, err := s.GetSubJobs(ctx, "fo-1")
+	require.NoError(t, err)
+	assert.Empty(t, subs, "old sub-jobs cleared")
 }
 
 // TestRequeue_ClearsCheckpoints verifies Requeue resets the job AND drops its

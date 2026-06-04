@@ -69,8 +69,11 @@ func openTestDB(t testing.TB) *gorm.DB {
 // so tests are isolated without requiring a fresh database per test.
 func cleanupExternalDB(t testing.TB, db *gorm.DB) {
 	t.Helper()
-	// Order matters: respect foreign key constraints.
-	tables := []string{"checkpoints", "fan_outs", "queue_states", "jobs"}
+	// Order matters: respect foreign key constraints. scheduled_fires and leases
+	// hold per-test state too (the scheduler anchor and recovery lease), so they
+	// must be cleaned for tests to be isolated on a persistent external DB.
+	// schema_migrations is intentionally NOT cleaned — it is the migration ledger.
+	tables := []string{"checkpoints", "fan_outs", "queue_states", "jobs", "scheduled_fires", "leases"}
 	for _, tbl := range tables {
 		db.Exec("DELETE FROM " + tbl)
 	}

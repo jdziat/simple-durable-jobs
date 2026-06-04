@@ -25,6 +25,10 @@ var (
 	ErrJobNotFound        = errors.New("jobs: job not found")
 	ErrJobNotCompleted    = errors.New("jobs: job has not completed")
 	ErrNoResult           = errors.New("jobs: completed job has no result")
+	// ErrCannotRequeueSubJob is returned by Requeue for a fan-out sub-job:
+	// requeuing it directly would double-count its parent's fan-out. Requeue the
+	// parent instead, which re-dispatches the whole batch.
+	ErrCannotRequeueSubJob = errors.New("jobs: cannot requeue a fan-out sub-job directly; requeue its parent")
 )
 
 // NoRetryError indicates an error that should not be retried.

@@ -105,8 +105,7 @@ func (s *GormStorage) Migrate(ctx context.Context) error {
 	// calls from every worker serialize rather than racing on DDL (gorm's
 	// AutoMigrate does check-then-create, which is not concurrency-safe on its
 	// own — two workers can both try to CREATE the same table/index).
-	return s.withMigrationLock(ctx, func() error {
-		db := s.db.WithContext(ctx)
+	return s.withMigrationLock(ctx, func(db *gorm.DB) error {
 		if err := db.AutoMigrate(
 			&core.Job{},
 			&core.Checkpoint{},
@@ -133,7 +132,7 @@ func (s *GormStorage) Migrate(ctx context.Context) error {
 			}
 		}
 
-		return s.runMigrations(ctx)
+		return s.applyPendingMigrations(ctx, db)
 	})
 }
 
@@ -1361,6 +1360,11 @@ func (s *GormStorage) ResumeJob(ctx context.Context, jobID string) (bool, error)
 // unconsumed-checkpoint guard. Handlers must be idempotent regardless (the
 // execution contract is at-least-once), so a full replay is safe.
 //
+// A fan-out sub-job cannot be requeued directly (it would double-count its
+// parent); ErrCannotRequeueSubJob is returned in that case. Requeuing a fan-out
+// PARENT deletes its old fan-out records and their sub-jobs so the replay
+// re-dispatches a fresh batch instead of orphaning the old one.
+//
 // Returns true if a job was requeued, false if it was not found or not in a
 // requeuable (failed/cancelled) state.
 func (s *GormStorage) Requeue(ctx context.Context, jobID string) (bool, error) {
@@ -1368,8 +1372,24 @@ func (s *GormStorage) Requeue(ctx context.Context, jobID string) (bool, error) {
 	err := s.withSerializationRetry(ctx, func() error {
 		requeued = false
 		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			var job core.Job
+			if err := tx.First(&job, "id = ?", jobID).Error; err != nil {
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					return nil // not found → not requeued
+				}
+				return err
+			}
+			if job.Status != core.StatusFailed && job.Status != core.StatusCancelled {
+				return nil // not in a requeuable state
+			}
+			if job.FanOutID != nil && *job.FanOutID != "" {
+				// Requeuing a sub-job directly would re-run it and increment the
+				// parent's fan-out counter a second time. Replay via the parent.
+				return core.ErrCannotRequeueSubJob
+			}
+
 			result := tx.Model(&core.Job{}).
-				Where("id = ? AND status IN (?, ?)", jobID, core.StatusFailed, core.StatusCancelled).
+				Where("id = ?", jobID).
 				Updates(map[string]any{
 					"status":       core.StatusPending,
 					"attempt":      0,
@@ -1385,12 +1405,31 @@ func (s *GormStorage) Requeue(ctx context.Context, jobID string) (bool, error) {
 			if result.Error != nil {
 				return result.Error
 			}
-			if result.RowsAffected == 0 {
-				return nil // not found or not in a requeuable state
-			}
 			requeued = true
+
 			// Replay from scratch: drop checkpoints recorded by the prior run.
-			return tx.Where("job_id = ?", jobID).Delete(&core.Checkpoint{}).Error
+			if err := tx.Where("job_id = ?", jobID).Delete(&core.Checkpoint{}).Error; err != nil {
+				return err
+			}
+
+			// If this job is a fan-out parent, delete its old fan-out batch
+			// (records + sub-jobs) so the replay's FanOut() re-dispatches a
+			// fresh batch rather than leaving orphaned rows and stale counters.
+			var fanOutIDs []string
+			if err := tx.Model(&core.FanOut{}).
+				Where("parent_job_id = ?", jobID).
+				Pluck("id", &fanOutIDs).Error; err != nil {
+				return err
+			}
+			if len(fanOutIDs) > 0 {
+				if err := tx.Where("fan_out_id IN ?", fanOutIDs).Delete(&core.Job{}).Error; err != nil {
+					return err
+				}
+				if err := tx.Where("parent_job_id = ?", jobID).Delete(&core.FanOut{}).Error; err != nil {
+					return err
+				}
+			}
+			return nil
 		})
 	})
 	if err != nil {

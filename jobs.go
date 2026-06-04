@@ -231,8 +231,9 @@ var (
 	ErrQueueAlreadyPaused = core.ErrQueueAlreadyPaused
 	ErrQueueNotPaused     = core.ErrQueueNotPaused
 	ErrCannotPauseStatus  = core.ErrCannotPauseStatus
-	ErrJobNotFound        = core.ErrJobNotFound
-	ErrNoResult           = core.ErrNoResult
+	ErrJobNotFound         = core.ErrJobNotFound
+	ErrNoResult            = core.ErrNoResult
+	ErrCannotRequeueSubJob = core.ErrCannotRequeueSubJob
 )
 
 // Default values
@@ -630,11 +631,13 @@ func IsSuspendError(err error) bool {
 // and replay one with Requeue. The job's checkpoints are cleared so a workflow
 // replays from the beginning (handlers must be idempotent regardless), which is
 // the safe behavior when the usual reason to requeue is a code or dependency
-// fix that changes the workflow's steps.
+// fix that changes the workflow's steps. Requeuing a fan-out parent also clears
+// its old sub-job batch so the replay re-dispatches cleanly.
 //
 // Returns true if the job was requeued, false if it was not found or not in a
-// requeuable (failed/cancelled) state. Returns an error if the storage backend
-// does not support requeueing.
+// requeuable (failed/cancelled) state. Returns ErrCannotRequeueSubJob for a
+// fan-out sub-job (requeue its parent instead), or an error if the storage
+// backend does not support requeueing.
 func Requeue(ctx context.Context, q *Queue, jobID string) (bool, error) {
 	type requeuer interface {
 		Requeue(ctx context.Context, jobID string) (bool, error)
