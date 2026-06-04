@@ -47,12 +47,12 @@ func TestZZ_GetQueueDepthStats_CountsByStatus(t *testing.T) {
 
 	byQueue := make(map[string]*struct {
 		pending, running, completed, failed, paused int64
-		isPaused                                     bool
+		isPaused                                    bool
 	})
 	for _, qs := range stats {
 		byQueue[qs.Name] = &struct {
 			pending, running, completed, failed, paused int64
-			isPaused                                     bool
+			isPaused                                    bool
 		}{qs.Pending, qs.Running, qs.Completed, qs.Failed, qs.Paused, qs.IsPaused}
 	}
 

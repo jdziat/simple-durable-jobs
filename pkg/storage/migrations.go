@@ -114,11 +114,11 @@ func (s *GormStorage) withMigrationLock(ctx context.Context, fn func(db *gorm.DB
 // CONCURRENCY: Migrate() is documented as safe to call from every worker at
 // startup. The primary guard is the fleet-wide lock held by withMigrationLock
 // for the whole of Migrate (a SESSION-level pg_advisory_lock / MySQL GET_LOCK
-// held on the connection that also runs the work — not a single transaction;
-// each DDL statement auto-commits independently, and it is the held lock, not a
-// transaction, that serializes the fleet). As a backstop, every migration body
-// is also idempotent and tolerant of a racing worker (IF [NOT] EXISTS on
-// PG/SQLite, benign-error tolerance on MySQL), and the ledger insert uses ON
+// held on a DEDICATED connection while the work runs on the pool — not a single
+// transaction; each DDL statement auto-commits independently, and it is the held
+// lock, not a transaction, that serializes the fleet). As a backstop, every
+// migration body is also idempotent and tolerant of a racing worker (IF [NOT]
+// EXISTS on PG/SQLite, benign-error tolerance on MySQL), and the ledger insert uses ON
 // CONFLICT DO NOTHING.
 type schemaMigration struct {
 	Version int
@@ -145,9 +145,9 @@ var schemaMigrations = []schemaMigration{
 // applyPendingMigrations runs every migration whose version is absent from the
 // ledger, in order, recording each with an ON CONFLICT ledger insert so a
 // racing worker that already recorded it is a no-op rather than a PK error.
-// Called from Migrate on the lock-holding connection (see withMigrationLock),
-// so it is not racing other workers; the idempotent bodies and ON CONFLICT
-// ledger insert remain as a backstop.
+// Called from Migrate while the fleet-wide migration lock is held (see
+// withMigrationLock), so it is not racing other workers; the idempotent bodies
+// and ON CONFLICT ledger insert remain as a backstop.
 func (s *GormStorage) applyPendingMigrations(ctx context.Context, db *gorm.DB) error {
 	var applied []core.SchemaMigration
 	if err := db.Find(&applied).Error; err != nil {
