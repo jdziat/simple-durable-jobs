@@ -192,8 +192,11 @@ const (
 	FanOutFailed    = core.FanOutFailed
 )
 
-// Determinism mode constants. ExplicitCheckpoints and Strict error on replay
-// checkpoint type mismatches; BestEffort logs and re-executes the call.
+// Determinism mode constants, in increasing order of strictness:
+//   - ExplicitCheckpoints (default): error on a replay checkpoint type mismatch.
+//   - Strict: also fail terminally if any recorded Call checkpoint is not
+//     replayed (the handler's Call sequence changed).
+//   - BestEffort: log type mismatches and re-execute the call.
 const (
 	ExplicitCheckpoints = queue.ExplicitCheckpoints
 	Strict              = queue.Strict
@@ -214,22 +217,23 @@ const (
 
 // Error variables
 var (
-	ErrInvalidJobTypeName = core.ErrInvalidJobTypeName
-	ErrJobTypeNameTooLong = core.ErrJobTypeNameTooLong
-	ErrInvalidQueueName   = core.ErrInvalidQueueName
-	ErrQueueNameTooLong   = core.ErrQueueNameTooLong
-	ErrJobArgsTooLarge    = core.ErrJobArgsTooLarge
-	ErrJobNotCompleted    = core.ErrJobNotCompleted
-	ErrJobNotOwned        = core.ErrJobNotOwned
-	ErrDuplicateJob       = core.ErrDuplicateJob
-	ErrUniqueKeyTooLong   = core.ErrUniqueKeyTooLong
-	ErrJobAlreadyPaused   = core.ErrJobAlreadyPaused
-	ErrJobNotPaused       = core.ErrJobNotPaused
-	ErrQueueAlreadyPaused = core.ErrQueueAlreadyPaused
-	ErrQueueNotPaused     = core.ErrQueueNotPaused
-	ErrCannotPauseStatus  = core.ErrCannotPauseStatus
-	ErrJobNotFound        = core.ErrJobNotFound
-	ErrNoResult           = core.ErrNoResult
+	ErrInvalidJobTypeName  = core.ErrInvalidJobTypeName
+	ErrJobTypeNameTooLong  = core.ErrJobTypeNameTooLong
+	ErrInvalidQueueName    = core.ErrInvalidQueueName
+	ErrQueueNameTooLong    = core.ErrQueueNameTooLong
+	ErrJobArgsTooLarge     = core.ErrJobArgsTooLarge
+	ErrJobNotCompleted     = core.ErrJobNotCompleted
+	ErrJobNotOwned         = core.ErrJobNotOwned
+	ErrDuplicateJob        = core.ErrDuplicateJob
+	ErrUniqueKeyTooLong    = core.ErrUniqueKeyTooLong
+	ErrJobAlreadyPaused    = core.ErrJobAlreadyPaused
+	ErrJobNotPaused        = core.ErrJobNotPaused
+	ErrQueueAlreadyPaused  = core.ErrQueueAlreadyPaused
+	ErrQueueNotPaused      = core.ErrQueueNotPaused
+	ErrCannotPauseStatus   = core.ErrCannotPauseStatus
+	ErrJobNotFound         = core.ErrJobNotFound
+	ErrNoResult            = core.ErrNoResult
+	ErrCannotRequeueSubJob = core.ErrCannotRequeueSubJob
 )
 
 // Default values
@@ -619,6 +623,31 @@ func IsWaitingError(err error) bool {
 // core.StatusWaiting, which is the actual status the parent job carries.
 func IsSuspendError(err error) bool {
 	return fanout.IsWaitingError(err)
+}
+
+// Requeue resets a terminally failed or cancelled job back to pending so it
+// runs again from scratch. Failed jobs are the dead-letter set — there is no
+// separate DLQ table; query them with q.Storage().GetJobsByStatus(StatusFailed)
+// and replay one with Requeue. The job's checkpoints are cleared so a workflow
+// replays from the beginning (handlers must be idempotent regardless), which is
+// the safe behavior when the usual reason to requeue is a code or dependency
+// fix that changes the workflow's steps. Requeuing a fan-out parent also clears
+// its entire fan-out subtree (descendant fan-outs and sub-jobs at every depth,
+// including nested workflows) so the replay re-dispatches cleanly.
+//
+// Returns true if the job was requeued, false if it was not found or not in a
+// requeuable (failed/cancelled) state. Returns ErrCannotRequeueSubJob for a
+// fan-out sub-job (requeue its parent instead), or an error if the storage
+// backend does not support requeueing.
+func Requeue(ctx context.Context, q *Queue, jobID string) (bool, error) {
+	type requeuer interface {
+		Requeue(ctx context.Context, jobID string) (bool, error)
+	}
+	r, ok := q.Storage().(requeuer)
+	if !ok {
+		return false, fmt.Errorf("jobs: storage backend does not support Requeue")
+	}
+	return r.Requeue(ctx, jobID)
 }
 
 // LoadResult decodes the persisted return value of a completed job into T.

@@ -1,0 +1,41 @@
+name: Bug report
+description: Report incorrect or unexpected behavior
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you expect, and what happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: Minimal steps or a code snippet that reproduces the issue.
+    validations:
+      required: true
+  - type: dropdown
+    id: backend
+    attributes:
+      label: Storage backend
+      options:
+        - PostgreSQL
+        - MySQL
+        - SQLite
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: simple-durable-jobs version, Go version, and database version.
+      placeholder: "sdj v1.x.y, Go 1.25.x, Postgres 16"
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      render: text

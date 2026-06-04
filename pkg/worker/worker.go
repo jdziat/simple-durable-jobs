@@ -18,6 +18,7 @@ import (
 	"github.com/jdziat/simple-durable-jobs/pkg/internal/handler"
 	"github.com/jdziat/simple-durable-jobs/pkg/queue"
 	"github.com/jdziat/simple-durable-jobs/pkg/schedule"
+	"github.com/jdziat/simple-durable-jobs/pkg/security"
 )
 
 // Worker processes jobs from the queue.
@@ -52,6 +53,14 @@ type scheduledFireReader interface {
 	GetScheduledFireTime(context.Context, string) (time.Time, bool, error)
 }
 
+// scheduledFireSeeder is implemented by storage backends that can establish a
+// shared fire-boundary anchor for a fresh schedule (insert-if-absent). It lets
+// every worker in a fleet derive the same first boundary, so skewed wall clocks
+// can't double-fire the first tick. Optional.
+type scheduledFireSeeder interface {
+	SeedScheduledFire(ctx context.Context, name string, anchor time.Time) (time.Time, error)
+}
+
 type completeWithResultStorage interface {
 	CompleteWithResult(ctx context.Context, jobID, workerID string, result []byte) (*core.FanOut, error)
 }
@@ -59,6 +68,22 @@ type completeWithResultStorage interface {
 type failTerminalWithResultStorage interface {
 	FailTerminalWithResult(ctx context.Context, jobID, workerID, errMsg string) (*core.FanOut, error)
 }
+
+// recoveryLeaser is implemented by storage backends that can elect a single
+// worker to run the fleet-wide fan-out recovery scan. Optional: backends that
+// don't implement it fall back to every worker polling.
+type recoveryLeaser interface {
+	TryAcquireRecoveryLease(ctx context.Context, name, owner string, ttl time.Duration) (bool, error)
+}
+
+const (
+	// recoveryLeaseName is the lease key for the fan-out recovery poll.
+	recoveryLeaseName = "fanout-recovery"
+	// recoveryLeaseTTL must exceed the recovery poll interval so the current
+	// holder keeps renewing across ticks; if the holder dies, the lease fails
+	// over to another worker within one TTL.
+	recoveryLeaseTTL = 15 * time.Second
+)
 
 // NewWorker creates a new worker for the given queue.
 func NewWorker(q *queue.Queue, opts ...WorkerOption) *Worker {
@@ -106,6 +131,9 @@ func NewWorker(q *queue.Queue, opts ...WorkerOption) *Worker {
 	}
 	if config.FanOutRecoveryStaleAge <= 0 {
 		config.FanOutRecoveryStaleAge = 2 * time.Minute
+	}
+	if config.MaxRetryBackoff <= 0 {
+		config.MaxRetryBackoff = time.Minute
 	}
 
 	// Propagate lock duration to the storage backend if supported.
@@ -421,6 +449,17 @@ func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 
 	resultBytes, err := w.executeHandler(jobCtx, job, h)
 
+	// Enforce the result size limit on the top-level handler result too — Call
+	// already enforces it for nested results, but a top-level handler can return
+	// an arbitrarily large value. Oversized results are a non-retryable failure:
+	// persisting a multi-megabyte blob per job would bloat the table, and a retry
+	// would just reproduce the same oversized result.
+	if err == nil && len(resultBytes) > security.MaxResultSize {
+		err = core.NoRetry(fmt.Errorf("jobs: job %q result is %d bytes, limit is %d",
+			job.Type, len(resultBytes), security.MaxResultSize))
+		resultBytes = nil
+	}
+
 	if err != nil {
 		// Check for WaitingError - job is waiting for sub-jobs
 		if fanout.IsWaitingError(err) {
@@ -660,11 +699,12 @@ func (w *Worker) executeHandler(ctx context.Context, job *core.Job, h *handler.H
 
 	// Create job context with all necessary references
 	jc := &intctx.JobContext{
-		Job:              job,
-		Storage:          w.queue.Storage(),
-		WorkerID:         w.config.WorkerID,
-		BestEffortReplay: job.Determinism == int(queue.BestEffort),
-		Logger:           w.logger,
+		Job:               job,
+		Storage:           w.queue.Storage(),
+		WorkerID:          w.config.WorkerID,
+		BestEffortReplay:  job.Determinism == int(queue.BestEffort),
+		DeterminismStrict: job.Determinism == int(queue.Strict),
+		Logger:            w.logger,
 		HandlerLookup: func(name string) (any, bool) {
 			return w.queue.GetHandler(name)
 		},
@@ -675,7 +715,22 @@ func (w *Worker) executeHandler(ctx context.Context, job *core.Job, h *handler.H
 	jobCtx := intctx.WithJobContext(ctx, jc)
 	jobCtx = intctx.WithCallState(jobCtx, checkpoints)
 
-	return h.Execute(jobCtx, job.Args)
+	resultBytes, err = h.Execute(jobCtx, job.Args)
+
+	// Strict determinism: after a successful replay, every recorded Call
+	// checkpoint must have been consumed. An unconsumed checkpoint means the
+	// handler's Call sequence changed between runs — a nondeterminism the
+	// stricter mode surfaces as a terminal (non-retryable) failure. Skipped for
+	// the default ExplicitCheckpoints and for BestEffort.
+	if err == nil && jc.DeterminismStrict {
+		if cs := intctx.GetCallState(jobCtx); cs != nil {
+			if n := cs.UnconsumedCallCheckpoints(); n > 0 {
+				return nil, core.NoRetry(fmt.Errorf(
+					"jobs: strict determinism violation: %d recorded Call checkpoint(s) were not replayed (handler issued fewer or reordered Calls than the original run)", n))
+			}
+		}
+	}
+	return resultBytes, err
 }
 
 func (w *Worker) handleError(ctx context.Context, jobCtx context.Context, job *core.Job, err error) {
@@ -891,6 +946,10 @@ func (w *Worker) completeFanOut(ctx context.Context, fo *core.FanOut, status cor
 }
 
 func (w *Worker) calculateBackoff(attempt int) time.Duration {
+	maxBackoff := w.config.MaxRetryBackoff
+	if maxBackoff <= 0 {
+		maxBackoff = time.Minute
+	}
 	shift := attempt
 	if shift < 0 {
 		shift = 0
@@ -900,8 +959,8 @@ func (w *Worker) calculateBackoff(attempt int) time.Duration {
 	}
 
 	backoff := time.Second << uint(shift)
-	if backoff <= 0 || backoff > time.Minute {
-		return time.Minute
+	if backoff <= 0 || backoff > maxBackoff {
+		return maxBackoff
 	}
 	return backoff
 }
@@ -917,10 +976,13 @@ const maxCatchUpIterations = 100_000
 // one catch-up fire, after which natural cadence resumes. When no boundary is
 // due (fresh start or no gap) it returns persisted unchanged. Pure: no clock,
 // no storage.
-func seedLastRun(schedule schedule.Schedule, persisted, now time.Time) time.Time {
+// The returned cappedCatchUp is true when the scan hit maxCatchUpIterations and
+// fell back to "resume from now", silently dropping the missed boundaries — the
+// caller logs a warning so this is observable rather than invisible.
+func seedLastRun(schedule schedule.Schedule, persisted, now time.Time) (cursor time.Time, cappedCatchUp bool) {
 	next := schedule.Next(persisted)
 	if next.IsZero() || next.After(now) {
-		return persisted
+		return persisted, false
 	}
 
 	prev := persisted
@@ -928,15 +990,71 @@ func seedLastRun(schedule schedule.Schedule, persisted, now time.Time) time.Time
 	for {
 		n2 := schedule.Next(next)
 		if n2.IsZero() || n2.After(now) {
-			return prev
+			return prev, false
 		}
 		prev = next
 		next = n2
 		iter++
 		if iter >= maxCatchUpIterations {
-			return now
+			return now, true
 		}
 	}
+}
+
+// establishScheduleBase computes the fire-boundary cursor for a schedule the
+// first time this worker sees it, in a way that is consistent across the fleet.
+//
+//   - If a prior fire (or anchor) is persisted, it seeds from that shared value
+//     — running at most one catch-up fire for boundaries missed while the whole
+//     fleet was down (seedLastRun).
+//   - If the schedule is fresh (no persisted value), it anchors a shared base in
+//     storage via ClaimScheduledFire(name, now). This writes last_fire_at without
+//     enqueuing anything, so anti-boot-storm holds (the first real fire is one
+//     interval later), and — crucially — every worker then derives the SAME next
+//     boundary from that shared anchor. Without it, two workers seeing a fresh
+//     schedule at slightly skewed local times would compute different nextRun
+//     values and each claim its own, double-firing the first tick.
+//
+// For absolute schedules (cron/daily/weekly) Next() snaps to the same wall-clock
+// boundary regardless of base, so they were never skew-sensitive; the anchor is
+// what protects interval (Every) schedules. Storage backends that don't persist
+// fire times fall back to the local clock (single-worker deployments are
+// unaffected; multi-worker without persistence cannot be coordinated anyway).
+func (w *Worker) establishScheduleBase(ctx context.Context, name string, sched schedule.Schedule, now time.Time) time.Time {
+	reader, ok := w.queue.Storage().(scheduledFireReader)
+	if !ok {
+		return now
+	}
+	persisted, found, err := reader.GetScheduledFireTime(ctx, name)
+	if err != nil {
+		w.logger.Error("failed to read scheduled fire time", "name", name, "error", err)
+		return now
+	}
+	if found && persisted.After(time.Unix(0, 0).UTC()) {
+		cursor, capped := seedLastRun(sched, persisted, now)
+		if capped {
+			w.logger.Warn("scheduled job catch-up exceeded the iteration cap; missed boundaries were dropped and the schedule resumes from now",
+				"name", name,
+				"persisted_last_fire_at", persisted,
+				"max_catch_up_iterations", maxCatchUpIterations)
+		}
+		return cursor
+	}
+	// Fresh schedule: anchor a shared base via insert-if-absent so the whole
+	// fleet derives the same first boundary. This does NOT fire or advance the
+	// boundary — it only records the starting cursor. Backends that don't
+	// support seeding fall back to the local clock (fine for single-worker).
+	if seeder, ok := w.queue.Storage().(scheduledFireSeeder); ok {
+		base, err := seeder.SeedScheduledFire(ctx, name, now)
+		if err != nil {
+			w.logger.Error("failed to anchor schedule base", "name", name, "error", err)
+			return now
+		}
+		if base.After(time.Unix(0, 0).UTC()) {
+			return base
+		}
+	}
+	return now
 }
 
 func (w *Worker) runScheduler(ctx context.Context) {
@@ -959,19 +1077,11 @@ func (w *Worker) runScheduler(ctx context.Context) {
 			now := time.Now()
 			for name, sj := range scheduled {
 				if _, ok := lastRun[name]; !ok {
-					// First sight of this schedule. Default to now (anti-boot-storm:
-					// a brand-new schedule must not fire immediately). But if a real
-					// prior fire is persisted, seed from it so the most recent missed
-					// boundary while the whole fleet was down fires once.
-					lastRun[name] = now
-					if reader, ok := w.queue.Storage().(scheduledFireReader); ok {
-						persistedLastFireAt, found, err := reader.GetScheduledFireTime(ctx, name)
-						if err != nil {
-							w.logger.Error("failed to read scheduled fire time", "name", name, "error", err)
-						} else if found && persistedLastFireAt.After(time.Unix(0, 0).UTC()) {
-							lastRun[name] = seedLastRun(sj.Schedule, persistedLastFireAt, now)
-						}
-					}
+					// First sight of this schedule: establish a fire-boundary base
+					// that every worker in the fleet agrees on, so skewed wall
+					// clocks cannot make two workers target different boundaries
+					// for the same logical tick (which would double-fire).
+					lastRun[name] = w.establishScheduleBase(ctx, name, sj.Schedule, now)
 				}
 				nextRun := sj.Schedule.Next(lastRun[name])
 				if now.After(nextRun) || now.Equal(nextRun) {
@@ -1021,11 +1131,30 @@ func (w *Worker) pollWaitingJobs(ctx context.Context) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
+	// If the backend supports a recovery lease, only the worker holding it runs
+	// the scan each tick. This bounds the cost of the recovery queries to one
+	// scan per tick for the whole fleet instead of one per worker. The primary,
+	// event-driven resume path (completeFanOut, on every worker) is unaffected;
+	// this poll is only the fallback for missed resumes and stalled parents.
+	leaser, hasLeaser := w.queue.Storage().(recoveryLeaser)
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			if hasLeaser {
+				held, err := leaser.TryAcquireRecoveryLease(ctx, recoveryLeaseName, w.config.WorkerID, recoveryLeaseTTL)
+				if err != nil {
+					// Don't let a lease hiccup wedge recovery — resume is
+					// idempotent, so scanning anyway is safe.
+					if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+						w.logger.Warn("recovery lease acquisition failed; scanning anyway", "error", err)
+					}
+				} else if !held {
+					continue
+				}
+			}
 			w.pollWaitingJobsOnce(ctx)
 		}
 	}

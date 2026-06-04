@@ -1,0 +1,31 @@
+# Codecov configuration.
+#
+# Coverage is produced per storage backend (SQLite, Postgres, MySQL) and merged
+# into a single profile before upload (see the `coverage` job in ci.yml), because
+# much of the storage layer is dialect-specific: the DB-clock lock expressions,
+# the MySQL generated-column migration, and the GET_LOCK/advisory-lock branches
+# only execute on their respective backend. A single-backend profile understates
+# real coverage badly, so the merged profile is the source of truth.
+coverage:
+  status:
+    project:
+      default:
+        target: auto
+        threshold: 2%
+    patch:
+      default:
+        target: 70%
+        threshold: 5%
+
+# Exclude code that `go test` does not (and should not) exercise: the chaostest
+# harness binary is run by the Stress & Chaos workflow, generated protobuf/UI
+# code is machine-produced, examples are illustrative, and doc.go files are
+# package documentation only.
+ignore:
+  - "cmd/chaostest/**"
+  - "ui/gen/**"
+  - "ui/proto/**"
+  - "examples/**"
+  - "**/doc.go"
+  - "**/*.pb.go"
+  - "**/*.connect.go"

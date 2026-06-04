@@ -20,6 +20,11 @@ help:
 	@echo "  test-postgres     Run tests against the compose Postgres service"
 	@echo "  test-mysql        Run tests against the compose MySQL service"
 	@echo "  test-backends     Run tests against SQLite + Postgres + MySQL"
+	@echo "  test-race         Run the SQLite suite under -race with package parallelism"
+	@echo "  bench             Run storage benchmarks (SQLite; set TEST_DATABASE_URL for Postgres)"
+	@echo "  bench-postgres    Run storage benchmarks against the compose Postgres service"
+	@echo "  chaos-test        Run the Postgres chaos harness"
+	@echo "  chaos-test-mysql  Run the MySQL chaos harness"
 	@echo "  compose-up        Bring up Postgres and MySQL containers"
 	@echo "  compose-down      Stop and remove test containers and volumes"
 	@echo "  build             go build ./..."
@@ -44,9 +49,25 @@ test-mysql:
 test-backends:
 	./scripts/test-backends.sh
 
+.PHONY: test-race
+test-race:
+	$(GO) test -race $(PKGS)
+
+.PHONY: bench
+bench:
+	$(GO) test -run '^$$' -bench=. -benchmem ./pkg/storage/...
+
+.PHONY: bench-postgres
+bench-postgres:
+	TEST_DATABASE_URL='$(POSTGRES_DSN)' $(GO) test -run '^$$' -bench=. -benchmem ./pkg/storage/...
+
 .PHONY: chaos-test
 chaos-test:
-	bash scripts/chaos-test.sh
+	bash scripts/chaos-test.sh postgres
+
+.PHONY: chaos-test-mysql
+chaos-test-mysql:
+	bash scripts/chaos-test.sh mysql
 
 .PHONY: compose-up
 compose-up:

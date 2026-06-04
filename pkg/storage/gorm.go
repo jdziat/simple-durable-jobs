@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"strings"
 	"time"
 
@@ -20,6 +21,12 @@ import (
 const (
 	defaultLockDuration = 45 * time.Minute
 	maxResumeBatch      = 100
+	// maxFanOutTreeDepth bounds the fan-out subtree walk in Requeue. Real
+	// workflows nest only a few levels; this is insurance against pathologically
+	// deep (or cyclically corrupt) data, not a normal limit. Per-level deletion
+	// already makes a cycle impossible to loop on (visited rows are gone), so
+	// this is belt-and-suspenders.
+	maxFanOutTreeDepth = 256
 )
 
 // GormStorageOption configures a GormStorage.
@@ -91,43 +98,48 @@ func (s *GormStorage) DB() *gorm.DB {
 	return s.db
 }
 
-// Migrate creates the necessary tables.
+// Migrate creates the necessary tables and applies versioned schema migrations.
+//
+// AutoMigrate creates/extends the base tables (it only ever adds columns and
+// indexes, never replaces or backfills). Anything that requires replacing an
+// index, adding a generated column, or transforming data is expressed as a
+// versioned migration in migrations.go and applied by runMigrations, which
+// records each applied version in the schema_migrations ledger so it runs at
+// most once per database.
 func (s *GormStorage) Migrate(ctx context.Context) error {
-	db := s.db.WithContext(ctx)
-	if err := db.AutoMigrate(&core.Job{}, &core.Checkpoint{}, &core.FanOut{}, &core.QueueState{}, &core.ScheduledFire{}); err != nil {
-		return err
-	}
-
-	if strings.EqualFold(s.db.Name(), "mysql") {
-		err := db.Exec(`
-			CREATE INDEX idx_jobs_dequeue
-			ON jobs (status, queue, priority, created_at)
-		`).Error
-		if err != nil && !strings.Contains(err.Error(), "Duplicate key name") && !strings.Contains(err.Error(), "Error 1061") {
+	// Hold a fleet-wide lock for the whole migration so concurrent Migrate()
+	// calls from every worker serialize rather than racing on DDL (gorm's
+	// AutoMigrate does check-then-create, which is not concurrency-safe on its
+	// own — two workers can both try to CREATE the same table/index).
+	return s.withMigrationLock(ctx, func(db *gorm.DB) error {
+		if err := db.AutoMigrate(
+			&core.Job{},
+			&core.Checkpoint{},
+			&core.FanOut{},
+			&core.QueueState{},
+			&core.ScheduledFire{},
+			&core.Lease{},
+			&core.SchemaMigration{},
+		); err != nil {
 			return err
 		}
-	} else {
-		if err := db.Exec(`
-			CREATE INDEX IF NOT EXISTS idx_jobs_dequeue
-			ON jobs (status, queue, priority DESC, created_at ASC)
-		`).Error; err != nil {
-			return err
-		}
-	}
 
-	// SQLite and PostgreSQL support partial indexes, which are needed to
-	// enforce active-job uniqueness while freeing the key after terminal
-	// states. MySQL is intentionally skipped because it does not support
-	// partial indexes, and its FOR UPDATE gap locks protect concurrent
-	// first-time inserts under the default REPEATABLE READ isolation.
-	if s.isSQLite || strings.EqualFold(s.db.Name(), "postgres") {
-		return db.Exec(`
-			CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_active_unique
-			ON jobs (unique_key)
-			WHERE unique_key <> '' AND status IN ('pending','running')
-		`).Error
-	}
-	return nil
+		// SQLite and PostgreSQL enforce active-job uniqueness with a partial
+		// unique index, which frees the key once a job reaches a terminal
+		// status. MySQL has no partial indexes; it gets an equivalent
+		// generated-column unique index in migration 2 (mysql_active_unique_key).
+		if s.isSQLite || s.dialect() == dialectPostgres {
+			if err := db.Exec(`
+				CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_active_unique
+				ON jobs (unique_key)
+				WHERE unique_key <> '' AND status IN ('pending','running')
+			`).Error; err != nil {
+				return err
+			}
+		}
+
+		return s.applyPendingMigrations(ctx, db)
+	})
 }
 
 // Enqueue adds a job to the queue.
@@ -176,8 +188,12 @@ func (s *GormStorage) withSerializationRetry(ctx context.Context, fn func() erro
 			return lastErr
 		}
 		// Linear backoff with a small cap — the retriable errors above
-		// clear on the next acquisition, so we do not need exponential.
-		time.Sleep(time.Duration(attempt+1) * 5 * time.Millisecond)
+		// clear on the next acquisition, so we do not need exponential. Add up
+		// to 50% jitter so a herd of workers deadlocking on the same rows does
+		// not retry in lockstep and re-collide on the next attempt.
+		base := time.Duration(attempt+1) * 5 * time.Millisecond
+		jitter := time.Duration(rand.Int64N(int64(base/2) + 1))
+		time.Sleep(base + jitter)
 	}
 	return fmt.Errorf("transaction failed after %d retries: %w", maxAttempts, lastErr)
 }
@@ -319,6 +335,22 @@ func (s *GormStorage) Dequeue(ctx context.Context, queues []string, workerID str
 	// PostgreSQL/MySQL: Use FOR UPDATE SKIP LOCKED for proper distributed locking
 	// Use silent logger for this transaction — "record not found" is the normal
 	// idle state and spams logs every poll interval.
+	//
+	// Lock timing is anchored to the DATABASE clock, not this worker's wall
+	// clock: the freshness predicates and the locked_until/started_at writes all
+	// evaluate NOW() server-side. This is what makes the lock safe across a
+	// fleet — the reaper on another worker compares locked_until against the same
+	// DB clock, so clock skew can never cause a live lock to be reclaimed early.
+	//
+	// Note on snapshot semantics: on Postgres NOW() is transaction_timestamp(),
+	// constant for the whole transaction. On MySQL NOW(6) is the per-STATEMENT
+	// time, so the SELECT's freshness check and the UPDATE's locked_until read
+	// slightly different instants. That is still correct: the UPDATE always runs
+	// after the SELECT, so locked_until is anchored to a time >= the freshness
+	// check — it can never make a just-taken lock look already expired. Do not
+	// add a predicate that assumes the two reads are equal.
+	nowExpr := s.nowExpr()
+	lockUntilExpr := s.offsetExpr(s.lockDuration)
 	silentDB := s.db.Session(&gorm.Session{Logger: s.db.Logger.LogMode(logger.Silent)})
 	err = silentDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		// FOR UPDATE SKIP LOCKED ensures:
@@ -328,8 +360,8 @@ func (s *GormStorage) Dequeue(ctx context.Context, queues []string, workerID str
 		result := tx.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).
 			Where("queue IN ?", activeQueues).
 			Where("status = ?", core.StatusPending).
-			Where("(run_at IS NULL OR run_at <= ?)", now).
-			Where("(locked_until IS NULL OR locked_until < ?)", now).
+			Where("(run_at IS NULL OR run_at <= ?)", nowExpr).
+			Where("(locked_until IS NULL OR locked_until < ?)", nowExpr).
 			Order("priority DESC, created_at ASC").
 			First(&job)
 
@@ -350,21 +382,22 @@ func (s *GormStorage) Dequeue(ctx context.Context, queues []string, workerID str
 			}
 		}
 
-		job.Status = core.StatusRunning
-		job.LockedBy = workerID
-		job.LockedUntil = &lockUntil
-		job.StartedAt = &now
-		job.Attempt++
-
-		return tx.Model(&core.Job{}).
+		if err := tx.Model(&core.Job{}).
 			Where("id = ?", job.ID).
 			Updates(map[string]any{
 				"status":       core.StatusRunning,
 				"locked_by":    workerID,
-				"locked_until": lockUntil,
-				"started_at":   now,
-				"attempt":      job.Attempt,
-			}).Error
+				"locked_until": lockUntilExpr,
+				"started_at":   nowExpr,
+				"attempt":      job.Attempt + 1,
+			}).Error; err != nil {
+			return err
+		}
+
+		// Re-read the row so the returned struct reflects the DB-clock
+		// locked_until/started_at the UPDATE assigned via SQL expressions
+		// (the in-memory job still holds pre-update values otherwise).
+		return tx.First(&job, "id = ?", job.ID).Error
 	})
 
 	if err != nil {
@@ -537,6 +570,22 @@ func (s *GormStorage) FailTerminalWithResult(ctx context.Context, jobID, workerI
 	return s.accountTerminalWithFanOut(ctx, jobID, workerID, updates, "failed_count")
 }
 
+// fanOutCounterStmt returns the constant UPDATE statement that increments the
+// named fan-out counter, or ok=false for any unrecognized column. This is an
+// allow-list: the only valid columns are the two terminal counters, and each
+// maps to a fixed string literal so no caller value is ever interpolated into
+// SQL. The placeholders bind (updated_at, fan_out_id, status).
+func fanOutCounterStmt(col string) (stmt string, ok bool) {
+	switch col {
+	case "completed_count":
+		return "UPDATE fan_outs SET completed_count = completed_count + 1, updated_at = ? WHERE id = ? AND status = ?", true
+	case "failed_count":
+		return "UPDATE fan_outs SET failed_count = failed_count + 1, updated_at = ? WHERE id = ? AND status = ?", true
+	default:
+		return "", false
+	}
+}
+
 // accountTerminalWithFanOut performs the ownership-guarded terminal job UPDATE
 // described by jobUpdates and, when the job is a sub-job of a still-pending
 // fan-out, atomically increments fanOutCounterCol in the same transaction
@@ -576,8 +625,16 @@ func (s *GormStorage) accountTerminalWithFanOut(ctx context.Context, jobID, work
 				return nil
 			}
 
-			// fanOutCounterCol is a hardcoded caller constant, not user input.
-			counterSQL := fmt.Sprintf("UPDATE fan_outs SET %s = %s + 1, updated_at = ? WHERE id = ? AND status = ?", fanOutCounterCol, fanOutCounterCol)
+			// Map the caller's intent to a constant SQL statement via an
+			// allow-list. The column name is never interpolated from a
+			// variable — even though callers only pass hardcoded constants
+			// today, building the statement with fmt.Sprintf made the call
+			// site one careless edit away from SQL injection. The switch
+			// makes that impossible and is checked at compile time.
+			counterSQL, ok := fanOutCounterStmt(fanOutCounterCol)
+			if !ok {
+				return fmt.Errorf("storage: invalid fan-out counter column %q", fanOutCounterCol)
+			}
 			if err := tx.Exec(
 				counterSQL,
 				now, *job.FanOutID, core.FanOutPending,
@@ -610,7 +667,7 @@ func (s *GormStorage) SaveCheckpoint(ctx context.Context, cp *core.Checkpoint) e
 	return s.db.WithContext(ctx).
 		Clauses(clause.OnConflict{
 			Columns:   []clause.Column{{Name: "job_id"}, {Name: "call_index"}, {Name: "call_type"}},
-			DoUpdates: clause.AssignmentColumns([]string{"result", "error", "error_kind", "error_delay_nanos"}),
+			DoUpdates: clause.AssignmentColumns([]string{"result", "error", "error_kind", "error_cause", "error_delay_nanos"}),
 		}).
 		Create(cp).Error
 }
@@ -635,7 +692,14 @@ func (s *GormStorage) DeleteCheckpoints(ctx context.Context, jobID string) error
 // GetDueJobs returns jobs ready to run.
 func (s *GormStorage) GetDueJobs(ctx context.Context, queues []string, limit int) ([]*core.Job, error) {
 	var jobList []*core.Job
-	now := time.Now()
+
+	// Match Dequeue's clock source so "due" means the same thing to every caller.
+	var nowVal any
+	if s.useDBClock() {
+		nowVal = s.nowExpr()
+	} else {
+		nowVal = time.Now()
+	}
 
 	// Get paused queues to filter out
 	pausedQueues, err := s.GetPausedQueues(ctx)
@@ -662,8 +726,8 @@ func (s *GormStorage) GetDueJobs(ctx context.Context, queues []string, limit int
 	err = s.db.WithContext(ctx).
 		Where("queue IN ?", activeQueues).
 		Where("status = ?", core.StatusPending).
-		Where("(run_at IS NULL OR run_at <= ?)", now).
-		Where("(locked_until IS NULL OR locked_until < ?)", now).
+		Where("(run_at IS NULL OR run_at <= ?)", nowVal).
+		Where("(locked_until IS NULL OR locked_until < ?)", nowVal).
 		Order("priority DESC, created_at ASC").
 		Limit(limit).
 		Find(&jobList).Error
@@ -691,6 +755,26 @@ func (s *GormStorage) ClaimScheduledFire(ctx context.Context, name string, fireT
 	return result.RowsAffected == 1, nil
 }
 
+// SeedScheduledFire establishes a shared fire-boundary anchor for a fresh
+// schedule and returns the effective anchor. It inserts a row with
+// last_fire_at = anchor only if none exists (insert-if-absent via ON CONFLICT
+// DO NOTHING), so the first worker in the fleet to seed wins and every other
+// worker reads back the same value. Unlike ClaimScheduledFire it never advances
+// an existing boundary and never represents a fire — it only records the
+// starting cursor so all workers compute identical fire times and the atomic
+// ClaimScheduledFire then elects exactly one firing per boundary.
+func (s *GormStorage) SeedScheduledFire(ctx context.Context, name string, anchor time.Time) (time.Time, error) {
+	if err := s.db.WithContext(ctx).Clauses(clause.OnConflict{DoNothing: true}).
+		Create(&core.ScheduledFire{Name: name, LastFireAt: anchor}).Error; err != nil {
+		return time.Time{}, err
+	}
+	var fire core.ScheduledFire
+	if err := s.db.WithContext(ctx).First(&fire, "name = ?", name).Error; err != nil {
+		return time.Time{}, err
+	}
+	return fire.LastFireAt, nil
+}
+
 // GetScheduledFireTime returns the latest persisted fire boundary for a schedule.
 func (s *GormStorage) GetScheduledFireTime(ctx context.Context, name string) (time.Time, bool, error) {
 	var fire core.ScheduledFire
@@ -707,15 +791,21 @@ func (s *GormStorage) GetScheduledFireTime(ctx context.Context, name string) (ti
 // Heartbeat extends the lock on a running job.
 // Returns ErrJobNotOwned if the job is no longer owned by this worker.
 func (s *GormStorage) Heartbeat(ctx context.Context, jobID string, workerID string) error {
-	now := time.Now()
-	lockUntil := now.Add(s.lockDuration)
+	updates := map[string]any{}
+	if s.useDBClock() {
+		// Extend the lock on the DB clock so it stays comparable with the
+		// reaper's stale cutoff regardless of this worker's wall clock.
+		updates["locked_until"] = s.offsetExpr(s.lockDuration)
+		updates["last_heartbeat_at"] = s.nowExpr()
+	} else {
+		now := time.Now()
+		updates["locked_until"] = now.Add(s.lockDuration)
+		updates["last_heartbeat_at"] = now
+	}
 	result := s.db.WithContext(ctx).
 		Model(&core.Job{}).
 		Where("id = ? AND locked_by = ? AND status = ?", jobID, workerID, core.StatusRunning).
-		Updates(map[string]any{
-			"locked_until":      lockUntil,
-			"last_heartbeat_at": now,
-		})
+		Updates(updates)
 	if result.Error != nil {
 		return result.Error
 	}
@@ -802,7 +892,17 @@ func (s *GormStorage) FindOrphanedJobs(ctx context.Context, jobIDs []string, wor
 // cancel any local in-flight handlers — see core.Storage.ReleaseStaleLocks
 // for the rationale.
 func (s *GormStorage) ReleaseStaleLocks(ctx context.Context, staleDuration time.Duration) ([]string, error) {
-	cutoff := time.Now().Add(-staleDuration)
+	// The cutoff is computed on the DB clock for multi-worker backends so it is
+	// comparable with the DB-clock locked_until written by Dequeue/Heartbeat.
+	// Comparing a client-computed cutoff against a DB-written lock is exactly the
+	// skew bug this avoids: a reaper whose wall clock ran ahead would otherwise
+	// reclaim a lock that is still live on the owning worker.
+	var cutoff any
+	if s.useDBClock() {
+		cutoff = s.offsetExpr(-staleDuration)
+	} else {
+		cutoff = time.Now().Add(-staleDuration)
+	}
 
 	// Two-step: first capture the IDs of stale jobs, then update them in
 	// the same transaction so the reader and the writer agree. RETURNING
@@ -1249,6 +1349,140 @@ func (s *GormStorage) ResumeJob(ctx context.Context, jobID string) (bool, error)
 		return false, result.Error
 	}
 	return result.RowsAffected > 0, nil
+}
+
+// Requeue resets a terminally failed or cancelled job back to pending so it can
+// run again from scratch. Failed jobs are this library's dead-letter set — there
+// is no separate DLQ table; a job that exhausts its retries (or is cancelled)
+// stays queryable via GetJobsByStatus(StatusFailed) and Requeue is how an
+// operator replays one.
+//
+// The attempt counter, error, lock, and result fields are reset, run_at is
+// cleared (immediately eligible), AND the job's checkpoints are deleted so the
+// run starts fresh. Clearing checkpoints is deliberate: the usual reason to
+// requeue is a code or dependency fix, which can change a workflow's Call
+// sequence — resuming into checkpoints recorded by the old run would skip the
+// wrong steps and, under Strict determinism, falsely trip the
+// unconsumed-checkpoint guard. Handlers must be idempotent regardless (the
+// execution contract is at-least-once), so a full replay is safe.
+//
+// A fan-out sub-job cannot be requeued directly (it would double-count its
+// parent); ErrCannotRequeueSubJob is returned in that case. Requeuing a fan-out
+// PARENT deletes its entire fan-out subtree — every descendant fan-out record,
+// sub-job, and their checkpoints, at any nesting depth — so the replay
+// re-dispatches a fresh tree instead of orphaning the old one.
+//
+// Returns true if a job was requeued, false if it was not found or not in a
+// requeuable (failed/cancelled) state.
+func (s *GormStorage) Requeue(ctx context.Context, jobID string) (bool, error) {
+	var requeued bool
+	err := s.withSerializationRetry(ctx, func() error {
+		requeued = false
+		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			var job core.Job
+			if err := tx.First(&job, "id = ?", jobID).Error; err != nil {
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					return nil // not found → not requeued
+				}
+				return err
+			}
+			if job.Status != core.StatusFailed && job.Status != core.StatusCancelled {
+				return nil // not in a requeuable state
+			}
+			if job.FanOutID != nil && *job.FanOutID != "" {
+				// Requeuing a sub-job directly would re-run it and increment the
+				// parent's fan-out counter a second time. Replay via the parent.
+				return core.ErrCannotRequeueSubJob
+			}
+
+			result := tx.Model(&core.Job{}).
+				Where("id = ?", jobID).
+				Updates(map[string]any{
+					"status":       core.StatusPending,
+					"attempt":      0,
+					"last_error":   "",
+					"result":       nil,
+					"locked_by":    "",
+					"locked_until": nil,
+					"started_at":   nil,
+					"completed_at": nil,
+					"run_at":       nil,
+					"updated_at":   time.Now(),
+				})
+			if result.Error != nil {
+				return result.Error
+			}
+			requeued = true
+
+			// Replay from scratch: drop checkpoints recorded by the prior run.
+			if err := tx.Where("job_id = ?", jobID).Delete(&core.Checkpoint{}).Error; err != nil {
+				return err
+			}
+
+			// If this job is a fan-out parent, delete its entire fan-out
+			// subtree (records + sub-jobs + their checkpoints, at every depth)
+			// so the replay's FanOut() re-dispatches a fresh tree rather than
+			// leaving orphaned rows and stale counters — including under nested
+			// workflows where a sub-job is itself a fan-out parent.
+			return s.deleteFanOutSubtree(tx, jobID)
+		})
+	})
+	if err != nil {
+		return false, err
+	}
+	return requeued, nil
+}
+
+// deleteFanOutSubtree deletes the entire fan-out tree rooted at rootJobID: every
+// fan-out it spawned directly or transitively, all of those sub-jobs, and their
+// checkpoints. The root job row itself is NOT touched. Used by Requeue so
+// replaying a parent re-dispatches a fresh tree instead of orphaning the old one
+// at any depth (a sub-job may itself be a fan-out parent).
+//
+// It descends level by level, deleting each level before expanding the next.
+// parent_job_id/fan_out_id are plain columns (no FK), so a child fan-out is
+// still findable by its (now-deleted) parent sub-job's id; and because each
+// level's rows are deleted as it is visited, even cyclically corrupt data cannot
+// loop (the depth cap is just extra insurance). IN-lists stay bounded to one
+// level's width rather than the whole tree.
+func (s *GormStorage) deleteFanOutSubtree(tx *gorm.DB, rootJobID string) error {
+	frontier := []string{rootJobID}
+	for depth := 0; len(frontier) > 0 && depth < maxFanOutTreeDepth; depth++ {
+		var fanOutIDs []string
+		if err := tx.Model(&core.FanOut{}).
+			Where("parent_job_id IN ?", frontier).
+			Pluck("id", &fanOutIDs).Error; err != nil {
+			return err
+		}
+		if len(fanOutIDs) == 0 {
+			return nil // reached the leaves
+		}
+
+		var subJobIDs []string
+		if err := tx.Model(&core.Job{}).
+			Where("fan_out_id IN ?", fanOutIDs).
+			Pluck("id", &subJobIDs).Error; err != nil {
+			return err
+		}
+
+		if len(subJobIDs) > 0 {
+			if err := tx.Where("job_id IN ?", subJobIDs).Delete(&core.Checkpoint{}).Error; err != nil {
+				return err
+			}
+			if err := tx.Where("id IN ?", subJobIDs).Delete(&core.Job{}).Error; err != nil {
+				return err
+			}
+		}
+		if err := tx.Where("id IN ?", fanOutIDs).Delete(&core.FanOut{}).Error; err != nil {
+			return err
+		}
+
+		// Sub-jobs just deleted may themselves have spawned fan-outs; expand
+		// into them next. Their child fan-out rows are still present and remain
+		// findable by parent_job_id (a plain column).
+		frontier = subJobIDs
+	}
+	return nil
 }
 
 // GetWaitingJobsToResume finds waiting jobs whose fan-out is complete.

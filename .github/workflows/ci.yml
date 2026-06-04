@@ -48,12 +48,54 @@ jobs:
         if: always() && matrix.db != ''
         run: docker compose down -v
 
-      - name: Upload coverage
-        uses: codecov/codecov-action@v4
+      # Coverage is dialect-split, so upload each backend's profile as an
+      # artifact and let the `coverage` job merge them before sending the
+      # combined result to Codecov (a single-backend profile understates the
+      # storage layer's real coverage).
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
         if: always()
         with:
-          files: ./coverage/coverage-${{ matrix.backend }}.out
-          flags: ${{ matrix.backend }}
+          name: coverage-${{ matrix.backend }}
+          path: ./coverage/coverage-${{ matrix.backend }}.out
+          if-no-files-found: warn
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    needs: [test-backends]
+    if: always()
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+
+      - name: Download coverage artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: coverage-*
+          path: coverage-raw
+          merge-multiple: true
+
+      - name: Merge backend coverage profiles
+        run: |
+          shopt -s nullglob
+          files=(coverage-raw/coverage-*.out)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "no coverage profiles found; skipping merge"
+            exit 0
+          fi
+          go run github.com/wadey/gocovmerge@latest "${files[@]}" > coverage-merged.out
+          echo "Merged coverage:"
+          go tool cover -func=coverage-merged.out | tail -1
+
+      - name: Upload merged coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: ./coverage-merged.out
           fail_ci_if_error: false
 
   test-e2e:
@@ -122,6 +164,20 @@ jobs:
           version: latest
           install-mode: goinstall
           args: --timeout=5m
+
+  chaos-smoke:
+    name: Chaos smoke (Postgres)
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    # A short multi-worker crash/recovery run on every PR so regressions in the
+    # lock/heartbeat/reaper/ownership paths are caught before merge, not just by
+    # the nightly Stress & Chaos workflow. The full PG+MySQL chaos runs nightly.
+    env:
+      CHAOS_DURATION: "25"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run chaos smoke
+        run: bash scripts/chaos-test.sh postgres
 
   build:
     name: Build

@@ -63,13 +63,19 @@ type Job struct {
 
 // Checkpoint stores the result of a durable Call() for replay.
 type Checkpoint struct {
-	ID              string    `gorm:"primaryKey;size:36"`
-	JobID           string    `gorm:"index;uniqueIndex:idx_checkpoints_job_call,priority:1;size:36;not null"`
-	CallIndex       int       `gorm:"uniqueIndex:idx_checkpoints_job_call,priority:2;not null"`
-	CallType        string    `gorm:"uniqueIndex:idx_checkpoints_job_call,priority:3;size:255;not null"`
-	Result          []byte    `gorm:"type:bytes"`
-	Error           string    `gorm:"type:text"`
-	ErrorKind       string    `gorm:"size:64"`
+	ID        string `gorm:"primaryKey;size:36"`
+	JobID     string `gorm:"index;uniqueIndex:idx_checkpoints_job_call,priority:1;size:36;not null"`
+	CallIndex int    `gorm:"uniqueIndex:idx_checkpoints_job_call,priority:2;not null"`
+	CallType  string `gorm:"uniqueIndex:idx_checkpoints_job_call,priority:3;size:255;not null"`
+	Result    []byte `gorm:"type:bytes"`
+	Error     string `gorm:"type:text"`
+	ErrorKind string `gorm:"size:64"`
+	// ErrorCause holds the discriminator-specific reconstruction payload: for
+	// no_retry/retry_after it is the inner cause message (so the wrapper is
+	// rebuilt without parsing the formatted prefix); for sentinel errors it is
+	// the stable sentinel key. Empty for checkpoints written before this column
+	// existed — RehydrateCheckpointError falls back to message parsing then.
+	ErrorCause      string    `gorm:"type:text"`
 	ErrorDelayNanos int64     `gorm:"default:0"`
 	CreatedAt       time.Time `gorm:"autoCreateTime"`
 }

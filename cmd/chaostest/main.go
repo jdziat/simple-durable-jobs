@@ -14,6 +14,7 @@ import (
 	"time"
 
 	jobs "github.com/jdziat/simple-durable-jobs"
+	"gorm.io/driver/mysql"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
@@ -22,9 +23,10 @@ import (
 const defaultDatabaseURL = "postgres://jobs:jobs@postgres:5432/jobs_test?sslmode=disable"
 
 type app struct {
-	db    *gorm.DB
-	store *jobs.GormStorage
-	q     *jobs.Queue
+	db      *gorm.DB
+	store   *jobs.GormStorage
+	q       *jobs.Queue
+	dialect string // "postgres" or "mysql"
 }
 
 type subArgs struct {
@@ -69,11 +71,8 @@ func main() {
 }
 
 func openApp(ctx context.Context) (*app, error) {
-	dsn := os.Getenv("TEST_DATABASE_URL")
-	if dsn == "" {
-		dsn = defaultDatabaseURL
-	}
-	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{
+	dialector, dialect := openDialector()
+	db, err := gorm.Open(dialector, &gorm.Config{
 		Logger: logger.Default.LogMode(logger.Warn),
 	})
 	if err != nil {
@@ -88,27 +87,59 @@ func openApp(ctx context.Context) (*app, error) {
 	if err := store.Migrate(ctx); err != nil {
 		return nil, err
 	}
-	if err := ensureLedger(ctx, db); err != nil {
+	if err := ensureLedger(ctx, db, dialect); err != nil {
 		return nil, err
 	}
 	q := jobs.New(store)
-	registerHandlers(q, db)
-	return &app{db: db, store: store, q: q}, nil
+	registerHandlers(q, db, dialect)
+	return &app{db: db, store: store, q: q, dialect: dialect}, nil
 }
 
-func ensureLedger(ctx context.Context, db *gorm.DB) error {
-	stmts := []string{
-		`CREATE TABLE IF NOT EXISTS chaos_effects (
-			id bigserial PRIMARY KEY,
-			job_id text NOT NULL,
-			marker text NOT NULL,
-			created_at timestamptz NOT NULL DEFAULT now(),
-			UNIQUE(job_id, marker)
-		)`,
-		`CREATE TABLE IF NOT EXISTS chaos_ticks (
-			id bigserial PRIMARY KEY,
-			fired_at timestamptz NOT NULL DEFAULT now()
-		)`,
+// openDialector selects the storage backend from the environment so the chaos
+// harness can exercise BOTH multi-worker backends. TEST_MYSQL_URL takes
+// precedence (MySQL is first-class); otherwise TEST_DATABASE_URL / the default
+// selects Postgres.
+func openDialector() (gorm.Dialector, string) {
+	if dsn := os.Getenv("TEST_MYSQL_URL"); dsn != "" {
+		return mysql.Open(dsn), "mysql"
+	}
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		dsn = defaultDatabaseURL
+	}
+	return postgres.Open(dsn), "postgres"
+}
+
+func ensureLedger(ctx context.Context, db *gorm.DB, dialect string) error {
+	var stmts []string
+	if dialect == "mysql" {
+		stmts = []string{
+			`CREATE TABLE IF NOT EXISTS chaos_effects (
+				id BIGINT AUTO_INCREMENT PRIMARY KEY,
+				job_id VARCHAR(191) NOT NULL,
+				marker VARCHAR(191) NOT NULL,
+				created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+				UNIQUE KEY uq_job_marker (job_id, marker)
+			)`,
+			`CREATE TABLE IF NOT EXISTS chaos_ticks (
+				id BIGINT AUTO_INCREMENT PRIMARY KEY,
+				fired_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+			)`,
+		}
+	} else {
+		stmts = []string{
+			`CREATE TABLE IF NOT EXISTS chaos_effects (
+				id bigserial PRIMARY KEY,
+				job_id text NOT NULL,
+				marker text NOT NULL,
+				created_at timestamptz NOT NULL DEFAULT now(),
+				UNIQUE(job_id, marker)
+			)`,
+			`CREATE TABLE IF NOT EXISTS chaos_ticks (
+				id bigserial PRIMARY KEY,
+				fired_at timestamptz NOT NULL DEFAULT now()
+			)`,
+		}
 	}
 	for _, stmt := range stmts {
 		if err := db.WithContext(ctx).Exec(stmt).Error; err != nil {
@@ -118,7 +149,7 @@ func ensureLedger(ctx context.Context, db *gorm.DB) error {
 	return nil
 }
 
-func registerHandlers(q *jobs.Queue, db *gorm.DB) {
+func registerHandlers(q *jobs.Queue, db *gorm.DB, dialect string) {
 	q.Register("chaos.unit", func(ctx context.Context, _ struct{}) error {
 		return insertEffect(ctx, db, jobs.JobIDFromContext(ctx), "done")
 	})
@@ -132,7 +163,7 @@ func registerHandlers(q *jobs.Queue, db *gorm.DB) {
 			marker := "phase:" + phase
 			if err := insertEffect(ctx, db, jobs.JobIDFromContext(ctx), marker); err != nil {
 				if isDuplicate(err) {
-					_ = insertEffectIgnoreDuplicate(ctx, db, jobs.JobIDFromContext(ctx), "phase-reexec:"+phase)
+					_ = insertEffectIgnoreDuplicate(ctx, db, dialect, jobs.JobIDFromContext(ctx), "phase-reexec:"+phase)
 				}
 				return err
 			}
@@ -185,7 +216,11 @@ func registerHandlers(q *jobs.Queue, db *gorm.DB) {
 	})
 
 	q.Register("chaos.tick", func(ctx context.Context, _ struct{}) error {
-		return db.WithContext(ctx).Exec(`INSERT INTO chaos_ticks DEFAULT VALUES`).Error
+		stmt := `INSERT INTO chaos_ticks DEFAULT VALUES`
+		if dialect == "mysql" {
+			stmt = `INSERT INTO chaos_ticks () VALUES ()`
+		}
+		return db.WithContext(ctx).Exec(stmt).Error
 	})
 	q.Schedule("chaos.tick", nil, jobs.Every(5*time.Second), jobs.Retries(0))
 }
@@ -214,7 +249,7 @@ func runWorker(parent context.Context, a *app) error {
 }
 
 func runSeed(ctx context.Context, a *app) error {
-	if err := resetHarnessData(ctx, a.db); err != nil {
+	if err := resetHarnessData(ctx, a.db, a.dialect); err != nil {
 		return err
 	}
 
@@ -261,8 +296,25 @@ func runSeed(ctx context.Context, a *app) error {
 	return nil
 }
 
-func resetHarnessData(ctx context.Context, db *gorm.DB) error {
-	return db.WithContext(ctx).Exec(`TRUNCATE TABLE chaos_effects, chaos_ticks, checkpoints, fan_outs, jobs, queue_states RESTART IDENTITY CASCADE`).Error
+func resetHarnessData(ctx context.Context, db *gorm.DB, dialect string) error {
+	if dialect == "mysql" {
+		// MySQL TRUNCATE can't target multiple tables or CASCADE; truncate each
+		// with FK checks off (the schema has no inter-table FKs, but this keeps
+		// the order-independent regardless).
+		tables := []string{"chaos_effects", "chaos_ticks", "checkpoints", "fan_outs", "jobs", "queue_states", "scheduled_fires", "leases"}
+		return db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			if err := tx.Exec(`SET FOREIGN_KEY_CHECKS=0`).Error; err != nil {
+				return err
+			}
+			for _, t := range tables {
+				if err := tx.Exec(`TRUNCATE TABLE ` + t).Error; err != nil {
+					return err
+				}
+			}
+			return tx.Exec(`SET FOREIGN_KEY_CHECKS=1`).Error
+		})
+	}
+	return db.WithContext(ctx).Exec(`TRUNCATE TABLE chaos_effects, chaos_ticks, checkpoints, fan_outs, jobs, queue_states, scheduled_fires, leases RESTART IDENTITY CASCADE`).Error
 }
 
 func runCheck(ctx context.Context, a *app) error {
@@ -395,8 +447,11 @@ func checkSchedule(ctx context.Context, db *gorm.DB) invariant {
 	// boundary alignment and a tick landing at each edge of the window.
 	maxExpected := int64(window/period) + 2
 	return invariant{
-		name:   "INV-SCHED",
-		level:  "INFO",
+		name: "INV-SCHED",
+		// HARD as of the shared-anchor scheduler fix: a fresh schedule now seeds
+		// a fleet-wide base (SeedScheduledFire), so skewed worker clocks can no
+		// longer make replicas target different first boundaries and double-fire.
+		level:  "HARD",
 		pass:   got <= maxExpected,
 		detail: fmt.Sprintf("ticks_in_%s_window=%d max_expected_single_scheduler=%d", window, got, maxExpected),
 	}
@@ -409,11 +464,15 @@ func insertEffect(ctx context.Context, db *gorm.DB, jobID, marker string) error 
 	return db.WithContext(ctx).Exec(`INSERT INTO chaos_effects (job_id, marker) VALUES (?, ?)`, jobID, marker).Error
 }
 
-func insertEffectIgnoreDuplicate(ctx context.Context, db *gorm.DB, jobID, marker string) error {
+func insertEffectIgnoreDuplicate(ctx context.Context, db *gorm.DB, dialect, jobID, marker string) error {
 	if jobID == "" {
 		jobID = "unknown"
 	}
-	return db.WithContext(ctx).Exec(`INSERT INTO chaos_effects (job_id, marker) VALUES (?, ?) ON CONFLICT (job_id, marker) DO NOTHING`, jobID, marker).Error
+	stmt := `INSERT INTO chaos_effects (job_id, marker) VALUES (?, ?) ON CONFLICT (job_id, marker) DO NOTHING`
+	if dialect == "mysql" {
+		stmt = `INSERT IGNORE INTO chaos_effects (job_id, marker) VALUES (?, ?)`
+	}
+	return db.WithContext(ctx).Exec(stmt, jobID, marker).Error
 }
 
 func isDuplicate(err error) bool {
@@ -421,7 +480,10 @@ func isDuplicate(err error) bool {
 		return false
 	}
 	msg := err.Error()
-	return strings.Contains(msg, "duplicate key value") || strings.Contains(msg, "SQLSTATE 23505")
+	return strings.Contains(msg, "duplicate key value") || // pg text
+		strings.Contains(msg, "SQLSTATE 23505") || // pg code
+		strings.Contains(msg, "Duplicate entry") || // mysql text
+		strings.Contains(msg, "Error 1062") // mysql code
 }
 
 func fatalf(format string, args ...any) {

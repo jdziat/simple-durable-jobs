@@ -1,5 +1,47 @@
 # Changelog
 
+Per-release notes are generated from commit messages and published as
+[GitHub Releases](https://github.com/jdziat/simple-durable-jobs/releases), which
+are the authoritative changelog (the entries below `Unreleased` are historical).
+See [VERSIONING.md](VERSIONING.md) for the versioning and deprecation policy.
+
+## Unreleased
+
+### Reliability & correctness
+
+- **DB-clock lock timing.** On Postgres/MySQL, `locked_until`, heartbeat
+  extension, and the stale-lock reaper cutoff are now computed from the database
+  clock, so clock skew between workers can no longer reclaim a live lock and
+  cause double execution.
+- **Dequeue index reworked** to match the dequeue query (partial index over
+  pending rows on Postgres/SQLite), via a new versioned migration runner with a
+  `schema_migrations` ledger.
+- **MySQL active-job uniqueness** now enforced with a generated-column unique
+  index, matching the partial-index semantics Postgres/SQLite already had — a
+  unique key now dedups identically on all three backends.
+- **Scheduler double-fire fix.** A fresh schedule seeds a fleet-wide anchor, so
+  skewed worker clocks can't target different first boundaries and double-fire.
+- **Recovery poll is leader-elected** via an expiring lease, so a fleet runs the
+  fan-out recovery scan once per tick instead of once per worker.
+- **Error replay** stores an explicit cause/sentinel-key, removing the brittle
+  message-prefix parsing.
+
+### Features
+
+- `Determinism(Strict)` now genuinely stricter: fails terminally if a replay
+  does not reach every recorded `Call` checkpoint.
+- `Requeue(ctx, q, jobID)` to replay a failed/cancelled job (failed jobs are the
+  dead-letter set).
+- `WithMaxRetryBackoff(d)` to cap automatic retry backoff.
+- Storage benchmarks (`make bench` / `make bench-postgres`).
+
+### Verification & docs
+
+- Chaos + multi-backend stress wired into CI (nightly Stress & Chaos workflow on
+  Postgres + MySQL; a chaos smoke on every PR). The chaos scheduler invariant is
+  now a hard gate.
+- New "Guarantees & Production Readiness" doc; honest positioning vs Temporal/River.
+
 ## [1.0.2](https://github.com/jdziat/simple-durable-jobs/compare/v1.0.1...v1.0.2) (2026-02-28)
 
 

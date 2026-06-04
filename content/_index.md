@@ -41,7 +41,7 @@ description: "A Go library for durable job queues with checkpointed workflows, f
   <span>SQLite</span>
   <span>PostgreSQL</span>
   <span>MySQL</span>
-  <span>Go 1.24+</span>
+  <span>Go 1.25+</span>
 </div>
 
 <p class="sdj-section-label">Up and running in a few lines</p>
