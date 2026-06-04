@@ -5,7 +5,7 @@ Per-release notes are generated from commit messages and published as
 are the authoritative changelog (the entries below `Unreleased` are historical).
 See [VERSIONING.md](VERSIONING.md) for the versioning and deprecation policy.
 
-## Unreleased
+## 1.3.0
 
 ### Reliability & correctness
 
@@ -28,6 +28,11 @@ See [VERSIONING.md](VERSIONING.md) for the versioning and deprecation policy.
 
 ### Features
 
+- `CallWithCheckpointCtx(execCtx, checkpointCtx, ...)` — run a durable `Call`
+  with a per-activity deadline (`execCtx`) while persisting its checkpoint on a
+  separate long-lived context (`checkpointCtx`), so a deadline firing right as a
+  long activity returns can no longer lose a successful result. `Call` is
+  unchanged (it delegates with both contexts equal).
 - `Determinism(Strict)` now genuinely stricter: fails terminally if a replay
   does not reach every recorded `Call` checkpoint.
 - `Requeue(ctx, q, jobID)` to replay a failed/cancelled job (failed jobs are the

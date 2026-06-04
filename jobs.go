@@ -319,6 +319,14 @@ func Call[T any](ctx context.Context, name string, args any) (T, error) {
 	return call.Call[T](ctx, name, args)
 }
 
+// CallWithCheckpointCtx is like Call but uses execCtx for handler execution
+// and checkpointCtx for the checkpoint write. Use this when the activity has
+// a per-call deadline (execCtx = WithTimeout(root, deadline)) but the checkpoint
+// write must survive past that deadline (checkpointCtx = workflow root context).
+func CallWithCheckpointCtx[T any](execCtx, checkpointCtx context.Context, name string, args any) (T, error) {
+	return call.CallWithCheckpointCtx[T](execCtx, checkpointCtx, name, args)
+}
+
 // SavePhaseCheckpoint saves a phase result to the checkpoint store.
 // Use this to checkpoint expensive operations so they can be skipped on job retry.
 func SavePhaseCheckpoint(ctx context.Context, phaseName string, result any) error {
