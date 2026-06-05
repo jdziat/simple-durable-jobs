@@ -173,58 +173,14 @@ func (q *Queue) enqueue(ctx context.Context, name string, args any, opts ...Opti
 
 // enqueueWithOptions adds a job using a pre-built Options value.
 func (q *Queue) enqueueWithOptions(ctx context.Context, name string, args any, options *Options) (string, error) {
-	// Validate queue name
-	if err := security.ValidateQueueName(options.Queue); err != nil {
-		return "", err
-	}
-
-	argsBytes, err := json.Marshal(args)
+	job, err := q.buildJob(name, args, options)
 	if err != nil {
-		return "", fmt.Errorf("jobs: failed to marshal args: %w", err)
-	}
-
-	// Enforce size limit on arguments
-	if len(argsBytes) > security.MaxJobArgsSize {
-		return "", core.ErrJobArgsTooLarge
-	}
-
-	// Clamp retries to maximum
-	maxRetries := security.ClampRetries(options.MaxRetries)
-	effDet := options.Determinism
-	if !options.determinismSet {
-		q.mu.RLock()
-		effDet = q.determinism
-		q.mu.RUnlock()
-	}
-
-	job := &core.Job{
-		ID:          uuid.New().String(),
-		Type:        name,
-		Args:        argsBytes,
-		Queue:       options.Queue,
-		Priority:    options.Priority,
-		MaxRetries:  maxRetries,
-		Determinism: int(effDet),
-		Status:      core.StatusPending,
-	}
-
-	if options.Timeout > 0 {
-		job.Timeout = options.Timeout
-	}
-	if options.Delay > 0 {
-		runAt := time.Now().Add(options.Delay)
-		job.RunAt = &runAt
-	}
-	if options.RunAt != nil {
-		job.RunAt = options.RunAt
+		return "", err
 	}
 
 	// Build the persist function that the middleware chain will eventually call
 	persist := func(ctx context.Context, j *core.Job) error {
 		if options.UniqueKey != "" {
-			if err := security.ValidateUniqueKey(options.UniqueKey); err != nil {
-				return err
-			}
 			if err := q.storage.EnqueueUnique(ctx, j, options.UniqueKey); err != nil {
 				if errors.Is(err, core.ErrDuplicateJob) {
 					return err
@@ -245,6 +201,118 @@ func (q *Queue) enqueueWithOptions(ctx context.Context, name string, args any, o
 	}
 
 	return job.ID, nil
+}
+
+func (q *Queue) buildJob(name string, args any, options *Options) (*core.Job, error) {
+	// Validate queue name
+	if err := security.ValidateQueueName(options.Queue); err != nil {
+		return nil, err
+	}
+	if options.UniqueKey != "" {
+		if err := security.ValidateUniqueKey(options.UniqueKey); err != nil {
+			return nil, err
+		}
+	}
+
+	argsBytes, err := json.Marshal(args)
+	if err != nil {
+		return nil, fmt.Errorf("jobs: failed to marshal args: %w", err)
+	}
+
+	// Enforce size limit on arguments
+	if len(argsBytes) > security.MaxJobArgsSize {
+		return nil, core.ErrJobArgsTooLarge
+	}
+
+	// Clamp retries to maximum
+	maxRetries := security.ClampRetries(options.MaxRetries)
+	effDet := options.Determinism
+	if !options.determinismSet {
+		q.mu.RLock()
+		effDet = q.determinism
+		q.mu.RUnlock()
+	}
+
+	job := &core.Job{
+		ID:          uuid.New().String(),
+		Type:        name,
+		Args:        argsBytes,
+		Queue:       options.Queue,
+		Priority:    options.Priority,
+		MaxRetries:  maxRetries,
+		UniqueKey:   options.UniqueKey,
+		Determinism: int(effDet),
+		Status:      core.StatusPending,
+	}
+
+	if options.Timeout > 0 {
+		job.Timeout = options.Timeout
+	}
+	if options.Delay > 0 {
+		runAt := time.Now().Add(options.Delay)
+		job.RunAt = &runAt
+	}
+	if options.RunAt != nil {
+		job.RunAt = options.RunAt
+	}
+
+	return job, nil
+}
+
+// EnqueueBatch adds multiple jobs to the queue in one storage operation.
+//
+// The entries are validated and marshaled with the same rules as EnqueueRemote,
+// and enqueue middleware runs once per entry before persistence. Returned IDs
+// match input order. When Unique keys collide, storage deduplicates silently;
+// a returned ID for a deduped entry refers to the existing job.
+func (q *Queue) EnqueueBatch(ctx context.Context, entries []BatchEntry) ([]string, error) {
+	if len(entries) == 0 {
+		return []string{}, nil
+	}
+
+	jobs := make([]*core.Job, len(entries))
+	ids := make([]string, len(entries))
+	for i, entry := range entries {
+		options := NewOptions()
+		for _, opt := range entry.Options {
+			opt.Apply(options)
+		}
+		job, err := q.buildJob(entry.Name, entry.Args, options)
+		if err != nil {
+			return nil, err
+		}
+		jobs[i] = job
+		ids[i] = job.ID
+	}
+
+	seenUnique := make(map[string]string, len(jobs))
+	for i, job := range jobs {
+		if job.UniqueKey == "" {
+			continue
+		}
+		if existingID, ok := seenUnique[job.UniqueKey]; ok {
+			job.ID = existingID
+			ids[i] = existingID
+			continue
+		}
+		seenUnique[job.UniqueKey] = job.ID
+	}
+
+	toPersist := make([]*core.Job, 0, len(jobs))
+	for _, job := range jobs {
+		persist := func(ctx context.Context, j *core.Job) error {
+			toPersist = append(toPersist, j)
+			return nil
+		}
+		if err := q.runEnqueueMiddleware(ctx, job, persist); err != nil {
+			return nil, err
+		}
+	}
+
+	if err := q.storage.EnqueueBatch(ctx, toPersist); err != nil {
+		return nil, fmt.Errorf("jobs: failed to enqueue batch: %w", err)
+	}
+	return ids, nil
 }
 
 // runEnqueueMiddleware executes the enqueue middleware chain, ending with persist.

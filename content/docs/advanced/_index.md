@@ -12,4 +12,5 @@ Production tuning for Simple Durable Jobs. These pages cover the knobs you reach
   {{< card link="pool-configuration/" title="Pool Configuration" icon="adjustments" subtitle="The four connection-pool presets, what each optimizes for, and how to hand-roll a custom PoolConfig with the option functions." >}}
   {{< card link="storage-retry/" title="Storage Retry" icon="shield-check" subtitle="Why the worker has two retry knobs (WithStorageRetry, WithDequeueRetry), what each protects against, and tuning for slow storage." >}}
   {{< card link="retry-backoff/" title="Job Retry Backoff" icon="clock" subtitle="Configure worker-default and per-handler retry delays with BackoffPolicy, ExponentialBackoff, and jitter." >}}
+  {{< card link="batch-enqueue/" title="Batch Enqueue" icon="collection" subtitle="Use Batch entries and Queue.EnqueueBatch to insert many producer jobs with one storage batch operation." >}}
 {{< /cards >}}

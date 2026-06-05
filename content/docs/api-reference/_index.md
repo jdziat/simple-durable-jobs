@@ -7,7 +7,7 @@ toc: false
 Complete API documentation for Simple Durable Jobs, split by area. Use the **search box** (top of the page) or pick a section below.
 
 {{< cards cols="3" >}}
-  {{< card link="queue/" title="Queue" icon="collection" subtitle="New, Register, Enqueue, Schedule, NewWorker, context helpers." >}}
+  {{< card link="queue/" title="Queue" icon="collection" subtitle="New, Register, Enqueue, EnqueueRemote, EnqueueBatch, Batch, BatchEntry, Schedule, NewWorker." >}}
   {{< card link="worker/" title="Worker" icon="cog" subtitle="Start, pause/resume, concurrency, scheduler, stale-lock, retry." >}}
   {{< card link="workflows/" title="Durable Workflows & Fan-Out" icon="refresh" subtitle="Call, checkpoints, FanOut, SubJob, result helpers, strategies." >}}
   {{< card link="signals/" title="Workflow Signals" icon="bell" subtitle="Signal, WaitForSignal, WaitForSignalTimeout, CheckSignal, DrainSignals." >}}

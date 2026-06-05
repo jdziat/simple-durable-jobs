@@ -39,6 +39,18 @@ type Option interface {
 	Apply(*Options)
 }
 
+// BatchEntry describes one job to enqueue through Queue.EnqueueBatch.
+type BatchEntry struct {
+	Name    string
+	Args    any
+	Options []Option
+}
+
+// Batch creates a batch enqueue entry.
+func Batch(name string, args any, opts ...Option) BatchEntry {
+	return BatchEntry{Name: name, Args: args, Options: opts}
+}
+
 type optionFunc func(*Options)
 
 func (f optionFunc) Apply(o *Options) { f(o) }

@@ -108,6 +108,9 @@ type (
 	// Option modifies Options.
 	Option = queue.Option
 
+	// BatchEntry describes one job in a batch enqueue request.
+	BatchEntry = queue.BatchEntry
+
 	// EnqueueMiddleware wraps the enqueue operation for cross-cutting concerns.
 	EnqueueMiddleware = queue.EnqueueMiddleware
 
@@ -322,6 +325,11 @@ func ConnMaxIdleTime(d time.Duration) PoolOption {
 // NewOptions creates Options with defaults.
 func NewOptions() *Options {
 	return queue.NewOptions()
+}
+
+// Batch creates a batch enqueue entry.
+func Batch(name string, args any, opts ...Option) BatchEntry {
+	return queue.Batch(name, args, opts...)
 }
 
 // NewWorker creates a new worker for the given queue.
