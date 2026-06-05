@@ -25,11 +25,15 @@ var _ TxEnqueuer = (*GormStorage)(nil)
 // EnqueueTx adds a job using the caller-supplied transaction handle.
 func (s *GormStorage) EnqueueTx(ctx context.Context, tx *gorm.DB, job *core.Job) error {
 	fillEnqueueDefaults(job)
+	row, err := s.encodedJobForCreate(job)
+	if err != nil {
+		return err
+	}
 	db := tx.WithContext(ctx)
 	if job.UniqueKey == "" {
-		return db.Create(job).Error
+		return db.Create(row).Error
 	}
-	result := db.Clauses(clause.OnConflict{DoNothing: true}).Create(job)
+	result := db.Clauses(clause.OnConflict{DoNothing: true}).Create(row)
 	if result.Error != nil {
 		return result.Error
 	}
@@ -60,7 +64,11 @@ func (s *GormStorage) EnqueueUniqueTx(ctx context.Context, tx *gorm.DB, job *cor
 		return err
 	}
 
-	result := db.Clauses(clause.OnConflict{DoNothing: true}).Create(job)
+	row, err := s.encodedJobForCreate(job)
+	if err != nil {
+		return err
+	}
+	result := db.Clauses(clause.OnConflict{DoNothing: true}).Create(row)
 	if result.Error != nil {
 		return result.Error
 	}
@@ -134,5 +142,9 @@ func (s *GormStorage) enqueueBatchWithDB(db *gorm.DB, jobs []*core.Job) error {
 	if len(toCreate) == 0 {
 		return nil
 	}
-	return db.Clauses(clause.OnConflict{DoNothing: true}).Create(toCreate).Error
+	rows, err := s.encodedJobsForCreate(toCreate)
+	if err != nil {
+		return err
+	}
+	return db.Clauses(clause.OnConflict{DoNothing: true}).Create(rows).Error
 }

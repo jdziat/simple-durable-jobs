@@ -40,11 +40,24 @@ func WithStorageLockDuration(d time.Duration) GormStorageOption {
 	}
 }
 
+// WithCodec configures a payload codec for bytes stored in payload columns.
+// Nil selects the default identity codec.
+func WithCodec(c core.PayloadCodec) GormStorageOption {
+	return func(s *GormStorage) {
+		if c == nil {
+			s.codec = core.IdentityCodec
+			return
+		}
+		s.codec = c
+	}
+}
+
 // GormStorage implements Storage using GORM.
 type GormStorage struct {
 	db           *gorm.DB
 	isSQLite     bool
 	lockDuration time.Duration
+	codec        core.PayloadCodec
 }
 
 // NewGormStorage creates a new GORM-backed storage. For SQLite under concurrent
@@ -67,7 +80,7 @@ func NewGormStorage(db *gorm.DB, opts ...GormStorageOption) *GormStorage {
 		dialector := db.Name()
 		isSQLite = strings.Contains(strings.ToLower(dialector), "sqlite")
 	}
-	s := &GormStorage{db: db, isSQLite: isSQLite, lockDuration: defaultLockDuration}
+	s := &GormStorage{db: db, isSQLite: isSQLite, lockDuration: defaultLockDuration, codec: core.IdentityCodec}
 	if s.isSQLite {
 		// NOTE: a one-shot PRAGMA only affects the single pooled connection it
 		// runs on; connections the pool opens later default to busy_timeout=0.
@@ -146,11 +159,15 @@ func (s *GormStorage) Migrate(ctx context.Context) error {
 // Enqueue adds a job to the queue.
 func (s *GormStorage) Enqueue(ctx context.Context, job *core.Job) error {
 	fillEnqueueDefaults(job)
+	row, err := s.encodedJobForCreate(job)
+	if err != nil {
+		return err
+	}
 	db := s.db.WithContext(ctx)
 	if job.UniqueKey == "" {
-		return db.Create(job).Error
+		return db.Create(row).Error
 	}
-	result := db.Clauses(clause.OnConflict{DoNothing: true}).Create(job)
+	result := db.Clauses(clause.OnConflict{DoNothing: true}).Create(row)
 	if result.Error != nil {
 		return result.Error
 	}
@@ -270,7 +287,11 @@ func (s *GormStorage) EnqueueUnique(ctx context.Context, job *core.Job, uniqueKe
 			// No existing active job found. The database-level partial unique
 			// index is the final backstop for PostgreSQL's absent-row FOR
 			// UPDATE gap.
-			result := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(job)
+			row, err := s.encodedJobForCreate(job)
+			if err != nil {
+				return err
+			}
+			result := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(row)
 			if result.Error != nil {
 				return result.Error
 			}
@@ -391,6 +412,9 @@ func (s *GormStorage) Dequeue(ctx context.Context, queues []string, workerID str
 	if job.ID == "" {
 		return nil, nil
 	}
+	if err := s.decodeJobPayloads(&job); err != nil {
+		return nil, err
+	}
 	return &job, nil
 }
 
@@ -465,6 +489,9 @@ func (s *GormStorage) dequeueSQLite(ctx context.Context, queues []string, worker
 	if job.ID == "" {
 		return nil, nil
 	}
+	if err := s.decodeJobPayloads(&job); err != nil {
+		return nil, err
+	}
 	return &job, nil
 }
 
@@ -500,7 +527,11 @@ func (s *GormStorage) CompleteWithResult(ctx context.Context, jobID, workerID st
 		"locked_until": nil,
 	}
 	if result != nil {
-		updates["result"] = result
+		encoded, err := s.encodePayload("job result", jobID, result)
+		if err != nil {
+			return nil, err
+		}
+		updates["result"] = encoded
 	}
 	return s.accountTerminalWithFanOut(ctx, jobID, workerID, updates, "completed_count")
 }
@@ -649,12 +680,16 @@ func (s *GormStorage) SaveCheckpoint(ctx context.Context, cp *core.Checkpoint) e
 	if cp.ID == "" {
 		cp.ID = uuid.New().String()
 	}
+	row, err := s.encodedCheckpointForSave(cp)
+	if err != nil {
+		return err
+	}
 	return s.db.WithContext(ctx).
 		Clauses(clause.OnConflict{
 			Columns:   []clause.Column{{Name: "job_id"}, {Name: "call_index"}, {Name: "call_type"}},
 			DoUpdates: clause.AssignmentColumns([]string{"result", "error", "error_kind", "error_cause", "error_delay_nanos"}),
 		}).
-		Create(cp).Error
+		Create(row).Error
 }
 
 // GetCheckpoints retrieves all checkpoints for a job.
@@ -664,7 +699,13 @@ func (s *GormStorage) GetCheckpoints(ctx context.Context, jobID string) ([]core.
 		Where("job_id = ?", jobID).
 		Order("call_index ASC").
 		Find(&checkpoints).Error
-	return checkpoints, err
+	if err != nil {
+		return nil, err
+	}
+	if err := s.decodeCheckpointPayloads(checkpoints); err != nil {
+		return nil, err
+	}
+	return checkpoints, nil
 }
 
 // DeleteCheckpoints removes all checkpoints for a job.
@@ -717,7 +758,13 @@ func (s *GormStorage) GetDueJobs(ctx context.Context, queues []string, limit int
 		Limit(limit).
 		Find(&jobList).Error
 
-	return jobList, err
+	if err != nil {
+		return nil, err
+	}
+	if err := s.decodeJobListPayloads(jobList); err != nil {
+		return nil, err
+	}
+	return jobList, nil
 }
 
 // ClaimScheduledFire atomically advances a schedule's last claimed fire time.
@@ -932,7 +979,13 @@ func (s *GormStorage) GetJob(ctx context.Context, jobID string) (*core.Job, erro
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil, nil
 	}
-	return &job, err
+	if err != nil {
+		return nil, err
+	}
+	if err := s.decodeJobPayloads(&job); err != nil {
+		return nil, err
+	}
+	return &job, nil
 }
 
 // GetJobsByStatus retrieves jobs by status.
@@ -942,7 +995,13 @@ func (s *GormStorage) GetJobsByStatus(ctx context.Context, status core.JobStatus
 		Where("status = ?", status).
 		Limit(limit).
 		Find(&jobList).Error
-	return jobList, err
+	if err != nil {
+		return nil, err
+	}
+	if err := s.decodeJobListPayloads(jobList); err != nil {
+		return nil, err
+	}
+	return jobList, nil
 }
 
 // --- Fan-out operations ---
@@ -1096,7 +1155,13 @@ func (s *GormStorage) GetSubJobs(ctx context.Context, fanOutID string) ([]*core.
 		Where("fan_out_id = ?", fanOutID).
 		Order("fan_out_index ASC").
 		Find(&jobs).Error
-	return jobs, err
+	if err != nil {
+		return nil, err
+	}
+	if err := s.decodeJobListPayloads(jobs); err != nil {
+		return nil, err
+	}
+	return jobs, nil
 }
 
 // GetSubJobResults retrieves completed/failed sub-jobs for result collection.
@@ -1106,7 +1171,13 @@ func (s *GormStorage) GetSubJobResults(ctx context.Context, fanOutID string) ([]
 		Where("fan_out_id = ? AND status IN ?", fanOutID, []core.JobStatus{core.StatusCompleted, core.StatusFailed}).
 		Order("fan_out_index ASC").
 		Find(&jobs).Error
-	return jobs, err
+	if err != nil {
+		return nil, err
+	}
+	if err := s.decodeJobListPayloads(jobs); err != nil {
+		return nil, err
+	}
+	return jobs, nil
 }
 
 // CancelSubJobs cancels pending/running sub-jobs for a fan-out.
@@ -1465,7 +1536,13 @@ func (s *GormStorage) GetWaitingJobsToResume(ctx context.Context) ([]*core.Job, 
 		)
 		LIMIT ?
 	`, core.StatusWaiting, core.FanOutCompleted, core.FanOutFailed, core.FanOutPending, maxResumeBatch).Scan(&jobs).Error
-	return jobs, err
+	if err != nil {
+		return nil, err
+	}
+	if err := s.decodeJobListPayloads(jobs); err != nil {
+		return nil, err
+	}
+	return jobs, nil
 }
 
 // GetStalledFanOutParents finds waiting parents whose pending fan-out never
@@ -1490,15 +1567,25 @@ func (s *GormStorage) GetStalledFanOutParents(ctx context.Context, olderThan tim
 		) < f.total_count
 		LIMIT ?
 	`, core.StatusWaiting, core.FanOutPending, olderThan, maxResumeBatch).Scan(&jobs).Error
-	return jobs, err
+	if err != nil {
+		return nil, err
+	}
+	if err := s.decodeJobListPayloads(jobs); err != nil {
+		return nil, err
+	}
+	return jobs, nil
 }
 
 // SaveJobResult stores the serialized result for a job.
 func (s *GormStorage) SaveJobResult(ctx context.Context, jobID string, workerID string, result []byte) error {
+	encoded, err := s.encodePayload("job result", jobID, result)
+	if err != nil {
+		return err
+	}
 	update := s.db.WithContext(ctx).
 		Model(&core.Job{}).
 		Where("id = ? AND locked_by = ? AND status = ?", jobID, workerID, core.StatusRunning).
-		Update("result", result)
+		Update("result", encoded)
 	if update.Error != nil {
 		return update.Error
 	}
@@ -1600,7 +1687,13 @@ func (s *GormStorage) GetPausedJobs(ctx context.Context, queue string) ([]*core.
 		Where("queue = ? AND status = ?", queue, core.StatusPaused).
 		Order("created_at ASC").
 		Find(&jobs).Error
-	return jobs, err
+	if err != nil {
+		return nil, err
+	}
+	if err := s.decodeJobListPayloads(jobs); err != nil {
+		return nil, err
+	}
+	return jobs, nil
 }
 
 // IsJobPaused checks if a job is paused.

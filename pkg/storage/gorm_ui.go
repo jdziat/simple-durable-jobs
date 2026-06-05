@@ -125,6 +125,9 @@ func (s *GormStorage) SearchJobs(ctx context.Context, filter core.JobFilter) ([]
 		return nil, 0, err
 	}
 
+	if err := s.decodeJobListPayloads(jobs); err != nil {
+		return nil, 0, err
+	}
 	return jobs, total, nil
 }
 
@@ -188,6 +191,9 @@ func (s *GormStorage) RetryJob(ctx context.Context, jobID string) (*core.Job, er
 	job.StartedAt = nil
 	job.CompletedAt = nil
 	job.UpdatedAt = now
+	if err := s.decodeJobPayloads(&job); err != nil {
+		return nil, err
+	}
 	return &job, nil
 }
 
@@ -254,6 +260,9 @@ func (s *GormStorage) GetWorkflowRoots(ctx context.Context, status string, limit
 		return nil, 0, err
 	}
 
+	if err := s.decodeJobListPayloads(jobs); err != nil {
+		return nil, 0, err
+	}
 	return jobs, total, nil
 }
 
@@ -282,5 +291,11 @@ func (s *GormStorage) GetSubJobsByFanOuts(ctx context.Context, fanOutIDs []strin
 		Where("fan_out_id IN ?", fanOutIDs).
 		Order("fan_out_id ASC, fan_out_index ASC").
 		Find(&jobs).Error
-	return jobs, err
+	if err != nil {
+		return nil, err
+	}
+	if err := s.decodeJobListPayloads(jobs); err != nil {
+		return nil, err
+	}
+	return jobs, nil
 }

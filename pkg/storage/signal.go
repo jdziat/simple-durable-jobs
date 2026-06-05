@@ -15,11 +15,15 @@ import (
 // SendSignal persists a named signal for a job. It is buffered: a signal sent
 // before the handler waits for it is not lost.
 func (s *GormStorage) SendSignal(ctx context.Context, jobID, name string, payload []byte) error {
+	encoded, err := s.encodePayload("signal payload", jobID+"/"+name, payload)
+	if err != nil {
+		return err
+	}
 	return s.db.WithContext(ctx).Create(&core.Signal{
 		ID:      uuid.New().String(),
 		JobID:   jobID,
 		Name:    name,
-		Payload: payload,
+		Payload: encoded,
 	}).Error
 }
 
@@ -35,6 +39,9 @@ func (s *GormStorage) PeekSignal(ctx context.Context, jobID, name string) (*core
 		return nil, nil
 	}
 	if err != nil {
+		return nil, err
+	}
+	if err := s.decodeSignalPayload(&sig); err != nil {
 		return nil, err
 	}
 	return &sig, nil
@@ -73,6 +80,9 @@ func (s *GormStorage) ConsumeSignal(ctx context.Context, jobID, name string) (*c
 				return nil // raced with another consumer; treat as none this round
 			}
 			sig.ConsumedAt = &now
+			if err := s.decodeSignalPayload(&sig); err != nil {
+				return err
+			}
 			out = &sig
 			return nil
 		})
@@ -111,6 +121,9 @@ func (s *GormStorage) DrainSignals(ctx context.Context, jobID, name string) ([]*
 			if err := tx.Model(&core.Signal{}).
 				Where("id IN ?", ids).
 				Update("consumed_at", now).Error; err != nil {
+				return err
+			}
+			if err := s.decodeSignalPayloads(sigs); err != nil {
 				return err
 			}
 			out = sigs
@@ -197,5 +210,11 @@ func (s *GormStorage) GetSignalWaitingJobsToResume(ctx context.Context) ([]*core
 		).
 		Limit(maxResumeBatch).
 		Find(&jobs).Error
-	return jobs, err
+	if err != nil {
+		return nil, err
+	}
+	if err := s.decodeJobListPayloads(jobs); err != nil {
+		return nil, err
+	}
+	return jobs, nil
 }

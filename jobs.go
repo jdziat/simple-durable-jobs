@@ -34,6 +34,7 @@ import (
 	"gorm.io/gorm"
 
 	"github.com/jdziat/simple-durable-jobs/pkg/call"
+	payloadcodec "github.com/jdziat/simple-durable-jobs/pkg/codec"
 	"github.com/jdziat/simple-durable-jobs/pkg/core"
 	"github.com/jdziat/simple-durable-jobs/pkg/fanout"
 	"github.com/jdziat/simple-durable-jobs/pkg/jobctx"
@@ -71,6 +72,9 @@ type (
 
 	// Storage defines the persistence layer for jobs.
 	Storage = core.Storage
+
+	// PayloadCodec transforms serialized payload bytes at the storage boundary.
+	PayloadCodec = core.PayloadCodec
 
 	// Starter is an interface for types that can be started with a context.
 	Starter = core.Starter
@@ -153,8 +157,14 @@ type (
 	// GormStorage implements Storage using GORM.
 	GormStorage = storage.GormStorage
 
+	// GormStorageOption configures GormStorage.
+	GormStorageOption = storage.GormStorageOption
+
 	// TxEnqueuer is the optional storage capability for caller-supplied transactions.
 	TxEnqueuer = storage.TxEnqueuer
+
+	// Secretbox is the built-in NaCl Secretbox payload codec.
+	Secretbox = payloadcodec.Secretbox
 
 	// PoolConfig holds connection pool configuration.
 	PoolConfig = storage.PoolConfig
@@ -260,12 +270,18 @@ var (
 	ErrSignalNameTooLong   = core.ErrSignalNameTooLong
 	ErrStorageNoSignals    = core.ErrStorageNoSignals
 	ErrStorageNoTxEnqueue  = core.ErrStorageNoTxEnqueue
+	ErrPayloadDecode       = core.ErrPayloadDecode
+
+	ErrSecretboxAuthentication = payloadcodec.ErrSecretboxAuthentication
 )
 
 // Default values
 var (
 	DefaultJobRetries  = queue.DefaultJobRetries
 	DefaultCallRetries = queue.DefaultCallRetries
+
+	IdentityCodec = core.IdentityCodec
+	NopCodec      = core.NopCodec
 )
 
 // New creates a new Queue with the given storage backend.
@@ -274,8 +290,18 @@ func New(s Storage) *Queue {
 }
 
 // NewGormStorage creates a new GORM-backed storage.
-func NewGormStorage(db *gorm.DB) *GormStorage {
-	return storage.NewGormStorage(db)
+func NewGormStorage(db *gorm.DB, opts ...GormStorageOption) *GormStorage {
+	return storage.NewGormStorage(db, opts...)
+}
+
+// WithCodec configures a payload codec for GormStorage.
+func WithCodec(c PayloadCodec) GormStorageOption {
+	return storage.WithCodec(c)
+}
+
+// NewSecretbox creates the built-in NaCl Secretbox payload codec.
+func NewSecretbox(primaryKey [32]byte, fallbackKeys ...[32]byte) (*Secretbox, error) {
+	return payloadcodec.NewSecretbox(primaryKey, fallbackKeys...)
 }
 
 // NewGormStorageWithPool creates storage with connection pool configuration.

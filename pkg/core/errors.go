@@ -37,6 +37,8 @@ var (
 	// ErrStorageNoTxEnqueue is returned when the storage backend does not
 	// implement caller-supplied transaction enqueue.
 	ErrStorageNoTxEnqueue = errors.New("jobs: storage backend does not support transactional enqueue")
+	// ErrPayloadDecode wraps codec failures while reading stored payload bytes.
+	ErrPayloadDecode = errors.New("jobs: payload decode failed")
 )
 
 // WorkflowWaiter is implemented by control-flow errors that tell the worker a
