@@ -4,6 +4,7 @@ package worker
 import (
 	"time"
 
+	"github.com/jdziat/simple-durable-jobs/pkg/core"
 	"github.com/jdziat/simple-durable-jobs/pkg/security"
 )
 
@@ -90,6 +91,10 @@ type WorkerConfig struct {
 	// Default: 1 minute. Raising it backs off harder on a persistently failing
 	// dependency instead of re-attempting every minute until retries exhaust.
 	MaxRetryBackoff time.Duration
+
+	// JobBackoff configures retry delays for job re-execution after handler
+	// errors. If nil, the worker uses DefaultBackoffPolicy().
+	JobBackoff core.BackoffPolicy
 }
 
 // Concurrency sets the concurrency for a queue.
@@ -237,6 +242,14 @@ func WithMaxRetryBackoff(d time.Duration) WorkerOption {
 		if d > 0 {
 			c.MaxRetryBackoff = d
 		}
+	})
+}
+
+// WithBackoff configures the worker-default retry backoff policy for failed
+// job re-execution. Per-handler policies and RetryAfter override it.
+func WithBackoff(p BackoffPolicy) WorkerOption {
+	return workerOptionFunc(func(c *WorkerConfig) {
+		c.JobBackoff = p
 	})
 }
 

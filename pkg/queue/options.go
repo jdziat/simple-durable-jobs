@@ -4,6 +4,7 @@ package queue
 import (
 	"time"
 
+	"github.com/jdziat/simple-durable-jobs/pkg/core"
 	"github.com/jdziat/simple-durable-jobs/pkg/security"
 )
 
@@ -21,6 +22,7 @@ type Options struct {
 	// Timezone is reserved for future use and is currently ignored; schedules evaluate in UTC.
 	Timezone *time.Location
 	Timeout  time.Duration // max wall time for handler execution; 0 means no limit
+	Backoff  core.BackoffPolicy
 }
 
 // NewOptions creates Options with defaults.
@@ -87,6 +89,13 @@ func At(t time.Time) Option {
 func Timeout(d time.Duration) Option {
 	return optionFunc(func(o *Options) {
 		o.Timeout = d
+	})
+}
+
+// WithHandlerBackoff sets the retry backoff policy for this handler.
+func WithHandlerBackoff(p core.BackoffPolicy) Option {
+	return optionFunc(func(o *Options) {
+		o.Backoff = p
 	})
 }
 

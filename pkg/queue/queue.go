@@ -102,6 +102,7 @@ func (q *Queue) RegisterE(name string, fn any, opts ...Option) error {
 			opt.Apply(o)
 		}
 		h.Timeout = o.Timeout
+		h.Backoff = o.Backoff
 	}
 
 	q.mu.Lock()

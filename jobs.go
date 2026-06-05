@@ -132,6 +132,15 @@ type (
 	// RetryConfig holds configuration for retry with backoff.
 	RetryConfig = worker.RetryConfig
 
+	// BackoffPolicy computes the delay before a failed job is retried.
+	BackoffPolicy = worker.BackoffPolicy
+
+	// BackoffFunc adapts a function to BackoffPolicy.
+	BackoffFunc = worker.BackoffFunc
+
+	// ExponentialBackoff computes exponential job retry delays with optional jitter.
+	ExponentialBackoff = worker.ExponentialBackoff
+
 	// Schedule defines when a job should run next.
 	Schedule = schedule.Schedule
 
@@ -415,6 +424,11 @@ func Timeout(d time.Duration) Option {
 	return queue.Timeout(d)
 }
 
+// WithHandlerBackoff sets the retry backoff policy for this handler.
+func WithHandlerBackoff(p BackoffPolicy) Option {
+	return queue.WithHandlerBackoff(p)
+}
+
 // Unique ensures only one job with this key exists.
 func Unique(key string) Option {
 	return queue.Unique(key)
@@ -475,6 +489,12 @@ func WithDrainTimeout(d time.Duration) WorkerOption {
 	return worker.WithDrainTimeout(d)
 }
 
+// WithBackoff configures the worker-default retry backoff policy for failed
+// job re-execution. Per-handler policies and RetryAfter override it.
+func WithBackoff(p BackoffPolicy) WorkerOption {
+	return worker.WithBackoff(p)
+}
+
 // WithStaleLockInterval sets how often the worker checks for stale running jobs.
 func WithStaleLockInterval(d time.Duration) WorkerOption {
 	return worker.WithStaleLockInterval(d)
@@ -503,6 +523,11 @@ func WithFanOutRecoveryStaleAge(d time.Duration) WorkerOption {
 // DefaultRetryConfig returns the default retry configuration.
 func DefaultRetryConfig() RetryConfig {
 	return worker.DefaultRetryConfig()
+}
+
+// DefaultBackoffPolicy returns the default job retry backoff policy.
+func DefaultBackoffPolicy() BackoffPolicy {
+	return worker.DefaultBackoffPolicy()
 }
 
 // Schedule functions

@@ -18,6 +18,7 @@ type Handler struct {
 	ArgsType   reflect.Type
 	HasContext bool
 	Timeout    time.Duration // max wall time for handler execution; 0 means no limit
+	Backoff    core.BackoffPolicy
 }
 
 // NewHandler creates a Handler from a function.

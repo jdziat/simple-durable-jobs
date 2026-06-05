@@ -758,7 +758,7 @@ func (w *Worker) handleError(ctx context.Context, jobCtx context.Context, job *c
 		t := time.Now().Add(retryAfter.Delay)
 		retryAt = &t
 	case job.Attempt < job.MaxRetries:
-		t := time.Now().Add(w.calculateBackoff(job.Attempt))
+		t := time.Now().Add(w.retryBackoff(job, err))
 		retryAt = &t
 	default:
 		// terminal — attempts exhausted.
@@ -974,6 +974,29 @@ func (w *Worker) calculateBackoff(attempt int) time.Duration {
 		return maxBackoff
 	}
 	return backoff
+}
+
+func (w *Worker) retryBackoff(job *core.Job, err error) time.Duration {
+	policy := w.config.JobBackoff
+	if h, ok := w.queue.GetHandler(job.Type); ok && h.Backoff != nil {
+		policy = h.Backoff
+	}
+	if policy == nil {
+		policy = DefaultBackoffPolicy()
+	}
+
+	delay := policy.NextRetry(job.Attempt, err)
+	maxBackoff := w.config.MaxRetryBackoff
+	if maxBackoff <= 0 {
+		maxBackoff = time.Minute
+	}
+	if delay > maxBackoff {
+		return maxBackoff
+	}
+	if delay <= 0 {
+		return time.Nanosecond
+	}
+	return delay
 }
 
 // maxCatchUpIterations bounds the seed scan so a pathologically dense schedule

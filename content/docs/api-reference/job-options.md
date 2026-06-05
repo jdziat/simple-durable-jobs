@@ -31,6 +31,13 @@ Ensures only one pending-or-running job with this `key` exists. If a matching jo
 
 Records a per-job timeout on the job record. The value is surfaced on the job metadata and in events — applications should enforce it via the handler's `context.Context` or external monitoring; the queue does not cancel handlers automatically.
 
+### `WithHandlerBackoff(p BackoffPolicy) Option`
+
+Sets a registration-time retry backoff policy for the handler. This overrides
+the worker default set with `WithBackoff`, while `RetryAfter(d, err)` still wins
+as an explicit handler-provided delay. See [Job Retry Backoff]({{< relref
+"/docs/advanced/retry-backoff" >}}).
+
 ### `Determinism(mode DeterminismMode) Option`
 
 Controls how strictly a handler's non-deterministic actions are policed on replay of a checkpointed workflow. Exported modes:
