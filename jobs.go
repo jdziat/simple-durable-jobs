@@ -145,6 +145,12 @@ type (
 	// CapOption configures a ConcurrencyCap.
 	CapOption = worker.CapOption
 
+	// RateLimitConfig describes a DB-backed fleet-wide or per-key rate limit.
+	RateLimitConfig = worker.RateLimitConfig
+
+	// RateLimitOption configures a RateLimit.
+	RateLimitOption = worker.RateLimitOption
+
 	// RetryConfig holds configuration for retry with backoff.
 	RetryConfig = worker.RetryConfig
 
@@ -503,6 +509,23 @@ func ConcurrencyCap(name string, limit int, opts ...CapOption) WorkerOption {
 // CapKey derives the per-key partition for a ConcurrencyCap.
 func CapKey(fn func(*Job) string) CapOption {
 	return worker.CapKey(fn)
+}
+
+// RateLimit limits admitted jobs per second across the fleet when the storage
+// backend implements DB-backed rate windows.
+func RateLimit(name string, perSecond float64, opts ...RateLimitOption) WorkerOption {
+	return worker.RateLimit(name, perSecond, opts...)
+}
+
+// RateLimitKey derives the per-key partition for a RateLimit.
+func RateLimitKey(fn func(*Job) string) RateLimitOption {
+	return worker.RateLimitKey(fn)
+}
+
+// WithQueueRateLimit applies a per-worker token bucket before dequeueing from
+// the named queue.
+func WithQueueRateLimit(queue string, perSecond float64, burst int) WorkerOption {
+	return worker.WithQueueRateLimit(queue, perSecond, burst)
 }
 
 // WithScheduler enables the scheduler in the worker.

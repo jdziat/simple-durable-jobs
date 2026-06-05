@@ -145,6 +145,11 @@ var schemaMigrations = []schemaMigration{
 		Name:    "concurrency_slots_live_index",
 		Up:      migrateConcurrencySlotsLiveIndex,
 	},
+	{
+		Version: 4,
+		Name:    "rate_limit_windows",
+		Up:      migrateRateLimitWindows,
+	},
 }
 
 // applyPendingMigrations runs every migration whose version is absent from the
@@ -274,6 +279,25 @@ func migrateConcurrencySlotsLiveIndex(ctx context.Context, db *gorm.DB, dialect 
 	default:
 		return db.Exec(
 			"CREATE INDEX IF NOT EXISTS idx_concurrency_slots_live ON concurrency_slots (slot_name, expires_at)",
+		).Error
+	}
+}
+
+func migrateRateLimitWindows(ctx context.Context, db *gorm.DB, dialect string) error {
+	switch dialect {
+	case dialectMySQL:
+		m := db.Migrator()
+		if !m.HasIndex(&core.RateLimitWindow{}, "idx_rate_limit_windows_lookup") {
+			if err := db.Exec(
+				"CREATE INDEX idx_rate_limit_windows_lookup ON rate_limit_windows (limit_name, window_start)",
+			).Error; err != nil && !isBenignDDLError(err) {
+				return fmt.Errorf("create idx_rate_limit_windows_lookup: %w", err)
+			}
+		}
+		return nil
+	default:
+		return db.Exec(
+			"CREATE INDEX IF NOT EXISTS idx_rate_limit_windows_lookup ON rate_limit_windows (limit_name, window_start)",
 		).Error
 	}
 }

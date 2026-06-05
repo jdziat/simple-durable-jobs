@@ -27,6 +27,9 @@ func (f workerOptionFunc) ApplyWorker(c *WorkerConfig) { f(c) }
 // CapOption configures a fleet-wide concurrency cap.
 type CapOption func(*ConcurrencyCapConfig)
 
+// RateLimitOption configures a fleet-wide rate limit.
+type RateLimitOption func(*RateLimitConfig)
+
 // ConcurrencyCapConfig describes a DB-backed concurrency cap. If Key is nil,
 // the cap is fleet-wide and uses Name as the slot name. If Key is set, the
 // effective slot name is Name + ":" + Key(job), allowing per-tenant or per-key
@@ -35,6 +38,16 @@ type ConcurrencyCapConfig struct {
 	Name  string
 	Limit int
 	Key   func(*core.Job) string
+}
+
+// RateLimitConfig describes a DB-backed fixed-window rate limit. If Key is nil,
+// the limiter uses Name as the partition. If Key is set, the effective limit
+// name is Name + ":" + Key(job), allowing per-tenant or per-key partitions.
+type RateLimitConfig struct {
+	Name      string
+	PerSecond float64
+	Window    time.Duration
+	Key       func(*core.Job) string
 }
 
 // WorkerConfig holds worker configuration.
@@ -50,6 +63,15 @@ type WorkerConfig struct {
 	// capability. Backends without that capability keep existing per-process
 	// behavior.
 	ConcurrencyCaps []ConcurrencyCapConfig
+
+	// RateLimits are optional DB-backed caps enforced across the fleet when the
+	// storage backend implements the worker's optional rate limiter capability.
+	// Backends without that capability continue processing jobs unchanged.
+	RateLimits []RateLimitConfig
+
+	// QueueRateLimits are per-worker token buckets applied before dequeue, keyed
+	// by queue name. They require no storage capability.
+	QueueRateLimits map[string]queueRateLimitConfig
 
 	// DrainTimeout is how long Start waits after its context is cancelled for
 	// in-flight handlers to finish and persist their result before forcing
@@ -146,6 +168,14 @@ func CapKey(fn func(*core.Job) string) CapOption {
 	}
 }
 
+// RateLimitKey derives the partition key for a RateLimit from the dequeued job.
+// The effective limit name is rateLimitName + ":" + key(job).
+func RateLimitKey(fn func(*core.Job) string) RateLimitOption {
+	return func(c *RateLimitConfig) {
+		c.Key = fn
+	}
+}
+
 // ConcurrencyCap limits concurrent jobs across the fleet when the storage
 // backend supports DB-backed concurrency slots. Without CapKey, the cap is
 // fleet-wide under name. With CapKey, the same limit applies independently to
@@ -160,6 +190,45 @@ func ConcurrencyCap(name string, limit int, opts ...CapOption) WorkerOption {
 			opt(&cfg)
 		}
 		c.ConcurrencyCaps = append(c.ConcurrencyCaps, cfg)
+	})
+}
+
+// RateLimit limits admitted jobs per second across the fleet when the storage
+// backend supports DB-backed rate windows. Without RateLimitKey, the limit is
+// fleet-wide under name. With RateLimitKey, the same rate applies independently
+// to each derived key.
+func RateLimit(name string, perSecond float64, opts ...RateLimitOption) WorkerOption {
+	return workerOptionFunc(func(c *WorkerConfig) {
+		if name == "" || perSecond <= 0 {
+			return
+		}
+		cfg := RateLimitConfig{
+			Name:      name,
+			PerSecond: perSecond,
+			Window:    defaultRateLimitWindow,
+		}
+		for _, opt := range opts {
+			opt(&cfg)
+		}
+		if cfg.Window <= 0 {
+			cfg.Window = defaultRateLimitWindow
+		}
+		c.RateLimits = append(c.RateLimits, cfg)
+	})
+}
+
+// WithQueueRateLimit limits dequeue admission for one queue in this worker
+// process using an in-memory token bucket. Empty queue names, non-positive
+// rates, or non-positive bursts are ignored.
+func WithQueueRateLimit(queue string, perSecond float64, burst int) WorkerOption {
+	return workerOptionFunc(func(c *WorkerConfig) {
+		if queue == "" || perSecond <= 0 || burst <= 0 {
+			return
+		}
+		if c.QueueRateLimits == nil {
+			c.QueueRateLimits = make(map[string]queueRateLimitConfig)
+		}
+		c.QueueRateLimits[queue] = queueRateLimitConfig{PerSecond: perSecond, Burst: burst}
 	})
 }
 

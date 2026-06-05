@@ -45,6 +45,12 @@ type Worker struct {
 	slotJobIDMu sync.Mutex
 	slotJobID   map[string][]string
 
+	// Per-worker queue rate-limit buckets. Only populated for queues configured
+	// with WithQueueRateLimit.
+	queueRateBuckets map[string]*tokenBucket
+
+	rateLimitStorageMissingLogged atomic.Bool
+
 	// heartbeatInterval is the tick rate for runHeartbeat. Defaults to
 	// 2 minutes; tests override with a sub-second value. Not exposed via
 	// WorkerConfig because changing it in production would change lock
@@ -80,6 +86,10 @@ type batchDequeuer interface {
 type concurrencySlotStorage interface {
 	TryAcquireConcurrencySlot(ctx context.Context, slotName, jobID, workerID string, limit int, ttl time.Duration) (bool, error)
 	ReleaseConcurrencySlot(ctx context.Context, slotName, jobID string) error
+}
+
+type rateLimiterStorage interface {
+	TryConsumeRate(ctx context.Context, limitName string, perSecond float64, window time.Duration, now time.Time) (bool, error)
 }
 
 // signalResumeStorage is implemented by backends that buffer signals; the
@@ -178,6 +188,13 @@ func NewWorker(q *queue.Queue, opts ...WorkerOption) *Worker {
 	for name := range config.Queues {
 		queueRunning[name] = &atomic.Int32{}
 	}
+	queueRateBuckets := make(map[string]*tokenBucket, len(config.QueueRateLimits))
+	now := time.Now()
+	for name, limit := range config.QueueRateLimits {
+		if bucket := newTokenBucket(limit.PerSecond, limit.Burst, now); bucket != nil {
+			queueRateBuckets[name] = bucket
+		}
+	}
 
 	// Default OwnershipAuditInterval to 5s only when it was never set. An
 	// explicit WithOwnershipAuditInterval(0) is honored as "disable" (the
@@ -195,6 +212,7 @@ func NewWorker(q *queue.Queue, opts ...WorkerOption) *Worker {
 		queueRunning:      queueRunning,
 		queueJobID:        make(map[string]string),
 		slotJobID:         make(map[string][]string),
+		queueRateBuckets:  queueRateBuckets,
 		heartbeatInterval: 2 * time.Minute,
 	}
 }
@@ -347,11 +365,22 @@ func (w *Worker) dispatchDequeuedJobs(ctx context.Context, jobsChan chan<- *core
 			w.releaseDequeuedJobOnShutdown(ctx, job)
 			continue
 		}
+		if !w.tryConsumeQueueRateLimit(job.Queue) {
+			w.releaseDequeuedJobOnShutdown(ctx, job)
+			continue
+		}
+		if ok := w.tryConsumeRateLimits(ctx, job); !ok {
+			w.refundQueueRateLimit(job.Queue)
+			w.releaseDequeuedJobOnShutdown(ctx, job)
+			continue
+		}
 		if ok := w.tryAcquireConcurrencySlots(ctx, job); !ok {
+			w.refundQueueRateLimit(job.Queue)
 			w.releaseDequeuedJobOnShutdown(ctx, job)
 			continue
 		}
 		if ctx.Err() != nil {
+			w.refundQueueRateLimit(job.Queue)
 			w.releaseDequeuedJobOnShutdown(ctx, job)
 			continue
 		}
@@ -359,6 +388,7 @@ func (w *Worker) dispatchDequeuedJobs(ctx context.Context, jobsChan chan<- *core
 		select {
 		case jobsChan <- job:
 		case <-ctx.Done():
+			w.refundQueueRateLimit(job.Queue)
 			w.releaseDequeuedJobOnShutdown(ctx, job)
 		}
 	}
@@ -407,6 +437,9 @@ func (w *Worker) goTracked(fn func()) {
 func (w *Worker) queuesWithCapacity() []string {
 	available := make([]string, 0, len(w.config.Queues))
 	for name, maxConcurrency := range w.config.Queues {
+		if !w.queueRateLimitHasToken(name) {
+			continue
+		}
 		counter, ok := w.queueRunning[name]
 		if !ok {
 			available = append(available, name)
@@ -417,6 +450,30 @@ func (w *Worker) queuesWithCapacity() []string {
 		}
 	}
 	return available
+}
+
+func (w *Worker) queueRateLimitHasToken(queueName string) bool {
+	bucket, ok := w.queueRateBuckets[queueName]
+	if !ok {
+		return true
+	}
+	return bucket.hasToken(time.Now())
+}
+
+func (w *Worker) tryConsumeQueueRateLimit(queueName string) bool {
+	bucket, ok := w.queueRateBuckets[queueName]
+	if !ok {
+		return true
+	}
+	return bucket.tryConsume(time.Now())
+}
+
+func (w *Worker) refundQueueRateLimit(queueName string) {
+	bucket, ok := w.queueRateBuckets[queueName]
+	if !ok {
+		return
+	}
+	bucket.refund(time.Now())
 }
 
 // trackQueueJob increments the running counter for a queue and records the job→queue mapping.
@@ -482,6 +539,48 @@ func (w *Worker) capSlotName(cap ConcurrencyCapConfig, job *core.Job) string {
 		return cap.Name
 	}
 	return cap.Name + ":" + cap.Key(job)
+}
+
+func (w *Worker) rateLimitName(limit RateLimitConfig, job *core.Job) string {
+	if limit.Key == nil {
+		return limit.Name
+	}
+	return limit.Name + ":" + limit.Key(job)
+}
+
+func (w *Worker) tryConsumeRateLimits(ctx context.Context, job *core.Job) bool {
+	if len(w.config.RateLimits) == 0 {
+		return true
+	}
+	storage, ok := w.queue.Storage().(rateLimiterStorage)
+	if !ok {
+		if w.rateLimitStorageMissingLogged.CompareAndSwap(false, true) {
+			w.logger.Warn("storage backend does not support fleet-wide rate limits; continuing without RateLimit enforcement")
+		}
+		return true
+	}
+	for _, limit := range w.config.RateLimits {
+		if limit.Name == "" || limit.PerSecond <= 0 {
+			continue
+		}
+		window := limit.Window
+		if window <= 0 {
+			window = defaultRateLimitWindow
+		}
+		limitName := w.rateLimitName(limit, job)
+		allowed, err := storage.TryConsumeRate(ctx, limitName, limit.PerSecond, window, time.Time{})
+		if err != nil {
+			w.logger.Warn("failed to consume rate limit; releasing dequeued job",
+				"job_id", job.ID,
+				"limit", limitName,
+				"error", err)
+			return false
+		}
+		if !allowed {
+			return false
+		}
+	}
+	return true
 }
 
 func (w *Worker) tryAcquireConcurrencySlots(ctx context.Context, job *core.Job) bool {
