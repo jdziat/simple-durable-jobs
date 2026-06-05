@@ -13,6 +13,7 @@ Production tuning for Simple Durable Jobs. These pages cover the knobs you reach
   {{< card link="storage-retry/" title="Storage Retry" icon="shield-check" subtitle="Why the worker has two retry knobs (WithStorageRetry, WithDequeueRetry), what each protects against, and tuning for slow storage." >}}
   {{< card link="retry-backoff/" title="Job Retry Backoff" icon="clock" subtitle="Configure worker-default and per-handler retry delays with BackoffPolicy, ExponentialBackoff, and jitter." >}}
   {{< card link="batch-enqueue/" title="Batch Enqueue" icon="collection" subtitle="Use Batch entries and Queue.EnqueueBatch to insert many producer jobs with one storage batch operation." >}}
+  {{< card link="batch-dequeue/" title="Batch Dequeue" icon="collection" subtitle="Opt in to bounded worker-side batch dequeue to claim multiple due jobs per poll when storage supports it." >}}
   {{< card link="transactional-enqueue/" title="Transactional Enqueue" icon="database" subtitle="Persist jobs inside your own GORM transaction so business rows and jobs commit or roll back together." >}}
   {{< card link="payload-codec/" title="Payload Codec" icon="lock-closed" subtitle="Encrypt or transform job arguments, results, checkpoints, and signal payloads at the GORM storage boundary." >}}
 {{< /cards >}}

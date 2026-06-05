@@ -68,6 +68,10 @@ type failTerminalWithResultStorage interface {
 	FailTerminalWithResult(ctx context.Context, jobID, workerID, errMsg string) (*core.FanOut, error)
 }
 
+type batchDequeuer interface {
+	DequeueBatch(ctx context.Context, queues []string, workerID string, limit int) ([]*core.Job, error)
+}
+
 // signalResumeStorage is implemented by backends that buffer signals; the
 // recovery poll uses it to wake jobs whose awaited signal has arrived or whose
 // wait deadline has passed. Optional — backends without it simply don't poll.
@@ -98,10 +102,11 @@ const (
 // NewWorker creates a new worker for the given queue.
 func NewWorker(q *queue.Queue, opts ...WorkerOption) *Worker {
 	config := WorkerConfig{
-		Queues:       nil, // Will be set to default if no queue options provided
-		PollInterval: 100 * time.Millisecond,
-		WorkerID:     uuid.New().String(),
-		DrainTimeout: 30 * time.Second,
+		Queues:           nil, // Will be set to default if no queue options provided
+		PollInterval:     100 * time.Millisecond,
+		WorkerID:         uuid.New().String(),
+		DrainTimeout:     30 * time.Second,
+		DequeueBatchSize: 1,
 	}
 
 	for _, opt := range opts {
@@ -253,28 +258,92 @@ func (w *Worker) Start(ctx context.Context) error {
 				continue
 			}
 
-			job, err := w.dequeueWithRetry(ctx, availableQueues)
+			jobs, err := w.dequeueAvailableJobs(ctx, availableQueues, totalConcurrency)
 			if err != nil {
 				if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 					w.logger.Error("failed to dequeue after retries", "error", err)
 				}
 				continue
 			}
-			if job != nil {
-				// Track this job against its queue's concurrency
-				w.trackQueueJob(job.ID, job.Queue)
+			w.dispatchDequeuedJobs(ctx, jobsChan, jobs)
+		}
+	}
+}
 
-				if ctx.Err() != nil {
-					w.releaseDequeuedJobOnShutdown(ctx, job)
-					continue
-				}
+func (w *Worker) dequeueAvailableJobs(ctx context.Context, availableQueues []string, totalConcurrency int) ([]*core.Job, error) {
+	slots := w.dequeueSlots(availableQueues, totalConcurrency)
+	if slots <= 0 {
+		return nil, nil
+	}
+	if slots > 1 {
+		if bd, ok := w.queue.Storage().(batchDequeuer); ok {
+			return w.dequeueBatchWithRetry(ctx, bd, availableQueues, slots)
+		}
+	}
+	job, err := w.dequeueWithRetry(ctx, availableQueues)
+	if err != nil || job == nil {
+		return nil, err
+	}
+	return []*core.Job{job}, nil
+}
 
-				select {
-				case jobsChan <- job:
-				case <-ctx.Done():
-					w.releaseDequeuedJobOnShutdown(ctx, job)
-				}
-			}
+func (w *Worker) dequeueSlots(availableQueues []string, totalConcurrency int) int {
+	if len(availableQueues) == 0 {
+		return 0
+	}
+	slots := totalConcurrency - w.RunningJobCount()
+	if slots <= 0 {
+		return 0
+	}
+	if w.config.DequeueBatchSize > 0 && slots > w.config.DequeueBatchSize {
+		slots = w.config.DequeueBatchSize
+	}
+	queueCapacity := w.totalCapacityAcrossQueues(availableQueues)
+	if slots > queueCapacity {
+		slots = queueCapacity
+	}
+	if slots < 0 {
+		return 0
+	}
+	return slots
+}
+
+func (w *Worker) totalCapacityAcrossQueues(queues []string) int {
+	total := 0
+	for _, name := range queues {
+		maxConcurrency, ok := w.config.Queues[name]
+		if !ok {
+			continue
+		}
+		used := 0
+		if counter, ok := w.queueRunning[name]; ok {
+			used = int(counter.Load())
+		}
+		if remaining := maxConcurrency - used; remaining > 0 {
+			total += remaining
+		}
+	}
+	return total
+}
+
+func (w *Worker) dispatchDequeuedJobs(ctx context.Context, jobsChan chan<- *core.Job, jobs []*core.Job) {
+	for _, job := range jobs {
+		if job == nil {
+			continue
+		}
+		if !w.tryTrackQueueJob(job.ID, job.Queue) {
+			w.releaseDequeuedJobOnShutdown(ctx, job)
+			continue
+		}
+		if ctx.Err() != nil {
+			w.releaseDequeuedJobOnShutdown(ctx, job)
+			continue
+		}
+
+		select {
+		case jobsChan <- job:
+		case <-ctx.Done():
+			w.releaseDequeuedJobOnShutdown(ctx, job)
 		}
 	}
 }
@@ -343,6 +412,31 @@ func (w *Worker) trackQueueJob(jobID, queueName string) {
 	w.queueJobIDMu.Unlock()
 }
 
+func (w *Worker) tryTrackQueueJob(jobID, queueName string) bool {
+	counter, ok := w.queueRunning[queueName]
+	if !ok {
+		w.trackQueueJob(jobID, queueName)
+		return true
+	}
+	maxConcurrency, ok := w.config.Queues[queueName]
+	if !ok {
+		w.trackQueueJob(jobID, queueName)
+		return true
+	}
+	for {
+		current := counter.Load()
+		if int(current) >= maxConcurrency {
+			return false
+		}
+		if counter.CompareAndSwap(current, current+1) {
+			w.queueJobIDMu.Lock()
+			w.queueJobID[jobID] = queueName
+			w.queueJobIDMu.Unlock()
+			return true
+		}
+	}
+}
+
 // untrackQueueJob decrements the running counter for a job's queue.
 func (w *Worker) untrackQueueJob(jobID string) {
 	w.queueJobIDMu.Lock()
@@ -368,6 +462,16 @@ func (w *Worker) dequeueWithRetry(ctx context.Context, queues []string) (*core.J
 		return dequeueErr
 	})
 	return job, err
+}
+
+func (w *Worker) dequeueBatchWithRetry(ctx context.Context, storage batchDequeuer, queues []string, limit int) ([]*core.Job, error) {
+	var jobs []*core.Job
+	err := retryWithBackoff(ctx, *w.config.DequeueRetry, func() error {
+		var dequeueErr error
+		jobs, dequeueErr = storage.DequeueBatch(ctx, queues, w.config.WorkerID, limit)
+		return dequeueErr
+	})
+	return jobs, err
 }
 
 func (w *Worker) processLoop(ctx context.Context, jobs <-chan *core.Job) {

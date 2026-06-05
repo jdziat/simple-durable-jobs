@@ -250,27 +250,28 @@ const (
 
 // Error variables
 var (
-	ErrInvalidJobTypeName  = core.ErrInvalidJobTypeName
-	ErrJobTypeNameTooLong  = core.ErrJobTypeNameTooLong
-	ErrInvalidQueueName    = core.ErrInvalidQueueName
-	ErrQueueNameTooLong    = core.ErrQueueNameTooLong
-	ErrJobArgsTooLarge     = core.ErrJobArgsTooLarge
-	ErrJobNotCompleted     = core.ErrJobNotCompleted
-	ErrJobNotOwned         = core.ErrJobNotOwned
-	ErrDuplicateJob        = core.ErrDuplicateJob
-	ErrUniqueKeyTooLong    = core.ErrUniqueKeyTooLong
-	ErrJobAlreadyPaused    = core.ErrJobAlreadyPaused
-	ErrJobNotPaused        = core.ErrJobNotPaused
-	ErrQueueAlreadyPaused  = core.ErrQueueAlreadyPaused
-	ErrQueueNotPaused      = core.ErrQueueNotPaused
-	ErrCannotPauseStatus   = core.ErrCannotPauseStatus
-	ErrJobNotFound         = core.ErrJobNotFound
-	ErrNoResult            = core.ErrNoResult
-	ErrCannotRequeueSubJob = core.ErrCannotRequeueSubJob
-	ErrSignalNameTooLong   = core.ErrSignalNameTooLong
-	ErrStorageNoSignals    = core.ErrStorageNoSignals
-	ErrStorageNoTxEnqueue  = core.ErrStorageNoTxEnqueue
-	ErrPayloadDecode       = core.ErrPayloadDecode
+	ErrInvalidJobTypeName    = core.ErrInvalidJobTypeName
+	ErrJobTypeNameTooLong    = core.ErrJobTypeNameTooLong
+	ErrInvalidQueueName      = core.ErrInvalidQueueName
+	ErrQueueNameTooLong      = core.ErrQueueNameTooLong
+	ErrJobArgsTooLarge       = core.ErrJobArgsTooLarge
+	ErrJobNotCompleted       = core.ErrJobNotCompleted
+	ErrJobNotOwned           = core.ErrJobNotOwned
+	ErrDuplicateJob          = core.ErrDuplicateJob
+	ErrUniqueKeyTooLong      = core.ErrUniqueKeyTooLong
+	ErrJobAlreadyPaused      = core.ErrJobAlreadyPaused
+	ErrJobNotPaused          = core.ErrJobNotPaused
+	ErrQueueAlreadyPaused    = core.ErrQueueAlreadyPaused
+	ErrQueueNotPaused        = core.ErrQueueNotPaused
+	ErrCannotPauseStatus     = core.ErrCannotPauseStatus
+	ErrJobNotFound           = core.ErrJobNotFound
+	ErrNoResult              = core.ErrNoResult
+	ErrCannotRequeueSubJob   = core.ErrCannotRequeueSubJob
+	ErrSignalNameTooLong     = core.ErrSignalNameTooLong
+	ErrStorageNoSignals      = core.ErrStorageNoSignals
+	ErrStorageNoTxEnqueue    = core.ErrStorageNoTxEnqueue
+	ErrStorageNoBatchDequeue = core.ErrStorageNoBatchDequeue
+	ErrPayloadDecode         = core.ErrPayloadDecode
 
 	ErrSecretboxAuthentication = payloadcodec.ErrSecretboxAuthentication
 )
@@ -505,6 +506,11 @@ func WithStorageRetry(config RetryConfig) WorkerOption {
 // WithDequeueRetry configures retry behavior for dequeue operations.
 func WithDequeueRetry(config RetryConfig) WorkerOption {
 	return worker.WithDequeueRetry(config)
+}
+
+// WithDequeueBatchSize sets the per-poll cap for optional batch dequeue.
+func WithDequeueBatchSize(n int) WorkerOption {
+	return worker.WithDequeueBatchSize(n)
 }
 
 // WithRetryAttempts sets the max retry attempts for storage operations.

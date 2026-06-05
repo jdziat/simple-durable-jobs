@@ -37,6 +37,9 @@ var (
 	// ErrStorageNoTxEnqueue is returned when the storage backend does not
 	// implement caller-supplied transaction enqueue.
 	ErrStorageNoTxEnqueue = errors.New("jobs: storage backend does not support transactional enqueue")
+	// ErrStorageNoBatchDequeue is returned when the storage backend does not
+	// implement batch dequeue.
+	ErrStorageNoBatchDequeue = errors.New("jobs: storage backend does not support batch dequeue")
 	// ErrPayloadDecode wraps codec failures while reading stored payload bytes.
 	ErrPayloadDecode = errors.New("jobs: payload decode failed")
 )

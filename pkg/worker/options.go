@@ -13,6 +13,8 @@ import (
 // hammering the database; the reaper itself can never be turned off.
 const minStaleLockInterval = 1 * time.Second
 
+const maxDequeueBatch = 1000
+
 // WorkerOption configures a Worker.
 type WorkerOption interface {
 	ApplyWorker(*WorkerConfig)
@@ -95,6 +97,11 @@ type WorkerConfig struct {
 	// JobBackoff configures retry delays for job re-execution after handler
 	// errors. If nil, the worker uses DefaultBackoffPolicy().
 	JobBackoff core.BackoffPolicy
+
+	// DequeueBatchSize is the maximum number of jobs a worker asks storage to
+	// claim in one polling round when the backend implements the optional batch
+	// dequeue capability. Default: 1 (single-row dequeue).
+	DequeueBatchSize int
 }
 
 // Concurrency sets the concurrency for a queue.
@@ -250,6 +257,21 @@ func WithMaxRetryBackoff(d time.Duration) WorkerOption {
 func WithBackoff(p BackoffPolicy) WorkerOption {
 	return workerOptionFunc(func(c *WorkerConfig) {
 		c.JobBackoff = p
+	})
+}
+
+// WithDequeueBatchSize sets the per-poll cap for optional batch dequeue.
+// Values are clamped to [1, maxDequeueBatch]. Backends that do not implement
+// the batch capability continue using single-row dequeue.
+func WithDequeueBatchSize(n int) WorkerOption {
+	return workerOptionFunc(func(c *WorkerConfig) {
+		if n < 1 {
+			n = 1
+		}
+		if n > maxDequeueBatch {
+			n = maxDequeueBatch
+		}
+		c.DequeueBatchSize = n
 	})
 }
 
