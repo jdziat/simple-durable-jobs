@@ -145,15 +145,7 @@ func (s *GormStorage) Migrate(ctx context.Context) error {
 
 // Enqueue adds a job to the queue.
 func (s *GormStorage) Enqueue(ctx context.Context, job *core.Job) error {
-	if job.ID == "" {
-		job.ID = uuid.New().String()
-	}
-	if job.Status == "" {
-		job.Status = core.StatusPending
-	}
-	if job.Queue == "" {
-		job.Queue = "default"
-	}
+	fillEnqueueDefaults(job)
 	db := s.db.WithContext(ctx)
 	if job.UniqueKey == "" {
 		return db.Create(job).Error
@@ -242,15 +234,7 @@ func isSerializationFailure(err error) bool {
 // Uses SELECT FOR UPDATE to prevent TOCTOU race conditions in concurrent scenarios.
 // For SQLite, relies on serializable transaction isolation (SQLite's default).
 func (s *GormStorage) EnqueueUnique(ctx context.Context, job *core.Job, uniqueKey string) error {
-	if job.ID == "" {
-		job.ID = uuid.New().String()
-	}
-	if job.Status == "" {
-		job.Status = core.StatusPending
-	}
-	if job.Queue == "" {
-		job.Queue = "default"
-	}
+	fillEnqueueDefaults(job)
 	job.UniqueKey = uniqueKey
 
 	// Retry on serialization/deadlock failures. Under MySQL REPEATABLE READ,
@@ -1088,15 +1072,7 @@ func (s *GormStorage) EnqueueBatch(ctx context.Context, jobs []*core.Job) error 
 	// Fill in defaults up front so callers always see the resolved IDs/statuses
 	// regardless of which rows survive the dedup pass.
 	for _, job := range jobs {
-		if job.ID == "" {
-			job.ID = uuid.New().String()
-		}
-		if job.Status == "" {
-			job.Status = core.StatusPending
-		}
-		if job.Queue == "" {
-			job.Queue = "default"
-		}
+		fillEnqueueDefaults(job)
 	}
 
 	return s.withSerializationRetry(ctx, func() error {
@@ -1109,55 +1085,7 @@ func (s *GormStorage) EnqueueBatch(ctx context.Context, jobs []*core.Job) error 
 // default-filling pass above.
 func (s *GormStorage) enqueueBatchTx(ctx context.Context, jobs []*core.Job) error {
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		// Collect the non-empty UniqueKeys we need to check. A single
-		// IN-list query amortizes the round-trip cost across the batch.
-		keys := make([]string, 0, len(jobs))
-		for _, job := range jobs {
-			if job.UniqueKey != "" {
-				keys = append(keys, job.UniqueKey)
-			}
-		}
-
-		existing := make(map[string]struct{}, len(keys))
-		if len(keys) > 0 {
-			query := tx.Model(&core.Job{}).
-				Select("unique_key").
-				Where("unique_key IN ? AND status IN ?", keys,
-					[]core.JobStatus{core.StatusPending, core.StatusRunning, core.StatusCompleted})
-
-			// SQLite's writer lock already serializes the transaction, so
-			// FOR UPDATE is both unsupported and unnecessary there.
-			if !s.isSQLite {
-				query = query.Clauses(clause.Locking{Strength: "UPDATE"})
-			}
-
-			var found []string
-			if err := query.Pluck("unique_key", &found).Error; err != nil {
-				return err
-			}
-			for _, k := range found {
-				existing[k] = struct{}{}
-			}
-		}
-
-		toCreate := make([]*core.Job, 0, len(jobs))
-		for _, job := range jobs {
-			if job.UniqueKey != "" {
-				if _, seen := existing[job.UniqueKey]; seen {
-					continue
-				}
-				// Guard against duplicates within the same batch (e.g.,
-				// two sub-jobs with the same UniqueKey in one call) so
-				// the later Create does not insert siblings twice.
-				existing[job.UniqueKey] = struct{}{}
-			}
-			toCreate = append(toCreate, job)
-		}
-
-		if len(toCreate) == 0 {
-			return nil
-		}
-		return tx.Clauses(clause.OnConflict{DoNothing: true}).Create(toCreate).Error
+		return s.enqueueBatchWithDB(tx, jobs)
 	})
 }
 

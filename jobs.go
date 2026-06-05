@@ -150,6 +150,9 @@ type (
 	// GormStorage implements Storage using GORM.
 	GormStorage = storage.GormStorage
 
+	// TxEnqueuer is the optional storage capability for caller-supplied transactions.
+	TxEnqueuer = storage.TxEnqueuer
+
 	// PoolConfig holds connection pool configuration.
 	PoolConfig = storage.PoolConfig
 
@@ -253,6 +256,7 @@ var (
 	ErrCannotRequeueSubJob = core.ErrCannotRequeueSubJob
 	ErrSignalNameTooLong   = core.ErrSignalNameTooLong
 	ErrStorageNoSignals    = core.ErrStorageNoSignals
+	ErrStorageNoTxEnqueue  = core.ErrStorageNoTxEnqueue
 )
 
 // Default values

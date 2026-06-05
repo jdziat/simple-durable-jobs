@@ -34,6 +34,9 @@ var (
 	// ErrStorageNoSignals is returned when the storage backend does not
 	// implement the signal capability.
 	ErrStorageNoSignals = errors.New("jobs: storage backend does not support signals")
+	// ErrStorageNoTxEnqueue is returned when the storage backend does not
+	// implement caller-supplied transaction enqueue.
+	ErrStorageNoTxEnqueue = errors.New("jobs: storage backend does not support transactional enqueue")
 )
 
 // WorkflowWaiter is implemented by control-flow errors that tell the worker a

@@ -10,11 +10,13 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"gorm.io/gorm"
 
 	"github.com/jdziat/simple-durable-jobs/pkg/core"
 	"github.com/jdziat/simple-durable-jobs/pkg/internal/handler"
 	"github.com/jdziat/simple-durable-jobs/pkg/schedule"
 	"github.com/jdziat/simple-durable-jobs/pkg/security"
+	"github.com/jdziat/simple-durable-jobs/pkg/storage"
 )
 
 // EnqueueMiddleware wraps the enqueue operation.
@@ -163,12 +165,57 @@ func (q *Queue) EnqueueRemote(ctx context.Context, name string, args any, opts .
 	return q.enqueue(ctx, name, args, opts...)
 }
 
+// EnqueueTx adds a job through a caller-owned GORM transaction without requiring
+// a local handler registration. The caller is responsible for committing or
+// rolling back tx.
+func (q *Queue) EnqueueTx(ctx context.Context, tx *gorm.DB, name string, args any, opts ...Option) (string, error) {
+	options := NewOptions()
+	for _, opt := range opts {
+		opt.Apply(options)
+	}
+	return q.enqueueTxWithOptions(ctx, tx, name, args, options)
+}
+
 func (q *Queue) enqueue(ctx context.Context, name string, args any, opts ...Option) (string, error) {
 	options := NewOptions()
 	for _, opt := range opts {
 		opt.Apply(options)
 	}
 	return q.enqueueWithOptions(ctx, name, args, options)
+}
+
+func (q *Queue) enqueueTxWithOptions(ctx context.Context, tx *gorm.DB, name string, args any, options *Options) (string, error) {
+	txEnqueuer, ok := q.storage.(storage.TxEnqueuer)
+	if !ok {
+		return "", core.ErrStorageNoTxEnqueue
+	}
+
+	job, err := q.buildJob(name, args, options)
+	if err != nil {
+		return "", err
+	}
+
+	persist := func(ctx context.Context, j *core.Job) error {
+		if options.UniqueKey != "" {
+			err := txEnqueuer.EnqueueUniqueTx(ctx, tx, j, options.UniqueKey)
+			if err != nil {
+				if errors.Is(err, core.ErrDuplicateJob) {
+					return err
+				}
+				return fmt.Errorf("jobs: failed to enqueue: %w", err)
+			}
+			return nil
+		}
+		if err := txEnqueuer.EnqueueTx(ctx, tx, j); err != nil {
+			return fmt.Errorf("jobs: failed to enqueue: %w", err)
+		}
+		return nil
+	}
+
+	if err := q.runEnqueueMiddleware(ctx, job, persist); err != nil {
+		return "", err
+	}
+	return job.ID, nil
 }
 
 // enqueueWithOptions adds a job using a pre-built Options value.
@@ -266,6 +313,22 @@ func (q *Queue) buildJob(name string, args any, options *Options) (*core.Job, er
 // match input order. When Unique keys collide, storage deduplicates silently;
 // a returned ID for a deduped entry refers to the existing job.
 func (q *Queue) EnqueueBatch(ctx context.Context, entries []BatchEntry) ([]string, error) {
+	return q.enqueueBatch(ctx, entries, q.storage.EnqueueBatch)
+}
+
+// EnqueueBatchTx adds multiple jobs through a caller-owned GORM transaction.
+// The caller is responsible for committing or rolling back tx.
+func (q *Queue) EnqueueBatchTx(ctx context.Context, tx *gorm.DB, entries []BatchEntry) ([]string, error) {
+	txEnqueuer, ok := q.storage.(storage.TxEnqueuer)
+	if !ok {
+		return nil, core.ErrStorageNoTxEnqueue
+	}
+	return q.enqueueBatch(ctx, entries, func(ctx context.Context, jobs []*core.Job) error {
+		return txEnqueuer.EnqueueBatchTx(ctx, tx, jobs)
+	})
+}
+
+func (q *Queue) enqueueBatch(ctx context.Context, entries []BatchEntry, enqueueBatch func(context.Context, []*core.Job) error) ([]string, error) {
 	if len(entries) == 0 {
 		return []string{}, nil
 	}
@@ -309,7 +372,7 @@ func (q *Queue) EnqueueBatch(ctx context.Context, entries []BatchEntry) ([]strin
 		}
 	}
 
-	if err := q.storage.EnqueueBatch(ctx, toPersist); err != nil {
+	if err := enqueueBatch(ctx, toPersist); err != nil {
 		return nil, fmt.Errorf("jobs: failed to enqueue batch: %w", err)
 	}
 	return ids, nil
