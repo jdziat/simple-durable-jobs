@@ -140,6 +140,11 @@ var schemaMigrations = []schemaMigration{
 		Name:    "mysql_active_unique_key",
 		Up:      migrateMySQLActiveUniqueKey,
 	},
+	{
+		Version: 3,
+		Name:    "concurrency_slots_live_index",
+		Up:      migrateConcurrencySlotsLiveIndex,
+	},
 }
 
 // applyPendingMigrations runs every migration whose version is absent from the
@@ -252,4 +257,23 @@ func migrateMySQLActiveUniqueKey(ctx context.Context, db *gorm.DB, dialect strin
 		}
 	}
 	return nil
+}
+
+func migrateConcurrencySlotsLiveIndex(ctx context.Context, db *gorm.DB, dialect string) error {
+	switch dialect {
+	case dialectMySQL:
+		m := db.Migrator()
+		if !m.HasIndex(&core.ConcurrencySlot{}, "idx_concurrency_slots_live") {
+			if err := db.Exec(
+				"CREATE INDEX idx_concurrency_slots_live ON concurrency_slots (slot_name, expires_at)",
+			).Error; err != nil && !isBenignDDLError(err) {
+				return fmt.Errorf("create idx_concurrency_slots_live: %w", err)
+			}
+		}
+		return nil
+	default:
+		return db.Exec(
+			"CREATE INDEX IF NOT EXISTS idx_concurrency_slots_live ON concurrency_slots (slot_name, expires_at)",
+		).Error
+	}
 }

@@ -24,6 +24,19 @@ type workerOptionFunc func(*WorkerConfig)
 
 func (f workerOptionFunc) ApplyWorker(c *WorkerConfig) { f(c) }
 
+// CapOption configures a fleet-wide concurrency cap.
+type CapOption func(*ConcurrencyCapConfig)
+
+// ConcurrencyCapConfig describes a DB-backed concurrency cap. If Key is nil,
+// the cap is fleet-wide and uses Name as the slot name. If Key is set, the
+// effective slot name is Name + ":" + Key(job), allowing per-tenant or per-key
+// partitions under the same configured cap.
+type ConcurrencyCapConfig struct {
+	Name  string
+	Limit int
+	Key   func(*core.Job) string
+}
+
 // WorkerConfig holds worker configuration.
 type WorkerConfig struct {
 	Queues          map[string]int // queue name -> concurrency
@@ -31,6 +44,12 @@ type WorkerConfig struct {
 	WorkerID        string
 	EnableScheduler bool
 	currentQueue    string // internal: scopes Concurrency to this queue
+
+	// ConcurrencyCaps are optional DB-backed caps enforced across the fleet when
+	// the storage backend implements the worker's optional concurrency slot
+	// capability. Backends without that capability keep existing per-process
+	// behavior.
+	ConcurrencyCaps []ConcurrencyCapConfig
 
 	// DrainTimeout is how long Start waits after its context is cancelled for
 	// in-flight handlers to finish and persist their result before forcing
@@ -116,6 +135,31 @@ func Concurrency(n int) WorkerOption {
 				c.Queues[k] = clamped
 			}
 		}
+	})
+}
+
+// CapKey derives the partition key for a ConcurrencyCap from the dequeued job.
+// The effective slot name is capName + ":" + key(job).
+func CapKey(fn func(*core.Job) string) CapOption {
+	return func(c *ConcurrencyCapConfig) {
+		c.Key = fn
+	}
+}
+
+// ConcurrencyCap limits concurrent jobs across the fleet when the storage
+// backend supports DB-backed concurrency slots. Without CapKey, the cap is
+// fleet-wide under name. With CapKey, the same limit applies independently to
+// each derived key.
+func ConcurrencyCap(name string, limit int, opts ...CapOption) WorkerOption {
+	return workerOptionFunc(func(c *WorkerConfig) {
+		cfg := ConcurrencyCapConfig{
+			Name:  name,
+			Limit: security.ClampConcurrency(limit),
+		}
+		for _, opt := range opts {
+			opt(&cfg)
+		}
+		c.ConcurrencyCaps = append(c.ConcurrencyCaps, cfg)
 	})
 }
 

@@ -133,6 +133,7 @@ func (s *GormStorage) Migrate(ctx context.Context) error {
 			&core.ScheduledFire{},
 			&core.Lease{},
 			&core.Signal{},
+			&core.ConcurrencySlot{},
 			&core.SchemaMigration{},
 		); err != nil {
 			return err

@@ -40,6 +40,11 @@ type Worker struct {
 	queueJobID   map[string]string        // job ID -> queue name (for decrement on completion)
 	queueJobIDMu sync.Mutex
 
+	// DB-backed concurrency slots acquired for dequeued jobs. Only populated
+	// when the storage backend implements concurrencySlotStorage.
+	slotJobIDMu sync.Mutex
+	slotJobID   map[string][]string
+
 	// heartbeatInterval is the tick rate for runHeartbeat. Defaults to
 	// 2 minutes; tests override with a sub-second value. Not exposed via
 	// WorkerConfig because changing it in production would change lock
@@ -72,6 +77,11 @@ type batchDequeuer interface {
 	DequeueBatch(ctx context.Context, queues []string, workerID string, limit int) ([]*core.Job, error)
 }
 
+type concurrencySlotStorage interface {
+	TryAcquireConcurrencySlot(ctx context.Context, slotName, jobID, workerID string, limit int, ttl time.Duration) (bool, error)
+	ReleaseConcurrencySlot(ctx context.Context, slotName, jobID string) error
+}
+
 // signalResumeStorage is implemented by backends that buffer signals; the
 // recovery poll uses it to wake jobs whose awaited signal has arrived or whose
 // wait deadline has passed. Optional — backends without it simply don't poll.
@@ -96,7 +106,8 @@ const (
 	// recoveryLeaseTTL must exceed the recovery poll interval so the current
 	// holder keeps renewing across ticks; if the holder dies, the lease fails
 	// over to another worker within one TTL.
-	recoveryLeaseTTL = 15 * time.Second
+	recoveryLeaseTTL          = 15 * time.Second
+	defaultConcurrencySlotTTL = 45 * time.Minute
 )
 
 // NewWorker creates a new worker for the given queue.
@@ -183,6 +194,7 @@ func NewWorker(q *queue.Queue, opts ...WorkerOption) *Worker {
 		runningJobs:       make(map[string]context.CancelFunc),
 		queueRunning:      queueRunning,
 		queueJobID:        make(map[string]string),
+		slotJobID:         make(map[string][]string),
 		heartbeatInterval: 2 * time.Minute,
 	}
 }
@@ -335,6 +347,10 @@ func (w *Worker) dispatchDequeuedJobs(ctx context.Context, jobsChan chan<- *core
 			w.releaseDequeuedJobOnShutdown(ctx, job)
 			continue
 		}
+		if ok := w.tryAcquireConcurrencySlots(ctx, job); !ok {
+			w.releaseDequeuedJobOnShutdown(ctx, job)
+			continue
+		}
 		if ctx.Err() != nil {
 			w.releaseDequeuedJobOnShutdown(ctx, job)
 			continue
@@ -357,6 +373,7 @@ func (w *Worker) releaseDequeuedJobOnShutdown(ctx context.Context, job *core.Job
 			"job_id", job.ID,
 			"error", err)
 	}
+	w.releaseConcurrencySlots(releaseCtx, job.ID)
 	w.untrackQueueJob(job.ID)
 }
 
@@ -453,6 +470,98 @@ func (w *Worker) untrackQueueJob(jobID string) {
 	}
 }
 
+func (w *Worker) concurrencySlotTTL() time.Duration {
+	if w.config.LockDuration > 0 {
+		return w.config.LockDuration
+	}
+	return defaultConcurrencySlotTTL
+}
+
+func (w *Worker) capSlotName(cap ConcurrencyCapConfig, job *core.Job) string {
+	if cap.Key == nil {
+		return cap.Name
+	}
+	return cap.Name + ":" + cap.Key(job)
+}
+
+func (w *Worker) tryAcquireConcurrencySlots(ctx context.Context, job *core.Job) bool {
+	if len(w.config.ConcurrencyCaps) == 0 {
+		return true
+	}
+	storage, ok := w.queue.Storage().(concurrencySlotStorage)
+	if !ok {
+		return true
+	}
+	ttl := w.concurrencySlotTTL()
+	acquiredSlots := make([]string, 0, len(w.config.ConcurrencyCaps))
+	for _, cap := range w.config.ConcurrencyCaps {
+		slotName := w.capSlotName(cap, job)
+		acquired, err := storage.TryAcquireConcurrencySlot(ctx, slotName, job.ID, w.config.WorkerID, cap.Limit, ttl)
+		if err != nil {
+			w.logger.Warn("failed to acquire concurrency slot; releasing dequeued job",
+				"job_id", job.ID,
+				"slot", slotName,
+				"error", err)
+			w.releaseSlotNames(ctx, job.ID, acquiredSlots)
+			return false
+		}
+		if !acquired {
+			w.releaseSlotNames(ctx, job.ID, acquiredSlots)
+			return false
+		}
+		acquiredSlots = append(acquiredSlots, slotName)
+	}
+	w.slotJobIDMu.Lock()
+	w.slotJobID[job.ID] = acquiredSlots
+	w.slotJobIDMu.Unlock()
+	return true
+}
+
+func (w *Worker) releaseConcurrencySlots(ctx context.Context, jobID string) {
+	w.slotJobIDMu.Lock()
+	slots := w.slotJobID[jobID]
+	delete(w.slotJobID, jobID)
+	w.slotJobIDMu.Unlock()
+	w.releaseSlotNames(ctx, jobID, slots)
+}
+
+func (w *Worker) releaseSlotNames(ctx context.Context, jobID string, slots []string) {
+	if len(slots) == 0 {
+		return
+	}
+	storage, ok := w.queue.Storage().(concurrencySlotStorage)
+	if !ok {
+		return
+	}
+	for _, slot := range slots {
+		if err := storage.ReleaseConcurrencySlot(ctx, slot, jobID); err != nil {
+			w.logger.Warn("failed to release concurrency slot",
+				"job_id", jobID,
+				"slot", slot,
+				"error", err)
+		}
+	}
+}
+
+func (w *Worker) renewConcurrencySlots(ctx context.Context, jobID string) {
+	w.slotJobIDMu.Lock()
+	slots := append([]string(nil), w.slotJobID[jobID]...)
+	w.slotJobIDMu.Unlock()
+	if len(slots) == 0 {
+		return
+	}
+	storage, ok := w.queue.Storage().(concurrencySlotStorage)
+	if !ok {
+		return
+	}
+	ttl := w.concurrencySlotTTL()
+	for _, slot := range slots {
+		if _, err := storage.TryAcquireConcurrencySlot(ctx, slot, jobID, w.config.WorkerID, 1, ttl); err != nil {
+			w.logger.Warn("failed to renew concurrency slot", "job_id", jobID, "slot", slot, "error", err)
+		}
+	}
+}
+
 // dequeueWithRetry attempts to dequeue a job with exponential backoff on failure.
 func (w *Worker) dequeueWithRetry(ctx context.Context, queues []string) (*core.Job, error) {
 	var job *core.Job
@@ -485,6 +594,7 @@ func (w *Worker) processLoop(ctx context.Context, jobs <-chan *core.Job) {
 func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 	// Ensure per-queue concurrency counter is decremented when job finishes
 	defer w.untrackQueueJob(job.ID)
+	defer w.releaseConcurrencySlots(context.WithoutCancel(ctx), job.ID)
 
 	startTime := time.Now()
 
@@ -754,6 +864,7 @@ func (w *Worker) runHeartbeat(ctx context.Context, job *core.Job) {
 			switch {
 			case err == nil:
 				consecutiveOrphanErrs = 0
+				w.renewConcurrencySlots(ctx, job.ID)
 				w.logger.Debug("heartbeat sent", "job_id", job.ID)
 			case errors.Is(err, core.ErrJobNotOwned):
 				consecutiveOrphanErrs++

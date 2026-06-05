@@ -139,6 +139,12 @@ type (
 	// WorkerConfig holds worker configuration.
 	WorkerConfig = worker.WorkerConfig
 
+	// ConcurrencyCapConfig describes a DB-backed fleet-wide or per-key cap.
+	ConcurrencyCapConfig = worker.ConcurrencyCapConfig
+
+	// CapOption configures a ConcurrencyCap.
+	CapOption = worker.CapOption
+
 	// RetryConfig holds configuration for retry with backoff.
 	RetryConfig = worker.RetryConfig
 
@@ -486,6 +492,17 @@ func Determinism(mode DeterminismMode) Option {
 // Concurrency sets the concurrency for a queue.
 func Concurrency(n int) WorkerOption {
 	return worker.Concurrency(n)
+}
+
+// ConcurrencyCap limits concurrent jobs across the fleet when the storage
+// backend implements DB-backed concurrency slots.
+func ConcurrencyCap(name string, limit int, opts ...CapOption) WorkerOption {
+	return worker.ConcurrencyCap(name, limit, opts...)
+}
+
+// CapKey derives the per-key partition for a ConcurrencyCap.
+func CapKey(fn func(*Job) string) CapOption {
+	return worker.CapKey(fn)
 }
 
 // WithScheduler enables the scheduler in the worker.
