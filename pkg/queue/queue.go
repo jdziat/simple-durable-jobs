@@ -40,6 +40,11 @@ type Queue struct {
 	// Enqueue middleware chain
 	enqueueMiddleware []EnqueueMiddleware
 
+	// Execution middleware and policies
+	executionMiddleware []ExecutionMiddleware
+	errorHandler        func(context.Context, *core.Job, error)
+	isFailure           func(*core.Job, error) bool
+
 	// Event stream
 	eventSubs     []chan core.Event
 	droppedEvents atomic.Uint64

@@ -457,7 +457,9 @@ func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 	// Start heartbeat goroutine to extend lock during long-running jobs
 	go w.runHeartbeat(heartbeatCtx, job)
 
-	resultBytes, err := w.executeHandler(jobCtx, job, h)
+	resultBytes, err := w.queue.RunExecutionMiddleware(jobCtx, job, func(ctx context.Context, j *core.Job) ([]byte, error) {
+		return w.executeHandler(ctx, j, h)
+	})
 
 	// Enforce the result size limit on the top-level handler result too — Call
 	// already enforces it for nested results, but a top-level handler can return
@@ -479,6 +481,13 @@ func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 			// Job is already in StatusWaiting; just return
 			return
 		}
+		if !w.queue.IsFailure(job, err) {
+			err = nil
+		}
+	}
+
+	if err != nil {
+		w.queue.CallErrorHandler(jobCtx, job, err)
 		w.handleError(ctx, jobCtx, job, err)
 		cancelHeartbeat()
 	} else {

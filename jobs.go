@@ -114,6 +114,9 @@ type (
 	// EnqueueMiddleware wraps the enqueue operation for cross-cutting concerns.
 	EnqueueMiddleware = queue.EnqueueMiddleware
 
+	// ExecutionMiddleware wraps each job handler attempt for cross-cutting concerns.
+	ExecutionMiddleware = queue.ExecutionMiddleware
+
 	// Options holds configuration for job enqueueing and registration.
 	Options = queue.Options
 
