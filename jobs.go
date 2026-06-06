@@ -76,6 +76,9 @@ type (
 	// PayloadCodec transforms serialized payload bytes at the storage boundary.
 	PayloadCodec = core.PayloadCodec
 
+	// DeadLetterFilter scopes dead-letter triage queries.
+	DeadLetterFilter = core.DeadLetterFilter
+
 	// Starter is an interface for types that can be started with a context.
 	Starter = core.Starter
 
@@ -215,6 +218,9 @@ type (
 	// FanOutStatus represents the state of a fan-out batch.
 	FanOutStatus = core.FanOutStatus
 )
+
+// DeadLetterOption configures dead-letter triage queries.
+type DeadLetterOption func(*DeadLetterFilter)
 
 // Status constants
 const (
@@ -786,14 +792,14 @@ func IsSuspendError(err error) bool {
 }
 
 // Requeue resets a terminally failed or cancelled job back to pending so it
-// runs again from scratch. Failed jobs are the dead-letter set — there is no
-// separate DLQ table; query them with q.Storage().GetJobsByStatus(StatusFailed)
-// and replay one with Requeue. The job's checkpoints are cleared so a workflow
-// replays from the beginning (handlers must be idempotent regardless), which is
-// the safe behavior when the usual reason to requeue is a code or dependency
-// fix that changes the workflow's steps. Requeuing a fan-out parent also clears
-// its entire fan-out subtree (descendant fan-outs and sub-jobs at every depth,
-// including nested workflows) so the replay re-dispatches cleanly.
+// runs again from scratch. Exhausted failed jobs are the dead-letter set; query
+// them with ListDeadLettered/CountDeadLettered and replay one with Requeue.
+// DLQ metadata and checkpoints are cleared so a workflow replays from the
+// beginning (handlers must be idempotent regardless), which is the safe behavior
+// when the usual reason to requeue is a code or dependency fix that changes the
+// workflow's steps. Requeuing a fan-out parent also clears its entire fan-out
+// subtree (descendant fan-outs and sub-jobs at every depth, including nested
+// workflows) so the replay re-dispatches cleanly.
 //
 // Returns true if the job was requeued, false if it was not found or not in a
 // requeuable (failed/cancelled) state. Returns ErrCannotRequeueSubJob for a
@@ -808,6 +814,69 @@ func Requeue(ctx context.Context, q *Queue, jobID string) (bool, error) {
 		return false, fmt.Errorf("jobs: storage backend does not support Requeue")
 	}
 	return r.Requeue(ctx, jobID)
+}
+
+// ListDeadLettered returns jobs with explicit DLQ metadata, ordered by
+// dead_lettered_at descending. Replay a returned job with Requeue.
+func ListDeadLettered(ctx context.Context, q *Queue, opts ...DeadLetterOption) ([]*Job, error) {
+	type deadLetterLister interface {
+		ListDeadLettered(ctx context.Context, filter core.DeadLetterFilter) ([]*core.Job, error)
+	}
+	l, ok := q.Storage().(deadLetterLister)
+	if !ok {
+		return nil, fmt.Errorf("jobs: storage backend does not support dead-letter triage")
+	}
+	filter := newDeadLetterFilter(opts...)
+	return l.ListDeadLettered(ctx, filter)
+}
+
+// CountDeadLettered returns the number of jobs with explicit DLQ metadata.
+func CountDeadLettered(ctx context.Context, q *Queue, opts ...DeadLetterOption) (int64, error) {
+	type deadLetterCounter interface {
+		CountDeadLettered(ctx context.Context, filter core.DeadLetterFilter) (int64, error)
+	}
+	c, ok := q.Storage().(deadLetterCounter)
+	if !ok {
+		return 0, fmt.Errorf("jobs: storage backend does not support dead-letter triage")
+	}
+	filter := newDeadLetterFilter(opts...)
+	return c.CountDeadLettered(ctx, filter)
+}
+
+// DeadLetterQueue filters dead-letter queries to one queue.
+func DeadLetterQueue(queue string) DeadLetterOption {
+	return func(f *DeadLetterFilter) {
+		f.Queue = queue
+	}
+}
+
+// DeadLetterType filters dead-letter queries to one job type.
+func DeadLetterType(jobType string) DeadLetterOption {
+	return func(f *DeadLetterFilter) {
+		f.Type = jobType
+	}
+}
+
+// DeadLetterLimit sets the maximum number of dead-lettered jobs returned.
+func DeadLetterLimit(limit int) DeadLetterOption {
+	return func(f *DeadLetterFilter) {
+		f.Limit = limit
+	}
+}
+
+// DeadLetterOffset sets the pagination offset for dead-lettered jobs.
+func DeadLetterOffset(offset int) DeadLetterOption {
+	return func(f *DeadLetterFilter) {
+		f.Offset = offset
+	}
+}
+
+func newDeadLetterFilter(opts ...DeadLetterOption) DeadLetterFilter {
+	var filter DeadLetterFilter
+	for _, opt := range opts {
+		opt(&filter)
+	}
+	return filter
 }
 
 // Signal delivers a named signal carrying payload to a job (workflow). The

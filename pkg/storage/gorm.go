@@ -21,6 +21,7 @@ import (
 const (
 	defaultLockDuration = 45 * time.Minute
 	maxResumeBatch      = 100
+	deadLetterReasonKey = "__dead_letter_reason"
 	// maxFanOutTreeDepth bounds the fan-out subtree walk in Requeue. Real
 	// workflows nest only a few levels; this is insurance against pathologically
 	// deep (or cyclically corrupt) data, not a normal limit. Per-level deletion
@@ -558,6 +559,8 @@ func (s *GormStorage) Fail(ctx context.Context, jobID string, workerID string, e
 		updates["status"] = core.StatusFailed
 		now := time.Now()
 		updates["completed_at"] = now
+		updates["dead_lettered_at"] = now
+		updates["dead_letter_reason"] = deadLetterReasonExpr(sanitizedErr)
 	}
 
 	result := s.db.WithContext(ctx).
@@ -580,12 +583,36 @@ func (s *GormStorage) Fail(ctx context.Context, jobID string, workerID string, e
 func (s *GormStorage) FailTerminalWithResult(ctx context.Context, jobID, workerID, errMsg string) (*core.FanOut, error) {
 	sanitizedErr := security.SanitizeErrorMessage(errMsg)
 	updates := map[string]any{
-		"last_error":   sanitizedErr,
-		"status":       core.StatusFailed,
-		"locked_by":    "",
-		"locked_until": nil,
+		"last_error":        sanitizedErr,
+		"status":            core.StatusFailed,
+		"locked_by":         "",
+		"locked_until":      nil,
+		deadLetterReasonKey: sanitizedErr,
 	}
 	return s.accountTerminalWithFanOut(ctx, jobID, workerID, updates, "failed_count")
+}
+
+func deadLetterReason(lastError string) string {
+	if lastError == "" {
+		return "max retries exhausted"
+	}
+	return "max retries exhausted: " + lastError
+}
+
+func nonRetryableDeadLetterReason(lastError string) string {
+	if lastError == "" {
+		return "non-retryable failure"
+	}
+	return "non-retryable failure: " + lastError
+}
+
+func deadLetterReasonExpr(lastError string) clause.Expr {
+	// attempt is incremented on dequeue, so attempt >= max_retries means retries were exhausted; this label also wins when NoRetry lands on the final attempt.
+	return gorm.Expr(
+		"CASE WHEN attempt >= max_retries THEN ? ELSE ? END",
+		deadLetterReason(lastError),
+		nonRetryableDeadLetterReason(lastError),
+	)
 }
 
 // fanOutCounterStmt returns the constant UPDATE statement that increments the
@@ -611,8 +638,8 @@ func fanOutCounterStmt(col string) (stmt string, ok bool) {
 // has a fan-out, or nil. Increments nothing and returns core.ErrJobNotOwned if the
 // worker no longer owns the running job.
 //
-// Note: this mutates jobUpdates by setting "completed_at"; callers must pass a
-// freshly-allocated map (not a shared or package-level one).
+// Note: this builds a per-attempt copy of jobUpdates because the transaction
+// body may be retried after serialization failures.
 func (s *GormStorage) accountTerminalWithFanOut(ctx context.Context, jobID, workerID string, jobUpdates map[string]any, fanOutCounterCol string) (*core.FanOut, error) {
 	var fanOut core.FanOut
 	var hasFanOut bool
@@ -623,11 +650,22 @@ func (s *GormStorage) accountTerminalWithFanOut(ctx context.Context, jobID, work
 
 		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 			now := time.Now()
-			jobUpdates["completed_at"] = now
+			updates := make(map[string]any, len(jobUpdates)+2)
+			for key, value := range jobUpdates {
+				if key == deadLetterReasonKey {
+					continue
+				}
+				updates[key] = value
+			}
+			updates["completed_at"] = now
+			if lastError, ok := jobUpdates[deadLetterReasonKey].(string); ok {
+				updates["dead_lettered_at"] = now
+				updates["dead_letter_reason"] = deadLetterReasonExpr(lastError)
+			}
 
 			update := tx.Model(&core.Job{}).
 				Where("id = ? AND locked_by = ? AND status = ?", jobID, workerID, core.StatusRunning).
-				Updates(jobUpdates)
+				Updates(updates)
 			if update.Error != nil {
 				return update.Error
 			}
@@ -1380,16 +1418,16 @@ func (s *GormStorage) ResumeSignalWaitingJob(ctx context.Context, jobID string) 
 
 // Requeue resets a terminally failed or cancelled job back to pending so it can
 // run again from scratch. Failed jobs are this library's dead-letter set — there
-// is no separate DLQ table; a job that exhausts its retries (or is cancelled)
-// stays queryable via GetJobsByStatus(StatusFailed) and Requeue is how an
+// is no separate DLQ table; a job that exhausts its retries stays queryable via
+// its dead_lettered_at/dead_letter_reason metadata and Requeue is how an
 // operator replays one.
 //
-// The attempt counter, error, lock, and result fields are reset, run_at is
-// cleared (immediately eligible), AND the job's checkpoints are deleted so the
-// run starts fresh. Clearing checkpoints is deliberate: the usual reason to
-// requeue is a code or dependency fix, which can change a workflow's Call
-// sequence — resuming into checkpoints recorded by the old run would skip the
-// wrong steps and, under Strict determinism, falsely trip the
+// The attempt counter, error, DLQ metadata, lock, and result fields are reset,
+// run_at is cleared (immediately eligible), AND the job's checkpoints are
+// deleted so the run starts fresh. Clearing checkpoints is deliberate: the usual
+// reason to requeue is a code or dependency fix, which can change a workflow's
+// Call sequence — resuming into checkpoints recorded by the old run would skip
+// the wrong steps and, under Strict determinism, falsely trip the
 // unconsumed-checkpoint guard. Handlers must be idempotent regardless (the
 // execution contract is at-least-once), so a full replay is safe.
 //
@@ -1425,16 +1463,18 @@ func (s *GormStorage) Requeue(ctx context.Context, jobID string) (bool, error) {
 			result := tx.Model(&core.Job{}).
 				Where("id = ?", jobID).
 				Updates(map[string]any{
-					"status":       core.StatusPending,
-					"attempt":      0,
-					"last_error":   "",
-					"result":       nil,
-					"locked_by":    "",
-					"locked_until": nil,
-					"started_at":   nil,
-					"completed_at": nil,
-					"run_at":       nil,
-					"updated_at":   time.Now(),
+					"status":             core.StatusPending,
+					"attempt":            0,
+					"last_error":         "",
+					"dead_lettered_at":   nil,
+					"dead_letter_reason": "",
+					"result":             nil,
+					"locked_by":          "",
+					"locked_until":       nil,
+					"started_at":         nil,
+					"completed_at":       nil,
+					"run_at":             nil,
+					"updated_at":         time.Now(),
 				})
 			if result.Error != nil {
 				return result.Error

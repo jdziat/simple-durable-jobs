@@ -170,14 +170,16 @@ func (s *GormStorage) RetryJob(ctx context.Context, jobID string) (*core.Job, er
 
 	now := time.Now()
 	err = s.db.WithContext(ctx).Model(&job).Updates(map[string]any{
-		"status":       core.StatusPending,
-		"attempt":      0,
-		"last_error":   "",
-		"locked_by":    "",
-		"locked_until": nil,
-		"started_at":   nil,
-		"completed_at": nil,
-		"updated_at":   now,
+		"status":             core.StatusPending,
+		"attempt":            0,
+		"last_error":         "",
+		"dead_lettered_at":   nil,
+		"dead_letter_reason": "",
+		"locked_by":          "",
+		"locked_until":       nil,
+		"started_at":         nil,
+		"completed_at":       nil,
+		"updated_at":         now,
 	}).Error
 	if err != nil {
 		return nil, err
@@ -186,6 +188,8 @@ func (s *GormStorage) RetryJob(ctx context.Context, jobID string) (*core.Job, er
 	job.Status = core.StatusPending
 	job.Attempt = 0
 	job.LastError = ""
+	job.DeadLetteredAt = nil
+	job.DeadLetterReason = ""
 	job.LockedBy = ""
 	job.LockedUntil = nil
 	job.StartedAt = nil

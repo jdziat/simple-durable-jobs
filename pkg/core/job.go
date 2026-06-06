@@ -34,17 +34,19 @@ type Job struct {
 	// Determinism is the replay strictness mode
 	// (0=ExplicitCheckpoints,1=Strict,2=BestEffort).
 	// BestEffort relaxes the Call replay type-mismatch guard.
-	Determinism     int        `gorm:"not null;default:0"`
-	LastError       string     `gorm:"type:text"`
-	RunAt           *time.Time `gorm:"index"`
-	StartedAt       *time.Time
-	CompletedAt     *time.Time
-	CreatedAt       time.Time  `gorm:"autoCreateTime"`
-	UpdatedAt       time.Time  `gorm:"autoUpdateTime"`
-	LockedBy        string     `gorm:"size:255"`
-	LockedUntil     *time.Time `gorm:"index"`
-	LastHeartbeatAt *time.Time // Tracks when the last heartbeat was received
-	UniqueKey       string     `gorm:"index;size:255"` // For job deduplication
+	Determinism      int        `gorm:"not null;default:0"`
+	LastError        string     `gorm:"type:text"`
+	DeadLetteredAt   *time.Time `gorm:"index"`
+	DeadLetterReason string     `gorm:"type:text"`
+	RunAt            *time.Time `gorm:"index"`
+	StartedAt        *time.Time
+	CompletedAt      *time.Time
+	CreatedAt        time.Time  `gorm:"autoCreateTime"`
+	UpdatedAt        time.Time  `gorm:"autoUpdateTime"`
+	LockedBy         string     `gorm:"size:255"`
+	LockedUntil      *time.Time `gorm:"index"`
+	LastHeartbeatAt  *time.Time // Tracks when the last heartbeat was received
+	UniqueKey        string     `gorm:"index;size:255"` // For job deduplication
 
 	// Parent-child relationship
 	ParentJobID *string `gorm:"index;size:36"`
