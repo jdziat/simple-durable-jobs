@@ -209,16 +209,16 @@ Set up recurring jobs:
 
 ```go
 // Every 5 minutes
-queue.Schedule("cleanup", jobs.Every(5 * time.Minute))
+queue.Schedule("cleanup", nil, jobs.Every(5 * time.Minute))
 
 // Daily at 9:00 AM
-queue.Schedule("report", jobs.Daily(9, 0))
+queue.Schedule("report", nil, jobs.Daily(9, 0))
 
 // Weekly on Sunday at 2:00 AM
-queue.Schedule("backup", jobs.Weekly(time.Sunday, 2, 0))
+queue.Schedule("backup", nil, jobs.Weekly(time.Sunday, 2, 0))
 
 // Cron expression
-queue.Schedule("hourly", jobs.Cron("0 * * * *"))
+queue.Schedule("hourly", nil, jobs.Cron("0 * * * *"))
 
 // Remember to enable scheduler in worker
 worker := queue.NewWorker(jobs.WithScheduler(true))

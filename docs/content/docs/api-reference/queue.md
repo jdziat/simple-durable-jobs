@@ -49,12 +49,12 @@ jobID, err := queue.Enqueue(ctx, "send-email", EmailArgs{
 })
 ```
 
-### `(*Queue) Schedule(name string, schedule Schedule, opts ...Option)`
+### `(*Queue) Schedule(name string, args any, sched Schedule, opts ...Option)`
 
 Registers a recurring job with the given schedule.
 
 ```go
-queue.Schedule("cleanup", jobs.Every(5 * time.Minute))
+queue.Schedule("cleanup", nil, jobs.Every(5 * time.Minute))
 ```
 
 ### `(*Queue) NewWorker(opts ...WorkerOption) *Worker`

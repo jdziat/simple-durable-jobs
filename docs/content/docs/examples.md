@@ -320,12 +320,12 @@ func main() {
     })
 
     // Schedule jobs
-    queue.Schedule("health-check", jobs.Every(1 * time.Minute))
-    queue.Schedule("daily-report", jobs.Daily(9, 0))        // 9:00 AM UTC
-    queue.Schedule("weekly-backup", jobs.Weekly(time.Sunday, 2, 0)) // Sunday 2:00 AM
+    queue.Schedule("health-check", nil, jobs.Every(1 * time.Minute))
+    queue.Schedule("daily-report", nil, jobs.Daily(9, 0))        // 9:00 AM UTC
+    queue.Schedule("weekly-backup", nil, jobs.Weekly(time.Sunday, 2, 0)) // Sunday 2:00 AM
 
     // Cron expression: every hour at minute 0
-    queue.Schedule("hourly-task", jobs.Cron("0 * * * *"))
+    queue.Schedule("hourly-task", nil, jobs.Cron("0 * * * *"))
 
     // Start worker with scheduler enabled
     worker := queue.NewWorker(jobs.WithScheduler(true))

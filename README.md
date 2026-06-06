@@ -45,6 +45,9 @@ for the full contract, backend support tiers, and crash-recovery tuning.
 - [Getting Started](https://jdziat.github.io/simple-durable-jobs/docs/getting-started/)
 - [API Reference](https://jdziat.github.io/simple-durable-jobs/docs/api-reference/)
 - [Examples](https://jdziat.github.io/simple-durable-jobs/docs/examples/)
+- [Benchmarks](https://jdziat.github.io/simple-durable-jobs/docs/benchmarks/) - Measured numbers, methodology, and throughput tuning
+- [Choosing a Job System](https://jdziat.github.io/simple-durable-jobs/docs/comparison/) - An honest comparison vs River, Temporal, and Asynq
+- [Migrating from River](https://jdziat.github.io/simple-durable-jobs/docs/migrating-from-river/) / [Migrating from Asynq](https://jdziat.github.io/simple-durable-jobs/docs/migrating-from-asynq/)
 - [Embedded Web UI](https://jdziat.github.io/simple-durable-jobs/docs/embedded-ui/)
 - [Live Demo](https://jdziat.github.io/simple-durable-jobs/docs/live-demo/)
 - [Guarantees & Production Readiness](https://jdziat.github.io/simple-durable-jobs/docs/advanced/guarantees/) - Execution semantics, backend tiers, crash-recovery tuning
@@ -297,16 +300,16 @@ The dashboard provides:
 
 ```go
 // Run every 5 minutes
-queue.Schedule("cleanup", jobs.Every(5 * time.Minute))
+queue.Schedule("cleanup", nil, jobs.Every(5 * time.Minute))
 
 // Run daily at 9:00 AM
-queue.Schedule("daily-report", jobs.Daily(9, 0))
+queue.Schedule("daily-report", nil, jobs.Daily(9, 0))
 
 // Run weekly on Sunday at 2:00 AM
-queue.Schedule("backup", jobs.Weekly(time.Sunday, 2, 0))
+queue.Schedule("backup", nil, jobs.Weekly(time.Sunday, 2, 0))
 
 // Use cron expressions
-queue.Schedule("hourly-check", jobs.Cron("0 * * * *"))
+queue.Schedule("hourly-check", nil, jobs.Cron("0 * * * *"))
 
 // Start worker with scheduler enabled
 worker := queue.NewWorker(jobs.WithScheduler(true))
@@ -472,6 +475,11 @@ All public types and functions are re-exported through the facade for a clean AP
 - [Workflows](./examples/workflow/) - Multi-step durable workflows
 - [Scheduled Jobs](./examples/scheduled/) - Recurring job scheduling
 - [Distributed](./examples/distributed/) - Multiple workers
+- [Durable Agent](./examples/agent/) - AI-agent loop with checkpointed LLM steps, durable sleep, and a human approval gate
+- [Signals](./examples/signals/) - Human-in-the-loop approval via durable signals
+- [Transactional Enqueue](./examples/transactional-enqueue/) - Outbox pattern with a caller-supplied transaction
+- [Metrics](./examples/metrics/) - Prometheus exporter wired and scraped
+- [Rate Limiting](./examples/ratelimit/) - Queue rate limits and per-key concurrency caps
 
 ## License
 
