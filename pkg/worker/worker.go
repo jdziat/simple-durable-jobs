@@ -18,6 +18,7 @@ import (
 	"github.com/jdziat/simple-durable-jobs/pkg/queue"
 	"github.com/jdziat/simple-durable-jobs/pkg/schedule"
 	"github.com/jdziat/simple-durable-jobs/pkg/security"
+	"github.com/jdziat/simple-durable-jobs/pkg/signal"
 )
 
 // Worker processes jobs from the queue.
@@ -51,6 +52,15 @@ type Worker struct {
 
 	rateLimitStorageMissingLogged atomic.Bool
 	retentionStorageMissingLogged atomic.Bool
+
+	// futureSleepSuppressions memoizes (jobID -> run_at) for sleeping jobs the
+	// signal-resume backstop has already inspected, capping checkpoint lookups
+	// at one per sleeper per sleep. Entries are pruned once their run_at
+	// passes and cleared on resume; worst case, a job that leaves waiting
+	// out-of-band (e.g. cancelled mid-sleep) holds its ~tens-of-bytes entry
+	// until the original deadline expires.
+	futureSleepMu           sync.Mutex
+	futureSleepSuppressions map[string]int64
 
 	// heartbeatInterval is the tick rate for runHeartbeat. Defaults to
 	// 2 minutes; tests override with a sub-second value. Not exposed via
@@ -108,6 +118,10 @@ type signalResumeStorage interface {
 	ResumeSignalWaitingJob(ctx context.Context, jobID string) (bool, error)
 }
 
+type signalResumePager interface {
+	GetSignalWaitingJobsToResumeAfter(ctx context.Context, afterJobID string, limit int) ([]*core.Job, error)
+}
+
 // recoveryLeaser is implemented by storage backends that can elect a single
 // worker to run the fleet-wide fan-out recovery scan. Optional: backends that
 // don't implement it fall back to every worker polling.
@@ -124,6 +138,8 @@ const (
 	recoveryLeaseTTL          = 15 * time.Second
 	defaultConcurrencySlotTTL = 45 * time.Minute
 )
+
+var signalResumePollBatchSize = 100
 
 // NewWorker creates a new worker for the given queue.
 func NewWorker(q *queue.Queue, opts ...WorkerOption) *Worker {
@@ -210,15 +226,16 @@ func NewWorker(q *queue.Queue, opts ...WorkerOption) *Worker {
 	}
 
 	return &Worker{
-		queue:             q,
-		config:            config,
-		logger:            slog.Default(),
-		runningJobs:       make(map[string]context.CancelFunc),
-		queueRunning:      queueRunning,
-		queueJobID:        make(map[string]string),
-		slotJobID:         make(map[string][]string),
-		queueRateBuckets:  queueRateBuckets,
-		heartbeatInterval: 2 * time.Minute,
+		queue:                   q,
+		config:                  config,
+		logger:                  slog.Default(),
+		runningJobs:             make(map[string]context.CancelFunc),
+		queueRunning:            queueRunning,
+		queueJobID:              make(map[string]string),
+		slotJobID:               make(map[string][]string),
+		queueRateBuckets:        queueRateBuckets,
+		futureSleepSuppressions: make(map[string]int64),
+		heartbeatInterval:       2 * time.Minute,
 	}
 }
 
@@ -1641,10 +1658,28 @@ func (w *Worker) pollWaitingJobsOnce(ctx context.Context) {
 	// race — a signal delivered just before SuspendJob commits would otherwise
 	// miss the event-driven resume and leave the job waiting forever.
 	if sr, ok := w.queue.Storage().(signalResumeStorage); ok {
+		w.pollSignalWaitingJobs(ctx, sr)
+	}
+}
+
+func (w *Worker) pollSignalWaitingJobs(ctx context.Context, sr signalResumeStorage) {
+	w.pruneExpiredFutureSleepMemos(time.Now())
+	batchSize := signalResumePollBatchSize
+	if batchSize <= 0 {
+		batchSize = 100
+	}
+	pager, paged := w.queue.Storage().(signalResumePager)
+	afterJobID := ""
+
+	for {
 		var sigWaiting []*core.Job
-		err = retryWithBackoff(ctx, *w.config.StorageRetry, func() error {
+		err := retryWithBackoff(ctx, *w.config.StorageRetry, func() error {
 			var queryErr error
-			sigWaiting, queryErr = sr.GetSignalWaitingJobsToResume(ctx)
+			if paged {
+				sigWaiting, queryErr = pager.GetSignalWaitingJobsToResumeAfter(ctx, afterJobID, batchSize)
+			} else {
+				sigWaiting, queryErr = sr.GetSignalWaitingJobsToResume(ctx)
+			}
 			return queryErr
 		})
 		if err != nil {
@@ -1653,7 +1688,26 @@ func (w *Worker) pollWaitingJobsOnce(ctx context.Context) {
 			}
 			return
 		}
+		if len(sigWaiting) == 0 {
+			return
+		}
 		for _, job := range sigWaiting {
+			if job == nil {
+				continue
+			}
+			afterJobID = job.ID
+			if w.waitingOnMemoizedFutureSleep(job) {
+				w.logger.Debug("suppressed signal resume for durable timer",
+					"job_id", job.ID,
+					"run_at", job.RunAt,
+					"memoized", true)
+				continue
+			}
+			if signal.WaitingOnFutureSleep(ctx, w.queue.Storage(), job, w.logger) {
+				w.memoizeFutureSleep(job)
+				continue
+			}
+			w.clearFutureSleepMemo(job.ID)
 			resumeErr := retryWithBackoff(ctx, *w.config.StorageRetry, func() error {
 				_, err := sr.ResumeSignalWaitingJob(ctx, job.ID)
 				return err
@@ -1664,7 +1718,51 @@ func (w *Worker) pollWaitingJobsOnce(ctx context.Context) {
 				w.logger.Info("resumed signal-waiting job via polling fallback", "job_id", job.ID)
 			}
 		}
+		if !paged || len(sigWaiting) < batchSize {
+			return
+		}
 	}
+}
+
+func (w *Worker) waitingOnMemoizedFutureSleep(job *core.Job) bool {
+	if job == nil || job.RunAt == nil {
+		return false
+	}
+	if !job.RunAt.After(time.Now()) {
+		w.clearFutureSleepMemo(job.ID)
+		return false
+	}
+	runAt := job.RunAt.UnixNano()
+	w.futureSleepMu.Lock()
+	memoizedRunAt, ok := w.futureSleepSuppressions[job.ID]
+	w.futureSleepMu.Unlock()
+	return ok && memoizedRunAt == runAt
+}
+
+func (w *Worker) memoizeFutureSleep(job *core.Job) {
+	if job == nil || job.RunAt == nil {
+		return
+	}
+	w.futureSleepMu.Lock()
+	w.futureSleepSuppressions[job.ID] = job.RunAt.UnixNano()
+	w.futureSleepMu.Unlock()
+}
+
+func (w *Worker) clearFutureSleepMemo(jobID string) {
+	w.futureSleepMu.Lock()
+	delete(w.futureSleepSuppressions, jobID)
+	w.futureSleepMu.Unlock()
+}
+
+func (w *Worker) pruneExpiredFutureSleepMemos(now time.Time) {
+	nowUnix := now.UnixNano()
+	w.futureSleepMu.Lock()
+	for jobID, runAtUnix := range w.futureSleepSuppressions {
+		if runAtUnix <= nowUnix {
+			delete(w.futureSleepSuppressions, jobID)
+		}
+	}
+	w.futureSleepMu.Unlock()
 }
 
 // reapStaleLocks periodically releases locks on jobs that are stuck in running

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -20,6 +21,7 @@ import (
 	"github.com/jdziat/simple-durable-jobs/pkg/fanout"
 	"github.com/jdziat/simple-durable-jobs/pkg/queue"
 	"github.com/jdziat/simple-durable-jobs/pkg/schedule"
+	"github.com/jdziat/simple-durable-jobs/pkg/signal"
 	"github.com/jdziat/simple-durable-jobs/pkg/storage"
 )
 
@@ -28,23 +30,26 @@ import (
 type mockStorage struct {
 	mu sync.Mutex
 
-	releaseCount    int64         // number of ReleaseStaleLocks calls
-	releasedIDs     []string      // IDs returned by ReleaseStaleLocks
-	releaseErr      error         // error returned by ReleaseStaleLocks
-	releaseDelay    time.Duration // optional artificial delay per call
-	releaseFunc     func(ctx context.Context, age time.Duration) ([]string, error)
-	releasedJobIDs  []string // IDs passed to Release
-	releaseJobFunc  func(ctx context.Context, jobID string, workerID string) error
-	dequeueFunc     func(ctx context.Context, queues []string, workerID string) (*core.Job, error)
-	completeFunc    func(ctx context.Context, jobID string, workerID string) error
-	failFunc        func(ctx context.Context, jobID string, workerID string, errMsg string, retryAt *time.Time) error
-	heartbeatFunc   func(ctx context.Context, jobID string, workerID string) error
-	checkpointFunc  func(ctx context.Context, jobID string) ([]core.Checkpoint, error)
-	waitingJobsFunc func(ctx context.Context) ([]*core.Job, error)
-	stalledJobsFunc func(ctx context.Context, olderThan time.Time) ([]*core.Job, error)
-	claimFireFunc   func(ctx context.Context, name string, fireTime time.Time) (bool, error)
-	fireTimeFunc    func(ctx context.Context, name string) (time.Time, bool, error)
-	fireTimes       map[string]time.Time
+	releaseCount           int64         // number of ReleaseStaleLocks calls
+	releasedIDs            []string      // IDs returned by ReleaseStaleLocks
+	releaseErr             error         // error returned by ReleaseStaleLocks
+	releaseDelay           time.Duration // optional artificial delay per call
+	releaseFunc            func(ctx context.Context, age time.Duration) ([]string, error)
+	releasedJobIDs         []string // IDs passed to Release
+	releaseJobFunc         func(ctx context.Context, jobID string, workerID string) error
+	dequeueFunc            func(ctx context.Context, queues []string, workerID string) (*core.Job, error)
+	completeFunc           func(ctx context.Context, jobID string, workerID string) error
+	failFunc               func(ctx context.Context, jobID string, workerID string, errMsg string, retryAt *time.Time) error
+	heartbeatFunc          func(ctx context.Context, jobID string, workerID string) error
+	checkpointFunc         func(ctx context.Context, jobID string) ([]core.Checkpoint, error)
+	waitingJobsFunc        func(ctx context.Context) ([]*core.Job, error)
+	stalledJobsFunc        func(ctx context.Context, olderThan time.Time) ([]*core.Job, error)
+	signalWaitingAfterFunc func(ctx context.Context, afterJobID string, limit int) ([]*core.Job, error)
+	signalWaitingFunc      func(ctx context.Context) ([]*core.Job, error)
+	resumeSignalFunc       func(ctx context.Context, jobID string) (bool, error)
+	claimFireFunc          func(ctx context.Context, name string, fireTime time.Time) (bool, error)
+	fireTimeFunc           func(ctx context.Context, name string) (time.Time, bool, error)
+	fireTimes              map[string]time.Time
 
 	// fan-out control hooks
 	incrementCompletedFunc func(ctx context.Context, fanOutID string) (*core.FanOut, error)
@@ -265,6 +270,27 @@ func (m *mockStorage) GetStalledFanOutParents(ctx context.Context, olderThan tim
 		return m.stalledJobsFunc(ctx, olderThan)
 	}
 	return nil, nil
+}
+
+func (m *mockStorage) GetSignalWaitingJobsToResume(ctx context.Context) ([]*core.Job, error) {
+	if m.signalWaitingFunc != nil {
+		return m.signalWaitingFunc(ctx)
+	}
+	return nil, nil
+}
+
+func (m *mockStorage) GetSignalWaitingJobsToResumeAfter(ctx context.Context, afterJobID string, limit int) ([]*core.Job, error) {
+	if m.signalWaitingAfterFunc != nil {
+		return m.signalWaitingAfterFunc(ctx, afterJobID, limit)
+	}
+	return nil, nil
+}
+
+func (m *mockStorage) ResumeSignalWaitingJob(ctx context.Context, jobID string) (bool, error) {
+	if m.resumeSignalFunc != nil {
+		return m.resumeSignalFunc(ctx, jobID)
+	}
+	return false, nil
 }
 
 func (m *mockStorage) SaveJobResult(_ context.Context, jobID string, _ string, result []byte) error {
@@ -2176,6 +2202,73 @@ func TestWorker_PollWaitingJobs_ResumesStalledFanOutParent(t *testing.T) {
 		t.Fatal("ResumeJob was not called for stalled fan-out parent")
 	}
 	assert.True(t, sawCutoff.Load(), "stalled fan-out query should use configured stale age cutoff")
+}
+
+func TestWorker_PollSignalWaitingJobs_PagesPastMemoizedFutureSleeps(t *testing.T) {
+	origBatchSize := signalResumePollBatchSize
+	signalResumePollBatchSize = 3
+	t.Cleanup(func() { signalResumePollBatchSize = origBatchSize })
+
+	future := time.Now().Add(time.Hour)
+	sleepState, err := json.Marshal(map[string]any{
+		"deadline": future.UnixNano(),
+		"resolved": false,
+	})
+	require.NoError(t, err)
+
+	jobs := []*core.Job{
+		{ID: "a-sleep-00", Status: core.StatusWaiting, RunAt: &future},
+		{ID: "a-sleep-01", Status: core.StatusWaiting, RunAt: &future},
+		{ID: "a-sleep-02", Status: core.StatusWaiting, RunAt: &future},
+		{ID: "a-sleep-03", Status: core.StatusWaiting, RunAt: &future},
+		{ID: "z-legit-signal", Status: core.StatusWaiting},
+	}
+
+	var sleepCheckpointReads atomic.Int32
+	resumed := make(chan string, 4)
+	mock := &mockStorage{
+		signalWaitingAfterFunc: func(_ context.Context, afterJobID string, limit int) ([]*core.Job, error) {
+			var out []*core.Job
+			for _, job := range jobs {
+				if job.ID <= afterJobID {
+					continue
+				}
+				out = append(out, job)
+				if len(out) == limit {
+					break
+				}
+			}
+			return out, nil
+		},
+		checkpointFunc: func(_ context.Context, jobID string) ([]core.Checkpoint, error) {
+			if strings.HasPrefix(jobID, "a-sleep-") {
+				sleepCheckpointReads.Add(1)
+				return []core.Checkpoint{{
+					JobID: jobID, CallIndex: 0, CallType: signal.SleepCheckpointType, Result: sleepState,
+				}}, nil
+			}
+			return nil, nil
+		},
+		resumeSignalFunc: func(_ context.Context, jobID string) (bool, error) {
+			resumed <- jobID
+			return true, nil
+		},
+	}
+	q := queue.New(mock)
+	w := NewWorker(q, WithStorageRetry(RetryConfig{MaxAttempts: 1}))
+
+	w.pollWaitingJobsOnce(context.Background())
+
+	select {
+	case jobID := <-resumed:
+		assert.Equal(t, "z-legit-signal", jobID)
+	case <-time.After(time.Second):
+		t.Fatal("signal backstop did not page past future durable timers")
+	}
+	assert.Equal(t, int32(4), sleepCheckpointReads.Load(), "each future sleeper should be inspected once")
+
+	w.pollWaitingJobsOnce(context.Background())
+	assert.Equal(t, int32(4), sleepCheckpointReads.Load(), "memoized future sleepers should not be re-inspected on the next tick")
 }
 
 // ---------------------------------------------------------------------------

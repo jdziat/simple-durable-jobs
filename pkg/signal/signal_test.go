@@ -3,6 +3,7 @@ package signal_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -21,10 +22,12 @@ import (
 // panic, but aren't called).
 type fakeSignalStore struct {
 	core.Storage
-	mu        sync.Mutex
-	pending   []*core.Signal // unconsumed, FIFO
-	suspended int
-	waitDur   time.Duration
+	mu             sync.Mutex
+	pending        []*core.Signal // unconsumed, FIFO
+	checkpoints    []core.Checkpoint
+	checkpointsErr error
+	suspended      int
+	waitDur        time.Duration
 }
 
 func (f *fakeSignalStore) SendSignal(_ context.Context, _, name string, payload []byte) error {
@@ -85,6 +88,12 @@ func (f *fakeSignalStore) SuspendJobWithDeadline(_ context.Context, _, _ string,
 	f.suspended++
 	f.waitDur = d
 	return nil
+}
+
+func (f *fakeSignalStore) GetCheckpoints(_ context.Context, _ string) ([]core.Checkpoint, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]core.Checkpoint(nil), f.checkpoints...), f.checkpointsErr
 }
 
 type recorder struct {
@@ -291,4 +300,126 @@ func TestWaitForSignalTimeout_SignalArrivesAfterSuspend(t *testing.T) {
 func TestSignal_RequiresJobContext(t *testing.T) {
 	_, err := signal.WaitForSignal[string](context.Background(), "ctx")
 	require.Error(t, err)
+}
+
+func TestSignal_ReservedNameRejected(t *testing.T) {
+	store := &fakeSignalStore{}
+	_, err := signal.WaitForSignal[string](buildCtx(store, newRecorder(), nil), "_sleep")
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, signal.ErrSignalNameReserved))
+
+	_, _, err = signal.WaitForSignalTimeout[string](buildCtx(store, newRecorder(), nil), "_sleep", time.Second)
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, signal.ErrSignalNameReserved))
+
+	_, _, err = signal.CheckSignal[string](buildCtx(store, newRecorder(), nil), "_sleep")
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, signal.ErrSignalNameReserved))
+
+	_, err = signal.DrainSignals[string](buildCtx(store, newRecorder(), nil), "_sleep")
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, signal.ErrSignalNameReserved))
+}
+
+func TestSleep_RequiresJobContext(t *testing.T) {
+	err := signal.Sleep(context.Background(), time.Second)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "must be used within a job handler")
+}
+
+func TestSleep_NonPositiveReturnsAndCheckpoints(t *testing.T) {
+	store := &fakeSignalStore{}
+	rec := newRecorder()
+
+	require.NoError(t, signal.Sleep(buildCtx(store, rec, nil), 0))
+	assert.Equal(t, 0, store.suspended)
+	require.Len(t, rec.list(), 1)
+	assert.Equal(t, signal.SleepCheckpointType, rec.list()[0].CallType)
+
+	require.NoError(t, signal.Sleep(buildCtx(store, rec, rec.list()), time.Hour))
+	assert.Equal(t, 0, store.suspended, "resolved fast-path checkpoint must replay without suspending")
+}
+
+func TestSleepUntil_PastReturnsAndCheckpoints(t *testing.T) {
+	store := &fakeSignalStore{}
+	rec := newRecorder()
+
+	require.NoError(t, signal.SleepUntil(buildCtx(store, rec, nil), time.Now().Add(-time.Second)))
+	assert.Equal(t, 0, store.suspended)
+	require.Len(t, rec.list(), 1)
+
+	require.NoError(t, signal.SleepUntil(buildCtx(store, rec, rec.list()), time.Now().Add(time.Hour)))
+	assert.Equal(t, 0, store.suspended, "resolved past-time checkpoint must replay without suspending")
+}
+
+func TestSleep_SuspendsBeforeDeadline(t *testing.T) {
+	store := &fakeSignalStore{}
+	rec := newRecorder()
+
+	err := signal.Sleep(buildCtx(store, rec, nil), time.Hour)
+	require.Error(t, err)
+	assert.True(t, core.IsWaiting(err))
+	assert.Equal(t, 1, store.suspended)
+	assert.Greater(t, store.waitDur, 59*time.Minute)
+}
+
+func TestSleep_ReplayAfterCompletionDoesNotRewait(t *testing.T) {
+	store := &fakeSignalStore{}
+	rec := newRecorder()
+
+	err := signal.Sleep(buildCtx(store, rec, nil), 20*time.Millisecond)
+	require.Error(t, err)
+	require.True(t, core.IsWaiting(err))
+	require.Equal(t, 1, store.suspended)
+
+	time.Sleep(30 * time.Millisecond)
+	require.NoError(t, signal.Sleep(buildCtx(store, rec, rec.list()), 20*time.Millisecond))
+	require.Equal(t, 1, store.suspended, "resume after elapsed deadline resolves without suspending again")
+
+	require.NoError(t, signal.Sleep(buildCtx(store, rec, rec.list()), time.Hour))
+	require.Equal(t, 1, store.suspended, "resolved checkpoint must replay without re-waiting")
+}
+
+func TestSleep_ReplayBeforeDeadlineKeepsOriginalDeadline(t *testing.T) {
+	store := &fakeSignalStore{}
+	rec := newRecorder()
+
+	err := signal.Sleep(buildCtx(store, rec, nil), time.Hour)
+	require.Error(t, err)
+	require.True(t, core.IsWaiting(err))
+	firstWait := store.waitDur
+
+	err = signal.Sleep(buildCtx(store, rec, rec.list()), 2*time.Hour)
+	require.Error(t, err)
+	require.True(t, core.IsWaiting(err))
+	assert.Less(t, store.waitDur, firstWait, "replay uses remaining time to the original deadline, not the new duration")
+	assert.Greater(t, store.waitDur, 59*time.Minute)
+}
+
+func TestWaitingOnFutureSleep_GuardRequiresInternalCallCheckpointWithDeadline(t *testing.T) {
+	future := time.Now().Add(time.Hour)
+	unresolvedSleep, err := json.Marshal(map[string]any{
+		"deadline": future.UnixNano(),
+		"resolved": false,
+	})
+	require.NoError(t, err)
+	zeroDeadline, err := json.Marshal(map[string]any{
+		"deadline": 0,
+		"resolved": false,
+	})
+	require.NoError(t, err)
+
+	job := &core.Job{ID: "j1", RunAt: &future}
+	store := &fakeSignalStore{checkpoints: []core.Checkpoint{
+		{JobID: "j1", CallIndex: -1, CallType: signal.SleepCheckpointType, Result: unresolvedSleep},
+		{JobID: "j1", CallIndex: 0, CallType: "sleep", Result: unresolvedSleep},
+		{JobID: "j1", CallIndex: 1, CallType: signal.SleepCheckpointType, Result: zeroDeadline},
+	}}
+	assert.False(t, signal.WaitingOnFutureSleep(context.Background(), store, job, nil),
+		"phase checkpoints, user call type collisions, and zero deadlines must not suppress resume")
+
+	store.checkpoints = append(store.checkpoints, core.Checkpoint{
+		JobID: "j1", CallIndex: 2, CallType: signal.SleepCheckpointType, Result: unresolvedSleep,
+	})
+	assert.True(t, signal.WaitingOnFutureSleep(context.Background(), store, job, nil))
 }

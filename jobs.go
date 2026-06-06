@@ -29,6 +29,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -304,6 +305,7 @@ var (
 	ErrPayloadDecode         = core.ErrPayloadDecode
 
 	ErrUnsupportedWorkflowVersion = jobctx.ErrUnsupportedWorkflowVersion
+	ErrSignalNameReserved         = signal.ErrSignalNameReserved
 
 	ErrSecretboxAuthentication = payloadcodec.ErrSecretboxAuthentication
 )
@@ -916,18 +918,23 @@ func newDeadLetterFilter(opts ...DeadLetterOption) DeadLetterFilter {
 	return filter
 }
 
-// Signal delivers a named signal carrying payload to a job (workflow). The
-// signal is buffered durably, so it is not lost if sent before the handler
-// waits for it; and if the target job is currently waiting on a signal, this
-// resumes it promptly (a recovery poll is the backstop). Delivery is FIFO per
-// (job, name).
+// Signal delivers a named signal carrying payload to a job (workflow). Signal
+// names starting with "_" are reserved for library-internal primitives such as
+// durable timers and are rejected with ErrSignalNameReserved. The signal is
+// buffered durably, so it is not lost if sent before the handler waits for it;
+// and if the target job is currently waiting on a signal, this resumes it
+// promptly (a recovery poll is the backstop). Delivery is FIFO per (job, name).
 //
 // The handler receives signals with WaitForSignal / WaitForSignalTimeout /
 // CheckSignal / DrainSignals. Returns ErrJobNotFound if the job does not exist,
-// ErrStorageNoSignals if the backend lacks signal support, or ErrSignalNameTooLong.
+// ErrStorageNoSignals if the backend lacks signal support,
+// ErrSignalNameReserved, or ErrSignalNameTooLong.
 func Signal(ctx context.Context, q *Queue, jobID, name string, payload any) error {
 	if name == "" {
 		return fmt.Errorf("jobs: signal name must not be empty")
+	}
+	if strings.HasPrefix(name, "_") {
+		return signal.ErrSignalNameReserved
 	}
 	if len(name) > MaxSignalNameLength {
 		return core.ErrSignalNameTooLong
@@ -967,6 +974,9 @@ func Signal(ctx context.Context, q *Queue, jobID, name string, payload any) erro
 	// never un-pause an operator-paused job. The signal-resume poll backstops the
 	// deliver-vs-suspend race for anything this fast path misses.
 	if job.Status == core.StatusWaiting {
+		if signal.WaitingOnFutureSleep(ctx, q.Storage(), job, slog.Default()) {
+			return nil
+		}
 		type signalResumer interface {
 			ResumeSignalWaitingJob(ctx context.Context, jobID string) (bool, error)
 		}
@@ -989,6 +999,36 @@ func WaitForSignal[T any](ctx context.Context, name string) (T, error) {
 // if no signal arrives within d.
 func WaitForSignalTimeout[T any](ctx context.Context, name string, d time.Duration) (T, bool, error) {
 	return signal.WaitForSignalTimeout[T](ctx, name, d)
+}
+
+// Sleep durably pauses the current job until at least d has elapsed. It may
+// only be called from inside a registered job handler, like WaitForSignal. While
+// sleeping, the job is suspended as StatusWaiting with the deadline stored in
+// run_at and does not occupy a worker slot; after the deadline, any worker can
+// resume it. The deadline is checkpointed on first execution, so replay after a
+// crash uses the original deadline rather than restarting the duration.
+//
+// Non-positive durations return nil immediately without suspending, but still
+// checkpoint the resolved sleep for deterministic replay. Wakeups are coarse:
+// elapsed sleeps are detected by the worker's waiting-job polling backstop
+// (about every 5 seconds) plus normal dispatch polling. Sleep is for backoff and
+// scheduling gaps, not sub-second timing.
+//
+// Durable timers require storage that implements the optional signal capability
+// (GormStorage does). A storage backend without it returns ErrStorageNoSignals.
+func Sleep(ctx context.Context, d time.Duration) error {
+	return signal.Sleep(ctx, d)
+}
+
+// SleepUntil durably pauses the current job until t. It has the same
+// checkpointing, worker-slot, crash-recovery, and coarse wake-granularity
+// semantics as Sleep. Times in the past return nil immediately without
+// suspending, while still recording a resolved checkpoint for deterministic
+// replay. Durable timers require storage that implements the optional signal
+// capability (GormStorage does). A storage backend without it returns
+// ErrStorageNoSignals.
+func SleepUntil(ctx context.Context, t time.Time) error {
+	return signal.SleepUntil(ctx, t)
 }
 
 // CheckSignal reports the oldest pending signal of name without consuming it

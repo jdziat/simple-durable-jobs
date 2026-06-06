@@ -55,6 +55,7 @@ for the full contract, backend support tiers, and crash-recovery tuning.
 - **Background Jobs** - Fire-and-forget task processing
 - **Durable Workflows** - Multi-step workflows with automatic checkpointing
 - **Durable Signals** - send/wait/check/drain for cross-job and external coordination
+- **Durable Timers** - Sleep and SleepUntil pause workflows without occupying worker slots
 - **Fan-Out/Fan-In** - Spawn parallel sub-jobs, wait for results, aggregate
 - **Crash Recovery** - Jobs resume from the last successful checkpoint
 - **Pause / Resume / Cancel** - Pause, resume, or cancel jobs, queues, or workers (graceful or aggressive); first-class cancel verb across facade, RPC, and dashboard

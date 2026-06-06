@@ -182,6 +182,16 @@ func (s *GormStorage) SuspendJobWithDeadline(ctx context.Context, jobID, workerI
 // deciding to wait and SuspendJob committing would otherwise leave the job
 // waiting forever with the event-driven resume already missed.
 func (s *GormStorage) GetSignalWaitingJobsToResume(ctx context.Context) ([]*core.Job, error) {
+	return s.GetSignalWaitingJobsToResumeAfter(ctx, "", maxResumeBatch)
+}
+
+// GetSignalWaitingJobsToResumeAfter is the ordered, keyset-paged form of
+// GetSignalWaitingJobsToResume. The worker uses it to scan past durable timers
+// that have buffered user signals but should not be resumed before run_at.
+func (s *GormStorage) GetSignalWaitingJobsToResumeAfter(ctx context.Context, afterJobID string, limit int) ([]*core.Job, error) {
+	if limit <= 0 {
+		limit = maxResumeBatch
+	}
 	var nowVal any
 	if s.useDBClock() {
 		nowVal = s.nowExpr()
@@ -191,6 +201,7 @@ func (s *GormStorage) GetSignalWaitingJobsToResume(ctx context.Context) ([]*core
 	var jobs []*core.Job
 	err := s.db.WithContext(ctx).
 		Where("status = ?", core.StatusWaiting).
+		Where("id > ?", afterJobID).
 		Where(
 			s.db.Where("EXISTS (?)",
 				s.db.Model(&core.Signal{}).
@@ -208,7 +219,8 @@ func (s *GormStorage) GetSignalWaitingJobsToResume(ctx context.Context) ([]*core
 				Select("1").
 				Where("fan_outs.parent_job_id = jobs.id AND fan_outs.status = ?", core.FanOutPending),
 		).
-		Limit(maxResumeBatch).
+		Order("id ASC").
+		Limit(limit).
 		Find(&jobs).Error
 	if err != nil {
 		return nil, err
