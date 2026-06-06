@@ -17,6 +17,7 @@ Welcome to the **Simple Durable Jobs** documentation — a Go library for durabl
   {{< card link="examples/" title="Examples" icon="code" subtitle="Copy-paste-runnable examples: workflows, fan-out/fan-in, scheduling, priorities, error handling, and more." >}}
   {{< card link="embedded-ui/" title="Embedded Web UI" icon="chart-bar" subtitle="Mount the real-time monitoring dashboard into your own HTTP server." >}}
   {{< card link="live-demo/" title="Live Demo" icon="play" subtitle="Try the dashboard in your browser on simulated data — no backend required." >}}
+  {{< card link="benchmarks/" title="Benchmarks" icon="chart-bar" subtitle="Measured enqueue, end-to-end, workflow, and dispatch-latency results with reproduction commands." >}}
 {{< /cards >}}
 
 ## Reference

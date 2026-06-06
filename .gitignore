@@ -59,6 +59,7 @@ resources/
 # Temporary files
 tmp/
 temp/
+bench-results/
 
 # UI frontend
 ui/frontend/node_modules/

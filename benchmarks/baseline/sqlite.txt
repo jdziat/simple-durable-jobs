@@ -1,0 +1,24 @@
+goos: linux
+goarch: amd64
+pkg: github.com/jdziat/simple-durable-jobs/benchmarks
+cpu: AMD EPYC 9R14 96-Core Processor                
+BenchmarkEnqueue-192                  	    1632	    877802 ns/op	      1139 jobs/sec	   16562 B/op	     145 allocs/op
+BenchmarkEnqueue-192                  	    1465	    977545 ns/op	      1023 jobs/sec	   16528 B/op	     145 allocs/op
+BenchmarkEnqueue-192                  	    1425	    837897 ns/op	      1193 jobs/sec	   16525 B/op	     145 allocs/op
+BenchmarkEnqueueBatch-192             	     100	  13100984 ns/op	      7633 jobs/sec	  611989 B/op	    4322 allocs/op
+BenchmarkEnqueueBatch-192             	     100	  12626447 ns/op	      7920 jobs/sec	  612006 B/op	    4322 allocs/op
+BenchmarkEnqueueBatch-192             	     100	  11934574 ns/op	      8379 jobs/sec	  611782 B/op	    4321 allocs/op
+BenchmarkEndToEnd-192                 	       1	50003746325 ns/op	        20.02 jobs/sec	70293528 B/op	  807741 allocs/op
+BenchmarkEndToEnd-192                 	       1	50002157750 ns/op	        20.02 jobs/sec	70228080 B/op	  806928 allocs/op
+BenchmarkEndToEnd-192                 	       1	50004304917 ns/op	        20.02 jobs/sec	70299456 B/op	  807547 allocs/op
+BenchmarkEndToEndBatchDequeue-192     	       1	6440544245 ns/op	       156.9 jobs/sec	65112248 B/op	  743194 allocs/op
+BenchmarkEndToEndBatchDequeue-192     	       1	6485311590 ns/op	       156.0 jobs/sec	65111744 B/op	  744235 allocs/op
+BenchmarkEndToEndBatchDequeue-192     	       1	6453714812 ns/op	       156.7 jobs/sec	65082560 B/op	  743606 allocs/op
+BenchmarkWorkflowSteps-192            	     103	  11566785 ns/op	       432.3 steps/sec	  144725 B/op	    1470 allocs/op
+BenchmarkWorkflowSteps-192            	     115	  10351083 ns/op	       483.0 steps/sec	  141997 B/op	    1460 allocs/op
+BenchmarkWorkflowSteps-192            	     108	  11967415 ns/op	       417.8 steps/sec	  142024 B/op	    1470 allocs/op
+BenchmarkDispatchLatency-192          	      26	  42508957 ns/op	     41745 p50-us	     43062 p95-us	     43894 p99-us	  109263 B/op	    1123 allocs/op
+BenchmarkDispatchLatency-192          	      26	  42473300 ns/op	     41821 p50-us	     42394 p95-us	     44120 p99-us	  109171 B/op	    1122 allocs/op
+BenchmarkDispatchLatency-192          	      26	  42486357 ns/op	     41757 p50-us	     41963 p95-us	     43931 p99-us	  109216 B/op	    1122 allocs/op
+PASS
+ok  	github.com/jdziat/simple-durable-jobs/benchmarks	193.466s
