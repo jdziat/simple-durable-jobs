@@ -322,6 +322,12 @@ func jobIDs(n int) []string {
 // Handler write authorization tests
 // ---------------------------------------------------------------------------
 
+type authorizerFunc func(context.Context, Action) error
+
+func (f authorizerFunc) Authorize(ctx context.Context, action Action) error {
+	return f(ctx, action)
+}
+
 func TestHandler_MutatingRPCDeniedWithoutAuthOrOptIn(t *testing.T) {
 	called := false
 	store := &mockUIStorage{
@@ -430,6 +436,127 @@ func TestHandler_MutatingRPCAllowedWithMiddleware(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.True(t, called)
+}
+
+func TestHandler_AuthorizerAllowsAndDeniesPerAction(t *testing.T) {
+	retryCalled := false
+	deleteCalled := false
+	store := &mockUIStorage{
+		retryJobFn: func(_ context.Context, _ string) (*core.Job, error) {
+			retryCalled = true
+			return sampleJob("j1", "default", "work", core.StatusPending), nil
+		},
+		deleteJobFn: func(_ context.Context, _ string) error {
+			deleteCalled = true
+			return nil
+		},
+	}
+	authorizer := authorizerFunc(func(_ context.Context, action Action) error {
+		if action == ActionRetryJob {
+			return nil
+		}
+		return errors.New("not allowed")
+	})
+	server := httptest.NewServer(Handler(store, WithAuthorizer(authorizer)))
+	defer server.Close()
+
+	client := jobsv1connect.NewJobsServiceClient(server.Client(), server.URL)
+	retryResp, err := client.RetryJob(context.Background(), connect.NewRequest(&jobsv1.RetryJobRequest{Id: "j1"}))
+	require.NoError(t, err)
+	require.NotNil(t, retryResp.Msg.Job)
+	assert.Equal(t, "j1", retryResp.Msg.Job.Id)
+	assert.True(t, retryCalled)
+
+	_, err = client.DeleteJob(context.Background(), connect.NewRequest(&jobsv1.DeleteJobRequest{Id: "j1"}))
+	require.Error(t, err)
+	assert.Equal(t, connect.CodePermissionDenied, connect.CodeOf(err))
+	assert.False(t, deleteCalled)
+}
+
+func TestHandler_AuthorizerUsesPrincipalFromMiddleware(t *testing.T) {
+	type principal struct {
+		Role string
+	}
+	called := false
+	store := &mockUIStorage{
+		deleteJobFn: func(_ context.Context, _ string) error {
+			called = true
+			return nil
+		},
+	}
+	middleware := func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			ctx := WithPrincipal(r.Context(), principal{Role: "admin"})
+			next.ServeHTTP(w, r.WithContext(ctx))
+		})
+	}
+	authorizer := authorizerFunc(func(ctx context.Context, action Action) error {
+		if action != ActionDeleteJob {
+			return errors.New("unexpected action")
+		}
+		p, ok := PrincipalFromContext(ctx)
+		if !ok {
+			return errors.New("missing principal")
+		}
+		user, ok := p.(principal)
+		if !ok || user.Role != "admin" {
+			return errors.New("not an admin")
+		}
+		return nil
+	})
+	server := httptest.NewServer(Handler(store, WithMiddleware(middleware), WithAuthorizer(authorizer)))
+	defer server.Close()
+
+	client := jobsv1connect.NewJobsServiceClient(server.Client(), server.URL)
+	_, err := client.DeleteJob(context.Background(), connect.NewRequest(&jobsv1.DeleteJobRequest{Id: "j1"}))
+
+	require.NoError(t, err)
+	assert.True(t, called)
+}
+
+func TestHandler_ReadOnlyRPCNeverCallsAuthorizer(t *testing.T) {
+	authorized := false
+	store := &mockUIStorage{
+		searchJobsFn: func(_ context.Context, _ JobFilter) ([]*core.Job, int64, error) {
+			return []*core.Job{sampleJob("j1", "default", "work", core.StatusPending)}, 1, nil
+		},
+	}
+	authorizer := authorizerFunc(func(_ context.Context, _ Action) error {
+		authorized = true
+		return errors.New("deny everything")
+	})
+	server := httptest.NewServer(Handler(store, WithAuthorizer(authorizer)))
+	defer server.Close()
+
+	client := jobsv1connect.NewJobsServiceClient(server.Client(), server.URL)
+	resp, err := client.ListJobs(context.Background(), connect.NewRequest(&jobsv1.ListJobsRequest{}))
+
+	require.NoError(t, err)
+	require.Len(t, resp.Msg.Jobs, 1)
+	assert.Equal(t, "j1", resp.Msg.Jobs[0].Id)
+	assert.False(t, authorized)
+}
+
+func TestHandler_AuthorizerPreservesConnectErrorCode(t *testing.T) {
+	called := false
+	store := &mockUIStorage{
+		retryJobFn: func(_ context.Context, _ string) (*core.Job, error) {
+			called = true
+			return sampleJob("j1", "default", "work", core.StatusPending), nil
+		},
+	}
+	authorizer := authorizerFunc(func(_ context.Context, _ Action) error {
+		return connect.NewError(connect.CodeUnauthenticated, errors.New("login required"))
+	})
+	server := httptest.NewServer(Handler(store, WithAuthorizer(authorizer)))
+	defer server.Close()
+
+	client := jobsv1connect.NewJobsServiceClient(server.Client(), server.URL)
+	_, err := client.RetryJob(context.Background(), connect.NewRequest(&jobsv1.RetryJobRequest{Id: "j1"}))
+
+	require.Error(t, err)
+	assert.Equal(t, connect.CodeUnauthenticated, connect.CodeOf(err))
+	assert.False(t, called)
 }
 
 func TestHandler_ReadOnlyRPCAllowedWithoutAuth(t *testing.T) {

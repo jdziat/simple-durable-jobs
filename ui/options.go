@@ -24,6 +24,7 @@ type config struct {
 	queue                              *queue.Queue
 	statsRetention                     time.Duration
 	insecureAllowUnauthenticatedWrites bool
+	authorizer                         Authorizer
 }
 
 // WithMiddleware wraps the handler with middleware (auth, logging, etc.).
@@ -52,6 +53,13 @@ func WithStatsRetention(d time.Duration) Option {
 func WithInsecureAllowUnauthenticatedWrites() Option {
 	return optionFunc(func(c *config) {
 		c.insecureAllowUnauthenticatedWrites = true
+	})
+}
+
+// WithAuthorizer configures per-action authorization for mutating dashboard RPCs.
+func WithAuthorizer(a Authorizer) Option {
+	return optionFunc(func(c *config) {
+		c.authorizer = a
 	})
 }
 
