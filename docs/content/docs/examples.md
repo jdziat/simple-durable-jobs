@@ -15,6 +15,11 @@ Complete, copy-paste-runnable code examples for common use cases. Jump to what y
   {{< card link="#observability" title="Observability" icon="chart-bar" subtitle="Hooks and the event stream." >}}
   {{< card link="#distributed-workers" title="Distributed Workers" icon="server" subtitle="Scale out across processes." >}}
   {{< card link="#pauseresume" title="Pause / Resume" icon="pause" subtitle="Pause jobs, queues, or workers." >}}
+  {{< card link="#durable-signals" title="Durable Signals" icon="bell" subtitle="Human approval and buffered workflow signals." >}}
+  {{< card link="#transactional-enqueue" title="Transactional Enqueue" icon="database" subtitle="Commit app data and jobs together." >}}
+  {{< card link="#durable-agent" title="Durable Agent" icon="sparkles" subtitle="Checkpointed agent loop with sleeps and approval." >}}
+  {{< card link="#metrics" title="Metrics" icon="chart-bar" subtitle="Prometheus/OpenTelemetry queue metrics." >}}
+  {{< card link="#rate-limits-and-caps" title="Rate Limits and Caps" icon="adjustments" subtitle="Queue pacing and per-key concurrency." >}}
 {{< /cards >}}
 
 ## Basic Job Processing
@@ -626,6 +631,154 @@ storage, err := jobs.NewGormStorageWithPool(db,
     jobs.ConnMaxIdleTime(2 * time.Minute),
 )
 ```
+
+---
+
+## Durable Signals
+
+Human-in-the-loop workflow approval with durable signals.
+
+```go
+queue.Register("approval-workflow", func(ctx context.Context, req ApprovalRequest) error {
+	packet, err := jobs.Call[ApprovalPacket](ctx, "prepare-request", req)
+	if err != nil {
+		return err
+	}
+
+	approval, ok, err := jobs.WaitForSignalTimeout[Approval](ctx, "approval", 30*time.Minute)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return jobs.NoRetry(fmt.Errorf("approval timed out for %s", packet.RequestID))
+	}
+
+	return applyApproval(ctx, packet, approval)
+})
+
+jobID, err := queue.Enqueue(ctx, "approval-workflow", ApprovalRequest{ID: "REQ-1001"})
+if err != nil {
+	return err
+}
+
+err = jobs.Signal(ctx, queue, jobID, "approval", Approval{
+	ApprovedBy: "alice@example.com",
+})
+```
+
+[View full example](https://github.com/jdziat/simple-durable-jobs/tree/main/examples/signals)
+
+---
+
+## Transactional Enqueue
+
+Write application data and enqueue follow-up work in the same database transaction.
+
+```go
+tx := db.Begin()
+defer tx.Rollback()
+
+order := Order{ID: "ORD-1001", Status: "pending"}
+if err := tx.WithContext(ctx).Create(&order).Error; err != nil {
+	return err
+}
+
+jobID, err := queue.EnqueueTx(ctx, tx, "fulfill-order", FulfillOrderArgs{
+	OrderID: order.ID,
+}, jobs.Unique("fulfill:"+order.ID))
+if err != nil {
+	return err
+}
+
+if err := tx.Commit().Error; err != nil {
+	return err
+}
+log.Printf("committed order and job %s", jobID)
+```
+
+[View full example](https://github.com/jdziat/simple-durable-jobs/tree/main/examples/transactional-enqueue)
+
+---
+
+## Durable Agent
+
+A durable AI-agent-shaped workflow with mocked model calls, checkpointed steps, durable sleeps, and human approval before action.
+
+```go
+queue.Register("agent-workflow", func(ctx context.Context, task AgentTask) error {
+	observations := make([]string, 0, 3)
+	for i := 0; i < 3; i++ {
+		result, err := jobs.Call[LLMResult](ctx, "mock-llm", LLMRequest{
+			TaskID:    task.ID,
+			Iteration: i,
+		})
+		if err != nil {
+			return err
+		}
+		observations = append(observations, result.Observation)
+		if err := jobs.Sleep(ctx, 2*time.Second); err != nil {
+			return err
+		}
+	}
+
+	if _, _, err := jobs.WaitForSignalTimeout[Approval](ctx, "approval", time.Hour); err != nil {
+		return err
+	}
+	_, err := jobs.Call[any](ctx, "act-on-plan", FinalPlan{TaskID: task.ID, Observations: observations})
+	return err
+})
+```
+
+[View full example](https://github.com/jdziat/simple-durable-jobs/tree/main/examples/agent)
+
+---
+
+## Metrics
+
+Optional Prometheus/OpenTelemetry metrics for queue depth, lifecycle counters, and duration histograms.
+
+```go
+import jobsmetrics "github.com/jdziat/simple-durable-jobs/pkg/metrics"
+
+handler, meterProvider, err := jobsmetrics.NewPrometheusHandler()
+if err != nil {
+	return err
+}
+defer func() {
+	_ = meterProvider.Shutdown(ctx)
+}()
+
+jobsmetrics.Instrument(queue, jobsmetrics.WithMeterProvider(meterProvider))
+
+mux.Handle("/metrics", handler)
+```
+
+[View full example](https://github.com/jdziat/simple-durable-jobs/tree/main/examples/metrics)
+
+---
+
+## Rate Limits and Caps
+
+Throttle one queue locally and cap in-flight work per tenant across the fleet.
+
+```go
+func tenantFromJob(job *jobs.Job) string {
+	var args LimitedWorkArgs
+	if err := json.Unmarshal(job.Args, &args); err != nil || args.Tenant == "" {
+		return "unknown"
+	}
+	return args.Tenant
+}
+
+worker := queue.NewWorker(
+	jobs.WorkerQueue("limited", jobs.Concurrency(6)),
+	jobs.WithQueueRateLimit("limited", 3, 1),
+	jobs.ConcurrencyCap("tenant-work", 2, jobs.CapKey(tenantFromJob)),
+	jobs.WithPollInterval(50*time.Millisecond),
+)
+```
+
+[View full example](https://github.com/jdziat/simple-durable-jobs/tree/main/examples/ratelimit)
 
 ---
 

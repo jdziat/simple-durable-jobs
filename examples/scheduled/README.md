@@ -11,7 +11,7 @@ This example demonstrates recurring job scheduling with various schedule types.
 
 ## Prerequisites
 
-- Go 1.21+
+- Go 1.25+
 - No external services needed (uses SQLite)
 
 ## Running
