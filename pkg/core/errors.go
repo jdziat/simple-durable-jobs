@@ -29,7 +29,36 @@ var (
 	// requeuing it directly would double-count its parent's fan-out. Requeue the
 	// parent instead, which re-dispatches the whole batch.
 	ErrCannotRequeueSubJob = errors.New("jobs: cannot requeue a fan-out sub-job directly; requeue its parent")
+	// ErrSignalNameTooLong is returned when a signal name exceeds the limit.
+	ErrSignalNameTooLong = errors.New("jobs: signal name too long")
+	// ErrStorageNoSignals is returned when the storage backend does not
+	// implement the signal capability.
+	ErrStorageNoSignals = errors.New("jobs: storage backend does not support signals")
+	// ErrStorageNoTxEnqueue is returned when the storage backend does not
+	// implement caller-supplied transaction enqueue.
+	ErrStorageNoTxEnqueue = errors.New("jobs: storage backend does not support transactional enqueue")
+	// ErrStorageNoBatchDequeue is returned when the storage backend does not
+	// implement batch dequeue.
+	ErrStorageNoBatchDequeue = errors.New("jobs: storage backend does not support batch dequeue")
+	// ErrPayloadDecode wraps codec failures while reading stored payload bytes.
+	ErrPayloadDecode = errors.New("jobs: payload decode failed")
 )
+
+// WorkflowWaiter is implemented by control-flow errors that tell the worker a
+// job has suspended itself into StatusWaiting (fan-out or signal waits) and the
+// outcome must NOT be treated as a failure — the job is already persisted as
+// waiting and will be resumed later. See IsWaiting.
+type WorkflowWaiter interface {
+	WorkflowWaiting() bool
+}
+
+// IsWaiting reports whether err is a self-suspension signal (the handler moved
+// its job to StatusWaiting and returned). The worker treats such an error as
+// "stop, do not fail" rather than a job failure.
+func IsWaiting(err error) bool {
+	var w WorkflowWaiter
+	return errors.As(err, &w) && w.WorkflowWaiting()
+}
 
 // NoRetryError indicates an error that should not be retried.
 type NoRetryError struct {

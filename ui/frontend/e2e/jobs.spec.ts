@@ -23,8 +23,23 @@ test.describe('Jobs Page', () => {
     const count = await statuses.count()
     expect(count).toBeGreaterThan(0)
     for (let i = 0; i < count; i++) {
-      await expect(statuses.nth(i)).toHaveText('failed')
+      // A dead-lettered job has status 'failed' and shows under this filter with
+      // a distinct "Dead-lettered" badge; both are valid failed-state rows.
+      await expect(statuses.nth(i)).toHaveText(/^(failed|Dead-lettered)$/)
     }
+  })
+
+  test('filter by dead-lettered status', async ({ page }) => {
+    await page.locator('.filters select').selectOption('dead-lettered')
+    await page.waitForTimeout(500)
+    const statuses = page.locator('.jobs-table tbody .status')
+    const count = await statuses.count()
+    expect(count).toBeGreaterThan(0)
+    // The dead-lettered filter returns only dead-lettered jobs, each badged distinctly.
+    for (let i = 0; i < count; i++) {
+      await expect(statuses.nth(i)).toHaveText('Dead-lettered')
+    }
+    await expect(page.locator('.jobs-table tbody .status-dead-lettered').first()).toBeVisible()
   })
 
   test('filter by paused status', async ({ page }) => {

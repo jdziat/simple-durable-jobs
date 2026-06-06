@@ -21,6 +21,7 @@ import (
 const (
 	defaultLockDuration = 45 * time.Minute
 	maxResumeBatch      = 100
+	deadLetterReasonKey = "__dead_letter_reason"
 	// maxFanOutTreeDepth bounds the fan-out subtree walk in Requeue. Real
 	// workflows nest only a few levels; this is insurance against pathologically
 	// deep (or cyclically corrupt) data, not a normal limit. Per-level deletion
@@ -40,11 +41,24 @@ func WithStorageLockDuration(d time.Duration) GormStorageOption {
 	}
 }
 
+// WithCodec configures a payload codec for bytes stored in payload columns.
+// Nil selects the default identity codec.
+func WithCodec(c core.PayloadCodec) GormStorageOption {
+	return func(s *GormStorage) {
+		if c == nil {
+			s.codec = core.IdentityCodec
+			return
+		}
+		s.codec = c
+	}
+}
+
 // GormStorage implements Storage using GORM.
 type GormStorage struct {
 	db           *gorm.DB
 	isSQLite     bool
 	lockDuration time.Duration
+	codec        core.PayloadCodec
 }
 
 // NewGormStorage creates a new GORM-backed storage. For SQLite under concurrent
@@ -67,7 +81,7 @@ func NewGormStorage(db *gorm.DB, opts ...GormStorageOption) *GormStorage {
 		dialector := db.Name()
 		isSQLite = strings.Contains(strings.ToLower(dialector), "sqlite")
 	}
-	s := &GormStorage{db: db, isSQLite: isSQLite, lockDuration: defaultLockDuration}
+	s := &GormStorage{db: db, isSQLite: isSQLite, lockDuration: defaultLockDuration, codec: core.IdentityCodec}
 	if s.isSQLite {
 		// NOTE: a one-shot PRAGMA only affects the single pooled connection it
 		// runs on; connections the pool opens later default to busy_timeout=0.
@@ -119,6 +133,9 @@ func (s *GormStorage) Migrate(ctx context.Context) error {
 			&core.QueueState{},
 			&core.ScheduledFire{},
 			&core.Lease{},
+			&core.Signal{},
+			&core.ConcurrencySlot{},
+			&core.RateLimitWindow{},
 			&core.SchemaMigration{},
 		); err != nil {
 			return err
@@ -144,20 +161,16 @@ func (s *GormStorage) Migrate(ctx context.Context) error {
 
 // Enqueue adds a job to the queue.
 func (s *GormStorage) Enqueue(ctx context.Context, job *core.Job) error {
-	if job.ID == "" {
-		job.ID = uuid.New().String()
-	}
-	if job.Status == "" {
-		job.Status = core.StatusPending
-	}
-	if job.Queue == "" {
-		job.Queue = "default"
+	fillEnqueueDefaults(job)
+	row, err := s.encodedJobForCreate(job)
+	if err != nil {
+		return err
 	}
 	db := s.db.WithContext(ctx)
 	if job.UniqueKey == "" {
-		return db.Create(job).Error
+		return db.Create(row).Error
 	}
-	result := db.Clauses(clause.OnConflict{DoNothing: true}).Create(job)
+	result := db.Clauses(clause.OnConflict{DoNothing: true}).Create(row)
 	if result.Error != nil {
 		return result.Error
 	}
@@ -241,15 +254,7 @@ func isSerializationFailure(err error) bool {
 // Uses SELECT FOR UPDATE to prevent TOCTOU race conditions in concurrent scenarios.
 // For SQLite, relies on serializable transaction isolation (SQLite's default).
 func (s *GormStorage) EnqueueUnique(ctx context.Context, job *core.Job, uniqueKey string) error {
-	if job.ID == "" {
-		job.ID = uuid.New().String()
-	}
-	if job.Status == "" {
-		job.Status = core.StatusPending
-	}
-	if job.Queue == "" {
-		job.Queue = "default"
-	}
+	fillEnqueueDefaults(job)
 	job.UniqueKey = uniqueKey
 
 	// Retry on serialization/deadlock failures. Under MySQL REPEATABLE READ,
@@ -285,7 +290,11 @@ func (s *GormStorage) EnqueueUnique(ctx context.Context, job *core.Job, uniqueKe
 			// No existing active job found. The database-level partial unique
 			// index is the final backstop for PostgreSQL's absent-row FOR
 			// UPDATE gap.
-			result := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(job)
+			row, err := s.encodedJobForCreate(job)
+			if err != nil {
+				return err
+			}
+			result := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(row)
 			if result.Error != nil {
 				return result.Error
 			}
@@ -406,6 +415,9 @@ func (s *GormStorage) Dequeue(ctx context.Context, queues []string, workerID str
 	if job.ID == "" {
 		return nil, nil
 	}
+	if err := s.decodeJobPayloads(&job); err != nil {
+		return nil, err
+	}
 	return &job, nil
 }
 
@@ -480,6 +492,9 @@ func (s *GormStorage) dequeueSQLite(ctx context.Context, queues []string, worker
 	if job.ID == "" {
 		return nil, nil
 	}
+	if err := s.decodeJobPayloads(&job); err != nil {
+		return nil, err
+	}
 	return &job, nil
 }
 
@@ -515,7 +530,11 @@ func (s *GormStorage) CompleteWithResult(ctx context.Context, jobID, workerID st
 		"locked_until": nil,
 	}
 	if result != nil {
-		updates["result"] = result
+		encoded, err := s.encodePayload("job result", jobID, result)
+		if err != nil {
+			return nil, err
+		}
+		updates["result"] = encoded
 	}
 	return s.accountTerminalWithFanOut(ctx, jobID, workerID, updates, "completed_count")
 }
@@ -540,6 +559,8 @@ func (s *GormStorage) Fail(ctx context.Context, jobID string, workerID string, e
 		updates["status"] = core.StatusFailed
 		now := time.Now()
 		updates["completed_at"] = now
+		updates["dead_lettered_at"] = now
+		updates["dead_letter_reason"] = deadLetterReasonExpr(sanitizedErr)
 	}
 
 	result := s.db.WithContext(ctx).
@@ -562,12 +583,36 @@ func (s *GormStorage) Fail(ctx context.Context, jobID string, workerID string, e
 func (s *GormStorage) FailTerminalWithResult(ctx context.Context, jobID, workerID, errMsg string) (*core.FanOut, error) {
 	sanitizedErr := security.SanitizeErrorMessage(errMsg)
 	updates := map[string]any{
-		"last_error":   sanitizedErr,
-		"status":       core.StatusFailed,
-		"locked_by":    "",
-		"locked_until": nil,
+		"last_error":        sanitizedErr,
+		"status":            core.StatusFailed,
+		"locked_by":         "",
+		"locked_until":      nil,
+		deadLetterReasonKey: sanitizedErr,
 	}
 	return s.accountTerminalWithFanOut(ctx, jobID, workerID, updates, "failed_count")
+}
+
+func deadLetterReason(lastError string) string {
+	if lastError == "" {
+		return "max retries exhausted"
+	}
+	return "max retries exhausted: " + lastError
+}
+
+func nonRetryableDeadLetterReason(lastError string) string {
+	if lastError == "" {
+		return "non-retryable failure"
+	}
+	return "non-retryable failure: " + lastError
+}
+
+func deadLetterReasonExpr(lastError string) clause.Expr {
+	// attempt is incremented on dequeue, so attempt >= max_retries means retries were exhausted; this label also wins when NoRetry lands on the final attempt.
+	return gorm.Expr(
+		"CASE WHEN attempt >= max_retries THEN ? ELSE ? END",
+		deadLetterReason(lastError),
+		nonRetryableDeadLetterReason(lastError),
+	)
 }
 
 // fanOutCounterStmt returns the constant UPDATE statement that increments the
@@ -593,8 +638,8 @@ func fanOutCounterStmt(col string) (stmt string, ok bool) {
 // has a fan-out, or nil. Increments nothing and returns core.ErrJobNotOwned if the
 // worker no longer owns the running job.
 //
-// Note: this mutates jobUpdates by setting "completed_at"; callers must pass a
-// freshly-allocated map (not a shared or package-level one).
+// Note: this builds a per-attempt copy of jobUpdates because the transaction
+// body may be retried after serialization failures.
 func (s *GormStorage) accountTerminalWithFanOut(ctx context.Context, jobID, workerID string, jobUpdates map[string]any, fanOutCounterCol string) (*core.FanOut, error) {
 	var fanOut core.FanOut
 	var hasFanOut bool
@@ -605,11 +650,22 @@ func (s *GormStorage) accountTerminalWithFanOut(ctx context.Context, jobID, work
 
 		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 			now := time.Now()
-			jobUpdates["completed_at"] = now
+			updates := make(map[string]any, len(jobUpdates)+2)
+			for key, value := range jobUpdates {
+				if key == deadLetterReasonKey {
+					continue
+				}
+				updates[key] = value
+			}
+			updates["completed_at"] = now
+			if lastError, ok := jobUpdates[deadLetterReasonKey].(string); ok {
+				updates["dead_lettered_at"] = now
+				updates["dead_letter_reason"] = deadLetterReasonExpr(lastError)
+			}
 
 			update := tx.Model(&core.Job{}).
 				Where("id = ? AND locked_by = ? AND status = ?", jobID, workerID, core.StatusRunning).
-				Updates(jobUpdates)
+				Updates(updates)
 			if update.Error != nil {
 				return update.Error
 			}
@@ -664,12 +720,16 @@ func (s *GormStorage) SaveCheckpoint(ctx context.Context, cp *core.Checkpoint) e
 	if cp.ID == "" {
 		cp.ID = uuid.New().String()
 	}
+	row, err := s.encodedCheckpointForSave(cp)
+	if err != nil {
+		return err
+	}
 	return s.db.WithContext(ctx).
 		Clauses(clause.OnConflict{
 			Columns:   []clause.Column{{Name: "job_id"}, {Name: "call_index"}, {Name: "call_type"}},
 			DoUpdates: clause.AssignmentColumns([]string{"result", "error", "error_kind", "error_cause", "error_delay_nanos"}),
 		}).
-		Create(cp).Error
+		Create(row).Error
 }
 
 // GetCheckpoints retrieves all checkpoints for a job.
@@ -679,7 +739,13 @@ func (s *GormStorage) GetCheckpoints(ctx context.Context, jobID string) ([]core.
 		Where("job_id = ?", jobID).
 		Order("call_index ASC").
 		Find(&checkpoints).Error
-	return checkpoints, err
+	if err != nil {
+		return nil, err
+	}
+	if err := s.decodeCheckpointPayloads(checkpoints); err != nil {
+		return nil, err
+	}
+	return checkpoints, nil
 }
 
 // DeleteCheckpoints removes all checkpoints for a job.
@@ -732,7 +798,13 @@ func (s *GormStorage) GetDueJobs(ctx context.Context, queues []string, limit int
 		Limit(limit).
 		Find(&jobList).Error
 
-	return jobList, err
+	if err != nil {
+		return nil, err
+	}
+	if err := s.decodeJobListPayloads(jobList); err != nil {
+		return nil, err
+	}
+	return jobList, nil
 }
 
 // ClaimScheduledFire atomically advances a schedule's last claimed fire time.
@@ -947,7 +1019,13 @@ func (s *GormStorage) GetJob(ctx context.Context, jobID string) (*core.Job, erro
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil, nil
 	}
-	return &job, err
+	if err != nil {
+		return nil, err
+	}
+	if err := s.decodeJobPayloads(&job); err != nil {
+		return nil, err
+	}
+	return &job, nil
 }
 
 // GetJobsByStatus retrieves jobs by status.
@@ -957,7 +1035,13 @@ func (s *GormStorage) GetJobsByStatus(ctx context.Context, status core.JobStatus
 		Where("status = ?", status).
 		Limit(limit).
 		Find(&jobList).Error
-	return jobList, err
+	if err != nil {
+		return nil, err
+	}
+	if err := s.decodeJobListPayloads(jobList); err != nil {
+		return nil, err
+	}
+	return jobList, nil
 }
 
 // --- Fan-out operations ---
@@ -1087,15 +1171,7 @@ func (s *GormStorage) EnqueueBatch(ctx context.Context, jobs []*core.Job) error 
 	// Fill in defaults up front so callers always see the resolved IDs/statuses
 	// regardless of which rows survive the dedup pass.
 	for _, job := range jobs {
-		if job.ID == "" {
-			job.ID = uuid.New().String()
-		}
-		if job.Status == "" {
-			job.Status = core.StatusPending
-		}
-		if job.Queue == "" {
-			job.Queue = "default"
-		}
+		fillEnqueueDefaults(job)
 	}
 
 	return s.withSerializationRetry(ctx, func() error {
@@ -1108,55 +1184,7 @@ func (s *GormStorage) EnqueueBatch(ctx context.Context, jobs []*core.Job) error 
 // default-filling pass above.
 func (s *GormStorage) enqueueBatchTx(ctx context.Context, jobs []*core.Job) error {
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		// Collect the non-empty UniqueKeys we need to check. A single
-		// IN-list query amortizes the round-trip cost across the batch.
-		keys := make([]string, 0, len(jobs))
-		for _, job := range jobs {
-			if job.UniqueKey != "" {
-				keys = append(keys, job.UniqueKey)
-			}
-		}
-
-		existing := make(map[string]struct{}, len(keys))
-		if len(keys) > 0 {
-			query := tx.Model(&core.Job{}).
-				Select("unique_key").
-				Where("unique_key IN ? AND status IN ?", keys,
-					[]core.JobStatus{core.StatusPending, core.StatusRunning, core.StatusCompleted})
-
-			// SQLite's writer lock already serializes the transaction, so
-			// FOR UPDATE is both unsupported and unnecessary there.
-			if !s.isSQLite {
-				query = query.Clauses(clause.Locking{Strength: "UPDATE"})
-			}
-
-			var found []string
-			if err := query.Pluck("unique_key", &found).Error; err != nil {
-				return err
-			}
-			for _, k := range found {
-				existing[k] = struct{}{}
-			}
-		}
-
-		toCreate := make([]*core.Job, 0, len(jobs))
-		for _, job := range jobs {
-			if job.UniqueKey != "" {
-				if _, seen := existing[job.UniqueKey]; seen {
-					continue
-				}
-				// Guard against duplicates within the same batch (e.g.,
-				// two sub-jobs with the same UniqueKey in one call) so
-				// the later Create does not insert siblings twice.
-				existing[job.UniqueKey] = struct{}{}
-			}
-			toCreate = append(toCreate, job)
-		}
-
-		if len(toCreate) == 0 {
-			return nil
-		}
-		return tx.Clauses(clause.OnConflict{DoNothing: true}).Create(toCreate).Error
+		return s.enqueueBatchWithDB(tx, jobs)
 	})
 }
 
@@ -1167,7 +1195,13 @@ func (s *GormStorage) GetSubJobs(ctx context.Context, fanOutID string) ([]*core.
 		Where("fan_out_id = ?", fanOutID).
 		Order("fan_out_index ASC").
 		Find(&jobs).Error
-	return jobs, err
+	if err != nil {
+		return nil, err
+	}
+	if err := s.decodeJobListPayloads(jobs); err != nil {
+		return nil, err
+	}
+	return jobs, nil
 }
 
 // GetSubJobResults retrieves completed/failed sub-jobs for result collection.
@@ -1177,7 +1211,13 @@ func (s *GormStorage) GetSubJobResults(ctx context.Context, fanOutID string) ([]
 		Where("fan_out_id = ? AND status IN ?", fanOutID, []core.JobStatus{core.StatusCompleted, core.StatusFailed}).
 		Order("fan_out_index ASC").
 		Find(&jobs).Error
-	return jobs, err
+	if err != nil {
+		return nil, err
+	}
+	if err := s.decodeJobListPayloads(jobs); err != nil {
+		return nil, err
+	}
+	return jobs, nil
 }
 
 // CancelSubJobs cancels pending/running sub-jobs for a fan-out.
@@ -1336,7 +1376,10 @@ func (s *GormStorage) SuspendJob(ctx context.Context, jobID string, workerID str
 // Returns (true, nil) if resumed, (false, nil) if job was not in a resumable status.
 func (s *GormStorage) ResumeJob(ctx context.Context, jobID string) (bool, error) {
 	// Accept both waiting and paused status — paused jobs should also be
-	// resumable when their fan-out completes.
+	// resumable when their fan-out completes. run_at is deliberately left
+	// untouched so a delayed job that was paused before its run_at and then
+	// resumed still honors its original schedule. (Signal-waiting jobs use
+	// ResumeSignalWaitingJob instead, which clears the timeout wake deadline.)
 	result := s.db.WithContext(ctx).
 		Model(&core.Job{}).
 		Where("id = ? AND status IN (?, ?)", jobID, core.StatusWaiting, core.StatusPaused).
@@ -1351,18 +1394,40 @@ func (s *GormStorage) ResumeJob(ctx context.Context, jobID string) (bool, error)
 	return result.RowsAffected > 0, nil
 }
 
+// ResumeSignalWaitingJob resumes a job that is waiting on a signal. Unlike the
+// general ResumeJob it matches StatusWaiting ONLY (never paused — a producer
+// must not be able to un-pause an operator-paused job), and it clears run_at:
+// WaitForSignalTimeout parks a future run_at as its wake deadline, so when a
+// signal arrives early the resume must not leave a future run_at that would
+// block Dequeue until that deadline. Returns whether a row was resumed.
+func (s *GormStorage) ResumeSignalWaitingJob(ctx context.Context, jobID string) (bool, error) {
+	result := s.db.WithContext(ctx).
+		Model(&core.Job{}).
+		Where("id = ? AND status = ?", jobID, core.StatusWaiting).
+		Updates(map[string]any{
+			"status":     core.StatusPending,
+			"attempt":    gorm.Expr("CASE WHEN attempt > 0 THEN attempt - 1 ELSE 0 END"),
+			"run_at":     nil,
+			"updated_at": time.Now(),
+		})
+	if result.Error != nil {
+		return false, result.Error
+	}
+	return result.RowsAffected > 0, nil
+}
+
 // Requeue resets a terminally failed or cancelled job back to pending so it can
 // run again from scratch. Failed jobs are this library's dead-letter set — there
-// is no separate DLQ table; a job that exhausts its retries (or is cancelled)
-// stays queryable via GetJobsByStatus(StatusFailed) and Requeue is how an
+// is no separate DLQ table; a job that exhausts its retries stays queryable via
+// its dead_lettered_at/dead_letter_reason metadata and Requeue is how an
 // operator replays one.
 //
-// The attempt counter, error, lock, and result fields are reset, run_at is
-// cleared (immediately eligible), AND the job's checkpoints are deleted so the
-// run starts fresh. Clearing checkpoints is deliberate: the usual reason to
-// requeue is a code or dependency fix, which can change a workflow's Call
-// sequence — resuming into checkpoints recorded by the old run would skip the
-// wrong steps and, under Strict determinism, falsely trip the
+// The attempt counter, error, DLQ metadata, lock, and result fields are reset,
+// run_at is cleared (immediately eligible), AND the job's checkpoints are
+// deleted so the run starts fresh. Clearing checkpoints is deliberate: the usual
+// reason to requeue is a code or dependency fix, which can change a workflow's
+// Call sequence — resuming into checkpoints recorded by the old run would skip
+// the wrong steps and, under Strict determinism, falsely trip the
 // unconsumed-checkpoint guard. Handlers must be idempotent regardless (the
 // execution contract is at-least-once), so a full replay is safe.
 //
@@ -1398,16 +1463,18 @@ func (s *GormStorage) Requeue(ctx context.Context, jobID string) (bool, error) {
 			result := tx.Model(&core.Job{}).
 				Where("id = ?", jobID).
 				Updates(map[string]any{
-					"status":       core.StatusPending,
-					"attempt":      0,
-					"last_error":   "",
-					"result":       nil,
-					"locked_by":    "",
-					"locked_until": nil,
-					"started_at":   nil,
-					"completed_at": nil,
-					"run_at":       nil,
-					"updated_at":   time.Now(),
+					"status":             core.StatusPending,
+					"attempt":            0,
+					"last_error":         "",
+					"dead_lettered_at":   nil,
+					"dead_letter_reason": "",
+					"result":             nil,
+					"locked_by":          "",
+					"locked_until":       nil,
+					"started_at":         nil,
+					"completed_at":       nil,
+					"run_at":             nil,
+					"updated_at":         time.Now(),
 				})
 			if result.Error != nil {
 				return result.Error
@@ -1511,7 +1578,13 @@ func (s *GormStorage) GetWaitingJobsToResume(ctx context.Context) ([]*core.Job, 
 		)
 		LIMIT ?
 	`, core.StatusWaiting, core.FanOutCompleted, core.FanOutFailed, core.FanOutPending, maxResumeBatch).Scan(&jobs).Error
-	return jobs, err
+	if err != nil {
+		return nil, err
+	}
+	if err := s.decodeJobListPayloads(jobs); err != nil {
+		return nil, err
+	}
+	return jobs, nil
 }
 
 // GetStalledFanOutParents finds waiting parents whose pending fan-out never
@@ -1536,15 +1609,25 @@ func (s *GormStorage) GetStalledFanOutParents(ctx context.Context, olderThan tim
 		) < f.total_count
 		LIMIT ?
 	`, core.StatusWaiting, core.FanOutPending, olderThan, maxResumeBatch).Scan(&jobs).Error
-	return jobs, err
+	if err != nil {
+		return nil, err
+	}
+	if err := s.decodeJobListPayloads(jobs); err != nil {
+		return nil, err
+	}
+	return jobs, nil
 }
 
 // SaveJobResult stores the serialized result for a job.
 func (s *GormStorage) SaveJobResult(ctx context.Context, jobID string, workerID string, result []byte) error {
+	encoded, err := s.encodePayload("job result", jobID, result)
+	if err != nil {
+		return err
+	}
 	update := s.db.WithContext(ctx).
 		Model(&core.Job{}).
 		Where("id = ? AND locked_by = ? AND status = ?", jobID, workerID, core.StatusRunning).
-		Update("result", result)
+		Update("result", encoded)
 	if update.Error != nil {
 		return update.Error
 	}
@@ -1646,7 +1729,13 @@ func (s *GormStorage) GetPausedJobs(ctx context.Context, queue string) ([]*core.
 		Where("queue = ? AND status = ?", queue, core.StatusPaused).
 		Order("created_at ASC").
 		Find(&jobs).Error
-	return jobs, err
+	if err != nil {
+		return nil, err
+	}
+	if err := s.decodeJobListPayloads(jobs); err != nil {
+		return nil, err
+	}
+	return jobs, nil
 }
 
 // IsJobPaused checks if a job is paused.

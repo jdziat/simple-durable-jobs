@@ -1,6 +1,6 @@
 ---
 title: "Observability"
-weight: 9
+weight: 10
 ---
 
 ## OpenTelemetry Tracing

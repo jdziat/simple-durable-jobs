@@ -1,6 +1,6 @@
 ---
 title: "Storage & Embedded UI"
-weight: 10
+weight: 11
 ---
 
 ## Embedded UI

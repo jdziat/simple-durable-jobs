@@ -34,12 +34,14 @@ import (
 	"gorm.io/gorm"
 
 	"github.com/jdziat/simple-durable-jobs/pkg/call"
+	payloadcodec "github.com/jdziat/simple-durable-jobs/pkg/codec"
 	"github.com/jdziat/simple-durable-jobs/pkg/core"
 	"github.com/jdziat/simple-durable-jobs/pkg/fanout"
 	"github.com/jdziat/simple-durable-jobs/pkg/jobctx"
 	"github.com/jdziat/simple-durable-jobs/pkg/queue"
 	"github.com/jdziat/simple-durable-jobs/pkg/schedule"
 	"github.com/jdziat/simple-durable-jobs/pkg/security"
+	"github.com/jdziat/simple-durable-jobs/pkg/signal"
 	"github.com/jdziat/simple-durable-jobs/pkg/storage"
 	"github.com/jdziat/simple-durable-jobs/pkg/worker"
 )
@@ -71,6 +73,12 @@ type (
 	// Storage defines the persistence layer for jobs.
 	Storage = core.Storage
 
+	// PayloadCodec transforms serialized payload bytes at the storage boundary.
+	PayloadCodec = core.PayloadCodec
+
+	// DeadLetterFilter scopes dead-letter triage queries.
+	DeadLetterFilter = core.DeadLetterFilter
+
 	// Starter is an interface for types that can be started with a context.
 	Starter = core.Starter
 
@@ -92,6 +100,9 @@ type (
 	// CheckpointSaved is emitted when a checkpoint is saved.
 	CheckpointSaved = core.CheckpointSaved
 
+	// SignalDelivered is emitted when a signal is persisted for a job.
+	SignalDelivered = core.SignalDelivered
+
 	// NoRetryError indicates an error that should not be retried.
 	NoRetryError = core.NoRetryError
 
@@ -104,8 +115,14 @@ type (
 	// Option modifies Options.
 	Option = queue.Option
 
+	// BatchEntry describes one job in a batch enqueue request.
+	BatchEntry = queue.BatchEntry
+
 	// EnqueueMiddleware wraps the enqueue operation for cross-cutting concerns.
 	EnqueueMiddleware = queue.EnqueueMiddleware
+
+	// ExecutionMiddleware wraps each job handler attempt for cross-cutting concerns.
+	ExecutionMiddleware = queue.ExecutionMiddleware
 
 	// Options holds configuration for job enqueueing and registration.
 	Options = queue.Options
@@ -125,14 +142,50 @@ type (
 	// WorkerConfig holds worker configuration.
 	WorkerConfig = worker.WorkerConfig
 
+	// ConcurrencyCapConfig describes a DB-backed fleet-wide or per-key cap.
+	ConcurrencyCapConfig = worker.ConcurrencyCapConfig
+
+	// CapOption configures a ConcurrencyCap.
+	CapOption = worker.CapOption
+
+	// RateLimitConfig describes a DB-backed fleet-wide or per-key rate limit.
+	RateLimitConfig = worker.RateLimitConfig
+
+	// RateLimitOption configures a RateLimit.
+	RateLimitOption = worker.RateLimitOption
+
+	// RetentionConfig controls automatic terminal-job retention.
+	RetentionConfig = worker.RetentionConfig
+
+	// RetentionOption configures automatic terminal-job retention.
+	RetentionOption = worker.RetentionOption
+
 	// RetryConfig holds configuration for retry with backoff.
 	RetryConfig = worker.RetryConfig
+
+	// BackoffPolicy computes the delay before a failed job is retried.
+	BackoffPolicy = worker.BackoffPolicy
+
+	// BackoffFunc adapts a function to BackoffPolicy.
+	BackoffFunc = worker.BackoffFunc
+
+	// ExponentialBackoff computes exponential job retry delays with optional jitter.
+	ExponentialBackoff = worker.ExponentialBackoff
 
 	// Schedule defines when a job should run next.
 	Schedule = schedule.Schedule
 
 	// GormStorage implements Storage using GORM.
 	GormStorage = storage.GormStorage
+
+	// GormStorageOption configures GormStorage.
+	GormStorageOption = storage.GormStorageOption
+
+	// TxEnqueuer is the optional storage capability for caller-supplied transactions.
+	TxEnqueuer = storage.TxEnqueuer
+
+	// Secretbox is the built-in NaCl Secretbox payload codec.
+	Secretbox = payloadcodec.Secretbox
 
 	// PoolConfig holds connection pool configuration.
 	PoolConfig = storage.PoolConfig
@@ -165,6 +218,9 @@ type (
 	// FanOutStatus represents the state of a fan-out batch.
 	FanOutStatus = core.FanOutStatus
 )
+
+// DeadLetterOption configures dead-letter triage queries.
+type DeadLetterOption func(*DeadLetterFilter)
 
 // Status constants
 const (
@@ -203,6 +259,11 @@ const (
 	BestEffort          = queue.BestEffort
 )
 
+// Workflow version constants
+const (
+	DefaultVersion = jobctx.DefaultVersion
+)
+
 // Security limits
 const (
 	MaxJobTypeNameLength  = security.MaxJobTypeNameLength
@@ -213,33 +274,46 @@ const (
 	MaxErrorMessageLength = security.MaxErrorMessageLength
 	MaxQueueNameLength    = security.MaxQueueNameLength
 	MaxUniqueKeyLength    = security.MaxUniqueKeyLength
+	MaxSignalNameLength   = security.MaxSignalNameLength
 )
 
 // Error variables
 var (
-	ErrInvalidJobTypeName  = core.ErrInvalidJobTypeName
-	ErrJobTypeNameTooLong  = core.ErrJobTypeNameTooLong
-	ErrInvalidQueueName    = core.ErrInvalidQueueName
-	ErrQueueNameTooLong    = core.ErrQueueNameTooLong
-	ErrJobArgsTooLarge     = core.ErrJobArgsTooLarge
-	ErrJobNotCompleted     = core.ErrJobNotCompleted
-	ErrJobNotOwned         = core.ErrJobNotOwned
-	ErrDuplicateJob        = core.ErrDuplicateJob
-	ErrUniqueKeyTooLong    = core.ErrUniqueKeyTooLong
-	ErrJobAlreadyPaused    = core.ErrJobAlreadyPaused
-	ErrJobNotPaused        = core.ErrJobNotPaused
-	ErrQueueAlreadyPaused  = core.ErrQueueAlreadyPaused
-	ErrQueueNotPaused      = core.ErrQueueNotPaused
-	ErrCannotPauseStatus   = core.ErrCannotPauseStatus
-	ErrJobNotFound         = core.ErrJobNotFound
-	ErrNoResult            = core.ErrNoResult
-	ErrCannotRequeueSubJob = core.ErrCannotRequeueSubJob
+	ErrInvalidJobTypeName    = core.ErrInvalidJobTypeName
+	ErrJobTypeNameTooLong    = core.ErrJobTypeNameTooLong
+	ErrInvalidQueueName      = core.ErrInvalidQueueName
+	ErrQueueNameTooLong      = core.ErrQueueNameTooLong
+	ErrJobArgsTooLarge       = core.ErrJobArgsTooLarge
+	ErrJobNotCompleted       = core.ErrJobNotCompleted
+	ErrJobNotOwned           = core.ErrJobNotOwned
+	ErrDuplicateJob          = core.ErrDuplicateJob
+	ErrUniqueKeyTooLong      = core.ErrUniqueKeyTooLong
+	ErrJobAlreadyPaused      = core.ErrJobAlreadyPaused
+	ErrJobNotPaused          = core.ErrJobNotPaused
+	ErrQueueAlreadyPaused    = core.ErrQueueAlreadyPaused
+	ErrQueueNotPaused        = core.ErrQueueNotPaused
+	ErrCannotPauseStatus     = core.ErrCannotPauseStatus
+	ErrJobNotFound           = core.ErrJobNotFound
+	ErrNoResult              = core.ErrNoResult
+	ErrCannotRequeueSubJob   = core.ErrCannotRequeueSubJob
+	ErrSignalNameTooLong     = core.ErrSignalNameTooLong
+	ErrStorageNoSignals      = core.ErrStorageNoSignals
+	ErrStorageNoTxEnqueue    = core.ErrStorageNoTxEnqueue
+	ErrStorageNoBatchDequeue = core.ErrStorageNoBatchDequeue
+	ErrPayloadDecode         = core.ErrPayloadDecode
+
+	ErrUnsupportedWorkflowVersion = jobctx.ErrUnsupportedWorkflowVersion
+
+	ErrSecretboxAuthentication = payloadcodec.ErrSecretboxAuthentication
 )
 
 // Default values
 var (
 	DefaultJobRetries  = queue.DefaultJobRetries
 	DefaultCallRetries = queue.DefaultCallRetries
+
+	IdentityCodec = core.IdentityCodec
+	NopCodec      = core.NopCodec
 )
 
 // New creates a new Queue with the given storage backend.
@@ -248,8 +322,18 @@ func New(s Storage) *Queue {
 }
 
 // NewGormStorage creates a new GORM-backed storage.
-func NewGormStorage(db *gorm.DB) *GormStorage {
-	return storage.NewGormStorage(db)
+func NewGormStorage(db *gorm.DB, opts ...GormStorageOption) *GormStorage {
+	return storage.NewGormStorage(db, opts...)
+}
+
+// WithCodec configures a payload codec for GormStorage.
+func WithCodec(c PayloadCodec) GormStorageOption {
+	return storage.WithCodec(c)
+}
+
+// NewSecretbox creates the built-in NaCl Secretbox payload codec.
+func NewSecretbox(primaryKey [32]byte, fallbackKeys ...[32]byte) (*Secretbox, error) {
+	return payloadcodec.NewSecretbox(primaryKey, fallbackKeys...)
 }
 
 // NewGormStorageWithPool creates storage with connection pool configuration.
@@ -308,6 +392,11 @@ func NewOptions() *Options {
 	return queue.NewOptions()
 }
 
+// Batch creates a batch enqueue entry.
+func Batch(name string, args any, opts ...Option) BatchEntry {
+	return queue.Batch(name, args, opts...)
+}
+
 // NewWorker creates a new worker for the given queue.
 func NewWorker(q *Queue, opts ...WorkerOption) *Worker {
 	return worker.NewWorker(q, opts...)
@@ -337,6 +426,13 @@ func SavePhaseCheckpoint(ctx context.Context, phaseName string, result any) erro
 // Returns (result, true) if found, (zero, false) if not found or not in job context.
 func LoadPhaseCheckpoint[T any](ctx context.Context, phaseName string) (T, bool) {
 	return jobctx.LoadPhaseCheckpoint[T](ctx, phaseName)
+}
+
+// GetVersion records or replays a workflow-code version marker for changeID.
+// Use the returned version to branch around changes to Call, fan-out, and signal
+// wait sequences so in-flight runs keep their originally recorded path.
+func GetVersion(ctx context.Context, changeID string, minSupported, maxSupported int) (int, error) {
+	return jobctx.GetVersion(ctx, changeID, minSupported, maxSupported)
 }
 
 // NoRetry wraps an error to indicate it should not be retried.
@@ -408,6 +504,11 @@ func Timeout(d time.Duration) Option {
 	return queue.Timeout(d)
 }
 
+// WithHandlerBackoff sets the retry backoff policy for this handler.
+func WithHandlerBackoff(p BackoffPolicy) Option {
+	return queue.WithHandlerBackoff(p)
+}
+
 // Unique ensures only one job with this key exists.
 func Unique(key string) Option {
 	return queue.Unique(key)
@@ -423,6 +524,61 @@ func Determinism(mode DeterminismMode) Option {
 // Concurrency sets the concurrency for a queue.
 func Concurrency(n int) WorkerOption {
 	return worker.Concurrency(n)
+}
+
+// ConcurrencyCap limits concurrent jobs across the fleet when the storage
+// backend implements DB-backed concurrency slots.
+func ConcurrencyCap(name string, limit int, opts ...CapOption) WorkerOption {
+	return worker.ConcurrencyCap(name, limit, opts...)
+}
+
+// CapKey derives the per-key partition for a ConcurrencyCap.
+func CapKey(fn func(*Job) string) CapOption {
+	return worker.CapKey(fn)
+}
+
+// RateLimit limits admitted jobs per second across the fleet when the storage
+// backend implements DB-backed rate windows.
+func RateLimit(name string, perSecond float64, opts ...RateLimitOption) WorkerOption {
+	return worker.RateLimit(name, perSecond, opts...)
+}
+
+// RateLimitKey derives the per-key partition for a RateLimit.
+func RateLimitKey(fn func(*Job) string) RateLimitOption {
+	return worker.RateLimitKey(fn)
+}
+
+// WithRetention enables optional automatic garbage collection of terminal jobs.
+func WithRetention(opts ...RetentionOption) WorkerOption {
+	return worker.WithRetention(opts...)
+}
+
+// RetentionCompletedAfter deletes completed jobs older than d. A non-positive
+// duration keeps completed jobs forever.
+func RetentionCompletedAfter(d time.Duration) RetentionOption {
+	return worker.RetentionCompletedAfter(d)
+}
+
+// RetentionFailedAfter deletes terminal failed and cancelled jobs older than d.
+// A non-positive duration keeps failed/cancelled jobs forever.
+func RetentionFailedAfter(d time.Duration) RetentionOption {
+	return worker.RetentionFailedAfter(d)
+}
+
+// RetentionInterval sets the retention scan cadence.
+func RetentionInterval(d time.Duration) RetentionOption {
+	return worker.RetentionInterval(d)
+}
+
+// RetentionBatchSize sets the maximum rows deleted in one pass.
+func RetentionBatchSize(n int) RetentionOption {
+	return worker.RetentionBatchSize(n)
+}
+
+// WithQueueRateLimit applies a per-worker token bucket before dequeueing from
+// the named queue.
+func WithQueueRateLimit(queue string, perSecond float64, burst int) WorkerOption {
+	return worker.WithQueueRateLimit(queue, perSecond, burst)
 }
 
 // WithScheduler enables the scheduler in the worker.
@@ -443,6 +599,11 @@ func WithStorageRetry(config RetryConfig) WorkerOption {
 // WithDequeueRetry configures retry behavior for dequeue operations.
 func WithDequeueRetry(config RetryConfig) WorkerOption {
 	return worker.WithDequeueRetry(config)
+}
+
+// WithDequeueBatchSize sets the per-poll cap for optional batch dequeue.
+func WithDequeueBatchSize(n int) WorkerOption {
+	return worker.WithDequeueBatchSize(n)
 }
 
 // WithRetryAttempts sets the max retry attempts for storage operations.
@@ -466,6 +627,12 @@ func WithPollInterval(d time.Duration) WorkerOption {
 // after its context is cancelled. A non-positive duration aborts immediately.
 func WithDrainTimeout(d time.Duration) WorkerOption {
 	return worker.WithDrainTimeout(d)
+}
+
+// WithBackoff configures the worker-default retry backoff policy for failed
+// job re-execution. Per-handler policies and RetryAfter override it.
+func WithBackoff(p BackoffPolicy) WorkerOption {
+	return worker.WithBackoff(p)
 }
 
 // WithStaleLockInterval sets how often the worker checks for stale running jobs.
@@ -496,6 +663,11 @@ func WithFanOutRecoveryStaleAge(d time.Duration) WorkerOption {
 // DefaultRetryConfig returns the default retry configuration.
 func DefaultRetryConfig() RetryConfig {
 	return worker.DefaultRetryConfig()
+}
+
+// DefaultBackoffPolicy returns the default job retry backoff policy.
+func DefaultBackoffPolicy() BackoffPolicy {
+	return worker.DefaultBackoffPolicy()
 }
 
 // Schedule functions
@@ -634,14 +806,14 @@ func IsSuspendError(err error) bool {
 }
 
 // Requeue resets a terminally failed or cancelled job back to pending so it
-// runs again from scratch. Failed jobs are the dead-letter set — there is no
-// separate DLQ table; query them with q.Storage().GetJobsByStatus(StatusFailed)
-// and replay one with Requeue. The job's checkpoints are cleared so a workflow
-// replays from the beginning (handlers must be idempotent regardless), which is
-// the safe behavior when the usual reason to requeue is a code or dependency
-// fix that changes the workflow's steps. Requeuing a fan-out parent also clears
-// its entire fan-out subtree (descendant fan-outs and sub-jobs at every depth,
-// including nested workflows) so the replay re-dispatches cleanly.
+// runs again from scratch. Exhausted failed jobs are the dead-letter set; query
+// them with ListDeadLettered/CountDeadLettered and replay one with Requeue.
+// DLQ metadata and checkpoints are cleared so a workflow replays from the
+// beginning (handlers must be idempotent regardless), which is the safe behavior
+// when the usual reason to requeue is a code or dependency fix that changes the
+// workflow's steps. Requeuing a fan-out parent also clears its entire fan-out
+// subtree (descendant fan-outs and sub-jobs at every depth, including nested
+// workflows) so the replay re-dispatches cleanly.
 //
 // Returns true if the job was requeued, false if it was not found or not in a
 // requeuable (failed/cancelled) state. Returns ErrCannotRequeueSubJob for a
@@ -656,6 +828,156 @@ func Requeue(ctx context.Context, q *Queue, jobID string) (bool, error) {
 		return false, fmt.Errorf("jobs: storage backend does not support Requeue")
 	}
 	return r.Requeue(ctx, jobID)
+}
+
+// ListDeadLettered returns jobs with explicit DLQ metadata, ordered by
+// dead_lettered_at descending. Replay a returned job with Requeue.
+func ListDeadLettered(ctx context.Context, q *Queue, opts ...DeadLetterOption) ([]*Job, error) {
+	type deadLetterLister interface {
+		ListDeadLettered(ctx context.Context, filter core.DeadLetterFilter) ([]*core.Job, error)
+	}
+	l, ok := q.Storage().(deadLetterLister)
+	if !ok {
+		return nil, fmt.Errorf("jobs: storage backend does not support dead-letter triage")
+	}
+	filter := newDeadLetterFilter(opts...)
+	return l.ListDeadLettered(ctx, filter)
+}
+
+// CountDeadLettered returns the number of jobs with explicit DLQ metadata.
+func CountDeadLettered(ctx context.Context, q *Queue, opts ...DeadLetterOption) (int64, error) {
+	type deadLetterCounter interface {
+		CountDeadLettered(ctx context.Context, filter core.DeadLetterFilter) (int64, error)
+	}
+	c, ok := q.Storage().(deadLetterCounter)
+	if !ok {
+		return 0, fmt.Errorf("jobs: storage backend does not support dead-letter triage")
+	}
+	filter := newDeadLetterFilter(opts...)
+	return c.CountDeadLettered(ctx, filter)
+}
+
+// DeadLetterQueue filters dead-letter queries to one queue.
+func DeadLetterQueue(queue string) DeadLetterOption {
+	return func(f *DeadLetterFilter) {
+		f.Queue = queue
+	}
+}
+
+// DeadLetterType filters dead-letter queries to one job type.
+func DeadLetterType(jobType string) DeadLetterOption {
+	return func(f *DeadLetterFilter) {
+		f.Type = jobType
+	}
+}
+
+// DeadLetterLimit sets the maximum number of dead-lettered jobs returned.
+func DeadLetterLimit(limit int) DeadLetterOption {
+	return func(f *DeadLetterFilter) {
+		f.Limit = limit
+	}
+}
+
+// DeadLetterOffset sets the pagination offset for dead-lettered jobs.
+func DeadLetterOffset(offset int) DeadLetterOption {
+	return func(f *DeadLetterFilter) {
+		f.Offset = offset
+	}
+}
+
+func newDeadLetterFilter(opts ...DeadLetterOption) DeadLetterFilter {
+	var filter DeadLetterFilter
+	for _, opt := range opts {
+		opt(&filter)
+	}
+	return filter
+}
+
+// Signal delivers a named signal carrying payload to a job (workflow). The
+// signal is buffered durably, so it is not lost if sent before the handler
+// waits for it; and if the target job is currently waiting on a signal, this
+// resumes it promptly (a recovery poll is the backstop). Delivery is FIFO per
+// (job, name).
+//
+// The handler receives signals with WaitForSignal / WaitForSignalTimeout /
+// CheckSignal / DrainSignals. Returns ErrJobNotFound if the job does not exist,
+// ErrStorageNoSignals if the backend lacks signal support, or ErrSignalNameTooLong.
+func Signal(ctx context.Context, q *Queue, jobID, name string, payload any) error {
+	if name == "" {
+		return fmt.Errorf("jobs: signal name must not be empty")
+	}
+	if len(name) > MaxSignalNameLength {
+		return core.ErrSignalNameTooLong
+	}
+	type signalSender interface {
+		SendSignal(ctx context.Context, jobID, name string, payload []byte) error
+	}
+	sender, ok := q.Storage().(signalSender)
+	if !ok {
+		return core.ErrStorageNoSignals
+	}
+
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("jobs: marshal signal payload: %w", err)
+	}
+	if len(data) > security.MaxResultSize {
+		return fmt.Errorf("jobs: signal %q payload is %d bytes, limit is %d", name, len(data), security.MaxResultSize)
+	}
+
+	job, err := q.Storage().GetJob(ctx, jobID)
+	if err != nil {
+		return err
+	}
+	if job == nil {
+		return fmt.Errorf("%w: %s", core.ErrJobNotFound, jobID)
+	}
+
+	if err := sender.SendSignal(ctx, jobID, name, data); err != nil {
+		return err
+	}
+	q.Emit(&core.SignalDelivered{JobID: jobID, Name: name, Timestamp: time.Now()})
+
+	// Fast path: wake a job that's currently waiting. ResumeSignalWaitingJob
+	// matches StatusWaiting only (its WHERE guard closes the TOCTOU where the job
+	// is paused between the GetJob read above and the resume), so a producer can
+	// never un-pause an operator-paused job. The signal-resume poll backstops the
+	// deliver-vs-suspend race for anything this fast path misses.
+	if job.Status == core.StatusWaiting {
+		type signalResumer interface {
+			ResumeSignalWaitingJob(ctx context.Context, jobID string) (bool, error)
+		}
+		if r, ok := q.Storage().(signalResumer); ok {
+			if _, err := r.ResumeSignalWaitingJob(ctx, jobID); err != nil {
+				return fmt.Errorf("jobs: signal sent but resume failed (poll will recover): %w", err)
+			}
+		}
+	}
+	return nil
+}
+
+// WaitForSignal consumes the oldest pending signal of name from within a job
+// handler, suspending the job until one arrives. See pkg/signal.
+func WaitForSignal[T any](ctx context.Context, name string) (T, error) {
+	return signal.WaitForSignal[T](ctx, name)
+}
+
+// WaitForSignalTimeout is WaitForSignal with a deadline: returns (zero, false)
+// if no signal arrives within d.
+func WaitForSignalTimeout[T any](ctx context.Context, name string, d time.Duration) (T, bool, error) {
+	return signal.WaitForSignalTimeout[T](ctx, name, d)
+}
+
+// CheckSignal reports the oldest pending signal of name without consuming it
+// (non-blocking). Returns (zero, false) when none is pending.
+func CheckSignal[T any](ctx context.Context, name string) (T, bool, error) {
+	return signal.CheckSignal[T](ctx, name)
+}
+
+// DrainSignals consumes and returns all currently-pending signals of name
+// (non-blocking), in FIFO order.
+func DrainSignals[T any](ctx context.Context, name string) ([]T, error) {
+	return signal.DrainSignals[T](ctx, name)
 }
 
 // LoadResult decodes the persisted return value of a completed job into T.

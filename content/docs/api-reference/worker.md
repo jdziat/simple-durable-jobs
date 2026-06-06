@@ -59,7 +59,14 @@ Configures the worker to process a specific queue.
 
 ### `Concurrency(n int) WorkerOption`
 
-Sets the number of concurrent job processors. Default is 10.
+Sets the number of concurrent job processors per worker process. Default is 10.
+
+### `ConcurrencyCap(name string, limit int, opts ...CapOption) WorkerOption`
+
+Adds an optional database-backed fleet-wide cap. Without options, `name` is the
+slot name and the cap applies across the fleet. With `CapKey(func(*Job) string)`,
+the effective slot name is `name + ":" + key`, so the cap applies independently
+per key. See [Concurrency Caps]({{< relref "/docs/advanced/concurrency-caps" >}}).
 
 ### `WithScheduler(enabled bool) WorkerOption`
 

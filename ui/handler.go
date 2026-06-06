@@ -67,7 +67,10 @@ func Handler(storage core.Storage, opts ...Option) http.Handler {
 	// Register Connect-RPC handler
 	path, handler := jobsv1connect.NewJobsServiceHandler(
 		svc,
-		connect.WithInterceptors(writeAuthInterceptor(cfg.middleware != nil || cfg.insecureAllowUnauthenticatedWrites)),
+		connect.WithInterceptors(writeAuthInterceptor(
+			cfg.middleware != nil || cfg.insecureAllowUnauthenticatedWrites,
+			cfg.authorizer,
+		)),
 	)
 	mux.Handle(path, handler)
 
@@ -116,22 +119,37 @@ func registerStatsCollector(db *gorm.DB) bool {
 	return true
 }
 
-var mutatingProcedures = map[string]struct{}{
-	jobsv1connect.JobsServiceRetryJobProcedure:       {},
-	jobsv1connect.JobsServiceDeleteJobProcedure:      {},
-	jobsv1connect.JobsServiceBulkRetryJobsProcedure:  {},
-	jobsv1connect.JobsServiceBulkDeleteJobsProcedure: {},
-	jobsv1connect.JobsServicePauseJobProcedure:       {},
-	jobsv1connect.JobsServiceResumeJobProcedure:      {},
-	jobsv1connect.JobsServicePauseQueueProcedure:     {},
-	jobsv1connect.JobsServiceResumeQueueProcedure:    {},
-	jobsv1connect.JobsServicePurgeQueueProcedure:     {},
+var mutatingProcedures = map[string]Action{
+	jobsv1connect.JobsServiceRetryJobProcedure:       ActionRetryJob,
+	jobsv1connect.JobsServiceDeleteJobProcedure:      ActionDeleteJob,
+	jobsv1connect.JobsServiceBulkRetryJobsProcedure:  ActionBulkRetryJobs,
+	jobsv1connect.JobsServiceBulkDeleteJobsProcedure: ActionBulkDeleteJobs,
+	jobsv1connect.JobsServicePauseJobProcedure:       ActionPauseJob,
+	jobsv1connect.JobsServiceCancelJobProcedure:      ActionCancelJob,
+	jobsv1connect.JobsServiceResumeJobProcedure:      ActionResumeJob,
+	jobsv1connect.JobsServicePauseQueueProcedure:     ActionPauseQueue,
+	jobsv1connect.JobsServiceResumeQueueProcedure:    ActionResumeQueue,
+	jobsv1connect.JobsServicePurgeQueueProcedure:     ActionPurgeQueue,
 }
 
-func writeAuthInterceptor(allowWrites bool) connect.Interceptor {
+func writeAuthInterceptor(allowWrites bool, authorizer Authorizer) connect.Interceptor {
 	return connect.UnaryInterceptorFunc(func(next connect.UnaryFunc) connect.UnaryFunc {
 		return connect.UnaryFunc(func(ctx context.Context, req connect.AnyRequest) (connect.AnyResponse, error) {
-			if _, mutates := mutatingProcedures[req.Spec().Procedure]; mutates && !allowWrites {
+			action, mutates := mutatingProcedures[req.Spec().Procedure]
+			if !mutates {
+				return next(ctx, req)
+			}
+			if authorizer != nil {
+				if err := authorizer.Authorize(ctx, action); err != nil {
+					var connectErr *connect.Error
+					if errors.As(err, &connectErr) {
+						return nil, connectErr
+					}
+					return nil, connect.NewError(connect.CodePermissionDenied, err)
+				}
+				return next(ctx, req)
+			}
+			if !allowWrites {
 				return nil, connect.NewError(connect.CodePermissionDenied, errors.New("jobs UI write RPCs require auth middleware or explicit insecure opt-in"))
 			}
 			return next(ctx, req)

@@ -23,5 +23,5 @@ Welcome to the **Simple Durable Jobs** documentation — a Go library for durabl
 
 {{< cards >}}
   {{< card link="api-reference/" title="API Reference" icon="book-open" subtitle="Complete type and method reference: Queue, Worker, durable Calls, fan-out, options, events, and storage." >}}
-  {{< card link="advanced/" title="Advanced Topics" icon="cog" subtitle="Production tuning: the stale-lock reaper, connection-pool presets, and storage retry." >}}
+  {{< card link="advanced/" title="Advanced Topics" icon="cog" subtitle="Production features: transactional enqueue, dead-letter queue, retention/GC, rate limiting, concurrency caps, metrics, workflow versioning, payload codec, dashboard authorization, testing utilities, and tuning knobs." >}}
 {{< /cards >}}

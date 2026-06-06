@@ -19,6 +19,8 @@
     createdAt: Date | null
     startedAt: Date | null
     completedAt: Date | null
+    deadLetteredAt: Date | null
+    deadLetterReason: string
   } | null>(null)
 
   let checkpoints = $state<Array<{
@@ -70,6 +72,8 @@
           createdAt: j.createdAt?.toDate() ?? null,
           startedAt: j.startedAt?.toDate() ?? null,
           completedAt: j.completedAt?.toDate() ?? null,
+          deadLetteredAt: j.deadLetteredAt?.toDate() ?? null,
+          deadLetterReason: j.deadLetterReason,
         }
         checkpoints = response.checkpoints.map(cp => ({
           id: cp.id,
@@ -123,6 +127,16 @@
     }
   }
 
+  async function cancelJob() {
+    if (!confirm('Cancel this running job? This interrupts the handler cooperatively by cancelling its context; handlers that ignore context are not force-killed.')) return
+    try {
+      await jobsClient.cancelJob({ id })
+      loadJob()
+    } catch (e) {
+      alert('Failed to cancel job')
+    }
+  }
+
   async function resumeJob() {
     try {
       await jobsClient.resumeJob({ id })
@@ -157,7 +171,11 @@
   {:else if job}
     <div class="header">
       <h2>{job.type}</h2>
-      <span class="status status-{job.status}">{job.status}</span>
+      {#if job.deadLetteredAt}
+        <span class="status status-dead-lettered">Dead-lettered</span>
+      {:else}
+        <span class="status status-{job.status}">{job.status}</span>
+      {/if}
     </div>
 
     <div class="meta">
@@ -198,6 +216,19 @@
       <div class="error-box">
         <h4>Last Error</h4>
         <pre>{job.lastError}</pre>
+      </div>
+    {/if}
+
+    {#if job.deadLetteredAt}
+      <div class="dead-letter-box">
+        <h4>Dead-letter</h4>
+        <div class="dead-letter-meta">
+          <span class="label">Dead-lettered</span>
+          <span class="value">{job.deadLetteredAt.toLocaleString()}</span>
+        </div>
+        {#if job.deadLetterReason}
+          <pre>{job.deadLetterReason}</pre>
+        {/if}
       </div>
     {/if}
 
@@ -257,6 +288,9 @@
       {#if job.status === 'pending' || job.status === 'running'}
         <button class="btn-pause" onclick={pauseJob}>Pause Job</button>
       {/if}
+      {#if job.status === 'running'}
+        <button class="btn-cancel" onclick={cancelJob}>Cancel Job</button>
+      {/if}
       {#if job.status === 'paused'}
         <button class="btn-resume" onclick={resumeJob}>Resume Job</button>
       {/if}
@@ -299,6 +333,7 @@
   .status-running { background: #dbeafe; color: #1e40af; }
   .status-completed { background: #d1fae5; color: #065f46; }
   .status-failed { background: #fee2e2; color: #991b1b; }
+  .status-dead-lettered { background: #3f1d1d; color: #fee2e2; }
   .status-paused { background: #fef9c3; color: #854d0e; }
   .status-cancelled { background: #fce7f3; color: #9d174d; }
   .status-waiting { background: #e0e7ff; color: #3730a3; }
@@ -337,7 +372,7 @@
     font-size: 14px;
   }
 
-  .error-box, .args-box, .checkpoints {
+  .error-box, .dead-letter-box, .args-box, .checkpoints {
     background: white;
     padding: 20px;
     border-radius: 8px;
@@ -349,7 +384,18 @@
     border-left: 4px solid #ef4444;
   }
 
-  .error-box h4, .args-box h4, .checkpoints h4 {
+  .dead-letter-box {
+    border-left: 4px solid #3f1d1d;
+  }
+
+  .dead-letter-meta {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin-bottom: 12px;
+  }
+
+  .error-box h4, .dead-letter-box h4, .args-box h4, .checkpoints h4 {
     margin: 0 0 12px;
     font-size: 14px;
     color: #666;
@@ -400,7 +446,7 @@
     margin-top: 24px;
   }
 
-  .btn-retry, .btn-delete, .btn-pause, .btn-resume {
+  .btn-retry, .btn-delete, .btn-pause, .btn-resume, .btn-cancel {
     padding: 10px 20px;
     border: none;
     border-radius: 6px;
@@ -412,6 +458,7 @@
   .btn-delete { background: #ef4444; color: white; }
   .btn-pause { background: #f59e0b; color: white; }
   .btn-resume { background: #10b981; color: white; }
+  .btn-cancel { background: #b91c1c; color: white; }
 
   .workflow-section {
     margin-bottom: 24px;

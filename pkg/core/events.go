@@ -71,6 +71,17 @@ type JobResumed struct {
 
 func (*JobResumed) eventMarker() {}
 
+// SignalDelivered is emitted when a signal is successfully persisted for a job
+// (via Signal). It lets an orchestrator observe that a signal landed; the job
+// consumes it later via WaitForSignal/CheckSignal/DrainSignals.
+type SignalDelivered struct {
+	JobID     string
+	Name      string
+	Timestamp time.Time
+}
+
+func (*SignalDelivered) eventMarker() {}
+
 // QueuePaused is emitted when a queue is paused.
 type QueuePaused struct {
 	Queue     string

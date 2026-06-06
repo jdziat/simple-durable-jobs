@@ -4,12 +4,23 @@ package jobctx
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"github.com/google/uuid"
 	"github.com/jdziat/simple-durable-jobs/pkg/core"
 	intctx "github.com/jdziat/simple-durable-jobs/pkg/internal/context"
 )
+
+// DefaultVersion is the sentinel version used for code paths that existed
+// before a version marker was introduced.
+const DefaultVersion = -1
+
+const versionCheckpointPrefix = "jobs.version:"
+
+// ErrUnsupportedWorkflowVersion is returned when a recorded workflow-code
+// version falls outside the caller's supported range.
+var ErrUnsupportedWorkflowVersion = errors.New("jobs: unsupported workflow version")
 
 // JobFromContext returns the current Job from context, or nil if not in a job handler.
 // Use this to get the job ID for logging or progress tracking.
@@ -28,6 +39,70 @@ func JobIDFromContext(ctx context.Context) string {
 		return ""
 	}
 	return job.ID
+}
+
+// GetVersion records or replays a workflow-code version marker for changeID.
+//
+// On first execution it saves maxSupported as a named checkpoint and returns it.
+// On replay it returns the previously recorded version, even if maxSupported has
+// since increased. If the recorded version is outside [minSupported,
+// maxSupported], ErrUnsupportedWorkflowVersion is returned.
+//
+// Version markers are stored at CallIndex -1 with an internal CallType prefix,
+// so they do not collide with phase checkpoints and are ignored by Strict
+// determinism's unconsumed-Call check.
+func GetVersion(ctx context.Context, changeID string, minSupported, maxSupported int) (int, error) {
+	if minSupported > maxSupported {
+		return 0, fmt.Errorf("%w: change %q supports [%d, %d]", ErrUnsupportedWorkflowVersion, changeID, minSupported, maxSupported)
+	}
+
+	jc := intctx.GetJobContext(ctx)
+	if jc == nil {
+		return maxSupported, nil
+	}
+
+	cs := intctx.GetCallState(ctx)
+	if cs == nil {
+		return 0, fmt.Errorf("jobs.GetVersion: call state not initialized")
+	}
+
+	key := intctx.CheckpointKey{Index: -1, Type: versionCheckpointType(changeID)}
+	cs.Mu.Lock()
+	cp, ok := cs.Checkpoints[key]
+	cs.Mu.Unlock()
+
+	if ok {
+		var recorded int
+		if err := json.Unmarshal(cp.Result, &recorded); err != nil {
+			return 0, fmt.Errorf("jobs.GetVersion: unmarshal version marker %q: %w", changeID, err)
+		}
+		if recorded < minSupported || recorded > maxSupported {
+			return 0, fmt.Errorf("%w: change %q recorded version %d outside supported range [%d, %d]", ErrUnsupportedWorkflowVersion, changeID, recorded, minSupported, maxSupported)
+		}
+		return recorded, nil
+	}
+
+	resultBytes, err := json.Marshal(maxSupported)
+	if err != nil {
+		return 0, fmt.Errorf("marshal workflow version: %w", err)
+	}
+
+	cp = &core.Checkpoint{
+		ID:        uuid.New().String(),
+		JobID:     jc.Job.ID,
+		CallIndex: -1,
+		CallType:  key.Type,
+		Result:    resultBytes,
+	}
+	if err := jc.SaveCheckpoint(ctx, cp); err != nil {
+		return 0, err
+	}
+
+	cs.Mu.Lock()
+	cs.Checkpoints[key] = cp
+	cs.Mu.Unlock()
+
+	return maxSupported, nil
 }
 
 // SavePhaseCheckpoint saves a phase result to the checkpoint store.
@@ -83,4 +158,8 @@ func LoadPhaseCheckpoint[T any](ctx context.Context, phaseName string) (T, bool)
 		return zero, false
 	}
 	return result, true
+}
+
+func versionCheckpointType(changeID string) string {
+	return versionCheckpointPrefix + changeID
 }

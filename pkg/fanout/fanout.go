@@ -241,6 +241,10 @@ func (e *WaitingError) Error() string {
 	return fmt.Sprintf("job waiting for fan-out %s", e.FanOutID)
 }
 
+// WorkflowWaiting marks this as a self-suspension signal so the worker treats it
+// as "stop, do not fail" via core.IsWaiting (shared with signal waits).
+func (e *WaitingError) WorkflowWaiting() bool { return true }
+
 // IsWaitingError reports whether err is a waiting-for-fan-out signal
 // produced by FanOut.
 func IsWaitingError(err error) bool {

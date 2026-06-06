@@ -125,6 +125,9 @@ func (s *GormStorage) SearchJobs(ctx context.Context, filter core.JobFilter) ([]
 		return nil, 0, err
 	}
 
+	if err := s.decodeJobListPayloads(jobs); err != nil {
+		return nil, 0, err
+	}
 	return jobs, total, nil
 }
 
@@ -167,14 +170,16 @@ func (s *GormStorage) RetryJob(ctx context.Context, jobID string) (*core.Job, er
 
 	now := time.Now()
 	err = s.db.WithContext(ctx).Model(&job).Updates(map[string]any{
-		"status":       core.StatusPending,
-		"attempt":      0,
-		"last_error":   "",
-		"locked_by":    "",
-		"locked_until": nil,
-		"started_at":   nil,
-		"completed_at": nil,
-		"updated_at":   now,
+		"status":             core.StatusPending,
+		"attempt":            0,
+		"last_error":         "",
+		"dead_lettered_at":   nil,
+		"dead_letter_reason": "",
+		"locked_by":          "",
+		"locked_until":       nil,
+		"started_at":         nil,
+		"completed_at":       nil,
+		"updated_at":         now,
 	}).Error
 	if err != nil {
 		return nil, err
@@ -183,19 +188,27 @@ func (s *GormStorage) RetryJob(ctx context.Context, jobID string) (*core.Job, er
 	job.Status = core.StatusPending
 	job.Attempt = 0
 	job.LastError = ""
+	job.DeadLetteredAt = nil
+	job.DeadLetterReason = ""
 	job.LockedBy = ""
 	job.LockedUntil = nil
 	job.StartedAt = nil
 	job.CompletedAt = nil
 	job.UpdatedAt = now
+	if err := s.decodeJobPayloads(&job); err != nil {
+		return nil, err
+	}
 	return &job, nil
 }
 
 // DeleteJob permanently removes a job from the database.
 func (s *GormStorage) DeleteJob(ctx context.Context, jobID string) error {
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		// Delete checkpoints first
+		// Delete checkpoints and any buffered signals first
 		if err := tx.Where("job_id = ?", jobID).Delete(&core.Checkpoint{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("job_id = ?", jobID).Delete(&core.Signal{}).Error; err != nil {
 			return err
 		}
 		return tx.Where("id = ?", jobID).Delete(&core.Job{}).Error
@@ -251,6 +264,9 @@ func (s *GormStorage) GetWorkflowRoots(ctx context.Context, status string, limit
 		return nil, 0, err
 	}
 
+	if err := s.decodeJobListPayloads(jobs); err != nil {
+		return nil, 0, err
+	}
 	return jobs, total, nil
 }
 
@@ -279,5 +295,11 @@ func (s *GormStorage) GetSubJobsByFanOuts(ctx context.Context, fanOutIDs []strin
 		Where("fan_out_id IN ?", fanOutIDs).
 		Order("fan_out_id ASC, fan_out_index ASC").
 		Find(&jobs).Error
-	return jobs, err
+	if err != nil {
+		return nil, err
+	}
+	if err := s.decodeJobListPayloads(jobs); err != nil {
+		return nil, err
+	}
+	return jobs, nil
 }

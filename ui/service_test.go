@@ -191,12 +191,14 @@ func (m *mockStorage) GetCheckpoints(ctx context.Context, jobID string) ([]core.
 
 type mockUIStorage struct {
 	mockStorage
-	getQueueStatsFn    func(ctx context.Context) ([]*jobsv1.QueueStats, error)
-	searchJobsFn       func(ctx context.Context, f JobFilter) ([]*core.Job, int64, error)
-	retryJobFn         func(ctx context.Context, id string) (*core.Job, error)
-	deleteJobFn        func(ctx context.Context, id string) error
-	purgeJobsFn        func(ctx context.Context, queue string, status core.JobStatus) (int64, error)
-	getWorkflowRootsFn func(ctx context.Context, status string, limit, offset int) ([]*core.Job, int64, error)
+	getQueueStatsFn     func(ctx context.Context) ([]*jobsv1.QueueStats, error)
+	searchJobsFn        func(ctx context.Context, f JobFilter) ([]*core.Job, int64, error)
+	listDeadLetteredFn  func(ctx context.Context, f core.DeadLetterFilter) ([]*core.Job, error)
+	countDeadLetteredFn func(ctx context.Context, f core.DeadLetterFilter) (int64, error)
+	retryJobFn          func(ctx context.Context, id string) (*core.Job, error)
+	deleteJobFn         func(ctx context.Context, id string) error
+	purgeJobsFn         func(ctx context.Context, queue string, status core.JobStatus) (int64, error)
+	getWorkflowRootsFn  func(ctx context.Context, status string, limit, offset int) ([]*core.Job, int64, error)
 }
 
 func (m *mockUIStorage) GetQueueStats(ctx context.Context) ([]*jobsv1.QueueStats, error) {
@@ -211,6 +213,20 @@ func (m *mockUIStorage) SearchJobs(ctx context.Context, f JobFilter) ([]*core.Jo
 		return m.searchJobsFn(ctx, f)
 	}
 	return nil, 0, nil
+}
+
+func (m *mockUIStorage) ListDeadLettered(ctx context.Context, f core.DeadLetterFilter) ([]*core.Job, error) {
+	if m.listDeadLetteredFn != nil {
+		return m.listDeadLetteredFn(ctx, f)
+	}
+	return nil, nil
+}
+
+func (m *mockUIStorage) CountDeadLettered(ctx context.Context, f core.DeadLetterFilter) (int64, error) {
+	if m.countDeadLetteredFn != nil {
+		return m.countDeadLetteredFn(ctx, f)
+	}
+	return 0, nil
 }
 
 func (m *mockUIStorage) RetryJob(ctx context.Context, id string) (*core.Job, error) {
@@ -322,6 +338,12 @@ func jobIDs(n int) []string {
 // Handler write authorization tests
 // ---------------------------------------------------------------------------
 
+type authorizerFunc func(context.Context, Action) error
+
+func (f authorizerFunc) Authorize(ctx context.Context, action Action) error {
+	return f(ctx, action)
+}
+
 func TestHandler_MutatingRPCDeniedWithoutAuthOrOptIn(t *testing.T) {
 	called := false
 	store := &mockUIStorage{
@@ -361,6 +383,54 @@ func TestHandler_MutatingRPCAllowedWithInsecureOptIn(t *testing.T) {
 	assert.True(t, called)
 }
 
+func TestHandler_CancelJobRPCRequiresWriteAuth(t *testing.T) {
+	called := false
+	store := &mockStorage{
+		pauseJobFn: func(_ context.Context, _ string) error {
+			called = true
+			return nil
+		},
+		getJobFn: func(_ context.Context, _ string) (*core.Job, error) {
+			return sampleJob("j1", "default", "work", core.StatusCancelled), nil
+		},
+	}
+	q := queue.New(store)
+	server := httptest.NewServer(Handler(store, WithQueue(q)))
+	defer server.Close()
+
+	client := jobsv1connect.NewJobsServiceClient(server.Client(), server.URL)
+	_, err := client.CancelJob(context.Background(), connect.NewRequest(&jobsv1.CancelJobRequest{Id: "j1"}))
+
+	require.Error(t, err)
+	assert.Equal(t, connect.CodePermissionDenied, connect.CodeOf(err))
+	assert.False(t, called)
+}
+
+func TestHandler_CancelJobRPCAllowedWithInsecureOptIn(t *testing.T) {
+	called := false
+	store := &mockStorage{
+		getJobFn: func(_ context.Context, _ string) (*core.Job, error) {
+			return sampleJob("j1", "default", "work", core.StatusCancelled), nil
+		},
+		pauseJobFn: func(_ context.Context, id string) error {
+			assert.Equal(t, "j1", id)
+			called = true
+			return nil
+		},
+	}
+	q := queue.New(store)
+	server := httptest.NewServer(Handler(store, WithQueue(q), WithInsecureAllowUnauthenticatedWrites()))
+	defer server.Close()
+
+	client := jobsv1connect.NewJobsServiceClient(server.Client(), server.URL)
+	resp, err := client.CancelJob(context.Background(), connect.NewRequest(&jobsv1.CancelJobRequest{Id: "j1"}))
+
+	require.NoError(t, err)
+	require.NotNil(t, resp.Msg.Job)
+	assert.Equal(t, "j1", resp.Msg.Job.Id)
+	assert.True(t, called)
+}
+
 func TestHandler_MutatingRPCAllowedWithMiddleware(t *testing.T) {
 	called := false
 	store := &mockUIStorage{
@@ -382,6 +452,127 @@ func TestHandler_MutatingRPCAllowedWithMiddleware(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.True(t, called)
+}
+
+func TestHandler_AuthorizerAllowsAndDeniesPerAction(t *testing.T) {
+	retryCalled := false
+	deleteCalled := false
+	store := &mockUIStorage{
+		retryJobFn: func(_ context.Context, _ string) (*core.Job, error) {
+			retryCalled = true
+			return sampleJob("j1", "default", "work", core.StatusPending), nil
+		},
+		deleteJobFn: func(_ context.Context, _ string) error {
+			deleteCalled = true
+			return nil
+		},
+	}
+	authorizer := authorizerFunc(func(_ context.Context, action Action) error {
+		if action == ActionRetryJob {
+			return nil
+		}
+		return errors.New("not allowed")
+	})
+	server := httptest.NewServer(Handler(store, WithAuthorizer(authorizer)))
+	defer server.Close()
+
+	client := jobsv1connect.NewJobsServiceClient(server.Client(), server.URL)
+	retryResp, err := client.RetryJob(context.Background(), connect.NewRequest(&jobsv1.RetryJobRequest{Id: "j1"}))
+	require.NoError(t, err)
+	require.NotNil(t, retryResp.Msg.Job)
+	assert.Equal(t, "j1", retryResp.Msg.Job.Id)
+	assert.True(t, retryCalled)
+
+	_, err = client.DeleteJob(context.Background(), connect.NewRequest(&jobsv1.DeleteJobRequest{Id: "j1"}))
+	require.Error(t, err)
+	assert.Equal(t, connect.CodePermissionDenied, connect.CodeOf(err))
+	assert.False(t, deleteCalled)
+}
+
+func TestHandler_AuthorizerUsesPrincipalFromMiddleware(t *testing.T) {
+	type principal struct {
+		Role string
+	}
+	called := false
+	store := &mockUIStorage{
+		deleteJobFn: func(_ context.Context, _ string) error {
+			called = true
+			return nil
+		},
+	}
+	middleware := func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			ctx := WithPrincipal(r.Context(), principal{Role: "admin"})
+			next.ServeHTTP(w, r.WithContext(ctx))
+		})
+	}
+	authorizer := authorizerFunc(func(ctx context.Context, action Action) error {
+		if action != ActionDeleteJob {
+			return errors.New("unexpected action")
+		}
+		p, ok := PrincipalFromContext(ctx)
+		if !ok {
+			return errors.New("missing principal")
+		}
+		user, ok := p.(principal)
+		if !ok || user.Role != "admin" {
+			return errors.New("not an admin")
+		}
+		return nil
+	})
+	server := httptest.NewServer(Handler(store, WithMiddleware(middleware), WithAuthorizer(authorizer)))
+	defer server.Close()
+
+	client := jobsv1connect.NewJobsServiceClient(server.Client(), server.URL)
+	_, err := client.DeleteJob(context.Background(), connect.NewRequest(&jobsv1.DeleteJobRequest{Id: "j1"}))
+
+	require.NoError(t, err)
+	assert.True(t, called)
+}
+
+func TestHandler_ReadOnlyRPCNeverCallsAuthorizer(t *testing.T) {
+	authorized := false
+	store := &mockUIStorage{
+		searchJobsFn: func(_ context.Context, _ JobFilter) ([]*core.Job, int64, error) {
+			return []*core.Job{sampleJob("j1", "default", "work", core.StatusPending)}, 1, nil
+		},
+	}
+	authorizer := authorizerFunc(func(_ context.Context, _ Action) error {
+		authorized = true
+		return errors.New("deny everything")
+	})
+	server := httptest.NewServer(Handler(store, WithAuthorizer(authorizer)))
+	defer server.Close()
+
+	client := jobsv1connect.NewJobsServiceClient(server.Client(), server.URL)
+	resp, err := client.ListJobs(context.Background(), connect.NewRequest(&jobsv1.ListJobsRequest{}))
+
+	require.NoError(t, err)
+	require.Len(t, resp.Msg.Jobs, 1)
+	assert.Equal(t, "j1", resp.Msg.Jobs[0].Id)
+	assert.False(t, authorized)
+}
+
+func TestHandler_AuthorizerPreservesConnectErrorCode(t *testing.T) {
+	called := false
+	store := &mockUIStorage{
+		retryJobFn: func(_ context.Context, _ string) (*core.Job, error) {
+			called = true
+			return sampleJob("j1", "default", "work", core.StatusPending), nil
+		},
+	}
+	authorizer := authorizerFunc(func(_ context.Context, _ Action) error {
+		return connect.NewError(connect.CodeUnauthenticated, errors.New("login required"))
+	})
+	server := httptest.NewServer(Handler(store, WithAuthorizer(authorizer)))
+	defer server.Close()
+
+	client := jobsv1connect.NewJobsServiceClient(server.Client(), server.URL)
+	_, err := client.RetryJob(context.Background(), connect.NewRequest(&jobsv1.RetryJobRequest{Id: "j1"}))
+
+	require.Error(t, err)
+	assert.Equal(t, connect.CodeUnauthenticated, connect.CodeOf(err))
+	assert.False(t, called)
 }
 
 func TestHandler_ReadOnlyRPCAllowedWithoutAuth(t *testing.T) {
@@ -685,6 +876,44 @@ func TestListJobs_FilterForwarded(t *testing.T) {
 	assert.Equal(t, "send-email", capturedFilter.Type)
 	assert.Equal(t, "foo", capturedFilter.Search)
 	assert.Equal(t, 40, capturedFilter.Offset) // page 3, limit 20 → offset 40
+}
+
+func TestListJobs_DeadLetteredFilterUsesDLQQueries(t *testing.T) {
+	deadLetteredAt := time.Now()
+	job := sampleJob("j1", "emails", "send-email", core.StatusFailed)
+	job.DeadLetteredAt = &deadLetteredAt
+	job.DeadLetterReason = "max retries exhausted: smtp timeout"
+
+	var capturedFilter core.DeadLetterFilter
+	store := &mockUIStorage{
+		listDeadLetteredFn: func(_ context.Context, f core.DeadLetterFilter) ([]*core.Job, error) {
+			capturedFilter = f
+			return []*core.Job{job}, nil
+		},
+		countDeadLetteredFn: func(_ context.Context, f core.DeadLetterFilter) (int64, error) {
+			assert.Equal(t, capturedFilter, f)
+			return 1, nil
+		},
+	}
+	svc := newServiceWithUIStorage(store)
+
+	resp, err := svc.ListJobs(context.Background(), connect.NewRequest(&jobsv1.ListJobsRequest{
+		Limit:  20,
+		Page:   2,
+		Status: statusDeadLetteredUI,
+		Queue:  "emails",
+		Type:   "send-email",
+	}))
+
+	require.NoError(t, err)
+	require.Len(t, resp.Msg.Jobs, 1)
+	assert.Equal(t, int64(1), resp.Msg.Total)
+	assert.Equal(t, "emails", capturedFilter.Queue)
+	assert.Equal(t, "send-email", capturedFilter.Type)
+	assert.Equal(t, 20, capturedFilter.Limit)
+	assert.Equal(t, 20, capturedFilter.Offset)
+	assert.NotNil(t, resp.Msg.Jobs[0].DeadLetteredAt)
+	assert.Equal(t, "max retries exhausted: smtp timeout", resp.Msg.Jobs[0].DeadLetterReason)
 }
 
 func TestListJobs_UIStorageError(t *testing.T) {
@@ -1208,6 +1437,23 @@ func TestJobToProto_OptionalFieldsSet(t *testing.T) {
 	assert.NotNil(t, pb.RunAt)
 	assert.Equal(t, "oops", pb.LastError)
 	assert.Equal(t, []byte(`{"x":1}`), pb.Args)
+}
+
+func TestJobToProto_DeadLetterFields(t *testing.T) {
+	deadLetteredAt := time.Now()
+	deadLettered := sampleJob("j1", "default", "work", core.StatusFailed)
+	deadLettered.DeadLetteredAt = &deadLetteredAt
+	deadLettered.DeadLetterReason = "max retries exhausted: boom"
+
+	pb := jobToProto(deadLettered)
+	require.NotNil(t, pb.DeadLetteredAt)
+	assert.Equal(t, deadLetteredAt.Unix(), pb.DeadLetteredAt.AsTime().Unix())
+	assert.Equal(t, "max retries exhausted: boom", pb.DeadLetterReason)
+
+	notDeadLettered := sampleJob("j2", "default", "work", core.StatusFailed)
+	pb = jobToProto(notDeadLettered)
+	assert.Nil(t, pb.DeadLetteredAt)
+	assert.Empty(t, pb.DeadLetterReason)
 }
 
 func TestJobToProto_RedactsPayloadsWithoutTruncating(t *testing.T) {
@@ -1960,6 +2206,67 @@ func TestPauseJob_JobNotFoundAfterPause(t *testing.T) {
 	svc := newJobsService(store, q, nil)
 
 	_, err := svc.PauseJob(context.Background(), connect.NewRequest(&jobsv1.PauseJobRequest{Id: "j1"}))
+	require.Error(t, err)
+	assert.Equal(t, connect.CodeNotFound, connect.CodeOf(err))
+}
+
+// ---------------------------------------------------------------------------
+// CancelJob tests
+// ---------------------------------------------------------------------------
+
+func TestCancelJob_Success(t *testing.T) {
+	cancelled := sampleJob("j1", "default", "work", core.StatusCancelled)
+
+	store := &mockStorage{
+		pauseJobFn: func(_ context.Context, id string) error {
+			assert.Equal(t, "j1", id)
+			return nil
+		},
+		getJobFn: func(_ context.Context, id string) (*core.Job, error) {
+			assert.Equal(t, "j1", id)
+			return cancelled, nil
+		},
+	}
+	q := queue.New(store)
+	svc := newJobsService(store, q, nil)
+
+	resp, err := svc.CancelJob(context.Background(), connect.NewRequest(&jobsv1.CancelJobRequest{Id: "j1"}))
+	require.NoError(t, err)
+	require.NotNil(t, resp.Msg.Job)
+	assert.Equal(t, "j1", resp.Msg.Job.Id)
+	assert.Equal(t, string(core.StatusCancelled), resp.Msg.Job.Status)
+}
+
+func TestCancelJob_NilQueue_ReturnsUnimplemented(t *testing.T) {
+	svc := newJobsService(&mockStorage{}, nil, nil)
+	_, err := svc.CancelJob(context.Background(), connect.NewRequest(&jobsv1.CancelJobRequest{Id: "j1"}))
+	require.Error(t, err)
+	assert.Equal(t, connect.CodeUnimplemented, connect.CodeOf(err))
+}
+
+func TestCancelJob_StorageError(t *testing.T) {
+	store := &mockStorage{
+		pauseJobFn: func(_ context.Context, _ string) error {
+			return errors.New("db error")
+		},
+	}
+	q := queue.New(store)
+	svc := newJobsService(store, q, nil)
+
+	_, err := svc.CancelJob(context.Background(), connect.NewRequest(&jobsv1.CancelJobRequest{Id: "j1"}))
+	require.Error(t, err)
+	assert.Equal(t, connect.CodeInternal, connect.CodeOf(err))
+}
+
+func TestCancelJob_JobNotFoundAfterCancel(t *testing.T) {
+	store := &mockStorage{
+		pauseJobFn: func(_ context.Context, _ string) error { return nil },
+		getJobFn:   func(_ context.Context, _ string) (*core.Job, error) { return nil, nil },
+	}
+	q := queue.New(store)
+	svc := newJobsService(store, q, nil)
+
+	_, err := svc.CancelJob(context.Background(), connect.NewRequest(&jobsv1.CancelJobRequest{Id: "j1"}))
 	require.Error(t, err)
 	assert.Equal(t, connect.CodeNotFound, connect.CodeOf(err))
 }

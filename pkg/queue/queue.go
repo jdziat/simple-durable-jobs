@@ -10,11 +10,13 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"gorm.io/gorm"
 
 	"github.com/jdziat/simple-durable-jobs/pkg/core"
 	"github.com/jdziat/simple-durable-jobs/pkg/internal/handler"
 	"github.com/jdziat/simple-durable-jobs/pkg/schedule"
 	"github.com/jdziat/simple-durable-jobs/pkg/security"
+	"github.com/jdziat/simple-durable-jobs/pkg/storage"
 )
 
 // EnqueueMiddleware wraps the enqueue operation.
@@ -37,6 +39,11 @@ type Queue struct {
 
 	// Enqueue middleware chain
 	enqueueMiddleware []EnqueueMiddleware
+
+	// Execution middleware and policies
+	executionMiddleware []ExecutionMiddleware
+	errorHandler        func(context.Context, *core.Job, error)
+	isFailure           func(*core.Job, error) bool
 
 	// Event stream
 	eventSubs     []chan core.Event
@@ -102,6 +109,7 @@ func (q *Queue) RegisterE(name string, fn any, opts ...Option) error {
 			opt.Apply(o)
 		}
 		h.Timeout = o.Timeout
+		h.Backoff = o.Backoff
 	}
 
 	q.mu.Lock()
@@ -162,6 +170,17 @@ func (q *Queue) EnqueueRemote(ctx context.Context, name string, args any, opts .
 	return q.enqueue(ctx, name, args, opts...)
 }
 
+// EnqueueTx adds a job through a caller-owned GORM transaction without requiring
+// a local handler registration. The caller is responsible for committing or
+// rolling back tx.
+func (q *Queue) EnqueueTx(ctx context.Context, tx *gorm.DB, name string, args any, opts ...Option) (string, error) {
+	options := NewOptions()
+	for _, opt := range opts {
+		opt.Apply(options)
+	}
+	return q.enqueueTxWithOptions(ctx, tx, name, args, options)
+}
+
 func (q *Queue) enqueue(ctx context.Context, name string, args any, opts ...Option) (string, error) {
 	options := NewOptions()
 	for _, opt := range opts {
@@ -170,60 +189,50 @@ func (q *Queue) enqueue(ctx context.Context, name string, args any, opts ...Opti
 	return q.enqueueWithOptions(ctx, name, args, options)
 }
 
-// enqueueWithOptions adds a job using a pre-built Options value.
-func (q *Queue) enqueueWithOptions(ctx context.Context, name string, args any, options *Options) (string, error) {
-	// Validate queue name
-	if err := security.ValidateQueueName(options.Queue); err != nil {
+func (q *Queue) enqueueTxWithOptions(ctx context.Context, tx *gorm.DB, name string, args any, options *Options) (string, error) {
+	txEnqueuer, ok := q.storage.(storage.TxEnqueuer)
+	if !ok {
+		return "", core.ErrStorageNoTxEnqueue
+	}
+
+	job, err := q.buildJob(name, args, options)
+	if err != nil {
 		return "", err
 	}
 
-	argsBytes, err := json.Marshal(args)
+	persist := func(ctx context.Context, j *core.Job) error {
+		if options.UniqueKey != "" {
+			err := txEnqueuer.EnqueueUniqueTx(ctx, tx, j, options.UniqueKey)
+			if err != nil {
+				if errors.Is(err, core.ErrDuplicateJob) {
+					return err
+				}
+				return fmt.Errorf("jobs: failed to enqueue: %w", err)
+			}
+			return nil
+		}
+		if err := txEnqueuer.EnqueueTx(ctx, tx, j); err != nil {
+			return fmt.Errorf("jobs: failed to enqueue: %w", err)
+		}
+		return nil
+	}
+
+	if err := q.runEnqueueMiddleware(ctx, job, persist); err != nil {
+		return "", err
+	}
+	return job.ID, nil
+}
+
+// enqueueWithOptions adds a job using a pre-built Options value.
+func (q *Queue) enqueueWithOptions(ctx context.Context, name string, args any, options *Options) (string, error) {
+	job, err := q.buildJob(name, args, options)
 	if err != nil {
-		return "", fmt.Errorf("jobs: failed to marshal args: %w", err)
-	}
-
-	// Enforce size limit on arguments
-	if len(argsBytes) > security.MaxJobArgsSize {
-		return "", core.ErrJobArgsTooLarge
-	}
-
-	// Clamp retries to maximum
-	maxRetries := security.ClampRetries(options.MaxRetries)
-	effDet := options.Determinism
-	if !options.determinismSet {
-		q.mu.RLock()
-		effDet = q.determinism
-		q.mu.RUnlock()
-	}
-
-	job := &core.Job{
-		ID:          uuid.New().String(),
-		Type:        name,
-		Args:        argsBytes,
-		Queue:       options.Queue,
-		Priority:    options.Priority,
-		MaxRetries:  maxRetries,
-		Determinism: int(effDet),
-		Status:      core.StatusPending,
-	}
-
-	if options.Timeout > 0 {
-		job.Timeout = options.Timeout
-	}
-	if options.Delay > 0 {
-		runAt := time.Now().Add(options.Delay)
-		job.RunAt = &runAt
-	}
-	if options.RunAt != nil {
-		job.RunAt = options.RunAt
+		return "", err
 	}
 
 	// Build the persist function that the middleware chain will eventually call
 	persist := func(ctx context.Context, j *core.Job) error {
 		if options.UniqueKey != "" {
-			if err := security.ValidateUniqueKey(options.UniqueKey); err != nil {
-				return err
-			}
 			if err := q.storage.EnqueueUnique(ctx, j, options.UniqueKey); err != nil {
 				if errors.Is(err, core.ErrDuplicateJob) {
 					return err
@@ -244,6 +253,134 @@ func (q *Queue) enqueueWithOptions(ctx context.Context, name string, args any, o
 	}
 
 	return job.ID, nil
+}
+
+func (q *Queue) buildJob(name string, args any, options *Options) (*core.Job, error) {
+	// Validate queue name
+	if err := security.ValidateQueueName(options.Queue); err != nil {
+		return nil, err
+	}
+	if options.UniqueKey != "" {
+		if err := security.ValidateUniqueKey(options.UniqueKey); err != nil {
+			return nil, err
+		}
+	}
+
+	argsBytes, err := json.Marshal(args)
+	if err != nil {
+		return nil, fmt.Errorf("jobs: failed to marshal args: %w", err)
+	}
+
+	// Enforce size limit on arguments
+	if len(argsBytes) > security.MaxJobArgsSize {
+		return nil, core.ErrJobArgsTooLarge
+	}
+
+	// Clamp retries to maximum
+	maxRetries := security.ClampRetries(options.MaxRetries)
+	effDet := options.Determinism
+	if !options.determinismSet {
+		q.mu.RLock()
+		effDet = q.determinism
+		q.mu.RUnlock()
+	}
+
+	job := &core.Job{
+		ID:          uuid.New().String(),
+		Type:        name,
+		Args:        argsBytes,
+		Queue:       options.Queue,
+		Priority:    options.Priority,
+		MaxRetries:  maxRetries,
+		UniqueKey:   options.UniqueKey,
+		Determinism: int(effDet),
+		Status:      core.StatusPending,
+	}
+
+	if options.Timeout > 0 {
+		job.Timeout = options.Timeout
+	}
+	if options.Delay > 0 {
+		runAt := time.Now().Add(options.Delay)
+		job.RunAt = &runAt
+	}
+	if options.RunAt != nil {
+		job.RunAt = options.RunAt
+	}
+
+	return job, nil
+}
+
+// EnqueueBatch adds multiple jobs to the queue in one storage operation.
+//
+// The entries are validated and marshaled with the same rules as EnqueueRemote,
+// and enqueue middleware runs once per entry before persistence. Returned IDs
+// match input order. When Unique keys collide, storage deduplicates silently;
+// a returned ID for a deduped entry refers to the existing job.
+func (q *Queue) EnqueueBatch(ctx context.Context, entries []BatchEntry) ([]string, error) {
+	return q.enqueueBatch(ctx, entries, q.storage.EnqueueBatch)
+}
+
+// EnqueueBatchTx adds multiple jobs through a caller-owned GORM transaction.
+// The caller is responsible for committing or rolling back tx.
+func (q *Queue) EnqueueBatchTx(ctx context.Context, tx *gorm.DB, entries []BatchEntry) ([]string, error) {
+	txEnqueuer, ok := q.storage.(storage.TxEnqueuer)
+	if !ok {
+		return nil, core.ErrStorageNoTxEnqueue
+	}
+	return q.enqueueBatch(ctx, entries, func(ctx context.Context, jobs []*core.Job) error {
+		return txEnqueuer.EnqueueBatchTx(ctx, tx, jobs)
+	})
+}
+
+func (q *Queue) enqueueBatch(ctx context.Context, entries []BatchEntry, enqueueBatch func(context.Context, []*core.Job) error) ([]string, error) {
+	if len(entries) == 0 {
+		return []string{}, nil
+	}
+
+	jobs := make([]*core.Job, len(entries))
+	ids := make([]string, len(entries))
+	for i, entry := range entries {
+		options := NewOptions()
+		for _, opt := range entry.Options {
+			opt.Apply(options)
+		}
+		job, err := q.buildJob(entry.Name, entry.Args, options)
+		if err != nil {
+			return nil, err
+		}
+		jobs[i] = job
+		ids[i] = job.ID
+	}
+
+	seenUnique := make(map[string]string, len(jobs))
+	for i, job := range jobs {
+		if job.UniqueKey == "" {
+			continue
+		}
+		if existingID, ok := seenUnique[job.UniqueKey]; ok {
+			job.ID = existingID
+			ids[i] = existingID
+			continue
+		}
+		seenUnique[job.UniqueKey] = job.ID
+	}
+
+	toPersist := make([]*core.Job, 0, len(jobs))
+	for _, job := range jobs {
+		persist := func(ctx context.Context, j *core.Job) error {
+			toPersist = append(toPersist, j)
+			return nil
+		}
+		if err := q.runEnqueueMiddleware(ctx, job, persist); err != nil {
+			return nil, err
+		}
+	}
+
+	if err := enqueueBatch(ctx, toPersist); err != nil {
+		return nil, fmt.Errorf("jobs: failed to enqueue batch: %w", err)
+	}
+	return ids, nil
 }
 
 // runEnqueueMiddleware executes the enqueue middleware chain, ending with persist.
@@ -599,6 +736,16 @@ func (q *Queue) PauseJob(ctx context.Context, jobID string, opts ...PauseOption)
 		q.Emit(&core.JobPaused{Job: job, Mode: po.Mode, Timestamp: time.Now()})
 	}
 	return nil
+}
+
+// CancelJob cooperatively cancels a running job by aliasing aggressive pause.
+// It durably records cancellation through the storage pause path and cancels a
+// locally-running handler's context; handlers that ignore ctx are not force-killed.
+// Pending or waiting jobs are paused by the underlying pause operation. Already
+// paused jobs, terminal jobs, and missing jobs return the same sentinel errors
+// as PauseJob, such as ErrJobAlreadyPaused, ErrCannotPauseStatus, or ErrJobNotFound.
+func (q *Queue) CancelJob(ctx context.Context, jobID string) error {
+	return q.PauseJob(ctx, jobID, WithPauseMode(core.PauseModeAggressive))
 }
 
 // ResumeJob resumes a paused job.

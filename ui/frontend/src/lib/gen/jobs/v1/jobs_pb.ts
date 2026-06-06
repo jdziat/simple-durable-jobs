@@ -100,6 +100,16 @@ export class Job extends Message<Job> {
    */
   result = new Uint8Array(0);
 
+  /**
+   * @generated from field: optional google.protobuf.Timestamp dead_lettered_at = 19;
+   */
+  deadLetteredAt?: Timestamp;
+
+  /**
+   * @generated from field: string dead_letter_reason = 20;
+   */
+  deadLetterReason = "";
+
   constructor(data?: PartialMessage<Job>) {
     super();
     proto3.util.initPartial(data, this);
@@ -126,6 +136,8 @@ export class Job extends Message<Job> {
     { no: 16, name: "fan_out_id", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
     { no: 17, name: "fan_out_index", kind: "scalar", T: 5 /* ScalarType.INT32 */ },
     { no: 18, name: "result", kind: "scalar", T: 12 /* ScalarType.BYTES */ },
+    { no: 19, name: "dead_lettered_at", kind: "message", T: Timestamp, opt: true },
+    { no: 20, name: "dead_letter_reason", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): Job {
@@ -1257,6 +1269,80 @@ export class PauseJobResponse extends Message<PauseJobResponse> {
 
   static equals(a: PauseJobResponse | PlainMessage<PauseJobResponse> | undefined, b: PauseJobResponse | PlainMessage<PauseJobResponse> | undefined): boolean {
     return proto3.util.equals(PauseJobResponse, a, b);
+  }
+}
+
+/**
+ * @generated from message jobs.v1.CancelJobRequest
+ */
+export class CancelJobRequest extends Message<CancelJobRequest> {
+  /**
+   * @generated from field: string id = 1;
+   */
+  id = "";
+
+  constructor(data?: PartialMessage<CancelJobRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "jobs.v1.CancelJobRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): CancelJobRequest {
+    return new CancelJobRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): CancelJobRequest {
+    return new CancelJobRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): CancelJobRequest {
+    return new CancelJobRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: CancelJobRequest | PlainMessage<CancelJobRequest> | undefined, b: CancelJobRequest | PlainMessage<CancelJobRequest> | undefined): boolean {
+    return proto3.util.equals(CancelJobRequest, a, b);
+  }
+}
+
+/**
+ * @generated from message jobs.v1.CancelJobResponse
+ */
+export class CancelJobResponse extends Message<CancelJobResponse> {
+  /**
+   * @generated from field: jobs.v1.Job job = 1;
+   */
+  job?: Job;
+
+  constructor(data?: PartialMessage<CancelJobResponse>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "jobs.v1.CancelJobResponse";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "job", kind: "message", T: Job },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): CancelJobResponse {
+    return new CancelJobResponse().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): CancelJobResponse {
+    return new CancelJobResponse().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): CancelJobResponse {
+    return new CancelJobResponse().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: CancelJobResponse | PlainMessage<CancelJobResponse> | undefined, b: CancelJobResponse | PlainMessage<CancelJobResponse> | undefined): boolean {
+    return proto3.util.equals(CancelJobResponse, a, b);
   }
 }
 

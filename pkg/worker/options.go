@@ -4,6 +4,7 @@ package worker
 import (
 	"time"
 
+	"github.com/jdziat/simple-durable-jobs/pkg/core"
 	"github.com/jdziat/simple-durable-jobs/pkg/security"
 )
 
@@ -11,6 +12,14 @@ import (
 // WithStaleLockInterval. It guards against a pathologically tight reaper
 // hammering the database; the reaper itself can never be turned off.
 const minStaleLockInterval = 1 * time.Second
+
+const maxDequeueBatch = 1000
+
+const (
+	defaultRetentionInterval  = time.Hour
+	minRetentionInterval      = 100 * time.Millisecond
+	defaultRetentionBatchSize = 1000
+)
 
 // WorkerOption configures a Worker.
 type WorkerOption interface {
@@ -21,6 +30,48 @@ type workerOptionFunc func(*WorkerConfig)
 
 func (f workerOptionFunc) ApplyWorker(c *WorkerConfig) { f(c) }
 
+// CapOption configures a fleet-wide concurrency cap.
+type CapOption func(*ConcurrencyCapConfig)
+
+// RateLimitOption configures a fleet-wide rate limit.
+type RateLimitOption func(*RateLimitConfig)
+
+// RetentionOption configures automatic terminal-job retention.
+type RetentionOption func(*RetentionConfig)
+
+// ConcurrencyCapConfig describes a DB-backed concurrency cap. If Key is nil,
+// the cap is fleet-wide and uses Name as the slot name. If Key is set, the
+// effective slot name is Name + ":" + Key(job), allowing per-tenant or per-key
+// partitions under the same configured cap.
+type ConcurrencyCapConfig struct {
+	Name  string
+	Limit int
+	Key   func(*core.Job) string
+}
+
+// RateLimitConfig describes a DB-backed fixed-window rate limit. If Key is nil,
+// the limiter uses Name as the partition. If Key is set, the effective limit
+// name is Name + ":" + Key(job), allowing per-tenant or per-key partitions.
+type RateLimitConfig struct {
+	Name      string
+	PerSecond float64
+	Window    time.Duration
+	Key       func(*core.Job) string
+}
+
+// RetentionConfig controls automatic deletion of old terminal jobs. A zero
+// per-status window keeps that status forever.
+type RetentionConfig struct {
+	CompletedAfter time.Duration
+	FailedAfter    time.Duration
+	Interval       time.Duration
+	BatchSize      int
+}
+
+func (c RetentionConfig) enabled() bool {
+	return c.CompletedAfter > 0 || c.FailedAfter > 0
+}
+
 // WorkerConfig holds worker configuration.
 type WorkerConfig struct {
 	Queues          map[string]int // queue name -> concurrency
@@ -28,6 +79,21 @@ type WorkerConfig struct {
 	WorkerID        string
 	EnableScheduler bool
 	currentQueue    string // internal: scopes Concurrency to this queue
+
+	// ConcurrencyCaps are optional DB-backed caps enforced across the fleet when
+	// the storage backend implements the worker's optional concurrency slot
+	// capability. Backends without that capability keep existing per-process
+	// behavior.
+	ConcurrencyCaps []ConcurrencyCapConfig
+
+	// RateLimits are optional DB-backed caps enforced across the fleet when the
+	// storage backend implements the worker's optional rate limiter capability.
+	// Backends without that capability continue processing jobs unchanged.
+	RateLimits []RateLimitConfig
+
+	// QueueRateLimits are per-worker token buckets applied before dequeue, keyed
+	// by queue name. They require no storage capability.
+	QueueRateLimits map[string]queueRateLimitConfig
 
 	// DrainTimeout is how long Start waits after its context is cancelled for
 	// in-flight handlers to finish and persist their result before forcing
@@ -90,6 +156,19 @@ type WorkerConfig struct {
 	// Default: 1 minute. Raising it backs off harder on a persistently failing
 	// dependency instead of re-attempting every minute until retries exhaust.
 	MaxRetryBackoff time.Duration
+
+	// JobBackoff configures retry delays for job re-execution after handler
+	// errors. If nil, the worker uses DefaultBackoffPolicy().
+	JobBackoff core.BackoffPolicy
+
+	// DequeueBatchSize is the maximum number of jobs a worker asks storage to
+	// claim in one polling round when the backend implements the optional batch
+	// dequeue capability. Default: 1 (single-row dequeue).
+	DequeueBatchSize int
+
+	// Retention configures optional automatic garbage collection for terminal
+	// jobs. It is disabled by default; zero per-status windows keep rows forever.
+	Retention RetentionConfig
 }
 
 // Concurrency sets the concurrency for a queue.
@@ -104,6 +183,142 @@ func Concurrency(n int) WorkerOption {
 				c.Queues[k] = clamped
 			}
 		}
+	})
+}
+
+// CapKey derives the partition key for a ConcurrencyCap from the dequeued job.
+// The effective slot name is capName + ":" + key(job).
+func CapKey(fn func(*core.Job) string) CapOption {
+	return func(c *ConcurrencyCapConfig) {
+		c.Key = fn
+	}
+}
+
+// RateLimitKey derives the partition key for a RateLimit from the dequeued job.
+// The effective limit name is rateLimitName + ":" + key(job).
+func RateLimitKey(fn func(*core.Job) string) RateLimitOption {
+	return func(c *RateLimitConfig) {
+		c.Key = fn
+	}
+}
+
+// ConcurrencyCap limits concurrent jobs across the fleet when the storage
+// backend supports DB-backed concurrency slots. Without CapKey, the cap is
+// fleet-wide under name. With CapKey, the same limit applies independently to
+// each derived key.
+func ConcurrencyCap(name string, limit int, opts ...CapOption) WorkerOption {
+	return workerOptionFunc(func(c *WorkerConfig) {
+		cfg := ConcurrencyCapConfig{
+			Name:  name,
+			Limit: security.ClampConcurrency(limit),
+		}
+		for _, opt := range opts {
+			opt(&cfg)
+		}
+		c.ConcurrencyCaps = append(c.ConcurrencyCaps, cfg)
+	})
+}
+
+// RateLimit limits admitted jobs per second across the fleet when the storage
+// backend supports DB-backed rate windows. Without RateLimitKey, the limit is
+// fleet-wide under name. With RateLimitKey, the same rate applies independently
+// to each derived key.
+func RateLimit(name string, perSecond float64, opts ...RateLimitOption) WorkerOption {
+	return workerOptionFunc(func(c *WorkerConfig) {
+		if name == "" || perSecond <= 0 {
+			return
+		}
+		cfg := RateLimitConfig{
+			Name:      name,
+			PerSecond: perSecond,
+			Window:    defaultRateLimitWindow,
+		}
+		for _, opt := range opts {
+			opt(&cfg)
+		}
+		if cfg.Window <= 0 {
+			cfg.Window = defaultRateLimitWindow
+		}
+		c.RateLimits = append(c.RateLimits, cfg)
+	})
+}
+
+// WithRetention enables optional automatic garbage collection of terminal jobs
+// when at least one per-status retention window is positive. With no positive
+// windows it is a no-op and starts no retention goroutine.
+func WithRetention(opts ...RetentionOption) WorkerOption {
+	return workerOptionFunc(func(c *WorkerConfig) {
+		cfg := c.Retention
+		for _, opt := range opts {
+			opt(&cfg)
+		}
+		if cfg.enabled() {
+			if cfg.Interval <= 0 {
+				cfg.Interval = defaultRetentionInterval
+			}
+			if cfg.Interval < minRetentionInterval {
+				cfg.Interval = minRetentionInterval
+			}
+			if cfg.BatchSize <= 0 {
+				cfg.BatchSize = defaultRetentionBatchSize
+			}
+		}
+		c.Retention = cfg
+	})
+}
+
+// RetentionCompletedAfter deletes completed jobs older than d. A non-positive
+// duration keeps completed jobs forever.
+func RetentionCompletedAfter(d time.Duration) RetentionOption {
+	return func(c *RetentionConfig) {
+		if d > 0 {
+			c.CompletedAfter = d
+		} else {
+			c.CompletedAfter = 0
+		}
+	}
+}
+
+// RetentionFailedAfter deletes terminal failed and cancelled jobs older than d.
+// A non-positive duration keeps failed/cancelled jobs forever.
+func RetentionFailedAfter(d time.Duration) RetentionOption {
+	return func(c *RetentionConfig) {
+		if d > 0 {
+			c.FailedAfter = d
+		} else {
+			c.FailedAfter = 0
+		}
+	}
+}
+
+// RetentionInterval sets the retention scan cadence. Non-positive values use
+// the default and very small positive values are clamped to a small floor.
+func RetentionInterval(d time.Duration) RetentionOption {
+	return func(c *RetentionConfig) {
+		c.Interval = d
+	}
+}
+
+// RetentionBatchSize sets the maximum rows deleted in one pass. Non-positive
+// values use the default.
+func RetentionBatchSize(n int) RetentionOption {
+	return func(c *RetentionConfig) {
+		c.BatchSize = n
+	}
+}
+
+// WithQueueRateLimit limits dequeue admission for one queue in this worker
+// process using an in-memory token bucket. Empty queue names, non-positive
+// rates, or non-positive bursts are ignored.
+func WithQueueRateLimit(queue string, perSecond float64, burst int) WorkerOption {
+	return workerOptionFunc(func(c *WorkerConfig) {
+		if queue == "" || perSecond <= 0 || burst <= 0 {
+			return
+		}
+		if c.QueueRateLimits == nil {
+			c.QueueRateLimits = make(map[string]queueRateLimitConfig)
+		}
+		c.QueueRateLimits[queue] = queueRateLimitConfig{PerSecond: perSecond, Burst: burst}
 	})
 }
 
@@ -237,6 +452,29 @@ func WithMaxRetryBackoff(d time.Duration) WorkerOption {
 		if d > 0 {
 			c.MaxRetryBackoff = d
 		}
+	})
+}
+
+// WithBackoff configures the worker-default retry backoff policy for failed
+// job re-execution. Per-handler policies and RetryAfter override it.
+func WithBackoff(p BackoffPolicy) WorkerOption {
+	return workerOptionFunc(func(c *WorkerConfig) {
+		c.JobBackoff = p
+	})
+}
+
+// WithDequeueBatchSize sets the per-poll cap for optional batch dequeue.
+// Values are clamped to [1, maxDequeueBatch]. Backends that do not implement
+// the batch capability continue using single-row dequeue.
+func WithDequeueBatchSize(n int) WorkerOption {
+	return workerOptionFunc(func(c *WorkerConfig) {
+		if n < 1 {
+			n = 1
+		}
+		if n > maxDequeueBatch {
+			n = maxDequeueBatch
+		}
+		c.DequeueBatchSize = n
 	})
 }
 

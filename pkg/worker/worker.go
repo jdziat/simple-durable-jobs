@@ -13,7 +13,6 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/jdziat/simple-durable-jobs/pkg/core"
-	"github.com/jdziat/simple-durable-jobs/pkg/fanout"
 	intctx "github.com/jdziat/simple-durable-jobs/pkg/internal/context"
 	"github.com/jdziat/simple-durable-jobs/pkg/internal/handler"
 	"github.com/jdziat/simple-durable-jobs/pkg/queue"
@@ -40,6 +39,18 @@ type Worker struct {
 	queueRunning map[string]*atomic.Int32 // queue name -> active count
 	queueJobID   map[string]string        // job ID -> queue name (for decrement on completion)
 	queueJobIDMu sync.Mutex
+
+	// DB-backed concurrency slots acquired for dequeued jobs. Only populated
+	// when the storage backend implements concurrencySlotStorage.
+	slotJobIDMu sync.Mutex
+	slotJobID   map[string][]string
+
+	// Per-worker queue rate-limit buckets. Only populated for queues configured
+	// with WithQueueRateLimit.
+	queueRateBuckets map[string]*tokenBucket
+
+	rateLimitStorageMissingLogged atomic.Bool
+	retentionStorageMissingLogged atomic.Bool
 
 	// heartbeatInterval is the tick rate for runHeartbeat. Defaults to
 	// 2 minutes; tests override with a sub-second value. Not exposed via
@@ -69,6 +80,34 @@ type failTerminalWithResultStorage interface {
 	FailTerminalWithResult(ctx context.Context, jobID, workerID, errMsg string) (*core.FanOut, error)
 }
 
+type batchDequeuer interface {
+	DequeueBatch(ctx context.Context, queues []string, workerID string, limit int) ([]*core.Job, error)
+}
+
+type concurrencySlotStorage interface {
+	TryAcquireConcurrencySlot(ctx context.Context, slotName, jobID, workerID string, limit int, ttl time.Duration) (bool, error)
+	ReleaseConcurrencySlot(ctx context.Context, slotName, jobID string) error
+}
+
+type rateLimiterStorage interface {
+	TryConsumeRate(ctx context.Context, limitName string, perSecond float64, window time.Duration, now time.Time) (bool, error)
+}
+
+type retentionStorage interface {
+	DeleteTerminalJobsOlderThan(ctx context.Context, status core.JobStatus, age time.Duration, limit int) (int64, error)
+}
+
+// signalResumeStorage is implemented by backends that buffer signals; the
+// recovery poll uses it to wake jobs whose awaited signal has arrived or whose
+// wait deadline has passed. Optional — backends without it simply don't poll.
+type signalResumeStorage interface {
+	GetSignalWaitingJobsToResume(ctx context.Context) ([]*core.Job, error)
+	// ResumeSignalWaitingJob resumes a waiting (never paused) job and clears its
+	// timeout wake deadline. Distinct from ResumeJob so the signal backstop can't
+	// un-pause an operator-paused job or strip a delayed job's schedule.
+	ResumeSignalWaitingJob(ctx context.Context, jobID string) (bool, error)
+}
+
 // recoveryLeaser is implemented by storage backends that can elect a single
 // worker to run the fleet-wide fan-out recovery scan. Optional: backends that
 // don't implement it fall back to every worker polling.
@@ -82,16 +121,18 @@ const (
 	// recoveryLeaseTTL must exceed the recovery poll interval so the current
 	// holder keeps renewing across ticks; if the holder dies, the lease fails
 	// over to another worker within one TTL.
-	recoveryLeaseTTL = 15 * time.Second
+	recoveryLeaseTTL          = 15 * time.Second
+	defaultConcurrencySlotTTL = 45 * time.Minute
 )
 
 // NewWorker creates a new worker for the given queue.
 func NewWorker(q *queue.Queue, opts ...WorkerOption) *Worker {
 	config := WorkerConfig{
-		Queues:       nil, // Will be set to default if no queue options provided
-		PollInterval: 100 * time.Millisecond,
-		WorkerID:     uuid.New().String(),
-		DrainTimeout: 30 * time.Second,
+		Queues:           nil, // Will be set to default if no queue options provided
+		PollInterval:     100 * time.Millisecond,
+		WorkerID:         uuid.New().String(),
+		DrainTimeout:     30 * time.Second,
+		DequeueBatchSize: 1,
 	}
 
 	for _, opt := range opts {
@@ -152,6 +193,13 @@ func NewWorker(q *queue.Queue, opts ...WorkerOption) *Worker {
 	for name := range config.Queues {
 		queueRunning[name] = &atomic.Int32{}
 	}
+	queueRateBuckets := make(map[string]*tokenBucket, len(config.QueueRateLimits))
+	now := time.Now()
+	for name, limit := range config.QueueRateLimits {
+		if bucket := newTokenBucket(limit.PerSecond, limit.Burst, now); bucket != nil {
+			queueRateBuckets[name] = bucket
+		}
+	}
 
 	// Default OwnershipAuditInterval to 5s only when it was never set. An
 	// explicit WithOwnershipAuditInterval(0) is honored as "disable" (the
@@ -168,6 +216,8 @@ func NewWorker(q *queue.Queue, opts ...WorkerOption) *Worker {
 		runningJobs:       make(map[string]context.CancelFunc),
 		queueRunning:      queueRunning,
 		queueJobID:        make(map[string]string),
+		slotJobID:         make(map[string][]string),
+		queueRateBuckets:  queueRateBuckets,
 		heartbeatInterval: 2 * time.Minute,
 	}
 }
@@ -204,6 +254,10 @@ func (w *Worker) Start(ctx context.Context) error {
 	// counterpart.
 	if w.config.OwnershipAuditInterval > 0 {
 		w.goTracked(func() { w.runOwnershipAudit(ctx) })
+	}
+
+	if w.config.Retention.enabled() {
+		w.goTracked(func() { w.runRetention(ctx) })
 	}
 
 	for i := 0; i < totalConcurrency; i++ {
@@ -243,28 +297,108 @@ func (w *Worker) Start(ctx context.Context) error {
 				continue
 			}
 
-			job, err := w.dequeueWithRetry(ctx, availableQueues)
+			jobs, err := w.dequeueAvailableJobs(ctx, availableQueues, totalConcurrency)
 			if err != nil {
 				if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 					w.logger.Error("failed to dequeue after retries", "error", err)
 				}
 				continue
 			}
-			if job != nil {
-				// Track this job against its queue's concurrency
-				w.trackQueueJob(job.ID, job.Queue)
+			w.dispatchDequeuedJobs(ctx, jobsChan, jobs)
+		}
+	}
+}
 
-				if ctx.Err() != nil {
-					w.releaseDequeuedJobOnShutdown(ctx, job)
-					continue
-				}
+func (w *Worker) dequeueAvailableJobs(ctx context.Context, availableQueues []string, totalConcurrency int) ([]*core.Job, error) {
+	slots := w.dequeueSlots(availableQueues, totalConcurrency)
+	if slots <= 0 {
+		return nil, nil
+	}
+	if slots > 1 {
+		if bd, ok := w.queue.Storage().(batchDequeuer); ok {
+			return w.dequeueBatchWithRetry(ctx, bd, availableQueues, slots)
+		}
+	}
+	job, err := w.dequeueWithRetry(ctx, availableQueues)
+	if err != nil || job == nil {
+		return nil, err
+	}
+	return []*core.Job{job}, nil
+}
 
-				select {
-				case jobsChan <- job:
-				case <-ctx.Done():
-					w.releaseDequeuedJobOnShutdown(ctx, job)
-				}
-			}
+func (w *Worker) dequeueSlots(availableQueues []string, totalConcurrency int) int {
+	if len(availableQueues) == 0 {
+		return 0
+	}
+	slots := totalConcurrency - w.RunningJobCount()
+	if slots <= 0 {
+		return 0
+	}
+	if w.config.DequeueBatchSize > 0 && slots > w.config.DequeueBatchSize {
+		slots = w.config.DequeueBatchSize
+	}
+	queueCapacity := w.totalCapacityAcrossQueues(availableQueues)
+	if slots > queueCapacity {
+		slots = queueCapacity
+	}
+	if slots < 0 {
+		return 0
+	}
+	return slots
+}
+
+func (w *Worker) totalCapacityAcrossQueues(queues []string) int {
+	total := 0
+	for _, name := range queues {
+		maxConcurrency, ok := w.config.Queues[name]
+		if !ok {
+			continue
+		}
+		used := 0
+		if counter, ok := w.queueRunning[name]; ok {
+			used = int(counter.Load())
+		}
+		if remaining := maxConcurrency - used; remaining > 0 {
+			total += remaining
+		}
+	}
+	return total
+}
+
+func (w *Worker) dispatchDequeuedJobs(ctx context.Context, jobsChan chan<- *core.Job, jobs []*core.Job) {
+	for _, job := range jobs {
+		if job == nil {
+			continue
+		}
+		if !w.tryTrackQueueJob(job.ID, job.Queue) {
+			w.releaseDequeuedJobOnShutdown(ctx, job)
+			continue
+		}
+		if !w.tryConsumeQueueRateLimit(job.Queue) {
+			w.releaseDequeuedJobOnShutdown(ctx, job)
+			continue
+		}
+		if ok := w.tryConsumeRateLimits(ctx, job); !ok {
+			w.refundQueueRateLimit(job.Queue)
+			w.releaseDequeuedJobOnShutdown(ctx, job)
+			continue
+		}
+		if ok := w.tryAcquireConcurrencySlots(ctx, job); !ok {
+			w.refundQueueRateLimit(job.Queue)
+			w.releaseDequeuedJobOnShutdown(ctx, job)
+			continue
+		}
+		if ctx.Err() != nil {
+			w.refundQueueRateLimit(job.Queue)
+			w.releaseDequeuedJobOnShutdown(ctx, job)
+			continue
+		}
+
+		select {
+		case jobsChan <- job:
+		case <-ctx.Done():
+			w.refundQueueRateLimit(job.Queue)
+			w.releaseDequeuedJobOnShutdown(ctx, job)
 		}
 	}
 }
@@ -278,6 +412,7 @@ func (w *Worker) releaseDequeuedJobOnShutdown(ctx context.Context, job *core.Job
 			"job_id", job.ID,
 			"error", err)
 	}
+	w.releaseConcurrencySlots(releaseCtx, job.ID)
 	w.untrackQueueJob(job.ID)
 }
 
@@ -307,10 +442,73 @@ func (w *Worker) goTracked(fn func()) {
 	}()
 }
 
+func (w *Worker) runRetention(ctx context.Context) {
+	storage, ok := w.queue.Storage().(retentionStorage)
+	if !ok {
+		if w.retentionStorageMissingLogged.CompareAndSwap(false, true) {
+			w.logger.Warn("storage backend does not support retention GC; retention disabled")
+		}
+		return
+	}
+
+	cfg := w.config.Retention
+	interval := cfg.Interval
+	if interval <= 0 {
+		interval = defaultRetentionInterval
+	}
+	if interval < minRetentionInterval {
+		interval = minRetentionInterval
+	}
+	batchSize := cfg.BatchSize
+	if batchSize <= 0 {
+		batchSize = defaultRetentionBatchSize
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			w.runRetentionOnce(ctx, storage, cfg, batchSize)
+		}
+	}
+}
+
+func (w *Worker) runRetentionOnce(ctx context.Context, storage retentionStorage, cfg RetentionConfig, batchSize int) {
+	if cfg.CompletedAfter > 0 {
+		w.deleteTerminalStatus(ctx, storage, core.StatusCompleted, cfg.CompletedAfter, batchSize)
+	}
+	if cfg.FailedAfter > 0 {
+		w.deleteTerminalStatus(ctx, storage, core.StatusFailed, cfg.FailedAfter, batchSize)
+		w.deleteTerminalStatus(ctx, storage, core.StatusCancelled, cfg.FailedAfter, batchSize)
+	}
+}
+
+func (w *Worker) deleteTerminalStatus(ctx context.Context, storage retentionStorage, status core.JobStatus, age time.Duration, batchSize int) {
+	for ctx.Err() == nil {
+		deleted, err := storage.DeleteTerminalJobsOlderThan(ctx, status, age, batchSize)
+		if err != nil {
+			if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+				w.logger.Warn("retention GC pass failed", "status", status, "error", err)
+			}
+			return
+		}
+		if deleted < int64(batchSize) {
+			return
+		}
+	}
+}
+
 // queuesWithCapacity returns queue names that haven't reached their concurrency limit.
 func (w *Worker) queuesWithCapacity() []string {
 	available := make([]string, 0, len(w.config.Queues))
 	for name, maxConcurrency := range w.config.Queues {
+		if !w.queueRateLimitHasToken(name) {
+			continue
+		}
 		counter, ok := w.queueRunning[name]
 		if !ok {
 			available = append(available, name)
@@ -323,6 +521,30 @@ func (w *Worker) queuesWithCapacity() []string {
 	return available
 }
 
+func (w *Worker) queueRateLimitHasToken(queueName string) bool {
+	bucket, ok := w.queueRateBuckets[queueName]
+	if !ok {
+		return true
+	}
+	return bucket.hasToken(time.Now())
+}
+
+func (w *Worker) tryConsumeQueueRateLimit(queueName string) bool {
+	bucket, ok := w.queueRateBuckets[queueName]
+	if !ok {
+		return true
+	}
+	return bucket.tryConsume(time.Now())
+}
+
+func (w *Worker) refundQueueRateLimit(queueName string) {
+	bucket, ok := w.queueRateBuckets[queueName]
+	if !ok {
+		return
+	}
+	bucket.refund(time.Now())
+}
+
 // trackQueueJob increments the running counter for a queue and records the job→queue mapping.
 func (w *Worker) trackQueueJob(jobID, queueName string) {
 	if counter, ok := w.queueRunning[queueName]; ok {
@@ -331,6 +553,31 @@ func (w *Worker) trackQueueJob(jobID, queueName string) {
 	w.queueJobIDMu.Lock()
 	w.queueJobID[jobID] = queueName
 	w.queueJobIDMu.Unlock()
+}
+
+func (w *Worker) tryTrackQueueJob(jobID, queueName string) bool {
+	counter, ok := w.queueRunning[queueName]
+	if !ok {
+		w.trackQueueJob(jobID, queueName)
+		return true
+	}
+	maxConcurrency, ok := w.config.Queues[queueName]
+	if !ok {
+		w.trackQueueJob(jobID, queueName)
+		return true
+	}
+	for {
+		current := counter.Load()
+		if int(current) >= maxConcurrency {
+			return false
+		}
+		if counter.CompareAndSwap(current, current+1) {
+			w.queueJobIDMu.Lock()
+			w.queueJobID[jobID] = queueName
+			w.queueJobIDMu.Unlock()
+			return true
+		}
+	}
 }
 
 // untrackQueueJob decrements the running counter for a job's queue.
@@ -349,6 +596,140 @@ func (w *Worker) untrackQueueJob(jobID string) {
 	}
 }
 
+func (w *Worker) concurrencySlotTTL() time.Duration {
+	if w.config.LockDuration > 0 {
+		return w.config.LockDuration
+	}
+	return defaultConcurrencySlotTTL
+}
+
+func (w *Worker) capSlotName(cap ConcurrencyCapConfig, job *core.Job) string {
+	if cap.Key == nil {
+		return cap.Name
+	}
+	return cap.Name + ":" + cap.Key(job)
+}
+
+func (w *Worker) rateLimitName(limit RateLimitConfig, job *core.Job) string {
+	if limit.Key == nil {
+		return limit.Name
+	}
+	return limit.Name + ":" + limit.Key(job)
+}
+
+func (w *Worker) tryConsumeRateLimits(ctx context.Context, job *core.Job) bool {
+	if len(w.config.RateLimits) == 0 {
+		return true
+	}
+	storage, ok := w.queue.Storage().(rateLimiterStorage)
+	if !ok {
+		if w.rateLimitStorageMissingLogged.CompareAndSwap(false, true) {
+			w.logger.Warn("storage backend does not support fleet-wide rate limits; continuing without RateLimit enforcement")
+		}
+		return true
+	}
+	for _, limit := range w.config.RateLimits {
+		if limit.Name == "" || limit.PerSecond <= 0 {
+			continue
+		}
+		window := limit.Window
+		if window <= 0 {
+			window = defaultRateLimitWindow
+		}
+		limitName := w.rateLimitName(limit, job)
+		allowed, err := storage.TryConsumeRate(ctx, limitName, limit.PerSecond, window, time.Time{})
+		if err != nil {
+			w.logger.Warn("failed to consume rate limit; releasing dequeued job",
+				"job_id", job.ID,
+				"limit", limitName,
+				"error", err)
+			return false
+		}
+		if !allowed {
+			return false
+		}
+	}
+	return true
+}
+
+func (w *Worker) tryAcquireConcurrencySlots(ctx context.Context, job *core.Job) bool {
+	if len(w.config.ConcurrencyCaps) == 0 {
+		return true
+	}
+	storage, ok := w.queue.Storage().(concurrencySlotStorage)
+	if !ok {
+		return true
+	}
+	ttl := w.concurrencySlotTTL()
+	acquiredSlots := make([]string, 0, len(w.config.ConcurrencyCaps))
+	for _, cap := range w.config.ConcurrencyCaps {
+		slotName := w.capSlotName(cap, job)
+		acquired, err := storage.TryAcquireConcurrencySlot(ctx, slotName, job.ID, w.config.WorkerID, cap.Limit, ttl)
+		if err != nil {
+			w.logger.Warn("failed to acquire concurrency slot; releasing dequeued job",
+				"job_id", job.ID,
+				"slot", slotName,
+				"error", err)
+			w.releaseSlotNames(ctx, job.ID, acquiredSlots)
+			return false
+		}
+		if !acquired {
+			w.releaseSlotNames(ctx, job.ID, acquiredSlots)
+			return false
+		}
+		acquiredSlots = append(acquiredSlots, slotName)
+	}
+	w.slotJobIDMu.Lock()
+	w.slotJobID[job.ID] = acquiredSlots
+	w.slotJobIDMu.Unlock()
+	return true
+}
+
+func (w *Worker) releaseConcurrencySlots(ctx context.Context, jobID string) {
+	w.slotJobIDMu.Lock()
+	slots := w.slotJobID[jobID]
+	delete(w.slotJobID, jobID)
+	w.slotJobIDMu.Unlock()
+	w.releaseSlotNames(ctx, jobID, slots)
+}
+
+func (w *Worker) releaseSlotNames(ctx context.Context, jobID string, slots []string) {
+	if len(slots) == 0 {
+		return
+	}
+	storage, ok := w.queue.Storage().(concurrencySlotStorage)
+	if !ok {
+		return
+	}
+	for _, slot := range slots {
+		if err := storage.ReleaseConcurrencySlot(ctx, slot, jobID); err != nil {
+			w.logger.Warn("failed to release concurrency slot",
+				"job_id", jobID,
+				"slot", slot,
+				"error", err)
+		}
+	}
+}
+
+func (w *Worker) renewConcurrencySlots(ctx context.Context, jobID string) {
+	w.slotJobIDMu.Lock()
+	slots := append([]string(nil), w.slotJobID[jobID]...)
+	w.slotJobIDMu.Unlock()
+	if len(slots) == 0 {
+		return
+	}
+	storage, ok := w.queue.Storage().(concurrencySlotStorage)
+	if !ok {
+		return
+	}
+	ttl := w.concurrencySlotTTL()
+	for _, slot := range slots {
+		if _, err := storage.TryAcquireConcurrencySlot(ctx, slot, jobID, w.config.WorkerID, 1, ttl); err != nil {
+			w.logger.Warn("failed to renew concurrency slot", "job_id", jobID, "slot", slot, "error", err)
+		}
+	}
+}
+
 // dequeueWithRetry attempts to dequeue a job with exponential backoff on failure.
 func (w *Worker) dequeueWithRetry(ctx context.Context, queues []string) (*core.Job, error) {
 	var job *core.Job
@@ -358,6 +739,16 @@ func (w *Worker) dequeueWithRetry(ctx context.Context, queues []string) (*core.J
 		return dequeueErr
 	})
 	return job, err
+}
+
+func (w *Worker) dequeueBatchWithRetry(ctx context.Context, storage batchDequeuer, queues []string, limit int) ([]*core.Job, error) {
+	var jobs []*core.Job
+	err := retryWithBackoff(ctx, *w.config.DequeueRetry, func() error {
+		var dequeueErr error
+		jobs, dequeueErr = storage.DequeueBatch(ctx, queues, w.config.WorkerID, limit)
+		return dequeueErr
+	})
+	return jobs, err
 }
 
 func (w *Worker) processLoop(ctx context.Context, jobs <-chan *core.Job) {
@@ -371,6 +762,7 @@ func (w *Worker) processLoop(ctx context.Context, jobs <-chan *core.Job) {
 func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 	// Ensure per-queue concurrency counter is decremented when job finishes
 	defer w.untrackQueueJob(job.ID)
+	defer w.releaseConcurrencySlots(context.WithoutCancel(ctx), job.ID)
 
 	startTime := time.Now()
 
@@ -447,7 +839,9 @@ func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 	// Start heartbeat goroutine to extend lock during long-running jobs
 	go w.runHeartbeat(heartbeatCtx, job)
 
-	resultBytes, err := w.executeHandler(jobCtx, job, h)
+	resultBytes, err := w.queue.RunExecutionMiddleware(jobCtx, job, func(ctx context.Context, j *core.Job) ([]byte, error) {
+		return w.executeHandler(ctx, j, h)
+	})
 
 	// Enforce the result size limit on the top-level handler result too — Call
 	// already enforces it for nested results, but a top-level handler can return
@@ -461,13 +855,21 @@ func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 	}
 
 	if err != nil {
-		// Check for WaitingError - job is waiting for sub-jobs
-		if fanout.IsWaitingError(err) {
-			w.logger.Info("job waiting for sub-jobs", "job_id", job.ID)
+		// Self-suspension signal — the handler moved its job to StatusWaiting
+		// (fan-out or signal wait) and returned. Not a failure: just stop.
+		if core.IsWaiting(err) {
+			w.logger.Info("job waiting", "job_id", job.ID)
 			cancelHeartbeat()
 			// Job is already in StatusWaiting; just return
 			return
 		}
+		if !w.queue.IsFailure(job, err) {
+			err = nil
+		}
+	}
+
+	if err != nil {
+		w.queue.CallErrorHandler(jobCtx, job, err)
 		w.handleError(ctx, jobCtx, job, err)
 		cancelHeartbeat()
 	} else {
@@ -630,6 +1032,7 @@ func (w *Worker) runHeartbeat(ctx context.Context, job *core.Job) {
 			switch {
 			case err == nil:
 				consecutiveOrphanErrs = 0
+				w.renewConcurrencySlots(ctx, job.ID)
 				w.logger.Debug("heartbeat sent", "job_id", job.ID)
 			case errors.Is(err, core.ErrJobNotOwned):
 				consecutiveOrphanErrs++
@@ -661,8 +1064,8 @@ func (w *Worker) executeHandler(ctx context.Context, job *core.Job, h *handler.H
 			// Check if the panicked value is an error - preserve type for special errors
 			// like WaitingError that need type-based detection
 			if e, ok := r.(error); ok {
-				// Check if this is a waiting signal (expected behavior from fan-out)
-				if fanout.IsWaitingError(e) {
+				// Self-suspension signal raised via panic (fan-out or signal wait)
+				if core.IsWaiting(e) {
 					// Don't log as panic - this is expected behavior
 					w.logger.Debug("job handler signaled waiting via panic",
 						"job_id", job.ID,
@@ -747,7 +1150,7 @@ func (w *Worker) handleError(ctx context.Context, jobCtx context.Context, job *c
 		t := time.Now().Add(retryAfter.Delay)
 		retryAt = &t
 	case job.Attempt < job.MaxRetries:
-		t := time.Now().Add(w.calculateBackoff(job.Attempt))
+		t := time.Now().Add(w.retryBackoff(job, err))
 		retryAt = &t
 	default:
 		// terminal — attempts exhausted.
@@ -963,6 +1366,29 @@ func (w *Worker) calculateBackoff(attempt int) time.Duration {
 		return maxBackoff
 	}
 	return backoff
+}
+
+func (w *Worker) retryBackoff(job *core.Job, err error) time.Duration {
+	policy := w.config.JobBackoff
+	if h, ok := w.queue.GetHandler(job.Type); ok && h.Backoff != nil {
+		policy = h.Backoff
+	}
+	if policy == nil {
+		policy = DefaultBackoffPolicy()
+	}
+
+	delay := policy.NextRetry(job.Attempt, err)
+	maxBackoff := w.config.MaxRetryBackoff
+	if maxBackoff <= 0 {
+		maxBackoff = time.Minute
+	}
+	if delay > maxBackoff {
+		return maxBackoff
+	}
+	if delay <= 0 {
+		return time.Nanosecond
+	}
+	return delay
 }
 
 // maxCatchUpIterations bounds the seed scan so a pathologically dense schedule
@@ -1207,6 +1633,36 @@ func (w *Worker) pollWaitingJobsOnce(ctx context.Context) {
 			w.logger.Error("failed to resume stalled fan-out parent after retries", "job_id", job.ID, "error", resumeErr)
 		} else {
 			w.logger.Info("resumed stalled fan-out parent via polling fallback", "job_id", job.ID)
+		}
+	}
+
+	// Resume jobs waiting on a signal that has arrived (or whose timeout wake
+	// deadline has passed). This is the backstop for the deliver-vs-suspend
+	// race — a signal delivered just before SuspendJob commits would otherwise
+	// miss the event-driven resume and leave the job waiting forever.
+	if sr, ok := w.queue.Storage().(signalResumeStorage); ok {
+		var sigWaiting []*core.Job
+		err = retryWithBackoff(ctx, *w.config.StorageRetry, func() error {
+			var queryErr error
+			sigWaiting, queryErr = sr.GetSignalWaitingJobsToResume(ctx)
+			return queryErr
+		})
+		if err != nil {
+			if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+				w.logger.Error("failed to get signal-waiting jobs after retries", "error", err)
+			}
+			return
+		}
+		for _, job := range sigWaiting {
+			resumeErr := retryWithBackoff(ctx, *w.config.StorageRetry, func() error {
+				_, err := sr.ResumeSignalWaitingJob(ctx, job.ID)
+				return err
+			})
+			if resumeErr != nil {
+				w.logger.Error("failed to resume signal-waiting job after retries", "job_id", job.ID, "error", resumeErr)
+			} else {
+				w.logger.Info("resumed signal-waiting job via polling fallback", "job_id", job.ID)
+			}
 		}
 	}
 }

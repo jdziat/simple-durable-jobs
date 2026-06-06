@@ -342,5 +342,5 @@ Two knobs matter most once you're running multiple workers against a shared data
 - [Examples](../examples/) - More code examples
 - [Embedded Web UI](../embedded-ui/) - Dashboard setup and configuration
 - [Live Demo](../live-demo/) - The dashboard running on simulated data
-- [Advanced Topics](../advanced/) - Stale lock reaper, pool configuration, storage retry
+- [Advanced Topics](../advanced/) - Transactional enqueue, dead-letter queue, retention/GC, rate limiting, concurrency caps, metrics, workflow versioning, payload codec, authorization, testing utilities, and tuning knobs
 - [GitHub](https://github.com/jdziat/simple-durable-jobs) - Source code and issues

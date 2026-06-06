@@ -3,10 +3,21 @@ package jobctx
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"os"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"gorm.io/driver/mysql"
+	"gorm.io/driver/postgres"
+	"gorm.io/driver/sqlite"
+	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
 
 	"github.com/jdziat/simple-durable-jobs/pkg/core"
 	intctx "github.com/jdziat/simple-durable-jobs/pkg/internal/context"
+	"github.com/jdziat/simple-durable-jobs/pkg/storage"
 )
 
 func TestJobFromContext(t *testing.T) {
@@ -108,6 +119,119 @@ func TestJobIDFromContext(t *testing.T) {
 			t.Errorf("expected empty string, got %q", result)
 		}
 	})
+}
+
+func TestGetVersion(t *testing.T) {
+	t.Run("first run records max supported and replay returns recorded version", func(t *testing.T) {
+		var saved []*core.Checkpoint
+		ctx := newTestVersionContext("job-1", nil, func(_ context.Context, cp *core.Checkpoint) error {
+			saved = append(saved, cp)
+			return nil
+		})
+
+		version, err := GetVersion(ctx, "add-review-step", DefaultVersion, 1)
+		require.NoError(t, err)
+		assert.Equal(t, 1, version)
+		require.Len(t, saved, 1)
+		assert.Equal(t, -1, saved[0].CallIndex)
+		assert.Equal(t, versionCheckpointType("add-review-step"), saved[0].CallType)
+		assert.NotEqual(t, "add-review-step", saved[0].CallType, "version markers must be namespaced away from phase names")
+
+		var persisted int
+		require.NoError(t, json.Unmarshal(saved[0].Result, &persisted))
+		assert.Equal(t, 1, persisted)
+
+		replayCtx := newTestVersionContext("job-1", []core.Checkpoint{*saved[0]}, nil)
+		replayed, err := GetVersion(replayCtx, "add-review-step", DefaultVersion, 2)
+		require.NoError(t, err)
+		assert.Equal(t, 1, replayed, "replay must keep the recorded version even after maxSupported advances")
+	})
+
+	t.Run("recorded version outside supported range returns sentinel error", func(t *testing.T) {
+		result, err := json.Marshal(1)
+		require.NoError(t, err)
+		ctx := newTestVersionContext("job-1", []core.Checkpoint{{
+			JobID:     "job-1",
+			CallIndex: -1,
+			CallType:  versionCheckpointType("old-change"),
+			Result:    result,
+		}}, nil)
+
+		version, err := GetVersion(ctx, "old-change", 2, 3)
+		assert.Equal(t, 0, version)
+		require.Error(t, err)
+		assert.True(t, errors.Is(err, ErrUnsupportedWorkflowVersion))
+	})
+
+	t.Run("default version can be recorded for absent marker path", func(t *testing.T) {
+		var saved *core.Checkpoint
+		ctx := newTestVersionContext("job-1", nil, func(_ context.Context, cp *core.Checkpoint) error {
+			saved = cp
+			return nil
+		})
+
+		version, err := GetVersion(ctx, "legacy-branch", DefaultVersion, DefaultVersion)
+		require.NoError(t, err)
+		assert.Equal(t, DefaultVersion, version)
+		require.NotNil(t, saved)
+
+		var recorded int
+		require.NoError(t, json.Unmarshal(saved.Result, &recorded))
+		assert.Equal(t, DefaultVersion, recorded)
+	})
+
+	t.Run("same change ID is stable within one execution and distinct IDs are independent", func(t *testing.T) {
+		ctx := newTestVersionContext("job-1", nil, func(_ context.Context, _ *core.Checkpoint) error {
+			return nil
+		})
+
+		first, err := GetVersion(ctx, "change-a", DefaultVersion, 1)
+		require.NoError(t, err)
+		second, err := GetVersion(ctx, "change-a", DefaultVersion, 2)
+		require.NoError(t, err)
+		other, err := GetVersion(ctx, "change-b", DefaultVersion, 2)
+		require.NoError(t, err)
+
+		assert.Equal(t, 1, first)
+		assert.Equal(t, 1, second)
+		assert.Equal(t, 2, other)
+	})
+
+	t.Run("version marker is excluded from strict unconsumed call checkpoint guard", func(t *testing.T) {
+		ctx := newTestVersionContext("job-1", nil, func(_ context.Context, _ *core.Checkpoint) error {
+			return nil
+		})
+
+		_, err := GetVersion(ctx, "strict-safe-change", DefaultVersion, 1)
+		require.NoError(t, err)
+
+		cs := intctx.GetCallState(ctx)
+		require.NotNil(t, cs)
+		assert.Equal(t, 0, cs.UnconsumedCallCheckpoints())
+	})
+}
+
+func TestGetVersion_GormStorageRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	store := newVersionTestStorage(t)
+	job := &core.Job{Type: "workflow.versioned", Queue: "default"}
+	require.NoError(t, store.Enqueue(ctx, job))
+
+	runCtx := newTestVersionContext(job.ID, nil, store.SaveCheckpoint)
+	version, err := GetVersion(runCtx, "fanout-shape", DefaultVersion, 1)
+	require.NoError(t, err)
+	assert.Equal(t, 1, version)
+
+	checkpoints, err := store.GetCheckpoints(ctx, job.ID)
+	require.NoError(t, err)
+	require.Len(t, checkpoints, 1)
+	assert.Equal(t, -1, checkpoints[0].CallIndex)
+	assert.Equal(t, versionCheckpointType("fanout-shape"), checkpoints[0].CallType)
+
+	replayCtx := newTestVersionContext(job.ID, checkpoints, store.SaveCheckpoint)
+	replayed, err := GetVersion(replayCtx, "fanout-shape", DefaultVersion, 2)
+	require.NoError(t, err)
+	assert.Equal(t, 1, replayed)
 }
 
 func TestSavePhaseCheckpoint(t *testing.T) {
@@ -225,6 +349,75 @@ func TestSavePhaseCheckpoint(t *testing.T) {
 			t.Fatal("expected unique checkpoint IDs")
 		}
 	})
+}
+
+func newTestVersionContext(jobID string, checkpoints []core.Checkpoint, save func(context.Context, *core.Checkpoint) error) context.Context {
+	if save == nil {
+		save = func(context.Context, *core.Checkpoint) error { return nil }
+	}
+	ctx := intctx.WithJobContext(context.Background(), &intctx.JobContext{
+		Job:            &core.Job{ID: jobID},
+		SaveCheckpoint: save,
+	})
+	return intctx.WithCallState(ctx, checkpoints)
+}
+
+func newVersionTestStorage(t *testing.T) *storage.GormStorage {
+	t.Helper()
+
+	db, external := openVersionTestDB(t)
+	store := storage.NewGormStorage(db)
+	require.NoError(t, store.Migrate(context.Background()))
+	if external {
+		cleanupVersionExternalDB(t, db)
+		t.Cleanup(func() { cleanupVersionExternalDB(t, db) })
+	}
+	return store
+}
+
+func openVersionTestDB(t *testing.T) (*gorm.DB, bool) {
+	t.Helper()
+
+	if dsn := os.Getenv("TEST_MYSQL_URL"); dsn != "" {
+		db, err := gorm.Open(mysql.Open(dsn), &gorm.Config{
+			Logger: logger.Default.LogMode(logger.Silent),
+		})
+		require.NoError(t, err, "open mysql version test db")
+		closeVersionTestDB(t, db)
+		return db, true
+	}
+	if dsn := os.Getenv("TEST_DATABASE_URL"); dsn != "" {
+		db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{
+			Logger: logger.Default.LogMode(logger.Silent),
+		})
+		require.NoError(t, err, "open postgres version test db")
+		closeVersionTestDB(t, db)
+		return db, true
+	}
+
+	dbPath := t.TempDir() + "/workflow-versioning.db"
+	db, err := gorm.Open(sqlite.Open(dbPath+"?_journal_mode=WAL&_busy_timeout=5000&_txlock=immediate"), &gorm.Config{
+		Logger: logger.Default.LogMode(logger.Silent),
+	})
+	require.NoError(t, err, "open sqlite version test db")
+	closeVersionTestDB(t, db)
+	return db, false
+}
+
+func closeVersionTestDB(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	sqlDB.SetMaxOpenConns(2)
+	sqlDB.SetMaxIdleConns(1)
+	t.Cleanup(func() { _ = sqlDB.Close() })
+}
+
+func cleanupVersionExternalDB(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	for _, table := range []string{"checkpoints", "fan_outs", "queue_states", "jobs", "scheduled_fires", "leases"} {
+		require.NoError(t, db.Exec("DELETE FROM "+table).Error)
+	}
 }
 
 func TestLoadPhaseCheckpoint(t *testing.T) {

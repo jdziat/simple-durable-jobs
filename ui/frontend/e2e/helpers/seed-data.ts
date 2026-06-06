@@ -12,6 +12,11 @@ export const JOBS = {
   COMPLETED_2: 'e2e-completed-002',
   FAILED_1: 'e2e-failed-001',
   FAILED_2: 'e2e-failed-002',
+  // e2e-failed-003 is the dead-lettered fixture. It is deliberately a job no
+  // other test navigates to or mutates, so FAILED_1/FAILED_2 stay plain failed
+  // (their status/retry assertions don't collide with the Dead-lettered badge)
+  // and the DLQ assertions stay stable regardless of test order.
+  DEADLETTERED_1: 'e2e-failed-003',
   PAUSED_1: 'e2e-paused-001',
   PAUSED_2: 'e2e-paused-002',
   CANCELLED_1: 'e2e-cancelled-001',

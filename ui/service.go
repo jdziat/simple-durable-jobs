@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -19,9 +20,10 @@ import (
 )
 
 const (
-	maxWatchStreams = 50
-	maxBulkJobIDs   = 1000
-	maxWorkflowJobs = 1000
+	maxWatchStreams      = 50
+	maxBulkJobIDs        = 1000
+	maxWorkflowJobs      = 1000
+	statusDeadLetteredUI = "dead-lettered"
 )
 
 // jobsService implements the JobsService Connect-RPC service.
@@ -242,6 +244,24 @@ func (s *jobsService) PauseJob(ctx context.Context, req *connect.Request[jobsv1.
 		return nil, connect.NewError(connect.CodeNotFound, nil)
 	}
 	return connect.NewResponse(&jobsv1.PauseJobResponse{Job: jobToProto(job)}), nil
+}
+
+// CancelJob cooperatively cancels a running job by aliasing aggressive pause.
+func (s *jobsService) CancelJob(ctx context.Context, req *connect.Request[jobsv1.CancelJobRequest]) (*connect.Response[jobsv1.CancelJobResponse], error) {
+	if s.queue == nil {
+		return nil, connect.NewError(connect.CodeUnimplemented, nil)
+	}
+	if err := s.queue.CancelJob(ctx, req.Msg.Id); err != nil {
+		return nil, connect.NewError(connect.CodeInternal, err)
+	}
+	job, err := s.storage.GetJob(ctx, req.Msg.Id)
+	if err != nil {
+		return nil, connect.NewError(connect.CodeInternal, err)
+	}
+	if job == nil {
+		return nil, connect.NewError(connect.CodeNotFound, nil)
+	}
+	return connect.NewResponse(&jobsv1.CancelJobResponse{Job: jobToProto(job)}), nil
 }
 
 // ResumeJob resumes a paused job.
@@ -548,6 +568,31 @@ func (s *jobsService) getQueueStats(ctx context.Context) ([]*jobsv1.QueueStats, 
 }
 
 func (s *jobsService) searchJobs(ctx context.Context, req *jobsv1.ListJobsRequest, limit, page int) ([]*core.Job, int64, error) {
+	if req.Status == statusDeadLetteredUI {
+		deadLettered, ok := s.storage.(deadLetterStorage)
+		if !ok {
+			return nil, 0, connect.NewError(connect.CodeUnimplemented, fmt.Errorf("dead-lettered job filter requires storage with DLQ query support"))
+		}
+		filter := core.DeadLetterFilter{
+			Queue:  req.Queue,
+			Type:   req.Type,
+			Limit:  limit,
+			Offset: (page - 1) * limit,
+		}
+		jobs, err := deadLettered.ListDeadLettered(ctx, filter)
+		if err != nil {
+			return nil, 0, err
+		}
+		total, err := deadLettered.CountDeadLettered(ctx, filter)
+		if err != nil {
+			return nil, 0, err
+		}
+		if req.Search != "" {
+			jobs = filterDeadLetterSearch(jobs, req.Search)
+		}
+		return jobs, total, nil
+	}
+
 	// Check if storage implements UIStorage
 	if ui, ok := s.storage.(UIStorage); ok {
 		return ui.SearchJobs(ctx, JobFilter{
@@ -561,6 +606,19 @@ func (s *jobsService) searchJobs(ctx context.Context, req *jobsv1.ListJobsReques
 	}
 
 	return nil, 0, connect.NewError(connect.CodeUnimplemented, fmt.Errorf("ListJobs requires storage with UI search support"))
+}
+
+func filterDeadLetterSearch(jobs []*core.Job, search string) []*core.Job {
+	search = strings.ToLower(search)
+	filtered := jobs[:0]
+	for _, job := range jobs {
+		if strings.Contains(strings.ToLower(job.ID), search) ||
+			strings.Contains(strings.ToLower(job.Type), search) ||
+			strings.Contains(strings.ToLower(job.Queue), search) {
+			filtered = append(filtered, job)
+		}
+	}
+	return filtered
 }
 
 func (s *jobsService) collectWorkflowTree(ctx context.Context, root *core.Job) ([]*jobsv1.FanOut, []*jobsv1.Job, error) {
@@ -800,6 +858,10 @@ func jobToProto(j *core.Job) *jobsv1.Job {
 	if j.FanOutID != nil {
 		pb.FanOutId = j.FanOutID
 	}
+	if j.DeadLetteredAt != nil {
+		pb.DeadLetteredAt = timestamppb.New(*j.DeadLetteredAt)
+	}
+	pb.DeadLetterReason = j.DeadLetterReason
 	return pb
 }
 
@@ -939,6 +1001,11 @@ type workflowBatchStorage interface {
 
 type queueDepthStatsStorage interface {
 	GetQueueDepthStats(ctx context.Context) ([]*jobsv1.QueueStats, error)
+}
+
+type deadLetterStorage interface {
+	ListDeadLettered(ctx context.Context, filter core.DeadLetterFilter) ([]*core.Job, error)
+	CountDeadLettered(ctx context.Context, filter core.DeadLetterFilter) (int64, error)
 }
 
 // JobFilter is an alias for core.JobFilter for backward compatibility.

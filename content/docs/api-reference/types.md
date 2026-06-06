@@ -1,6 +1,6 @@
 ---
 title: "Types"
-weight: 5
+weight: 6
 ---
 
 ### `RetryConfig`

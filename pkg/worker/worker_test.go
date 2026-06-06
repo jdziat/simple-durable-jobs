@@ -623,6 +623,52 @@ func TestWorker_PauseJobAggressivePreservesCancelledStatus(t *testing.T) {
 	assert.Equal(t, core.StatusCancelled, job.Status)
 }
 
+func TestWorker_CancelJobCancelsRunningJob(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{
+		Logger: logger.Default.LogMode(logger.Silent),
+	})
+	require.NoError(t, err)
+	store := storage.NewGormStorage(db)
+	require.NoError(t, store.Migrate(context.Background()))
+	q := queue.New(store)
+
+	started := make(chan struct{})
+	cancelled := make(chan struct{})
+	q.Register("long-job", func(ctx context.Context, args struct{}) error {
+		close(started)
+		<-ctx.Done()
+		close(cancelled)
+		return ctx.Err()
+	})
+
+	jobID, err := q.Enqueue(context.Background(), "long-job", struct{}{})
+	require.NoError(t, err)
+
+	w := NewWorker(q, WithPollInterval(50*time.Millisecond))
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	go func() { _ = w.Start(ctx) }()
+
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("job did not start")
+	}
+
+	require.NoError(t, q.CancelJob(context.Background(), jobID))
+
+	select {
+	case <-cancelled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("job context was not cancelled")
+	}
+
+	require.Eventually(t, func() bool {
+		job, err := store.GetJob(context.Background(), jobID)
+		return err == nil && job != nil && job.Status == core.StatusCancelled
+	}, 2*time.Second, 25*time.Millisecond)
+}
+
 // ---------------------------------------------------------------------------
 // Options tests
 // ---------------------------------------------------------------------------

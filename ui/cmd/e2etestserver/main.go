@@ -146,19 +146,29 @@ func seedE2EData(ctx context.Context, store *storage.GormStorage, db *gorm.DB) e
 		createdAt := now.Add(-time.Duration(12-i) * time.Hour)
 		startedAt := createdAt.Add(5 * time.Second)
 		completedAt := startedAt.Add(30 * time.Second)
+		var deadLetteredAt *time.Time
+		deadLetterReason := ""
+		// e2e-failed-003 is the dead-lettered fixture (no e2e test mutates it,
+		// so the DLQ badge/filter/panel assertions stay stable across the run).
+		if i == 2 {
+			deadLetteredAt = &completedAt
+			deadLetterReason = "max retries exhausted: " + failedErrors[i]
+		}
 		failedJobs[i] = &core.Job{
-			ID:          fmt.Sprintf("e2e-failed-%03d", i+1),
-			Type:        "SendEmail",
-			Queue:       "default",
-			Status:      core.StatusFailed,
-			Priority:    5,
-			Attempt:     3,
-			MaxRetries:  3,
-			Args:        mustJSON(map[string]any{"to": fmt.Sprintf("user%d@example.com", i+1)}),
-			LastError:   failedErrors[i],
-			CreatedAt:   createdAt,
-			StartedAt:   &startedAt,
-			CompletedAt: &completedAt,
+			ID:               fmt.Sprintf("e2e-failed-%03d", i+1),
+			Type:             "SendEmail",
+			Queue:            "default",
+			Status:           core.StatusFailed,
+			Priority:         5,
+			Attempt:          3,
+			MaxRetries:       3,
+			Args:             mustJSON(map[string]any{"to": fmt.Sprintf("user%d@example.com", i+1)}),
+			LastError:        failedErrors[i],
+			DeadLetteredAt:   deadLetteredAt,
+			DeadLetterReason: deadLetterReason,
+			CreatedAt:        createdAt,
+			StartedAt:        &startedAt,
+			CompletedAt:      &completedAt,
 		}
 	}
 

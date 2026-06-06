@@ -140,6 +140,26 @@ var schemaMigrations = []schemaMigration{
 		Name:    "mysql_active_unique_key",
 		Up:      migrateMySQLActiveUniqueKey,
 	},
+	{
+		Version: 3,
+		Name:    "concurrency_slots_live_index",
+		Up:      migrateConcurrencySlotsLiveIndex,
+	},
+	{
+		Version: 4,
+		Name:    "rate_limit_windows",
+		Up:      migrateRateLimitWindows,
+	},
+	{
+		Version: 5,
+		Name:    "retention_terminal_index",
+		Up:      migrateRetentionTerminalIndex,
+	},
+	{
+		Version: 6,
+		Name:    "dead_letter_columns",
+		Up:      migrateDeadLetterColumns,
+	},
 }
 
 // applyPendingMigrations runs every migration whose version is absent from the
@@ -252,4 +272,105 @@ func migrateMySQLActiveUniqueKey(ctx context.Context, db *gorm.DB, dialect strin
 		}
 	}
 	return nil
+}
+
+func migrateConcurrencySlotsLiveIndex(ctx context.Context, db *gorm.DB, dialect string) error {
+	switch dialect {
+	case dialectMySQL:
+		m := db.Migrator()
+		if !m.HasIndex(&core.ConcurrencySlot{}, "idx_concurrency_slots_live") {
+			if err := db.Exec(
+				"CREATE INDEX idx_concurrency_slots_live ON concurrency_slots (slot_name, expires_at)",
+			).Error; err != nil && !isBenignDDLError(err) {
+				return fmt.Errorf("create idx_concurrency_slots_live: %w", err)
+			}
+		}
+		return nil
+	default:
+		return db.Exec(
+			"CREATE INDEX IF NOT EXISTS idx_concurrency_slots_live ON concurrency_slots (slot_name, expires_at)",
+		).Error
+	}
+}
+
+func migrateRateLimitWindows(ctx context.Context, db *gorm.DB, dialect string) error {
+	switch dialect {
+	case dialectMySQL:
+		m := db.Migrator()
+		if !m.HasIndex(&core.RateLimitWindow{}, "idx_rate_limit_windows_lookup") {
+			if err := db.Exec(
+				"CREATE INDEX idx_rate_limit_windows_lookup ON rate_limit_windows (limit_name, window_start)",
+			).Error; err != nil && !isBenignDDLError(err) {
+				return fmt.Errorf("create idx_rate_limit_windows_lookup: %w", err)
+			}
+		}
+		return nil
+	default:
+		return db.Exec(
+			"CREATE INDEX IF NOT EXISTS idx_rate_limit_windows_lookup ON rate_limit_windows (limit_name, window_start)",
+		).Error
+	}
+}
+
+func migrateRetentionTerminalIndex(ctx context.Context, db *gorm.DB, dialect string) error {
+	switch dialect {
+	case dialectMySQL:
+		m := db.Migrator()
+		if !m.HasIndex(&core.Job{}, "idx_jobs_retention_terminal") {
+			if err := db.Exec(
+				"CREATE INDEX idx_jobs_retention_terminal ON jobs (status, completed_at)",
+			).Error; err != nil && !isBenignDDLError(err) {
+				return fmt.Errorf("create idx_jobs_retention_terminal: %w", err)
+			}
+		}
+		return nil
+	default:
+		return db.Exec(
+			"CREATE INDEX IF NOT EXISTS idx_jobs_retention_terminal ON jobs (status, completed_at) WHERE status IN ('completed','failed','cancelled') AND completed_at IS NOT NULL",
+		).Error
+	}
+}
+
+func migrateDeadLetterColumns(ctx context.Context, db *gorm.DB, dialect string) error {
+	switch dialect {
+	case dialectMySQL:
+		m := db.Migrator()
+		if !m.HasColumn(&core.Job{}, "dead_lettered_at") {
+			if err := db.Exec("ALTER TABLE jobs ADD COLUMN dead_lettered_at DATETIME(6) NULL").Error; err != nil && !isBenignDDLError(err) {
+				return fmt.Errorf("add dead_lettered_at column: %w", err)
+			}
+		}
+		if !m.HasColumn(&core.Job{}, "dead_letter_reason") {
+			if err := db.Exec("ALTER TABLE jobs ADD COLUMN dead_letter_reason TEXT NULL").Error; err != nil && !isBenignDDLError(err) {
+				return fmt.Errorf("add dead_letter_reason column: %w", err)
+			}
+		}
+		if !m.HasIndex(&core.Job{}, "idx_jobs_dead_lettered_at") {
+			if err := db.Exec("CREATE INDEX idx_jobs_dead_lettered_at ON jobs (dead_lettered_at)").Error; err != nil && !isBenignDDLError(err) {
+				return fmt.Errorf("create idx_jobs_dead_lettered_at: %w", err)
+			}
+		}
+		return nil
+	case dialectPostgres:
+		if err := db.Exec("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS dead_lettered_at timestamp with time zone NULL").Error; err != nil {
+			return fmt.Errorf("add dead_lettered_at column: %w", err)
+		}
+		if err := db.Exec("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS dead_letter_reason text NULL").Error; err != nil {
+			return fmt.Errorf("add dead_letter_reason column: %w", err)
+		}
+		return db.Exec("CREATE INDEX IF NOT EXISTS idx_jobs_dead_lettered_at ON jobs (dead_lettered_at) WHERE dead_lettered_at IS NOT NULL").Error
+	default:
+		m := db.Migrator()
+		if !m.HasColumn(&core.Job{}, "dead_lettered_at") {
+			if err := db.Exec("ALTER TABLE jobs ADD COLUMN dead_lettered_at datetime NULL").Error; err != nil {
+				return fmt.Errorf("add dead_lettered_at column: %w", err)
+			}
+		}
+		if !m.HasColumn(&core.Job{}, "dead_letter_reason") {
+			if err := db.Exec("ALTER TABLE jobs ADD COLUMN dead_letter_reason text NULL").Error; err != nil {
+				return fmt.Errorf("add dead_letter_reason column: %w", err)
+			}
+		}
+		return db.Exec("CREATE INDEX IF NOT EXISTS idx_jobs_dead_lettered_at ON jobs (dead_lettered_at) WHERE dead_lettered_at IS NOT NULL").Error
+	}
 }
