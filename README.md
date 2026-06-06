@@ -48,22 +48,35 @@ for the full contract, backend support tiers, and crash-recovery tuning.
 - [Embedded Web UI](https://jdziat.github.io/simple-durable-jobs/docs/embedded-ui/)
 - [Live Demo](https://jdziat.github.io/simple-durable-jobs/docs/live-demo/)
 - [Guarantees & Production Readiness](https://jdziat.github.io/simple-durable-jobs/docs/advanced/guarantees/) - Execution semantics, backend tiers, crash-recovery tuning
-- [Advanced Topics](https://jdziat.github.io/simple-durable-jobs/docs/advanced/) - Stale lock reaper, pool configuration, storage retry
+- [Advanced Topics](https://jdziat.github.io/simple-durable-jobs/docs/advanced/) - Transactional enqueue, dead-letter queue, retention/GC, rate limiting, concurrency caps, metrics, workflow versioning, payload codec, execution middleware, dashboard authorization, and testing utilities
 
 ## Features
 
 - **Background Jobs** - Fire-and-forget task processing
 - **Durable Workflows** - Multi-step workflows with automatic checkpointing
+- **Durable Signals** - send/wait/check/drain for cross-job and external coordination
 - **Fan-Out/Fan-In** - Spawn parallel sub-jobs, wait for results, aggregate
 - **Crash Recovery** - Jobs resume from the last successful checkpoint
-- **Pause/Resume** - Pause and resume individual jobs, queues, or workers (graceful or aggressive)
+- **Pause / Resume / Cancel** - Pause, resume, or cancel jobs, queues, or workers (graceful or aggressive); first-class cancel verb across facade, RPC, and dashboard
 - **Scheduled Jobs** - Cron, daily, weekly, and interval-based scheduling
 - **Priority Queues** - Higher priority jobs run first
-- **Retries with Backoff** - Configurable retry logic with exponential backoff
-- **Observability** - Hooks, event streams, optional OpenTelemetry tracing, and an embedded web dashboard
-- **Embedded Web UI** - Real-time monitoring dashboard with stats and event streaming
+- **Transactional Enqueue** - Enqueue inside your own DB transaction (outbox pattern) so business rows and jobs commit together
+- **Batch Enqueue & Dequeue** - Bulk insert plus buffered worker-side batch dequeue for throughput
+- **Concurrency Caps** - Fleet-wide and per-key concurrency limits, not just per-process
+- **Rate Limiting** - Per-queue token buckets and an optional fleet-wide limiter (throttle waits don't burn retry attempts)
+- **Retries with Backoff** - Configurable retry logic with exponential backoff and jitter
+- **Dead-Letter Queue** - Explicit dead-letter metadata with list/count/requeue triage
+- **Retention / GC** - Automatic pruning of terminal jobs by per-status age window
+- **Execution Middleware** - Interceptors that wrap handler execution
+- **Payload Codec** - Pluggable encryption-at-rest for job arguments, results, and checkpoints
+- **Workflow Versioning** - GetVersion markers to evolve in-flight workflows safely across deploys
+- **Metrics** - Optional Prometheus / OpenTelemetry metrics exporter (queue depth, latency, throughput, failures)
+- **Observability** - Hooks, event streams, OpenTelemetry tracing, and an embedded web dashboard
+- **Embedded Web UI** - Real-time monitoring dashboard with stats, event streaming, and job actions (incl. cancel)
+- **Dashboard Authorization** - Optional per-action authorization for mutating dashboard RPCs
 - **Stale Lock Reaper** - Automatically reclaims stuck running jobs after worker crashes
 - **Connection Pool Presets** - Pre-built pool configurations for different workloads
+- **Testing Utilities** - The jobstest package: SQLite fixtures and enqueue assertions
 - **Simple API** - Minimal boilerplate, type-safe handlers
 
 ## Installation

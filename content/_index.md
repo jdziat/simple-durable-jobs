@@ -109,6 +109,36 @@ func main() {
     title="Simple API"
     subtitle="Minimal boilerplate, type-safe handlers, and a clean facade. Import one package and start processing jobs."
   >}}
+  {{< hextra/feature-card
+    icon="database"
+    title="Transactional Enqueue"
+    subtitle="Enqueue inside your own database transaction so business rows and the jobs that act on them commit — or roll back — together. No dual-write race."
+  >}}
+  {{< hextra/feature-card
+    icon="bell"
+    title="Durable Signals"
+    subtitle="Send, wait, check, and drain durable signals to coordinate jobs with each other and with the outside world — buffered, FIFO, and exactly-once."
+  >}}
+  {{< hextra/feature-card
+    icon="exclamation-circle"
+    title="Dead-Letter Queue"
+    subtitle="Jobs that exhaust retries (or hit a non-retryable error) carry explicit dead-letter metadata you can list, count, inspect, and requeue."
+  >}}
+  {{< hextra/feature-card
+    icon="adjustments"
+    title="Rate Limiting"
+    subtitle="Throttle execution with per-queue token buckets and an optional fleet-wide limiter, and cap concurrency fleet-wide or per key — without burning retry attempts."
+  >}}
+  {{< hextra/feature-card
+    icon="chart-bar"
+    title="Prometheus / OTel Metrics"
+    subtitle="Opt into an exporter for queue depth, throughput, wait and run latency, attempts, failures, and retries — scrapeable for alerting and capacity planning."
+  >}}
+  {{< hextra/feature-card
+    icon="lock-closed"
+    title="Payload Encryption"
+    subtitle="Plug in a codec to transparently encrypt job arguments, results, and checkpoints at rest, with key rotation, at the storage boundary."
+  >}}
 {{< /hextra/feature-grid >}}
 
 <p class="sdj-section-label">A real-time dashboard, embedded in your app</p>

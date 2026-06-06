@@ -19,4 +19,11 @@ Production tuning for Simple Durable Jobs. These pages cover the knobs you reach
   {{< card link="transactional-enqueue/" title="Transactional Enqueue" icon="database" subtitle="Persist jobs inside your own GORM transaction so business rows and jobs commit or roll back together." >}}
   {{< card link="payload-codec/" title="Payload Codec" icon="lock-closed" subtitle="Encrypt or transform job arguments, results, checkpoints, and signal payloads at the GORM storage boundary." >}}
   {{< card link="authorization/" title="Dashboard Authorization" icon="shield-check" subtitle="Add optional per-action authorization for mutating dashboard RPCs while keeping identity extraction in your own middleware." >}}
+  {{< card link="execution-middleware/" title="Execution Middleware" icon="adjustments" subtitle="Wrap handler execution with interceptors for logging, auth context, panic classification, and error mapping." >}}
+  {{< card link="concurrency-caps/" title="Concurrency Caps" icon="adjustments" subtitle="Cap parallelism fleet-wide and per-key (e.g. at most N jobs per customer) with DB-coordinated concurrency slots." >}}
+  {{< card link="rate-limiting/" title="Rate Limiting" icon="clock" subtitle="Throttle execution to a requests-per-window ceiling with per-queue token buckets and an optional fleet-wide limiter — without burning retry attempts." >}}
+  {{< card link="retention-gc/" title="Retention & GC" icon="trash" subtitle="Automatically prune terminal jobs by per-status age window with a background retention worker, so the jobs table stays bounded." >}}
+  {{< card link="metrics/" title="Metrics" icon="chart-bar" subtitle="Export Prometheus / OpenTelemetry metrics — queue depth, throughput, wait/run latency, attempts, failures, retries — via an opt-in instrument." >}}
+  {{< card link="cancel-job/" title="Cancel & Terminate" icon="x-circle" subtitle="Cancel a running job fleet-wide via a first-class verb across the facade, Connect-RPC, and the dashboard (cooperative cancellation)." >}}
+  {{< card link="testing/" title="Testing Utilities" icon="beaker" subtitle="The jobstest package: isolated SQLite fixtures and rivertest-style enqueue assertions for testing job producers and consumers." >}}
 {{< /cards >}}
