@@ -259,6 +259,11 @@ const (
 	BestEffort          = queue.BestEffort
 )
 
+// Workflow version constants
+const (
+	DefaultVersion = jobctx.DefaultVersion
+)
+
 // Security limits
 const (
 	MaxJobTypeNameLength  = security.MaxJobTypeNameLength
@@ -296,6 +301,8 @@ var (
 	ErrStorageNoTxEnqueue    = core.ErrStorageNoTxEnqueue
 	ErrStorageNoBatchDequeue = core.ErrStorageNoBatchDequeue
 	ErrPayloadDecode         = core.ErrPayloadDecode
+
+	ErrUnsupportedWorkflowVersion = jobctx.ErrUnsupportedWorkflowVersion
 
 	ErrSecretboxAuthentication = payloadcodec.ErrSecretboxAuthentication
 )
@@ -419,6 +426,13 @@ func SavePhaseCheckpoint(ctx context.Context, phaseName string, result any) erro
 // Returns (result, true) if found, (zero, false) if not found or not in job context.
 func LoadPhaseCheckpoint[T any](ctx context.Context, phaseName string) (T, bool) {
 	return jobctx.LoadPhaseCheckpoint[T](ctx, phaseName)
+}
+
+// GetVersion records or replays a workflow-code version marker for changeID.
+// Use the returned version to branch around changes to Call, fan-out, and signal
+// wait sequences so in-flight runs keep their originally recorded path.
+func GetVersion(ctx context.Context, changeID string, minSupported, maxSupported int) (int, error) {
+	return jobctx.GetVersion(ctx, changeID, minSupported, maxSupported)
 }
 
 // NoRetry wraps an error to indicate it should not be retried.

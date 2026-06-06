@@ -14,6 +14,7 @@ Production tuning for Simple Durable Jobs. These pages cover the knobs you reach
   {{< card link="retry-backoff/" title="Job Retry Backoff" icon="clock" subtitle="Configure worker-default and per-handler retry delays with BackoffPolicy, ExponentialBackoff, and jitter." >}}
   {{< card link="dead-letter-queue/" title="Dead-Letter Queue" icon="exclamation-circle" subtitle="List, count, inspect, and requeue jobs that exhausted retries, with explicit DLQ metadata and retention caveats." >}}
   {{< card link="batch-enqueue/" title="Batch Enqueue" icon="collection" subtitle="Use Batch entries and Queue.EnqueueBatch to insert many producer jobs with one storage batch operation." >}}
+  {{< card link="workflow-versioning/" title="Workflow Versioning" icon="code" subtitle="Use GetVersion markers to evolve Call, fan-out, and signal-wait sequences while in-flight runs keep their recorded branch." >}}
   {{< card link="batch-dequeue/" title="Batch Dequeue" icon="collection" subtitle="Opt in to bounded worker-side batch dequeue to claim multiple due jobs per poll when storage supports it." >}}
   {{< card link="transactional-enqueue/" title="Transactional Enqueue" icon="database" subtitle="Persist jobs inside your own GORM transaction so business rows and jobs commit or roll back together." >}}
   {{< card link="payload-codec/" title="Payload Codec" icon="lock-closed" subtitle="Encrypt or transform job arguments, results, checkpoints, and signal payloads at the GORM storage boundary." >}}
