@@ -50,6 +50,7 @@ type Worker struct {
 	queueRateBuckets map[string]*tokenBucket
 
 	rateLimitStorageMissingLogged atomic.Bool
+	retentionStorageMissingLogged atomic.Bool
 
 	// heartbeatInterval is the tick rate for runHeartbeat. Defaults to
 	// 2 minutes; tests override with a sub-second value. Not exposed via
@@ -90,6 +91,10 @@ type concurrencySlotStorage interface {
 
 type rateLimiterStorage interface {
 	TryConsumeRate(ctx context.Context, limitName string, perSecond float64, window time.Duration, now time.Time) (bool, error)
+}
+
+type retentionStorage interface {
+	DeleteTerminalJobsOlderThan(ctx context.Context, status core.JobStatus, age time.Duration, limit int) (int64, error)
 }
 
 // signalResumeStorage is implemented by backends that buffer signals; the
@@ -249,6 +254,10 @@ func (w *Worker) Start(ctx context.Context) error {
 	// counterpart.
 	if w.config.OwnershipAuditInterval > 0 {
 		w.goTracked(func() { w.runOwnershipAudit(ctx) })
+	}
+
+	if w.config.Retention.enabled() {
+		w.goTracked(func() { w.runRetention(ctx) })
 	}
 
 	for i := 0; i < totalConcurrency; i++ {
@@ -431,6 +440,66 @@ func (w *Worker) goTracked(fn func()) {
 		defer w.wg.Done()
 		fn()
 	}()
+}
+
+func (w *Worker) runRetention(ctx context.Context) {
+	storage, ok := w.queue.Storage().(retentionStorage)
+	if !ok {
+		if w.retentionStorageMissingLogged.CompareAndSwap(false, true) {
+			w.logger.Warn("storage backend does not support retention GC; retention disabled")
+		}
+		return
+	}
+
+	cfg := w.config.Retention
+	interval := cfg.Interval
+	if interval <= 0 {
+		interval = defaultRetentionInterval
+	}
+	if interval < minRetentionInterval {
+		interval = minRetentionInterval
+	}
+	batchSize := cfg.BatchSize
+	if batchSize <= 0 {
+		batchSize = defaultRetentionBatchSize
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			w.runRetentionOnce(ctx, storage, cfg, batchSize)
+		}
+	}
+}
+
+func (w *Worker) runRetentionOnce(ctx context.Context, storage retentionStorage, cfg RetentionConfig, batchSize int) {
+	if cfg.CompletedAfter > 0 {
+		w.deleteTerminalStatus(ctx, storage, core.StatusCompleted, cfg.CompletedAfter, batchSize)
+	}
+	if cfg.FailedAfter > 0 {
+		w.deleteTerminalStatus(ctx, storage, core.StatusFailed, cfg.FailedAfter, batchSize)
+		w.deleteTerminalStatus(ctx, storage, core.StatusCancelled, cfg.FailedAfter, batchSize)
+	}
+}
+
+func (w *Worker) deleteTerminalStatus(ctx context.Context, storage retentionStorage, status core.JobStatus, age time.Duration, batchSize int) {
+	for ctx.Err() == nil {
+		deleted, err := storage.DeleteTerminalJobsOlderThan(ctx, status, age, batchSize)
+		if err != nil {
+			if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+				w.logger.Warn("retention GC pass failed", "status", status, "error", err)
+			}
+			return
+		}
+		if deleted < int64(batchSize) {
+			return
+		}
+	}
 }
 
 // queuesWithCapacity returns queue names that haven't reached their concurrency limit.

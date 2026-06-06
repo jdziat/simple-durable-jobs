@@ -150,6 +150,11 @@ var schemaMigrations = []schemaMigration{
 		Name:    "rate_limit_windows",
 		Up:      migrateRateLimitWindows,
 	},
+	{
+		Version: 5,
+		Name:    "retention_terminal_index",
+		Up:      migrateRetentionTerminalIndex,
+	},
 }
 
 // applyPendingMigrations runs every migration whose version is absent from the
@@ -298,6 +303,25 @@ func migrateRateLimitWindows(ctx context.Context, db *gorm.DB, dialect string) e
 	default:
 		return db.Exec(
 			"CREATE INDEX IF NOT EXISTS idx_rate_limit_windows_lookup ON rate_limit_windows (limit_name, window_start)",
+		).Error
+	}
+}
+
+func migrateRetentionTerminalIndex(ctx context.Context, db *gorm.DB, dialect string) error {
+	switch dialect {
+	case dialectMySQL:
+		m := db.Migrator()
+		if !m.HasIndex(&core.Job{}, "idx_jobs_retention_terminal") {
+			if err := db.Exec(
+				"CREATE INDEX idx_jobs_retention_terminal ON jobs (status, completed_at)",
+			).Error; err != nil && !isBenignDDLError(err) {
+				return fmt.Errorf("create idx_jobs_retention_terminal: %w", err)
+			}
+		}
+		return nil
+	default:
+		return db.Exec(
+			"CREATE INDEX IF NOT EXISTS idx_jobs_retention_terminal ON jobs (status, completed_at) WHERE status IN ('completed','failed','cancelled') AND completed_at IS NOT NULL",
 		).Error
 	}
 }

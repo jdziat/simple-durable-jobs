@@ -15,6 +15,12 @@ const minStaleLockInterval = 1 * time.Second
 
 const maxDequeueBatch = 1000
 
+const (
+	defaultRetentionInterval  = time.Hour
+	minRetentionInterval      = 100 * time.Millisecond
+	defaultRetentionBatchSize = 1000
+)
+
 // WorkerOption configures a Worker.
 type WorkerOption interface {
 	ApplyWorker(*WorkerConfig)
@@ -29,6 +35,9 @@ type CapOption func(*ConcurrencyCapConfig)
 
 // RateLimitOption configures a fleet-wide rate limit.
 type RateLimitOption func(*RateLimitConfig)
+
+// RetentionOption configures automatic terminal-job retention.
+type RetentionOption func(*RetentionConfig)
 
 // ConcurrencyCapConfig describes a DB-backed concurrency cap. If Key is nil,
 // the cap is fleet-wide and uses Name as the slot name. If Key is set, the
@@ -48,6 +57,19 @@ type RateLimitConfig struct {
 	PerSecond float64
 	Window    time.Duration
 	Key       func(*core.Job) string
+}
+
+// RetentionConfig controls automatic deletion of old terminal jobs. A zero
+// per-status window keeps that status forever.
+type RetentionConfig struct {
+	CompletedAfter time.Duration
+	FailedAfter    time.Duration
+	Interval       time.Duration
+	BatchSize      int
+}
+
+func (c RetentionConfig) enabled() bool {
+	return c.CompletedAfter > 0 || c.FailedAfter > 0
 }
 
 // WorkerConfig holds worker configuration.
@@ -143,6 +165,10 @@ type WorkerConfig struct {
 	// claim in one polling round when the backend implements the optional batch
 	// dequeue capability. Default: 1 (single-row dequeue).
 	DequeueBatchSize int
+
+	// Retention configures optional automatic garbage collection for terminal
+	// jobs. It is disabled by default; zero per-status windows keep rows forever.
+	Retention RetentionConfig
 }
 
 // Concurrency sets the concurrency for a queue.
@@ -215,6 +241,70 @@ func RateLimit(name string, perSecond float64, opts ...RateLimitOption) WorkerOp
 		}
 		c.RateLimits = append(c.RateLimits, cfg)
 	})
+}
+
+// WithRetention enables optional automatic garbage collection of terminal jobs
+// when at least one per-status retention window is positive. With no positive
+// windows it is a no-op and starts no retention goroutine.
+func WithRetention(opts ...RetentionOption) WorkerOption {
+	return workerOptionFunc(func(c *WorkerConfig) {
+		cfg := c.Retention
+		for _, opt := range opts {
+			opt(&cfg)
+		}
+		if cfg.enabled() {
+			if cfg.Interval <= 0 {
+				cfg.Interval = defaultRetentionInterval
+			}
+			if cfg.Interval < minRetentionInterval {
+				cfg.Interval = minRetentionInterval
+			}
+			if cfg.BatchSize <= 0 {
+				cfg.BatchSize = defaultRetentionBatchSize
+			}
+		}
+		c.Retention = cfg
+	})
+}
+
+// RetentionCompletedAfter deletes completed jobs older than d. A non-positive
+// duration keeps completed jobs forever.
+func RetentionCompletedAfter(d time.Duration) RetentionOption {
+	return func(c *RetentionConfig) {
+		if d > 0 {
+			c.CompletedAfter = d
+		} else {
+			c.CompletedAfter = 0
+		}
+	}
+}
+
+// RetentionFailedAfter deletes terminal failed and cancelled jobs older than d.
+// A non-positive duration keeps failed/cancelled jobs forever.
+func RetentionFailedAfter(d time.Duration) RetentionOption {
+	return func(c *RetentionConfig) {
+		if d > 0 {
+			c.FailedAfter = d
+		} else {
+			c.FailedAfter = 0
+		}
+	}
+}
+
+// RetentionInterval sets the retention scan cadence. Non-positive values use
+// the default and very small positive values are clamped to a small floor.
+func RetentionInterval(d time.Duration) RetentionOption {
+	return func(c *RetentionConfig) {
+		c.Interval = d
+	}
+}
+
+// RetentionBatchSize sets the maximum rows deleted in one pass. Non-positive
+// values use the default.
+func RetentionBatchSize(n int) RetentionOption {
+	return func(c *RetentionConfig) {
+		c.BatchSize = n
+	}
 }
 
 // WithQueueRateLimit limits dequeue admission for one queue in this worker

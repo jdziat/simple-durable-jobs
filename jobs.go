@@ -151,6 +151,12 @@ type (
 	// RateLimitOption configures a RateLimit.
 	RateLimitOption = worker.RateLimitOption
 
+	// RetentionConfig controls automatic terminal-job retention.
+	RetentionConfig = worker.RetentionConfig
+
+	// RetentionOption configures automatic terminal-job retention.
+	RetentionOption = worker.RetentionOption
+
 	// RetryConfig holds configuration for retry with backoff.
 	RetryConfig = worker.RetryConfig
 
@@ -520,6 +526,33 @@ func RateLimit(name string, perSecond float64, opts ...RateLimitOption) WorkerOp
 // RateLimitKey derives the per-key partition for a RateLimit.
 func RateLimitKey(fn func(*Job) string) RateLimitOption {
 	return worker.RateLimitKey(fn)
+}
+
+// WithRetention enables optional automatic garbage collection of terminal jobs.
+func WithRetention(opts ...RetentionOption) WorkerOption {
+	return worker.WithRetention(opts...)
+}
+
+// RetentionCompletedAfter deletes completed jobs older than d. A non-positive
+// duration keeps completed jobs forever.
+func RetentionCompletedAfter(d time.Duration) RetentionOption {
+	return worker.RetentionCompletedAfter(d)
+}
+
+// RetentionFailedAfter deletes terminal failed and cancelled jobs older than d.
+// A non-positive duration keeps failed/cancelled jobs forever.
+func RetentionFailedAfter(d time.Duration) RetentionOption {
+	return worker.RetentionFailedAfter(d)
+}
+
+// RetentionInterval sets the retention scan cadence.
+func RetentionInterval(d time.Duration) RetentionOption {
+	return worker.RetentionInterval(d)
+}
+
+// RetentionBatchSize sets the maximum rows deleted in one pass.
+func RetentionBatchSize(n int) RetentionOption {
+	return worker.RetentionBatchSize(n)
 }
 
 // WithQueueRateLimit applies a per-worker token bucket before dequeueing from
