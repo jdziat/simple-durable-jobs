@@ -148,9 +148,11 @@ func seedE2EData(ctx context.Context, store *storage.GormStorage, db *gorm.DB) e
 		completedAt := startedAt.Add(30 * time.Second)
 		var deadLetteredAt *time.Time
 		deadLetterReason := ""
-		if i == 0 {
+		// e2e-failed-003 is the dead-lettered fixture (no e2e test mutates it,
+		// so the DLQ badge/filter/panel assertions stay stable across the run).
+		if i == 2 {
 			deadLetteredAt = &completedAt
-			deadLetterReason = "max retries exhausted: connection timeout after 30s"
+			deadLetterReason = "max retries exhausted: " + failedErrors[i]
 		}
 		failedJobs[i] = &core.Job{
 			ID:               fmt.Sprintf("e2e-failed-%03d", i+1),

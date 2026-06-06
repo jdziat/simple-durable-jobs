@@ -47,6 +47,8 @@ test.describe('Job Detail', () => {
     await expect(errorBox).toBeVisible()
     await expect(errorBox.locator('h4')).toHaveText('Last Error')
     await expect(errorBox.locator('pre')).toContainText('connection timeout')
+    // A plain failed job (no dead_lettered_at) shows no dead-letter panel.
+    await expect(page.locator('.dead-letter-box')).toHaveCount(0)
   })
 
   test('shows arguments section', async ({ page }) => {
@@ -96,5 +98,23 @@ test.describe('Job Detail', () => {
     page.on('dialog', dialog => dialog.accept())
     await page.locator('.actions .btn-delete').click()
     await expect(page).toHaveURL(/#\/jobs$/)
+  })
+
+  test('shows dead-letter status and panel for a dead-lettered job', async ({ page }) => {
+    await page.goto(`/#/jobs/${JOBS.DEADLETTERED_1}`)
+    await page.waitForSelector('.job-detail .header', { timeout: 10000 })
+
+    // The header status badge reads "Dead-lettered" (driven by dead_lettered_at,
+    // not the underlying 'failed' status).
+    await expect(page.locator('.header .status')).toHaveText('Dead-lettered')
+
+    // A dedicated dead-letter panel shows the reason.
+    const dlBox = page.locator('.dead-letter-box')
+    await expect(dlBox).toBeVisible()
+    await expect(dlBox.locator('h4')).toHaveText('Dead-letter')
+    await expect(dlBox.locator('pre')).toContainText('max retries exhausted')
+
+    // Cancel is for running jobs only; a terminal dead-lettered job must not show it.
+    await expect(page.locator('.actions .btn-cancel')).toHaveCount(0)
   })
 })
