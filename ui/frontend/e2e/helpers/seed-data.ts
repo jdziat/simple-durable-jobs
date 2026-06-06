@@ -12,6 +12,7 @@ export const JOBS = {
   COMPLETED_2: 'e2e-completed-002',
   FAILED_1: 'e2e-failed-001',
   FAILED_2: 'e2e-failed-002',
+  DEADLETTERED_1: 'e2e-failed-001',
   PAUSED_1: 'e2e-paused-001',
   PAUSED_2: 'e2e-paused-002',
   CANCELLED_1: 'e2e-cancelled-001',

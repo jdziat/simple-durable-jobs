@@ -191,12 +191,14 @@ func (m *mockStorage) GetCheckpoints(ctx context.Context, jobID string) ([]core.
 
 type mockUIStorage struct {
 	mockStorage
-	getQueueStatsFn    func(ctx context.Context) ([]*jobsv1.QueueStats, error)
-	searchJobsFn       func(ctx context.Context, f JobFilter) ([]*core.Job, int64, error)
-	retryJobFn         func(ctx context.Context, id string) (*core.Job, error)
-	deleteJobFn        func(ctx context.Context, id string) error
-	purgeJobsFn        func(ctx context.Context, queue string, status core.JobStatus) (int64, error)
-	getWorkflowRootsFn func(ctx context.Context, status string, limit, offset int) ([]*core.Job, int64, error)
+	getQueueStatsFn     func(ctx context.Context) ([]*jobsv1.QueueStats, error)
+	searchJobsFn        func(ctx context.Context, f JobFilter) ([]*core.Job, int64, error)
+	listDeadLetteredFn  func(ctx context.Context, f core.DeadLetterFilter) ([]*core.Job, error)
+	countDeadLetteredFn func(ctx context.Context, f core.DeadLetterFilter) (int64, error)
+	retryJobFn          func(ctx context.Context, id string) (*core.Job, error)
+	deleteJobFn         func(ctx context.Context, id string) error
+	purgeJobsFn         func(ctx context.Context, queue string, status core.JobStatus) (int64, error)
+	getWorkflowRootsFn  func(ctx context.Context, status string, limit, offset int) ([]*core.Job, int64, error)
 }
 
 func (m *mockUIStorage) GetQueueStats(ctx context.Context) ([]*jobsv1.QueueStats, error) {
@@ -211,6 +213,20 @@ func (m *mockUIStorage) SearchJobs(ctx context.Context, f JobFilter) ([]*core.Jo
 		return m.searchJobsFn(ctx, f)
 	}
 	return nil, 0, nil
+}
+
+func (m *mockUIStorage) ListDeadLettered(ctx context.Context, f core.DeadLetterFilter) ([]*core.Job, error) {
+	if m.listDeadLetteredFn != nil {
+		return m.listDeadLetteredFn(ctx, f)
+	}
+	return nil, nil
+}
+
+func (m *mockUIStorage) CountDeadLettered(ctx context.Context, f core.DeadLetterFilter) (int64, error) {
+	if m.countDeadLetteredFn != nil {
+		return m.countDeadLetteredFn(ctx, f)
+	}
+	return 0, nil
 }
 
 func (m *mockUIStorage) RetryJob(ctx context.Context, id string) (*core.Job, error) {
@@ -862,6 +878,44 @@ func TestListJobs_FilterForwarded(t *testing.T) {
 	assert.Equal(t, 40, capturedFilter.Offset) // page 3, limit 20 → offset 40
 }
 
+func TestListJobs_DeadLetteredFilterUsesDLQQueries(t *testing.T) {
+	deadLetteredAt := time.Now()
+	job := sampleJob("j1", "emails", "send-email", core.StatusFailed)
+	job.DeadLetteredAt = &deadLetteredAt
+	job.DeadLetterReason = "max retries exhausted: smtp timeout"
+
+	var capturedFilter core.DeadLetterFilter
+	store := &mockUIStorage{
+		listDeadLetteredFn: func(_ context.Context, f core.DeadLetterFilter) ([]*core.Job, error) {
+			capturedFilter = f
+			return []*core.Job{job}, nil
+		},
+		countDeadLetteredFn: func(_ context.Context, f core.DeadLetterFilter) (int64, error) {
+			assert.Equal(t, capturedFilter, f)
+			return 1, nil
+		},
+	}
+	svc := newServiceWithUIStorage(store)
+
+	resp, err := svc.ListJobs(context.Background(), connect.NewRequest(&jobsv1.ListJobsRequest{
+		Limit:  20,
+		Page:   2,
+		Status: statusDeadLetteredUI,
+		Queue:  "emails",
+		Type:   "send-email",
+	}))
+
+	require.NoError(t, err)
+	require.Len(t, resp.Msg.Jobs, 1)
+	assert.Equal(t, int64(1), resp.Msg.Total)
+	assert.Equal(t, "emails", capturedFilter.Queue)
+	assert.Equal(t, "send-email", capturedFilter.Type)
+	assert.Equal(t, 20, capturedFilter.Limit)
+	assert.Equal(t, 20, capturedFilter.Offset)
+	assert.NotNil(t, resp.Msg.Jobs[0].DeadLetteredAt)
+	assert.Equal(t, "max retries exhausted: smtp timeout", resp.Msg.Jobs[0].DeadLetterReason)
+}
+
 func TestListJobs_UIStorageError(t *testing.T) {
 	store := &mockUIStorage{
 		searchJobsFn: func(_ context.Context, _ JobFilter) ([]*core.Job, int64, error) {
@@ -1383,6 +1437,23 @@ func TestJobToProto_OptionalFieldsSet(t *testing.T) {
 	assert.NotNil(t, pb.RunAt)
 	assert.Equal(t, "oops", pb.LastError)
 	assert.Equal(t, []byte(`{"x":1}`), pb.Args)
+}
+
+func TestJobToProto_DeadLetterFields(t *testing.T) {
+	deadLetteredAt := time.Now()
+	deadLettered := sampleJob("j1", "default", "work", core.StatusFailed)
+	deadLettered.DeadLetteredAt = &deadLetteredAt
+	deadLettered.DeadLetterReason = "max retries exhausted: boom"
+
+	pb := jobToProto(deadLettered)
+	require.NotNil(t, pb.DeadLetteredAt)
+	assert.Equal(t, deadLetteredAt.Unix(), pb.DeadLetteredAt.AsTime().Unix())
+	assert.Equal(t, "max retries exhausted: boom", pb.DeadLetterReason)
+
+	notDeadLettered := sampleJob("j2", "default", "work", core.StatusFailed)
+	pb = jobToProto(notDeadLettered)
+	assert.Nil(t, pb.DeadLetteredAt)
+	assert.Empty(t, pb.DeadLetterReason)
 }
 
 func TestJobToProto_RedactsPayloadsWithoutTruncating(t *testing.T) {

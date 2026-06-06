@@ -61,6 +61,8 @@ message Job {
   optional string fan_out_id = 16;
   int32 fan_out_index = 17;
   bytes result = 18;
+  optional google.protobuf.Timestamp dead_lettered_at = 19;
+  string dead_letter_reason = 20;
 }
 
 message Checkpoint {

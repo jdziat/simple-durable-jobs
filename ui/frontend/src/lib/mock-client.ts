@@ -134,6 +134,8 @@ interface MockJob {
   createdAt: Date
   startedAt: Date | null
   completedAt: Date | null
+  deadLetteredAt?: Date
+  deadLetterReason?: string
   parentJobId?: string
   rootJobId?: string
   fanOutId?: string
@@ -191,6 +193,8 @@ function makeJob(overrides: Partial<MockJob> = {}): MockJob {
     completedAt: overrides.completedAt !== undefined
       ? overrides.completedAt
       : (['completed', 'failed'].includes(status as string) ? new Date(createdAt.getTime() + randInt(10, 300) * 1000) : null),
+    deadLetteredAt: overrides.deadLetteredAt,
+    deadLetterReason: overrides.deadLetterReason ?? '',
     parentJobId: overrides.parentJobId,
     rootJobId: overrides.rootJobId,
     fanOutId: overrides.fanOutId,
@@ -212,6 +216,21 @@ function seedJobs(): void {
       jobs.push(makeJob({ status }))
     }
   }
+
+  const deadLetteredAt = minutesAgo(18)
+  jobs.push(makeJob({
+    id: 'job_demo_dead_lettered',
+    type: 'send-webhook',
+    queue: 'critical',
+    status: 'failed',
+    attempt: 3,
+    maxRetries: 3,
+    createdAt: minutesAgo(28),
+    completedAt: deadLetteredAt,
+    lastError: 'HTTP 503 Service Unavailable',
+    deadLetteredAt,
+    deadLetterReason: 'max retries exhausted: HTTP 503 Service Unavailable',
+  }))
 }
 
 // Seed history points (last 60 minutes, one point per minute)
@@ -618,8 +637,12 @@ function tick(): void {
       // ~10% chance of failure
       j.status = 'failed'
       j.lastError = pick(ERROR_MESSAGES)
+      j.deadLetteredAt = undefined
+      j.deadLetterReason = ''
     } else {
       j.status = 'completed'
+      j.deadLetteredAt = undefined
+      j.deadLetterReason = ''
     }
     j.completedAt = new Date()
   }
@@ -685,6 +708,8 @@ function toProtoJob(j: MockJob): Job {
     createdAt: ts(j.createdAt),
     startedAt: j.startedAt ? ts(j.startedAt) : undefined,
     completedAt: j.completedAt ? ts(j.completedAt) : undefined,
+    deadLetteredAt: j.deadLetteredAt ? ts(j.deadLetteredAt) : undefined,
+    deadLetterReason: j.deadLetterReason ?? '',
     parentJobId: j.parentJobId,
     rootJobId: j.rootJobId,
     fanOutId: j.fanOutId,
@@ -809,7 +834,11 @@ export const mockJobsClient = {
     ensureSimulation()
 
     let filtered = [...jobs, ...workflowJobs]
-    if (req.status) filtered = filtered.filter((j) => j.status === req.status)
+    if (req.status === 'dead-lettered') {
+      filtered = filtered.filter((j) => j.deadLetteredAt)
+    } else if (req.status) {
+      filtered = filtered.filter((j) => j.status === req.status)
+    }
     if (req.queue) filtered = filtered.filter((j) => j.queue === req.queue)
     if (req.type) filtered = filtered.filter((j) => j.type === req.type)
     if (req.search) {
@@ -864,6 +893,8 @@ export const mockJobsClient = {
       j.lastError = ''
       j.startedAt = null
       j.completedAt = null
+      j.deadLetteredAt = undefined
+      j.deadLetterReason = ''
       j.attempt = 0
     }
     return new RetryJobResponse({
@@ -891,6 +922,8 @@ export const mockJobsClient = {
       j.status = 'cancelled'
       j.lastError = 'cancelled by user'
       j.completedAt = new Date()
+      j.deadLetteredAt = undefined
+      j.deadLetterReason = ''
     }
     return new CancelJobResponse({
       job: j ? toProtoJob(j) : undefined,

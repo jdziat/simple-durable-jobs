@@ -12,6 +12,7 @@
     attempt: number
     maxRetries: number
     createdAt: Date | null
+    deadLetteredAt: Date | null
     lastError: string
   }
 
@@ -73,6 +74,7 @@
         attempt: j.attempt,
         maxRetries: j.maxRetries,
         createdAt: j.createdAt?.toDate() ?? null,
+        deadLetteredAt: j.deadLetteredAt?.toDate() ?? null,
         lastError: j.lastError,
       }))
       total = Number(response.total)
@@ -169,6 +171,7 @@
       <option value="running">Running</option>
       <option value="completed">Completed</option>
       <option value="failed">Failed</option>
+      <option value="dead-lettered">Dead-lettered</option>
       <option value="paused">Paused</option>
       <option value="cancelled">Cancelled</option>
       <option value="waiting">Waiting</option>
@@ -224,7 +227,11 @@
             <td>{job.type}</td>
             <td>{job.queue}</td>
             <td>
-              <span class="status status-{job.status}">{job.status}</span>
+              {#if job.deadLetteredAt}
+                <span class="status status-dead-lettered">Dead-lettered</span>
+              {:else}
+                <span class="status status-{job.status}">{job.status}</span>
+              {/if}
             </td>
             <td>{job.attempt}/{job.maxRetries}</td>
             <td>{job.createdAt?.toLocaleString() ?? '-'}</td>
@@ -356,6 +363,7 @@
   .status-running { background: #dbeafe; color: #1e40af; }
   .status-completed { background: #d1fae5; color: #065f46; }
   .status-failed { background: #fee2e2; color: #991b1b; }
+  .status-dead-lettered { background: #3f1d1d; color: #fee2e2; }
   .status-paused { background: #fef9c3; color: #854d0e; }
   .status-cancelled { background: #fce7f3; color: #9d174d; }
   .status-waiting { background: #e0e7ff; color: #3730a3; }

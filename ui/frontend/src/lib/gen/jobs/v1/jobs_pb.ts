@@ -100,6 +100,16 @@ export class Job extends Message<Job> {
    */
   result = new Uint8Array(0);
 
+  /**
+   * @generated from field: optional google.protobuf.Timestamp dead_lettered_at = 19;
+   */
+  deadLetteredAt?: Timestamp;
+
+  /**
+   * @generated from field: string dead_letter_reason = 20;
+   */
+  deadLetterReason = "";
+
   constructor(data?: PartialMessage<Job>) {
     super();
     proto3.util.initPartial(data, this);
@@ -126,6 +136,8 @@ export class Job extends Message<Job> {
     { no: 16, name: "fan_out_id", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
     { no: 17, name: "fan_out_index", kind: "scalar", T: 5 /* ScalarType.INT32 */ },
     { no: 18, name: "result", kind: "scalar", T: 12 /* ScalarType.BYTES */ },
+    { no: 19, name: "dead_lettered_at", kind: "message", T: Timestamp, opt: true },
+    { no: 20, name: "dead_letter_reason", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): Job {

@@ -45,6 +45,12 @@ bin/
 # Track embedded UI assets (required for go:embed)
 !ui/frontend/dist/
 
+# Local-only frontend codegen convenience (lets `cd ui/frontend && buf generate`
+# resolve ../proto). Not required to build: the TS client in src/lib/gen and the
+# embedded dist are committed. Intentionally untracked.
+ui/frontend/buf.yaml
+ui/frontend/proto
+
 # Hugo build output
 public/
 resources/
