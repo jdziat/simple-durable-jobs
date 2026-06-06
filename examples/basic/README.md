@@ -12,7 +12,7 @@ This example demonstrates fire-and-forget job processing with Simple Durable Job
 
 ## Prerequisites
 
-- Go 1.21+
+- Go 1.25+
 - No external services needed (uses SQLite)
 
 ## Running

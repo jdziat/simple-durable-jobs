@@ -59,11 +59,12 @@ resources/
 # Temporary files
 tmp/
 temp/
+bench-results/
 
 # UI frontend
 ui/frontend/node_modules/
 ui/frontend/demo-dist/
-static/demo/
+docs/static/demo/
 
 # Playwright
 ui/frontend/playwright-report/

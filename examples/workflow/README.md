@@ -12,7 +12,7 @@ This example demonstrates multi-step workflows with automatic checkpointing and 
 
 ## Prerequisites
 
-- Go 1.21+
+- Go 1.25+
 - No external services needed (uses SQLite)
 
 ## Running

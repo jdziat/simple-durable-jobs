@@ -11,7 +11,7 @@ This example demonstrates running multiple workers that process jobs from a shar
 
 ## Prerequisites
 
-- Go 1.21+
+- Go 1.25+
 - No external services needed for the demo (uses SQLite with WAL mode)
 - For production: PostgreSQL recommended for proper concurrent access
 

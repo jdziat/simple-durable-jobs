@@ -22,6 +22,8 @@ New optional storage capabilities are added as **optional interfaces**
 (discovered via type assertion), never as new required methods on
 `core.Storage`, so custom backends keep compiling.
 
+CI runs an API-compatibility gate against the latest released `v1` module.
+
 ## Deprecations
 
 Deprecated API stays and keeps working for the remainder of the current major

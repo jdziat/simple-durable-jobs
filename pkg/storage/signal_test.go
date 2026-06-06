@@ -128,6 +128,30 @@ func TestGetSignalWaitingJobsToResume(t *testing.T) {
 	assert.False(t, ids["fanout-parent"], "a parent waiting on a pending fan-out must not be signal-resumed")
 }
 
+func TestGetSignalWaitingJobsToResumeAfter_KeysetPagesInIDOrder(t *testing.T) {
+	s := newTestStorage(t)
+	ctx := context.Background()
+
+	for _, id := range []string{"a", "b", "c", "d"} {
+		require.NoError(t, s.db.WithContext(ctx).Create(&core.Job{
+			ID: id, Type: "wf", Queue: "default", Status: core.StatusWaiting,
+		}).Error)
+		require.NoError(t, s.SendSignal(ctx, id, "ctx", []byte(`1`)))
+	}
+
+	first, err := s.GetSignalWaitingJobsToResumeAfter(ctx, "", 2)
+	require.NoError(t, err)
+	require.Len(t, first, 2)
+	assert.Equal(t, "a", first[0].ID)
+	assert.Equal(t, "b", first[1].ID)
+
+	second, err := s.GetSignalWaitingJobsToResumeAfter(ctx, first[1].ID, 2)
+	require.NoError(t, err)
+	require.Len(t, second, 2)
+	assert.Equal(t, "c", second[0].ID)
+	assert.Equal(t, "d", second[1].ID)
+}
+
 func TestResumeSignalWaitingJob(t *testing.T) {
 	s := newTestStorage(t)
 	ctx := context.Background()

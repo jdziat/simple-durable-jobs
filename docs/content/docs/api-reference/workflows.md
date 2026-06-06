@@ -33,6 +33,23 @@ Retrieves a previously saved phase checkpoint. Returns the result and true if fo
 
 ---
 
+## Durable Timers
+
+### `Sleep(ctx context.Context, d time.Duration) error`
+
+### `SleepUntil(ctx context.Context, t time.Time) error`
+
+Durable timers suspend the current workflow until the duration has elapsed or
+the target time is reached. The job moves to `waiting`, stores its wake deadline
+in `run_at`, frees the worker slot, and can be resumed by any worker after a
+crash or deploy. Wakeups are coarse: the worker polling backstop detects elapsed
+timers at about 5-second granularity, then normal dispatch picks the job up.
+
+See [Durable Timers]({{< relref "/docs/advanced/durable-timers" >}}) for replay
+rules, signal isolation, and examples.
+
+---
+
 ## Fan-Out/Fan-In
 
 ### `Sub(jobType string, args any, opts ...Option) SubJob`

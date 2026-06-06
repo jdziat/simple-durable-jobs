@@ -5,6 +5,9 @@
 Security fixes are applied to the latest `1.x` release line. Pin a released tag
 (`v1.x.y`) rather than tracking `main`.
 
+CI runs `govulncheck` against the root module on every pull request and on
+pushes to `main`; the release job depends on it, so a finding blocks the tag.
+
 ## Reporting a vulnerability
 
 Please report security issues **privately** — do not open a public GitHub issue.

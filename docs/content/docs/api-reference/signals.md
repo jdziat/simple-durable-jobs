@@ -39,8 +39,8 @@ err := jobs.Signal(ctx, queue, agentJobID, "ctx", map[string]any{
 
 - Payload is JSON-marshalled (subject to the same size limit as job results).
 - Returns `ErrJobNotFound` if the job does not exist, `ErrStorageNoSignals` if
-  the backend lacks signal support, or `ErrSignalNameTooLong` if `name` exceeds
-  the limit.
+  the backend lacks signal support, `ErrSignalNameReserved` if `name` starts
+  with `_`, or `ErrSignalNameTooLong` if `name` exceeds the limit.
 - Sending to a **terminal** job (completed/failed/cancelled) stores the signal
   but it is never consumed; it is cleaned up when the job is deleted.
 
@@ -161,6 +161,7 @@ a delivered signal resumes a waiting job, the job re-runs and emits the usual
 |-------|------|
 | `ErrJobNotFound` | `Signal` targets a job that doesn't exist |
 | `ErrStorageNoSignals` | backend doesn't implement the signal capability |
+| `ErrSignalNameReserved` | signal `name` starts with `_`; this namespace is reserved for library internals such as durable timers, and applies on both send and consume sides |
 | `ErrSignalNameTooLong` | signal `name` exceeds `MaxSignalNameLength` (255) |
 
 Payloads are bounded by the same maximum-result-size limit as job results.

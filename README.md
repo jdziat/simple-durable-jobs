@@ -45,6 +45,9 @@ for the full contract, backend support tiers, and crash-recovery tuning.
 - [Getting Started](https://jdziat.github.io/simple-durable-jobs/docs/getting-started/)
 - [API Reference](https://jdziat.github.io/simple-durable-jobs/docs/api-reference/)
 - [Examples](https://jdziat.github.io/simple-durable-jobs/docs/examples/)
+- [Benchmarks](https://jdziat.github.io/simple-durable-jobs/docs/benchmarks/) - Measured numbers, methodology, and throughput tuning
+- [Choosing a Job System](https://jdziat.github.io/simple-durable-jobs/docs/comparison/) - An honest comparison vs River, Temporal, and Asynq
+- [Migrating from River](https://jdziat.github.io/simple-durable-jobs/docs/migrating-from-river/) / [Migrating from Asynq](https://jdziat.github.io/simple-durable-jobs/docs/migrating-from-asynq/)
 - [Embedded Web UI](https://jdziat.github.io/simple-durable-jobs/docs/embedded-ui/)
 - [Live Demo](https://jdziat.github.io/simple-durable-jobs/docs/live-demo/)
 - [Guarantees & Production Readiness](https://jdziat.github.io/simple-durable-jobs/docs/advanced/guarantees/) - Execution semantics, backend tiers, crash-recovery tuning
@@ -55,6 +58,7 @@ for the full contract, backend support tiers, and crash-recovery tuning.
 - **Background Jobs** - Fire-and-forget task processing
 - **Durable Workflows** - Multi-step workflows with automatic checkpointing
 - **Durable Signals** - send/wait/check/drain for cross-job and external coordination
+- **Durable Timers** - Sleep and SleepUntil pause workflows without occupying worker slots
 - **Fan-Out/Fan-In** - Spawn parallel sub-jobs, wait for results, aggregate
 - **Crash Recovery** - Jobs resume from the last successful checkpoint
 - **Pause / Resume / Cancel** - Pause, resume, or cancel jobs, queues, or workers (graceful or aggressive); first-class cancel verb across facade, RPC, and dashboard
@@ -101,10 +105,10 @@ import (
 )
 
 func main() {
-    // Setup database. The SQLite DSN parameters (WAL + busy_timeout + immediate
-    // transactions) are required for safe concurrent workers — without them,
-    // concurrent writes transiently fail with SQLITE_BUSY/SQLITE_READONLY.
-    db, _ := gorm.Open(sqlite.Open("jobs.db?_journal_mode=WAL&_busy_timeout=5000&_txlock=immediate"), &gorm.Config{})
+    // Setup database. SafeSQLiteDSN adds the DSN parameters (WAL + busy_timeout
+    // + immediate transactions) required for safe concurrent workers — without
+    // them, concurrent writes transiently fail with SQLITE_BUSY/SQLITE_READONLY.
+    db, _ := gorm.Open(sqlite.Open(jobs.SafeSQLiteDSN("jobs.db")), &gorm.Config{})
     storage := jobs.NewGormStorage(db)
     storage.Migrate(context.Background())
 
@@ -296,16 +300,16 @@ The dashboard provides:
 
 ```go
 // Run every 5 minutes
-queue.Schedule("cleanup", jobs.Every(5 * time.Minute))
+queue.Schedule("cleanup", nil, jobs.Every(5 * time.Minute))
 
 // Run daily at 9:00 AM
-queue.Schedule("daily-report", jobs.Daily(9, 0))
+queue.Schedule("daily-report", nil, jobs.Daily(9, 0))
 
 // Run weekly on Sunday at 2:00 AM
-queue.Schedule("backup", jobs.Weekly(time.Sunday, 2, 0))
+queue.Schedule("backup", nil, jobs.Weekly(time.Sunday, 2, 0))
 
 // Use cron expressions
-queue.Schedule("hourly-check", jobs.Cron("0 * * * *"))
+queue.Schedule("hourly-check", nil, jobs.Cron("0 * * * *"))
 
 // Start worker with scheduler enabled
 worker := queue.NewWorker(jobs.WithScheduler(true))
@@ -434,9 +438,7 @@ The library is organized into a layered architecture with a clean facade:
 simple-durable-jobs/
 ├── jobs.go                    # Root facade - import this package
 ├── pause.go                   # Standalone pause/resume functions
-├── hugo.toml                  # Documentation site config (Hextra theme)
-├── content/                   # Hugo documentation pages
-├── layouts/                   # Hugo layout overrides
+├── docs/                      # Documentation site (Hugo + Hextra theme, own go.mod)
 ├── pkg/
 │   ├── core/                  # Domain models (Job, FanOut, Storage, Event, errors)
 │   ├── storage/               # GormStorage implementation
@@ -473,6 +475,11 @@ All public types and functions are re-exported through the facade for a clean AP
 - [Workflows](./examples/workflow/) - Multi-step durable workflows
 - [Scheduled Jobs](./examples/scheduled/) - Recurring job scheduling
 - [Distributed](./examples/distributed/) - Multiple workers
+- [Durable Agent](./examples/agent/) - AI-agent loop with checkpointed LLM steps, durable sleep, and a human approval gate
+- [Signals](./examples/signals/) - Human-in-the-loop approval via durable signals
+- [Transactional Enqueue](./examples/transactional-enqueue/) - Outbox pattern with a caller-supplied transaction
+- [Metrics](./examples/metrics/) - Prometheus exporter wired and scraped
+- [Rate Limiting](./examples/ratelimit/) - Queue rate limits and per-key concurrency caps
 
 ## License
 

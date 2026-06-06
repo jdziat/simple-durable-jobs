@@ -17,6 +17,10 @@ Welcome to the **Simple Durable Jobs** documentation — a Go library for durabl
   {{< card link="examples/" title="Examples" icon="code" subtitle="Copy-paste-runnable examples: workflows, fan-out/fan-in, scheduling, priorities, error handling, and more." >}}
   {{< card link="embedded-ui/" title="Embedded Web UI" icon="chart-bar" subtitle="Mount the real-time monitoring dashboard into your own HTTP server." >}}
   {{< card link="live-demo/" title="Live Demo" icon="play" subtitle="Try the dashboard in your browser on simulated data — no backend required." >}}
+  {{< card link="benchmarks/" title="Benchmarks" icon="chart-bar" subtitle="Measured enqueue, end-to-end, workflow, and dispatch-latency results with reproduction commands." >}}
+  {{< card link="comparison/" title="Choosing a Job System" icon="scale" subtitle="Honest comparison with River, Temporal, and Asynq, including where each is stronger." >}}
+  {{< card link="migrating-from-river/" title="Migrating from River" icon="database" subtitle="Map River clients, workers, transactional inserts, unique jobs, and schedules to this library." >}}
+  {{< card link="migrating-from-asynq/" title="Migrating from Asynq" icon="switch-horizontal" subtitle="Move Redis-backed task concepts to SQL-backed jobs, workers, delays, and schedules." >}}
 {{< /cards >}}
 
 ## Reference
@@ -24,4 +28,6 @@ Welcome to the **Simple Durable Jobs** documentation — a Go library for durabl
 {{< cards >}}
   {{< card link="api-reference/" title="API Reference" icon="book-open" subtitle="Complete type and method reference: Queue, Worker, durable Calls, fan-out, options, events, and storage." >}}
   {{< card link="advanced/" title="Advanced Topics" icon="cog" subtitle="Production features: transactional enqueue, dead-letter queue, retention/GC, rate limiting, concurrency caps, metrics, workflow versioning, payload codec, dashboard authorization, testing utilities, and tuning knobs." >}}
+  {{< card link="advanced/multi-tenancy/" title="Multi-tenancy" icon="users" subtitle="Tenant-scoped queues, per-key caps, rate limits, metrics labels, and dashboard filtering without schema isolation." >}}
+  {{< card link="advanced/sql-interop/" title="SQL Interop" icon="terminal" subtitle="Minimal INSERT-only contract for enqueueing pending jobs from non-Go producers." >}}
 {{< /cards >}}

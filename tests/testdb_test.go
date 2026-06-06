@@ -83,7 +83,7 @@ func openIntegrationDB(t *testing.T) *gorm.DB {
 	// worker retry budget and dropping a job from the completed set. WAL +
 	// busy_timeout (applied to every pooled connection via the DSN, unlike a
 	// one-shot PRAGMA) + txlock=immediate serialize writers cleanly.
-	db, err := gorm.Open(sqlite.Open(dbPath+"?_journal_mode=WAL&_busy_timeout=5000&_txlock=immediate"), &gorm.Config{
+	db, err := gorm.Open(sqlite.Open(jobs.SafeSQLiteDSN(dbPath)), &gorm.Config{
 		Logger: logger.Default.LogMode(logger.Silent),
 	})
 	require.NoError(t, err, "open sqlite integration db")
@@ -113,7 +113,7 @@ func cleanupExternalIntegrationDB(t *testing.T, db *gorm.DB) {
 	// scheduled_fires and leases hold per-test state (scheduler anchor, recovery
 	// lease); clean them too so integration tests are isolated on a persistent
 	// external DB. schema_migrations is intentionally left (migration ledger).
-	tables := []string{"checkpoints", "fan_outs", "queue_states", "jobs", "scheduled_fires", "leases"}
+	tables := []string{"signals", "checkpoints", "fan_outs", "queue_states", "jobs", "scheduled_fires", "leases"}
 	for _, tbl := range tables {
 		db.Exec("DELETE FROM " + tbl)
 	}
