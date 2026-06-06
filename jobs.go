@@ -5,9 +5,9 @@
 //
 // Basic usage:
 //
-//	// Create storage and queue. The SQLite DSN parameters are required for safe
-//	// concurrent workers (WAL + busy_timeout + immediate transactions).
-//	db, _ := gorm.Open(sqlite.Open("jobs.db?_journal_mode=WAL&_busy_timeout=5000&_txlock=immediate"), &gorm.Config{})
+//	// Create storage and queue. SafeSQLiteDSN applies the recommended SQLite
+//	// settings for file-based databases used by this library.
+//	db, _ := gorm.Open(sqlite.Open(jobs.SafeSQLiteDSN("jobs.db")), &gorm.Config{})
 //	store := jobs.NewGormStorage(db)
 //	store.Migrate(context.Background())
 //	queue := jobs.New(store)
@@ -29,6 +29,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"gorm.io/gorm"
@@ -316,9 +317,31 @@ var (
 	NopCodec      = core.NopCodec
 )
 
+const safeSQLiteDSNQuery = "_journal_mode=WAL&_busy_timeout=5000&_txlock=immediate"
+
 // New creates a new Queue with the given storage backend.
 func New(s Storage) *Queue {
 	return queue.New(s)
+}
+
+// SafeSQLiteDSN returns path with the recommended SQLite DSN parameters for
+// any file-based SQLite use of this library. It is not applicable to :memory:
+// databases.
+//
+// WAL lets readers proceed without blocking the single writer. busy_timeout=5000
+// makes SQLite wait up to 5 seconds for a lock instead of returning SQLITE_BUSY
+// immediately. _txlock=immediate takes the write lock at BEGIN, avoiding
+// deferred-transaction lock upgrade deadlocks under concurrent workers.
+func SafeSQLiteDSN(path string) string {
+	sep := "?"
+	if strings.Contains(path, "?") {
+		sep = "&"
+	}
+	// A path already ending in "?" or "&" needs no separator at all.
+	if strings.HasSuffix(path, "?") || strings.HasSuffix(path, "&") {
+		sep = ""
+	}
+	return path + sep + safeSQLiteDSNQuery
 }
 
 // NewGormStorage creates a new GORM-backed storage.

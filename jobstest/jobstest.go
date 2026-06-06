@@ -46,9 +46,7 @@ func defaultFixtureConfig() fixtureConfig {
 		gormConfig: &gorm.Config{
 			Logger: logger.Default.LogMode(logger.Silent),
 		},
-		sqliteDSNFunc: func(dbPath string) string {
-			return dbPath + "?_journal_mode=WAL&_busy_timeout=5000&_txlock=immediate"
-		},
+		sqliteDSNFunc: jobs.SafeSQLiteDSN,
 	}
 }
 

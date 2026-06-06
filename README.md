@@ -101,10 +101,10 @@ import (
 )
 
 func main() {
-    // Setup database. The SQLite DSN parameters (WAL + busy_timeout + immediate
-    // transactions) are required for safe concurrent workers — without them,
-    // concurrent writes transiently fail with SQLITE_BUSY/SQLITE_READONLY.
-    db, _ := gorm.Open(sqlite.Open("jobs.db?_journal_mode=WAL&_busy_timeout=5000&_txlock=immediate"), &gorm.Config{})
+    // Setup database. SafeSQLiteDSN adds the DSN parameters (WAL + busy_timeout
+    // + immediate transactions) required for safe concurrent workers — without
+    // them, concurrent writes transiently fail with SQLITE_BUSY/SQLITE_READONLY.
+    db, _ := gorm.Open(sqlite.Open(jobs.SafeSQLiteDSN("jobs.db")), &gorm.Config{})
     storage := jobs.NewGormStorage(db)
     storage.Migrate(context.Background())
 

@@ -61,8 +61,9 @@ type GormStorage struct {
 	codec        core.PayloadCodec
 }
 
-// NewGormStorage creates a new GORM-backed storage. For SQLite under concurrent
-// workers, callers MUST open the database with a concurrency-safe DSN, e.g.
+// NewGormStorage creates a new GORM-backed storage. For file-based SQLite under
+// concurrent workers, callers MUST open the database with jobs.SafeSQLiteDSN or
+// an equivalent concurrency-safe DSN, e.g.
 //
 //	sqlite.Open("jobs.db?_journal_mode=WAL&_busy_timeout=5000&_txlock=immediate")
 //

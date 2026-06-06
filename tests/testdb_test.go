@@ -83,7 +83,7 @@ func openIntegrationDB(t *testing.T) *gorm.DB {
 	// worker retry budget and dropping a job from the completed set. WAL +
 	// busy_timeout (applied to every pooled connection via the DSN, unlike a
 	// one-shot PRAGMA) + txlock=immediate serialize writers cleanly.
-	db, err := gorm.Open(sqlite.Open(dbPath+"?_journal_mode=WAL&_busy_timeout=5000&_txlock=immediate"), &gorm.Config{
+	db, err := gorm.Open(sqlite.Open(jobs.SafeSQLiteDSN(dbPath)), &gorm.Config{
 		Logger: logger.Default.LogMode(logger.Silent),
 	})
 	require.NoError(t, err, "open sqlite integration db")
