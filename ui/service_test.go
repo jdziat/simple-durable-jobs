@@ -361,6 +361,54 @@ func TestHandler_MutatingRPCAllowedWithInsecureOptIn(t *testing.T) {
 	assert.True(t, called)
 }
 
+func TestHandler_CancelJobRPCRequiresWriteAuth(t *testing.T) {
+	called := false
+	store := &mockStorage{
+		pauseJobFn: func(_ context.Context, _ string) error {
+			called = true
+			return nil
+		},
+		getJobFn: func(_ context.Context, _ string) (*core.Job, error) {
+			return sampleJob("j1", "default", "work", core.StatusCancelled), nil
+		},
+	}
+	q := queue.New(store)
+	server := httptest.NewServer(Handler(store, WithQueue(q)))
+	defer server.Close()
+
+	client := jobsv1connect.NewJobsServiceClient(server.Client(), server.URL)
+	_, err := client.CancelJob(context.Background(), connect.NewRequest(&jobsv1.CancelJobRequest{Id: "j1"}))
+
+	require.Error(t, err)
+	assert.Equal(t, connect.CodePermissionDenied, connect.CodeOf(err))
+	assert.False(t, called)
+}
+
+func TestHandler_CancelJobRPCAllowedWithInsecureOptIn(t *testing.T) {
+	called := false
+	store := &mockStorage{
+		getJobFn: func(_ context.Context, _ string) (*core.Job, error) {
+			return sampleJob("j1", "default", "work", core.StatusCancelled), nil
+		},
+		pauseJobFn: func(_ context.Context, id string) error {
+			assert.Equal(t, "j1", id)
+			called = true
+			return nil
+		},
+	}
+	q := queue.New(store)
+	server := httptest.NewServer(Handler(store, WithQueue(q), WithInsecureAllowUnauthenticatedWrites()))
+	defer server.Close()
+
+	client := jobsv1connect.NewJobsServiceClient(server.Client(), server.URL)
+	resp, err := client.CancelJob(context.Background(), connect.NewRequest(&jobsv1.CancelJobRequest{Id: "j1"}))
+
+	require.NoError(t, err)
+	require.NotNil(t, resp.Msg.Job)
+	assert.Equal(t, "j1", resp.Msg.Job.Id)
+	assert.True(t, called)
+}
+
 func TestHandler_MutatingRPCAllowedWithMiddleware(t *testing.T) {
 	called := false
 	store := &mockUIStorage{
@@ -1960,6 +2008,67 @@ func TestPauseJob_JobNotFoundAfterPause(t *testing.T) {
 	svc := newJobsService(store, q, nil)
 
 	_, err := svc.PauseJob(context.Background(), connect.NewRequest(&jobsv1.PauseJobRequest{Id: "j1"}))
+	require.Error(t, err)
+	assert.Equal(t, connect.CodeNotFound, connect.CodeOf(err))
+}
+
+// ---------------------------------------------------------------------------
+// CancelJob tests
+// ---------------------------------------------------------------------------
+
+func TestCancelJob_Success(t *testing.T) {
+	cancelled := sampleJob("j1", "default", "work", core.StatusCancelled)
+
+	store := &mockStorage{
+		pauseJobFn: func(_ context.Context, id string) error {
+			assert.Equal(t, "j1", id)
+			return nil
+		},
+		getJobFn: func(_ context.Context, id string) (*core.Job, error) {
+			assert.Equal(t, "j1", id)
+			return cancelled, nil
+		},
+	}
+	q := queue.New(store)
+	svc := newJobsService(store, q, nil)
+
+	resp, err := svc.CancelJob(context.Background(), connect.NewRequest(&jobsv1.CancelJobRequest{Id: "j1"}))
+	require.NoError(t, err)
+	require.NotNil(t, resp.Msg.Job)
+	assert.Equal(t, "j1", resp.Msg.Job.Id)
+	assert.Equal(t, string(core.StatusCancelled), resp.Msg.Job.Status)
+}
+
+func TestCancelJob_NilQueue_ReturnsUnimplemented(t *testing.T) {
+	svc := newJobsService(&mockStorage{}, nil, nil)
+	_, err := svc.CancelJob(context.Background(), connect.NewRequest(&jobsv1.CancelJobRequest{Id: "j1"}))
+	require.Error(t, err)
+	assert.Equal(t, connect.CodeUnimplemented, connect.CodeOf(err))
+}
+
+func TestCancelJob_StorageError(t *testing.T) {
+	store := &mockStorage{
+		pauseJobFn: func(_ context.Context, _ string) error {
+			return errors.New("db error")
+		},
+	}
+	q := queue.New(store)
+	svc := newJobsService(store, q, nil)
+
+	_, err := svc.CancelJob(context.Background(), connect.NewRequest(&jobsv1.CancelJobRequest{Id: "j1"}))
+	require.Error(t, err)
+	assert.Equal(t, connect.CodeInternal, connect.CodeOf(err))
+}
+
+func TestCancelJob_JobNotFoundAfterCancel(t *testing.T) {
+	store := &mockStorage{
+		pauseJobFn: func(_ context.Context, _ string) error { return nil },
+		getJobFn:   func(_ context.Context, _ string) (*core.Job, error) { return nil, nil },
+	}
+	q := queue.New(store)
+	svc := newJobsService(store, q, nil)
+
+	_, err := svc.CancelJob(context.Background(), connect.NewRequest(&jobsv1.CancelJobRequest{Id: "j1"}))
 	require.Error(t, err)
 	assert.Equal(t, connect.CodeNotFound, connect.CodeOf(err))
 }

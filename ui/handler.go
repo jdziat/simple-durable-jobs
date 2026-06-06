@@ -122,6 +122,7 @@ var mutatingProcedures = map[string]struct{}{
 	jobsv1connect.JobsServiceBulkRetryJobsProcedure:  {},
 	jobsv1connect.JobsServiceBulkDeleteJobsProcedure: {},
 	jobsv1connect.JobsServicePauseJobProcedure:       {},
+	jobsv1connect.JobsServiceCancelJobProcedure:      {},
 	jobsv1connect.JobsServiceResumeJobProcedure:      {},
 	jobsv1connect.JobsServicePauseQueueProcedure:     {},
 	jobsv1connect.JobsServiceResumeQueueProcedure:    {},

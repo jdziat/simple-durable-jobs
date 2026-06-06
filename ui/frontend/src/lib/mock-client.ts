@@ -27,6 +27,7 @@ import {
   ListWorkflowsResponse,
   WorkflowSummary,
   PauseJobResponse,
+  CancelJobResponse,
   ResumeJobResponse,
   PauseQueueResponse,
   ResumeQueueResponse,
@@ -879,6 +880,21 @@ export const mockJobsClient = {
       jobs.splice(idx, 1)
     }
     return new DeleteJobResponse({})
+  },
+
+  async cancelJob(
+    req: { id: string },
+  ): Promise<CancelJobResponse> {
+    ensureSimulation()
+    const j = jobs.find((job) => job.id === req.id)
+    if (j) {
+      j.status = 'cancelled'
+      j.lastError = 'cancelled by user'
+      j.completedAt = new Date()
+    }
+    return new CancelJobResponse({
+      job: j ? toProtoJob(j) : undefined,
+    })
   },
 
   async listQueues(

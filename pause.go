@@ -29,6 +29,16 @@ func PauseJob(ctx context.Context, q *Queue, jobID string, opts ...PauseOption) 
 	return q.PauseJob(ctx, jobID, opts...)
 }
 
+// CancelJob cooperatively cancels a running job by aliasing aggressive pause.
+// It durably records cancellation and interrupts a running handler via context
+// cancellation; a handler that ignores ctx is not force-killed. Pending or
+// waiting jobs follow the underlying pause behavior. Already paused jobs,
+// terminal jobs, and missing jobs return the same sentinel errors as PauseJob,
+// such as ErrJobAlreadyPaused, ErrCannotPauseStatus, or ErrJobNotFound.
+func CancelJob(ctx context.Context, q *Queue, jobID string) error {
+	return q.CancelJob(ctx, jobID)
+}
+
 // ResumeJob resumes a paused job using storage only.
 // It does not emit a JobResumed event; callers wanting events should use Queue.ResumeJob.
 func ResumeJob(ctx context.Context, storage Storage, jobID string) error {

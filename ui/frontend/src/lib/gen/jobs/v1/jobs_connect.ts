@@ -3,7 +3,7 @@
 /* eslint-disable */
 // @ts-nocheck
 
-import { BulkDeleteJobsRequest, BulkDeleteJobsResponse, BulkRetryJobsRequest, BulkRetryJobsResponse, DeleteJobRequest, DeleteJobResponse, Event, GetJobRequest, GetJobResponse, GetStatsHistoryRequest, GetStatsHistoryResponse, GetStatsRequest, GetStatsResponse, GetWorkflowRequest, GetWorkflowResponse, ListJobsRequest, ListJobsResponse, ListQueuesRequest, ListQueuesResponse, ListScheduledJobsRequest, ListScheduledJobsResponse, ListWorkflowsRequest, ListWorkflowsResponse, PauseJobRequest, PauseJobResponse, PauseQueueRequest, PauseQueueResponse, PurgeQueueRequest, PurgeQueueResponse, ResumeJobRequest, ResumeJobResponse, ResumeQueueRequest, ResumeQueueResponse, RetryJobRequest, RetryJobResponse, WatchEventsRequest } from "./jobs_pb.js";
+import { BulkDeleteJobsRequest, BulkDeleteJobsResponse, BulkRetryJobsRequest, BulkRetryJobsResponse, CancelJobRequest, CancelJobResponse, DeleteJobRequest, DeleteJobResponse, Event, GetJobRequest, GetJobResponse, GetStatsHistoryRequest, GetStatsHistoryResponse, GetStatsRequest, GetStatsResponse, GetWorkflowRequest, GetWorkflowResponse, ListJobsRequest, ListJobsResponse, ListQueuesRequest, ListQueuesResponse, ListScheduledJobsRequest, ListScheduledJobsResponse, ListWorkflowsRequest, ListWorkflowsResponse, PauseJobRequest, PauseJobResponse, PauseQueueRequest, PauseQueueResponse, PurgeQueueRequest, PurgeQueueResponse, ResumeJobRequest, ResumeJobResponse, ResumeQueueRequest, ResumeQueueResponse, RetryJobRequest, RetryJobResponse, WatchEventsRequest } from "./jobs_pb.js";
 import { MethodKind } from "@bufbuild/protobuf";
 
 /**
@@ -97,6 +97,15 @@ export const JobsService = {
       name: "PauseJob",
       I: PauseJobRequest,
       O: PauseJobResponse,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * @generated from rpc jobs.v1.JobsService.CancelJob
+     */
+    cancelJob: {
+      name: "CancelJob",
+      I: CancelJobRequest,
+      O: CancelJobResponse,
       kind: MethodKind.Unary,
     },
     /**

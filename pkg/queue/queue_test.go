@@ -1292,6 +1292,30 @@ func TestQueue_PauseJob_RunningJobCancelsContext(t *testing.T) {
 	assert.Equal(t, core.StatusCancelled, job.Status)
 }
 
+func TestQueue_CancelJob_RunningJobCancelsContext(t *testing.T) {
+	store := newMockStorage()
+	q := New(store)
+	ctx := context.Background()
+
+	q.Register("run-job", func(ctx context.Context, args struct{}) error { return nil })
+	jobID, err := q.Enqueue(ctx, "run-job", struct{}{})
+	require.NoError(t, err)
+
+	_, err = store.Dequeue(ctx, []string{"default"}, "worker-1")
+	require.NoError(t, err)
+
+	var cancelled bool
+	q.RegisterRunningJob(jobID, func() { cancelled = true })
+
+	err = q.CancelJob(ctx, jobID)
+	require.NoError(t, err)
+	assert.True(t, cancelled, "cancel function should have been called")
+
+	job, err := store.GetJob(ctx, jobID)
+	require.NoError(t, err)
+	assert.Equal(t, core.StatusCancelled, job.Status)
+}
+
 func TestQueue_PauseJob_RunningGracefulReturnsError(t *testing.T) {
 	store := newMockStorage()
 	q := New(store)

@@ -738,6 +738,16 @@ func (q *Queue) PauseJob(ctx context.Context, jobID string, opts ...PauseOption)
 	return nil
 }
 
+// CancelJob cooperatively cancels a running job by aliasing aggressive pause.
+// It durably records cancellation through the storage pause path and cancels a
+// locally-running handler's context; handlers that ignore ctx are not force-killed.
+// Pending or waiting jobs are paused by the underlying pause operation. Already
+// paused jobs, terminal jobs, and missing jobs return the same sentinel errors
+// as PauseJob, such as ErrJobAlreadyPaused, ErrCannotPauseStatus, or ErrJobNotFound.
+func (q *Queue) CancelJob(ctx context.Context, jobID string) error {
+	return q.PauseJob(ctx, jobID, WithPauseMode(core.PauseModeAggressive))
+}
+
 // ResumeJob resumes a paused job.
 func (q *Queue) ResumeJob(ctx context.Context, jobID string) error {
 	if err := q.storage.UnpauseJob(ctx, jobID); err != nil {

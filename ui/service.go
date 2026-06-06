@@ -244,6 +244,24 @@ func (s *jobsService) PauseJob(ctx context.Context, req *connect.Request[jobsv1.
 	return connect.NewResponse(&jobsv1.PauseJobResponse{Job: jobToProto(job)}), nil
 }
 
+// CancelJob cooperatively cancels a running job by aliasing aggressive pause.
+func (s *jobsService) CancelJob(ctx context.Context, req *connect.Request[jobsv1.CancelJobRequest]) (*connect.Response[jobsv1.CancelJobResponse], error) {
+	if s.queue == nil {
+		return nil, connect.NewError(connect.CodeUnimplemented, nil)
+	}
+	if err := s.queue.CancelJob(ctx, req.Msg.Id); err != nil {
+		return nil, connect.NewError(connect.CodeInternal, err)
+	}
+	job, err := s.storage.GetJob(ctx, req.Msg.Id)
+	if err != nil {
+		return nil, connect.NewError(connect.CodeInternal, err)
+	}
+	if job == nil {
+		return nil, connect.NewError(connect.CodeNotFound, nil)
+	}
+	return connect.NewResponse(&jobsv1.CancelJobResponse{Job: jobToProto(job)}), nil
+}
+
 // ResumeJob resumes a paused job.
 func (s *jobsService) ResumeJob(ctx context.Context, req *connect.Request[jobsv1.ResumeJobRequest]) (*connect.Response[jobsv1.ResumeJobResponse], error) {
 	if s.queue == nil {

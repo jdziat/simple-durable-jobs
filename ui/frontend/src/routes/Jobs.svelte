@@ -101,6 +101,16 @@
     }
   }
 
+  async function cancelJob(id: string) {
+    if (!confirm('Cancel this running job? This interrupts the handler cooperatively by cancelling its context; handlers that ignore context are not force-killed.')) return
+    try {
+      await jobsClient.cancelJob({ id })
+      loadJobs()
+    } catch (e) {
+      alert('Failed to cancel job')
+    }
+  }
+
   async function resumeJob(id: string) {
     try {
       await jobsClient.resumeJob({ id })
@@ -224,6 +234,9 @@
               {/if}
               {#if job.status === 'pending' || job.status === 'running'}
                 <button class="btn-pause" onclick={() => pauseJob(job.id)}>Pause</button>
+              {/if}
+              {#if job.status === 'running'}
+                <button class="btn-cancel" onclick={() => cancelJob(job.id)}>Cancel</button>
               {/if}
               {#if job.status === 'paused'}
                 <button class="btn-resume" onclick={() => resumeJob(job.id)}>Resume</button>
@@ -355,6 +368,7 @@
 
   .btn-retry,
   .btn-delete,
+  .btn-cancel,
   .btn-pause,
   .btn-resume {
     padding: 4px 12px;
@@ -371,6 +385,11 @@
 
   .btn-delete {
     background: #ef4444;
+    color: white;
+  }
+
+  .btn-cancel {
+    background: #b91c1c;
     color: white;
   }
 
