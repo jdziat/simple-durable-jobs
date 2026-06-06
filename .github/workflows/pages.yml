@@ -4,9 +4,7 @@ on:
   push:
     branches: [main]
     paths:
-      - 'content/**'
-      - 'hugo.toml'
-      - 'layouts/**'
+      - 'docs/**'
       - 'README.md'
       - 'ui/frontend/**'
       - '.github/workflows/pages.yml'
@@ -42,7 +40,7 @@ jobs:
           npm run build:demo
 
       - name: Copy demo to static
-        run: mkdir -p static && cp -r ui/frontend/demo-dist static/demo
+        run: mkdir -p docs/static && cp -r ui/frontend/demo-dist docs/static/demo
 
       - name: Setup Hugo
         uses: peaceiris/actions-hugo@v3
@@ -59,15 +57,15 @@ jobs:
         uses: actions/configure-pages@v4
 
       - name: Build with Hugo
-        run: hugo --minify
+        run: hugo --minify --source docs
 
       - name: Verify live demo serves the SPA (not the docs shell)
         run: |
           # /demo/ must serve the Svelte dashboard bundle, not a Hugo-rendered
           # page. A content page named demo.md would shadow static/demo/ and
           # produce a recursive, empty iframe. Guard against that regression.
-          if ! grep -q 'id="app"' public/demo/index.html; then
-            echo "::error::public/demo/index.html does not contain the SPA mount (id=\"app\"). Did a content page shadow static/demo/?"
+          if ! grep -q 'id="app"' docs/public/demo/index.html; then
+            echo "::error::docs/public/demo/index.html does not contain the SPA mount (id=\"app\"). Did a content page shadow docs/static/demo/?"
             exit 1
           fi
           echo "OK: /demo/ serves the SPA bundle."
@@ -75,7 +73,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: ./public
+          path: ./docs/public
 
   deploy:
     environment:
