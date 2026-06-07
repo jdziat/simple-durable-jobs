@@ -146,11 +146,12 @@ test.describe('Dashboard', () => {
   })
 
   test('queue selector includes all queues', async ({ page }) => {
-    const selector = page.locator('.queue-selector')
-    await expect(selector.locator('option')).toHaveCount(3)
-    await expect(selector.locator('option').nth(0)).toHaveText('All queues')
-    await expect(selector.locator('option').nth(1)).toHaveText('default')
-    await expect(selector.locator('option').nth(2)).toHaveText('emails')
+    // Assert presence, not an exact total: other specs running against the
+    // shared server can create queues, making an exact count order-fragile.
+    const options = page.locator('.queue-selector option')
+    await expect(options.first()).toHaveText('All queues')
+    await expect(options.filter({ hasText: 'default' })).toHaveCount(1)
+    await expect(options.filter({ hasText: 'emails' })).toHaveCount(1)
   })
 
   test('switching throughput queue updates the chart heading', async ({ page }) => {
