@@ -23,6 +23,7 @@ const (
 	maxWatchStreams      = 50
 	maxBulkJobIDs        = 1000
 	maxWorkflowJobs      = 1000
+	maxInt32Value        = int64(1<<31 - 1)
 	statusDeadLetteredUI = "dead-lettered"
 )
 
@@ -61,6 +62,18 @@ func (s *jobsService) GetStats(ctx context.Context, req *connect.Request[jobsv1.
 		resp.TotalCompleted += qs.Completed
 		resp.TotalFailed += qs.Failed
 		resp.TotalPaused += qs.Paused
+	}
+
+	if active, ok := s.storage.(activeWorkersStorage); ok {
+		count, err := active.CountActiveWorkers(ctx)
+		if err != nil {
+			return nil, connect.NewError(connect.CodeInternal, err)
+		}
+		if count > maxInt32Value {
+			resp.ActiveWorkers = int32(maxInt32Value)
+		} else {
+			resp.ActiveWorkers = int32(count)
+		}
 	}
 
 	return connect.NewResponse(resp), nil
@@ -1001,6 +1014,10 @@ type workflowBatchStorage interface {
 
 type queueDepthStatsStorage interface {
 	GetQueueDepthStats(ctx context.Context) ([]*jobsv1.QueueStats, error)
+}
+
+type activeWorkersStorage interface {
+	CountActiveWorkers(ctx context.Context) (int64, error)
 }
 
 type deadLetterStorage interface {

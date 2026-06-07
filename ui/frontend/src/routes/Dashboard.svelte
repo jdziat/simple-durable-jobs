@@ -1,324 +1,551 @@
 <script lang="ts">
   import { onMount } from 'svelte'
   import { jobsClient } from '../lib/client'
-  import StatsCard from '../lib/components/StatsCard.svelte'
-  import StatsChart from '../lib/components/StatsChart.svelte'
+  import { deltaFlash } from '../lib/actions/deltaFlash'
+  import AreaChart from '../lib/components/AreaChart.svelte'
+  import MetricCard from '../lib/components/MetricCard.svelte'
+  import SegmentedControl from '../lib/components/SegmentedControl.svelte'
+  import Sparkline from '../lib/components/Sparkline.svelte'
+  import { error as statsError, start, stats, stop, type QueueStat } from '../lib/stores/stats.svelte'
 
-  type QueueStat = { name: string; pending: number; running: number; completed: number; failed: number; total: number }
+  type Period = '1h' | '24h' | '7d'
+  type HistorySeries = { completed: number[]; failed: number[]; labels: string[] }
 
-  let stats = $state<{
-    totalPending: number
-    totalRunning: number
-    totalCompleted: number
-    totalFailed: number
-    totalPaused: number
-    queues: QueueStat[]
-  } | null>(null)
+  const periods: Period[] = ['1h', '24h', '7d']
 
-  let chartCompleted = $state<{ timestamp: Date; value: number }[]>([])
-  let chartFailed = $state<{ timestamp: Date; value: number }[]>([])
-  let chartPeriod = $state('1h')
+  let chartPeriod = $state<Period>('1h')
   let chartQueue = $state('')
+  let history = $state<HistorySeries>({ completed: [], failed: [], labels: [] })
+  let queueSparklines = $state<Record<string, number[]>>({})
+  let historyError = $state<string | null>(null)
+  let failedGlow = $state(false)
+  let queueFailureGlow = $state<Set<string>>(new Set())
 
-  let error = $state<string | null>(null)
-  let loading = $state(true)
-  let sortKey = $state<keyof QueueStat>('name')
-  let sortDir = $state<'asc' | 'desc'>('asc')
+  let previousFailed: number | null = null
+  let previousQueueFailed = new Map<string, number>()
+  let glowTimer: ReturnType<typeof setTimeout> | null = null
 
-  let sortedQueues = $derived(
-    stats?.queues.slice().sort((a, b) => {
-      const aVal = a[sortKey]
-      const bVal = b[sortKey]
-      if (typeof aVal === 'string' && typeof bVal === 'string') {
-        return sortDir === 'asc' ? aVal.localeCompare(bVal) : bVal.localeCompare(aVal)
-      }
-      return sortDir === 'asc' ? (aVal as number) - (bVal as number) : (bVal as number) - (aVal as number)
-    }) ?? []
-  )
+  let snapshot = $derived(stats.value)
+  let topQueues = $derived((snapshot?.queues ?? []).slice().sort(compareQueues).slice(0, 5))
+  let terminalTotal = $derived((snapshot?.totalCompleted ?? 0) + (snapshot?.totalFailed ?? 0))
+  let failureRate = $derived(terminalTotal > 0 && snapshot ? (snapshot.totalFailed / terminalTotal) * 100 : 0)
+  let totalBacklog = $derived(snapshot ? snapshot.totalPending + snapshot.totalRunning + snapshot.totalPaused : 0)
+  let throughputPerMin = $derived(terminalThroughputPerMinute(history, chartPeriod))
 
-  function toggleSort(key: keyof QueueStat) {
-    if (sortKey === key) {
-      sortDir = sortDir === 'asc' ? 'desc' : 'asc'
-    } else {
-      sortKey = key
-      sortDir = 'asc'
+  $effect(() => {
+    if (!snapshot) return
+
+    const nextQueueGlow = new Set<string>()
+    if (previousFailed !== null && snapshot.totalFailed > previousFailed) {
+      failedGlow = true
     }
+    previousFailed = snapshot.totalFailed
+
+    for (const queue of snapshot.queues) {
+      const previous = previousQueueFailed.get(queue.name)
+      if (previous !== undefined && queue.failed > previous) {
+        nextQueueGlow.add(queue.name)
+      }
+      previousQueueFailed.set(queue.name, queue.failed)
+    }
+
+    if (nextQueueGlow.size > 0) {
+      queueFailureGlow = nextQueueGlow
+      failedGlow = true
+    }
+
+    if (failedGlow || nextQueueGlow.size > 0) {
+      if (glowTimer) clearTimeout(glowTimer)
+      glowTimer = setTimeout(() => {
+        failedGlow = false
+        queueFailureGlow = new Set()
+        glowTimer = null
+      }, 420)
+    }
+  })
+
+  function compareQueues(a: QueueStat, b: QueueStat): number {
+    const aBacklog = a.pending + a.running + a.paused
+    const bBacklog = b.pending + b.running + b.paused
+    if (bBacklog !== aBacklog) return bBacklog - aBacklog
+    if (b.failed !== a.failed) return b.failed - a.failed
+    return a.name.localeCompare(b.name)
   }
 
-  async function loadStats() {
-    try {
-      const response = await jobsClient.getStats({})
-      stats = {
-        totalPending: Number(response.totalPending),
-        totalRunning: Number(response.totalRunning),
-        totalCompleted: Number(response.totalCompleted),
-        totalFailed: Number(response.totalFailed),
-        totalPaused: Number(response.totalPaused),
-        queues: response.queues.map(q => ({
-          name: q.name,
-          pending: Number(q.pending),
-          running: Number(q.running),
-          completed: Number(q.completed),
-          failed: Number(q.failed),
-          total: Number(q.pending) + Number(q.running) + Number(q.completed) + Number(q.failed),
-        })),
-      }
-    } catch (e) {
-      error = e instanceof Error ? e.message : 'Failed to load stats'
-    } finally {
-      loading = false
+  function terminalThroughputPerMinute(series: HistorySeries, period: Period): number {
+    const total = series.completed.reduce((sum, value) => sum + value, 0) + series.failed.reduce((sum, value) => sum + value, 0)
+    const minutes = period === '1h' ? 60 : period === '24h' ? 1440 : 10080
+    return total / minutes
+  }
+
+  function formatNumber(value: number): string {
+    return value.toLocaleString()
+  }
+
+  function formatRate(value: number): string {
+    return `${value.toFixed(value >= 10 ? 1 : 2)}%`
+  }
+
+  function formatThroughput(value: number): string {
+    return value >= 10 ? value.toFixed(1) : value.toFixed(2)
+  }
+
+  type HistoryPoint = { timestamp?: { toDate(): Date }; value: bigint | number }
+
+  // The backend buckets completed and failed INDEPENDENTLY (two maps keyed by
+  // timestamp, sorted separately) — the series can differ in length and in
+  // timestamp sets. Merge over the sorted union of timestamps; positional
+  // zipping pairs values from different minutes and mislabels buckets (the
+  // mock client's aligned arrays hide this, the real backend does not).
+  function mergeHistory(completed: HistoryPoint[], failed: HistoryPoint[]): { completed: number[]; failed: number[]; labels: string[] } {
+    const times = new Set<number>()
+    for (const point of completed) if (point.timestamp) times.add(point.timestamp.toDate().getTime())
+    for (const point of failed) if (point.timestamp) times.add(point.timestamp.toDate().getTime())
+    const sorted = Array.from(times).sort((a, b) => a - b)
+    const completedMap = new Map(completed.filter(p => p.timestamp).map(p => [p.timestamp!.toDate().getTime(), Number(p.value)]))
+    const failedMap = new Map(failed.filter(p => p.timestamp).map(p => [p.timestamp!.toDate().getTime(), Number(p.value)]))
+    const fmt = new Intl.DateTimeFormat(undefined, {
+      month: 'short',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+      timeZoneName: 'short',
+    })
+    return {
+      completed: sorted.map(t => completedMap.get(t) ?? 0),
+      failed: sorted.map(t => failedMap.get(t) ?? 0),
+      labels: sorted.map(t => fmt.format(new Date(t))),
     }
   }
 
   async function loadStatsHistory() {
     try {
-      const response = await jobsClient.getStatsHistory({ period: chartPeriod, queue: chartQueue })
-      chartCompleted = (response.completed ?? []).map(d => ({
-        timestamp: d.timestamp?.toDate() ?? new Date(),
-        value: Number(d.value),
-      }))
-      chartFailed = (response.failed ?? []).map(d => ({
-        timestamp: d.timestamp?.toDate() ?? new Date(),
-        value: Number(d.value),
-      }))
-    } catch {
-      // Stats history not available yet - that's okay
+      const [main, ...queueHistories] = await Promise.all([
+        jobsClient.getStatsHistory({ period: chartPeriod, queue: chartQueue }),
+        ...topQueues.map(queue => jobsClient.getStatsHistory({ period: chartPeriod, queue: queue.name })),
+      ])
+
+      history = mergeHistory(main.completed, main.failed)
+
+      queueSparklines = Object.fromEntries(queueHistories.map((queueHistory, index) => {
+        const merged = mergeHistory(queueHistory.completed, queueHistory.failed)
+        return [
+          topQueues[index]?.name ?? '',
+          merged.completed.map((value, pointIndex) => value + merged.failed[pointIndex]),
+        ]
+      }).filter(([name]) => name !== ''))
+      historyError = null
+    } catch (e) {
+      historyError = e instanceof Error ? e.message : 'Failed to load stats history'
     }
   }
 
-  function switchPeriod(p: string) {
-    chartPeriod = p
-    loadStatsHistory()
+  function switchPeriod(period: string) {
+    chartPeriod = period as Period
+    void loadStatsHistory()
   }
 
-  function switchQueue(q: string) {
-    chartQueue = q
-    loadStatsHistory()
+  function switchQueue(queue: string) {
+    chartQueue = queue
+    void loadStatsHistory()
+  }
+
+  function openQueue(queue: string) {
+    window.location.hash = `#/jobs?queue=${encodeURIComponent(queue)}`
   }
 
   onMount(() => {
-    loadStats()
-    loadStatsHistory()
-    const interval = setInterval(() => {
-      loadStats()
-      loadStatsHistory()
-    }, 5000)
-    return () => clearInterval(interval)
+    start()
+    void loadStatsHistory()
+    const interval = setInterval(() => void loadStatsHistory(), 5000)
+
+    return () => {
+      clearInterval(interval)
+      if (glowTimer) clearTimeout(glowTimer)
+      stop()
+    }
   })
 </script>
 
 <div class="dashboard">
   <h2>Dashboard</h2>
 
-  {#if loading}
-    <p class="loading">Loading...</p>
-  {:else if error}
-    <p class="error">{error}</p>
-  {:else if stats}
-    <div class="stats-grid">
-      <StatsCard title="Pending" value={stats.totalPending} color="#f59e0b" href="#/jobs?status=pending" />
-      <StatsCard title="Running" value={stats.totalRunning} color="#3b82f6" href="#/jobs?status=running" />
-      <StatsCard title="Completed" value={stats.totalCompleted} color="#10b981" href="#/jobs?status=completed" />
-      <StatsCard title="Failed" value={stats.totalFailed} color="#ef4444" href="#/jobs?status=failed" />
-      <StatsCard title="Paused" value={stats.totalPaused} color="#854d0e" href="#/jobs?status=paused" />
+  {#if statsError.value}
+    <div class="error-banner" role="alert">{statsError.value}</div>
+  {/if}
+
+  {#if !snapshot}
+    <div class="stats-grid skeleton-grid" aria-label="Loading metrics">
+      {#each Array.from({ length: 6 }) as _}
+        <div class="card metric-skeleton"></div>
+      {/each}
     </div>
 
-    <div class="chart-section">
-      <div class="chart-header">
-        <h3>Throughput {chartQueue ? `— ${chartQueue}` : '— All Queues'}</h3>
-        <div class="chart-controls">
-          <select class="queue-selector" value={chartQueue} onchange={(e) => switchQueue(e.currentTarget.value)}>
-            <option value="">All Queues</option>
-            {#each stats.queues as q}
-              <option value={q.name}>{q.name}</option>
-            {/each}
-          </select>
-          <div class="period-selector">
-            <button class:active={chartPeriod === '1h'} onclick={() => switchPeriod('1h')}>1h</button>
-            <button class:active={chartPeriod === '24h'} onclick={() => switchPeriod('24h')}>24h</button>
-            <button class:active={chartPeriod === '7d'} onclick={() => switchPeriod('7d')}>7d</button>
-          </div>
+    <section class="chart-section">
+      <div class="section-header">
+        <div>
+          <h3>Throughput</h3>
+          <p>Loading history</p>
         </div>
       </div>
-      <StatsChart completed={chartCompleted} failed={chartFailed} period={chartPeriod} />
+      <div class="chart-skeleton"></div>
+    </section>
+  {:else}
+    <div class="stats-grid">
+      <div class:fail-glow={failedGlow}>
+        <!-- dominant is the only danger gate here; the href carries filtering. -->
+        <MetricCard label="Failed" value={formatNumber(snapshot.totalFailed)} href="#/jobs?status=failed" dominant={snapshot.totalFailed > 0} />
+      </div>
+      <MetricCard label="Pending" value={formatNumber(snapshot.totalPending)} status="pending" href="#/jobs?status=pending" />
+      <MetricCard label="Running" value={formatNumber(snapshot.totalRunning)} status="running" href="#/jobs?status=running" />
+      <MetricCard label="Completed" value={formatNumber(snapshot.totalCompleted)} status="completed" href="#/jobs?status=completed" />
+      <MetricCard label="Paused" value={formatNumber(snapshot.totalPaused)} status="paused" href="#/jobs?status=paused" />
+      <!-- Distinct workers currently holding running-job locks; idle workers are not counted. -->
+      <MetricCard label="Active workers" value={formatNumber(snapshot.activeWorkers)} />
     </div>
 
-    <h3>Queues</h3>
-    <table class="queues-table">
-      <thead>
-        <tr>
-          <th class="sortable" onclick={() => toggleSort('name')}>
-            Queue {sortKey === 'name' ? (sortDir === 'asc' ? '▲' : '▼') : ''}
-          </th>
-          <th class="sortable" onclick={() => toggleSort('pending')}>
-            Pending {sortKey === 'pending' ? (sortDir === 'asc' ? '▲' : '▼') : ''}
-          </th>
-          <th class="sortable" onclick={() => toggleSort('running')}>
-            Running {sortKey === 'running' ? (sortDir === 'asc' ? '▲' : '▼') : ''}
-          </th>
-          <th class="sortable" onclick={() => toggleSort('completed')}>
-            Completed {sortKey === 'completed' ? (sortDir === 'asc' ? '▲' : '▼') : ''}
-          </th>
-          <th class="sortable" onclick={() => toggleSort('failed')}>
-            Failed {sortKey === 'failed' ? (sortDir === 'asc' ? '▲' : '▼') : ''}
-          </th>
-          <th class="sortable" onclick={() => toggleSort('total')}>
-            Total {sortKey === 'total' ? (sortDir === 'asc' ? '▲' : '▼') : ''}
-          </th>
-        </tr>
-      </thead>
-      <tbody>
-        {#each sortedQueues as queue}
-          <tr class="clickable" onclick={() => window.location.hash = `#/jobs?queue=${encodeURIComponent(queue.name)}`}>
-            <td>{queue.name}</td>
-            <td class="num">{queue.pending}</td>
-            <td class="num">{queue.running}</td>
-            <td class="num">{queue.completed}</td>
-            <td class="num">{queue.failed}</td>
-            <td class="num total">{queue.total}</td>
+    <div class="ops-row" aria-label="Operational numbers">
+      <div class="ops-cell">
+        <span>Throughput/min</span>
+        <strong use:deltaFlash={throughputPerMin}>{formatThroughput(throughputPerMin)}</strong>
+      </div>
+      <div class="ops-cell">
+        <span>Failure rate</span>
+        <strong class:danger={snapshot.totalFailed > 0} use:deltaFlash={failureRate}>{formatRate(failureRate)}</strong>
+      </div>
+      <div class="ops-cell">
+        <span>Total backlog</span>
+        <strong use:deltaFlash={totalBacklog}>{formatNumber(totalBacklog)}</strong>
+      </div>
+    </div>
+
+    <section class="chart-section">
+      <div class="section-header chart-header">
+        <div>
+          <h3>Throughput {chartQueue ? `- ${chartQueue}` : '- all queues'}</h3>
+          <p>Completed and failed terminal jobs over {chartPeriod}</p>
+        </div>
+        <div class="chart-controls">
+          <select class="queue-selector" value={chartQueue} onchange={(event) => switchQueue(event.currentTarget.value)} aria-label="Filter throughput by queue">
+            <option value="">All queues</option>
+            {#each snapshot.queues as queue}
+              <option value={queue.name}>{queue.name}</option>
+            {/each}
+          </select>
+          <SegmentedControl options={periods} value={chartPeriod} onChange={switchPeriod} />
+        </div>
+      </div>
+      {#if historyError}
+        <div class="error-banner" role="alert">{historyError}</div>
+      {/if}
+      <AreaChart completed={history.completed} failed={history.failed} labels={history.labels} period={chartPeriod} />
+    </section>
+
+    <section class="top-queues">
+      <div class="section-header">
+        <div>
+          <h3>Top queues</h3>
+          <p>Highest live backlog first</p>
+        </div>
+        <a class="view-all" href="#/queues">view all -></a>
+      </div>
+
+      <table class="queues-table">
+        <thead>
+          <tr>
+            <th>Queue</th>
+            <th class="right">Backlog</th>
+            <th class="right">Failed</th>
+            <th>Throughput</th>
           </tr>
-        {/each}
-      </tbody>
-    </table>
+        </thead>
+        <tbody>
+          {#each topQueues as queue}
+            <tr class="clickable" onclick={() => openQueue(queue.name)}>
+              <td class="queue-name">{queue.name}</td>
+              <td class="num" use:deltaFlash={queue.pending + queue.running + queue.paused}>{formatNumber(queue.pending + queue.running + queue.paused)}</td>
+              <td
+                class="num failed-cell"
+                class:has-failures={queue.failed > 0}
+                class:fail-glow={queueFailureGlow.has(queue.name)}
+                use:deltaFlash={queue.failed}
+              >{formatNumber(queue.failed)}</td>
+              <td class="spark-cell" use:deltaFlash={queueSparklines[queue.name]?.join(',') ?? ''}>
+                <Sparkline data={queueSparklines[queue.name] ?? []} color="var(--fg-secondary)" label={`${queue.name} throughput`} />
+              </td>
+            </tr>
+          {/each}
+        </tbody>
+      </table>
+    </section>
   {/if}
 </div>
 
 <style>
+  .dashboard {
+    display: grid;
+    gap: var(--sp-6);
+  }
+
   .dashboard h2 {
-    margin-bottom: 24px;
+    font-size: var(--fs-title);
+    font-weight: var(--fw-head);
   }
 
   .dashboard h3 {
-    margin: 32px 0 16px;
+    color: var(--fg-primary);
+    font-size: var(--fs-section);
+    font-weight: var(--fw-head);
   }
 
   .stats-grid {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-    gap: 16px;
+    grid-template-columns: repeat(6, minmax(0, 1fr));
+    gap: var(--sp-3);
   }
 
-  .chart-section {
-    margin-top: 32px;
+  .stats-grid > :first-child {
+    min-width: 0;
   }
 
-  .chart-header {
+  .ops-row {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: var(--sp-3);
+  }
+
+  .ops-cell {
+    display: grid;
+    gap: var(--sp-2);
+    min-height: 72px;
+    padding: var(--sp-4);
+    border: var(--border);
+    border-radius: var(--radius-panel);
+    background: var(--bg-raised);
+    box-shadow: inset 0 1px 0 var(--inset-sheen);
+  }
+
+  .ops-cell span,
+  .section-header p {
+    color: var(--fg-secondary);
+    font-size: var(--fs-label);
+  }
+
+  .ops-cell span {
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+
+  .ops-cell strong,
+  .num,
+  .queue-name,
+  .view-all,
+  .queue-selector {
+    font-family: var(--font-mono);
+    font-feature-settings: var(--num);
+  }
+
+  .ops-cell strong {
+    align-self: end;
+    color: var(--fg-primary);
+    font-size: var(--fs-title);
+    line-height: 1;
+  }
+
+  /* Specificity must beat the base `.ops-cell strong` and `.queues-table td`
+     color rules, or the danger tint silently never renders. */
+  .ops-cell strong.danger,
+  .queues-table td.has-failures {
+    color: var(--sig-danger);
+  }
+
+  .chart-section,
+  .top-queues {
+    display: grid;
+    gap: var(--sp-4);
+  }
+
+  .section-header {
     display: flex;
+    align-items: end;
     justify-content: space-between;
-    align-items: center;
-    margin-bottom: 16px;
+    gap: var(--sp-4);
   }
 
-  .chart-header h3 {
-    margin: 0;
+  .section-header > div {
+    display: grid;
+    gap: var(--sp-1);
   }
 
   .chart-controls {
     display: flex;
-    gap: 12px;
     align-items: center;
+    gap: var(--sp-3);
   }
 
   .queue-selector {
-    padding: 6px 12px;
-    border: 1px solid #e2e8f0;
-    border-radius: 6px;
-    font-size: 13px;
-    font-weight: 500;
-    color: #334155;
-    background: white;
+    min-height: 32px;
+    padding: 0 var(--sp-3);
+    border: var(--border);
+    border-radius: var(--radius-input);
+    background: var(--bg-raised);
+    color: var(--fg-primary);
+    font-size: var(--fs-label);
     cursor: pointer;
+    box-shadow: inset 0 1px 0 var(--inset-sheen);
   }
 
-  .queue-selector:focus {
-    outline: none;
-    border-color: #3b82f6;
-    box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.15);
-  }
-
-  .period-selector {
-    display: flex;
-    gap: 4px;
-    background: #f1f5f9;
-    border-radius: 6px;
-    padding: 2px;
-  }
-
-  .period-selector button {
-    padding: 6px 14px;
-    border: none;
-    border-radius: 4px;
-    font-size: 13px;
-    font-weight: 500;
-    cursor: pointer;
-    background: transparent;
-    color: #64748b;
-    transition: all 0.15s;
-  }
-
-  .period-selector button.active {
-    background: white;
-    color: #0f172a;
-    box-shadow: 0 1px 2px rgba(0,0,0,0.1);
-  }
-
-  .period-selector button:hover:not(.active) {
-    color: #334155;
+  .queue-selector:focus-visible {
+    border-color: var(--accent);
   }
 
   .queues-table {
     width: 100%;
     border-collapse: collapse;
-    background: white;
-    border-radius: 8px;
+    border: var(--border);
+    border-radius: var(--radius-panel);
     overflow: hidden;
-    box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+    background: var(--bg-raised);
+    color: var(--fg-primary);
+    box-shadow: inset 0 1px 0 var(--inset-sheen);
   }
 
   .queues-table th,
   .queues-table td {
-    padding: 12px 16px;
+    height: var(--row-h);
+    padding: 0 var(--sp-3);
+    border-bottom: var(--border);
     text-align: left;
-    border-bottom: 1px solid #eee;
+    vertical-align: middle;
   }
 
   .queues-table th {
-    background: #f8f9fa;
-    font-weight: 600;
+    color: var(--fg-secondary);
+    font-size: var(--fs-micro);
+    font-weight: var(--fw-label);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
   }
 
-  .queues-table th.sortable {
-    cursor: pointer;
-    user-select: none;
-  }
-
-  .queues-table th.sortable:hover {
-    background: #e9ecef;
+  .queues-table tbody tr:last-child td {
+    border-bottom: 0;
   }
 
   .queues-table tr.clickable {
     cursor: pointer;
-    transition: background 0.15s;
   }
 
-  .queues-table tr.clickable:hover {
-    background: #f5f7fa;
+  .queues-table tr.clickable:hover,
+  .queues-table tr.clickable:focus-visible {
+    background: var(--bg-sunken);
   }
 
-  .queues-table td.num {
+  .queues-table td {
+    color: var(--fg-primary);
+    font-size: var(--fs-body);
+  }
+
+  .right,
+  .num {
     text-align: right;
-    font-variant-numeric: tabular-nums;
   }
 
-  .queues-table td.total {
-    font-weight: 600;
+  .spark-cell {
+    width: 132px;
+    color: var(--fg-secondary);
   }
 
-  .loading {
-    color: #666;
+  .view-all {
+    color: var(--fg-secondary);
+    font-size: var(--fs-label);
+    text-decoration: none;
   }
 
-  .error {
-    color: #ef4444;
+  .view-all:hover {
+    color: var(--fg-primary);
+  }
+
+  .error-banner {
+    padding: var(--sp-3) var(--sp-4);
+    border: var(--border);
+    border-color: var(--sig-danger);
+    border-radius: var(--radius-panel);
+    background: var(--sig-danger-bg);
+    color: var(--sig-danger);
+    font-family: var(--font-mono);
+    font-size: var(--fs-label);
+    font-feature-settings: var(--num);
+  }
+
+  .metric-skeleton,
+  .chart-skeleton {
+    border: var(--border);
+    border-radius: var(--radius-panel);
+    background: linear-gradient(90deg, var(--bg-raised), var(--bg-sunken), var(--bg-raised));
+    box-shadow: inset 0 1px 0 var(--inset-sheen);
+    animation: shimmer var(--dur-sweep) var(--ease) infinite alternate;
+  }
+
+  .metric-skeleton {
+    min-height: 96px;
+  }
+
+  .chart-skeleton {
+    min-height: 260px;
+  }
+
+  .fail-glow {
+    animation: failGlow var(--dur-sweep) var(--ease) 1;
+    outline: 1px solid var(--sig-danger-glow);
+    background: var(--sig-danger-bg);
+  }
+
+  :global(.flash) {
+    background: var(--sig-info-bg);
+    color: var(--accent);
+  }
+
+  @keyframes failGlow {
+    from {
+      outline-color: var(--sig-danger-glow);
+      background: var(--sig-danger-bg);
+    }
+    to {
+      outline-color: transparent;
+      background: transparent;
+    }
+  }
+
+  @keyframes shimmer {
+    from { opacity: 0.45; }
+    to { opacity: 1; }
+  }
+
+  @media (max-width: 1180px) {
+    .stats-grid,
+    .ops-row {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+  }
+
+  @media (max-width: 760px) {
+    .stats-grid,
+    .ops-row {
+      grid-template-columns: 1fr;
+    }
+
+    .section-header,
+    .chart-controls {
+      align-items: stretch;
+      flex-direction: column;
+    }
+
+    .queues-table {
+      min-width: 520px;
+    }
+
+    .top-queues {
+      overflow-x: auto;
+    }
   }
 </style>
