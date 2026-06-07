@@ -190,6 +190,7 @@ func TestAllEvents_ImplementEventInterface(t *testing.T) {
 		&JobPaused{},
 		&JobResumed{},
 		&JobResumedBySignal{},
+		&SignalDelivered{},
 		&QueuePaused{},
 		&QueueResumed{},
 		&WorkerPaused{},
@@ -197,7 +198,7 @@ func TestAllEvents_ImplementEventInterface(t *testing.T) {
 		&CustomEvent{},
 	)
 
-	assert.Len(t, events, 13, "all event types should be in the list")
+	assert.Len(t, events, 14, "all event types should be in the list")
 	for _, e := range events {
 		assert.NotNil(t, e)
 	}

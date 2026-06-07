@@ -191,6 +191,12 @@ func registerHandlers(q *jobs.Queue, db *gorm.DB, dialect string) {
 		return nil
 	})
 
+	// chaos.pipeline_window deliberately keeps the two-commit effect/checkpoint
+	// pattern to demonstrate the documented at-least-once window. A SIGKILL
+	// landing between the two commits leaves the effect without its checkpoint;
+	// every retry then re-hits the unique constraint, so such jobs END FAILED
+	// after retries by design — counted by INV-AT-LEAST-ONCE-WINDOW (INFO),
+	// never a HARD failure.
 	q.Register("chaos.pipeline_window", func(ctx context.Context, _ struct{}) error {
 		jobID := jobs.JobIDFromContext(ctx)
 		for _, phase := range []string{"extract", "transform", "load"} {
@@ -369,7 +375,7 @@ func runCheck(ctx context.Context, a *app) error {
 				hardFailed++
 			}
 		}
-		fmt.Printf("%-18s %-4s %-4s %s\n", inv.name, inv.level, status, inv.detail)
+		fmt.Printf("%-26s %-4s %-4s %s\n", inv.name, inv.level, status, inv.detail)
 	}
 	if hardFailed > 0 {
 		fmt.Printf("chaostest result: RED baseline reproduced with %d HARD failure(s)\n", hardFailed)

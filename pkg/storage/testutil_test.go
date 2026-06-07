@@ -73,7 +73,9 @@ func cleanupExternalDB(t testing.TB, db *gorm.DB) {
 	// hold per-test state too (the scheduler anchor and recovery lease), so they
 	// must be cleaned for tests to be isolated on a persistent external DB.
 	// schema_migrations is intentionally NOT cleaned — it is the migration ledger.
-	tables := []string{"checkpoints", "fan_outs", "queue_states", "jobs", "scheduled_fires", "leases"}
+	// signals included: unconsumed rows leak across tests otherwise (PeekSignal
+	// leaves ("j1","other") pending, which TestGetPendingSignalName then finds).
+	tables := []string{"signals", "checkpoints", "fan_outs", "queue_states", "jobs", "scheduled_fires", "leases"}
 	for _, tbl := range tables {
 		db.Exec("DELETE FROM " + tbl)
 	}
