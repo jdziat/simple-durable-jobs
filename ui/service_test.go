@@ -1482,6 +1482,102 @@ func TestListScheduledJobs_NilQueue(t *testing.T) {
 	assert.Empty(t, resp.Msg.Jobs)
 }
 
+func TestListScheduledJobs_PopulatesNextRunForEveryAndCron(t *testing.T) {
+	store := &mockStorage{}
+	q := queue.New(store)
+	q.Schedule("every-report", nil, schedule.Every(time.Hour), queue.QueueOpt("reports"))
+	cronSchedule, err := schedule.Cron("*/15 * * * *")
+	require.NoError(t, err)
+	q.Schedule("cron-sync", nil, cronSchedule, queue.QueueOpt("sync"))
+	svc := newJobsService(store, q, nil)
+
+	resp, err := svc.ListScheduledJobs(context.Background(), connect.NewRequest(&jobsv1.ListScheduledJobsRequest{}))
+	require.NoError(t, err)
+	require.Len(t, resp.Msg.Jobs, 2)
+
+	byName := scheduledJobsByName(resp.Msg.Jobs)
+	require.NotNil(t, byName["every-report"].NextRun)
+	assert.Equal(t, "reports", byName["every-report"].Queue)
+	require.NotNil(t, byName["cron-sync"].NextRun)
+	assert.Equal(t, "sync", byName["cron-sync"].Queue)
+}
+
+func TestListScheduledJobs_SkipsZeroNextRun(t *testing.T) {
+	store := &mockStorage{}
+	q := queue.New(store)
+	q.Schedule("never", nil, zeroSchedule{})
+	svc := newJobsService(store, q, nil)
+
+	resp, err := svc.ListScheduledJobs(context.Background(), connect.NewRequest(&jobsv1.ListScheduledJobsRequest{}))
+	require.NoError(t, err)
+	require.Len(t, resp.Msg.Jobs, 1)
+	assert.Nil(t, resp.Msg.Jobs[0].NextRun)
+}
+
+func TestListScheduledJobs_LastRunAbsentWithoutCapability(t *testing.T) {
+	store := &mockStorage{}
+	q := queue.New(store)
+	q.Schedule("hourly", nil, schedule.Every(time.Hour))
+	svc := newJobsService(store, q, nil)
+
+	resp, err := svc.ListScheduledJobs(context.Background(), connect.NewRequest(&jobsv1.ListScheduledJobsRequest{}))
+	require.NoError(t, err)
+	require.Len(t, resp.Msg.Jobs, 1)
+	assert.NotNil(t, resp.Msg.Jobs[0].NextRun)
+	assert.Nil(t, resp.Msg.Jobs[0].LastRun)
+}
+
+func TestListScheduledJobs_LastRunAbsentForSeededOnlySchedule(t *testing.T) {
+	ctx := context.Background()
+	svc, q := setupServiceWithQueue(t)
+	q.Schedule("hourly", nil, schedule.Every(time.Hour))
+	anchor := time.Now().UTC().Truncate(time.Second)
+	_, err := svc.storage.(interface {
+		SeedScheduledFire(context.Context, string, time.Time) (time.Time, error)
+	}).SeedScheduledFire(ctx, "hourly", anchor)
+	require.NoError(t, err)
+
+	resp, err := svc.ListScheduledJobs(ctx, connect.NewRequest(&jobsv1.ListScheduledJobsRequest{}))
+	require.NoError(t, err)
+	require.Len(t, resp.Msg.Jobs, 1)
+	assert.Nil(t, resp.Msg.Jobs[0].LastRun)
+}
+
+func TestListScheduledJobs_LastRunAfterClaimScheduledFire(t *testing.T) {
+	ctx := context.Background()
+	svc, q := setupServiceWithQueue(t)
+	q.Schedule("hourly", nil, schedule.Every(time.Hour))
+	anchor := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
+	_, err := svc.storage.(interface {
+		SeedScheduledFire(context.Context, string, time.Time) (time.Time, error)
+	}).SeedScheduledFire(ctx, "hourly", anchor)
+	require.NoError(t, err)
+
+	resp, err := svc.ListScheduledJobs(ctx, connect.NewRequest(&jobsv1.ListScheduledJobsRequest{}))
+	require.NoError(t, err)
+	require.Len(t, resp.Msg.Jobs, 1)
+	assert.Nil(t, resp.Msg.Jobs[0].LastRun)
+
+	fireTime := anchor.Add(time.Hour)
+	claimed, err := svc.storage.ClaimScheduledFire(ctx, "hourly", fireTime)
+	require.NoError(t, err)
+	require.True(t, claimed)
+
+	resp, err = svc.ListScheduledJobs(ctx, connect.NewRequest(&jobsv1.ListScheduledJobsRequest{}))
+	require.NoError(t, err)
+	require.Len(t, resp.Msg.Jobs, 1)
+	require.NotNil(t, resp.Msg.Jobs[0].LastRun)
+	assert.Equal(t, fireTime.Unix(), resp.Msg.Jobs[0].LastRun.AsTime().Unix())
+}
+
+func scheduledJobsByName(jobs []*jobsv1.ScheduledJobInfo) map[string]*jobsv1.ScheduledJobInfo {
+	byName := make(map[string]*jobsv1.ScheduledJobInfo, len(jobs))
+	for _, job := range jobs {
+		byName[job.Name] = job
+	}
+	return byName
+}
+
 // ---------------------------------------------------------------------------
 // checkpointToProto tests
 // ---------------------------------------------------------------------------
@@ -1574,6 +1670,19 @@ func TestJobToProto_DeadLetterFields(t *testing.T) {
 	assert.Empty(t, pb.DeadLetterReason)
 }
 
+func TestJobToProto_Worker(t *testing.T) {
+	job := sampleJob("j1", "default", "work", core.StatusRunning)
+	job.LockedBy = "worker-1"
+
+	pb := jobToProto(job)
+
+	assert.Equal(t, "worker-1", pb.Worker)
+
+	job.LockedBy = ""
+	pb = jobToProto(job)
+	assert.Empty(t, pb.Worker)
+}
+
 func TestJobToProto_RedactsPayloadsWithoutTruncating(t *testing.T) {
 	argsSecret := "ghp_1234567890abcdefghij"
 	resultSecret := "sk_live_1234567890abcdef"
@@ -1632,9 +1741,9 @@ func setupServiceWithQueue(t *testing.T) (*jobsService, *queue.Queue) {
 		Logger: logger.Default.LogMode(logger.Silent),
 	})
 	require.NoError(t, err)
-	require.NoError(t, db.AutoMigrate(&core.Job{}, &core.Checkpoint{}, &core.FanOut{}, &core.QueueState{}))
 
 	store := storagepackage.NewGormStorage(db)
+	require.NoError(t, store.Migrate(context.Background()))
 	q := queue.New(store)
 	svc := newJobsService(store, q, nil)
 	return svc, q
@@ -1657,6 +1766,10 @@ type stringerSchedule struct{ label string }
 
 func (s *stringerSchedule) Next(from time.Time) time.Time { return from.Add(time.Hour) }
 func (s *stringerSchedule) String() string                { return s.label }
+
+type zeroSchedule struct{}
+
+func (zeroSchedule) Next(time.Time) time.Time { return time.Time{} }
 
 func TestListScheduledJobs_WithStringerSchedule(t *testing.T) {
 	svc, q := setupServiceWithQueue(t)

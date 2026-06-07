@@ -351,18 +351,37 @@ func (s *jobsService) ListScheduledJobs(ctx context.Context, req *connect.Reques
 	var jobsList []*jobsv1.ScheduledJobInfo
 
 	if s.queue != nil {
+		var lastRuns map[string]time.Time
+		if fireTimes, ok := s.storage.(scheduledFireTimesStorage); ok {
+			var err error
+			lastRuns, err = fireTimes.GetScheduledFireTimes(ctx)
+			if err != nil {
+				return nil, connect.NewError(connect.CodeInternal, err)
+			}
+		}
+
 		scheduled := s.queue.GetScheduledJobs()
+		now := time.Now()
 		for name, sj := range scheduled {
 			// Format schedule - use type assertion or just store the name
 			schedStr := name // Fallback to name if no string method
 			if stringer, ok := interface{}(sj.Schedule).(interface{ String() string }); ok {
 				schedStr = stringer.String()
 			}
-			jobsList = append(jobsList, &jobsv1.ScheduledJobInfo{
+			info := &jobsv1.ScheduledJobInfo{
 				Name:     name,
 				Schedule: schedStr,
 				Queue:    sj.Options.Queue,
-			})
+			}
+			if sj.Schedule != nil {
+				if nextRun := sj.Schedule.Next(now); !nextRun.IsZero() {
+					info.NextRun = timestamppb.New(nextRun)
+				}
+			}
+			if lastRun, ok := lastRuns[name]; ok {
+				info.LastRun = timestamppb.New(lastRun)
+			}
+			jobsList = append(jobsList, info)
 		}
 	}
 
@@ -852,6 +871,7 @@ func jobToProto(j *core.Job) *jobsv1.Job {
 		CreatedAt:   timestamppb.New(j.CreatedAt),
 		FanOutIndex: int32(j.FanOutIndex),
 		Result:      redactBytes(j.Result),
+		Worker:      j.LockedBy,
 	}
 	if j.StartedAt != nil {
 		pb.StartedAt = timestamppb.New(*j.StartedAt)
@@ -1018,6 +1038,10 @@ type queueDepthStatsStorage interface {
 
 type activeWorkersStorage interface {
 	CountActiveWorkers(ctx context.Context) (int64, error)
+}
+
+type scheduledFireTimesStorage interface {
+	GetScheduledFireTimes(ctx context.Context) (map[string]time.Time, error)
 }
 
 type deadLetterStorage interface {

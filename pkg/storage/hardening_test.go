@@ -102,7 +102,7 @@ func TestRunMigrations_ConcurrentSafe(t *testing.T) {
 
 	var versions []int
 	require.NoError(t, s.db.Model(&core.SchemaMigration{}).Order("version").Pluck("version", &versions).Error)
-	assert.Equal(t, []int{1, 2, 3, 4, 5, 6}, versions, "every migration recorded exactly once")
+	assert.Equal(t, []int{1, 2, 3, 4, 5, 6, 7}, versions, "every migration recorded exactly once")
 	assert.True(t, s.db.Migrator().HasIndex(&core.Job{}, "idx_jobs_dequeue"), "reworked index present")
 
 	// Pathological single-connection pool must not deadlock (lock + work share
@@ -307,17 +307,30 @@ func TestTryAcquireRecoveryLease(t *testing.T) {
 func TestSeedScheduledFire_InsertIfAbsent(t *testing.T) {
 	s := newTestStorage(t)
 	ctx := context.Background()
+	require.NoError(t, s.DB().Where("name = ?", "sched-A").Delete(&core.ScheduledFire{}).Error)
 
 	base := time.Now().UTC().Truncate(time.Second)
 	got, err := s.SeedScheduledFire(ctx, "sched-A", base)
 	require.NoError(t, err)
 	assert.WithinDuration(t, base, got, time.Second, "first seed becomes the anchor")
 
+	var seeded core.ScheduledFire
+	require.NoError(t, s.DB().First(&seeded, "name = ?", "sched-A").Error)
+	assert.Nil(t, seeded.LastFiredAt, "seeding establishes only a boundary cursor, not a real fire")
+
 	// A later seed with a different anchor must NOT advance the boundary.
 	later := base.Add(10 * time.Second)
 	got2, err := s.SeedScheduledFire(ctx, "sched-A", later)
 	require.NoError(t, err)
 	assert.WithinDuration(t, base, got2, time.Second, "subsequent seed is a no-op (insert-if-absent)")
+
+	claimed, err := s.ClaimScheduledFire(ctx, "sched-A", later)
+	require.NoError(t, err)
+	require.True(t, claimed)
+	var claimedFire core.ScheduledFire
+	require.NoError(t, s.DB().First(&claimedFire, "name = ?", "sched-A").Error)
+	require.NotNil(t, claimedFire.LastFiredAt)
+	assert.True(t, claimedFire.LastFiredAt.Equal(later), "successful claim records the real fire time")
 }
 
 // TestSaveCheckpoint_PersistsErrorCause verifies the error_cause column is

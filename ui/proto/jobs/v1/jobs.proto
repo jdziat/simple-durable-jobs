@@ -63,6 +63,7 @@ message Job {
   bytes result = 18;
   optional google.protobuf.Timestamp dead_lettered_at = 19;
   string dead_letter_reason = 20;
+  string worker = 21;
 }
 
 message Checkpoint {
@@ -83,6 +84,7 @@ message QueueStats {
   int64 failed = 5;
   int64 paused = 6;
   bool is_paused = 7;
+  google.protobuf.Timestamp oldest_pending_at = 8;
 }
 
 message FanOut {

@@ -1451,8 +1451,10 @@ func seedLastRun(schedule schedule.Schedule, persisted, now time.Time) (cursor t
 //     — running at most one catch-up fire for boundaries missed while the whole
 //     fleet was down (seedLastRun).
 //   - If the schedule is fresh (no persisted value), it anchors a shared base in
-//     storage via ClaimScheduledFire(name, now). This writes last_fire_at without
-//     enqueuing anything, so anti-boot-storm holds (the first real fire is one
+//     storage via SeedScheduledFire(name, now). This records last_fire_at (the
+//     anchor cursor) but never last_fired_at (real fires only — the UI's
+//     last_run depends on that distinction), so anti-boot-storm holds (the
+//     first real fire is one
 //     interval later), and — crucially — every worker then derives the SAME next
 //     boundary from that shared anchor. Without it, two workers seeing a fresh
 //     schedule at slightly skewed local times would compute different nextRun

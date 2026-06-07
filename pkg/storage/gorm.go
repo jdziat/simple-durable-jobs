@@ -821,7 +821,10 @@ func (s *GormStorage) ClaimScheduledFire(ctx context.Context, name string, fireT
 	result := s.db.WithContext(ctx).
 		Model(&core.ScheduledFire{}).
 		Where("name = ? AND last_fire_at < ?", name, fireTime).
-		Update("last_fire_at", fireTime)
+		Updates(map[string]any{
+			"last_fire_at":  fireTime,
+			"last_fired_at": fireTime,
+		})
 	if result.Error != nil {
 		return false, result.Error
 	}
@@ -859,6 +862,21 @@ func (s *GormStorage) GetScheduledFireTime(ctx context.Context, name string) (ti
 		return time.Time{}, false, err
 	}
 	return fire.LastFireAt, true, nil
+}
+
+// GetScheduledFireTimes returns the latest real fire time for every schedule.
+func (s *GormStorage) GetScheduledFireTimes(ctx context.Context) (map[string]time.Time, error) {
+	var fires []core.ScheduledFire
+	if err := s.db.WithContext(ctx).Where("last_fired_at IS NOT NULL").Find(&fires).Error; err != nil {
+		return nil, err
+	}
+	times := make(map[string]time.Time, len(fires))
+	for _, fire := range fires {
+		if fire.LastFiredAt != nil {
+			times[fire.Name] = *fire.LastFiredAt
+		}
+	}
+	return times, nil
 }
 
 // Heartbeat extends the lock on a running job.
