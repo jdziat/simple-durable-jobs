@@ -7,6 +7,9 @@
   import Scheduled from './routes/Scheduled.svelte'
   import Workflows from './routes/Workflows.svelte'
   import WorkflowDetail from './routes/WorkflowDetail.svelte'
+  import Ticker from './lib/components/Ticker.svelte'
+  import NavRail from './lib/components/NavRail.svelte'
+  import { start as startStats, stop as stopStats } from './lib/stores/stats.svelte'
 
   let currentPath = $state(window.location.hash.slice(1) || '/')
   let jobId = $state<string | null>(null)
@@ -43,9 +46,13 @@
   }
 
   onMount(() => {
+    startStats()
     window.addEventListener('hashchange', handleHashChange)
     handleHashChange()
-    return () => window.removeEventListener('hashchange', handleHashChange)
+    return () => {
+      window.removeEventListener('hashchange', handleHashChange)
+      stopStats()
+    }
   })
 
   function isActive(path: string): boolean {
@@ -54,30 +61,11 @@
   }
 </script>
 
+<a class="skip-link" href="#content">Skip to content</a>
 <div class="app">
-  <nav class="sidebar">
-    <div class="logo">
-      <h1>Jobs UI</h1>
-    </div>
-    <ul class="nav-links">
-      <li>
-        <a href="#/" class:active={isActive('/')}>Dashboard</a>
-      </li>
-      <li>
-        <a href="#/jobs" class:active={isActive('/jobs')}>Jobs</a>
-      </li>
-      <li>
-        <a href="#/queues" class:active={isActive('/queues')}>Queues</a>
-      </li>
-      <li>
-        <a href="#/scheduled" class:active={isActive('/scheduled')}>Scheduled</a>
-      </li>
-      <li>
-        <a href="#/workflows" class:active={isActive('/workflows')}>Workflows</a>
-      </li>
-    </ul>
-  </nav>
-  <main class="content">
+  <Ticker />
+  <NavRail {currentPath} {isActive} />
+  <main id="content" class="content" tabindex="-1">
     {#if currentPath === '/'}
       <Dashboard />
     {:else if currentPath === '/jobs'}
@@ -99,69 +87,61 @@
 </div>
 
 <style>
-  :global(*) {
-    box-sizing: border-box;
-    margin: 0;
-    padding: 0;
+  .skip-link {
+    position: fixed;
+    top: var(--sp-3);
+    left: var(--sp-3);
+    z-index: 100;
+    transform: translateY(calc(-100% - var(--sp-4)));
+    padding: var(--sp-2) var(--sp-3);
+    border: var(--border-strong);
+    border-radius: var(--radius-input);
+    background: var(--bg-raised);
+    color: var(--fg-primary);
+    font-weight: var(--fw-label);
+    text-decoration: none;
+    transition: transform var(--dur-instant) var(--ease);
   }
 
-  :global(body) {
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
-    background: #f5f7fa;
-    color: #333;
+  .skip-link:focus {
+    transform: translateY(0);
   }
 
   .app {
-    display: flex;
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    grid-template-rows: 56px minmax(0, 1fr);
     min-height: 100vh;
-  }
-
-  .sidebar {
-    width: 220px;
-    background: #1a1a2e;
-    color: white;
-    padding: 20px 0;
-    position: fixed;
-    height: 100vh;
-  }
-
-  .logo {
-    padding: 0 20px 20px;
-    border-bottom: 1px solid rgba(255,255,255,0.1);
-  }
-
-  .logo h1 {
-    font-size: 20px;
-    font-weight: 600;
-  }
-
-  .nav-links {
-    list-style: none;
-    padding: 20px 0;
-  }
-
-  .nav-links li {
-    margin: 4px 0;
-  }
-
-  .nav-links a {
-    display: block;
-    padding: 12px 20px;
-    color: rgba(255,255,255,0.7);
-    text-decoration: none;
-    transition: all 0.2s;
-  }
-
-  .nav-links a:hover,
-  .nav-links a.active {
-    background: rgba(255,255,255,0.1);
-    color: white;
+    background: var(--bg-base);
+    color: var(--fg-primary);
   }
 
   .content {
-    flex: 1;
-    margin-left: 220px;
-    padding: 24px;
-    min-height: 100vh;
+    min-width: 0;
+    min-height: calc(100vh - 56px);
+    padding: var(--sp-6);
+    background: var(--bg-base);
+  }
+
+  .content:focus {
+    outline: none;
+  }
+
+  @media (max-width: 1439px) {
+    .content {
+      padding: var(--sp-4);
+    }
+  }
+
+  @media (max-width: 767px) {
+    .app {
+      display: block;
+      padding-bottom: 56px;
+    }
+
+    .content {
+      min-height: calc(100vh - 112px);
+      padding: var(--sp-3);
+    }
   }
 </style>
