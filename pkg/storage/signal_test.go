@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -218,6 +219,146 @@ func TestResumeJob_PreservesRunAt(t *testing.T) {
 	require.NoError(t, s.db.WithContext(ctx).First(&d, "id = ?", "d").Error)
 	assert.Equal(t, core.StatusPending, d.Status)
 	require.NotNil(t, d.RunAt, "ResumeJob must preserve a delayed job's schedule")
+}
+
+// validCheckpoint builds a well-formed call-index checkpoint for a consumed
+// signal, mirroring what pkg/signal's WaitForSignal closure produces.
+func validCheckpoint(jobID string, sig *core.Signal) *core.Checkpoint {
+	return &core.Checkpoint{
+		JobID:     jobID,
+		CallIndex: 0,
+		CallType:  "signal:ctx",
+		Result:    sig.Payload,
+	}
+}
+
+func TestConsumeSignalTx_AtomicConsumeAndCheckpoint(t *testing.T) {
+	s := newTestStorage(t)
+	ctx := context.Background()
+	require.NoError(t, s.SendSignal(ctx, "j1", "ctx", []byte(`"hi"`)))
+
+	sig, err := s.ConsumeSignalTx(ctx, "j1", "ctx", func(sig *core.Signal) (*core.Checkpoint, error) {
+		return validCheckpoint("j1", sig), nil
+	})
+	require.NoError(t, err)
+	require.NotNil(t, sig)
+	assert.Equal(t, `"hi"`, string(sig.Payload))
+
+	// The signal is consumed atomically with the checkpoint write.
+	peek, err := s.PeekSignal(ctx, "j1", "ctx")
+	require.NoError(t, err)
+	assert.Nil(t, peek, "signal consumed")
+
+	cps, err := s.GetCheckpoints(ctx, "j1")
+	require.NoError(t, err)
+	require.Len(t, cps, 1, "the call-index checkpoint was persisted in the same tx")
+	assert.Equal(t, 0, cps[0].CallIndex)
+	assert.Equal(t, "signal:ctx", cps[0].CallType)
+	assert.Equal(t, `"hi"`, string(cps[0].Result))
+}
+
+func TestConsumeSignalTx_RollbackLeavesSignalAndNoCheckpoint(t *testing.T) {
+	s := newTestStorage(t)
+	ctx := context.Background()
+	require.NoError(t, s.SendSignal(ctx, "j1", "ctx", []byte(`"hi"`)))
+
+	// The checkpoint-build closure fails: the whole consume+checkpoint must roll
+	// back. This is the crash/replay regression proof at the tx layer — the old
+	// two-tx design (consume commits, then checkpoint) cannot satisfy it. Runs on
+	// SQLite AND Postgres AND MySQL (the PG/MySQL FOR UPDATE SKIP LOCKED path).
+	_, err := s.ConsumeSignalTx(ctx, "j1", "ctx", func(*core.Signal) (*core.Checkpoint, error) {
+		return nil, errors.New("boom")
+	})
+	require.Error(t, err)
+
+	peek, err := s.PeekSignal(ctx, "j1", "ctx")
+	require.NoError(t, err)
+	require.NotNil(t, peek, "consume rolled back: signal still pending (consumed_at NULL)")
+	assert.Equal(t, `"hi"`, string(peek.Payload))
+
+	cps, err := s.GetCheckpoints(ctx, "j1")
+	require.NoError(t, err)
+	assert.Empty(t, cps, "no checkpoint recorded when the tx rolled back")
+}
+
+func TestConsumeSignalTx_NoPendingDoesNothing(t *testing.T) {
+	s := newTestStorage(t)
+	ctx := context.Background()
+
+	sig, err := s.ConsumeSignalTx(ctx, "j1", "ctx", func(*core.Signal) (*core.Checkpoint, error) {
+		t.Fatal("buildCheckpoint must not be called when no signal is pending")
+		return nil, nil
+	})
+	require.NoError(t, err)
+	assert.Nil(t, sig, "no signal → nil, nil")
+
+	cps, err := s.GetCheckpoints(ctx, "j1")
+	require.NoError(t, err)
+	assert.Empty(t, cps, "no checkpoint when nothing was consumed")
+}
+
+func TestDrainSignalsTx_AlwaysCheckpointsAndRollsBack(t *testing.T) {
+	drainCheckpoint := func(sigs []*core.Signal) *core.Checkpoint {
+		return &core.Checkpoint{
+			JobID:     "j1",
+			CallIndex: 0,
+			CallType:  "signaldrain:ctx",
+			Result:    []byte("[]"),
+		}
+	}
+
+	t.Run("empty still checkpoints", func(t *testing.T) {
+		s := newTestStorage(t)
+		ctx := context.Background()
+		var called bool
+		sigs, err := s.DrainSignalsTx(ctx, "j1", "ctx", func(sigs []*core.Signal) (*core.Checkpoint, error) {
+			called = true
+			assert.Empty(t, sigs, "empty batch")
+			return drainCheckpoint(sigs), nil
+		})
+		require.NoError(t, err)
+		assert.Empty(t, sigs)
+		assert.True(t, called, "buildCheckpoint always invoked, even when empty")
+		cps, err := s.GetCheckpoints(ctx, "j1")
+		require.NoError(t, err)
+		require.Len(t, cps, 1, "empty drain still records a checkpoint for deterministic replay")
+	})
+
+	t.Run("non-empty consumes all and checkpoints", func(t *testing.T) {
+		s := newTestStorage(t)
+		ctx := context.Background()
+		for _, p := range [][]byte{[]byte(`"a"`), []byte(`"b"`), []byte(`"c"`)} {
+			require.NoError(t, s.SendSignal(ctx, "j1", "ctx", p))
+		}
+		sigs, err := s.DrainSignalsTx(ctx, "j1", "ctx", func(sigs []*core.Signal) (*core.Checkpoint, error) {
+			return drainCheckpoint(sigs), nil
+		})
+		require.NoError(t, err)
+		require.Len(t, sigs, 3)
+		peek, err := s.PeekSignal(ctx, "j1", "ctx")
+		require.NoError(t, err)
+		assert.Nil(t, peek, "all consumed")
+		cps, err := s.GetCheckpoints(ctx, "j1")
+		require.NoError(t, err)
+		require.Len(t, cps, 1)
+	})
+
+	t.Run("closure error rolls back consume and checkpoint", func(t *testing.T) {
+		s := newTestStorage(t)
+		ctx := context.Background()
+		for _, p := range [][]byte{[]byte(`"a"`), []byte(`"b"`), []byte(`"c"`)} {
+			require.NoError(t, s.SendSignal(ctx, "j1", "ctx", p))
+		}
+		_, err := s.DrainSignalsTx(ctx, "j1", "ctx", func([]*core.Signal) (*core.Checkpoint, error) {
+			return nil, errors.New("boom")
+		})
+		require.Error(t, err)
+		drained, err := s.DrainSignals(ctx, "j1", "ctx")
+		require.NoError(t, err)
+		assert.Len(t, drained, 3, "nothing consumed: all three still pending")
+		// Note: this DrainSignals consumed them; assert no checkpoint from the
+		// failed tx existed beforehand by checking the rolled-back state above.
+	})
 }
 
 func TestConsumeSignal_ConcurrentDisjoint(t *testing.T) {

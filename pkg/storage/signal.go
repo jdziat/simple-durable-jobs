@@ -136,6 +136,131 @@ func (s *GormStorage) DrainSignals(ctx context.Context, jobID, name string) ([]*
 	return out, nil
 }
 
+// ConsumeSignalTx atomically takes the oldest pending signal of name for the job
+// (marking it consumed) AND persists a replay checkpoint built from that signal,
+// in a SINGLE transaction. The two writes commit or roll back together, closing
+// the torn-write window that the separate consume-then-checkpoint sequence left:
+// a crash either rolls back both (signal stays pending → replay re-consumes
+// cleanly) or commits both (replay reads the checkpoint without re-consuming).
+//
+// buildCheckpoint receives the decoded, consumed signal and returns the
+// fully-formed *core.Checkpoint to persist (arbitrary Result bytes — the caller
+// controls the payload shape: a raw signal payload, a JSON-wrapped timeout
+// object, etc.). Returning (nil, nil) skips the checkpoint write; returning an
+// error rolls back the consume. When no signal is pending the closure is never
+// invoked and (nil, nil) is returned (the caller suspends without a checkpoint).
+//
+// Concurrent consumers receive disjoint signals (FOR UPDATE SKIP LOCKED on
+// Postgres/MySQL; SQLite's serialized writer provides equivalent protection).
+// withSerializationRetry wraps the whole consume+checkpoint so a 40001/1213
+// retry re-runs both atomically.
+func (s *GormStorage) ConsumeSignalTx(ctx context.Context, jobID, name string, buildCheckpoint func(sig *core.Signal) (*core.Checkpoint, error)) (*core.Signal, error) {
+	var out *core.Signal
+	err := s.withSerializationRetry(ctx, func() error {
+		out = nil
+		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			q := tx.Where("job_id = ? AND name = ? AND consumed_at IS NULL", jobID, name).
+				Order("created_at ASC")
+			if !s.isSQLite {
+				q = q.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"})
+			}
+			var sig core.Signal
+			err := q.First(&sig).Error
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil // nothing pending — caller suspends, NO checkpoint written
+			}
+			if err != nil {
+				return err
+			}
+			now := time.Now()
+			res := tx.Model(&core.Signal{}).
+				Where("id = ? AND consumed_at IS NULL", sig.ID).
+				Update("consumed_at", now)
+			if res.Error != nil {
+				return res.Error
+			}
+			if res.RowsAffected == 0 {
+				return nil // raced with another consumer; treat as none this round
+			}
+			sig.ConsumedAt = &now
+			if err := s.decodeSignalPayload(&sig); err != nil {
+				return err
+			}
+			cp, err := buildCheckpoint(&sig)
+			if err != nil {
+				return err
+			}
+			if cp != nil {
+				if err := s.SaveCheckpointTx(ctx, tx, cp); err != nil {
+					return err
+				}
+			}
+			out = &sig
+			return nil
+		})
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// DrainSignalsTx atomically consumes ALL currently-pending signals of name for
+// the job, in arrival (FIFO) order, AND persists a single replay checkpoint
+// built from the whole batch, in ONE transaction. Unlike ConsumeSignalTx the
+// checkpoint closure is ALWAYS invoked — even when zero signals are pending —
+// because DrainSignals must record an empty-result checkpoint so replay of an
+// empty drain is deterministic. The consume-all and the checkpoint commit or
+// roll back together.
+func (s *GormStorage) DrainSignalsTx(ctx context.Context, jobID, name string, buildCheckpoint func(sigs []*core.Signal) (*core.Checkpoint, error)) ([]*core.Signal, error) {
+	var out []*core.Signal
+	err := s.withSerializationRetry(ctx, func() error {
+		out = nil
+		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			q := tx.Where("job_id = ? AND name = ? AND consumed_at IS NULL", jobID, name).
+				Order("created_at ASC")
+			if !s.isSQLite {
+				q = q.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"})
+			}
+			var sigs []*core.Signal
+			if err := q.Find(&sigs).Error; err != nil {
+				return err
+			}
+			if len(sigs) > 0 {
+				now := time.Now()
+				ids := make([]string, len(sigs))
+				for i, sg := range sigs {
+					ids[i] = sg.ID
+					sg.ConsumedAt = &now
+				}
+				if err := tx.Model(&core.Signal{}).
+					Where("id IN ?", ids).
+					Update("consumed_at", now).Error; err != nil {
+					return err
+				}
+				if err := s.decodeSignalPayloads(sigs); err != nil {
+					return err
+				}
+			}
+			cp, err := buildCheckpoint(sigs)
+			if err != nil {
+				return err
+			}
+			if cp != nil {
+				if err := s.SaveCheckpointTx(ctx, tx, cp); err != nil {
+					return err
+				}
+			}
+			out = sigs
+			return nil
+		})
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // GetPendingSignalName returns the oldest pending signal name for jobID. It is
 // an optional capability used by the worker to distinguish signal-driven wakes
 // from expired durable-timer wakes before emitting JobResumedBySignal.
