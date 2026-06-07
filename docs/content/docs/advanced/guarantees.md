@@ -19,6 +19,9 @@ that step again on replay.
 **Your handlers — and every `Call()` step — must be idempotent.** Use a unique
 key, an upsert, or an external dedup guard for any side effect that must not
 happen twice (charging a card, sending an email, calling a non-idempotent API).
+For phase effects in the same database as the jobs storage, see
+[Transactional Checkpoints]({{< relref "/docs/advanced/transactional-checkpoints" >}})
+to commit the effect and phase checkpoint together.
 This is not a limitation unique to this library; it is the same contract River
 and Temporal activities place on you. Exactly-once *effects* are achieved by
 making *effects* idempotent, not by the queue pretending a crash never happened.

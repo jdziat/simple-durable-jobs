@@ -155,19 +155,23 @@ func registerHandlers(q *jobs.Queue, db *gorm.DB, dialect string) {
 	})
 
 	q.Register("chaos.pipeline", func(ctx context.Context, _ struct{}) error {
+		jobID := jobs.JobIDFromContext(ctx)
 		for _, phase := range []string{"extract", "transform", "load"} {
 			if _, ok := jobs.LoadPhaseCheckpoint[string](ctx, phase); ok {
 				continue
 			}
 			time.Sleep(150 * time.Millisecond)
 			marker := "phase:" + phase
-			if err := insertEffect(ctx, db, jobs.JobIDFromContext(ctx), marker); err != nil {
-				if isDuplicate(err) {
-					_ = insertEffectIgnoreDuplicate(ctx, db, dialect, jobs.JobIDFromContext(ctx), "phase-reexec:"+phase)
+			err := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+				if err := insertEffect(ctx, tx, jobID, marker); err != nil {
+					return err
 				}
-				return err
-			}
-			if err := jobs.SavePhaseCheckpoint(ctx, phase, "ok"); err != nil {
+				return jobs.SavePhaseCheckpointTx(ctx, tx, phase, "ok")
+			})
+			if err != nil {
+				if isDuplicate(err) {
+					_ = insertEffectIgnoreDuplicate(ctx, db, dialect, jobID, "phase-reexec:"+phase)
+				}
 				return err
 			}
 		}
@@ -183,6 +187,35 @@ func registerHandlers(q *jobs.Queue, db *gorm.DB, dialect string) {
 				return err
 			}
 			return fmt.Errorf("chaostest: forced replay to exercise checkpoint keying")
+		}
+		return nil
+	})
+
+	// chaos.pipeline_window deliberately keeps the two-commit effect/checkpoint
+	// pattern to demonstrate the documented at-least-once window. A SIGKILL
+	// landing between the two commits leaves the effect without its checkpoint;
+	// every retry then re-hits the unique constraint, so such jobs END FAILED
+	// after retries by design — counted by INV-AT-LEAST-ONCE-WINDOW (INFO),
+	// never a HARD failure.
+	q.Register("chaos.pipeline_window", func(ctx context.Context, _ struct{}) error {
+		jobID := jobs.JobIDFromContext(ctx)
+		for _, phase := range []string{"extract", "transform", "load"} {
+			if _, ok := jobs.LoadPhaseCheckpoint[string](ctx, phase); ok {
+				continue
+			}
+			time.Sleep(150 * time.Millisecond)
+			marker := "phase:" + phase
+			if err := insertEffect(ctx, db, jobID, marker); err != nil {
+				if isDuplicate(err) {
+					_ = insertEffectIgnoreDuplicate(ctx, db, dialect, jobID, "window-reexec:"+phase)
+				}
+				return err
+			}
+			// This handler intentionally keeps the old two-commit pattern to
+			// demonstrate the documented at-least-once crash window.
+			if err := jobs.SavePhaseCheckpoint(ctx, phase, "ok"); err != nil {
+				return err
+			}
 		}
 		return nil
 	})
@@ -254,10 +287,11 @@ func runSeed(ctx context.Context, a *app) error {
 	}
 
 	counts := map[string]int{
-		"chaos.unit":     200,
-		"chaos.pipeline": 50,
-		"chaos.fanout":   20,
-		"chaos.slow":     10,
+		"chaos.unit":            200,
+		"chaos.pipeline":        30,
+		"chaos.pipeline_window": 20,
+		"chaos.fanout":          20,
+		"chaos.slow":            10,
 	}
 	for typ, n := range counts {
 		for i := 0; i < n; i++ {
@@ -291,8 +325,8 @@ func runSeed(ctx context.Context, a *app) error {
 	}
 	wg.Wait()
 
-	fmt.Printf("seeded workload: unit=%d pipeline=%d fanout=%d slow=%d unique_attempts=50 unique_inserted=%d duplicate_rejected=%d unique_errors=%d\n",
-		counts["chaos.unit"], counts["chaos.pipeline"], counts["chaos.fanout"], counts["chaos.slow"], uniqueOK, uniqueDup, uniqueErr)
+	fmt.Printf("seeded workload: unit=%d pipeline_tx=%d pipeline_window=%d fanout=%d slow=%d unique_attempts=50 unique_inserted=%d duplicate_rejected=%d unique_errors=%d\n",
+		counts["chaos.unit"], counts["chaos.pipeline"], counts["chaos.pipeline_window"], counts["chaos.fanout"], counts["chaos.slow"], uniqueOK, uniqueDup, uniqueErr)
 	return nil
 }
 
@@ -324,6 +358,7 @@ func runCheck(ctx context.Context, a *app) error {
 
 	results := []invariant{
 		checkExactlyOnce(ctx, a.db),
+		checkAtLeastOnceWindow(ctx, a.db),
 		checkNoWedge(ctx, a.db),
 		checkFanOutCounts(ctx, a.db),
 		checkUnique(ctx, a.db),
@@ -340,7 +375,7 @@ func runCheck(ctx context.Context, a *app) error {
 				hardFailed++
 			}
 		}
-		fmt.Printf("%-18s %-4s %-4s %s\n", inv.name, inv.level, status, inv.detail)
+		fmt.Printf("%-26s %-4s %-4s %s\n", inv.name, inv.level, status, inv.detail)
 	}
 	if hardFailed > 0 {
 		fmt.Printf("chaostest result: RED baseline reproduced with %d HARD failure(s)\n", hardFailed)
@@ -374,18 +409,40 @@ func waitForDrain(ctx context.Context, db *gorm.DB, timeout, quietFor time.Durat
 }
 
 func checkExactlyOnce(ctx context.Context, db *gorm.DB) invariant {
-	var duplicateRows, reexecRows int64
+	var duplicateRows, reexecRows, windowCheckpointedRows int64
 	db.WithContext(ctx).Raw(`
 		SELECT count(*) FROM (
 			SELECT job_id, marker FROM chaos_effects GROUP BY job_id, marker HAVING count(*) > 1
 		) dup`).Scan(&duplicateRows)
 	db.WithContext(ctx).Raw(`SELECT count(*) FROM chaos_effects WHERE marker LIKE 'phase-reexec:%'`).Scan(&reexecRows)
-	pass := duplicateRows == 0 && reexecRows == 0
+	db.WithContext(ctx).Raw(`
+		SELECT count(*)
+		FROM chaos_effects ce
+		WHERE ce.marker LIKE 'window-reexec:%'
+		  AND EXISTS (
+			SELECT 1
+			FROM checkpoints cp
+			WHERE cp.job_id = ce.job_id
+			  AND cp.call_index = -1
+			  AND cp.call_type = SUBSTRING(ce.marker FROM 15)
+		  )`).Scan(&windowCheckpointedRows)
+	pass := duplicateRows == 0 && reexecRows == 0 && windowCheckpointedRows == 0
 	return invariant{
 		name:   "INV-EXACTLY-ONCE",
 		level:  "HARD",
 		pass:   pass,
-		detail: fmt.Sprintf("duplicate_effect_groups=%d phase_reexec_markers=%d", duplicateRows, reexecRows),
+		detail: fmt.Sprintf("tx pipeline: duplicate_effect_groups=%d phase_reexec_markers=%d; window checkpointed_reexec_markers=%d", duplicateRows, reexecRows, windowCheckpointedRows),
+	}
+}
+
+func checkAtLeastOnceWindow(ctx context.Context, db *gorm.DB) invariant {
+	var windowRows int64
+	db.WithContext(ctx).Raw(`SELECT count(*) FROM chaos_effects WHERE marker LIKE 'window-reexec:%'`).Scan(&windowRows)
+	return invariant{
+		name:   "INV-AT-LEAST-ONCE-WINDOW",
+		level:  "INFO",
+		pass:   true,
+		detail: fmt.Sprintf("window_reexec_markers=%d expected at-least-once re-execution under SIGKILL; bounded by design", windowRows),
 	}
 }
 

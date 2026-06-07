@@ -160,6 +160,11 @@ var schemaMigrations = []schemaMigration{
 		Name:    "dead_letter_columns",
 		Up:      migrateDeadLetterColumns,
 	},
+	{
+		Version: 7,
+		Name:    "scheduled_fire_last_fired_at",
+		Up:      migrateScheduledFireLastFiredAt,
+	},
 }
 
 // applyPendingMigrations runs every migration whose version is absent from the
@@ -372,5 +377,28 @@ func migrateDeadLetterColumns(ctx context.Context, db *gorm.DB, dialect string) 
 			}
 		}
 		return db.Exec("CREATE INDEX IF NOT EXISTS idx_jobs_dead_lettered_at ON jobs (dead_lettered_at) WHERE dead_lettered_at IS NOT NULL").Error
+	}
+}
+
+func migrateScheduledFireLastFiredAt(ctx context.Context, db *gorm.DB, dialect string) error {
+	switch dialect {
+	case dialectMySQL:
+		m := db.Migrator()
+		if !m.HasColumn(&core.ScheduledFire{}, "last_fired_at") {
+			if err := db.Exec("ALTER TABLE scheduled_fires ADD COLUMN last_fired_at DATETIME(6) NULL").Error; err != nil && !isBenignDDLError(err) {
+				return fmt.Errorf("add last_fired_at column: %w", err)
+			}
+		}
+		return nil
+	case dialectPostgres:
+		return db.Exec("ALTER TABLE scheduled_fires ADD COLUMN IF NOT EXISTS last_fired_at timestamp with time zone NULL").Error
+	default:
+		m := db.Migrator()
+		if !m.HasColumn(&core.ScheduledFire{}, "last_fired_at") {
+			if err := db.Exec("ALTER TABLE scheduled_fires ADD COLUMN last_fired_at datetime NULL").Error; err != nil {
+				return fmt.Errorf("add last_fired_at column: %w", err)
+			}
+		}
+		return nil
 	}
 }

@@ -25,6 +25,7 @@
     priority: number
     attempt: number
     maxRetries: number
+    worker: string
     args: string
     lastError: string
     createdAt: TimeValue
@@ -159,6 +160,7 @@
         priority: j.priority,
         attempt: j.attempt,
         maxRetries: j.maxRetries,
+        worker: j.worker,
         args: formatJson(j.args),
         lastError: j.lastError,
         createdAt: toDate(j.createdAt),
@@ -324,7 +326,10 @@
           </div>
           <div class="meta-item">
             <span class="label">Worker</span>
-            <span class="value mono">—</span>
+            <span class="value mono">{job.worker || '—'}</span>
+            {#if job.worker}
+              <CopyButton text={job.worker} />
+            {/if}
           </div>
         </section>
 

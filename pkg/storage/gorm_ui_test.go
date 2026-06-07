@@ -14,6 +14,7 @@ import (
 	"gorm.io/gorm/logger"
 
 	"github.com/jdziat/simple-durable-jobs/pkg/core"
+	jobsv1 "github.com/jdziat/simple-durable-jobs/ui/gen/jobs/v1"
 )
 
 func newUITestStorage(t *testing.T) *GormStorage {
@@ -26,6 +27,18 @@ func newUITestStorage(t *testing.T) *GormStorage {
 	store := NewGormStorage(db)
 	require.NoError(t, store.Migrate(context.Background()))
 	return store
+}
+
+func TestMigrate_IdempotentRecordsAllMigrations(t *testing.T) {
+	ctx := context.Background()
+	store := newUITestStorage(t)
+
+	require.NoError(t, store.Migrate(ctx))
+	assert.True(t, store.db.Migrator().HasColumn(&core.ScheduledFire{}, "last_fired_at"))
+
+	var versions []int
+	require.NoError(t, store.db.Model(&core.SchemaMigration{}).Order("version").Pluck("version", &versions).Error)
+	assert.Equal(t, []int{1, 2, 3, 4, 5, 6, 7}, versions)
 }
 
 func TestSearchJobs_EscapesLikeMetacharacters(t *testing.T) {
@@ -79,6 +92,77 @@ func TestCountActiveWorkers_CountsDistinctRunningLockHolders(t *testing.T) {
 	count, err = store.CountActiveWorkers(ctx)
 	require.NoError(t, err)
 	assert.Equal(t, int64(2), count)
+}
+
+func TestGetQueueDepthStats_OldestPendingAt(t *testing.T) {
+	ctx := context.Background()
+	store := newUITestStorage(t)
+	now := time.Date(2026, 6, 7, 12, 0, 0, 0, time.UTC)
+	oldestDefault := now.Add(-3 * time.Hour)
+	newerDefault := now.Add(-time.Hour)
+	oldestEmails := now.Add(-2 * time.Hour)
+
+	jobs := []*core.Job{
+		{ID: "default-oldest", Type: "work", Queue: "default", Status: core.StatusPending, Args: []byte(`{}`), CreatedAt: oldestDefault},
+		{ID: "default-newer", Type: "work", Queue: "default", Status: core.StatusPending, Args: []byte(`{}`), CreatedAt: newerDefault},
+		{ID: "default-running", Type: "work", Queue: "default", Status: core.StatusRunning, Args: []byte(`{}`), CreatedAt: now.Add(-4 * time.Hour)},
+		{ID: "emails-oldest", Type: "work", Queue: "emails", Status: core.StatusPending, Args: []byte(`{}`), CreatedAt: oldestEmails},
+		{ID: "completed-only", Type: "work", Queue: "archive", Status: core.StatusCompleted, Args: []byte(`{}`), CreatedAt: now.Add(-5 * time.Hour)},
+	}
+	for _, job := range jobs {
+		require.NoError(t, store.Enqueue(ctx, job))
+	}
+
+	stats, err := store.GetQueueDepthStats(ctx)
+	require.NoError(t, err)
+	byQueue := queueStatsByName(stats)
+
+	require.NotNil(t, byQueue["default"].OldestPendingAt)
+	assert.Equal(t, oldestDefault.Unix(), byQueue["default"].OldestPendingAt.AsTime().Unix())
+	require.NotNil(t, byQueue["emails"].OldestPendingAt)
+	assert.Equal(t, oldestEmails.Unix(), byQueue["emails"].OldestPendingAt.AsTime().Unix())
+	require.NotNil(t, byQueue["archive"])
+	assert.Nil(t, byQueue["archive"].OldestPendingAt)
+}
+
+func TestParseDBTimestamp_AcceptsRFC3339NanoAndSQLiteLiterals(t *testing.T) {
+	rfc3339Nano := "2026-06-07T12:34:56.123456789Z"
+	sqliteLiteral := "2026-06-07 12:34:56.123456789+00:00"
+
+	rfcTime, ok := parseDBTimestamp(rfc3339Nano)
+	require.True(t, ok)
+	assert.Equal(t, time.Date(2026, 6, 7, 12, 34, 56, 123456789, time.UTC).UnixNano(), rfcTime.UnixNano())
+
+	sqliteTime, ok := parseDBTimestamp(sqliteLiteral)
+	require.True(t, ok)
+	assert.Equal(t, time.Date(2026, 6, 7, 12, 34, 56, 123456789, time.UTC).UnixNano(), sqliteTime.UnixNano())
+}
+
+func TestGetScheduledFireTimes(t *testing.T) {
+	ctx := context.Background()
+	store := newUITestStorage(t)
+	anchor := time.Date(2026, 6, 7, 12, 0, 0, 0, time.UTC)
+	fireTime := time.Date(2026, 6, 7, 12, 15, 0, 0, time.UTC)
+
+	_, err := store.SeedScheduledFire(ctx, "seeded-only", anchor)
+	require.NoError(t, err)
+	claimed, err := store.ClaimScheduledFire(ctx, "daily-report", fireTime)
+	require.NoError(t, err)
+	require.True(t, claimed)
+
+	times, err := store.GetScheduledFireTimes(ctx)
+	require.NoError(t, err)
+	require.NotContains(t, times, "seeded-only")
+	require.Contains(t, times, "daily-report")
+	assert.Equal(t, fireTime.Unix(), times["daily-report"].Unix())
+}
+
+func queueStatsByName(stats []*jobsv1.QueueStats) map[string]*jobsv1.QueueStats {
+	byName := make(map[string]*jobsv1.QueueStats, len(stats))
+	for _, stat := range stats {
+		byName[stat.Name] = stat
+	}
+	return byName
 }
 
 func TestSearchJobs_OverlongSearchIsBounded(t *testing.T) {

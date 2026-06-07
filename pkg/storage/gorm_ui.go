@@ -2,10 +2,12 @@ package storage
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"strings"
 	"time"
 
+	"google.golang.org/protobuf/types/known/timestamppb"
 	"gorm.io/gorm"
 
 	"github.com/jdziat/simple-durable-jobs/pkg/core"
@@ -61,6 +63,31 @@ func (s *GormStorage) GetQueueDepthStats(ctx context.Context) ([]*jobsv1.QueueSt
 		}
 	}
 
+	type pendingRow struct {
+		Queue           string
+		OldestPendingAt sql.NullString
+	}
+	var pendingRows []pendingRow
+	if err := s.db.WithContext(ctx).
+		Model(&core.Job{}).
+		Select("queue, MIN(created_at) AS oldest_pending_at").
+		Where("status = ?", core.StatusPending).
+		Group("queue").
+		Find(&pendingRows).Error; err != nil {
+		return nil, err
+	}
+	for _, r := range pendingRows {
+		qs, ok := statsMap[r.Queue]
+		if !ok {
+			qs = &jobsv1.QueueStats{Name: r.Queue}
+			statsMap[r.Queue] = qs
+		}
+		oldestPendingAt, ok := parseDBTimestamp(r.OldestPendingAt.String)
+		if r.OldestPendingAt.Valid && ok {
+			qs.OldestPendingAt = timestamppb.New(oldestPendingAt)
+		}
+	}
+
 	// Check which queues are paused
 	pausedQueues, _ := s.GetPausedQueues(ctx)
 	pausedSet := make(map[string]struct{}, len(pausedQueues))
@@ -76,6 +103,25 @@ func (s *GormStorage) GetQueueDepthStats(ctx context.Context) ([]*jobsv1.QueueSt
 		result = append(result, qs)
 	}
 	return result, nil
+}
+
+// parseDBTimestamp accepts the timestamp strings returned when aggregate
+// expressions are scanned through sql.NullString: pgx/MySQL convertAssign use
+// T-separated RFC3339, while SQLite returns a space-separated value with offset.
+func parseDBTimestamp(value string) (time.Time, bool) {
+	if value == "" {
+		return time.Time{}, false
+	}
+	for _, layout := range []string{
+		time.RFC3339Nano,
+		"2006-01-02 15:04:05.999999999Z07:00",
+		"2006-01-02 15:04:05Z07:00",
+	} {
+		if ts, err := time.Parse(layout, value); err == nil {
+			return ts, true
+		}
+	}
+	return time.Time{}, false
 }
 
 // CountActiveWorkers returns distinct workers currently holding running jobs.

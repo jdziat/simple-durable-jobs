@@ -2,6 +2,7 @@
   import { onDestroy, onMount } from 'svelte'
   import { jobsClient } from '../lib/client'
   import { deltaFlash } from '../lib/actions/deltaFlash'
+  import AgeHeat from '../lib/components/AgeHeat.svelte'
   import Button from '../lib/components/Button.svelte'
   import ConfirmDialog from '../lib/components/ConfirmDialog.svelte'
   import DataTable, { type Column } from '../lib/components/DataTable.svelte'
@@ -24,8 +25,11 @@
     paused: number
     total: number
     isPaused: boolean
+    oldestPendingAt: Date | null
     composition: number[]
   }
+
+  type ProtoTimestamp = { toDate?: () => Date }
 
   type ConfirmState = {
     queue: QueueItem
@@ -88,6 +92,12 @@
     return Number(value ?? 0)
   }
 
+  function toDate(value: ProtoTimestamp | undefined): Date | null {
+    if (!value?.toDate) return null
+    const date = value.toDate()
+    return Number.isNaN(date.getTime()) ? null : date
+  }
+
   function handleSort(key: string) {
     if (!['name', 'pending', 'running', 'completed', 'failed', 'paused', 'total'].includes(key)) return
     const nextKey = key as SortableQueueKey
@@ -119,6 +129,7 @@
           paused,
           total: pending + running + completed + failed + paused,
           isPaused: q.isPaused,
+          oldestPendingAt: toDate(q.oldestPendingAt),
           // Honest micro-chart: QueueStats exposes only a point-in-time status
           // distribution, not throughput history. This snapshot is labeled as
           // composition so it cannot be mistaken for fabricated time-series data.
@@ -234,7 +245,11 @@
         use:deltaFlash={value}
       >{value}</span>
     {:else if column.key === 'backlogAge'}
-      <span class="data-gap" title="QueueStats does not expose oldest queued job age.">—</span>
+      {#if queue.oldestPendingAt}
+        <AgeHeat ts={queue.oldestPendingAt} />
+      {:else}
+        <span class="data-gap">—</span>
+      {/if}
     {:else if column.key === 'composition'}
       <div class="spark-cell" title="Snapshot of pending, running, completed, failed, paused counts.">
         <Sparkline data={queue.composition} color={queue.failed > 0 ? 'var(--sig-danger)' : 'var(--fg-secondary)'} label={`Status composition for ${queue.name}`} />

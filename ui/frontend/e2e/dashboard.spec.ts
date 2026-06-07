@@ -158,4 +158,140 @@ test.describe('Dashboard', () => {
     await page.locator('.queue-selector').selectOption('emails')
     await expect(page.locator('.chart-section h3')).toHaveText('Throughput - emails')
   })
+
+  test('ops row shows oldest pending age', async ({ page }) => {
+    const cell = page.locator('.ops-cell', { hasText: 'Oldest pending age' })
+    await expect(cell).toBeVisible()
+    await expect(cell.locator('.age-heat')).toContainText('ago')
+  })
+
+  test('ops row exposes four operational cells', async ({ page }) => {
+    await expect(page.locator('.ops-row .ops-cell')).toHaveCount(4)
+    // Geometry guard: all four cells share ONE grid row at desktop width —
+    // a track-count regression once orphaned the 4th cell on its own row.
+    const tops = await page.locator('.ops-row .ops-cell').evaluateAll(
+      (cells) => cells.map((c) => (c as HTMLElement).offsetTop)
+    )
+    expect(new Set(tops).size).toBe(1)
+  })
+
+  test('ops row shows throughput per minute', async ({ page }) => {
+    await expect(page.locator('.ops-cell', { hasText: 'Throughput/min' }).locator('strong')).not.toHaveText('')
+  })
+
+  test('ops row shows total backlog', async ({ page }) => {
+    await expect(page.locator('.ops-cell', { hasText: 'Total backlog' }).locator('strong')).not.toHaveText('0')
+  })
+
+  test('throughput chart completed line has non-trivial geometry', async ({ page }) => {
+    const path = page.locator('.completed-line')
+    await expect(path).toBeVisible()
+    const d = await path.getAttribute('d')
+    expect(d ?? '').toMatch(/^M /)
+    expect((d?.match(/ L /g) ?? []).length).toBeGreaterThan(1)
+  })
+
+  test('throughput chart failed line renders', async ({ page }) => {
+    await expect(page.locator('.failed-line')).toBeVisible()
+  })
+
+  test('throughput chart areas render', async ({ page }) => {
+    await expect(page.locator('.completed-area')).toBeVisible()
+    await expect(page.locator('.failed-area')).toBeVisible()
+  })
+
+  test('throughput chart has accessible SVG label', async ({ page }) => {
+    await expect(page.locator('.area-chart svg')).toHaveAttribute('aria-label', 'Completed and failed jobs over 1h')
+  })
+
+  test('throughput chart caption shows update time', async ({ page }) => {
+    await expect(page.locator('.area-chart .caption')).toContainText('last updated')
+  })
+
+  test('throughput chart hidden table mirrors chart data', async ({ page }) => {
+    await expect(page.locator('.area-chart table caption')).toHaveText('Chart data')
+    await expect(page.locator('.area-chart tbody tr').first()).toBeAttached()
+  })
+
+  test('period selector switches to 24h', async ({ page }) => {
+    await page.locator('.period-selector').getByRole('radio', { name: '24h' }).click()
+    await expect(page.locator('.area-chart svg')).toHaveAttribute('aria-label', 'Completed and failed jobs over 24h')
+  })
+
+  test('period selector switches to 7d', async ({ page }) => {
+    await page.locator('.period-selector').getByRole('radio', { name: '7d' }).click()
+    await expect(page.locator('.area-chart svg')).toHaveAttribute('aria-label', 'Completed and failed jobs over 7d')
+  })
+
+  test('active workers card has explanatory title', async ({ page }) => {
+    await expect(metricCard(page, 'Active workers')).toHaveAttribute('title', /workers currently holding running jobs/)
+  })
+
+  test('top queues table has expected headers', async ({ page }) => {
+    const header = page.locator('.top-queues thead')
+    await expect(header).toContainText('Queue')
+    await expect(header).toContainText('Backlog')
+    await expect(header).toContainText('Failed')
+    await expect(header).toContainText('Throughput')
+  })
+
+  test('top queues show backlog values', async ({ page }) => {
+    const defaultRow = page.locator('.queues-table tr.clickable', { hasText: 'default' })
+    await expect(defaultRow.locator('td').nth(1)).not.toHaveText('0')
+  })
+
+  test('top queues show failed values', async ({ page }) => {
+    const defaultRow = page.locator('.queues-table tr.clickable', { hasText: 'default' })
+    await expect(defaultRow.locator('.failed-cell')).not.toHaveText('0')
+  })
+
+  test('top queues show throughput sparklines', async ({ page }) => {
+    await expect(page.locator('.top-queues .sparkline').first()).toBeVisible()
+  })
+
+  test('view-all link points to queues', async ({ page }) => {
+    await expect(page.locator('.view-all')).toHaveAttribute('href', '#/queues')
+  })
+
+  test('view-all link navigates to queues', async ({ page }) => {
+    await page.locator('.view-all').click()
+    await expect(page).toHaveURL(/#\/queues$/)
+  })
+
+  test('queue selector starts on all queues', async ({ page }) => {
+    await expect(page.locator('.queue-selector')).toHaveValue('')
+  })
+
+  test('switching throughput queue to default updates heading', async ({ page }) => {
+    await page.locator('.queue-selector').selectOption('default')
+    await expect(page.locator('.chart-section h3')).toHaveText('Throughput - default')
+  })
+
+  test('stat card values use metric-value class', async ({ page }) => {
+    await expect(page.locator('.stats-grid .metric-value')).toHaveCount(6)
+  })
+
+  test('pending card shows a count', async ({ page }) => {
+    await expect(metricCard(page, 'Pending').locator('.metric-value')).not.toHaveText('')
+  })
+
+  test('running card shows a count', async ({ page }) => {
+    await expect(metricCard(page, 'Running').locator('.metric-value')).not.toHaveText('')
+  })
+
+  test('completed card shows a count', async ({ page }) => {
+    await expect(metricCard(page, 'Completed').locator('.metric-value')).not.toHaveText('')
+  })
+
+  test('paused card shows a count', async ({ page }) => {
+    await expect(metricCard(page, 'Paused').locator('.metric-value')).not.toHaveText('')
+  })
+
+  test('chart heading starts on all queues', async ({ page }) => {
+    await expect(page.locator('.chart-section h3')).toHaveText('Throughput - all queues')
+  })
+
+  test('top queues section heading renders', async ({ page }) => {
+    await expect(page.locator('.top-queues h3')).toHaveText('Top queues')
+  })
 })

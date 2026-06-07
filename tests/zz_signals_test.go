@@ -215,6 +215,78 @@ func TestSignals_EmitsDeliveredEvent(t *testing.T) {
 	}
 }
 
+func TestSignals_EmitsResumedBySignalOnFastPath(t *testing.T) {
+	q, _ := openIntegrationQueue(t)
+	q.Register("agent-resume-event-fast", func(ctx context.Context, _ struct{}) error {
+		_, err := jobs.WaitForSignal[string](ctx, "ctx")
+		return err
+	})
+	startWorker(t, q)
+
+	ctx := context.Background()
+	id, err := q.Enqueue(ctx, "agent-resume-event-fast", struct{}{})
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		st, _ := q.LoadStatus(ctx, id)
+		return st == jobs.StatusWaiting
+	}, 10*time.Second, 50*time.Millisecond)
+
+	events := q.Events()
+	require.NoError(t, jobs.Signal(ctx, q, id, "ctx", "x"))
+
+	timeout := time.After(3 * time.Second)
+	for {
+		select {
+		case e := <-events:
+			if resumed, ok := e.(*jobs.JobResumedBySignal); ok {
+				assert.Equal(t, id, resumed.JobID)
+				assert.Equal(t, "ctx", resumed.SignalName)
+				return
+			}
+		case <-timeout:
+			t.Fatal("did not receive JobResumedBySignal event")
+		}
+	}
+}
+
+func TestSignals_EmitsResumedBySignalOnPollBackstop(t *testing.T) {
+	q, store := openIntegrationQueue(t)
+	q.Register("agent-resume-event-poll", func(ctx context.Context, _ struct{}) error {
+		_, err := jobs.WaitForSignal[string](ctx, "ctx")
+		return err
+	})
+	startWorker(t, q)
+
+	ctx := context.Background()
+	id, err := q.Enqueue(ctx, "agent-resume-event-poll", struct{}{})
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		st, _ := q.LoadStatus(ctx, id)
+		return st == jobs.StatusWaiting
+	}, 10*time.Second, 50*time.Millisecond)
+
+	events := q.Events()
+	sender, ok := store.(interface {
+		SendSignal(context.Context, string, string, []byte) error
+	})
+	require.True(t, ok, "storage must support signals")
+	require.NoError(t, sender.SendSignal(ctx, id, "ctx", []byte(`"via-poll"`)))
+
+	timeout := time.After(25 * time.Second)
+	for {
+		select {
+		case e := <-events:
+			if resumed, ok := e.(*jobs.JobResumedBySignal); ok {
+				assert.Equal(t, id, resumed.JobID)
+				assert.Equal(t, "ctx", resumed.SignalName)
+				return
+			}
+		case <-timeout:
+			t.Fatal("did not receive JobResumedBySignal event from poll backstop")
+		}
+	}
+}
+
 // TestSignals_PeekThenDrain: a handler peeks (non-consuming) then drains,
 // observing the same buffered signals.
 func TestSignals_PeekThenDrain(t *testing.T) {

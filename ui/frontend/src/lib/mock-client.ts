@@ -136,6 +136,7 @@ interface MockJob {
   completedAt: Date | null
   deadLetteredAt?: Date
   deadLetterReason?: string
+  worker?: string
   parentJobId?: string
   rootJobId?: string
   fanOutId?: string
@@ -195,6 +196,7 @@ function makeJob(overrides: Partial<MockJob> = {}): MockJob {
       : (['completed', 'failed'].includes(status as string) ? new Date(createdAt.getTime() + randInt(10, 300) * 1000) : null),
     deadLetteredAt: overrides.deadLetteredAt,
     deadLetterReason: overrides.deadLetterReason ?? '',
+    worker: overrides.worker ?? (status === 'running' ? `worker-${randInt(1, 4)}` : ''),
     parentJobId: overrides.parentJobId,
     rootJobId: overrides.rootJobId,
     fanOutId: overrides.fanOutId,
@@ -710,6 +712,7 @@ function toProtoJob(j: MockJob): Job {
     completedAt: j.completedAt ? ts(j.completedAt) : undefined,
     deadLetteredAt: j.deadLetteredAt ? ts(j.deadLetteredAt) : undefined,
     deadLetterReason: j.deadLetterReason ?? '',
+    worker: j.worker ?? '',
     parentJobId: j.parentJobId,
     rootJobId: j.rootJobId,
     fanOutId: j.fanOutId,
@@ -745,6 +748,11 @@ function countByStatus(source: MockJob[], status: Status): number {
 
 function buildQueueStats(queueName: string): QueueStats {
   const inQueue = jobs.filter((j) => j.queue === queueName)
+  const pending = inQueue.filter((j) => j.status === 'pending')
+  const oldestPending = pending.reduce<Date | null>((oldest, job) => {
+    if (oldest === null || job.createdAt.getTime() < oldest.getTime()) return job.createdAt
+    return oldest
+  }, null)
   return new QueueStats({
     name: queueName,
     pending: i64(countByStatus(inQueue, 'pending')),
@@ -753,6 +761,7 @@ function buildQueueStats(queueName: string): QueueStats {
     failed: i64(countByStatus(inQueue, 'failed')),
     paused: i64(countByStatus(inQueue, 'paused')),
     isPaused: pausedQueues.has(queueName),
+    oldestPendingAt: oldestPending ? ts(oldestPending) : undefined,
   })
 }
 

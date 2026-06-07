@@ -44,6 +44,7 @@ type Job struct {
 	Result           []byte                 `protobuf:"bytes,18,opt,name=result,proto3" json:"result,omitempty"`
 	DeadLetteredAt   *timestamppb.Timestamp `protobuf:"bytes,19,opt,name=dead_lettered_at,json=deadLetteredAt,proto3,oneof" json:"dead_lettered_at,omitempty"`
 	DeadLetterReason string                 `protobuf:"bytes,20,opt,name=dead_letter_reason,json=deadLetterReason,proto3" json:"dead_letter_reason,omitempty"`
+	Worker           string                 `protobuf:"bytes,21,opt,name=worker,proto3" json:"worker,omitempty"`
 	unknownFields    protoimpl.UnknownFields
 	sizeCache        protoimpl.SizeCache
 }
@@ -218,6 +219,13 @@ func (x *Job) GetDeadLetterReason() string {
 	return ""
 }
 
+func (x *Job) GetWorker() string {
+	if x != nil {
+		return x.Worker
+	}
+	return ""
+}
+
 type Checkpoint struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Id            string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
@@ -311,16 +319,17 @@ func (x *Checkpoint) GetCreatedAt() *timestamppb.Timestamp {
 }
 
 type QueueStats struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Name          string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
-	Pending       int64                  `protobuf:"varint,2,opt,name=pending,proto3" json:"pending,omitempty"`
-	Running       int64                  `protobuf:"varint,3,opt,name=running,proto3" json:"running,omitempty"`
-	Completed     int64                  `protobuf:"varint,4,opt,name=completed,proto3" json:"completed,omitempty"`
-	Failed        int64                  `protobuf:"varint,5,opt,name=failed,proto3" json:"failed,omitempty"`
-	Paused        int64                  `protobuf:"varint,6,opt,name=paused,proto3" json:"paused,omitempty"`
-	IsPaused      bool                   `protobuf:"varint,7,opt,name=is_paused,json=isPaused,proto3" json:"is_paused,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state           protoimpl.MessageState `protogen:"open.v1"`
+	Name            string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	Pending         int64                  `protobuf:"varint,2,opt,name=pending,proto3" json:"pending,omitempty"`
+	Running         int64                  `protobuf:"varint,3,opt,name=running,proto3" json:"running,omitempty"`
+	Completed       int64                  `protobuf:"varint,4,opt,name=completed,proto3" json:"completed,omitempty"`
+	Failed          int64                  `protobuf:"varint,5,opt,name=failed,proto3" json:"failed,omitempty"`
+	Paused          int64                  `protobuf:"varint,6,opt,name=paused,proto3" json:"paused,omitempty"`
+	IsPaused        bool                   `protobuf:"varint,7,opt,name=is_paused,json=isPaused,proto3" json:"is_paused,omitempty"`
+	OldestPendingAt *timestamppb.Timestamp `protobuf:"bytes,8,opt,name=oldest_pending_at,json=oldestPendingAt,proto3" json:"oldest_pending_at,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *QueueStats) Reset() {
@@ -400,6 +409,13 @@ func (x *QueueStats) GetIsPaused() bool {
 		return x.IsPaused
 	}
 	return false
+}
+
+func (x *QueueStats) GetOldestPendingAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.OldestPendingAt
+	}
+	return nil
 }
 
 type FanOut struct {
@@ -2606,7 +2622,7 @@ var File_jobs_v1_jobs_proto protoreflect.FileDescriptor
 
 const file_jobs_v1_jobs_proto_rawDesc = "" +
 	"\n" +
-	"\x12jobs/v1/jobs.proto\x12\ajobs.v1\x1a\x1fgoogle/protobuf/timestamp.proto\"\xb5\x06\n" +
+	"\x12jobs/v1/jobs.proto\x12\ajobs.v1\x1a\x1fgoogle/protobuf/timestamp.proto\"\xcd\x06\n" +
 	"\x03Job\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x12\n" +
 	"\x04type\x18\x02 \x01(\tR\x04type\x12\x14\n" +
@@ -2633,7 +2649,8 @@ const file_jobs_v1_jobs_proto_rawDesc = "" +
 	"\rfan_out_index\x18\x11 \x01(\x05R\vfanOutIndex\x12\x16\n" +
 	"\x06result\x18\x12 \x01(\fR\x06result\x12I\n" +
 	"\x10dead_lettered_at\x18\x13 \x01(\v2\x1a.google.protobuf.TimestampH\x03R\x0edeadLetteredAt\x88\x01\x01\x12,\n" +
-	"\x12dead_letter_reason\x18\x14 \x01(\tR\x10deadLetterReasonB\x10\n" +
+	"\x12dead_letter_reason\x18\x14 \x01(\tR\x10deadLetterReason\x12\x16\n" +
+	"\x06worker\x18\x15 \x01(\tR\x06workerB\x10\n" +
 	"\x0e_parent_job_idB\x0e\n" +
 	"\f_root_job_idB\r\n" +
 	"\v_fan_out_idB\x13\n" +
@@ -2648,7 +2665,7 @@ const file_jobs_v1_jobs_proto_rawDesc = "" +
 	"\x06result\x18\x05 \x01(\fR\x06result\x12\x14\n" +
 	"\x05error\x18\x06 \x01(\tR\x05error\x129\n" +
 	"\n" +
-	"created_at\x18\a \x01(\v2\x1a.google.protobuf.TimestampR\tcreatedAt\"\xbf\x01\n" +
+	"created_at\x18\a \x01(\v2\x1a.google.protobuf.TimestampR\tcreatedAt\"\x87\x02\n" +
 	"\n" +
 	"QueueStats\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x18\n" +
@@ -2657,7 +2674,8 @@ const file_jobs_v1_jobs_proto_rawDesc = "" +
 	"\tcompleted\x18\x04 \x01(\x03R\tcompleted\x12\x16\n" +
 	"\x06failed\x18\x05 \x01(\x03R\x06failed\x12\x16\n" +
 	"\x06paused\x18\x06 \x01(\x03R\x06paused\x12\x1b\n" +
-	"\tis_paused\x18\a \x01(\bR\bisPaused\"\xfb\x03\n" +
+	"\tis_paused\x18\a \x01(\bR\bisPaused\x12F\n" +
+	"\x11oldest_pending_at\x18\b \x01(\v2\x1a.google.protobuf.TimestampR\x0foldestPendingAt\"\xfb\x03\n" +
 	"\x06FanOut\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\"\n" +
 	"\rparent_job_id\x18\x02 \x01(\tR\vparentJobId\x12\x1f\n" +
@@ -2886,76 +2904,77 @@ var file_jobs_v1_jobs_proto_depIdxs = []int32{
 	45, // 3: jobs.v1.Job.run_at:type_name -> google.protobuf.Timestamp
 	45, // 4: jobs.v1.Job.dead_lettered_at:type_name -> google.protobuf.Timestamp
 	45, // 5: jobs.v1.Checkpoint.created_at:type_name -> google.protobuf.Timestamp
-	45, // 6: jobs.v1.FanOut.timeout_at:type_name -> google.protobuf.Timestamp
-	45, // 7: jobs.v1.FanOut.created_at:type_name -> google.protobuf.Timestamp
-	45, // 8: jobs.v1.FanOut.updated_at:type_name -> google.protobuf.Timestamp
-	0,  // 9: jobs.v1.Event.job:type_name -> jobs.v1.Job
-	45, // 10: jobs.v1.Event.timestamp:type_name -> google.protobuf.Timestamp
-	2,  // 11: jobs.v1.GetStatsResponse.queues:type_name -> jobs.v1.QueueStats
-	9,  // 12: jobs.v1.GetStatsHistoryResponse.completed:type_name -> jobs.v1.DataPoint
-	9,  // 13: jobs.v1.GetStatsHistoryResponse.failed:type_name -> jobs.v1.DataPoint
-	45, // 14: jobs.v1.DataPoint.timestamp:type_name -> google.protobuf.Timestamp
-	45, // 15: jobs.v1.ListJobsRequest.since:type_name -> google.protobuf.Timestamp
-	45, // 16: jobs.v1.ListJobsRequest.until:type_name -> google.protobuf.Timestamp
-	0,  // 17: jobs.v1.ListJobsResponse.jobs:type_name -> jobs.v1.Job
-	0,  // 18: jobs.v1.GetJobResponse.job:type_name -> jobs.v1.Job
-	1,  // 19: jobs.v1.GetJobResponse.checkpoints:type_name -> jobs.v1.Checkpoint
-	0,  // 20: jobs.v1.RetryJobResponse.job:type_name -> jobs.v1.Job
-	0,  // 21: jobs.v1.PauseJobResponse.job:type_name -> jobs.v1.Job
-	0,  // 22: jobs.v1.CancelJobResponse.job:type_name -> jobs.v1.Job
-	0,  // 23: jobs.v1.ResumeJobResponse.job:type_name -> jobs.v1.Job
-	2,  // 24: jobs.v1.ListQueuesResponse.queues:type_name -> jobs.v1.QueueStats
-	38, // 25: jobs.v1.ListScheduledJobsResponse.jobs:type_name -> jobs.v1.ScheduledJobInfo
-	45, // 26: jobs.v1.ScheduledJobInfo.next_run:type_name -> google.protobuf.Timestamp
-	45, // 27: jobs.v1.ScheduledJobInfo.last_run:type_name -> google.protobuf.Timestamp
-	0,  // 28: jobs.v1.GetWorkflowResponse.root:type_name -> jobs.v1.Job
-	3,  // 29: jobs.v1.GetWorkflowResponse.fan_outs:type_name -> jobs.v1.FanOut
-	0,  // 30: jobs.v1.GetWorkflowResponse.children:type_name -> jobs.v1.Job
-	43, // 31: jobs.v1.ListWorkflowsResponse.workflows:type_name -> jobs.v1.WorkflowSummary
-	0,  // 32: jobs.v1.WorkflowSummary.root_job:type_name -> jobs.v1.Job
-	5,  // 33: jobs.v1.JobsService.GetStats:input_type -> jobs.v1.GetStatsRequest
-	7,  // 34: jobs.v1.JobsService.GetStatsHistory:input_type -> jobs.v1.GetStatsHistoryRequest
-	10, // 35: jobs.v1.JobsService.ListJobs:input_type -> jobs.v1.ListJobsRequest
-	12, // 36: jobs.v1.JobsService.GetJob:input_type -> jobs.v1.GetJobRequest
-	14, // 37: jobs.v1.JobsService.RetryJob:input_type -> jobs.v1.RetryJobRequest
-	16, // 38: jobs.v1.JobsService.DeleteJob:input_type -> jobs.v1.DeleteJobRequest
-	18, // 39: jobs.v1.JobsService.BulkRetryJobs:input_type -> jobs.v1.BulkRetryJobsRequest
-	20, // 40: jobs.v1.JobsService.BulkDeleteJobs:input_type -> jobs.v1.BulkDeleteJobsRequest
-	22, // 41: jobs.v1.JobsService.PauseJob:input_type -> jobs.v1.PauseJobRequest
-	24, // 42: jobs.v1.JobsService.CancelJob:input_type -> jobs.v1.CancelJobRequest
-	26, // 43: jobs.v1.JobsService.ResumeJob:input_type -> jobs.v1.ResumeJobRequest
-	28, // 44: jobs.v1.JobsService.PauseQueue:input_type -> jobs.v1.PauseQueueRequest
-	30, // 45: jobs.v1.JobsService.ResumeQueue:input_type -> jobs.v1.ResumeQueueRequest
-	32, // 46: jobs.v1.JobsService.ListQueues:input_type -> jobs.v1.ListQueuesRequest
-	34, // 47: jobs.v1.JobsService.PurgeQueue:input_type -> jobs.v1.PurgeQueueRequest
-	36, // 48: jobs.v1.JobsService.ListScheduledJobs:input_type -> jobs.v1.ListScheduledJobsRequest
-	39, // 49: jobs.v1.JobsService.GetWorkflow:input_type -> jobs.v1.GetWorkflowRequest
-	41, // 50: jobs.v1.JobsService.ListWorkflows:input_type -> jobs.v1.ListWorkflowsRequest
-	44, // 51: jobs.v1.JobsService.WatchEvents:input_type -> jobs.v1.WatchEventsRequest
-	6,  // 52: jobs.v1.JobsService.GetStats:output_type -> jobs.v1.GetStatsResponse
-	8,  // 53: jobs.v1.JobsService.GetStatsHistory:output_type -> jobs.v1.GetStatsHistoryResponse
-	11, // 54: jobs.v1.JobsService.ListJobs:output_type -> jobs.v1.ListJobsResponse
-	13, // 55: jobs.v1.JobsService.GetJob:output_type -> jobs.v1.GetJobResponse
-	15, // 56: jobs.v1.JobsService.RetryJob:output_type -> jobs.v1.RetryJobResponse
-	17, // 57: jobs.v1.JobsService.DeleteJob:output_type -> jobs.v1.DeleteJobResponse
-	19, // 58: jobs.v1.JobsService.BulkRetryJobs:output_type -> jobs.v1.BulkRetryJobsResponse
-	21, // 59: jobs.v1.JobsService.BulkDeleteJobs:output_type -> jobs.v1.BulkDeleteJobsResponse
-	23, // 60: jobs.v1.JobsService.PauseJob:output_type -> jobs.v1.PauseJobResponse
-	25, // 61: jobs.v1.JobsService.CancelJob:output_type -> jobs.v1.CancelJobResponse
-	27, // 62: jobs.v1.JobsService.ResumeJob:output_type -> jobs.v1.ResumeJobResponse
-	29, // 63: jobs.v1.JobsService.PauseQueue:output_type -> jobs.v1.PauseQueueResponse
-	31, // 64: jobs.v1.JobsService.ResumeQueue:output_type -> jobs.v1.ResumeQueueResponse
-	33, // 65: jobs.v1.JobsService.ListQueues:output_type -> jobs.v1.ListQueuesResponse
-	35, // 66: jobs.v1.JobsService.PurgeQueue:output_type -> jobs.v1.PurgeQueueResponse
-	37, // 67: jobs.v1.JobsService.ListScheduledJobs:output_type -> jobs.v1.ListScheduledJobsResponse
-	40, // 68: jobs.v1.JobsService.GetWorkflow:output_type -> jobs.v1.GetWorkflowResponse
-	42, // 69: jobs.v1.JobsService.ListWorkflows:output_type -> jobs.v1.ListWorkflowsResponse
-	4,  // 70: jobs.v1.JobsService.WatchEvents:output_type -> jobs.v1.Event
-	52, // [52:71] is the sub-list for method output_type
-	33, // [33:52] is the sub-list for method input_type
-	33, // [33:33] is the sub-list for extension type_name
-	33, // [33:33] is the sub-list for extension extendee
-	0,  // [0:33] is the sub-list for field type_name
+	45, // 6: jobs.v1.QueueStats.oldest_pending_at:type_name -> google.protobuf.Timestamp
+	45, // 7: jobs.v1.FanOut.timeout_at:type_name -> google.protobuf.Timestamp
+	45, // 8: jobs.v1.FanOut.created_at:type_name -> google.protobuf.Timestamp
+	45, // 9: jobs.v1.FanOut.updated_at:type_name -> google.protobuf.Timestamp
+	0,  // 10: jobs.v1.Event.job:type_name -> jobs.v1.Job
+	45, // 11: jobs.v1.Event.timestamp:type_name -> google.protobuf.Timestamp
+	2,  // 12: jobs.v1.GetStatsResponse.queues:type_name -> jobs.v1.QueueStats
+	9,  // 13: jobs.v1.GetStatsHistoryResponse.completed:type_name -> jobs.v1.DataPoint
+	9,  // 14: jobs.v1.GetStatsHistoryResponse.failed:type_name -> jobs.v1.DataPoint
+	45, // 15: jobs.v1.DataPoint.timestamp:type_name -> google.protobuf.Timestamp
+	45, // 16: jobs.v1.ListJobsRequest.since:type_name -> google.protobuf.Timestamp
+	45, // 17: jobs.v1.ListJobsRequest.until:type_name -> google.protobuf.Timestamp
+	0,  // 18: jobs.v1.ListJobsResponse.jobs:type_name -> jobs.v1.Job
+	0,  // 19: jobs.v1.GetJobResponse.job:type_name -> jobs.v1.Job
+	1,  // 20: jobs.v1.GetJobResponse.checkpoints:type_name -> jobs.v1.Checkpoint
+	0,  // 21: jobs.v1.RetryJobResponse.job:type_name -> jobs.v1.Job
+	0,  // 22: jobs.v1.PauseJobResponse.job:type_name -> jobs.v1.Job
+	0,  // 23: jobs.v1.CancelJobResponse.job:type_name -> jobs.v1.Job
+	0,  // 24: jobs.v1.ResumeJobResponse.job:type_name -> jobs.v1.Job
+	2,  // 25: jobs.v1.ListQueuesResponse.queues:type_name -> jobs.v1.QueueStats
+	38, // 26: jobs.v1.ListScheduledJobsResponse.jobs:type_name -> jobs.v1.ScheduledJobInfo
+	45, // 27: jobs.v1.ScheduledJobInfo.next_run:type_name -> google.protobuf.Timestamp
+	45, // 28: jobs.v1.ScheduledJobInfo.last_run:type_name -> google.protobuf.Timestamp
+	0,  // 29: jobs.v1.GetWorkflowResponse.root:type_name -> jobs.v1.Job
+	3,  // 30: jobs.v1.GetWorkflowResponse.fan_outs:type_name -> jobs.v1.FanOut
+	0,  // 31: jobs.v1.GetWorkflowResponse.children:type_name -> jobs.v1.Job
+	43, // 32: jobs.v1.ListWorkflowsResponse.workflows:type_name -> jobs.v1.WorkflowSummary
+	0,  // 33: jobs.v1.WorkflowSummary.root_job:type_name -> jobs.v1.Job
+	5,  // 34: jobs.v1.JobsService.GetStats:input_type -> jobs.v1.GetStatsRequest
+	7,  // 35: jobs.v1.JobsService.GetStatsHistory:input_type -> jobs.v1.GetStatsHistoryRequest
+	10, // 36: jobs.v1.JobsService.ListJobs:input_type -> jobs.v1.ListJobsRequest
+	12, // 37: jobs.v1.JobsService.GetJob:input_type -> jobs.v1.GetJobRequest
+	14, // 38: jobs.v1.JobsService.RetryJob:input_type -> jobs.v1.RetryJobRequest
+	16, // 39: jobs.v1.JobsService.DeleteJob:input_type -> jobs.v1.DeleteJobRequest
+	18, // 40: jobs.v1.JobsService.BulkRetryJobs:input_type -> jobs.v1.BulkRetryJobsRequest
+	20, // 41: jobs.v1.JobsService.BulkDeleteJobs:input_type -> jobs.v1.BulkDeleteJobsRequest
+	22, // 42: jobs.v1.JobsService.PauseJob:input_type -> jobs.v1.PauseJobRequest
+	24, // 43: jobs.v1.JobsService.CancelJob:input_type -> jobs.v1.CancelJobRequest
+	26, // 44: jobs.v1.JobsService.ResumeJob:input_type -> jobs.v1.ResumeJobRequest
+	28, // 45: jobs.v1.JobsService.PauseQueue:input_type -> jobs.v1.PauseQueueRequest
+	30, // 46: jobs.v1.JobsService.ResumeQueue:input_type -> jobs.v1.ResumeQueueRequest
+	32, // 47: jobs.v1.JobsService.ListQueues:input_type -> jobs.v1.ListQueuesRequest
+	34, // 48: jobs.v1.JobsService.PurgeQueue:input_type -> jobs.v1.PurgeQueueRequest
+	36, // 49: jobs.v1.JobsService.ListScheduledJobs:input_type -> jobs.v1.ListScheduledJobsRequest
+	39, // 50: jobs.v1.JobsService.GetWorkflow:input_type -> jobs.v1.GetWorkflowRequest
+	41, // 51: jobs.v1.JobsService.ListWorkflows:input_type -> jobs.v1.ListWorkflowsRequest
+	44, // 52: jobs.v1.JobsService.WatchEvents:input_type -> jobs.v1.WatchEventsRequest
+	6,  // 53: jobs.v1.JobsService.GetStats:output_type -> jobs.v1.GetStatsResponse
+	8,  // 54: jobs.v1.JobsService.GetStatsHistory:output_type -> jobs.v1.GetStatsHistoryResponse
+	11, // 55: jobs.v1.JobsService.ListJobs:output_type -> jobs.v1.ListJobsResponse
+	13, // 56: jobs.v1.JobsService.GetJob:output_type -> jobs.v1.GetJobResponse
+	15, // 57: jobs.v1.JobsService.RetryJob:output_type -> jobs.v1.RetryJobResponse
+	17, // 58: jobs.v1.JobsService.DeleteJob:output_type -> jobs.v1.DeleteJobResponse
+	19, // 59: jobs.v1.JobsService.BulkRetryJobs:output_type -> jobs.v1.BulkRetryJobsResponse
+	21, // 60: jobs.v1.JobsService.BulkDeleteJobs:output_type -> jobs.v1.BulkDeleteJobsResponse
+	23, // 61: jobs.v1.JobsService.PauseJob:output_type -> jobs.v1.PauseJobResponse
+	25, // 62: jobs.v1.JobsService.CancelJob:output_type -> jobs.v1.CancelJobResponse
+	27, // 63: jobs.v1.JobsService.ResumeJob:output_type -> jobs.v1.ResumeJobResponse
+	29, // 64: jobs.v1.JobsService.PauseQueue:output_type -> jobs.v1.PauseQueueResponse
+	31, // 65: jobs.v1.JobsService.ResumeQueue:output_type -> jobs.v1.ResumeQueueResponse
+	33, // 66: jobs.v1.JobsService.ListQueues:output_type -> jobs.v1.ListQueuesResponse
+	35, // 67: jobs.v1.JobsService.PurgeQueue:output_type -> jobs.v1.PurgeQueueResponse
+	37, // 68: jobs.v1.JobsService.ListScheduledJobs:output_type -> jobs.v1.ListScheduledJobsResponse
+	40, // 69: jobs.v1.JobsService.GetWorkflow:output_type -> jobs.v1.GetWorkflowResponse
+	42, // 70: jobs.v1.JobsService.ListWorkflows:output_type -> jobs.v1.ListWorkflowsResponse
+	4,  // 71: jobs.v1.JobsService.WatchEvents:output_type -> jobs.v1.Event
+	53, // [53:72] is the sub-list for method output_type
+	34, // [34:53] is the sub-list for method input_type
+	34, // [34:34] is the sub-list for extension type_name
+	34, // [34:34] is the sub-list for extension extendee
+	0,  // [0:34] is the sub-list for field type_name
 }
 
 func init() { file_jobs_v1_jobs_proto_init() }

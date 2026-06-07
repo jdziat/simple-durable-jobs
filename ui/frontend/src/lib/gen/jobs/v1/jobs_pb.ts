@@ -110,6 +110,11 @@ export class Job extends Message<Job> {
    */
   deadLetterReason = "";
 
+  /**
+   * @generated from field: string worker = 21;
+   */
+  worker = "";
+
   constructor(data?: PartialMessage<Job>) {
     super();
     proto3.util.initPartial(data, this);
@@ -138,6 +143,7 @@ export class Job extends Message<Job> {
     { no: 18, name: "result", kind: "scalar", T: 12 /* ScalarType.BYTES */ },
     { no: 19, name: "dead_lettered_at", kind: "message", T: Timestamp, opt: true },
     { no: 20, name: "dead_letter_reason", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 21, name: "worker", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): Job {
@@ -269,6 +275,11 @@ export class QueueStats extends Message<QueueStats> {
    */
   isPaused = false;
 
+  /**
+   * @generated from field: google.protobuf.Timestamp oldest_pending_at = 8;
+   */
+  oldestPendingAt?: Timestamp;
+
   constructor(data?: PartialMessage<QueueStats>) {
     super();
     proto3.util.initPartial(data, this);
@@ -284,6 +295,7 @@ export class QueueStats extends Message<QueueStats> {
     { no: 5, name: "failed", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
     { no: 6, name: "paused", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
     { no: 7, name: "is_paused", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 8, name: "oldest_pending_at", kind: "message", T: Timestamp },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): QueueStats {

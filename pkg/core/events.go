@@ -71,6 +71,21 @@ type JobResumed struct {
 
 func (*JobResumed) eventMarker() {}
 
+// JobResumedBySignal is emitted when a persisted signal wakes a job that was
+// suspended waiting for signals. SignalName is optional: producer-side wakes set
+// it from Signal's name, while recovery/backstop paths may leave it empty if the
+// storage backend can confirm a pending signal but cannot cheaply report which
+// signal caused the wake. Durable timer wakes, including expired Sleep and
+// timeout-deadline resumes without a pending signal, are not signal resumes and
+// should not emit this event.
+type JobResumedBySignal struct {
+	JobID      string
+	SignalName string
+	Timestamp  time.Time
+}
+
+func (*JobResumedBySignal) eventMarker() {}
+
 // SignalDelivered is emitted when a signal is successfully persisted for a job
 // (via Signal). It lets an orchestrator observe that a signal landed; the job
 // consumes it later via WaitForSignal/CheckSignal/DrainSignals.

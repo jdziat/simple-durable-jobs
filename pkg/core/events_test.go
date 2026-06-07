@@ -101,6 +101,19 @@ func TestJobResumed_EventMarker(t *testing.T) {
 	assert.Equal(t, "jres", e.Job.ID)
 }
 
+func TestJobResumedBySignal_EventMarker(t *testing.T) {
+	e := &JobResumedBySignal{
+		JobID:      "jres-sig",
+		SignalName: "ctx",
+		Timestamp:  time.Now(),
+	}
+	e.eventMarker()
+
+	var _ Event = e
+	assert.Equal(t, "jres-sig", e.JobID)
+	assert.Equal(t, "ctx", e.SignalName)
+}
+
 func TestQueuePaused_EventMarker(t *testing.T) {
 	e := &QueuePaused{
 		Queue:     "emails",
@@ -176,6 +189,8 @@ func TestAllEvents_ImplementEventInterface(t *testing.T) {
 		&CheckpointSaved{},
 		&JobPaused{},
 		&JobResumed{},
+		&JobResumedBySignal{},
+		&SignalDelivered{},
 		&QueuePaused{},
 		&QueueResumed{},
 		&WorkerPaused{},
@@ -183,7 +198,7 @@ func TestAllEvents_ImplementEventInterface(t *testing.T) {
 		&CustomEvent{},
 	)
 
-	assert.Len(t, events, 12, "all event types should be in the list")
+	assert.Len(t, events, 14, "all event types should be in the list")
 	for _, e := range events {
 		assert.NotNil(t, e)
 	}

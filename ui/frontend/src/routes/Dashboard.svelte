@@ -2,14 +2,15 @@
   import { onMount } from 'svelte'
   import { jobsClient } from '../lib/client'
   import { deltaFlash } from '../lib/actions/deltaFlash'
+  import { mergeHistory, type HistorySeries, type Period } from '../lib/dashboardHistory'
+  import AgeHeat from '../lib/components/AgeHeat.svelte'
   import AreaChart from '../lib/components/AreaChart.svelte'
   import MetricCard from '../lib/components/MetricCard.svelte'
   import SegmentedControl from '../lib/components/SegmentedControl.svelte'
   import Sparkline from '../lib/components/Sparkline.svelte'
   import { error as statsError, start, stats, stop, type QueueStat } from '../lib/stores/stats.svelte'
 
-  type Period = '1h' | '24h' | '7d'
-  type HistorySeries = { completed: number[]; failed: number[]; labels: string[] }
+  type ProtoTimestamp = { toDate?: () => Date }
 
   const periods: Period[] = ['1h', '24h', '7d']
 
@@ -17,6 +18,7 @@
   let chartQueue = $state('')
   let history = $state<HistorySeries>({ completed: [], failed: [], labels: [] })
   let queueSparklines = $state<Record<string, number[]>>({})
+  let queueOldestPendingAt = $state<Record<string, Date>>({})
   let historyError = $state<string | null>(null)
   let failedGlow = $state(false)
   let queueFailureGlow = $state<Set<string>>(new Set())
@@ -31,6 +33,7 @@
   let failureRate = $derived(terminalTotal > 0 && snapshot ? (snapshot.totalFailed / terminalTotal) * 100 : 0)
   let totalBacklog = $derived(snapshot ? snapshot.totalPending + snapshot.totalRunning + snapshot.totalPaused : 0)
   let throughputPerMin = $derived(terminalThroughputPerMinute(history, chartPeriod))
+  let oldestPendingAt = $derived(oldestDate(Object.values(queueOldestPendingAt)))
 
   $effect(() => {
     if (!snapshot) return
@@ -90,31 +93,26 @@
     return value >= 10 ? value.toFixed(1) : value.toFixed(2)
   }
 
-  type HistoryPoint = { timestamp?: { toDate(): Date }; value: bigint | number }
+  function toDate(value: ProtoTimestamp | undefined): Date | null {
+    if (!value?.toDate) return null
+    const date = value.toDate()
+    return Number.isNaN(date.getTime()) ? null : date
+  }
 
-  // The backend buckets completed and failed INDEPENDENTLY (two maps keyed by
-  // timestamp, sorted separately) — the series can differ in length and in
-  // timestamp sets. Merge over the sorted union of timestamps; positional
-  // zipping pairs values from different minutes and mislabels buckets (the
-  // mock client's aligned arrays hide this, the real backend does not).
-  function mergeHistory(completed: HistoryPoint[], failed: HistoryPoint[]): { completed: number[]; failed: number[]; labels: string[] } {
-    const times = new Set<number>()
-    for (const point of completed) if (point.timestamp) times.add(point.timestamp.toDate().getTime())
-    for (const point of failed) if (point.timestamp) times.add(point.timestamp.toDate().getTime())
-    const sorted = Array.from(times).sort((a, b) => a - b)
-    const completedMap = new Map(completed.filter(p => p.timestamp).map(p => [p.timestamp!.toDate().getTime(), Number(p.value)]))
-    const failedMap = new Map(failed.filter(p => p.timestamp).map(p => [p.timestamp!.toDate().getTime(), Number(p.value)]))
-    const fmt = new Intl.DateTimeFormat(undefined, {
-      month: 'short',
-      day: 'numeric',
-      hour: '2-digit',
-      minute: '2-digit',
-      timeZoneName: 'short',
-    })
-    return {
-      completed: sorted.map(t => completedMap.get(t) ?? 0),
-      failed: sorted.map(t => failedMap.get(t) ?? 0),
-      labels: sorted.map(t => fmt.format(new Date(t))),
+  function oldestDate(values: Date[]): Date | null {
+    if (values.length === 0) return null
+    return values.reduce((oldest, value) => value.getTime() < oldest.getTime() ? value : oldest)
+  }
+
+  async function loadQueueOldestPendingAt() {
+    try {
+      const response = await jobsClient.listQueues({})
+      queueOldestPendingAt = Object.fromEntries(response.queues.map(queue => {
+        const oldest = toDate(queue.oldestPendingAt)
+        return oldest ? [queue.name, oldest] : null
+      }).filter((entry): entry is [string, Date] => entry !== null))
+    } catch {
+      queueOldestPendingAt = {}
     }
   }
 
@@ -157,7 +155,11 @@
   onMount(() => {
     start()
     void loadStatsHistory()
-    const interval = setInterval(() => void loadStatsHistory(), 5000)
+    void loadQueueOldestPendingAt()
+    const interval = setInterval(() => {
+      void loadStatsHistory()
+      void loadQueueOldestPendingAt()
+    }, 5000)
 
     return () => {
       clearInterval(interval)
@@ -216,6 +218,16 @@
       <div class="ops-cell">
         <span>Total backlog</span>
         <strong use:deltaFlash={totalBacklog}>{formatNumber(totalBacklog)}</strong>
+      </div>
+      <div class="ops-cell">
+        <span>Oldest pending age</span>
+        <strong use:deltaFlash={oldestPendingAt?.getTime() ?? 0}>
+          {#if oldestPendingAt}
+            <AgeHeat ts={oldestPendingAt} />
+          {:else}
+            —
+          {/if}
+        </strong>
       </div>
     </div>
 
@@ -310,7 +322,9 @@
 
   .ops-row {
     display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
+    /* 4 tracks for 4 cells — a 3-track grid orphaned the 4th cell on its
+       own row (gate-caught); the 1180px breakpoint folds to a 2x2. */
+    grid-template-columns: repeat(4, minmax(0, 1fr));
     gap: var(--sp-3);
   }
 
@@ -350,6 +364,10 @@
     color: var(--fg-primary);
     font-size: var(--fs-title);
     line-height: 1;
+  }
+
+  .ops-cell strong :global(.age-heat) {
+    font-size: inherit;
   }
 
   /* Specificity must beat the base `.ops-cell strong` and `.queues-table td`
@@ -522,9 +540,12 @@
   }
 
   @media (max-width: 1180px) {
-    .stats-grid,
-    .ops-row {
+    .stats-grid {
       grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+
+    .ops-row {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
     }
   }
 

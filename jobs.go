@@ -99,6 +99,9 @@ type (
 	// JobRetrying is emitted when a job is retried.
 	JobRetrying = core.JobRetrying
 
+	// JobResumedBySignal is emitted when a signal wakes a waiting job.
+	JobResumedBySignal = core.JobResumedBySignal
+
 	// CheckpointSaved is emitted when a checkpoint is saved.
 	CheckpointSaved = core.CheckpointSaved
 
@@ -156,10 +159,10 @@ type (
 	// RateLimitOption configures a RateLimit.
 	RateLimitOption = worker.RateLimitOption
 
-	// RetentionConfig controls automatic terminal-job retention.
+	// RetentionConfig controls automatic retention.
 	RetentionConfig = worker.RetentionConfig
 
-	// RetentionOption configures automatic terminal-job retention.
+	// RetentionOption configures automatic retention.
 	RetentionOption = worker.RetentionOption
 
 	// RetryConfig holds configuration for retry with backoff.
@@ -185,6 +188,9 @@ type (
 
 	// TxEnqueuer is the optional storage capability for caller-supplied transactions.
 	TxEnqueuer = storage.TxEnqueuer
+
+	// TxCheckpointer is the optional storage capability for caller-supplied transaction checkpoints.
+	TxCheckpointer = storage.TxCheckpointer
 
 	// Secretbox is the built-in NaCl Secretbox payload codec.
 	Secretbox = payloadcodec.Secretbox
@@ -301,6 +307,7 @@ var (
 	ErrSignalNameTooLong     = core.ErrSignalNameTooLong
 	ErrStorageNoSignals      = core.ErrStorageNoSignals
 	ErrStorageNoTxEnqueue    = core.ErrStorageNoTxEnqueue
+	ErrStorageNoTxCheckpoint = core.ErrStorageNoTxCheckpoint
 	ErrStorageNoBatchDequeue = core.ErrStorageNoBatchDequeue
 	ErrPayloadDecode         = core.ErrPayloadDecode
 
@@ -447,6 +454,13 @@ func SavePhaseCheckpoint(ctx context.Context, phaseName string, result any) erro
 	return jobctx.SavePhaseCheckpoint(ctx, phaseName, result)
 }
 
+// SavePhaseCheckpointTx saves a phase result through a caller-owned GORM
+// transaction. Use this when the phase's business side effect and checkpoint
+// must commit or roll back together.
+func SavePhaseCheckpointTx(ctx context.Context, tx *gorm.DB, phaseName string, result any) error {
+	return jobctx.SavePhaseCheckpointTx(ctx, tx, phaseName, result)
+}
+
 // LoadPhaseCheckpoint loads a previously saved phase result from the checkpoint store.
 // Returns (result, true) if found, (zero, false) if not found or not in job context.
 func LoadPhaseCheckpoint[T any](ctx context.Context, phaseName string) (T, bool) {
@@ -588,6 +602,13 @@ func RetentionCompletedAfter(d time.Duration) RetentionOption {
 // A non-positive duration keeps failed/cancelled jobs forever.
 func RetentionFailedAfter(d time.Duration) RetentionOption {
 	return worker.RetentionFailedAfter(d)
+}
+
+// RetentionConsumedSignalsAfter deletes consumed signal rows older than d.
+// Pending/unconsumed signals are durable workflow state and are never pruned.
+// A non-positive duration keeps consumed signal rows forever.
+func RetentionConsumedSignalsAfter(d time.Duration) RetentionOption {
+	return worker.RetentionConsumedSignalsAfter(d)
 }
 
 // RetentionInterval sets the retention scan cadence.
@@ -981,8 +1002,12 @@ func Signal(ctx context.Context, q *Queue, jobID, name string, payload any) erro
 			ResumeSignalWaitingJob(ctx context.Context, jobID string) (bool, error)
 		}
 		if r, ok := q.Storage().(signalResumer); ok {
-			if _, err := r.ResumeSignalWaitingJob(ctx, jobID); err != nil {
+			resumed, err := r.ResumeSignalWaitingJob(ctx, jobID)
+			if err != nil {
 				return fmt.Errorf("jobs: signal sent but resume failed (poll will recover): %w", err)
+			}
+			if resumed {
+				q.Emit(&core.JobResumedBySignal{JobID: jobID, SignalName: name, Timestamp: time.Now()})
 			}
 		}
 	}
