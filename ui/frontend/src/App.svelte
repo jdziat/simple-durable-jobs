@@ -114,7 +114,11 @@
     {:else if currentPath === '/jobs'}
       <Jobs {navigate} initialStatus={queryParams.status ?? ''} initialQueue={queryParams.queue ?? ''} />
     {:else if jobId}
-      <JobDetail id={jobId} {navigate} />
+      <!-- key: remount on id change so navigating job→job (e.g. waterfall
+           child links) reloads data and resets the poll/panel state. -->
+      {#key jobId}
+        <JobDetail id={jobId} {navigate} />
+      {/key}
     {:else if currentPath === '/queues'}
       <Queues />
     {:else if currentPath === '/scheduled'}

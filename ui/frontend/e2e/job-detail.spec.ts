@@ -23,6 +23,8 @@ test.describe('Job Detail', () => {
     await expect(timestamps).toContainText('Created')
     await expect(timestamps).toContainText('Started')
     await expect(timestamps).toContainText('Completed')
+    await expect(timestamps).toContainText('Wait')
+    await expect(timestamps).toContainText('Run')
   })
 
   test('shows checkpoints for completed job with checkpoints', async ({ page }) => {
@@ -36,6 +38,7 @@ test.describe('Job Detail', () => {
     // Should have 2 checkpoint rows
     const rows = checkpoints.locator('tbody tr')
     await expect(rows).toHaveCount(2)
+    await expect(checkpoints.getByRole('button', { name: 'Copy' }).first()).toBeVisible()
   })
 
   test('shows error box for failed job', async ({ page }) => {
@@ -91,13 +94,29 @@ test.describe('Job Detail', () => {
   })
 
   test('delete button navigates back to jobs', async ({ page }) => {
-    // Use failed-003 which we can afford to lose
+    // Use a plain failed fixture that this file has already inspected.
     await page.goto(`/#/jobs/${JOBS.FAILED_1}`)
     await page.waitForSelector('.job-detail .header', { timeout: 10000 })
 
-    page.on('dialog', dialog => dialog.accept())
     await page.locator('.actions .btn-delete').click()
+    const dialog = page.getByRole('dialog')
+    await expect(dialog).toBeVisible()
+    await expect(dialog).toContainText('Permanently deletes job')
+    await dialog.getByRole('textbox').fill('DELETE')
+    await dialog.getByRole('button', { name: 'Delete job' }).click()
     await expect(page).toHaveURL(/#\/jobs$/)
+  })
+
+  test('cancel dialog explains cooperative cancellation', async ({ page }) => {
+    await page.goto(`/#/jobs/${JOBS.RUNNING_1}`)
+    await page.waitForSelector('.job-detail .header', { timeout: 10000 })
+
+    const cancelBtn = page.locator('.actions .btn-cancel')
+    await expect(cancelBtn).toBeVisible()
+    await cancelBtn.click()
+    const dialog = page.getByRole('dialog')
+    await expect(dialog).toBeVisible()
+    await expect(dialog).toContainText('cooperatively')
   })
 
   test('shows dead-letter status and panel for a dead-lettered job', async ({ page }) => {
