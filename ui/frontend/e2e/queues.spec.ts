@@ -31,7 +31,26 @@ test.describe('Queues Page', () => {
   test('shows honest queue telemetry columns', async ({ page }) => {
     const firstRow = page.locator('.queues-table tbody tr').first()
     await expect(firstRow.locator('.sparkline')).toBeVisible()
-    await expect(firstRow.locator('.data-gap')).toHaveText('—')
+    await expect(firstRow.locator('.age-heat')).toBeVisible()
+    await expect(firstRow.locator('.age-heat')).not.toHaveText('—')
+  })
+
+  test('backlog age has no stale data-gap title', async ({ page }) => {
+    const firstRow = page.locator('.queues-table tbody tr').first()
+    await expect(firstRow.locator('.data-gap')).toHaveCount(0)
+    await expect(firstRow.locator('[title="QueueStats does not expose oldest queued job age."]')).toHaveCount(0)
+  })
+
+  test('default queue shows non-empty backlog age', async ({ page }) => {
+    const row = page.locator('.queues-table tbody tr', { hasText: 'default' })
+    await expect(row.locator('.age-heat')).toBeVisible()
+    await expect(row.locator('.age-heat')).toContainText('ago')
+  })
+
+  test('emails queue shows non-empty backlog age', async ({ page }) => {
+    const row = page.locator('.queues-table tbody tr', { hasText: 'emails' })
+    await expect(row.locator('.age-heat')).toBeVisible()
+    await expect(row.locator('.age-heat')).toContainText('ago')
   })
 
   test('summary shows queue count', async ({ page }) => {
@@ -46,6 +65,12 @@ test.describe('Queues Page', () => {
     await expect(page.locator('.summary')).toContainText('1 of 2 queues')
   })
 
+  test('filter with no matches shows empty state', async ({ page }) => {
+    await page.locator('.filters input').fill('missing-queue')
+    await expect(page.locator('.queues-table tbody tr')).toHaveCount(0)
+    await expect(page.locator('.empty')).toContainText('No queues')
+  })
+
   test('clicking a queue row opens filtered jobs', async ({ page }) => {
     await page.locator('.queues-table tbody tr', { hasText: 'emails' }).click()
     await expect(page).toHaveURL(/#\/jobs\?queue=emails/)
@@ -55,6 +80,49 @@ test.describe('Queues Page', () => {
     const pauseBtn = page.locator('.btn-pause-queue').first()
     await expect(pauseBtn).toBeVisible()
     await expect(pauseBtn).toHaveText('Pause Queue')
+  })
+
+  test('composition chart title explains snapshot', async ({ page }) => {
+    const firstRow = page.locator('.queues-table tbody tr').first()
+    await expect(firstRow.locator('.spark-cell')).toHaveAttribute('title', 'Snapshot of pending, running, completed, failed, paused counts.')
+  })
+
+  test('totals footer is visible', async ({ page }) => {
+    const totals = page.locator('.totals-footer')
+    await expect(totals).toBeVisible()
+    await expect(totals).toContainText('All queues')
+  })
+
+  test('totals footer includes all status buckets', async ({ page }) => {
+    const totals = page.locator('.totals-footer')
+    await expect(totals).toContainText('pending')
+    await expect(totals).toContainText('running')
+    await expect(totals).toContainText('completed')
+    await expect(totals).toContainText('failed')
+    await expect(totals).toContainText('paused')
+    await expect(totals).toContainText('total')
+  })
+
+  test('default queue exposes purge completed when completed jobs exist', async ({ page }) => {
+    const defaultRow = page.locator('.queues-table tbody tr', { hasText: 'default' })
+    await expect(defaultRow.locator('.btn-purge-secondary')).toHaveText('Purge Completed')
+  })
+
+  test('queue rows keep stable count cell contract', async ({ page }) => {
+    const rows = page.locator('.queues-table tbody tr')
+    await expect(rows.first().locator('.num')).toHaveCount(6)
+    await expect(rows.nth(1).locator('.num')).toHaveCount(6)
+  })
+
+  test('queue status badge is absent before pause', async ({ page }) => {
+    await expect(page.locator('.badge-paused')).toHaveCount(0)
+  })
+
+  test('actions stop row navigation', async ({ page }) => {
+    await page.locator('.btn-pause-queue').first().click()
+    await expect(page).toHaveURL(/#\/queues$/)
+    await page.locator('.btn-resume-queue').first().click()
+    await expect(page.locator('.btn-pause-queue').first()).toBeVisible()
   })
 
   test('pause then resume a queue', async ({ page }) => {

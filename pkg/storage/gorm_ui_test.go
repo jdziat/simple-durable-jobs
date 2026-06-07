@@ -125,6 +125,19 @@ func TestGetQueueDepthStats_OldestPendingAt(t *testing.T) {
 	assert.Nil(t, byQueue["archive"].OldestPendingAt)
 }
 
+func TestParseDBTimestamp_AcceptsRFC3339NanoAndSQLiteLiterals(t *testing.T) {
+	rfc3339Nano := "2026-06-07T12:34:56.123456789Z"
+	sqliteLiteral := "2026-06-07 12:34:56.123456789+00:00"
+
+	rfcTime, ok := parseDBTimestamp(rfc3339Nano)
+	require.True(t, ok)
+	assert.Equal(t, time.Date(2026, 6, 7, 12, 34, 56, 123456789, time.UTC).UnixNano(), rfcTime.UnixNano())
+
+	sqliteTime, ok := parseDBTimestamp(sqliteLiteral)
+	require.True(t, ok)
+	assert.Equal(t, time.Date(2026, 6, 7, 12, 34, 56, 123456789, time.UTC).UnixNano(), sqliteTime.UnixNano())
+}
+
 func TestGetScheduledFireTimes(t *testing.T) {
 	ctx := context.Background()
 	store := newUITestStorage(t)

@@ -15,6 +15,7 @@ import (
 
 	"github.com/jdziat/simple-durable-jobs/pkg/core"
 	"github.com/jdziat/simple-durable-jobs/pkg/queue"
+	"github.com/jdziat/simple-durable-jobs/pkg/schedule"
 	"github.com/jdziat/simple-durable-jobs/pkg/storage"
 	"github.com/jdziat/simple-durable-jobs/ui"
 	"gorm.io/driver/sqlite"
@@ -59,6 +60,7 @@ func main() {
 	}
 
 	q := queue.New(store)
+	q.Schedule("cleanup", map[string]any{"mode": "e2e"}, stringSchedule{Schedule: schedule.Every(5 * time.Minute), value: "*/5 * * * *"}, queue.QueueOpt("maintenance"))
 	ctx, cancel := context.WithCancel(seedCtx)
 	defer cancel()
 
@@ -87,6 +89,15 @@ func main() {
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutdownCancel()
 	_ = srv.Shutdown(shutdownCtx)
+}
+
+type stringSchedule struct {
+	schedule.Schedule
+	value string
+}
+
+func (s stringSchedule) String() string {
+	return s.value
 }
 
 func seedE2EData(ctx context.Context, store *storage.GormStorage, db *gorm.DB) error {

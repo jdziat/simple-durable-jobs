@@ -136,4 +136,152 @@ test.describe('Job Detail', () => {
     // Cancel is for running jobs only; a terminal dead-lettered job must not show it.
     await expect(page.locator('.actions .btn-cancel')).toHaveCount(0)
   })
+
+  test('shows worker for a running job', async ({ page }) => {
+    await page.goto(`/#/jobs/${JOBS.RUNNING_1}`)
+    await page.waitForSelector('.job-detail .header', { timeout: 10000 })
+
+    const workerRow = page.locator('.meta-item', { hasText: 'Worker' })
+    await expect(workerRow.locator('.value')).toHaveText('worker-1')
+    await expect(workerRow.getByRole('button', { name: 'Copy' })).toBeVisible()
+  })
+
+  test('shows dash worker for an unheld completed job', async ({ page }) => {
+    await page.goto(`/#/jobs/${JOBS.COMPLETED_1}`)
+    await page.waitForSelector('.job-detail .header', { timeout: 10000 })
+
+    await expect(page.locator('.meta-item', { hasText: 'Worker' }).locator('.value')).toHaveText('—')
+  })
+
+  test('metadata shows queue', async ({ page }) => {
+    await page.goto(`/#/jobs/${JOBS.COMPLETED_1}`)
+    await page.waitForSelector('.meta', { timeout: 10000 })
+    await expect(page.locator('.meta-item', { hasText: 'Queue' }).locator('.value')).toHaveText('emails')
+  })
+
+  test('metadata shows priority', async ({ page }) => {
+    await page.goto(`/#/jobs/${JOBS.COMPLETED_1}`)
+    await page.waitForSelector('.meta', { timeout: 10000 })
+    await expect(page.locator('.meta-item', { hasText: 'Priority' }).locator('.value')).toHaveText('5')
+  })
+
+  test('metadata shows attempts and max retries', async ({ page }) => {
+    await page.goto(`/#/jobs/${JOBS.COMPLETED_1}`)
+    await page.waitForSelector('.meta', { timeout: 10000 })
+    await expect(page.locator('.meta-item', { hasText: 'Attempts/Max' }).locator('.value')).toContainText('/')
+  })
+
+  test('header has copy button for job id', async ({ page }) => {
+    await page.goto(`/#/jobs/${JOBS.COMPLETED_1}`)
+    await page.waitForSelector('.job-detail .header', { timeout: 10000 })
+    await expect(page.locator('.header-id').getByRole('button', { name: 'Copy' })).toBeVisible()
+  })
+
+  test('metadata has copy button for job id', async ({ page }) => {
+    await page.goto(`/#/jobs/${JOBS.COMPLETED_1}`)
+    await page.waitForSelector('.meta', { timeout: 10000 })
+    await expect(page.locator('.meta-item', { hasText: 'ID' }).getByRole('button', { name: 'Copy' })).toBeVisible()
+  })
+
+  test('running job shows running completion indicator', async ({ page }) => {
+    await page.goto(`/#/jobs/${JOBS.RUNNING_1}`)
+    await page.waitForSelector('.timestamps', { timeout: 10000 })
+    await expect(page.locator('.running-indicator')).toHaveText('running')
+  })
+
+  test('running job shows cancel action', async ({ page }) => {
+    await page.goto(`/#/jobs/${JOBS.RUNNING_1}`)
+    await page.waitForSelector('.job-detail .header', { timeout: 10000 })
+    await expect(page.locator('.actions .btn-cancel')).toBeVisible()
+  })
+
+  test('running job shows pause action', async ({ page }) => {
+    await page.goto(`/#/jobs/${JOBS.RUNNING_1}`)
+    await page.waitForSelector('.job-detail .header', { timeout: 10000 })
+    await expect(page.locator('.actions .btn-pause')).toBeVisible()
+  })
+
+  test('completed job does not show cancel action', async ({ page }) => {
+    await page.goto(`/#/jobs/${JOBS.COMPLETED_1}`)
+    await page.waitForSelector('.job-detail .header', { timeout: 10000 })
+    await expect(page.locator('.actions .btn-cancel')).toHaveCount(0)
+  })
+
+  test('completed job has delete action', async ({ page }) => {
+    await page.goto(`/#/jobs/${JOBS.COMPLETED_1}`)
+    await page.waitForSelector('.job-detail .header', { timeout: 10000 })
+    await expect(page.locator('.actions .btn-delete')).toBeVisible()
+  })
+
+  test('arguments copy button is visible', async ({ page }) => {
+    await page.goto(`/#/jobs/${JOBS.PENDING_1}`)
+    await page.waitForSelector('.args-box', { timeout: 10000 })
+    await expect(page.locator('.args-box').getByRole('button', { name: 'Copy' })).toBeVisible()
+  })
+
+  test('last error copy button is visible', async ({ page }) => {
+    await page.goto('/#/jobs/e2e-failed-004')
+    await page.waitForSelector('.error-box', { timeout: 10000 })
+    await expect(page.locator('.error-box').getByRole('button', { name: 'Copy' })).toBeVisible()
+  })
+
+  test('dead-letter copy button is visible', async ({ page }) => {
+    await page.goto(`/#/jobs/${JOBS.DEADLETTERED_1}`)
+    await page.waitForSelector('.dead-letter-box', { timeout: 10000 })
+    await expect(page.locator('.dead-letter-box').getByRole('button', { name: 'Copy' })).toBeVisible()
+  })
+
+  test('checkpoint rows include created timestamps', async ({ page }) => {
+    await page.goto(`/#/jobs/${JOBS.COMPLETED_1}`)
+    await page.waitForSelector('.checkpoints', { timeout: 10000 })
+    await expect(page.locator('.checkpoints tbody tr').first().locator('td').nth(3)).not.toHaveText('')
+  })
+
+  test('checkpoint toggle is collapsed initially', async ({ page }) => {
+    await page.goto(`/#/jobs/${JOBS.COMPLETED_1}`)
+    await page.waitForSelector('.checkpoints', { timeout: 10000 })
+    await expect(page.locator('.checkpoint-toggle').first()).toHaveAttribute('aria-expanded', 'false')
+  })
+
+  test('checkpoint toggle expands payload', async ({ page }) => {
+    await page.goto(`/#/jobs/${JOBS.COMPLETED_1}`)
+    await page.waitForSelector('.checkpoints', { timeout: 10000 })
+    await page.locator('.checkpoint-toggle').first().click()
+    await expect(page.locator('.checkpoint-result pre').first()).toBeVisible()
+  })
+
+  test('not found job shows empty state', async ({ page }) => {
+    await page.goto('/#/jobs/not-found')
+    await expect(page.locator('.empty')).toContainText('Job unavailable')
+  })
+
+  test('workflow completed child shows workflow section', async ({ page }) => {
+    await page.goto(`/#/jobs/${JOBS.WORKFLOW_CHILD_1}`)
+    await page.waitForSelector('.job-detail .header', { timeout: 10000 })
+    await expect(page.locator('.workflow-section')).toBeVisible()
+  })
+
+  test('workflow running child shows workflow section', async ({ page }) => {
+    await page.goto(`/#/jobs/${JOBS.WORKFLOW_CHILD_2}`)
+    await page.waitForSelector('.job-detail .header', { timeout: 10000 })
+    await expect(page.locator('.workflow-section')).toBeVisible()
+  })
+
+  test('pending job shows wait duration', async ({ page }) => {
+    await page.goto(`/#/jobs/${JOBS.PENDING_1}`)
+    await page.waitForSelector('.timestamps', { timeout: 10000 })
+    await expect(page.locator('.duration-row').first()).not.toHaveText('—')
+  })
+
+  test('completed job shows run duration', async ({ page }) => {
+    await page.goto(`/#/jobs/${JOBS.COMPLETED_1}`)
+    await page.waitForSelector('.timestamps', { timeout: 10000 })
+    await expect(page.locator('.duration-row').nth(1)).not.toHaveText('—')
+  })
+
+  test('header status for running job is lowercase running', async ({ page }) => {
+    await page.goto(`/#/jobs/${JOBS.RUNNING_1}`)
+    await page.waitForSelector('.job-detail .header', { timeout: 10000 })
+    await expect(page.locator('.header .status')).toHaveText('running')
+  })
 })
