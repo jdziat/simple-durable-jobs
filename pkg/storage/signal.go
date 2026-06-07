@@ -136,6 +136,69 @@ func (s *GormStorage) DrainSignals(ctx context.Context, jobID, name string) ([]*
 	return out, nil
 }
 
+// GetPendingSignalName returns the oldest pending signal name for jobID. It is
+// an optional capability used by the worker to distinguish signal-driven wakes
+// from expired durable-timer wakes before emitting JobResumedBySignal.
+func (s *GormStorage) GetPendingSignalName(ctx context.Context, jobID string) (string, bool, error) {
+	var sig core.Signal
+	err := s.db.WithContext(ctx).
+		Select("name").
+		Where("job_id = ? AND consumed_at IS NULL", jobID).
+		Order("created_at ASC").
+		First(&sig).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return sig.Name, true, nil
+}
+
+// DeleteConsumedSignalsOlderThan deletes at most limit consumed signal rows
+// whose consumed_at timestamp is older than age. Pending/unconsumed signals are
+// durable workflow state and are never deleted by this retention capability.
+func (s *GormStorage) DeleteConsumedSignalsOlderThan(ctx context.Context, age time.Duration, limit int) (int64, error) {
+	if age <= 0 || limit <= 0 {
+		return 0, nil
+	}
+	var cutoff any
+	if s.useDBClock() {
+		cutoff = s.offsetExpr(-age)
+	} else {
+		cutoff = time.Now().Add(-age).UTC()
+	}
+
+	var deleted int64
+	err := s.withSerializationRetry(ctx, func() error {
+		deleted = 0
+		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			var ids []string
+			query := tx.Model(&core.Signal{}).
+				Where("consumed_at IS NOT NULL").
+				Where("consumed_at < ?", cutoff).
+				Order("consumed_at ASC, id ASC").
+				Limit(limit)
+			if !s.isSQLite {
+				query = query.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"})
+			}
+			if err := query.Pluck("id", &ids).Error; err != nil {
+				return err
+			}
+			if len(ids) == 0 {
+				return nil
+			}
+			result := tx.Where("id IN ?", ids).
+				Where("consumed_at IS NOT NULL").
+				Where("consumed_at < ?", cutoff).
+				Delete(&core.Signal{})
+			deleted = result.RowsAffected
+			return result.Error
+		})
+	})
+	return deleted, err
+}
+
 // SuspendJobWithDeadline moves an owned running job into StatusWaiting and parks
 // run_at at (now + d) as the wake deadline, so the signal-resume poll wakes it to
 // time out if no signal arrives first. Like SuspendJob but with the wake

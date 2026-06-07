@@ -182,6 +182,25 @@ func TestResumeSignalWaitingJob(t *testing.T) {
 	assert.Equal(t, core.StatusPaused, p.Status, "paused job stays paused")
 }
 
+func TestGetPendingSignalName(t *testing.T) {
+	s := newTestStorage(t)
+	ctx := context.Background()
+	require.NoError(t, s.SendSignal(ctx, "j1", "first", []byte(`1`)))
+	require.NoError(t, s.SendSignal(ctx, "j1", "second", []byte(`2`)))
+	_, err := s.ConsumeSignal(ctx, "j1", "first")
+	require.NoError(t, err)
+
+	name, ok, err := s.GetPendingSignalName(ctx, "j1")
+	require.NoError(t, err)
+	require.True(t, ok)
+	assert.Equal(t, "second", name)
+
+	name, ok, err = s.GetPendingSignalName(ctx, "missing")
+	require.NoError(t, err)
+	assert.False(t, ok)
+	assert.Empty(t, name)
+}
+
 func TestResumeJob_PreservesRunAt(t *testing.T) {
 	s := newTestStorage(t)
 	ctx := context.Background()

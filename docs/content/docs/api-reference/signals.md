@@ -149,9 +149,31 @@ short-circuiting the already-done work. The same rule as fan-out applies:
 
 A successful `Signal` emits a `SignalDelivered{JobID, Name, Timestamp}` event on
 `q.Events()`, so an orchestrator can observe that a signal landed (the handler
-consumes it later). When the wake deadline of a `WaitForSignalTimeout` lapses, or
-a delivered signal resumes a waiting job, the job re-runs and emits the usual
-`JobStarted` event as it resumes.
+consumes it later). When a delivered signal wakes a waiting job, the queue also
+emits `JobResumedBySignal{JobID, SignalName, Timestamp}`. `SignalName` is best
+effort for recovery/backstop wakes and may be empty for custom storage backends
+that can confirm a signal wake without cheaply reporting which signal name did
+it. Durable timer wakes and `WaitForSignalTimeout` deadline expirations without a
+pending signal do not emit `JobResumedBySignal`.
+
+After any resume, the job re-runs and emits the usual `JobStarted` event.
+
+## Consumed-signal retention
+
+Consumed signal rows are kept by default so existing installations see no
+behavior change. For high-volume workflows, opt into pruning only consumed rows
+with worker retention:
+
+```go
+w := jobs.NewWorker(q,
+    jobs.WithRetention(
+        jobs.RetentionConsumedSignalsAfter(7*24*time.Hour),
+    ),
+)
+```
+
+Pending/unconsumed signals are durable workflow state and are never pruned by
+this option. `DeleteJob` still removes all signal rows for the deleted job.
 
 ---
 
@@ -165,10 +187,3 @@ a delivered signal resumes a waiting job, the job re-runs and emits the usual
 | `ErrSignalNameTooLong` | signal `name` exceeds `MaxSignalNameLength` (255) |
 
 Payloads are bounded by the same maximum-result-size limit as job results.
-
-{{< callout type="info" >}}
-Garbage collection of old **consumed** signal rows beyond `DeleteJob` (which
-removes a job's signals) is not yet automatic. Consumed rows are never re-read,
-so for high-volume, long-lived workflows you can safely prune them
-administratively, e.g. `DELETE FROM signals WHERE consumed_at IS NOT NULL`.
-{{< /callout >}}

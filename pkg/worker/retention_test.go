@@ -73,6 +73,48 @@ func TestWorkerRetentionLoopPrunesOldTerminalJobs(t *testing.T) {
 	}, 5*time.Second, 50*time.Millisecond)
 }
 
+func TestWorkerRetentionLoopPrunesConsumedSignals(t *testing.T) {
+	db, store := newWorkerRetentionStore(t)
+	ctx := context.Background()
+	old := time.Now().Add(-2 * time.Hour).UTC()
+	recent := time.Now().Add(-10 * time.Minute).UTC()
+
+	seedWorkerRetentionSignal(t, db, "consumed-old", "job-a", "ctx", &old)
+	seedWorkerRetentionSignal(t, db, "consumed-new", "job-a", "ctx", &recent)
+	seedWorkerRetentionSignal(t, db, "pending-old", "job-a", "ctx", nil)
+
+	q := queue.New(store)
+	w := NewWorker(q,
+		WorkerQueue("retention-empty", Concurrency(1)),
+		WithRetention(
+			RetentionConsumedSignalsAfter(time.Hour),
+			RetentionInterval(10*time.Millisecond),
+			RetentionBatchSize(1),
+		),
+		WithOwnershipAuditInterval(0),
+	)
+
+	runCtx, cancel := context.WithCancel(ctx)
+	done := make(chan error, 1)
+	go func() { done <- w.Start(runCtx) }()
+	require.Eventually(t, func() bool {
+		return !workerRetentionSignalExists(t, db, "consumed-old")
+	}, 5*time.Second, 50*time.Millisecond)
+
+	assert.True(t, workerRetentionSignalExists(t, db, "consumed-new"))
+	assert.True(t, workerRetentionSignalExists(t, db, "pending-old"))
+
+	cancel()
+	require.Eventually(t, func() bool {
+		select {
+		case err := <-done:
+			return assert.ErrorIs(t, err, context.Canceled)
+		default:
+			return false
+		}
+	}, 5*time.Second, 50*time.Millisecond)
+}
+
 func TestWorkerRetentionUnsupportedStorageLogsOnceAndRuns(t *testing.T) {
 	var buf lockedLogBuffer
 	q := queue.New(&mockStorage{})
@@ -126,6 +168,13 @@ func TestWithRetentionZeroConfigDisabled(t *testing.T) {
 	assert.False(t, w.config.Retention.enabled())
 }
 
+func TestWithRetentionConsumedSignalsEnablesRetention(t *testing.T) {
+	q := queue.New(&mockStorage{})
+	w := NewWorker(q, WithRetention(RetentionConsumedSignalsAfter(time.Hour)))
+	assert.True(t, w.config.Retention.enabled())
+	assert.Equal(t, time.Hour, w.config.Retention.ConsumedSignalsAfter)
+}
+
 func newWorkerRetentionStore(t *testing.T) (*gorm.DB, *storage.GormStorage) {
 	t.Helper()
 	dbFile := t.TempDir() + "/worker-retention.db"
@@ -158,9 +207,27 @@ func seedWorkerRetentionJob(t *testing.T, db *gorm.DB, id string, status core.Jo
 	}).Error)
 }
 
+func seedWorkerRetentionSignal(t *testing.T, db *gorm.DB, id, jobID, name string, consumedAt *time.Time) {
+	t.Helper()
+	require.NoError(t, db.Create(&core.Signal{
+		ID:         id,
+		JobID:      jobID,
+		Name:       name,
+		Payload:    []byte(`"payload"`),
+		ConsumedAt: consumedAt,
+	}).Error)
+}
+
 func workerRetentionExists(t *testing.T, db *gorm.DB, id string) bool {
 	t.Helper()
 	var count int64
 	require.NoError(t, db.Model(&core.Job{}).Where("id = ?", id).Count(&count).Error)
+	return count == 1
+}
+
+func workerRetentionSignalExists(t *testing.T, db *gorm.DB, id string) bool {
+	t.Helper()
+	var count int64
+	require.NoError(t, db.Model(&core.Signal{}).Where("id = ?", id).Count(&count).Error)
 	return count == 1
 }

@@ -5,9 +5,10 @@ weight: 10
 
 ## Disabled by default
 
-Completed, failed, and cancelled jobs are kept forever unless you configure
-retention on a worker. With no retention options, no background retention
-goroutine starts and job rows are never deleted automatically.
+Completed, failed, and cancelled jobs, plus consumed signal rows, are kept
+forever unless you configure retention on a worker. With no retention options,
+no background retention goroutine starts and rows are never deleted
+automatically.
 
 ```go
 w := jobs.NewWorker(q)
@@ -39,17 +40,35 @@ w := jobs.NewWorker(q,
 )
 ```
 
+## Consumed-signal window
+
+Signals are durable: pending/unconsumed signal rows are workflow state and are
+never pruned by retention. If your workflows consume many signals and keep job
+rows for a long time, add a consumed-signal window:
+
+```go
+w := jobs.NewWorker(q,
+	jobs.WithRetention(
+		jobs.RetentionConsumedSignalsAfter(7*24*time.Hour),
+	),
+)
+```
+
+Only rows with `consumed_at` set and older than the configured window are
+deleted. A window of `0` keeps consumed signal rows forever.
+
 ## Batch and interval tuning
 
 Retention runs as a worker background loop. Each tick deletes matching terminal
-rows in bounded batches, then keeps looping until a pass deletes fewer rows than
-the batch size.
+job rows and consumed signal rows in bounded batches, then keeps looping until a
+pass deletes fewer rows than the batch size.
 
 ```go
 w := jobs.NewWorker(q,
 	jobs.WithRetention(
 		jobs.RetentionCompletedAfter(14*24*time.Hour),
 		jobs.RetentionFailedAfter(90*24*time.Hour),
+		jobs.RetentionConsumedSignalsAfter(14*24*time.Hour),
 		jobs.RetentionInterval(time.Hour),
 		jobs.RetentionBatchSize(1000),
 	),
@@ -67,6 +86,8 @@ implements it. Custom storage backends that do not implement the optional
 retention capability keep running normally; the worker logs one warning and
 disables retention.
 
-Deletes are permanent. Retention removes terminal job rows and their stored
-checkpoints/signals, so configure windows long enough for dashboards, audits,
-debugging, and any manual requeue workflow you rely on.
+Deletes are permanent. Terminal-job retention removes terminal job rows and
+their stored checkpoints/signals, so configure windows long enough for
+dashboards, audits, debugging, and any manual requeue workflow you rely on.
+Consumed-signal retention removes only consumed signal rows; pending signals are
+left intact.

@@ -99,6 +99,9 @@ type (
 	// JobRetrying is emitted when a job is retried.
 	JobRetrying = core.JobRetrying
 
+	// JobResumedBySignal is emitted when a signal wakes a waiting job.
+	JobResumedBySignal = core.JobResumedBySignal
+
 	// CheckpointSaved is emitted when a checkpoint is saved.
 	CheckpointSaved = core.CheckpointSaved
 
@@ -156,10 +159,10 @@ type (
 	// RateLimitOption configures a RateLimit.
 	RateLimitOption = worker.RateLimitOption
 
-	// RetentionConfig controls automatic terminal-job retention.
+	// RetentionConfig controls automatic retention.
 	RetentionConfig = worker.RetentionConfig
 
-	// RetentionOption configures automatic terminal-job retention.
+	// RetentionOption configures automatic retention.
 	RetentionOption = worker.RetentionOption
 
 	// RetryConfig holds configuration for retry with backoff.
@@ -601,6 +604,13 @@ func RetentionFailedAfter(d time.Duration) RetentionOption {
 	return worker.RetentionFailedAfter(d)
 }
 
+// RetentionConsumedSignalsAfter deletes consumed signal rows older than d.
+// Pending/unconsumed signals are durable workflow state and are never pruned.
+// A non-positive duration keeps consumed signal rows forever.
+func RetentionConsumedSignalsAfter(d time.Duration) RetentionOption {
+	return worker.RetentionConsumedSignalsAfter(d)
+}
+
 // RetentionInterval sets the retention scan cadence.
 func RetentionInterval(d time.Duration) RetentionOption {
 	return worker.RetentionInterval(d)
@@ -992,8 +1002,12 @@ func Signal(ctx context.Context, q *Queue, jobID, name string, payload any) erro
 			ResumeSignalWaitingJob(ctx context.Context, jobID string) (bool, error)
 		}
 		if r, ok := q.Storage().(signalResumer); ok {
-			if _, err := r.ResumeSignalWaitingJob(ctx, jobID); err != nil {
+			resumed, err := r.ResumeSignalWaitingJob(ctx, jobID)
+			if err != nil {
 				return fmt.Errorf("jobs: signal sent but resume failed (poll will recover): %w", err)
+			}
+			if resumed {
+				q.Emit(&core.JobResumedBySignal{JobID: jobID, SignalName: name, Timestamp: time.Now()})
 			}
 		}
 	}

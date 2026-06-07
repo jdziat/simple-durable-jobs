@@ -107,6 +107,13 @@ type retentionStorage interface {
 	DeleteTerminalJobsOlderThan(ctx context.Context, status core.JobStatus, age time.Duration, limit int) (int64, error)
 }
 
+// consumedSignalRetentionStorage is implemented by backends that can prune
+// consumed signal rows; the retention sweep uses it when the opt-in
+// consumed-signal window is set. Optional — absent backends are skipped.
+type consumedSignalRetentionStorage interface {
+	DeleteConsumedSignalsOlderThan(ctx context.Context, age time.Duration, limit int) (int64, error)
+}
+
 // signalResumeStorage is implemented by backends that buffer signals; the
 // recovery poll uses it to wake jobs whose awaited signal has arrived or whose
 // wait deadline has passed. Optional — backends without it simply don't poll.
@@ -120,6 +127,13 @@ type signalResumeStorage interface {
 
 type signalResumePager interface {
 	GetSignalWaitingJobsToResumeAfter(ctx context.Context, afterJobID string, limit int) ([]*core.Job, error)
+}
+
+// pendingSignalNameReader lets the resume backstop distinguish a genuine
+// signal wake (unconsumed signal present) from a durable-timer deadline wake,
+// and best-effort name the signal for the JobResumedBySignal event. Optional.
+type pendingSignalNameReader interface {
+	GetPendingSignalName(ctx context.Context, jobID string) (name string, ok bool, err error)
 }
 
 // recoveryLeaser is implemented by storage backends that can elect a single
@@ -460,8 +474,9 @@ func (w *Worker) goTracked(fn func()) {
 }
 
 func (w *Worker) runRetention(ctx context.Context) {
-	storage, ok := w.queue.Storage().(retentionStorage)
-	if !ok {
+	jobStorage, jobOK := w.queue.Storage().(retentionStorage)
+	signalStorage, signalOK := w.queue.Storage().(consumedSignalRetentionStorage)
+	if !jobOK && !signalOK {
 		if w.retentionStorageMissingLogged.CompareAndSwap(false, true) {
 			w.logger.Warn("storage backend does not support retention GC; retention disabled")
 		}
@@ -489,18 +504,21 @@ func (w *Worker) runRetention(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			w.runRetentionOnce(ctx, storage, cfg, batchSize)
+			w.runRetentionOnce(ctx, jobStorage, signalStorage, cfg, batchSize)
 		}
 	}
 }
 
-func (w *Worker) runRetentionOnce(ctx context.Context, storage retentionStorage, cfg RetentionConfig, batchSize int) {
-	if cfg.CompletedAfter > 0 {
-		w.deleteTerminalStatus(ctx, storage, core.StatusCompleted, cfg.CompletedAfter, batchSize)
+func (w *Worker) runRetentionOnce(ctx context.Context, jobStorage retentionStorage, signalStorage consumedSignalRetentionStorage, cfg RetentionConfig, batchSize int) {
+	if jobStorage != nil && cfg.CompletedAfter > 0 {
+		w.deleteTerminalStatus(ctx, jobStorage, core.StatusCompleted, cfg.CompletedAfter, batchSize)
 	}
-	if cfg.FailedAfter > 0 {
-		w.deleteTerminalStatus(ctx, storage, core.StatusFailed, cfg.FailedAfter, batchSize)
-		w.deleteTerminalStatus(ctx, storage, core.StatusCancelled, cfg.FailedAfter, batchSize)
+	if jobStorage != nil && cfg.FailedAfter > 0 {
+		w.deleteTerminalStatus(ctx, jobStorage, core.StatusFailed, cfg.FailedAfter, batchSize)
+		w.deleteTerminalStatus(ctx, jobStorage, core.StatusCancelled, cfg.FailedAfter, batchSize)
+	}
+	if signalStorage != nil && cfg.ConsumedSignalsAfter > 0 {
+		w.deleteConsumedSignals(ctx, signalStorage, cfg.ConsumedSignalsAfter, batchSize)
 	}
 }
 
@@ -510,6 +528,21 @@ func (w *Worker) deleteTerminalStatus(ctx context.Context, storage retentionStor
 		if err != nil {
 			if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 				w.logger.Warn("retention GC pass failed", "status", status, "error", err)
+			}
+			return
+		}
+		if deleted < int64(batchSize) {
+			return
+		}
+	}
+}
+
+func (w *Worker) deleteConsumedSignals(ctx context.Context, storage consumedSignalRetentionStorage, age time.Duration, batchSize int) {
+	for ctx.Err() == nil {
+		deleted, err := storage.DeleteConsumedSignalsOlderThan(ctx, age, batchSize)
+		if err != nil {
+			if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+				w.logger.Warn("retention GC consumed-signal pass failed", "error", err)
 			}
 			return
 		}
@@ -1671,6 +1704,7 @@ func (w *Worker) pollSignalWaitingJobs(ctx context.Context, sr signalResumeStora
 		batchSize = 100
 	}
 	pager, paged := w.queue.Storage().(signalResumePager)
+	signalNames, canReadSignalNames := w.queue.Storage().(pendingSignalNameReader)
 	afterJobID := ""
 
 	for {
@@ -1709,14 +1743,28 @@ func (w *Worker) pollSignalWaitingJobs(ctx context.Context, sr signalResumeStora
 				w.memoizeFutureSleep(job)
 				continue
 			}
+			signalName := ""
+			hasPendingSignal := false
+			if canReadSignalNames {
+				var nameErr error
+				signalName, hasPendingSignal, nameErr = signalNames.GetPendingSignalName(ctx, job.ID)
+				if nameErr != nil {
+					w.logger.Warn("failed to inspect pending signal before resume event", "job_id", job.ID, "error", nameErr)
+				}
+			}
 			w.clearFutureSleepMemo(job.ID)
+			resumed := false
 			resumeErr := retryWithBackoff(ctx, *w.config.StorageRetry, func() error {
-				_, err := sr.ResumeSignalWaitingJob(ctx, job.ID)
+				var err error
+				resumed, err = sr.ResumeSignalWaitingJob(ctx, job.ID)
 				return err
 			})
 			if resumeErr != nil {
 				w.logger.Error("failed to resume signal-waiting job after retries", "job_id", job.ID, "error", resumeErr)
 			} else {
+				if resumed && hasPendingSignal {
+					w.queue.Emit(&core.JobResumedBySignal{JobID: job.ID, SignalName: signalName, Timestamp: time.Now()})
+				}
 				w.logger.Info("resumed signal-waiting job via polling fallback", "job_id", job.ID)
 			}
 		}

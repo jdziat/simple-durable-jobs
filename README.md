@@ -71,7 +71,7 @@ for the full contract, backend support tiers, and crash-recovery tuning.
 - **Rate Limiting** - Per-queue token buckets and an optional fleet-wide limiter (throttle waits don't burn retry attempts)
 - **Retries with Backoff** - Configurable retry logic with exponential backoff and jitter
 - **Dead-Letter Queue** - Explicit dead-letter metadata with list/count/requeue triage
-- **Retention / GC** - Automatic pruning of terminal jobs by per-status age window
+- **Retention / GC** - Automatic pruning of terminal jobs by per-status age window and consumed signals by opt-in age window
 - **Execution Middleware** - Interceptors that wrap handler execution
 - **Payload Codec** - Pluggable encryption-at-rest for job arguments, results, and checkpoints
 - **Workflow Versioning** - GetVersion markers to evolve in-flight workflows safely across deploys

@@ -53,6 +53,36 @@ func TestSleep_SuspendsAndResumesAfterDeadline(t *testing.T) {
 	assert.Equal(t, int32(2), runs.Load(), "handler should run once to suspend and once to complete")
 }
 
+func TestSleep_DoesNotEmitResumedBySignalOnDeadlineWake(t *testing.T) {
+	q, _ := openIntegrationQueue(t)
+	q.Register("timer.no-signal-event", func(ctx context.Context, _ struct{}) error {
+		return jobs.Sleep(ctx, 200*time.Millisecond)
+	})
+	startWorker(t, q)
+
+	events := q.Events()
+	ctx := context.Background()
+	id, err := q.Enqueue(ctx, "timer.no-signal-event", struct{}{})
+	require.NoError(t, err)
+
+	require.Eventually(t, func() bool {
+		st, _ := q.LoadStatus(ctx, id)
+		return st == jobs.StatusCompleted
+	}, 20*time.Second, 100*time.Millisecond)
+
+	deadline := time.After(500 * time.Millisecond)
+	for {
+		select {
+		case e := <-events:
+			if resumed, ok := e.(*jobs.JobResumedBySignal); ok && resumed.JobID == id {
+				t.Fatalf("durable timer wake emitted JobResumedBySignal: %#v", resumed)
+			}
+		case <-deadline:
+			return
+		}
+	}
+}
+
 func TestSleep_FreesWorkerSlotWhileWaiting(t *testing.T) {
 	q, _ := openIntegrationQueue(t)
 	var quickDone atomic.Bool

@@ -36,7 +36,7 @@ type CapOption func(*ConcurrencyCapConfig)
 // RateLimitOption configures a fleet-wide rate limit.
 type RateLimitOption func(*RateLimitConfig)
 
-// RetentionOption configures automatic terminal-job retention.
+// RetentionOption configures automatic retention.
 type RetentionOption func(*RetentionConfig)
 
 // ConcurrencyCapConfig describes a DB-backed concurrency cap. If Key is nil,
@@ -59,17 +59,18 @@ type RateLimitConfig struct {
 	Key       func(*core.Job) string
 }
 
-// RetentionConfig controls automatic deletion of old terminal jobs. A zero
-// per-status window keeps that status forever.
+// RetentionConfig controls automatic deletion of old terminal jobs and consumed
+// signal rows. A zero window keeps that category forever.
 type RetentionConfig struct {
-	CompletedAfter time.Duration
-	FailedAfter    time.Duration
-	Interval       time.Duration
-	BatchSize      int
+	CompletedAfter       time.Duration
+	FailedAfter          time.Duration
+	ConsumedSignalsAfter time.Duration
+	Interval             time.Duration
+	BatchSize            int
 }
 
 func (c RetentionConfig) enabled() bool {
-	return c.CompletedAfter > 0 || c.FailedAfter > 0
+	return c.CompletedAfter > 0 || c.FailedAfter > 0 || c.ConsumedSignalsAfter > 0
 }
 
 // WorkerConfig holds worker configuration.
@@ -167,7 +168,8 @@ type WorkerConfig struct {
 	DequeueBatchSize int
 
 	// Retention configures optional automatic garbage collection for terminal
-	// jobs. It is disabled by default; zero per-status windows keep rows forever.
+	// jobs and consumed signals. It is disabled by default; zero windows keep
+	// rows forever.
 	Retention RetentionConfig
 }
 
@@ -243,9 +245,9 @@ func RateLimit(name string, perSecond float64, opts ...RateLimitOption) WorkerOp
 	})
 }
 
-// WithRetention enables optional automatic garbage collection of terminal jobs
-// when at least one per-status retention window is positive. With no positive
-// windows it is a no-op and starts no retention goroutine.
+// WithRetention enables optional automatic garbage collection when at least one
+// retention window is positive. With no positive windows it is a no-op and
+// starts no retention goroutine.
 func WithRetention(opts ...RetentionOption) WorkerOption {
 	return workerOptionFunc(func(c *WorkerConfig) {
 		cfg := c.Retention
@@ -287,6 +289,19 @@ func RetentionFailedAfter(d time.Duration) RetentionOption {
 			c.FailedAfter = d
 		} else {
 			c.FailedAfter = 0
+		}
+	}
+}
+
+// RetentionConsumedSignalsAfter deletes consumed signal rows older than d.
+// Pending/unconsumed signals are durable workflow state and are never pruned by
+// this option. A non-positive duration keeps consumed signal rows forever.
+func RetentionConsumedSignalsAfter(d time.Duration) RetentionOption {
+	return func(c *RetentionConfig) {
+		if d > 0 {
+			c.ConsumedSignalsAfter = d
+		} else {
+			c.ConsumedSignalsAfter = 0
 		}
 	}
 }

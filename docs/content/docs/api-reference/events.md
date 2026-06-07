@@ -71,6 +71,23 @@ type JobResumed struct {
     Timestamp time.Time
 }
 
+// Emitted when a signal wakes a waiting job (producer fast path or the
+// worker's polling backstop). SignalName is best-effort and may be empty
+// on backstop/recovery wakes. Durable-timer (Sleep) deadline wakes without
+// a pending signal do NOT emit this event.
+type JobResumedBySignal struct {
+    JobID      string
+    SignalName string
+    Timestamp  time.Time
+}
+
+// Emitted when a signal is successfully persisted for a job.
+type SignalDelivered struct {
+    JobID     string
+    Name      string
+    Timestamp time.Time
+}
+
 type QueuePaused struct {
     Queue     string
     Timestamp time.Time

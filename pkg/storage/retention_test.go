@@ -117,6 +117,50 @@ func TestDeleteTerminalJobsOlderThan_ConcurrentPasses(t *testing.T) {
 	assert.Equal(t, int64(0), remaining)
 }
 
+func TestDeleteConsumedSignalsOlderThan_PrunesOnlyConsumedOlderThanWindow(t *testing.T) {
+	s := newTestStorage(t)
+	ctx := context.Background()
+	old := time.Now().Add(-2 * time.Hour).UTC()
+	recent := time.Now().Add(-10 * time.Minute).UTC()
+
+	seedRetentionSignal(t, s, "consumed-old", "job-a", "ctx", &old)
+	seedRetentionSignal(t, s, "consumed-new", "job-a", "ctx", &recent)
+	seedRetentionSignal(t, s, "pending-old", "job-a", "ctx", nil)
+
+	deleted, err := s.DeleteConsumedSignalsOlderThan(ctx, time.Hour, 100)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), deleted)
+
+	assertRetentionSignalMissing(t, s, "consumed-old")
+	assertRetentionSignalExists(t, s, "consumed-new")
+	assertRetentionSignalExists(t, s, "pending-old")
+}
+
+func TestDeleteConsumedSignalsOlderThan_BatchLimitZeroWindowAndBoundary(t *testing.T) {
+	s := newTestStorage(t)
+	ctx := context.Background()
+	old := time.Now().Add(-2 * time.Hour).UTC()
+	insideWindow := time.Now().Add(-time.Hour + time.Second).UTC()
+
+	seedRetentionSignal(t, s, "batch-1", "job-a", "ctx", &old)
+	seedRetentionSignal(t, s, "batch-2", "job-a", "ctx", &old)
+	seedRetentionSignal(t, s, "inside-window", "job-a", "ctx", &insideWindow)
+
+	deleted, err := s.DeleteConsumedSignalsOlderThan(ctx, 0, 100)
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), deleted)
+
+	deleted, err = s.DeleteConsumedSignalsOlderThan(ctx, time.Hour, 1)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), deleted)
+	assertRetentionSignalExists(t, s, "inside-window")
+
+	deleted, err = s.DeleteConsumedSignalsOlderThan(ctx, time.Hour, 100)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), deleted)
+	assertRetentionSignalExists(t, s, "inside-window")
+}
+
 func seedRetentionJob(t *testing.T, s *GormStorage, id string, status core.JobStatus, completedAt time.Time) {
 	t.Helper()
 	require.NoError(t, s.db.Create(&core.Job{
@@ -128,11 +172,36 @@ func seedRetentionJob(t *testing.T, s *GormStorage, id string, status core.JobSt
 	}).Error)
 }
 
+func seedRetentionSignal(t *testing.T, s *GormStorage, id, jobID, name string, consumedAt *time.Time) {
+	t.Helper()
+	require.NoError(t, s.db.Create(&core.Signal{
+		ID:         id,
+		JobID:      jobID,
+		Name:       name,
+		Payload:    []byte(`"payload"`),
+		ConsumedAt: consumedAt,
+	}).Error)
+}
+
 func assertRetentionExists(t *testing.T, s *GormStorage, id string) {
 	t.Helper()
 	var count int64
 	require.NoError(t, s.db.Model(&core.Job{}).Where("id = ?", id).Count(&count).Error)
 	assert.Equal(t, int64(1), count, "job should exist: %s", id)
+}
+
+func assertRetentionSignalExists(t *testing.T, s *GormStorage, id string) {
+	t.Helper()
+	var count int64
+	require.NoError(t, s.db.Model(&core.Signal{}).Where("id = ?", id).Count(&count).Error)
+	assert.Equal(t, int64(1), count, "signal should exist: %s", id)
+}
+
+func assertRetentionSignalMissing(t *testing.T, s *GormStorage, id string) {
+	t.Helper()
+	var count int64
+	require.NoError(t, s.db.Model(&core.Signal{}).Where("id = ?", id).Count(&count).Error)
+	assert.Equal(t, int64(0), count, "signal should be deleted: %s", id)
 }
 
 func assertRetentionMissing(t *testing.T, s *GormStorage, id string) {
