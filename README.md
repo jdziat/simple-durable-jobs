@@ -65,6 +65,7 @@ for the full contract, backend support tiers, and crash-recovery tuning.
 - **Scheduled Jobs** - Cron, daily, weekly, and interval-based scheduling
 - **Priority Queues** - Higher priority jobs run first
 - **Transactional Enqueue** - Enqueue inside your own DB transaction (outbox pattern) so business rows and jobs commit together
+- **Transactional Checkpoints** - Save phase checkpoints in the same DB transaction as the business effect they protect
 - **Batch Enqueue & Dequeue** - Bulk insert plus buffered worker-side batch dequeue for throughput
 - **Concurrency Caps** - Fleet-wide and per-key concurrency limits, not just per-process
 - **Rate Limiting** - Per-queue token buckets and an optional fleet-wide limiter (throttle waits don't burn retry attempts)

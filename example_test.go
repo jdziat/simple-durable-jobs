@@ -15,6 +15,11 @@ type exampleOrder struct {
 	ExternalID string
 }
 
+type exampleProcessedOrder struct {
+	ID      uint `gorm:"primaryKey"`
+	OrderID string
+}
+
 func ExampleNew() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -114,6 +119,47 @@ func ExampleNew_transactional() {
 		panic(err)
 	}
 	if err := tx.Commit().Error; err != nil {
+		panic(err)
+	}
+}
+
+func ExampleSavePhaseCheckpointTx() {
+	ctx := context.Background()
+
+	db, err := gorm.Open(sqlite.Open(jobs.SafeSQLiteDSN("jobs.db")), &gorm.Config{})
+	if err != nil {
+		panic(err)
+	}
+	store := jobs.NewGormStorage(db)
+	if err := store.Migrate(ctx); err != nil {
+		panic(err)
+	}
+	if err := db.AutoMigrate(&exampleProcessedOrder{}); err != nil {
+		panic(err)
+	}
+
+	q := jobs.New(store)
+	q.Register("process-order", func(ctx context.Context, orderID string) error {
+		if _, ok := jobs.LoadPhaseCheckpoint[string](ctx, "mark-processed"); ok {
+			return nil
+		}
+
+		tx := db.WithContext(ctx).Begin()
+		if tx.Error != nil {
+			return tx.Error
+		}
+		defer tx.Rollback()
+
+		if err := tx.Create(&exampleProcessedOrder{OrderID: orderID}).Error; err != nil {
+			return err
+		}
+		if err := jobs.SavePhaseCheckpointTx(ctx, tx, "mark-processed", "done"); err != nil {
+			return err
+		}
+		return tx.Commit().Error
+	})
+
+	if _, err := q.Enqueue(ctx, "process-order", "order-123"); err != nil {
 		panic(err)
 	}
 }

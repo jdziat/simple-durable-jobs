@@ -186,6 +186,9 @@ type (
 	// TxEnqueuer is the optional storage capability for caller-supplied transactions.
 	TxEnqueuer = storage.TxEnqueuer
 
+	// TxCheckpointer is the optional storage capability for caller-supplied transaction checkpoints.
+	TxCheckpointer = storage.TxCheckpointer
+
 	// Secretbox is the built-in NaCl Secretbox payload codec.
 	Secretbox = payloadcodec.Secretbox
 
@@ -301,6 +304,7 @@ var (
 	ErrSignalNameTooLong     = core.ErrSignalNameTooLong
 	ErrStorageNoSignals      = core.ErrStorageNoSignals
 	ErrStorageNoTxEnqueue    = core.ErrStorageNoTxEnqueue
+	ErrStorageNoTxCheckpoint = core.ErrStorageNoTxCheckpoint
 	ErrStorageNoBatchDequeue = core.ErrStorageNoBatchDequeue
 	ErrPayloadDecode         = core.ErrPayloadDecode
 
@@ -445,6 +449,13 @@ func CallWithCheckpointCtx[T any](execCtx, checkpointCtx context.Context, name s
 // Use this to checkpoint expensive operations so they can be skipped on job retry.
 func SavePhaseCheckpoint(ctx context.Context, phaseName string, result any) error {
 	return jobctx.SavePhaseCheckpoint(ctx, phaseName, result)
+}
+
+// SavePhaseCheckpointTx saves a phase result through a caller-owned GORM
+// transaction. Use this when the phase's business side effect and checkpoint
+// must commit or roll back together.
+func SavePhaseCheckpointTx(ctx context.Context, tx *gorm.DB, phaseName string, result any) error {
+	return jobctx.SavePhaseCheckpointTx(ctx, tx, phaseName, result)
 }
 
 // LoadPhaseCheckpoint loads a previously saved phase result from the checkpoint store.

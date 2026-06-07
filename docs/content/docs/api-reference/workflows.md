@@ -27,6 +27,8 @@ queue.Register("workflow", func(ctx context.Context, input Input) error {
 
 Manually saves a checkpoint for a named phase within a job handler.
 
+Use `SavePhaseCheckpointTx(ctx, tx, phaseName, result)` when the phase's business write and checkpoint must commit atomically in the same GORM transaction; see [Transactional Checkpoints]({{< relref "/docs/advanced/transactional-checkpoints" >}}).
+
 ### `LoadPhaseCheckpoint[T any](ctx context.Context, phaseName string) (T, bool)`
 
 Retrieves a previously saved phase checkpoint. Returns the result and true if found, or the zero value and false if not found.

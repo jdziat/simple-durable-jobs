@@ -8,8 +8,11 @@ import (
 	"fmt"
 
 	"github.com/google/uuid"
+	"gorm.io/gorm"
+
 	"github.com/jdziat/simple-durable-jobs/pkg/core"
 	intctx "github.com/jdziat/simple-durable-jobs/pkg/internal/context"
+	"github.com/jdziat/simple-durable-jobs/pkg/storage"
 )
 
 // DefaultVersion is the sentinel version used for code paths that existed
@@ -128,6 +131,37 @@ func SavePhaseCheckpoint(ctx context.Context, phaseName string, result any) erro
 	}
 
 	return jc.SaveCheckpoint(ctx, cp)
+}
+
+// SavePhaseCheckpointTx saves a phase result through a caller-owned GORM
+// transaction. Unlike SavePhaseCheckpoint, it returns an error outside a job
+// handler because silently skipping a transactional checkpoint would break the
+// caller's atomicity guarantee.
+func SavePhaseCheckpointTx(ctx context.Context, tx *gorm.DB, phaseName string, result any) error {
+	jc := intctx.GetJobContext(ctx)
+	if jc == nil {
+		return fmt.Errorf("jobs.SavePhaseCheckpointTx: not in a job handler")
+	}
+
+	txCheckpointer, ok := jc.Storage.(storage.TxCheckpointer)
+	if !ok {
+		return core.ErrStorageNoTxCheckpoint
+	}
+
+	resultBytes, err := json.Marshal(result)
+	if err != nil {
+		return fmt.Errorf("marshal phase result: %w", err)
+	}
+
+	cp := &core.Checkpoint{
+		ID:        uuid.New().String(),
+		JobID:     jc.Job.ID,
+		CallIndex: -1, // Use -1 to indicate phase checkpoint (not a Call index)
+		CallType:  phaseName,
+		Result:    resultBytes,
+	}
+
+	return txCheckpointer.SaveCheckpointTx(ctx, tx, cp)
 }
 
 // LoadPhaseCheckpoint loads a previously saved phase result from the checkpoint store.

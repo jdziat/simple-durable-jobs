@@ -37,6 +37,9 @@ var (
 	// ErrStorageNoTxEnqueue is returned when the storage backend does not
 	// implement caller-supplied transaction enqueue.
 	ErrStorageNoTxEnqueue = errors.New("jobs: storage backend does not support transactional enqueue")
+	// ErrStorageNoTxCheckpoint is returned when the storage backend does not
+	// implement caller-supplied transaction checkpoints.
+	ErrStorageNoTxCheckpoint = errors.New("jobs: storage backend does not support transactional checkpoints")
 	// ErrStorageNoBatchDequeue is returned when the storage backend does not
 	// implement batch dequeue.
 	ErrStorageNoBatchDequeue = errors.New("jobs: storage backend does not support batch dequeue")
