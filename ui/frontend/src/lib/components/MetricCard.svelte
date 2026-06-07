@@ -8,6 +8,7 @@
     href,
     sub,
     dominant = false,
+    title,
   }: {
     label: string
     value: string | number
@@ -15,19 +16,21 @@
     href?: string
     sub?: string
     dominant?: boolean
+    title?: string
   } = $props()
 
   let danger = $derived(dominant || status === 'failed' || status === 'dead-lettered')
+  let cardTitle = $derived(title ?? (label === 'Active workers' ? 'workers currently holding running jobs; idle workers not counted' : undefined))
 </script>
 
 {#if href}
-  <a class="card metric-card" class:danger href={href}>
+  <a class="card metric-card" class:danger href={href} title={cardTitle}>
     <span class="metric-label">{label}</span>
     <span class="metric-value" use:deltaFlash={value}>{value}</span>
     {#if sub}<span class="metric-sub">{sub}</span>{/if}
   </a>
 {:else}
-  <div class="card metric-card" class:danger>
+  <div class="card metric-card" class:danger title={cardTitle}>
     <span class="metric-label">{label}</span>
     <span class="metric-value" use:deltaFlash={value}>{value}</span>
     {#if sub}<span class="metric-sub">{sub}</span>{/if}

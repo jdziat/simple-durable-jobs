@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onDestroy } from 'svelte'
   import AreaChart from '../lib/components/AreaChart.svelte'
   import AgeHeat from '../lib/components/AgeHeat.svelte'
   import Button from '../lib/components/Button.svelte'
@@ -11,7 +12,6 @@
   import RelativeTime from '../lib/components/RelativeTime.svelte'
   import Sparkline from '../lib/components/Sparkline.svelte'
   import StatusBadge from '../lib/components/StatusBadge.svelte'
-  import ButtonPrimitive from '../lib/components/Button.svelte'
   import { toast } from '../lib/stores/toast.svelte'
 
   const statuses = ['pending', 'running', 'completed', 'failed', 'dead-lettered', 'cancelled', 'paused', 'waiting', 'retrying']
@@ -32,6 +32,14 @@
     { id: 'job-beta', status: 'failed', count: 2 },
   ]
   let showDialog = $state(false)
+  let liveMetricValue = $state(41)
+  const liveMetricInterval = setInterval(() => {
+    liveMetricValue += 1
+  }, 1400)
+
+  onDestroy(() => {
+    clearInterval(liveMetricInterval)
+  })
 </script>
 
 <section class="components-dev">
@@ -50,6 +58,7 @@
     <MetricCard label="Failed" value={5} status="failed" dominant sub="danger dominant" href="#/jobs?status=failed" />
     <MetricCard label="Completed" value={128} sub="healthy" />
     <MetricCard label="Running" value={4} href="#/jobs?status=running" />
+    <MetricCard label="Live delta" value={liveMetricValue} sub="delta-flash demo" />
   </div>
 
   <div class="panel">
@@ -78,8 +87,8 @@
       <Button variant="destructive">Delete</Button>
       <Button variant="secondary" loading>Loading</Button>
       <CopyButton text="job-alpha" />
-      <ButtonPrimitive variant="secondary" onclick={() => toast.push({ kind: 'info', msg: 'sample toast' })}>Toast</ButtonPrimitive>
-      <ButtonPrimitive variant="destructive" onclick={() => { showDialog = true }}>Confirm</ButtonPrimitive>
+      <Button variant="secondary" onclick={() => toast.push({ kind: 'info', msg: 'sample toast' })}>Toast</Button>
+      <Button variant="destructive" onclick={() => { showDialog = true }}>Confirm</Button>
     </div>
   </div>
 
@@ -155,8 +164,14 @@
 
   .grid {
     display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
+    grid-template-columns: repeat(4, minmax(0, 1fr));
     gap: var(--sp-3);
+  }
+
+  @media (max-width: 1024px) {
+    .grid {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
   }
 
   @media (max-width: 767px) {

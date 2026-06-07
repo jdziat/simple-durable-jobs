@@ -92,6 +92,8 @@ test.describe('Queues Page', () => {
     const defaultRow = page.locator('.queues-table tbody tr', { hasText: 'default' })
     const failedText = await defaultRow.locator('.num').nth(3).innerText()
     const failedCount = Number(failedText.trim())
+    // This mutates the shared e2e server. The precondition guard keeps the test
+    // explicit about requiring seeded failed jobs before it consumes them.
     expect(failedCount).toBeGreaterThan(0)
 
     await defaultRow.locator('.btn-purge').click()

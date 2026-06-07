@@ -5,7 +5,6 @@
   import EmptyState from '../lib/components/EmptyState.svelte'
   import RelativeTime from '../lib/components/RelativeTime.svelte'
   import StatusBadge from '../lib/components/StatusBadge.svelte'
-  import { statusToken } from '../lib/status'
 
   type WorkflowItem = {
     rootJobId: string
@@ -163,8 +162,8 @@
     return Math.max(0, Math.min(100, (count / totalJobs) * 100))
   }
 
-  function segmentStyle(status: string, count: number, totalJobs: number): string {
-    return `width:${segmentPct(count, totalJobs)}%;background:${statusToken(status).color};`
+  function segmentStyle(count: number, totalJobs: number): string {
+    return `width:${segmentPct(count, totalJobs)}%;`
   }
 
   function nextPage() {
@@ -257,10 +256,10 @@
               aria-valuemax={100}
               aria-label={`${wf.completedJobs} of ${wf.totalJobs} workflow jobs completed`}
             >
-              <div class="bar bar-completed" style={segmentStyle('completed', wf.completedJobs, wf.totalJobs)}></div>
-              <div class="bar bar-failed" style={segmentStyle('failed', wf.failedJobs, wf.totalJobs)}></div>
-              <div class="bar bar-running" style={segmentStyle('running', wf.segmentRunningJobs, wf.totalJobs)}></div>
-              <div class="bar bar-pending" style={segmentStyle('pending', wf.pendingJobs, wf.totalJobs)}></div>
+              <div class="bar bar-completed" style={segmentStyle(wf.completedJobs, wf.totalJobs)}></div>
+              <div class="bar bar-failed" style={segmentStyle(wf.failedJobs, wf.totalJobs)}></div>
+              <div class="bar bar-running" style={segmentStyle(wf.segmentRunningJobs, wf.totalJobs)}></div>
+              <div class="bar bar-pending" style={segmentStyle(wf.pendingJobs, wf.totalJobs)}></div>
             </div>
             <div class="progress-text">
               <span>{wf.completedJobs}/{wf.totalJobs} completed</span>
@@ -405,6 +404,22 @@
     height: 100%;
     min-width: 0;
     transition: width var(--dur-settle) var(--ease);
+  }
+
+  .bar-completed {
+    background: var(--sig-ok);
+  }
+
+  .bar-failed {
+    background: var(--sig-danger);
+  }
+
+  .bar-running {
+    background: var(--sig-info);
+  }
+
+  .bar-pending {
+    background: var(--sig-warn);
   }
 
   .progress-text {
