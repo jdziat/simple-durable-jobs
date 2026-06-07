@@ -42,16 +42,24 @@ func main() {
 	sqlDB.SetMaxIdleConns(1)
 
 	store := storage.NewGormStorage(db)
-	if err := store.Migrate(context.Background()); err != nil {
+	seedCtx := context.Background()
+	if err := store.Migrate(seedCtx); err != nil {
 		log.Fatalf("Failed to migrate: %v", err)
 	}
 
-	if err := seedE2EData(context.Background(), store, db); err != nil {
+	if err := seedE2EData(seedCtx, store, db); err != nil {
 		log.Fatalf("Failed to seed data: %v", err)
+	}
+	statsStore := ui.NewGormStatsStorage(db)
+	if err := statsStore.MigrateStats(seedCtx); err != nil {
+		log.Fatalf("Failed to migrate stats data: %v", err)
+	}
+	if err := seedStatsHistory(seedCtx, statsStore, time.Now()); err != nil {
+		log.Fatalf("Failed to seed stats history: %v", err)
 	}
 
 	q := queue.New(store)
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(seedCtx)
 	defer cancel()
 
 	handler := ui.Handler(store, ui.WithQueue(q), ui.WithContext(ctx), ui.WithInsecureAllowUnauthenticatedWrites())
@@ -278,6 +286,53 @@ func seedE2EData(ctx context.Context, store *storage.GormStorage, db *gorm.DB) e
 	}
 
 	log.Printf("Seeded %d jobs, 1 fan-out, 4 checkpoints for E2E testing", len(allJobs))
+	return nil
+}
+
+func seedStatsHistory(ctx context.Context, statsStore ui.StatsStorage, now time.Time) error {
+	start := now.Truncate(time.Minute).Add(-70 * time.Minute)
+	queues := []string{"default", "emails"}
+
+	for minute := 0; minute <= 70; minute++ {
+		ts := start.Add(time.Duration(minute) * time.Minute)
+		for queueIndex, queueName := range queues {
+			completed := int64(3 + ((minute*5 + queueIndex*7) % 16))
+			failed := int64(0)
+			if (minute+queueIndex*3)%19 == 0 {
+				failed = int64(1 + (minute % 3))
+			}
+
+			// Deliberately sparse buckets exercise the frontend's timestamp-union merge:
+			// one minute has completions only, another has failures only.
+			completionOnly := queueName == "emails" && minute == 17
+			failureOnly := queueName == "default" && minute == 23
+			if completionOnly {
+				completed = 12
+				failed = 0
+			}
+			if failureOnly {
+				completed = 0
+				failed = 2
+			}
+
+			if err := statsStore.UpsertStatCounters(ctx, queueName, ts, completed, failed, 0); err != nil {
+				return fmt.Errorf("failed to seed stat counters for %s at %s: %w", queueName, ts.Format(time.RFC3339), err)
+			}
+
+			if completionOnly || failureOnly {
+				continue
+			}
+			if minute%3 == 0 || minute%7 == 0 {
+				pending := int64(4 + ((70 - minute + queueIndex*2) % 9))
+				running := int64(1 + ((minute + queueIndex) % 3))
+				if err := statsStore.SnapshotQueueDepth(ctx, queueName, ts, pending, running); err != nil {
+					return fmt.Errorf("failed to seed queue depth for %s at %s: %w", queueName, ts.Format(time.RFC3339), err)
+				}
+			}
+		}
+	}
+
+	log.Printf("Seeded stats history for %d queues across 71 minute buckets", len(queues))
 	return nil
 }
 

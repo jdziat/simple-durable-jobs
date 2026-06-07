@@ -7,11 +7,19 @@
   import Scheduled from './routes/Scheduled.svelte'
   import Workflows from './routes/Workflows.svelte'
   import WorkflowDetail from './routes/WorkflowDetail.svelte'
+  import CommandPalette from './lib/components/CommandPalette.svelte'
+  import Ticker from './lib/components/Ticker.svelte'
+  import NavRail from './lib/components/NavRail.svelte'
+  import Toast from './lib/components/Toast.svelte'
+  import { start as startStats, stats, stop as stopStats } from './lib/stores/stats.svelte'
 
   let currentPath = $state(window.location.hash.slice(1) || '/')
   let jobId = $state<string | null>(null)
   let workflowId = $state<string | null>(null)
   let queryParams = $state<Record<string, string>>({})
+  let paletteOpen = $state(false)
+  let ComponentsDev = $state<null | typeof import('./routes/ComponentsDev.svelte').default>(null)
+  let queues = $derived(stats.value?.queues.map(q => q.name) ?? [])
 
   function navigate(path: string) {
     window.location.hash = path
@@ -40,12 +48,54 @@
 
     const workflowMatch = path.match(/^\/workflows\/([^/]+)$/)
     workflowId = workflowMatch ? workflowMatch[1] : null
+
+    if (path === '/components' && !ComponentsDev) {
+      // This smoke route must remain reachable from the production build for
+      // preview review. Do not gate it on import.meta.env.DEV: Vite would
+      // tree-shake it out of dist. It is unlinked from NavRail and lazy-loaded
+      // so it ships with zero nav-visible surface and a separate gallery chunk.
+      import('./routes/ComponentsDev.svelte').then(mod => {
+        ComponentsDev = mod.default
+      })
+    }
+  }
+
+  function inputFocused(): boolean {
+    const active = document.activeElement
+    if (!(active instanceof HTMLElement)) return false
+    return ['INPUT', 'TEXTAREA', 'SELECT'].includes(active.tagName) || active.isContentEditable
+  }
+
+  function handleGlobalKeydown(event: KeyboardEvent) {
+    if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') {
+      event.preventDefault()
+      paletteOpen = true
+      return
+    }
+    if (event.key === 'Escape' && paletteOpen) {
+      event.preventDefault()
+      paletteOpen = false
+      return
+    }
+    if (event.key === '/' && !inputFocused()) {
+      const search = document.querySelector<HTMLInputElement>('input[type="search"], .filters input, input[name="search"]')
+      if (search) {
+        event.preventDefault()
+        search.focus()
+      }
+    }
   }
 
   onMount(() => {
+    startStats()
     window.addEventListener('hashchange', handleHashChange)
+    window.addEventListener('keydown', handleGlobalKeydown)
     handleHashChange()
-    return () => window.removeEventListener('hashchange', handleHashChange)
+    return () => {
+      window.removeEventListener('hashchange', handleHashChange)
+      window.removeEventListener('keydown', handleGlobalKeydown)
+      stopStats()
+    }
   })
 
   function isActive(path: string): boolean {
@@ -54,36 +104,21 @@
   }
 </script>
 
+<a class="skip-link" href="#content">Skip to content</a>
 <div class="app">
-  <nav class="sidebar">
-    <div class="logo">
-      <h1>Jobs UI</h1>
-    </div>
-    <ul class="nav-links">
-      <li>
-        <a href="#/" class:active={isActive('/')}>Dashboard</a>
-      </li>
-      <li>
-        <a href="#/jobs" class:active={isActive('/jobs')}>Jobs</a>
-      </li>
-      <li>
-        <a href="#/queues" class:active={isActive('/queues')}>Queues</a>
-      </li>
-      <li>
-        <a href="#/scheduled" class:active={isActive('/scheduled')}>Scheduled</a>
-      </li>
-      <li>
-        <a href="#/workflows" class:active={isActive('/workflows')}>Workflows</a>
-      </li>
-    </ul>
-  </nav>
-  <main class="content">
+  <Ticker />
+  <NavRail {currentPath} {isActive} />
+  <main id="content" class="content" tabindex="-1">
     {#if currentPath === '/'}
       <Dashboard />
     {:else if currentPath === '/jobs'}
       <Jobs {navigate} initialStatus={queryParams.status ?? ''} initialQueue={queryParams.queue ?? ''} />
     {:else if jobId}
-      <JobDetail id={jobId} {navigate} />
+      <!-- key: remount on id change so navigating job→job (e.g. waterfall
+           child links) reloads data and resets the poll/panel state. -->
+      {#key jobId}
+        <JobDetail id={jobId} {navigate} />
+      {/key}
     {:else if currentPath === '/queues'}
       <Queues />
     {:else if currentPath === '/scheduled'}
@@ -92,76 +127,76 @@
       <Workflows />
     {:else if workflowId}
       <WorkflowDetail id={workflowId} {navigate} />
+    {:else if currentPath === '/components'}
+      {#if ComponentsDev}
+        <ComponentsDev />
+      {:else}
+        <Dashboard />
+      {/if}
     {:else}
       <Dashboard />
     {/if}
   </main>
 </div>
+<CommandPalette open={paletteOpen} onClose={() => { paletteOpen = false }} {navigate} {queues} />
+<Toast />
 
 <style>
-  :global(*) {
-    box-sizing: border-box;
-    margin: 0;
-    padding: 0;
+  .skip-link {
+    position: fixed;
+    top: var(--sp-3);
+    left: var(--sp-3);
+    z-index: 100;
+    transform: translateY(calc(-100% - var(--sp-4)));
+    padding: var(--sp-2) var(--sp-3);
+    border: var(--border-strong);
+    border-radius: var(--radius-input);
+    background: var(--bg-raised);
+    color: var(--fg-primary);
+    font-weight: var(--fw-label);
+    text-decoration: none;
+    transition: transform var(--dur-instant) var(--ease);
   }
 
-  :global(body) {
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
-    background: #f5f7fa;
-    color: #333;
+  .skip-link:focus {
+    transform: translateY(0);
   }
 
   .app {
-    display: flex;
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    grid-template-rows: 56px minmax(0, 1fr);
     min-height: 100vh;
-  }
-
-  .sidebar {
-    width: 220px;
-    background: #1a1a2e;
-    color: white;
-    padding: 20px 0;
-    position: fixed;
-    height: 100vh;
-  }
-
-  .logo {
-    padding: 0 20px 20px;
-    border-bottom: 1px solid rgba(255,255,255,0.1);
-  }
-
-  .logo h1 {
-    font-size: 20px;
-    font-weight: 600;
-  }
-
-  .nav-links {
-    list-style: none;
-    padding: 20px 0;
-  }
-
-  .nav-links li {
-    margin: 4px 0;
-  }
-
-  .nav-links a {
-    display: block;
-    padding: 12px 20px;
-    color: rgba(255,255,255,0.7);
-    text-decoration: none;
-    transition: all 0.2s;
-  }
-
-  .nav-links a:hover,
-  .nav-links a.active {
-    background: rgba(255,255,255,0.1);
-    color: white;
+    background: var(--bg-base);
+    color: var(--fg-primary);
   }
 
   .content {
-    flex: 1;
-    margin-left: 220px;
-    padding: 24px;
-    min-height: 100vh;
+    min-width: 0;
+    min-height: calc(100vh - 56px);
+    padding: var(--sp-6);
+    background: var(--bg-base);
+  }
+
+  .content:focus {
+    outline: none;
+  }
+
+  @media (max-width: 1439px) {
+    .content {
+      padding: var(--sp-4);
+    }
+  }
+
+  @media (max-width: 767px) {
+    .app {
+      display: block;
+      padding-bottom: 56px;
+    }
+
+    .content {
+      min-height: calc(100vh - 112px);
+      padding: var(--sp-3);
+    }
   }
 </style>

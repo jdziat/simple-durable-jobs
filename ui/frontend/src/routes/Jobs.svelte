@@ -1,8 +1,21 @@
 <script lang="ts">
   import { onMount } from 'svelte'
   import { jobsClient } from '../lib/client'
+  import { deltaFlash } from '../lib/actions/deltaFlash'
+  import AgeHeat from '../lib/components/AgeHeat.svelte'
+  import Button from '../lib/components/Button.svelte'
+  import ConfirmDialog from '../lib/components/ConfirmDialog.svelte'
+  import CopyButton from '../lib/components/CopyButton.svelte'
+  import DataTable, { type Column } from '../lib/components/DataTable.svelte'
+  import Duration from '../lib/components/Duration.svelte'
+  import EmptyState from '../lib/components/EmptyState.svelte'
+  import RelativeTime from '../lib/components/RelativeTime.svelte'
+  import StatusBadge from '../lib/components/StatusBadge.svelte'
+  import { toast } from '../lib/stores/toast.svelte'
 
   let { navigate, initialStatus = '', initialQueue = '' }: { navigate: (path: string) => void; initialStatus?: string; initialQueue?: string } = $props()
+
+  type TimeValue = Date | null
 
   type JobItem = {
     id: string
@@ -11,52 +24,199 @@
     status: string
     attempt: number
     maxRetries: number
-    createdAt: Date | null
-    deadLetteredAt: Date | null
+    createdAt: TimeValue
+    startedAt: TimeValue
+    completedAt: TimeValue
+    deadLetteredAt: TimeValue
     lastError: string
   }
+
+  type ConfirmState =
+    | { kind: 'cancel'; id: string }
+    | { kind: 'delete'; id: string }
+    | null
+
+  const limit = 20
+  const statusOptions = [
+    ['pending', 'Pending'],
+    ['running', 'Running'],
+    ['completed', 'Completed'],
+    ['failed', 'Failed'],
+    ['dead-lettered', 'Dead-lettered'],
+    ['paused', 'Paused'],
+    ['cancelled', 'Cancelled'],
+    ['waiting', 'Waiting'],
+    ['retrying', 'Retrying'],
+  ] as const
+
+  const columns: Column[] = [
+    { key: 'id', label: 'ID', width: '150px' },
+    { key: 'type', label: 'Type', sortable: true },
+    { key: 'queue', label: 'Queue', sortable: true },
+    { key: 'status', label: 'Status', sortable: true },
+    { key: 'attempt', label: 'Attempts', align: 'right', sortable: true },
+    { key: 'duration', label: 'Duration', align: 'right', sortable: true },
+    { key: 'age', label: 'Age', align: 'right', sortable: true },
+    { key: 'createdAt', label: 'Created', sortable: true },
+    { key: 'actions', label: 'Actions' },
+  ]
 
   let jobs = $state<JobItem[]>([])
   let loading = $state(true)
   let error = $state<string | null>(null)
   let total = $state(0)
   let page = $state(1)
-  let statusFilter = $state(initialStatus)
-  let queueFilter = $state(initialQueue)
+  let statusFilter = $state('')
+  let queueFilter = $state('')
   let typeFilter = $state('')
   let searchQuery = $state('')
-  let sortKey = $state<keyof JobItem>('createdAt')
+  let sortKey = $state('createdAt')
   let sortDir = $state<'asc' | 'desc'>('desc')
-
-  const limit = 20
+  let filterTimer: ReturnType<typeof setTimeout> | null = null
+  let transitionTimer: ReturnType<typeof setTimeout> | null = null
+  let confirmState = $state<ConfirmState>(null)
+  let overflowJobId = $state<string | null>(null)
+  let transitionIds = $state<Set<string>>(new Set())
+  let previousStatuses = new Map<string, string>()
 
   let sortedJobs = $derived(
-    jobs.slice().sort((a, b) => {
-      const aVal = a[sortKey]
-      const bVal = b[sortKey]
-      if (aVal === null || aVal === undefined) return sortDir === 'asc' ? -1 : 1
-      if (bVal === null || bVal === undefined) return sortDir === 'asc' ? 1 : -1
-      if (aVal instanceof Date && bVal instanceof Date) {
-        return sortDir === 'asc' ? aVal.getTime() - bVal.getTime() : bVal.getTime() - aVal.getTime()
-      }
-      if (typeof aVal === 'string' && typeof bVal === 'string') {
-        return sortDir === 'asc' ? aVal.localeCompare(bVal) : bVal.localeCompare(aVal)
-      }
-      return sortDir === 'asc' ? (aVal as number) - (bVal as number) : (bVal as number) - (aVal as number)
-    })
+    jobs.slice().sort((a, b) => compareValue(sortValue(a, sortKey), sortValue(b, sortKey)))
   )
 
-  function toggleSort(key: keyof JobItem) {
+  let rangeStart = $derived(total === 0 ? 0 : Math.min((page - 1) * limit + 1, total))
+  let rangeEnd = $derived(Math.min(page * limit, total))
+  let totalPages = $derived(Math.max(1, Math.ceil(total / limit)))
+  let activeFilters = $derived([
+    ...(statusFilter ? [{ key: 'status', label: `status: ${statusFilter}` }] : []),
+    ...(queueFilter ? [{ key: 'queue', label: `queue: ${queueFilter}` }] : []),
+    ...(typeFilter ? [{ key: 'type', label: `type: ${typeFilter}` }] : []),
+    ...(searchQuery ? [{ key: 'search', label: `search: ${searchQuery}` }] : []),
+  ])
+
+  function toDate(value: { toDate?: () => Date } | undefined): Date | null {
+    if (!value?.toDate) return null
+    const date = value.toDate()
+    return Number.isNaN(date.getTime()) ? null : date
+  }
+
+  function displayStatus(job: JobItem): string {
+    return job.deadLetteredAt ? 'dead-lettered' : job.status
+  }
+
+  function isFailedStatus(job: JobItem): boolean {
+    const status = displayStatus(job)
+    return status === 'failed' || status === 'dead-lettered'
+  }
+
+  function truncate(value: string, max = 88): string {
+    if (value.length <= max) return value
+    return `${value.slice(0, max - 1)}…`
+  }
+
+  function durationMs(job: JobItem): number | null {
+    if (!job.startedAt) return null
+    return (job.completedAt?.getTime() ?? Date.now()) - job.startedAt.getTime()
+  }
+
+  function sortValue(job: JobItem, key: string): string | number | null {
+    if (key === 'status') return displayStatus(job)
+    if (key === 'duration') return durationMs(job)
+    if (key === 'age') return job.createdAt ? Date.now() - job.createdAt.getTime() : null
+    if (key === 'createdAt') return job.createdAt?.getTime() ?? null
+    const value = job[key as keyof JobItem]
+    if (value instanceof Date) return value.getTime()
+    if (typeof value === 'string' || typeof value === 'number') return value
+    return null
+  }
+
+  function compareValue(aVal: string | number | null, bVal: string | number | null): number {
+    if (aVal === null) return sortDir === 'asc' ? -1 : 1
+    if (bVal === null) return sortDir === 'asc' ? 1 : -1
+    if (typeof aVal === 'string' && typeof bVal === 'string') {
+      return sortDir === 'asc' ? aVal.localeCompare(bVal) : bVal.localeCompare(aVal)
+    }
+    return sortDir === 'asc' ? Number(aVal) - Number(bVal) : Number(bVal) - Number(aVal)
+  }
+
+  function handleSort(key: string) {
     if (sortKey === key) {
       sortDir = sortDir === 'asc' ? 'desc' : 'asc'
     } else {
       sortKey = key
-      sortDir = key === 'createdAt' ? 'desc' : 'asc'
+      sortDir = key === 'createdAt' || key === 'age' || key === 'duration' ? 'desc' : 'asc'
+    }
+  }
+
+  function syncHash() {
+    const params = new URLSearchParams()
+    if (statusFilter) params.set('status', statusFilter)
+    if (queueFilter) params.set('queue', queueFilter)
+    if (typeFilter) params.set('type', typeFilter)
+    if (searchQuery) params.set('search', searchQuery)
+    if (page > 1) params.set('page', String(page))
+    const query = params.toString()
+    window.location.hash = query ? `#/jobs?${query}` : '#/jobs'
+  }
+
+  function seedFromHash() {
+    const query = window.location.hash.split('?')[1] ?? ''
+    const params = new URLSearchParams(query)
+    statusFilter = initialStatus || params.get('status') || ''
+    queueFilter = initialQueue || params.get('queue') || ''
+    typeFilter = params.get('type') || ''
+    searchQuery = params.get('search') || ''
+    page = Math.max(1, Number(params.get('page') || 1) || 1)
+  }
+
+  function scheduleApply(resetPage = true) {
+    if (filterTimer) clearTimeout(filterTimer)
+    filterTimer = setTimeout(() => {
+      if (resetPage) page = 1
+      syncHash()
+      loadJobs()
+    }, 250)
+  }
+
+  function removeFilter(key: string) {
+    if (key === 'status') statusFilter = ''
+    if (key === 'queue') queueFilter = ''
+    if (key === 'type') typeFilter = ''
+    if (key === 'search') searchQuery = ''
+    scheduleApply()
+  }
+
+  function clearFilters() {
+    statusFilter = ''
+    queueFilter = ''
+    typeFilter = ''
+    searchQuery = ''
+    page = 1
+    if (filterTimer) clearTimeout(filterTimer)
+    syncHash()
+    loadJobs()
+  }
+
+  function noteTransitions(nextJobs: JobItem[]) {
+    const nextTransitions = new Set<string>()
+    for (const job of nextJobs) {
+      const status = displayStatus(job)
+      const previous = previousStatuses.get(job.id)
+      if (previous && previous !== status) nextTransitions.add(job.id)
+      previousStatuses.set(job.id, status)
+    }
+    transitionIds = nextTransitions
+    if (nextTransitions.size > 0) {
+      if (transitionTimer) clearTimeout(transitionTimer)
+      transitionTimer = setTimeout(() => {
+        transitionIds = new Set()
+        transitionTimer = null
+      }, 420)
     }
   }
 
   async function loadJobs() {
     loading = true
+    error = null
     try {
       const response = await jobsClient.listJobs({
         status: statusFilter,
@@ -66,20 +226,25 @@
         page,
         limit,
       })
-      jobs = response.jobs.map(j => ({
+      const nextJobs = response.jobs.map(j => ({
         id: j.id,
         type: j.type,
         queue: j.queue,
         status: j.status,
         attempt: j.attempt,
         maxRetries: j.maxRetries,
-        createdAt: j.createdAt?.toDate() ?? null,
-        deadLetteredAt: j.deadLetteredAt?.toDate() ?? null,
-        lastError: j.lastError,
+        createdAt: toDate(j.createdAt),
+        startedAt: toDate(j.startedAt),
+        completedAt: toDate(j.completedAt),
+        deadLetteredAt: toDate(j.deadLetteredAt),
+        lastError: j.lastError || '',
       }))
+      noteTransitions(nextJobs)
+      jobs = nextJobs
       total = Number(response.total)
     } catch (e) {
       error = e instanceof Error ? e.message : 'Failed to load jobs'
+      toast.push({ kind: 'err', msg: error })
     } finally {
       loading = false
     }
@@ -88,361 +253,506 @@
   async function retryJob(id: string) {
     try {
       await jobsClient.retryJob({ id })
+      toast.push({ kind: 'ok', msg: 'job queued for retry' })
       loadJobs()
     } catch (e) {
-      alert('Failed to retry job')
+      toast.push({ kind: 'err', msg: e instanceof Error ? e.message : 'Failed to retry job' })
     }
   }
 
   async function pauseJob(id: string) {
     try {
       await jobsClient.pauseJob({ id })
+      toast.push({ kind: 'ok', msg: 'job paused' })
       loadJobs()
     } catch (e) {
-      alert('Failed to pause job')
-    }
-  }
-
-  async function cancelJob(id: string) {
-    if (!confirm('Cancel this running job? This interrupts the handler cooperatively by cancelling its context; handlers that ignore context are not force-killed.')) return
-    try {
-      await jobsClient.cancelJob({ id })
-      loadJobs()
-    } catch (e) {
-      alert('Failed to cancel job')
+      toast.push({ kind: 'err', msg: e instanceof Error ? e.message : 'Failed to pause job' })
     }
   }
 
   async function resumeJob(id: string) {
     try {
       await jobsClient.resumeJob({ id })
+      toast.push({ kind: 'ok', msg: 'job resumed' })
       loadJobs()
     } catch (e) {
-      alert('Failed to resume job')
+      toast.push({ kind: 'err', msg: e instanceof Error ? e.message : 'Failed to resume job' })
     }
   }
 
-  async function deleteJob(id: string) {
-    if (!confirm('Are you sure you want to delete this job?')) return
+  async function confirmCancel() {
+    if (confirmState?.kind !== 'cancel') return
+    const id = confirmState.id
+    confirmState = null
+    try {
+      await jobsClient.cancelJob({ id })
+      toast.push({ kind: 'ok', msg: 'job cancellation requested' })
+      loadJobs()
+    } catch (e) {
+      toast.push({ kind: 'err', msg: e instanceof Error ? e.message : 'Failed to cancel job' })
+    }
+  }
+
+  async function confirmDelete() {
+    if (confirmState?.kind !== 'delete') return
+    const id = confirmState.id
+    confirmState = null
     try {
       await jobsClient.deleteJob({ id })
+      toast.push({ kind: 'ok', msg: 'job deleted' })
       loadJobs()
     } catch (e) {
-      alert('Failed to delete job')
+      toast.push({ kind: 'err', msg: e instanceof Error ? e.message : 'Failed to delete job' })
     }
   }
 
-  function viewJob(id: string) {
-    navigate(`#/jobs/${id}`)
+  function openDelete(event: MouseEvent, id: string) {
+    event.stopPropagation()
+    overflowJobId = null
+    confirmState = { kind: 'delete', id }
   }
 
-  function applyFilters() {
-    page = 1
+  function viewJob(job: JobItem) {
+    navigate(`#/jobs/${job.id}`)
+  }
+
+  function nextPage() {
+    if (page * limit >= total) return
+    page += 1
+    syncHash()
     loadJobs()
   }
 
-  function clearFilters() {
-    statusFilter = ''
-    queueFilter = ''
-    typeFilter = ''
-    searchQuery = ''
-    page = 1
+  function previousPage() {
+    if (page <= 1) return
+    page -= 1
+    syncHash()
     loadJobs()
   }
 
   onMount(() => {
+    seedFromHash()
     loadJobs()
+
+    // Clear pending timers on unmount: a leaked debounce firing after route
+    // change would syncHash() — a GLOBAL side effect that yanks the user back
+    // to /jobs from wherever they navigated — and write torn-down $state.
+    return () => {
+      if (filterTimer) clearTimeout(filterTimer)
+      if (transitionTimer) clearTimeout(transitionTimer)
+    }
   })
 </script>
 
 <div class="jobs-page">
   <h2>Jobs</h2>
 
-  <div class="filters">
+  <div class="filters" aria-label="Job filters">
     <input
-      type="text"
+      name="search"
+      type="search"
       placeholder="Search by ID..."
       bind:value={searchQuery}
-      onkeydown={(e) => e.key === 'Enter' && applyFilters()}
+      oninput={() => scheduleApply()}
     />
-    <select bind:value={statusFilter} onchange={applyFilters}>
+    <select bind:value={statusFilter} onchange={() => scheduleApply()}>
       <option value="">All Statuses</option>
-      <option value="pending">Pending</option>
-      <option value="running">Running</option>
-      <option value="completed">Completed</option>
-      <option value="failed">Failed</option>
-      <option value="dead-lettered">Dead-lettered</option>
-      <option value="paused">Paused</option>
-      <option value="cancelled">Cancelled</option>
-      <option value="waiting">Waiting</option>
-      <option value="retrying">Retrying</option>
+      {#each statusOptions as [value, label]}
+        <option {value}>{label}</option>
+      {/each}
     </select>
     <input
       type="text"
       placeholder="Queue..."
       bind:value={queueFilter}
-      onkeydown={(e) => e.key === 'Enter' && applyFilters()}
+      oninput={() => scheduleApply()}
     />
     <input
       type="text"
       placeholder="Type..."
       bind:value={typeFilter}
-      onkeydown={(e) => e.key === 'Enter' && applyFilters()}
+      oninput={() => scheduleApply()}
     />
-    <button class="btn-search" onclick={applyFilters}>Search</button>
-    <button class="btn-clear" onclick={clearFilters}>Clear</button>
+    <Button variant="ghost" class="btn-clear" onclick={clearFilters}>Clear</Button>
   </div>
 
-  {#if loading}
-    <p class="loading">Loading...</p>
-  {:else if error}
-    <p class="error">{error}</p>
-  {:else}
-    <table class="jobs-table">
-      <thead>
-        <tr>
-          <th>ID</th>
-          <th class="sortable" onclick={() => toggleSort('type')}>
-            Type {sortKey === 'type' ? (sortDir === 'asc' ? '▲' : '▼') : ''}
-          </th>
-          <th class="sortable" onclick={() => toggleSort('queue')}>
-            Queue {sortKey === 'queue' ? (sortDir === 'asc' ? '▲' : '▼') : ''}
-          </th>
-          <th class="sortable" onclick={() => toggleSort('status')}>
-            Status {sortKey === 'status' ? (sortDir === 'asc' ? '▲' : '▼') : ''}
-          </th>
-          <th class="sortable" onclick={() => toggleSort('attempt')}>
-            Attempts {sortKey === 'attempt' ? (sortDir === 'asc' ? '▲' : '▼') : ''}
-          </th>
-          <th class="sortable" onclick={() => toggleSort('createdAt')}>
-            Created {sortKey === 'createdAt' ? (sortDir === 'asc' ? '▲' : '▼') : ''}
-          </th>
-          <th>Actions</th>
-        </tr>
-      </thead>
-      <tbody>
-        {#each sortedJobs as job}
-          <tr onclick={() => viewJob(job.id)} class="clickable">
-            <td class="id">{job.id.slice(0, 8)}...</td>
-            <td>{job.type}</td>
-            <td>{job.queue}</td>
-            <td>
-              {#if job.deadLetteredAt}
-                <span class="status status-dead-lettered">Dead-lettered</span>
-              {:else}
-                <span class="status status-{job.status}">{job.status}</span>
-              {/if}
-            </td>
-            <td>{job.attempt}/{job.maxRetries}</td>
-            <td>{job.createdAt?.toLocaleString() ?? '-'}</td>
-            <td class="actions" onclick={(e) => e.stopPropagation()}>
-              {#if job.status === 'failed'}
-                <button class="btn-retry" onclick={() => retryJob(job.id)}>Retry</button>
-              {/if}
-              {#if job.status === 'pending' || job.status === 'running'}
-                <button class="btn-pause" onclick={() => pauseJob(job.id)}>Pause</button>
-              {/if}
-              {#if job.status === 'running'}
-                <button class="btn-cancel" onclick={() => cancelJob(job.id)}>Cancel</button>
-              {/if}
-              {#if job.status === 'paused'}
-                <button class="btn-resume" onclick={() => resumeJob(job.id)}>Resume</button>
-              {/if}
-              <button class="btn-delete" onclick={() => deleteJob(job.id)}>Delete</button>
-            </td>
-          </tr>
-        {/each}
-      </tbody>
-    </table>
-
-    <div class="pagination">
-      <span>Showing {Math.min((page - 1) * limit + 1, total)}-{Math.min(page * limit, total)} of {total}</span>
-      <div class="pagination-buttons">
-        <button disabled={page <= 1} onclick={() => { page--; loadJobs() }}>Previous</button>
-        <span class="page-info">Page {page} of {Math.ceil(total / limit) || 1}</span>
-        <button disabled={page * limit >= total} onclick={() => { page++; loadJobs() }}>Next</button>
-      </div>
+  {#if activeFilters.length > 0}
+    <div class="chip-bar" aria-label="Active filters">
+      {#each activeFilters as filter}
+        <button type="button" class="filter-chip" onclick={() => removeFilter(filter.key)} aria-label={`Remove ${filter.label}`}>
+          <span>{filter.label}</span>
+          <span aria-hidden="true">×</span>
+        </button>
+      {/each}
     </div>
+  {/if}
+
+  <div class="table-meta">
+    <span>Page-local sort: sorted within this page only.</span>
+  </div>
+
+  {#if error}
+    <div class="error" role="alert">{error}</div>
+  {/if}
+
+  {#snippet emptyState()}
+    <EmptyState title="No jobs" hint="No jobs match the current filters." />
+  {/snippet}
+
+  {#snippet cell(job: JobItem, column: Column)}
+    {#if column.key === 'id'}
+      <div class="id-cell" role="presentation" onclick={(event) => event.stopPropagation()} onkeydown={(event) => event.stopPropagation()}>
+        <span class="id" title={job.id}>{job.id.slice(0, 8)}…</span>
+        <CopyButton text={job.id} />
+      </div>
+    {:else if column.key === 'type'}
+      <div class="type-cell">
+        <span>{job.type || '—'}</span>
+        {#if job.lastError && isFailedStatus(job)}
+          <div class="error-peek" role="presentation" onclick={(event) => event.stopPropagation()} onkeydown={(event) => event.stopPropagation()}>
+            <button type="button" class="error-peek-toggle" aria-label="Toggle full error" onclick={(event) => event.stopPropagation()}>
+              {truncate(job.lastError)}
+            </button>
+            <div class="error-peek-full">
+              <pre>{job.lastError}</pre>
+              <CopyButton text={job.lastError} />
+            </div>
+          </div>
+        {/if}
+      </div>
+    {:else if column.key === 'queue'}
+      <span class="mono">{job.queue || '—'}</span>
+    {:else if column.key === 'status'}
+      <span
+        class:status-transition={transitionIds.has(job.id)}
+        class="status-cell"
+        use:deltaFlash={displayStatus(job)}
+      >
+        <StatusBadge status={displayStatus(job)} />
+      </span>
+    {:else if column.key === 'attempt'}
+      <span class="mono" use:deltaFlash={`${job.attempt}/${job.maxRetries}`}>{job.attempt}/{job.maxRetries}</span>
+    {:else if column.key === 'duration'}
+      {#if job.startedAt}
+        <Duration from={job.startedAt} to={job.completedAt} />
+      {:else}
+        <span class="muted">—</span>
+      {/if}
+    {:else if column.key === 'age'}
+      {#if job.createdAt}
+        <AgeHeat ts={job.createdAt} />
+      {:else}
+        <span class="muted">—</span>
+      {/if}
+    {:else if column.key === 'createdAt'}
+      <RelativeTime ts={job.createdAt} mode="both" />
+    {:else if column.key === 'actions'}
+      <div class="actions" role="presentation" onclick={(event) => event.stopPropagation()} onkeydown={(event) => event.stopPropagation()}>
+        {#if job.status === 'failed'}
+          <Button variant="secondary" size="sm" class="btn-retry" onclick={() => retryJob(job.id)}>Retry</Button>
+        {/if}
+        {#if job.status === 'pending' || job.status === 'running'}
+          <Button variant="secondary" size="sm" class="btn-pause" onclick={() => pauseJob(job.id)}>Pause</Button>
+        {/if}
+        {#if job.status === 'running'}
+          <Button variant="destructive" size="sm" class="btn-cancel" onclick={() => { confirmState = { kind: 'cancel', id: job.id } }}>Cancel</Button>
+        {/if}
+        {#if job.status === 'paused'}
+          <Button variant="secondary" size="sm" class="btn-resume" onclick={() => resumeJob(job.id)}>Resume</Button>
+        {/if}
+        <div
+          class="overflow"
+          role="presentation"
+          onkeydown={(event) => { if (event.key === 'Escape' && overflowJobId === job.id) { overflowJobId = null } }}
+          onfocusout={(event) => {
+            // Close when focus leaves the overflow cluster entirely.
+            const next = event.relatedTarget
+            if (overflowJobId === job.id && (!(next instanceof Node) || !event.currentTarget.contains(next))) {
+              overflowJobId = null
+            }
+          }}
+        >
+          <button
+            type="button"
+            class="overflow-trigger"
+            aria-label="More actions"
+            aria-expanded={overflowJobId === job.id}
+            onclick={() => { overflowJobId = overflowJobId === job.id ? null : job.id }}
+          >•••</button>
+          {#if overflowJobId === job.id}
+            <div class="overflow-menu">
+              <Button variant="destructive" size="sm" class="btn-delete" onclick={(event) => openDelete(event, job.id)}>Delete</Button>
+            </div>
+          {/if}
+        </div>
+      </div>
+    {/if}
+  {/snippet}
+
+  <DataTable
+    class="jobs-table"
+    {columns}
+    rows={sortedJobs}
+    {loading}
+    rowKey={(job) => job.id}
+    onRowClick={viewJob}
+    sort={{ key: sortKey, dir: sortDir }}
+    onSort={handleSort}
+    {emptyState}
+    {cell}
+  />
+
+  <div class="pagination">
+    <span>Showing {rangeStart}-{rangeEnd} of {total}</span>
+    <div class="pagination-buttons">
+      <Button variant="secondary" disabled={page <= 1} onclick={previousPage}>Previous</Button>
+      <span class="page-info">Page {page} of {totalPages}</span>
+      <Button variant="secondary" disabled={page * limit >= total} onclick={nextPage}>Next</Button>
+    </div>
+  </div>
+
+  {#if confirmState?.kind === 'cancel'}
+    <ConfirmDialog
+      title="Cancel running job"
+      body="Cancel this running job? This interrupts the handler cooperatively by cancelling its context; handlers that ignore context are not force-killed."
+      blastRadius={`Requests cooperative cancellation for ${confirmState.id}. The handler may continue if it ignores context cancellation.`}
+      confirmWord="CANCEL"
+      confirmLabel="Cancel job"
+      onConfirm={confirmCancel}
+      onCancel={() => { confirmState = null }}
+    />
+  {:else if confirmState?.kind === 'delete'}
+    <ConfirmDialog
+      title="Delete job"
+      body="Delete this job permanently?"
+      blastRadius={`Permanently deletes job ${confirmState.id}. This cannot be undone.`}
+      confirmWord="DELETE"
+      confirmLabel="Delete job"
+      onConfirm={confirmDelete}
+      onCancel={() => { confirmState = null }}
+    />
   {/if}
 </div>
 
 <style>
-  .jobs-page h2 {
-    margin-bottom: 24px;
+  .jobs-page {
+    display: grid;
+    gap: var(--sp-4);
+  }
+
+  h2 {
+    font-size: var(--fs-title);
+    line-height: var(--lh-dense);
   }
 
   .filters {
     display: flex;
-    gap: 12px;
-    margin-bottom: 20px;
+    gap: var(--sp-2);
     flex-wrap: wrap;
+    align-items: center;
   }
 
   .filters input,
   .filters select {
-    padding: 8px 12px;
-    border: 1px solid #ddd;
-    border-radius: 6px;
-    font-size: 14px;
+    min-height: 32px;
+    padding: 0 var(--sp-3);
+    border: var(--border);
+    border-radius: var(--radius-input);
+    background: var(--bg-sunken);
+    color: var(--fg-primary);
+    font-size: var(--fs-body);
   }
 
-  .filters input[type="text"] {
-    width: 150px;
+  .filters input {
+    width: 168px;
   }
 
-  .btn-search,
-  .btn-clear {
-    padding: 8px 16px;
-    border: none;
-    border-radius: 6px;
-    font-size: 14px;
+  .chip-bar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--sp-2);
+  }
+
+  .filter-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--sp-2);
+    min-height: 26px;
+    padding: 0 var(--sp-2);
+    border: var(--border);
+    border-radius: var(--radius-chip);
+    background: var(--bg-raised);
+    color: var(--fg-secondary);
+    font-family: var(--font-mono);
+    font-size: var(--fs-label);
     cursor: pointer;
   }
 
-  .btn-search {
-    background: #3b82f6;
-    color: white;
+  .table-meta {
+    color: var(--fg-secondary);
+    font-size: var(--fs-label);
   }
 
-  .btn-clear {
-    background: #6b7280;
-    color: white;
+  .error {
+    padding: var(--sp-3);
+    border: 1px solid var(--sig-danger);
+    border-radius: var(--radius-input);
+    background: var(--sig-danger-bg);
+    color: var(--sig-danger);
   }
 
-  .jobs-table {
-    width: 100%;
-    border-collapse: collapse;
-    background: white;
-    border-radius: 8px;
-    overflow: hidden;
-    box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+  .id-cell,
+  .actions {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--sp-2);
   }
 
-  .jobs-table th,
-  .jobs-table td {
-    padding: 12px 16px;
-    text-align: left;
-    border-bottom: 1px solid #eee;
-  }
-
-  .jobs-table th {
-    background: #f8f9fa;
-    font-weight: 600;
-  }
-
-  .jobs-table th.sortable {
-    cursor: pointer;
-    user-select: none;
-  }
-
-  .jobs-table th.sortable:hover {
-    background: #e9ecef;
-  }
-
-  .jobs-table tr.clickable {
-    cursor: pointer;
-  }
-
-  .jobs-table tr.clickable:hover {
-    background: #f5f7fa;
+  .id,
+  .mono {
+    font-family: var(--font-mono);
+    font-feature-settings: var(--num);
   }
 
   .id {
-    font-family: monospace;
-    font-size: 13px;
+    font-size: var(--fs-label);
   }
 
-  .status {
-    padding: 4px 8px;
-    border-radius: 4px;
-    font-size: 12px;
-    font-weight: 500;
+  .muted {
+    color: var(--fg-secondary);
+    font-family: var(--font-mono);
   }
 
-  .status-pending { background: #fef3c7; color: #92400e; }
-  .status-running { background: #dbeafe; color: #1e40af; }
-  .status-completed { background: #d1fae5; color: #065f46; }
-  .status-failed { background: #fee2e2; color: #991b1b; }
-  .status-dead-lettered { background: #3f1d1d; color: #fee2e2; }
-  .status-paused { background: #fef9c3; color: #854d0e; }
-  .status-cancelled { background: #fce7f3; color: #9d174d; }
-  .status-waiting { background: #e0e7ff; color: #3730a3; }
-  .status-retrying { background: #fff7ed; color: #9a3412; }
-
-  .actions {
-    display: flex;
-    gap: 8px;
+  .type-cell {
+    display: grid;
+    gap: var(--sp-1);
+    min-width: 180px;
   }
 
-  .btn-retry,
-  .btn-delete,
-  .btn-cancel,
-  .btn-pause,
-  .btn-resume {
-    padding: 4px 12px;
-    border: none;
-    border-radius: 4px;
-    font-size: 12px;
+  .error-peek {
+    max-width: 420px;
+    color: var(--fg-secondary);
+    font-family: var(--font-mono);
+    font-size: var(--fs-label);
+  }
+
+  .error-peek-toggle {
+    display: block;
+    max-width: 100%;
+    overflow: hidden;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    text-align: left;
+    text-overflow: ellipsis;
+    white-space: nowrap;
     cursor: pointer;
   }
 
-  .btn-retry {
-    background: #3b82f6;
-    color: white;
+  .error-peek-full {
+    display: none;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: var(--sp-2);
+    align-items: start;
+    margin-top: var(--sp-2);
+    padding: var(--sp-2);
+    border: var(--border);
+    border-radius: var(--radius-input);
+    background: var(--bg-sunken);
   }
 
-  .btn-delete {
-    background: #ef4444;
-    color: white;
+  .error-peek:hover .error-peek-full,
+  .error-peek:focus-within .error-peek-full {
+    display: grid;
   }
 
-  .btn-cancel {
-    background: #b91c1c;
-    color: white;
+  .error-peek pre {
+    margin: 0;
+    overflow: auto;
+    white-space: pre-wrap;
   }
 
-  .btn-pause {
-    background: #f59e0b;
-    color: white;
+  .status-cell {
+    display: inline-block;
   }
 
-  .btn-resume {
-    background: #10b981;
-    color: white;
+  :global(.jobs-table .flash) {
+    animation: cellFlash var(--dur-quick) var(--ease) 1;
+  }
+
+  :global(.jobs-table tr:has(.status-transition)) {
+    animation: rowSweep var(--dur-sweep) var(--ease) 1;
+  }
+
+  .overflow {
+    position: relative;
+  }
+
+  .overflow-trigger {
+    min-width: 30px;
+    min-height: 26px;
+    border: var(--border);
+    border-radius: var(--radius-input);
+    background: var(--bg-raised);
+    color: var(--fg-secondary);
+    font-family: var(--font-mono);
+    cursor: pointer;
+  }
+
+  .overflow-menu {
+    position: absolute;
+    right: 0;
+    z-index: 5;
+    display: grid;
+    gap: var(--sp-2);
+    min-width: 120px;
+    padding: var(--sp-2);
+    border: var(--border-strong);
+    border-radius: var(--radius-input);
+    background: var(--bg-raised);
+    box-shadow: var(--shadow-overlay);
   }
 
   .pagination {
     display: flex;
     justify-content: space-between;
     align-items: center;
-    margin-top: 16px;
-    color: #666;
+    gap: var(--sp-3);
+    color: var(--fg-secondary);
   }
 
   .pagination-buttons {
     display: flex;
-    gap: 8px;
+    gap: var(--sp-2);
     align-items: center;
   }
 
   .page-info {
-    padding: 0 12px;
-    font-size: 14px;
+    color: var(--fg-secondary);
+    font-family: var(--font-mono);
+    font-size: var(--fs-label);
   }
 
-  .pagination-buttons button {
-    padding: 8px 16px;
-    border: 1px solid #ddd;
-    background: white;
-    border-radius: 6px;
-    cursor: pointer;
+  @keyframes cellFlash {
+    from { background: var(--accent-ring); }
+    to { background: transparent; }
   }
 
-  .pagination-buttons button:disabled {
-    opacity: 0.5;
-    cursor: not-allowed;
+  @keyframes rowSweep {
+    from { outline: 2px solid var(--accent); outline-offset: -2px; }
+    to { outline: 2px solid transparent; outline-offset: -2px; }
   }
 
-  .loading { color: #666; }
-  .error { color: #ef4444; }
+  @media (max-width: 767px) {
+    .filters input {
+      width: 100%;
+    }
+
+    .pagination {
+      align-items: flex-start;
+      flex-direction: column;
+    }
+  }
 </style>

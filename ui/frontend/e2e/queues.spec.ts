@@ -20,11 +20,18 @@ test.describe('Queues Page', () => {
     const rows = page.locator('.queues-table tbody tr')
     await expect(rows).toHaveCount(2)
 
-    // Each row should have numeric cells
+    // .num is deliberately limited to numeric count cells; backlog-age and
+    // composition sparkline cells are non-.num data/visualization cells.
     const firstRow = rows.first()
     const cells = firstRow.locator('.num')
     const cellCount = await cells.count()
     expect(cellCount).toBeGreaterThanOrEqual(5) // pending, running, completed, failed, paused, total
+  })
+
+  test('shows honest queue telemetry columns', async ({ page }) => {
+    const firstRow = page.locator('.queues-table tbody tr').first()
+    await expect(firstRow.locator('.sparkline')).toBeVisible()
+    await expect(firstRow.locator('.data-gap')).toHaveText('—')
   })
 
   test('summary shows queue count', async ({ page }) => {
@@ -37,6 +44,11 @@ test.describe('Queues Page', () => {
     const rows = page.locator('.queues-table tbody tr')
     await expect(rows).toHaveCount(1)
     await expect(page.locator('.summary')).toContainText('1 of 2 queues')
+  })
+
+  test('clicking a queue row opens filtered jobs', async ({ page }) => {
+    await page.locator('.queues-table tbody tr', { hasText: 'emails' }).click()
+    await expect(page).toHaveURL(/#\/jobs\?queue=emails/)
   })
 
   test('pause queue button is visible', async ({ page }) => {
@@ -53,6 +65,7 @@ test.describe('Queues Page', () => {
 
     // Should now show "Paused" badge and Resume button
     await expect(page.locator('.badge-paused').first()).toBeVisible()
+    await expect(page.locator('.status-paused.badge-paused').first()).toBeVisible()
     const resumeBtn = page.locator('.btn-resume-queue').first()
     await expect(resumeBtn).toBeVisible()
 
@@ -73,5 +86,23 @@ test.describe('Queues Page', () => {
     if (count > 0) {
       await expect(purgeBtn.first()).toHaveText('Purge Failed')
     }
+  })
+
+  test('purge failed uses typed blast-radius confirmation', async ({ page }) => {
+    const defaultRow = page.locator('.queues-table tbody tr', { hasText: 'default' })
+    const failedText = await defaultRow.locator('.num').nth(3).innerText()
+    const failedCount = Number(failedText.trim())
+    // This mutates the shared e2e server. The precondition guard keeps the test
+    // explicit about requiring seeded failed jobs before it consumes them.
+    expect(failedCount).toBeGreaterThan(0)
+
+    await defaultRow.locator('.btn-purge').click()
+    const dialog = page.getByRole('dialog')
+    await expect(dialog).toBeVisible()
+    await expect(dialog).toContainText(`This permanently deletes ${failedCount} failed jobs from "default". This cannot be undone.`)
+
+    await dialog.getByRole('textbox').fill('default')
+    await dialog.getByRole('button', { name: /Purge failed/i }).click()
+    await expect(page.locator('.toast-ok').filter({ hasText: `deleted ${failedCount} failed jobs` }).first()).toBeVisible()
   })
 })

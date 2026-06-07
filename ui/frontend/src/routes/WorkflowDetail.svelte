@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte'
   import { jobsClient } from '../lib/client'
+  import StatusBadge from '../lib/components/StatusBadge.svelte'
   import WaterfallChart from '../components/WaterfallChart.svelte'
   import type { Job, FanOut } from '../lib/gen/jobs/v1/jobs_pb'
 
@@ -19,6 +20,7 @@
         root = response.root
         fanOuts = response.fanOuts
         children = response.children
+        error = null
       } else {
         error = 'Workflow not found'
       }
@@ -34,21 +36,23 @@
   }
 
   onMount(() => {
-    loadWorkflow()
+    void loadWorkflow()
+    const interval = setInterval(() => void loadWorkflow(), 5000)
+    return () => clearInterval(interval)
   })
 </script>
 
 <div class="workflow-detail">
-  <a href="#/workflows" class="back-link">&larr; Back to Workflows</a>
+  <a href="#/workflows" class="back-link">Back to Workflows</a>
 
   {#if loading}
-    <p class="loading">Loading...</p>
+    <div class="loading">Loading...</div>
   {:else if error}
-    <p class="error">{error}</p>
+    <div class="error" role="alert">{error}</div>
   {:else if root}
     <div class="header">
       <h2>{root.type}</h2>
-      <span class="status status-{root.status}">{root.status}</span>
+      <StatusBadge status={root.status} size="md" />
     </div>
 
     <WaterfallChart {root} {fanOuts} {children} onJobClick={handleJobClick} />
@@ -57,39 +61,57 @@
 
 <style>
   .workflow-detail {
-    max-width: 1200px;
+    display: grid;
+    gap: var(--sp-4);
+    max-width: none;
   }
 
   .back-link {
-    display: inline-block;
-    margin-bottom: 16px;
-    color: #3b82f6;
+    width: fit-content;
+    color: var(--accent);
+    font-family: var(--font-mono);
+    font-size: var(--fs-label);
     text-decoration: none;
+  }
+
+  .back-link::before {
+    content: "< ";
+  }
+
+  .back-link:hover,
+  .back-link:focus-visible {
+    text-decoration: underline;
   }
 
   .header {
     display: flex;
     align-items: center;
-    gap: 16px;
-    margin-bottom: 24px;
+    gap: var(--sp-3);
+    flex-wrap: wrap;
   }
 
   .header h2 {
     margin: 0;
+    color: var(--fg-primary);
+    font-size: var(--fs-title);
+    line-height: var(--lh-dense);
   }
 
-  .status {
-    padding: 6px 12px;
-    border-radius: 4px;
-    font-size: 14px;
-    font-weight: 500;
+  .loading {
+    color: var(--fg-secondary);
   }
 
-  .status-pending  { background: #fef3c7; color: #92400e; }
-  .status-running  { background: #dbeafe; color: #1e40af; }
-  .status-completed { background: #d1fae5; color: #065f46; }
-  .status-failed   { background: #fee2e2; color: #991b1b; }
+  .error {
+    padding: var(--sp-3);
+    border: 1px solid var(--sig-danger);
+    border-radius: var(--radius-input);
+    background: var(--sig-danger-bg);
+    color: var(--sig-danger);
+  }
 
-  .loading { color: #666; }
-  .error   { color: #ef4444; }
+  @media (max-width: 720px) {
+    .workflow-detail {
+      gap: var(--sp-3);
+    }
+  }
 </style>

@@ -1,137 +1,198 @@
 <script lang="ts">
-  import { onMount } from 'svelte'
+  import { onDestroy, onMount } from 'svelte'
   import { jobsClient } from '../lib/client'
+  import DataTable, { type Column } from '../lib/components/DataTable.svelte'
+  import EmptyState from '../lib/components/EmptyState.svelte'
+  import RelativeTime from '../lib/components/RelativeTime.svelte'
+  import { cronToProse } from '../lib/cron'
+  import { absolute, countdown } from '../lib/time'
+  import { toast } from '../lib/stores/toast.svelte'
+
+  type TimeValue = Date | null
+  type SortableScheduleKey = 'name' | 'schedule' | 'queue' | 'nextRun' | 'lastRun'
+  type ProtoTimestamp = { toDate?: () => Date }
 
   type ScheduledJob = {
     name: string
     schedule: string
+    scheduleProse: string
     queue: string
-    nextRun: Date | null
-    lastRun: Date | null
+    nextRun: TimeValue
+    lastRun: TimeValue
   }
+
+  const columns: Column[] = [
+    { key: 'name', label: 'Name', sortable: true },
+    { key: 'schedule', label: 'Cron', sortable: true },
+    { key: 'queue', label: 'Queue', sortable: true },
+    { key: 'nextRun', label: 'Next Run', sortable: true },
+    { key: 'lastRun', label: 'Last Run', sortable: true },
+    { key: 'health', label: 'Health' },
+  ]
 
   let scheduledJobs = $state<ScheduledJob[]>([])
   let loading = $state(true)
   let error = $state<string | null>(null)
-  let sortKey = $state<keyof ScheduledJob>('name')
+  let sortKey = $state<SortableScheduleKey>('nextRun')
   let sortDir = $state<'asc' | 'desc'>('asc')
   let filterName = $state('')
   let filterQueue = $state('')
+  let now = $state(Date.now())
+  let tickTimer: ReturnType<typeof setInterval> | null = null
+  let pollTimer: ReturnType<typeof setInterval> | null = null
 
   let filteredJobs = $derived(
-    scheduledJobs.filter(j => {
-      if (filterName && !j.name.toLowerCase().includes(filterName.toLowerCase())) return false
-      if (filterQueue && !j.queue.toLowerCase().includes(filterQueue.toLowerCase())) return false
+    scheduledJobs.filter(job => {
+      if (filterName && !job.name.toLowerCase().includes(filterName.toLowerCase())) return false
+      if (filterQueue && !job.queue.toLowerCase().includes(filterQueue.toLowerCase())) return false
       return true
     })
   )
 
   let sortedJobs = $derived(
-    filteredJobs.slice().sort((a, b) => {
-      const aVal = a[sortKey]
-      const bVal = b[sortKey]
-      if (aVal === null || aVal === undefined) return sortDir === 'asc' ? 1 : -1
-      if (bVal === null || bVal === undefined) return sortDir === 'asc' ? -1 : 1
-      if (aVal instanceof Date && bVal instanceof Date) {
-        return sortDir === 'asc' ? aVal.getTime() - bVal.getTime() : bVal.getTime() - aVal.getTime()
-      }
-      if (typeof aVal === 'string' && typeof bVal === 'string') {
-        return sortDir === 'asc' ? aVal.localeCompare(bVal) : bVal.localeCompare(aVal)
-      }
-      return 0
-    })
+    filteredJobs.slice().sort((a, b) => compareValue(sortValue(a, sortKey), sortValue(b, sortKey)))
   )
 
-  function toggleSort(key: keyof ScheduledJob) {
-    if (sortKey === key) {
+  function toDate(value: ProtoTimestamp | undefined): Date | null {
+    if (!value?.toDate) return null
+    const date = value.toDate()
+    return Number.isNaN(date.getTime()) ? null : date
+  }
+
+  function sortValue(job: ScheduledJob, key: SortableScheduleKey): string | number | null {
+    if (key === 'nextRun' || key === 'lastRun') return job[key]?.getTime() ?? null
+    return job[key]
+  }
+
+  function compareValue(aVal: string | number | null, bVal: string | number | null): number {
+    if (aVal === null) return sortDir === 'asc' ? 1 : -1
+    if (bVal === null) return sortDir === 'asc' ? -1 : 1
+    if (typeof aVal === 'string' && typeof bVal === 'string') {
+      return sortDir === 'asc' ? aVal.localeCompare(bVal) : bVal.localeCompare(aVal)
+    }
+    return sortDir === 'asc' ? Number(aVal) - Number(bVal) : Number(bVal) - Number(aVal)
+  }
+
+  function handleSort(key: string) {
+    if (!['name', 'schedule', 'queue', 'nextRun', 'lastRun'].includes(key)) return
+    const nextKey = key as SortableScheduleKey
+    if (sortKey === nextKey) {
       sortDir = sortDir === 'asc' ? 'desc' : 'asc'
     } else {
-      sortKey = key
-      sortDir = key === 'nextRun' || key === 'lastRun' ? 'asc' : 'asc'
+      sortKey = nextKey
+      sortDir = 'asc'
     }
   }
 
-  async function loadScheduledJobs() {
+  async function loadScheduledJobs(showLoading = false) {
+    if (showLoading) loading = true
+    error = null
     try {
       const response = await jobsClient.listScheduledJobs({})
-      scheduledJobs = response.jobs.map(j => ({
-        name: j.name,
-        schedule: j.schedule,
-        queue: j.queue,
-        nextRun: j.nextRun?.toDate() ?? null,
-        lastRun: j.lastRun?.toDate() ?? null,
+      scheduledJobs = response.jobs.map(job => ({
+        name: job.name,
+        schedule: job.schedule,
+        scheduleProse: cronToProse(job.schedule),
+        queue: job.queue,
+        nextRun: toDate(job.nextRun),
+        lastRun: toDate(job.lastRun),
       }))
     } catch (e) {
       error = e instanceof Error ? e.message : 'Failed to load scheduled jobs'
+      toast.push({ kind: 'err', msg: error })
     } finally {
       loading = false
     }
   }
 
+  function nextRunLabel(ts: TimeValue): string {
+    now
+    if (!ts) return '—'
+    return `${countdown(ts)} · ${absolute(ts)}`
+  }
+
   onMount(() => {
-    loadScheduledJobs()
+    loadScheduledJobs(true)
+    tickTimer = setInterval(() => {
+      now = Date.now()
+    }, 1000)
+    pollTimer = setInterval(() => {
+      loadScheduledJobs()
+    }, 5000)
+  })
+
+  onDestroy(() => {
+    if (tickTimer) clearInterval(tickTimer)
+    if (pollTimer) clearInterval(pollTimer)
   })
 </script>
 
 <div class="scheduled-page">
-  <h2>Scheduled Jobs</h2>
+  <h2>Scheduled</h2>
 
-  <div class="filters">
+  <div class="filters" aria-label="Scheduled job filters">
     <input
-      type="text"
+      name="name"
+      type="search"
       placeholder="Filter by name..."
       bind:value={filterName}
     />
     <input
-      type="text"
+      name="queue"
+      type="search"
       placeholder="Filter by queue..."
       bind:value={filterQueue}
     />
   </div>
 
-  {#if loading}
-    <p class="loading">Loading...</p>
-  {:else if error}
-    <p class="error">{error}</p>
-  {:else if scheduledJobs.length === 0}
-    <div class="empty-state">
-      <p>No scheduled jobs registered.</p>
-      <p class="hint">Use <code>queue.Schedule()</code> to register recurring jobs.</p>
-    </div>
-  {:else}
-    <table class="scheduled-table">
-      <thead>
-        <tr>
-          <th class="sortable" onclick={() => toggleSort('name')}>
-            Name {sortKey === 'name' ? (sortDir === 'asc' ? '▲' : '▼') : ''}
-          </th>
-          <th class="sortable" onclick={() => toggleSort('schedule')}>
-            Schedule {sortKey === 'schedule' ? (sortDir === 'asc' ? '▲' : '▼') : ''}
-          </th>
-          <th class="sortable" onclick={() => toggleSort('queue')}>
-            Queue {sortKey === 'queue' ? (sortDir === 'asc' ? '▲' : '▼') : ''}
-          </th>
-          <th class="sortable" onclick={() => toggleSort('nextRun')}>
-            Next Run {sortKey === 'nextRun' ? (sortDir === 'asc' ? '▲' : '▼') : ''}
-          </th>
-          <th class="sortable" onclick={() => toggleSort('lastRun')}>
-            Last Run {sortKey === 'lastRun' ? (sortDir === 'asc' ? '▲' : '▼') : ''}
-          </th>
-        </tr>
-      </thead>
-      <tbody>
-        {#each sortedJobs as job}
-          <tr>
-            <td class="job-name">{job.name}</td>
-            <td class="schedule">{job.schedule}</td>
-            <td>{job.queue}</td>
-            <td>{job.nextRun?.toLocaleString() ?? '-'}</td>
-            <td>{job.lastRun?.toLocaleString() ?? '-'}</td>
-          </tr>
-        {/each}
-      </tbody>
-    </table>
+  {#if error}
+    <div class="error" role="alert">{error}</div>
+  {/if}
 
+  {#snippet emptyState()}
+    <EmptyState
+      title={scheduledJobs.length === 0 ? 'No scheduled jobs' : 'No scheduled jobs match'}
+      hint={scheduledJobs.length === 0 ? 'Register recurring work with the queue scheduling API.' : 'Adjust the name or queue filters.'}
+      code={scheduledJobs.length === 0 ? 'queue.Schedule()' : undefined}
+    />
+  {/snippet}
+
+  {#snippet cell(job: ScheduledJob, column: Column)}
+    {#if column.key === 'name'}
+      <span class="job-name">{job.name}</span>
+    {:else if column.key === 'schedule'}
+      <div class="cron-cell">
+        <code>{job.schedule}</code>
+        <span>{job.scheduleProse}</span>
+      </div>
+    {:else if column.key === 'queue'}
+      <span class="mono">{job.queue || '—'}</span>
+    {:else if column.key === 'nextRun'}
+      <span class="time-cell">{nextRunLabel(job.nextRun)}</span>
+    {:else if column.key === 'lastRun'}
+      {#if job.lastRun}
+        <RelativeTime ts={job.lastRun} mode="both" live />
+      {:else}
+        <span class="muted">—</span>
+      {/if}
+    {:else if column.key === 'health'}
+      <span class="data-gap" title="The scheduled-jobs RPC does not expose last-run health.">—</span>
+    {/if}
+  {/snippet}
+
+  <DataTable
+    class="scheduled-table"
+    {columns}
+    rows={sortedJobs}
+    {loading}
+    rowKey={(job) => job.name}
+    sort={{ key: sortKey, dir: sortDir }}
+    onSort={handleSort}
+    {emptyState}
+    {cell}
+  />
+
+  {#if !loading && scheduledJobs.length > 0}
     <div class="summary">
       Showing {sortedJobs.length} of {scheduledJobs.length} scheduled jobs
     </div>
@@ -139,94 +200,88 @@
 </div>
 
 <style>
-  .scheduled-page h2 {
-    margin-bottom: 24px;
+  .scheduled-page {
+    display: grid;
+    gap: var(--sp-4);
+  }
+
+  h2 {
+    font-size: var(--fs-title);
+    line-height: var(--lh-dense);
   }
 
   .filters {
     display: flex;
-    gap: 12px;
-    margin-bottom: 20px;
+    gap: var(--sp-2);
+    flex-wrap: wrap;
+    align-items: center;
   }
 
   .filters input {
-    padding: 8px 12px;
-    border: 1px solid #ddd;
-    border-radius: 6px;
-    font-size: 14px;
     width: 200px;
+    min-height: 32px;
+    padding: 0 var(--sp-3);
+    border: var(--border);
+    border-radius: var(--radius-input);
+    background: var(--bg-sunken);
+    color: var(--fg-primary);
+    font-size: var(--fs-body);
   }
 
-  .scheduled-table {
-    width: 100%;
-    border-collapse: collapse;
-    background: white;
-    border-radius: 8px;
-    overflow: hidden;
-    box-shadow: 0 1px 3px rgba(0,0,0,0.1);
-  }
-
-  .scheduled-table th,
-  .scheduled-table td {
-    padding: 14px 16px;
-    text-align: left;
-    border-bottom: 1px solid #eee;
-  }
-
-  .scheduled-table th {
-    background: #f8f9fa;
-    font-weight: 600;
-  }
-
-  .scheduled-table th.sortable {
-    cursor: pointer;
-    user-select: none;
-  }
-
-  .scheduled-table th.sortable:hover {
-    background: #e9ecef;
+  .error {
+    padding: var(--sp-3);
+    border: 1px solid var(--sig-danger);
+    border-radius: var(--radius-input);
+    background: var(--sig-danger-bg);
+    color: var(--sig-danger);
   }
 
   .job-name {
-    font-weight: 500;
+    font-weight: var(--fw-head);
   }
 
-  .schedule {
-    font-family: monospace;
-    font-size: 13px;
-    color: #666;
+  .cron-cell {
+    display: grid;
+    gap: var(--sp-1);
   }
 
-  .empty-state {
-    background: white;
-    padding: 40px;
-    border-radius: 8px;
-    text-align: center;
-    box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+  .cron-cell code,
+  .mono,
+  .time-cell,
+  .muted,
+  .data-gap {
+    font-family: var(--font-mono);
+    font-feature-settings: var(--num);
   }
 
-  .empty-state p {
-    margin: 8px 0;
-    color: #666;
+  .cron-cell code {
+    width: max-content;
+    padding: 1px var(--sp-2);
+    border: var(--border);
+    border-radius: var(--radius-input);
+    background: var(--bg-sunken);
+    color: var(--fg-primary);
+    font-size: var(--fs-label);
   }
 
-  .empty-state .hint {
-    font-size: 14px;
+  .cron-cell span,
+  .muted,
+  .data-gap,
+  .summary {
+    color: var(--fg-secondary);
   }
 
-  .empty-state code {
-    background: #f5f7fa;
-    padding: 2px 6px;
-    border-radius: 4px;
-    font-size: 13px;
+  .time-cell {
+    white-space: nowrap;
   }
 
   .summary {
-    margin-top: 16px;
-    color: #666;
-    font-size: 14px;
+    font-size: var(--fs-label);
   }
 
-  .loading { color: #666; }
-  .error { color: #ef4444; }
+  @media (max-width: 767px) {
+    .filters input {
+      width: 100%;
+    }
+  }
 </style>

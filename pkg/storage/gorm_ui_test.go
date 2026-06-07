@@ -55,6 +55,32 @@ func TestSearchJobs_EscapesLikeMetacharacters(t *testing.T) {
 	assert.Equal(t, "literal-underscore-_", underscoreMatches[0].ID)
 }
 
+func TestCountActiveWorkers_CountsDistinctRunningLockHolders(t *testing.T) {
+	ctx := context.Background()
+	store := newUITestStorage(t)
+
+	count, err := store.CountActiveWorkers(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), count)
+
+	now := time.Now()
+	lockedUntil := now.Add(time.Minute)
+	jobs := []*core.Job{
+		{ID: "running-worker-1-a", Type: "work", Queue: "default", Status: core.StatusRunning, LockedBy: "worker-1", LockedUntil: &lockedUntil, CreatedAt: now},
+		{ID: "running-worker-1-b", Type: "work", Queue: "default", Status: core.StatusRunning, LockedBy: "worker-1", LockedUntil: &lockedUntil, CreatedAt: now},
+		{ID: "running-worker-2", Type: "work", Queue: "emails", Status: core.StatusRunning, LockedBy: "worker-2", LockedUntil: &lockedUntil, CreatedAt: now},
+		{ID: "running-empty-worker", Type: "work", Queue: "default", Status: core.StatusRunning, LockedBy: "", LockedUntil: &lockedUntil, CreatedAt: now},
+		{ID: "pending-worker-3", Type: "work", Queue: "default", Status: core.StatusPending, LockedBy: "worker-3", LockedUntil: &lockedUntil, CreatedAt: now},
+	}
+	for _, job := range jobs {
+		require.NoError(t, store.Enqueue(ctx, job))
+	}
+
+	count, err = store.CountActiveWorkers(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, int64(2), count)
+}
+
 func TestSearchJobs_OverlongSearchIsBounded(t *testing.T) {
 	ctx := context.Background()
 	store := newUITestStorage(t)

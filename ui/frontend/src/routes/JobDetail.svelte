@@ -1,12 +1,23 @@
 <script lang="ts">
   import { onMount } from 'svelte'
   import { jobsClient } from '../lib/client'
+  import { deltaFlash } from '../lib/actions/deltaFlash'
   import WaterfallChart from '../components/WaterfallChart.svelte'
+  import Button from '../lib/components/Button.svelte'
+  import ConfirmDialog from '../lib/components/ConfirmDialog.svelte'
+  import CopyButton from '../lib/components/CopyButton.svelte'
+  import Duration from '../lib/components/Duration.svelte'
+  import EmptyState from '../lib/components/EmptyState.svelte'
+  import RelativeTime from '../lib/components/RelativeTime.svelte'
+  import StatusBadge from '../lib/components/StatusBadge.svelte'
+  import { toast } from '../lib/stores/toast.svelte'
   import type { Job as ProtoJob, FanOut } from '../lib/gen/jobs/v1/jobs_pb'
 
   let { id, navigate }: { id: string; navigate: (path: string) => void } = $props()
 
-  let job = $state<{
+  type TimeValue = Date | null
+
+  type JobDetail = {
     id: string
     type: string
     queue: string
@@ -16,88 +27,49 @@
     maxRetries: number
     args: string
     lastError: string
-    createdAt: Date | null
-    startedAt: Date | null
-    completedAt: Date | null
-    deadLetteredAt: Date | null
+    createdAt: TimeValue
+    startedAt: TimeValue
+    completedAt: TimeValue
+    deadLetteredAt: TimeValue
     deadLetterReason: string
-  } | null>(null)
+  }
 
-  let checkpoints = $state<Array<{
+  type CheckpointItem = {
     id: string
     callIndex: number
     callType: string
     result: string
     error: string
-    createdAt: Date | null
-  }>>([])
+    createdAt: TimeValue
+  }
 
+  type ConfirmState =
+    | { kind: 'cancel'; id: string }
+    | { kind: 'delete'; id: string }
+    | null
+
+  let job = $state<JobDetail | null>(null)
+  let checkpoints = $state<CheckpointItem[]>([])
   let loading = $state(true)
   let error = $state<string | null>(null)
+  let confirmState = $state<ConfirmState>(null)
+  let expandedCheckpoints = $state<Set<string>>(new Set())
 
   let workflowRoot = $state<ProtoJob | null>(null)
   let workflowFanOuts = $state<FanOut[]>([])
   let workflowChildren = $state<ProtoJob[]>([])
 
-  async function loadWorkflow(jobData: { parentJobId?: string; rootJobId?: string; fanOutId?: string; id: string }) {
-    if (!jobData.parentJobId && !jobData.fanOutId) return
-    try {
-      const rootId = jobData.rootJobId || jobData.id
-      const response = await jobsClient.getWorkflow({ jobId: rootId })
-      if (response.root) {
-        workflowRoot = response.root
-        workflowFanOuts = response.fanOuts
-        workflowChildren = response.children
-      }
-    } catch {
-      // Silently ignore - workflow is optional
-    }
-  }
+  let mounted = false
+  let pollTimer: ReturnType<typeof setInterval> | null = null
+  let inFlight = false
 
-  async function loadJob() {
-    try {
-      const response = await jobsClient.getJob({ id })
-      if (response.job) {
-        const j = response.job
-        job = {
-          id: j.id,
-          type: j.type,
-          queue: j.queue,
-          status: j.status,
-          priority: j.priority,
-          attempt: j.attempt,
-          maxRetries: j.maxRetries,
-          args: formatJson(j.args),
-          lastError: j.lastError,
-          createdAt: j.createdAt?.toDate() ?? null,
-          startedAt: j.startedAt?.toDate() ?? null,
-          completedAt: j.completedAt?.toDate() ?? null,
-          deadLetteredAt: j.deadLetteredAt?.toDate() ?? null,
-          deadLetterReason: j.deadLetterReason,
-        }
-        checkpoints = response.checkpoints.map(cp => ({
-          id: cp.id,
-          callIndex: cp.callIndex,
-          callType: cp.callType,
-          result: formatJson(cp.result),
-          error: cp.error,
-          createdAt: cp.createdAt?.toDate() ?? null,
-        }))
-        // Check if this job is part of a workflow
-        if (j.parentJobId || j.fanOutId) {
-          loadWorkflow({
-            parentJobId: j.parentJobId ?? undefined,
-            rootJobId: j.rootJobId ?? undefined,
-            fanOutId: j.fanOutId ?? undefined,
-            id: j.id,
-          })
-        }
-      }
-    } catch (e) {
-      error = e instanceof Error ? e.message : 'Failed to load job'
-    } finally {
-      loading = false
-    }
+  let displayStatus = $derived(job?.deadLetteredAt ? 'dead-lettered' : (job?.status ?? ''))
+  let isRunning = $derived(job?.status === 'running' && !job.deadLetteredAt)
+
+  function toDate(value: { toDate?: () => Date } | undefined): Date | null {
+    if (!value?.toDate) return null
+    const date = value.toDate()
+    return Number.isNaN(date.getTime()) ? null : date
   }
 
   function formatJson(bytes: Uint8Array): string {
@@ -109,55 +81,194 @@
     }
   }
 
+  function checkpointPayload(cp: CheckpointItem): string {
+    return cp.error || cp.result || ''
+  }
+
+  function toggleCheckpoint(cpId: string) {
+    const next = new Set(expandedCheckpoints)
+    if (next.has(cpId)) {
+      next.delete(cpId)
+    } else {
+      next.add(cpId)
+    }
+    expandedCheckpoints = next
+  }
+
+  function stopPoll() {
+    if (pollTimer) clearInterval(pollTimer)
+    pollTimer = null
+  }
+
+  function reconcilePoll() {
+    if (isRunning) {
+      if (!pollTimer) {
+        pollTimer = setInterval(() => {
+          loadJob({ silent: true })
+        }, 3000)
+      }
+    } else {
+      stopPoll()
+    }
+  }
+
+  async function loadWorkflow(jobData: { parentJobId?: string; rootJobId?: string; fanOutId?: string; id: string }) {
+    if (!jobData.parentJobId && !jobData.fanOutId) {
+      workflowRoot = null
+      workflowFanOuts = []
+      workflowChildren = []
+      return
+    }
+    try {
+      const rootId = jobData.rootJobId || jobData.id
+      const response = await jobsClient.getWorkflow({ jobId: rootId })
+      if (!mounted) return
+      if (response.root) {
+        workflowRoot = response.root
+        workflowFanOuts = response.fanOuts
+        workflowChildren = response.children
+      }
+    } catch {
+      // Workflow context is optional for standalone jobs.
+    }
+  }
+
+  async function loadJob({ silent = false }: { silent?: boolean } = {}) {
+    if (inFlight) return
+    inFlight = true
+    if (!silent) {
+      loading = true
+      error = null
+    }
+    try {
+      const response = await jobsClient.getJob({ id })
+      if (!mounted) return
+      if (!response.job) {
+        job = null
+        checkpoints = []
+        error = 'Job not found'
+        return
+      }
+
+      const j = response.job
+      job = {
+        id: j.id,
+        type: j.type,
+        queue: j.queue,
+        status: j.status,
+        priority: j.priority,
+        attempt: j.attempt,
+        maxRetries: j.maxRetries,
+        args: formatJson(j.args),
+        lastError: j.lastError,
+        createdAt: toDate(j.createdAt),
+        startedAt: toDate(j.startedAt),
+        completedAt: toDate(j.completedAt),
+        deadLetteredAt: toDate(j.deadLetteredAt),
+        deadLetterReason: j.deadLetterReason,
+      }
+      checkpoints = response.checkpoints.map(cp => ({
+        id: cp.id,
+        callIndex: cp.callIndex,
+        callType: cp.callType,
+        result: formatJson(cp.result),
+        error: cp.error,
+        createdAt: toDate(cp.createdAt),
+      }))
+      expandedCheckpoints = new Set([...expandedCheckpoints].filter(cpId => checkpoints.some(cp => cp.id === cpId)))
+      error = null
+      reconcilePoll()
+      loadWorkflow({
+        parentJobId: j.parentJobId ?? undefined,
+        rootJobId: j.rootJobId ?? undefined,
+        fanOutId: j.fanOutId ?? undefined,
+        id: j.id,
+      })
+    } catch (e) {
+      if (!mounted) return
+      error = e instanceof Error ? e.message : 'Failed to load job'
+      toast.push({ kind: 'err', msg: error })
+      stopPoll()
+    } finally {
+      if (mounted) loading = false
+      inFlight = false
+    }
+  }
+
   async function retryJob() {
     try {
       await jobsClient.retryJob({ id })
+      toast.push({ kind: 'ok', msg: 'job queued for retry' })
       loadJob()
     } catch (e) {
-      alert('Failed to retry job')
+      toast.push({ kind: 'err', msg: e instanceof Error ? e.message : 'Failed to retry job' })
     }
   }
 
   async function pauseJob() {
     try {
       await jobsClient.pauseJob({ id })
+      toast.push({ kind: 'ok', msg: 'job paused' })
       loadJob()
     } catch (e) {
-      alert('Failed to pause job')
-    }
-  }
-
-  async function cancelJob() {
-    if (!confirm('Cancel this running job? This interrupts the handler cooperatively by cancelling its context; handlers that ignore context are not force-killed.')) return
-    try {
-      await jobsClient.cancelJob({ id })
-      loadJob()
-    } catch (e) {
-      alert('Failed to cancel job')
+      toast.push({ kind: 'err', msg: e instanceof Error ? e.message : 'Failed to pause job' })
     }
   }
 
   async function resumeJob() {
     try {
       await jobsClient.resumeJob({ id })
+      toast.push({ kind: 'ok', msg: 'job resumed' })
       loadJob()
     } catch (e) {
-      alert('Failed to resume job')
+      toast.push({ kind: 'err', msg: e instanceof Error ? e.message : 'Failed to resume job' })
     }
   }
 
-  async function deleteJob() {
-    if (!confirm('Are you sure you want to delete this job?')) return
+  async function confirmCancel() {
+    if (confirmState?.kind !== 'cancel') return
+    const jobId = confirmState.id
+    confirmState = null
     try {
-      await jobsClient.deleteJob({ id })
+      await jobsClient.cancelJob({ id: jobId })
+      toast.push({ kind: 'ok', msg: 'job cancellation requested' })
+      loadJob()
+    } catch (e) {
+      toast.push({ kind: 'err', msg: e instanceof Error ? e.message : 'Failed to cancel job' })
+    }
+  }
+
+  async function confirmDelete() {
+    if (confirmState?.kind !== 'delete') return
+    const jobId = confirmState.id
+    confirmState = null
+    try {
+      await jobsClient.deleteJob({ id: jobId })
+      toast.push({ kind: 'ok', msg: 'job deleted' })
       navigate('#/jobs')
     } catch (e) {
-      alert('Failed to delete job')
+      toast.push({ kind: 'err', msg: e instanceof Error ? e.message : 'Failed to delete job' })
     }
+  }
+
+  function openCancel() {
+    if (!job) return
+    confirmState = { kind: 'cancel', id: job.id }
+  }
+
+  function openDelete() {
+    if (!job) return
+    confirmState = { kind: 'delete', id: job.id }
   }
 
   onMount(() => {
+    mounted = true
     loadJob()
+
+    return () => {
+      mounted = false
+      stopPoll()
+    }
   })
 </script>
 
@@ -165,311 +276,571 @@
   <a href="#/jobs" class="back-link">&larr; Back to Jobs</a>
 
   {#if loading}
-    <p class="loading">Loading...</p>
+    <div class="detail-layout loading-layout" aria-label="Loading job detail">
+      <div class="left-pane">
+        <div class="skeleton panel-skeleton"></div>
+        <div class="skeleton panel-skeleton tall"></div>
+      </div>
+      <div class="right-pane">
+        <div class="skeleton panel-skeleton wide"></div>
+        <div class="skeleton panel-skeleton wide tall"></div>
+      </div>
+    </div>
   {:else if error}
-    <p class="error">{error}</p>
+    <div class="error-banner" role="alert">{error}</div>
+    <EmptyState title="Job unavailable" hint="The job could not be loaded from the current backend." />
   {:else if job}
     <div class="header">
-      <h2>{job.type}</h2>
-      {#if job.deadLetteredAt}
-        <span class="status status-dead-lettered">Dead-lettered</span>
-      {:else}
-        <span class="status status-{job.status}">{job.status}</span>
-      {/if}
-    </div>
-
-    <div class="meta">
-      <div class="meta-item">
-        <span class="label">ID</span>
-        <span class="value mono">{job.id}</span>
-      </div>
-      <div class="meta-item">
-        <span class="label">Queue</span>
-        <span class="value">{job.queue}</span>
-      </div>
-      <div class="meta-item">
-        <span class="label">Priority</span>
-        <span class="value">{job.priority}</span>
-      </div>
-      <div class="meta-item">
-        <span class="label">Attempts</span>
-        <span class="value">{job.attempt}/{job.maxRetries}</span>
-      </div>
-    </div>
-
-    <div class="timestamps">
-      <div class="ts-item">
-        <span class="label">Created</span>
-        <span class="value">{job.createdAt?.toLocaleString() ?? '-'}</span>
-      </div>
-      <div class="ts-item">
-        <span class="label">Started</span>
-        <span class="value">{job.startedAt?.toLocaleString() ?? '-'}</span>
-      </div>
-      <div class="ts-item">
-        <span class="label">Completed</span>
-        <span class="value">{job.completedAt?.toLocaleString() ?? '-'}</span>
-      </div>
-    </div>
-
-    {#if job.lastError}
-      <div class="error-box">
-        <h4>Last Error</h4>
-        <pre>{job.lastError}</pre>
-      </div>
-    {/if}
-
-    {#if job.deadLetteredAt}
-      <div class="dead-letter-box">
-        <h4>Dead-letter</h4>
-        <div class="dead-letter-meta">
-          <span class="label">Dead-lettered</span>
-          <span class="value">{job.deadLetteredAt.toLocaleString()}</span>
+      <div class="title-block">
+        <h2 use:deltaFlash={job.type}>{job.type || '—'}</h2>
+        <div class="header-id">
+          <span class="full-id">{job.id}</span>
+          <CopyButton text={job.id} />
         </div>
-        {#if job.deadLetterReason}
-          <pre>{job.deadLetterReason}</pre>
+      </div>
+      <StatusBadge status={displayStatus} size="md" />
+    </div>
+
+    <div class="detail-layout">
+      <div class="left-pane">
+        <section class="meta panel">
+          <div class="section-heading">Metadata</div>
+          <div class="meta-item">
+            <span class="label">ID</span>
+            <span class="value mono">{job.id}</span>
+            <CopyButton text={job.id} />
+          </div>
+          <div class="meta-item">
+            <span class="label">Queue</span>
+            <span class="value mono">{job.queue || '—'}</span>
+          </div>
+          <div class="meta-item">
+            <span class="label">Attempts/Max</span>
+            <span class="value mono" use:deltaFlash={`${job.attempt}/${job.maxRetries}`}>{job.attempt}/{job.maxRetries}</span>
+          </div>
+          <div class="meta-item">
+            <span class="label">Priority</span>
+            <span class="value mono">{job.priority}</span>
+          </div>
+          <div class="meta-item">
+            <span class="label">Worker</span>
+            <span class="value mono">—</span>
+          </div>
+        </section>
+
+        <section class="timestamps panel">
+          <div class="section-heading">Timestamps</div>
+          <div class="ts-item">
+            <span class="label">Created</span>
+            <span class="value"><RelativeTime ts={job.createdAt} mode="both" /></span>
+          </div>
+          <div class="ts-item">
+            <span class="label">Started</span>
+            <span class="value"><RelativeTime ts={job.startedAt} mode="both" /></span>
+          </div>
+          <div class="ts-item">
+            <span class="label">Completed</span>
+            <span class="value">
+              {#if job.completedAt}
+                <RelativeTime ts={job.completedAt} mode="both" />
+              {:else if job.status === 'running'}
+                <span class="running-indicator">running</span>
+              {:else}
+                <span class="muted">—</span>
+              {/if}
+            </span>
+          </div>
+          <div class="ts-item duration-row">
+            <span class="label">Wait</span>
+            <span class="value">
+              {#if job.createdAt && job.startedAt}
+                <Duration from={job.createdAt} to={job.startedAt} />
+              {:else if job.createdAt && job.status === 'pending'}
+                <Duration from={job.createdAt} />
+              {:else}
+                <span class="muted">—</span>
+              {/if}
+            </span>
+          </div>
+          <div class="ts-item duration-row">
+            <span class="label">Run</span>
+            <span class="value">
+              {#if job.startedAt}
+                <Duration from={job.startedAt} to={job.completedAt} />
+              {:else}
+                <span class="muted">—</span>
+              {/if}
+            </span>
+          </div>
+        </section>
+
+        {#if workflowRoot}
+          <section class="workflow-section panel">
+            <h4>Workflow Timeline</h4>
+            <WaterfallChart
+              root={workflowRoot}
+              fanOuts={workflowFanOuts}
+              children={workflowChildren}
+              onJobClick={(jobId) => navigate(`#/jobs/${jobId}`)}
+            />
+          </section>
         {/if}
       </div>
-    {/if}
 
-    <div class="args-box">
-      <h4>Arguments</h4>
-      <pre>{job.args}</pre>
-    </div>
+      <div class="right-pane">
+        {#if job.lastError}
+          <section class="error-box panel">
+            <div class="panel-header">
+              <h4>Last Error</h4>
+              <CopyButton text={job.lastError} />
+            </div>
+            <pre>{job.lastError}</pre>
+          </section>
+        {/if}
 
-    {#if checkpoints.length > 0}
-      <div class="checkpoints">
-        <h4>Checkpoints</h4>
-        <table>
-          <thead>
-            <tr>
-              <th>Index</th>
-              <th>Type</th>
-              <th>Result/Error</th>
-              <th>Created</th>
-            </tr>
-          </thead>
-          <tbody>
-            {#each checkpoints as cp}
-              <tr>
-                <td>{cp.callIndex}</td>
-                <td>{cp.callType}</td>
-                <td>
-                  {#if cp.error}
-                    <span class="cp-error">{cp.error}</span>
-                  {:else}
-                    <pre class="cp-result">{cp.result}</pre>
-                  {/if}
-                </td>
-                <td>{cp.createdAt?.toLocaleString() ?? '-'}</td>
-              </tr>
-            {/each}
-          </tbody>
-        </table>
+        {#if job.deadLetteredAt}
+          <section class="dead-letter-box panel">
+            <div class="panel-header">
+              <h4>Dead-letter</h4>
+              <CopyButton text={job.deadLetterReason || job.lastError} />
+            </div>
+            <div class="dead-letter-meta">
+              <span class="label">Dead-lettered</span>
+              <span class="value"><RelativeTime ts={job.deadLetteredAt} mode="both" /></span>
+            </div>
+            <pre>{job.deadLetterReason || job.lastError || '—'}</pre>
+          </section>
+        {/if}
+
+        <section class="args-box panel">
+          <div class="panel-header">
+            <h4>Arguments</h4>
+            <CopyButton text={job.args} />
+          </div>
+          <pre>{job.args || '—'}</pre>
+        </section>
+
+        {#if checkpoints.length > 0}
+          <section class="checkpoints panel">
+            <h4>Checkpoints</h4>
+            <div class="table-scroll">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Index</th>
+                    <th>Type</th>
+                    <th>Result</th>
+                    <th>Created</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {#each checkpoints as cp}
+                    <tr>
+                      <td class="mono">{cp.callIndex}</td>
+                      <td class="mono">{cp.callType || '—'}</td>
+                      <td>
+                        <div class="checkpoint-result">
+                          <button
+                            type="button"
+                            class:error-result={!!cp.error}
+                            class="checkpoint-toggle"
+                            aria-expanded={expandedCheckpoints.has(cp.id)}
+                            onclick={() => toggleCheckpoint(cp.id)}
+                          >
+                            {cp.error || cp.result || '—'}
+                          </button>
+                          <CopyButton text={checkpointPayload(cp)} />
+                          {#if expandedCheckpoints.has(cp.id)}
+                            <pre>{checkpointPayload(cp) || '—'}</pre>
+                          {/if}
+                        </div>
+                      </td>
+                      <td><RelativeTime ts={cp.createdAt} mode="both" /></td>
+                    </tr>
+                  {/each}
+                </tbody>
+              </table>
+            </div>
+          </section>
+        {/if}
+
+        <div class="actions">
+          {#if job.status === 'failed' && !job.deadLetteredAt}
+            <Button variant="secondary" class="btn-retry" onclick={retryJob}>Retry</Button>
+          {/if}
+          {#if (job.status === 'pending' || job.status === 'running') && !job.deadLetteredAt}
+            <Button variant="secondary" class="btn-pause" onclick={pauseJob}>Pause</Button>
+          {/if}
+          {#if job.status === 'running' && !job.deadLetteredAt}
+            <Button variant="destructive" class="btn-cancel" onclick={openCancel}>Cancel</Button>
+          {/if}
+          {#if job.status === 'paused' && !job.deadLetteredAt}
+            <Button variant="secondary" class="btn-resume" onclick={resumeJob}>Resume</Button>
+          {/if}
+          <Button variant="destructive" class="btn-delete" onclick={openDelete}>Delete</Button>
+        </div>
       </div>
-    {/if}
-
-    {#if workflowRoot}
-      <div class="workflow-section">
-        <h4>Workflow Timeline</h4>
-        <WaterfallChart
-          root={workflowRoot}
-          fanOuts={workflowFanOuts}
-          children={workflowChildren}
-          onJobClick={(jobId) => navigate(`#/jobs/${jobId}`)}
-        />
-      </div>
-    {/if}
-
-    <div class="actions">
-      {#if job.status === 'failed'}
-        <button class="btn-retry" onclick={retryJob}>Retry Job</button>
-      {/if}
-      {#if job.status === 'pending' || job.status === 'running'}
-        <button class="btn-pause" onclick={pauseJob}>Pause Job</button>
-      {/if}
-      {#if job.status === 'running'}
-        <button class="btn-cancel" onclick={cancelJob}>Cancel Job</button>
-      {/if}
-      {#if job.status === 'paused'}
-        <button class="btn-resume" onclick={resumeJob}>Resume Job</button>
-      {/if}
-      <button class="btn-delete" onclick={deleteJob}>Delete Job</button>
     </div>
+  {/if}
+
+  {#if confirmState?.kind === 'cancel'}
+    <ConfirmDialog
+      title="Cancel running job"
+      body="Cancel this running job? This interrupts the handler cooperatively by cancelling its context; handlers that ignore context are not force-killed."
+      blastRadius={`Requests cooperative cancellation for ${confirmState.id}. The handler may continue if it ignores context cancellation.`}
+      confirmWord="CANCEL"
+      confirmLabel="Cancel job"
+      onConfirm={confirmCancel}
+      onCancel={() => { confirmState = null }}
+    />
+  {:else if confirmState?.kind === 'delete'}
+    <ConfirmDialog
+      title="Delete job"
+      body="Delete this job permanently?"
+      blastRadius={`Permanently deletes job ${confirmState.id}. This cannot be undone.`}
+      confirmWord="DELETE"
+      confirmLabel="Delete job"
+      onConfirm={confirmDelete}
+      onCancel={() => { confirmState = null }}
+    />
   {/if}
 </div>
 
 <style>
   .job-detail {
-    max-width: 900px;
+    display: grid;
+    gap: var(--sp-4);
+    min-width: 0;
   }
 
   .back-link {
-    display: inline-block;
-    margin-bottom: 16px;
-    color: #3b82f6;
+    width: fit-content;
+    color: var(--accent);
+    font-size: var(--fs-body);
     text-decoration: none;
+  }
+
+  .back-link:hover {
+    color: var(--fg-primary);
   }
 
   .header {
     display: flex;
-    align-items: center;
-    gap: 16px;
-    margin-bottom: 24px;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: var(--sp-4);
+    padding-bottom: var(--sp-4);
+    border-bottom: var(--border-strong);
+  }
+
+  .title-block {
+    display: grid;
+    gap: var(--sp-2);
+    min-width: 0;
   }
 
   .header h2 {
     margin: 0;
+    color: var(--fg-primary);
+    font-size: var(--fs-title);
+    line-height: var(--lh-dense);
   }
 
-  .status {
-    padding: 6px 12px;
-    border-radius: 4px;
-    font-size: 14px;
-    font-weight: 500;
-  }
-
-  .status-pending { background: #fef3c7; color: #92400e; }
-  .status-running { background: #dbeafe; color: #1e40af; }
-  .status-completed { background: #d1fae5; color: #065f46; }
-  .status-failed { background: #fee2e2; color: #991b1b; }
-  .status-dead-lettered { background: #3f1d1d; color: #fee2e2; }
-  .status-paused { background: #fef9c3; color: #854d0e; }
-  .status-cancelled { background: #fce7f3; color: #9d174d; }
-  .status-waiting { background: #e0e7ff; color: #3730a3; }
-  .status-retrying { background: #fff7ed; color: #9a3412; }
-
-  .meta, .timestamps {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-    gap: 16px;
-    margin-bottom: 24px;
-    background: white;
-    padding: 20px;
-    border-radius: 8px;
-    box-shadow: 0 1px 3px rgba(0,0,0,0.1);
-  }
-
-  .meta-item, .ts-item {
+  .header-id,
+  .meta-item {
     display: flex;
-    flex-direction: column;
-    gap: 4px;
+    align-items: center;
+    gap: var(--sp-2);
+    min-width: 0;
+  }
+
+  .full-id,
+  .mono {
+    font-family: var(--font-mono);
+    font-feature-settings: var(--num);
+  }
+
+  .full-id {
+    overflow-wrap: anywhere;
+    color: var(--fg-secondary);
+    font-size: var(--fs-label);
+  }
+
+  .detail-layout {
+    display: grid;
+    grid-template-columns: minmax(280px, 360px) minmax(0, 1fr);
+    gap: var(--sp-4);
+    align-items: start;
+  }
+
+  .left-pane,
+  .right-pane {
+    display: grid;
+    gap: var(--sp-4);
+    min-width: 0;
+  }
+
+  .left-pane {
+    position: sticky;
+    top: var(--sp-4);
+  }
+
+  .panel {
+    padding: var(--sp-4);
+    border: var(--border);
+    border-radius: var(--radius-panel);
+    background: var(--bg-raised);
+    box-shadow: inset 0 1px 0 var(--inset-sheen);
+  }
+
+  .section-heading,
+  .panel-header h4,
+  .checkpoints h4,
+  .workflow-section h4 {
+    margin: 0;
+    color: var(--fg-secondary);
+    font-size: var(--fs-label);
+    font-weight: var(--fw-head);
+  }
+
+  .meta,
+  .timestamps {
+    display: grid;
+    gap: var(--sp-3);
+  }
+
+  .meta-item,
+  .ts-item {
+    display: grid;
+    grid-template-columns: 104px minmax(0, 1fr) auto;
+    gap: var(--sp-2);
+    align-items: center;
+  }
+
+  .ts-item {
+    grid-template-columns: 104px minmax(0, 1fr);
   }
 
   .label {
-    font-size: 12px;
-    color: #666;
+    color: var(--fg-secondary);
+    font-size: var(--fs-label);
+    line-height: var(--lh-dense);
     text-transform: uppercase;
   }
 
   .value {
-    font-size: 16px;
-    font-weight: 500;
+    min-width: 0;
+    color: var(--fg-primary);
+    font-size: var(--fs-body);
+    overflow-wrap: anywhere;
   }
 
-  .mono {
-    font-family: monospace;
-    font-size: 14px;
+  .muted {
+    color: var(--fg-secondary);
+    font-family: var(--font-mono);
   }
 
-  .error-box, .dead-letter-box, .args-box, .checkpoints {
-    background: white;
-    padding: 20px;
-    border-radius: 8px;
-    box-shadow: 0 1px 3px rgba(0,0,0,0.1);
-    margin-bottom: 24px;
+  .running-indicator {
+    color: var(--sig-info);
+    font-family: var(--font-mono);
+    font-feature-settings: var(--num);
+  }
+
+  .duration-row .label {
+    color: var(--fg-primary);
+  }
+
+  .panel-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--sp-3);
+    margin-bottom: var(--sp-3);
   }
 
   .error-box {
-    border-left: 4px solid #ef4444;
+    border-left: 4px solid var(--sig-danger);
   }
 
   .dead-letter-box {
-    border-left: 4px solid #3f1d1d;
+    border: 2px dashed var(--sig-danger);
+    background: var(--sig-danger-bg);
   }
 
   .dead-letter-meta {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-    margin-bottom: 12px;
-  }
-
-  .error-box h4, .dead-letter-box h4, .args-box h4, .checkpoints h4 {
-    margin: 0 0 12px;
-    font-size: 14px;
-    color: #666;
+    display: grid;
+    grid-template-columns: 112px minmax(0, 1fr);
+    gap: var(--sp-2);
+    align-items: center;
+    margin-bottom: var(--sp-3);
   }
 
   pre {
-    background: #f5f7fa;
-    padding: 12px;
-    border-radius: 4px;
-    overflow-x: auto;
-    font-size: 13px;
     margin: 0;
+    padding: var(--sp-3);
+    border: var(--border);
+    border-radius: var(--radius-input);
+    background: var(--bg-sunken);
+    color: var(--fg-primary);
+    font-family: var(--font-mono);
+    font-size: var(--fs-label);
+    font-feature-settings: var(--num);
+    line-height: var(--lh-prose);
+    overflow-wrap: anywhere;
+    white-space: pre-wrap;
+  }
+
+  .error-box pre {
+    color: var(--sig-danger);
+  }
+
+  .table-scroll {
+    overflow-x: auto;
+  }
+
+  .checkpoints {
+    display: grid;
+    gap: var(--sp-3);
   }
 
   .checkpoints table {
     width: 100%;
+    min-width: 680px;
     border-collapse: collapse;
   }
 
   .checkpoints th,
   .checkpoints td {
-    padding: 8px 12px;
+    padding: var(--sp-2) var(--sp-3);
+    border-bottom: var(--border);
     text-align: left;
-    border-bottom: 1px solid #eee;
+    vertical-align: top;
   }
 
   .checkpoints th {
-    font-weight: 600;
-    font-size: 12px;
-    color: #666;
+    color: var(--fg-secondary);
+    font-size: var(--fs-label);
+    font-weight: var(--fw-head);
   }
 
-  .cp-error {
-    color: #ef4444;
+  .checkpoint-result {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: var(--sp-2);
+    align-items: start;
   }
 
-  .cp-result {
-    font-size: 12px;
-    max-width: 300px;
+  .checkpoint-result pre {
+    grid-column: 1 / -1;
+  }
+
+  .checkpoint-toggle {
     overflow: hidden;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    color: var(--fg-primary);
+    font-family: var(--font-mono);
+    font-size: var(--fs-label);
+    font-feature-settings: var(--num);
+    text-align: left;
     text-overflow: ellipsis;
     white-space: nowrap;
+    cursor: pointer;
+  }
+
+  .checkpoint-toggle:hover,
+  .checkpoint-toggle:focus-visible {
+    color: var(--accent);
+  }
+
+  .checkpoint-toggle.error-result {
+    color: var(--sig-danger);
   }
 
   .actions {
     display: flex;
-    gap: 12px;
-    margin-top: 24px;
+    flex-wrap: wrap;
+    gap: var(--sp-2);
+    justify-content: flex-end;
   }
-
-  .btn-retry, .btn-delete, .btn-pause, .btn-resume, .btn-cancel {
-    padding: 10px 20px;
-    border: none;
-    border-radius: 6px;
-    font-size: 14px;
-    cursor: pointer;
-  }
-
-  .btn-retry { background: #3b82f6; color: white; }
-  .btn-delete { background: #ef4444; color: white; }
-  .btn-pause { background: #f59e0b; color: white; }
-  .btn-resume { background: #10b981; color: white; }
-  .btn-cancel { background: #b91c1c; color: white; }
 
   .workflow-section {
-    margin-bottom: 24px;
+    min-width: 0;
   }
 
   .workflow-section h4 {
-    margin: 0 0 12px;
-    font-size: 14px;
-    color: #666;
+    margin-bottom: var(--sp-3);
   }
 
-  .loading { color: #666; }
-  .error { color: #ef4444; }
+  .error-banner {
+    padding: var(--sp-3);
+    border: 1px solid var(--sig-danger);
+    border-radius: var(--radius-input);
+    background: var(--sig-danger-bg);
+    color: var(--sig-danger);
+  }
+
+  .loading-layout {
+    min-height: 360px;
+  }
+
+  .skeleton {
+    border: var(--border);
+    border-radius: var(--radius-panel);
+    background:
+      linear-gradient(90deg, transparent, color-mix(in srgb, var(--fg-secondary) 12%, transparent), transparent),
+      var(--bg-raised);
+    background-size: 220px 100%, 100% 100%;
+    animation: skeletonSweep 1200ms linear infinite;
+    box-shadow: inset 0 1px 0 var(--inset-sheen);
+  }
+
+  .panel-skeleton {
+    height: 180px;
+  }
+
+  .panel-skeleton.tall {
+    height: 260px;
+  }
+
+  .panel-skeleton.wide {
+    height: 220px;
+  }
+
+  :global(.job-detail .flash) {
+    animation: cellFlash var(--dur-quick) var(--ease) 1;
+  }
+
+  @keyframes skeletonSweep {
+    from { background-position: -220px 0, 0 0; }
+    to { background-position: calc(100% + 220px) 0, 0 0; }
+  }
+
+  @keyframes cellFlash {
+    from { background: var(--accent-ring); }
+    to { background: transparent; }
+  }
+
+  @media (max-width: 720px) {
+    .header,
+    .actions {
+      align-items: flex-start;
+      flex-direction: column;
+    }
+
+    .detail-layout {
+      grid-template-columns: 1fr;
+    }
+
+    .left-pane {
+      position: static;
+    }
+
+    .meta-item,
+    .ts-item,
+    .dead-letter-meta {
+      grid-template-columns: 1fr;
+    }
+  }
 </style>

@@ -78,6 +78,17 @@ func (s *GormStorage) GetQueueDepthStats(ctx context.Context) ([]*jobsv1.QueueSt
 	return result, nil
 }
 
+// CountActiveWorkers returns distinct workers currently holding running jobs.
+func (s *GormStorage) CountActiveWorkers(ctx context.Context) (int64, error) {
+	var count int64
+	err := s.db.WithContext(ctx).
+		Model(&core.Job{}).
+		Where("status = ? AND locked_by <> ?", core.StatusRunning, "").
+		Select("COUNT(DISTINCT locked_by)").
+		Count(&count).Error
+	return count, err
+}
+
 // SearchJobs returns jobs matching the filter with pagination and total count.
 func (s *GormStorage) SearchJobs(ctx context.Context, filter core.JobFilter) ([]*core.Job, int64, error) {
 	q := s.db.WithContext(ctx).Model(&core.Job{})

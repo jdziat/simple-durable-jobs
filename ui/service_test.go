@@ -260,6 +260,18 @@ func (m *mockUIStorage) GetWorkflowRoots(ctx context.Context, status string, lim
 // Verify the interface is satisfied at compile time.
 var _ UIStorage = (*mockUIStorage)(nil)
 
+type mockActiveWorkersStorage struct {
+	mockStorage
+	countActiveWorkersFn func(ctx context.Context) (int64, error)
+}
+
+func (m *mockActiveWorkersStorage) CountActiveWorkers(ctx context.Context) (int64, error) {
+	if m.countActiveWorkersFn != nil {
+		return m.countActiveWorkersFn(ctx)
+	}
+	return 0, nil
+}
+
 type mockWorkflowBatchStorage struct {
 	mockStorage
 	getFanOutsByParentsFn func(ctx context.Context, parentIDs []string) ([]*core.FanOut, error)
@@ -678,6 +690,112 @@ func TestGetStats_TotalsAggregatedAcrossQueues(t *testing.T) {
 	assert.Equal(t, int64(1), resp.Msg.TotalRunning)
 	assert.Equal(t, int64(7), resp.Msg.TotalCompleted)
 	assert.Equal(t, int64(2), resp.Msg.TotalFailed)
+}
+
+func TestGetStats_ActiveWorkersCapabilityPresent(t *testing.T) {
+	jobs := []*core.Job{
+		sampleJob("j1", "emails", "send", core.StatusPending),
+		sampleJob("j2", "emails", "send", core.StatusRunning),
+	}
+	store := &mockActiveWorkersStorage{
+		mockStorage: mockStorage{
+			getJobsByStatusFn: func(_ context.Context, status core.JobStatus, _ int) ([]*core.Job, error) {
+				switch status {
+				case core.StatusPending:
+					return jobs[:1], nil
+				case core.StatusRunning:
+					return jobs[1:], nil
+				default:
+					return nil, nil
+				}
+			},
+		},
+		countActiveWorkersFn: func(_ context.Context) (int64, error) {
+			return 2, nil
+		},
+	}
+	svc := newJobsService(store, nil, nil)
+
+	resp, err := svc.GetStats(context.Background(), connect.NewRequest(&jobsv1.GetStatsRequest{}))
+	require.NoError(t, err)
+	assert.Equal(t, int32(2), resp.Msg.ActiveWorkers)
+	assert.Equal(t, int64(1), resp.Msg.TotalPending)
+	assert.Equal(t, int64(1), resp.Msg.TotalRunning)
+	require.Len(t, resp.Msg.Queues, 1)
+	assert.Equal(t, "emails", resp.Msg.Queues[0].Name)
+}
+
+func TestGetStats_ActiveWorkersCapabilityAbsent(t *testing.T) {
+	store := &mockStorage{
+		getJobsByStatusFn: func(_ context.Context, status core.JobStatus, _ int) ([]*core.Job, error) {
+			if status == core.StatusPending {
+				return []*core.Job{sampleJob("j1", "default", "work", core.StatusPending)}, nil
+			}
+			return nil, nil
+		},
+	}
+	svc := newServiceWithBaseStorage(store)
+
+	resp, err := svc.GetStats(context.Background(), connect.NewRequest(&jobsv1.GetStatsRequest{}))
+	require.NoError(t, err)
+	assert.Equal(t, int32(0), resp.Msg.ActiveWorkers)
+	assert.Equal(t, int64(1), resp.Msg.TotalPending)
+}
+
+func TestGetStats_ActiveWorkersError(t *testing.T) {
+	// The queue-stats phase runs first and is a no-op here (no
+	// getJobsByStatusFn set -> nil, nil), so the asserted error is
+	// unambiguously from the ActiveWorkers branch.
+	store := &mockActiveWorkersStorage{
+		countActiveWorkersFn: func(_ context.Context) (int64, error) {
+			return 0, errors.New("worker count failed")
+		},
+	}
+	svc := newJobsService(store, nil, nil)
+
+	resp, err := svc.GetStats(context.Background(), connect.NewRequest(&jobsv1.GetStatsRequest{}))
+	require.Error(t, err)
+	assert.Nil(t, resp)
+	assert.Equal(t, connect.CodeInternal, connect.CodeOf(err))
+}
+
+func TestGetStats_ActiveWorkersClampsToInt32Max(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		count int64
+	}{
+		// exact max passes through the else branch unclamped (the clamp is a
+		// strict >); above max exercises the clamp. Both land on int32 max.
+		{name: "exact max", count: maxInt32Value},
+		{name: "above max", count: maxInt32Value + 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &mockActiveWorkersStorage{
+				countActiveWorkersFn: func(_ context.Context) (int64, error) {
+					return tc.count, nil
+				},
+			}
+			svc := newJobsService(store, nil, nil)
+
+			resp, err := svc.GetStats(context.Background(), connect.NewRequest(&jobsv1.GetStatsRequest{}))
+			require.NoError(t, err)
+			assert.Equal(t, int32(maxInt32Value), resp.Msg.ActiveWorkers)
+		})
+	}
+}
+
+func TestGetStats_ActiveWorkersNegativeCountPassesThrough(t *testing.T) {
+	store := &mockActiveWorkersStorage{
+		countActiveWorkersFn: func(_ context.Context) (int64, error) {
+			return -5, nil
+		},
+	}
+	svc := newJobsService(store, nil, nil)
+
+	resp, err := svc.GetStats(context.Background(), connect.NewRequest(&jobsv1.GetStatsRequest{}))
+	require.NoError(t, err)
+	// The storage query cannot produce negatives; current service behavior only clamps the upper bound.
+	assert.Equal(t, int32(-5), resp.Msg.ActiveWorkers)
 }
 
 // ---------------------------------------------------------------------------

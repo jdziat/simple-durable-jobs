@@ -1,13 +1,30 @@
 import { test, expect } from '@playwright/test'
 
 test.describe('Navigation', () => {
-  test('sidebar shows app title', async ({ page }) => {
+  test('ticker shows app identity', async ({ page }) => {
     await page.goto('/')
-    await expect(page.locator('.logo h1')).toHaveText('Jobs UI')
+    await expect(page.locator('.app-identity')).toHaveText('Durable Jobs')
+    await expect(page).toHaveTitle('Durable Jobs')
   })
 
-  test('sidebar has all navigation links', async ({ page }) => {
+  test('dark theme actually paints dark', async ({ page }) => {
+    // Regression guard: a CSS cascade tie once made the light palette win
+    // under data-theme="dark", rendering the hero theme as a white page.
+    // Assert the COMPUTED background, not just the attribute. A dark system
+    // preference must boot dark (first visit honors prefers-color-scheme).
+    await page.emulateMedia({ colorScheme: 'dark' })
     await page.goto('/')
+    await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark')
+    const bg = await page.evaluate(
+      () => getComputedStyle(document.body).backgroundColor
+    )
+    expect(bg).toBe('rgb(11, 14, 20)') // --bg-base #0B0E14 (dark)
+  })
+
+  test('nav rail has all navigation links', async ({ page }) => {
+    await page.goto('/')
+    await expect(page.getByRole('navigation', { name: 'Primary' })).toBeVisible()
+    await expect(page.locator('.nav-rail')).toBeVisible()
     const nav = page.locator('.nav-links')
     await expect(nav.getByRole('link', { name: 'Dashboard' })).toBeVisible()
     await expect(nav.getByRole('link', { name: 'Jobs' })).toBeVisible()
