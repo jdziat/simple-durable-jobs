@@ -28,6 +28,11 @@ type fakeSignalStore struct {
 	checkpointsErr error
 	suspended      int
 	waitDur        time.Duration
+	// onCheckpoint models the in-tx checkpoint write of ConsumeSignalTx/
+	// DrainSignalsTx. Returning an error models a checkpoint-write failure that
+	// rolls back the consume (the signal is restored). Wired by buildCtx to the
+	// same recorder that jc.SaveCheckpoint funnels into.
+	onCheckpoint func(*core.Checkpoint) error
 }
 
 func (f *fakeSignalStore) SendSignal(_ context.Context, _, name string, payload []byte) error {
@@ -48,19 +53,39 @@ func (f *fakeSignalStore) PeekSignal(_ context.Context, _, name string) (*core.S
 	return nil, nil
 }
 
-func (f *fakeSignalStore) ConsumeSignal(_ context.Context, _, name string) (*core.Signal, error) {
+// ConsumeSignalTx models the atomic consume+checkpoint primitive: it removes the
+// oldest pending signal of name, invokes buildCheckpoint, and writes the
+// checkpoint via onCheckpoint. If either the build or the write fails, the signal
+// is restored at its original position (the tx rolled back) and the error is
+// returned, leaving nothing consumed and no checkpoint recorded.
+func (f *fakeSignalStore) ConsumeSignalTx(_ context.Context, _, name string, buildCheckpoint func(sig *core.Signal) (*core.Checkpoint, error)) (*core.Signal, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	for i, s := range f.pending {
 		if s.Name == name {
 			f.pending = append(f.pending[:i], f.pending[i+1:]...)
+			cp, err := buildCheckpoint(s)
+			if err != nil {
+				f.restoreAt(i, s)
+				return nil, err
+			}
+			if cp != nil && f.onCheckpoint != nil {
+				if err := f.onCheckpoint(cp); err != nil {
+					f.restoreAt(i, s)
+					return nil, err
+				}
+			}
 			return s, nil
 		}
 	}
 	return nil, nil
 }
 
-func (f *fakeSignalStore) DrainSignals(_ context.Context, _, name string) ([]*core.Signal, error) {
+// DrainSignalsTx models the atomic drain+checkpoint primitive: it removes all
+// pending signals of name, ALWAYS invokes buildCheckpoint (even for an empty
+// batch), and writes the checkpoint via onCheckpoint. On any error the drained
+// signals are restored (the tx rolled back) and nothing is consumed.
+func (f *fakeSignalStore) DrainSignalsTx(_ context.Context, _, name string, buildCheckpoint func(sigs []*core.Signal) (*core.Checkpoint, error)) ([]*core.Signal, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	var out, rest []*core.Signal
@@ -72,7 +97,26 @@ func (f *fakeSignalStore) DrainSignals(_ context.Context, _, name string) ([]*co
 		}
 	}
 	f.pending = rest
+	cp, err := buildCheckpoint(out)
+	if err != nil {
+		f.pending = append(out, f.pending...)
+		return nil, err
+	}
+	if cp != nil && f.onCheckpoint != nil {
+		if err := f.onCheckpoint(cp); err != nil {
+			f.pending = append(out, f.pending...)
+			return nil, err
+		}
+	}
 	return out, nil
+}
+
+// restoreAt re-inserts sig at index i of the pending slice, undoing a consume.
+func (f *fakeSignalStore) restoreAt(i int, sig *core.Signal) {
+	if i < 0 || i > len(f.pending) {
+		i = len(f.pending)
+	}
+	f.pending = append(f.pending[:i], append([]*core.Signal{sig}, f.pending[i:]...)...)
 }
 
 func (f *fakeSignalStore) SuspendJob(_ context.Context, _, _ string) error {
@@ -126,6 +170,17 @@ func buildCtx(store core.Storage, rec *recorder, seed []core.Checkpoint) context
 			rec.cps[intctx.CheckpointKey{Index: cp.CallIndex, Type: cp.CallType}] = cp
 			return nil
 		},
+	}
+	// Funnel the atomic-path checkpoints (written inside ConsumeSignalTx/
+	// DrainSignalsTx via onCheckpoint) into the SAME recorder as jc.SaveCheckpoint,
+	// so every test that seeds replay from rec.list() keeps working unchanged.
+	if fs, ok := store.(*fakeSignalStore); ok {
+		fs.onCheckpoint = func(cp *core.Checkpoint) error {
+			rec.mu.Lock()
+			defer rec.mu.Unlock()
+			rec.cps[intctx.CheckpointKey{Index: cp.CallIndex, Type: cp.CallType}] = cp
+			return nil
+		}
 	}
 	ctx := intctx.WithJobContext(context.Background(), jc)
 	return intctx.WithCallState(ctx, seed)
@@ -212,6 +267,53 @@ func TestDrainSignals_FIFO(t *testing.T) {
 	got2, err := signal.DrainSignals[string](buildCtx(store, rec, rec.list()), "ctx")
 	require.NoError(t, err)
 	assert.Equal(t, []string{"a", "b", "c"}, got2)
+}
+
+func TestWaitForSignal_AtomicConsumeRollsBackOnCheckpointFailure(t *testing.T) {
+	store := &fakeSignalStore{}
+	send(store, "ctx", "hello")
+	rec := newRecorder()
+
+	// First attempt: the in-tx checkpoint write fails. The atomic primitive must
+	// roll back the consume — exactly the wedge the old two-tx code caused, here
+	// proven prevented.
+	ctx := buildCtx(store, rec, nil)
+	store.onCheckpoint = func(*core.Checkpoint) error { return errors.New("boom") }
+	_, err := signal.WaitForSignal[string](ctx, "ctx")
+	require.Error(t, err)
+	assert.False(t, core.IsWaiting(err), "checkpoint failure is a hard error, not a self-suspend")
+	assert.Len(t, store.pending, 1, "consume rolled back: the signal is still pending")
+	assert.Equal(t, 0, store.suspended, "must not suspend on checkpoint failure")
+
+	// Second attempt: the checkpoint now succeeds. The signal is consumed and the
+	// payload returned.
+	rec2 := newRecorder()
+	got, err := signal.WaitForSignal[string](buildCtx(store, rec2, nil), "ctx")
+	require.NoError(t, err)
+	assert.Equal(t, "hello", got)
+	assert.Empty(t, store.pending, "signal consumed once the checkpoint commits")
+}
+
+func TestDrainSignals_AtomicConsumeRollsBackOnCheckpointFailure(t *testing.T) {
+	store := &fakeSignalStore{}
+	for _, v := range []string{"a", "b", "c"} {
+		send(store, "ctx", v)
+	}
+	rec := newRecorder()
+
+	// Checkpoint write fails → the whole drain rolls back, all signals remain.
+	ctx := buildCtx(store, rec, nil)
+	store.onCheckpoint = func(*core.Checkpoint) error { return errors.New("boom") }
+	_, err := signal.DrainSignals[string](ctx, "ctx")
+	require.Error(t, err)
+	assert.Len(t, store.pending, 3, "drain rolled back: all signals still pending")
+
+	// Success path: drains and checkpoints.
+	rec2 := newRecorder()
+	got, err := signal.DrainSignals[string](buildCtx(store, rec2, nil), "ctx")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"a", "b", "c"}, got)
+	assert.Empty(t, store.pending, "all consumed once the checkpoint commits")
 }
 
 func TestWaitForSignalTimeout_PresentReturnsValue(t *testing.T) {

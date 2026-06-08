@@ -40,10 +40,12 @@ const (
 	metricJobWaitDuration = "jobs.wait.duration"
 	metricJobRunDuration  = "jobs.run.duration"
 	metricQueueDepth      = "jobs.queue.depth"
+	metricLeasesReclaimed = "jobs.leases.reclaimed"
 
 	attrQueue   = "queue"
 	attrJobType = "job.type"
 	attrOutcome = "outcome"
+	attrReason  = "reason"
 
 	outcomeStarted   = "started"
 	outcomeCompleted = "completed"
@@ -94,6 +96,7 @@ func Instrument(q *queue.Queue, opts ...InstrumentOption) {
 	q.OnJobComplete(completeHook(inst))
 	q.OnJobFail(failHook(inst))
 	q.OnRetry(retryHook(inst))
+	q.OnJobReclaimed(reclaimHook(inst))
 }
 
 // NewPrometheusHandler creates a Prometheus scrape handler and a MeterProvider
@@ -114,6 +117,7 @@ type instruments struct {
 	completed   metric.Int64Counter
 	failed      metric.Int64Counter
 	retried     metric.Int64Counter
+	reclaimed   metric.Int64Counter
 	waitSeconds metric.Float64Histogram
 	runSeconds  metric.Float64Histogram
 }
@@ -155,11 +159,18 @@ func newInstruments(meter metric.Meter) (*instruments, error) {
 	if err != nil {
 		return nil, err
 	}
+	reclaimed, err := meter.Int64Counter(metricLeasesReclaimed,
+		metric.WithUnit("{job}"),
+		metric.WithDescription("Job leases reclaimed from a presumed-dead owner (stale-lock reaper) or observed reclaimed by a peer (ownership audit)."))
+	if err != nil {
+		return nil, err
+	}
 	return &instruments{
 		started:     started,
 		completed:   completed,
 		failed:      failed,
 		retried:     retried,
+		reclaimed:   reclaimed,
 		waitSeconds: waitSeconds,
 		runSeconds:  runSeconds,
 	}, nil
@@ -195,6 +206,12 @@ func retryHook(inst *instruments) func(context.Context, *core.Job, int, error) {
 	return func(ctx context.Context, job *core.Job, _ int, _ error) {
 		attrs := jobAttributes(job, outcomeRetried)
 		inst.retried.Add(ctx, 1, metric.WithAttributes(attrs...))
+	}
+}
+
+func reclaimHook(inst *instruments) func(context.Context, string, string) {
+	return func(ctx context.Context, _ string, reason string) {
+		inst.reclaimed.Add(ctx, 1, metric.WithAttributes(attribute.String(attrReason, reason)))
 	}
 }
 

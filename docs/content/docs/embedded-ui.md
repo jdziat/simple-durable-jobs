@@ -184,7 +184,7 @@ When the stats collector is active (requires `WithQueue` and a GORM-backed stora
 
 ### Real-Time Events
 
-The dashboard uses server-streaming to display job events as they happen. Events include job started, completed, failed, retrying, paused, resumed, and queue/worker pause/resume notifications. Events can be filtered by queue.
+The dashboard uses server-streaming to display job events as they happen. Events include job started, completed, failed, retrying, paused, resumed, reclaimed (`job.reclaimed`, emitted when a stale lock is reclaimed by the reaper or an ownership audit), and queue/worker pause/resume notifications. Most events carry the full job record; the `job.reclaimed` event instead carries a job ID, worker ID, and reason (proto `Event` fields 5/6/7), where the reason is `stale_lock` (reaper) or `ownership_audit`. Events can be filtered by queue.
 
 ## Stats Collector
 

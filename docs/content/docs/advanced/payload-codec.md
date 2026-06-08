@@ -6,7 +6,14 @@ toc: true
 
 Simple Durable Jobs can transform payload bytes before they are written to the
 database. This is useful for encrypting job arguments, job results, checkpoint
-results, and signal payloads at rest without changing handler code.
+results, signal payloads, and handler error text (`last_error` and the
+`dead_letter_reason` suffix) at rest without changing handler code.
+
+Error text is encrypted selectively: the fixed `dead_letter_reason` label
+(for example `"max retries exhausted: "`) is non-PII and stays plaintext, so the
+SQL that distinguishes exhausted-retry from non-retryable failures keeps working;
+only the error suffix is encrypted. Under the default `IdentityCodec` the error
+text is stored verbatim, with no transformation.
 
 ## Interface
 
@@ -82,3 +89,12 @@ Codec-encoded payloads are opaque to database-side filtering and inspection.
 The dashboard and application APIs still receive decoded plaintext because they
 read through the storage layer, but direct SQL queries see ciphertext for
 encoded rows.
+
+This applies to the two error TEXT columns (`last_error` and
+`dead_letter_reason`) as well. Because Secretbox output contains NUL and
+non-UTF8 bytes that a TEXT column cannot store directly, the encrypted segment
+is base64-encoded behind an `sdjenc:` tag — for example
+`max retries exhausted: sdjenc:<base64-ciphertext>`. The plaintext label before
+the tag is preserved; the suffix after it is the encoded error. Storage decodes
+these columns transparently on readback, so the dashboard and APIs show the
+original error text, but direct SQL queries see the tagged base64 form.

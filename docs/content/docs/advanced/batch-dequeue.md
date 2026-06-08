@@ -17,7 +17,7 @@ w := q.NewWorker(
 )
 ```
 
-The default batch size is `1`, so existing workers keep the single-row dequeue behavior unless you opt in.
+The default batch size is `10`, so a single worker is no longer capped at the one-claim-per-poll throughput floor (~20 jobs/sec at a 50ms poll) regardless of concurrency. Set `WithDequeueBatchSize(1)` to restore strict single-row dequeue.
 
 ## How it works
 
@@ -25,6 +25,12 @@ The default batch size is `1`, so existing workers keep the single-row dequeue b
 - If the backend implements the optional `DequeueBatch(ctx, queues, workerID, limit)` capability and the computed limit is greater than one, the worker asks for that many jobs in one storage round trip.
 - Each returned job is tracked against its queue concurrency before it is placed on the worker's internal buffered dispatch channel.
 - If the worker shuts down while claimed jobs are still buffered or not yet delivered to a handler, those jobs are released back to `pending` immediately instead of waiting for stale-lock recovery.
+
+### Per-queue caps and fairness
+
+When one worker serves several queues with different concurrency caps, a batch claim follows the global `priority DESC, created_at ASC` order with no per-queue split. A hot or high-priority queue can therefore be over-claimed within a single poll: the worker may pull more rows for that queue than its concurrency cap allows. Those surplus rows never run over the cap — each one is dispatched only after an atomic per-queue compare-and-swap, and any row that would exceed the cap is immediately released back to `pending`. The release is **attempt-neutral**: it decrements the claim's `attempt + 1` increment via the same `Release` path, so over-claim churn cannot inflate a job's retry budget or violate exactly-once.
+
+This surplus claim/release is bounded (at most `limit - cap` extra rows per poll, each one extra UPDATE pair) and is the same behavior any existing `WithDequeueBatchSize(10)` user already saw; raising the default just makes the common single-queue worker fast. The work-conserving per-queue drain split that avoids the surplus entirely is planned for v1.9.0.
 
 ## Storage capability
 

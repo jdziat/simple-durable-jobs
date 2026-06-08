@@ -810,6 +810,27 @@ func TestQueue_Hooks(t *testing.T) {
 	assert.True(t, retryCalled)
 }
 
+func TestQueue_OnJobReclaimed_InvokesHook(t *testing.T) {
+	store := newMockStorage()
+	q := New(store)
+
+	type reclaim struct {
+		jobID  string
+		reason string
+	}
+	var got []reclaim
+
+	q.OnJobReclaimed(func(_ context.Context, jobID, reason string) {
+		got = append(got, reclaim{jobID: jobID, reason: reason})
+	})
+
+	q.CallJobReclaimedHooks(context.Background(), "job-1", core.ReclaimReasonStaleLock)
+
+	require.Len(t, got, 1)
+	assert.Equal(t, "job-1", got[0].jobID)
+	assert.Equal(t, core.ReclaimReasonStaleLock, got[0].reason)
+}
+
 func TestQueue_PauseJob(t *testing.T) {
 	store := newMockStorage()
 	q := New(store)

@@ -88,6 +88,29 @@ type SignalDelivered struct {
     Timestamp time.Time
 }
 
+// Emitted when a worker reclaims a job whose owner is presumed dead, or when a
+// worker observes a peer reclaim one of its own in-flight jobs. WorkerID is the
+// worker emitting the event; Reason is one of the ReclaimReason* constants:
+//
+//   - ReclaimReasonStaleLock     ("stale_lock")      — THIS worker's stale-lock
+//     reaper recovered a job from a presumed-dead peer. This is the actor side
+//     and the true crash leading-indicator ("I recovered N jobs"); alert on it.
+//   - ReclaimReasonOwnershipAudit ("ownership_audit") — the ownership audit saw
+//     a peer reclaim a job THIS worker was still running. This is the victim
+//     side ("a peer took N of my in-flight jobs"), meaning this worker was
+//     wrongly presumed dead or stalled.
+//
+// WARNING: in a multi-process fleet the SAME logical reclaim can surface once
+// on the reaper (stale_lock) and once on the victim (ownership_audit), emitted
+// by DIFFERENT workers. Keep the two reasons separable and do NOT sum across
+// them when counting reclaims.
+type JobReclaimed struct {
+    JobID     string
+    WorkerID  string
+    Reason    string
+    Timestamp time.Time
+}
+
 type QueuePaused struct {
     Queue     string
     Timestamp time.Time
@@ -141,3 +164,7 @@ Registers a callback for when a job fails permanently.
 ### `(*Queue) OnRetry(fn func(context.Context, *Job, int, error))`
 
 Registers a callback for when a job is being retried.
+
+### `(*Queue) OnJobReclaimed(fn func(context.Context, jobID, reason string))`
+
+Registers a callback for when a job lease is reclaimed. It fires both when this worker's stale-lock reaper recovers a job from a presumed-dead owner and when the ownership audit observes a peer reclaim a job this worker was running. `reason` is `ReclaimReasonStaleLock` (`"stale_lock"`, the actor/crash-leading-indicator side) or `ReclaimReasonOwnershipAudit` (`"ownership_audit"`, the victim side). See the `JobReclaimed` event above — the same caveat applies: do not sum across reasons, since one logical reclaim can fire on both sides on different workers.

@@ -17,8 +17,10 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 
+	"github.com/jdziat/simple-durable-jobs/pkg/call"
 	"github.com/jdziat/simple-durable-jobs/pkg/core"
 	"github.com/jdziat/simple-durable-jobs/pkg/fanout"
+	"github.com/jdziat/simple-durable-jobs/pkg/jobctx"
 	"github.com/jdziat/simple-durable-jobs/pkg/queue"
 	"github.com/jdziat/simple-durable-jobs/pkg/schedule"
 	"github.com/jdziat/simple-durable-jobs/pkg/signal"
@@ -42,6 +44,7 @@ type mockStorage struct {
 	failFunc               func(ctx context.Context, jobID string, workerID string, errMsg string, retryAt *time.Time) error
 	heartbeatFunc          func(ctx context.Context, jobID string, workerID string) error
 	checkpointFunc         func(ctx context.Context, jobID string) ([]core.Checkpoint, error)
+	saveCheckpointFunc     func(ctx context.Context, cp *core.Checkpoint) error
 	waitingJobsFunc        func(ctx context.Context) ([]*core.Job, error)
 	stalledJobsFunc        func(ctx context.Context, olderThan time.Time) ([]*core.Job, error)
 	signalWaitingAfterFunc func(ctx context.Context, afterJobID string, limit int) ([]*core.Job, error)
@@ -58,6 +61,7 @@ type mockStorage struct {
 	resumeJobFunc          func(ctx context.Context, jobID string) (bool, error)
 	cancelSubJobsFunc      func(ctx context.Context, fanOutID string) ([]string, error)
 	findOrphanedFunc       func(jobIDs []string) ([]string, error)
+	completablePendingFunc func(ctx context.Context, olderThan time.Time) ([]*core.FanOut, error)
 
 	// enqueue tracking
 	enqueueMu         sync.Mutex
@@ -120,7 +124,12 @@ func (m *mockStorage) EnqueueUnique(ctx context.Context, job *core.Job, uniqueKe
 	return nil
 }
 
-func (m *mockStorage) SaveCheckpoint(_ context.Context, _ *core.Checkpoint) error { return nil }
+func (m *mockStorage) SaveCheckpoint(ctx context.Context, cp *core.Checkpoint) error {
+	if m.saveCheckpointFunc != nil {
+		return m.saveCheckpointFunc(ctx, cp)
+	}
+	return nil
+}
 
 func (m *mockStorage) GetCheckpoints(ctx context.Context, jobID string) ([]core.Checkpoint, error) {
 	if m.checkpointFunc != nil {
@@ -268,6 +277,13 @@ func (m *mockStorage) GetWaitingJobsToResume(ctx context.Context) ([]*core.Job, 
 func (m *mockStorage) GetStalledFanOutParents(ctx context.Context, olderThan time.Time) ([]*core.Job, error) {
 	if m.stalledJobsFunc != nil {
 		return m.stalledJobsFunc(ctx, olderThan)
+	}
+	return nil, nil
+}
+
+func (m *mockStorage) GetCompletablePendingFanOuts(ctx context.Context, olderThan time.Time) ([]*core.FanOut, error) {
+	if m.completablePendingFunc != nil {
+		return m.completablePendingFunc(ctx, olderThan)
 	}
 	return nil, nil
 }
@@ -699,13 +715,13 @@ func TestWorker_CancelJobCancelsRunningJob(t *testing.T) {
 // Options tests
 // ---------------------------------------------------------------------------
 
-func TestWithPollInterval_SetsBelowMinimum(t *testing.T) {
+func TestWithPollInterval_ClampsBelowMinimumUp(t *testing.T) {
 	config := WorkerConfig{PollInterval: 100 * time.Millisecond}
 
-	// Values below 50 ms must be ignored.
+	// A positive value below 50 ms is clamped UP to the 50 ms floor, not discarded.
 	WithPollInterval(10 * time.Millisecond).ApplyWorker(&config)
 
-	assert.Equal(t, 100*time.Millisecond, config.PollInterval)
+	assert.Equal(t, 50*time.Millisecond, config.PollInterval)
 }
 
 func TestWithPollInterval_SetsValidValue(t *testing.T) {
@@ -722,6 +738,18 @@ func TestWithPollInterval_SetsExactMinimum(t *testing.T) {
 	WithPollInterval(50 * time.Millisecond).ApplyWorker(&config)
 
 	assert.Equal(t, 50*time.Millisecond, config.PollInterval)
+}
+
+func TestWithPollInterval_NonPositiveKeepsDefault(t *testing.T) {
+	config := WorkerConfig{PollInterval: 100 * time.Millisecond}
+
+	// A zero duration is ignored: the existing value is kept.
+	WithPollInterval(0).ApplyWorker(&config)
+	assert.Equal(t, 100*time.Millisecond, config.PollInterval)
+
+	// A negative duration is ignored too.
+	WithPollInterval(-1 * time.Millisecond).ApplyWorker(&config)
+	assert.Equal(t, 100*time.Millisecond, config.PollInterval)
 }
 
 func TestWithDrainTimeout_SetsValue(t *testing.T) {
@@ -1029,6 +1057,116 @@ func TestWorker_StartWaitsForStaleLockReaperToFinish(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("Start did not return after ReleaseStaleLocks finished")
 	}
+}
+
+// TestWorker_StaleLockReaper_EmitsJobReclaimed verifies that when the
+// stale-lock reaper releases jobs, each released ID surfaces as a
+// core.JobReclaimed event (Reason=stale_lock, WorkerID=this worker) AND
+// fires the OnJobReclaimed hook. This is the leading-indicator observability
+// the un-alertable slog-only reaper lacked.
+func TestWorker_StaleLockReaper_EmitsJobReclaimed(t *testing.T) {
+	mock := &mockStorage{releasedIDs: []string{"job-1", "job-2"}}
+	q := queue.New(mock)
+
+	// Subscribe BEFORE Start so no emitted event is missed.
+	ch := q.Events()
+	defer q.Unsubscribe(ch)
+
+	var hookCount atomic.Int32
+	q.OnJobReclaimed(func(_ context.Context, _, reason string) {
+		if reason == core.ReclaimReasonStaleLock {
+			hookCount.Add(1)
+		}
+	})
+
+	w := NewWorker(q, WithStaleLockAge(1*time.Minute), WithOwnershipAuditInterval(0))
+	w.config.StaleLockInterval = 30 * time.Millisecond
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	go func() { _ = w.Start(ctx) }()
+
+	// Drain events until we see a stale-lock reclaim for one of our IDs.
+	deadline := time.After(time.Second)
+	var sawReclaim bool
+	var gotReason, gotWorkerID, gotJobID string
+loop:
+	for {
+		select {
+		case ev := <-ch:
+			if rc, ok := ev.(*core.JobReclaimed); ok {
+				sawReclaim = true
+				gotReason = rc.Reason
+				gotWorkerID = rc.WorkerID
+				gotJobID = rc.JobID
+				break loop
+			}
+		case <-deadline:
+			break loop
+		}
+	}
+	cancel()
+
+	require.True(t, sawReclaim, "expected at least one JobReclaimed event from the reaper")
+	assert.Equal(t, core.ReclaimReasonStaleLock, gotReason)
+	assert.Equal(t, w.config.WorkerID, gotWorkerID)
+	assert.Contains(t, []string{"job-1", "job-2"}, gotJobID)
+
+	assert.Eventually(t, func() bool { return hookCount.Load() >= 1 }, time.Second, 5*time.Millisecond,
+		"OnJobReclaimed hook should fire for stale-lock reclaims")
+}
+
+// TestWorker_OwnershipAudit_EmitsJobReclaimed is the kill/recovery
+// observability test for the victim side: when a peer reclaims an in-flight
+// job, the ownership audit must turn that silent slog line into an emitted,
+// hookable core.JobReclaimed event (Reason=ownership_audit).
+func TestWorker_OwnershipAudit_EmitsJobReclaimed(t *testing.T) {
+	mock := &mockStorage{}
+	mock.findOrphanedFunc = func(_ []string) ([]string, error) {
+		return []string{"job-9"}, nil
+	}
+	q := queue.New(mock)
+
+	ch := q.Events()
+	defer q.Unsubscribe(ch)
+
+	w := NewWorker(q,
+		DisableRetry(),
+		WithOwnershipAuditInterval(20*time.Millisecond),
+	)
+	// Make the reaper effectively dormant so it can't emit a competing event.
+	w.config.StaleLockInterval = time.Hour
+
+	// Seed a running job so the audit snapshot is non-empty. Safe: no jobs are
+	// dequeued in this test, so processJob never touches the map.
+	w.runningJobsMu.Lock()
+	w.runningJobs["job-9"] = func() {}
+	w.runningJobsMu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go w.runOwnershipAudit(ctx)
+
+	deadline := time.After(time.Second)
+	var rc *core.JobReclaimed
+loop:
+	for {
+		select {
+		case ev := <-ch:
+			if got, ok := ev.(*core.JobReclaimed); ok {
+				rc = got
+				break loop
+			}
+		case <-deadline:
+			break loop
+		}
+	}
+	cancel()
+
+	require.NotNil(t, rc, "expected a JobReclaimed event from the ownership audit")
+	assert.Equal(t, core.ReclaimReasonOwnershipAudit, rc.Reason)
+	assert.Equal(t, "job-9", rc.JobID)
+	assert.Equal(t, w.config.WorkerID, rc.WorkerID)
 }
 
 // ---------------------------------------------------------------------------
@@ -1375,6 +1513,29 @@ func TestNewWorker_DefaultsApplied(t *testing.T) {
 	assert.Equal(t, 45*time.Minute, w.config.StaleLockAge)
 	assert.Equal(t, 2*time.Minute, w.config.FanOutRecoveryStaleAge)
 	assert.Equal(t, map[string]int{"default": 10}, w.config.Queues)
+}
+
+// TestNewWorker_ClampsHeartbeatIntervalBelowStaleLockAge proves the reaper-safety
+// clamp: with the reaper now reclaiming from last contact, the heartbeat must
+// refresh last_heartbeat_at at least ~3x within StaleLockAge, so the interval is
+// clamped to StaleLockAge/3.
+func TestNewWorker_ClampsHeartbeatIntervalBelowStaleLockAge(t *testing.T) {
+	mock := &mockStorage{}
+	q := queue.New(mock)
+	w := NewWorker(q, WithStaleLockAge(3*time.Second))
+
+	assert.Equal(t, 1*time.Second, w.heartbeatInterval, "heartbeat interval must clamp to StaleLockAge/3")
+	assert.Less(t, w.heartbeatInterval, 3*time.Second)
+}
+
+// TestNewWorker_DefaultHeartbeatIntervalUnchanged confirms the default
+// StaleLockAge (45m → 15m) leaves the 2m heartbeat default in place.
+func TestNewWorker_DefaultHeartbeatIntervalUnchanged(t *testing.T) {
+	mock := &mockStorage{}
+	q := queue.New(mock)
+	w := NewWorker(q)
+
+	assert.Equal(t, 2*time.Minute, w.heartbeatInterval)
 }
 
 func TestNewWorker_CustomQueuesPreserved(t *testing.T) {
@@ -2141,6 +2302,129 @@ func TestWorker_ExecuteHandler_GetCheckpointsError(t *testing.T) {
 	}
 }
 
+// TestExecuteHandler_CheckpointWriteSurvivesJobCancellation is the regression
+// test for finding #4 (DEADBOLT P3): the default checkpoint write must land even
+// when the per-job context is already cancelled/expired as the handler returns,
+// or a non-idempotent side effect re-runs on replay.
+//
+// Under the old closure (return Storage().SaveCheckpoint(ctx, cp)) the captured
+// ctx carries the per-job cancellation, so captured.Err() == context.Canceled.
+// After the fix the closure wraps the incoming ctx with WithoutCancel + a bounded
+// deadline, so the storage write sees a live context.
+func TestExecuteHandler_CheckpointWriteSurvivesJobCancellation(t *testing.T) {
+	var (
+		capturedErr error
+		sawWrite    bool
+		capturedCP  *core.Checkpoint
+	)
+	mock := &mockStorage{
+		checkpointFunc: func(_ context.Context, _ string) ([]core.Checkpoint, error) {
+			return nil, nil
+		},
+		saveCheckpointFunc: func(ctx context.Context, cp *core.Checkpoint) error {
+			// Capture the ctx state AT THE STORAGE BOUNDARY — checking after the
+			// closure returns would observe its deferred cancel() instead.
+			sawWrite = true
+			capturedErr = ctx.Err()
+			capturedCP = cp
+			return nil
+		},
+	}
+	q := queue.New(mock)
+
+	const jobType = "phase-checkpoint-job"
+	q.Register(jobType, func(c context.Context, _ struct{}) error {
+		return jobctx.SavePhaseCheckpoint(c, "phase", "v")
+	})
+
+	h, ok := q.GetHandler(jobType)
+	require.True(t, ok, "handler must be registered")
+
+	w := NewWorker(q, WithStaleLockInterval(0))
+
+	// A pre-cancelled per-job context: this is exactly the state when the per-job
+	// deadline fires microseconds after the activity returns but before the
+	// checkpoint is persisted.
+	jobCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	job := &core.Job{
+		ID:    "phase-job-1",
+		Type:  jobType,
+		Queue: "default",
+		Args:  []byte(`{}`),
+	}
+
+	_, err := w.executeHandler(jobCtx, job, h)
+	require.NoError(t, err)
+
+	require.True(t, sawWrite, "storage must have received a checkpoint write")
+	// The crux of the regression: the storage boundary sees a live context even
+	// though the per-job context was cancelled before the write.
+	require.NoError(t, capturedErr,
+		"checkpoint write context must not be cancelled (was %v)", capturedErr)
+	require.NotNil(t, capturedCP)
+	require.Equal(t, "phase", capturedCP.CallType,
+		"the phase checkpoint must be the one written")
+}
+
+// TestExecuteHandler_CheckpointWriteSurvivesJobCancellation_CallPath proves the
+// protection covers the default Call path too, not only SavePhaseCheckpoint —
+// the nested-call checkpoint must also land with a non-cancelled storage ctx.
+func TestExecuteHandler_CheckpointWriteSurvivesJobCancellation_CallPath(t *testing.T) {
+	var (
+		capturedErr error
+		sawWrite    bool
+		capturedCP  *core.Checkpoint
+	)
+	mock := &mockStorage{
+		checkpointFunc: func(_ context.Context, _ string) ([]core.Checkpoint, error) {
+			return nil, nil
+		},
+		saveCheckpointFunc: func(ctx context.Context, cp *core.Checkpoint) error {
+			sawWrite = true
+			capturedErr = ctx.Err()
+			capturedCP = cp
+			return nil
+		},
+	}
+	q := queue.New(mock)
+
+	const subHandler = "call-sub"
+	q.Register(subHandler, func(_ context.Context, _ struct{}) (string, error) {
+		return "ok", nil
+	})
+
+	const parentType = "call-parent-job"
+	q.Register(parentType, func(c context.Context, _ struct{}) error {
+		_, err := call.Call[string](c, subHandler, struct{}{})
+		return err
+	})
+
+	h, ok := q.GetHandler(parentType)
+	require.True(t, ok, "parent handler must be registered")
+
+	w := NewWorker(q, WithStaleLockInterval(0))
+
+	jobCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	job := &core.Job{
+		ID:    "call-parent-1",
+		Type:  parentType,
+		Queue: "default",
+		Args:  []byte(`{}`),
+	}
+
+	_, err := w.executeHandler(jobCtx, job, h)
+	require.NoError(t, err)
+
+	require.True(t, sawWrite, "the nested Call checkpoint must be written")
+	require.NoError(t, capturedErr,
+		"nested Call checkpoint write context must not be cancelled (was %v)", capturedErr)
+	require.NotNil(t, capturedCP)
+}
+
 // ---------------------------------------------------------------------------
 // pollWaitingJobs — cover the inner job-resume loop
 // ---------------------------------------------------------------------------
@@ -2202,6 +2486,97 @@ func TestWorker_PollWaitingJobs_ResumesStalledFanOutParent(t *testing.T) {
 		t.Fatal("ResumeJob was not called for stalled fan-out parent")
 	}
 	assert.True(t, sawCutoff.Load(), "stalled fan-out query should use configured stale age cutoff")
+}
+
+// TestPollWaitingJobsOnce_RescuesStrandedTerminalFanOut is the crash/replay
+// regression test for finding #2: a fan-out left status='pending' with terminal
+// counts and a waiting parent (the post-crash strand that NEITHER existing
+// recovery query rescues) must be healed in a single poll cycle. It drives the
+// stranded row through the same completeFanOut path the live worker uses —
+// UpdateFanOutStatus CAS + ResumeJob — proving the backstop is wired end-to-end.
+func TestPollWaitingJobsOnce_RescuesStrandedTerminalFanOut(t *testing.T) {
+	stranded := &core.FanOut{
+		ID:             "fo-stranded",
+		ParentJobID:    "parent-stranded",
+		TotalCount:     2,
+		CompletedCount: 2,
+		Strategy:       core.StrategyCollectAll,
+		Status:         core.FanOutPending,
+	}
+	statusUpdated := make(chan core.FanOutStatus, 1)
+	resumed := make(chan string, 1)
+
+	mock := &mockStorage{
+		completablePendingFunc: func(_ context.Context, _ time.Time) ([]*core.FanOut, error) {
+			return []*core.FanOut{stranded}, nil
+		},
+		updateFanOutStatusFunc: func(_ context.Context, fanOutID string, status core.FanOutStatus) (bool, error) {
+			assert.Equal(t, stranded.ID, fanOutID)
+			statusUpdated <- status
+			return true, nil
+		},
+		resumeJobFunc: func(_ context.Context, jobID string) (bool, error) {
+			resumed <- jobID
+			return true, nil
+		},
+	}
+	q := queue.New(mock)
+	w := NewWorker(q,
+		WithStorageRetry(RetryConfig{MaxAttempts: 1}),
+		WithFanOutRecoveryStaleAge(30*time.Second),
+	)
+
+	w.pollWaitingJobsOnce(context.Background())
+
+	select {
+	case status := <-statusUpdated:
+		assert.Equal(t, core.FanOutCompleted, status)
+	case <-time.After(time.Second):
+		t.Fatal("UpdateFanOutStatus was not called for the stranded pending fan-out")
+	}
+	select {
+	case jobID := <-resumed:
+		assert.Equal(t, stranded.ParentJobID, jobID)
+	case <-time.After(time.Second):
+		t.Fatal("ResumeJob was not called for the stranded fan-out's parent")
+	}
+}
+
+// TestCompleteFanOut_ResumesWhenStatusAlreadyTerminal guards against
+// re-introducing the early-return regression: with P2's in-tx advance, the very
+// worker responsible for resuming sees UpdateFanOutStatus return (false,nil)
+// because its own terminal transaction already advanced the status. completeFanOut
+// must still fall through to the idempotent ResumeJob.
+func TestCompleteFanOut_ResumesWhenStatusAlreadyTerminal(t *testing.T) {
+	resumed := make(chan string, 1)
+	mock := &mockStorage{
+		updateFanOutStatusFunc: func(_ context.Context, _ string, _ core.FanOutStatus) (bool, error) {
+			return false, nil // status already advanced in-tx
+		},
+		resumeJobFunc: func(_ context.Context, jobID string) (bool, error) {
+			resumed <- jobID
+			return true, nil
+		},
+	}
+	q := queue.New(mock)
+	w := NewWorker(q, WithStorageRetry(RetryConfig{MaxAttempts: 1}))
+
+	fo := &core.FanOut{
+		ID:             "fo-already-terminal",
+		ParentJobID:    "parent-already-terminal",
+		TotalCount:     2,
+		CompletedCount: 2,
+		Strategy:       core.StrategyCollectAll,
+		Status:         core.FanOutCompleted,
+	}
+	require.NoError(t, w.completeFanOut(context.Background(), fo, core.FanOutCompleted))
+
+	select {
+	case jobID := <-resumed:
+		assert.Equal(t, fo.ParentJobID, jobID)
+	case <-time.After(time.Second):
+		t.Fatal("ResumeJob must be called even when UpdateFanOutStatus reports !updated")
+	}
 }
 
 func TestWorker_PollSignalWaitingJobs_PagesPastMemoizedFutureSleeps(t *testing.T) {
@@ -3399,14 +3774,17 @@ func TestWorker_CheckFanOutCompletion_ThresholdAllCancelledNoActive(t *testing.T
 }
 
 // TestWorker_CompleteFanOut_AlreadyCompletedByAnotherWorker exercises the
-// branch where UpdateFanOutStatus returns (false, nil) — another worker won
-// the race and completeFanOut should return nil without calling ResumeJob.
+// branch where UpdateFanOutStatus returns (false, nil). Under P2's in-tx status
+// advance this is the COMMON case for the worker that just completed the last
+// sub-job (its own terminal transaction already advanced the status), so
+// completeFanOut must NOT early-return: it falls through to the idempotent
+// ResumeJob. The parent-row CAS keeps concurrent/duplicate callers single-effect.
 func TestWorker_CompleteFanOut_AlreadyCompletedByAnotherWorker(t *testing.T) {
 	resumeCalled := false
 
 	mock := &mockStorage{
 		updateFanOutStatusFunc: func(_ context.Context, _ string, _ core.FanOutStatus) (bool, error) {
-			return false, nil // another worker already completed
+			return false, nil // status already advanced (in-tx, or by another worker)
 		},
 		resumeJobFunc: func(_ context.Context, _ string) (bool, error) {
 			resumeCalled = true
@@ -3423,7 +3801,7 @@ func TestWorker_CompleteFanOut_AlreadyCompletedByAnotherWorker(t *testing.T) {
 
 	err := w.completeFanOut(context.Background(), fo, core.FanOutCompleted)
 	require.NoError(t, err)
-	assert.False(t, resumeCalled, "ResumeJob must not be called when update was a no-op")
+	assert.True(t, resumeCalled, "ResumeJob must still be called when the status was already terminal (in-tx advance)")
 }
 
 // TestWorker_CompleteFanOut_CancelOnFailCancelsSubJobs exercises the

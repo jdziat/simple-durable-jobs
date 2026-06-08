@@ -102,6 +102,9 @@ type (
 	// JobResumedBySignal is emitted when a signal wakes a waiting job.
 	JobResumedBySignal = core.JobResumedBySignal
 
+	// JobReclaimed is emitted when a worker reclaims a job from a presumed-dead owner.
+	JobReclaimed = core.JobReclaimed
+
 	// CheckpointSaved is emitted when a checkpoint is saved.
 	CheckpointSaved = core.CheckpointSaved
 
@@ -256,6 +259,15 @@ const (
 	FanOutFailed    = core.FanOutFailed
 )
 
+// Reclaim reason constants for the JobReclaimed event. ReclaimReasonStaleLock
+// marks a reclaim by this worker's stale-lock reaper (the crash leading
+// indicator); ReclaimReasonOwnershipAudit marks a peer reclaiming one of this
+// worker's in-flight jobs.
+const (
+	ReclaimReasonStaleLock      = core.ReclaimReasonStaleLock
+	ReclaimReasonOwnershipAudit = core.ReclaimReasonOwnershipAudit
+)
+
 // Determinism mode constants, in increasing order of strictness:
 //   - ExplicitCheckpoints (default): error on a replay checkpoint type mismatch.
 //   - Strict: also fail terminally if any recorded Call checkpoint is not
@@ -293,6 +305,8 @@ var (
 	ErrQueueNameTooLong      = core.ErrQueueNameTooLong
 	ErrJobArgsTooLarge       = core.ErrJobArgsTooLarge
 	ErrJobNotCompleted       = core.ErrJobNotCompleted
+	ErrJobFailed             = core.ErrJobFailed
+	ErrJobCancelled          = core.ErrJobCancelled
 	ErrJobNotOwned           = core.ErrJobNotOwned
 	ErrDuplicateJob          = core.ErrDuplicateJob
 	ErrUniqueKeyTooLong      = core.ErrUniqueKeyTooLong
@@ -353,7 +367,11 @@ func SafeSQLiteDSN(path string) string {
 	return path + sep + safeSQLiteDSNQuery
 }
 
-// NewGormStorage creates a new GORM-backed storage.
+// NewGormStorage creates a new GORM-backed storage. Unless the caller has
+// already sized the pool (or opts out via NewGormStorageWithPool), it installs a
+// bounded default connection pool: DefaultPoolConfig (25 open / 10 idle / 5m
+// lifetime / 1m idle) for PostgreSQL and MySQL, and a small SQLite-safe pool
+// (4 open / 2 idle, no connection expiry) for SQLite.
 func NewGormStorage(db *gorm.DB, opts ...GormStorageOption) *GormStorage {
 	return storage.NewGormStorage(db, opts...)
 }
@@ -592,6 +610,14 @@ func WithRetention(opts ...RetentionOption) WorkerOption {
 	return worker.WithRetention(opts...)
 }
 
+// DefaultRetention is an explicit opt-in conservative retention preset (NOT a
+// silent default): completed jobs 7 days, terminal failed/cancelled jobs 30
+// days, consumed signals 7 days. Tune individual windows by composing the
+// Retention* options under WithRetention instead.
+func DefaultRetention() WorkerOption {
+	return worker.DefaultRetention()
+}
+
 // RetentionCompletedAfter deletes completed jobs older than d. A non-positive
 // duration keeps completed jobs forever.
 func RetentionCompletedAfter(d time.Duration) RetentionOption {
@@ -619,6 +645,15 @@ func RetentionInterval(d time.Duration) RetentionOption {
 // RetentionBatchSize sets the maximum rows deleted in one pass.
 func RetentionBatchSize(n int) RetentionOption {
 	return worker.RetentionBatchSize(n)
+}
+
+// RetentionDeleteCheckpointsOnComplete opts in to deleting a successful job's
+// checkpoints transactionally with its completion, bounding the checkpoints
+// table without a background sweep. Off by default because the dashboard reads
+// completed jobs' checkpoints for finished-workflow phase results; the failure
+// path is never affected (retry replay keeps checkpoints).
+func RetentionDeleteCheckpointsOnComplete() RetentionOption {
+	return worker.RetentionDeleteCheckpointsOnComplete()
 }
 
 // WithQueueRateLimit applies a per-worker token bucket before dequeueing from
@@ -664,7 +699,10 @@ func DisableRetry() WorkerOption {
 
 // WithPollInterval sets the interval between job polling attempts.
 // Lower values increase throughput but also database load.
-// Default is 100ms. Minimum is 50ms to prevent database overload.
+//
+// The default is 100ms and the floor is 50ms (to prevent database overload). A
+// positive duration below 50ms is clamped up to 50ms (it is not discarded). A
+// non-positive duration is ignored and the existing value is kept.
 func WithPollInterval(d time.Duration) WorkerOption {
 	return worker.WithPollInterval(d)
 }
@@ -686,7 +724,12 @@ func WithStaleLockInterval(d time.Duration) WorkerOption {
 	return worker.WithStaleLockInterval(d)
 }
 
-// WithStaleLockAge sets how long a lock must be expired before reclaim.
+// WithStaleLockAge sets how long the owning worker must have made no contact
+// before a running job is reclaimed. Reclaim anchors on the last contact —
+// COALESCE(last_heartbeat_at, started_at, locked_until) older than StaleLockAge —
+// not on lease (LockedUntil) expiry, so a job whose lease has been pushed into
+// the future is still reclaimed once its last contact is stale. The default is
+// 45 minutes.
 func WithStaleLockAge(d time.Duration) WorkerOption {
 	return worker.WithStaleLockAge(d)
 }
@@ -699,9 +742,13 @@ func WithLockDuration(d time.Duration) WorkerOption {
 }
 
 // WithFanOutRecoveryStaleAge sets how old a pending fan-out must be before the
-// worker resumes a parent that crashed mid-enqueue (recovery for an
-// incompletely-enqueued fan-out). Default is 2 minutes; non-positive keeps the
-// default (recovery cannot be disabled).
+// worker's polling backstop heals it. This single cutoff gates two recovery
+// paths: resuming a parent that crashed mid-enqueue (an incompletely-enqueued
+// fan-out), and the terminal-strand sweep (GetCompletablePendingFanOuts) that
+// completes a fan-out left status=pending with terminal counts and a waiting
+// parent after a crash between the last sub-job's terminal write and the parent
+// resume. Default is 2 minutes; non-positive keeps the default (recovery cannot
+// be disabled).
 func WithFanOutRecoveryStaleAge(d time.Duration) WorkerOption {
 	return worker.WithFanOutRecoveryStaleAge(d)
 }
@@ -1071,8 +1118,11 @@ func DrainSignals[T any](ctx context.Context, name string) ([]T, error) {
 // LoadResult decodes the persisted return value of a completed job into T.
 //
 // Returns:
-//   - ErrJobNotCompleted if the job has not reached a terminal state.
-//   - An error containing job.LastError if the job failed.
+//   - ErrJobNotCompleted only when the job is in a genuinely non-terminal state
+//     (pending, running, retrying, waiting, or paused) — a poller should keep polling.
+//   - An error wrapping ErrJobFailed (whose message embeds job.LastError) if the
+//     job failed — errors.Is(err, ErrJobFailed) lets a poller stop.
+//   - An error wrapping ErrJobCancelled if the job was cancelled.
 //   - ErrNoResult if the job completed but has no persisted result value.
 //   - An error wrapping the JSON decode failure if Result cannot be unmarshaled into T.
 func LoadResult[T any](ctx context.Context, q *Queue, jobID string) (T, error) {
@@ -1095,7 +1145,9 @@ func LoadResult[T any](ctx context.Context, q *Queue, jobID string) (T, error) {
 		}
 		return out, nil
 	case core.StatusFailed:
-		return zero, fmt.Errorf("jobs: job %s failed: %s", jobID, job.LastError)
+		return zero, fmt.Errorf("%w: %s", core.ErrJobFailed, job.LastError)
+	case core.StatusCancelled:
+		return zero, fmt.Errorf("%w: %s", core.ErrJobCancelled, jobID)
 	default:
 		return zero, core.ErrJobNotCompleted
 	}

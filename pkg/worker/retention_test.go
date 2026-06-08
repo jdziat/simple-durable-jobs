@@ -162,6 +162,98 @@ func (b *lockedLogBuffer) String() string {
 	return b.buf.String()
 }
 
+func TestStart_WarnsWhenRetentionUnconfigured(t *testing.T) {
+	var buf bytes.Buffer
+	q := queue.New(&mockStorage{})
+	w := NewWorker(q, WithOwnershipAuditInterval(0))
+	w.logger = slog.New(slog.NewTextHandler(&buf, nil))
+
+	require.False(t, w.config.Retention.enabled())
+
+	// CompareAndSwap dedup: two direct calls log exactly once.
+	w.warnIfRetentionUnconfigured()
+	w.warnIfRetentionUnconfigured()
+
+	out := buf.String()
+	assert.Contains(t, out, "retention is not configured")
+	assert.Equal(t, 1, strings.Count(out, "retention is not configured"))
+}
+
+func TestStart_NoWarnWhenRetentionConfigured(t *testing.T) {
+	var buf bytes.Buffer
+	q := queue.New(&mockStorage{})
+	w := NewWorker(q,
+		WithRetention(RetentionCompletedAfter(time.Hour)),
+		WithOwnershipAuditInterval(0),
+	)
+	w.logger = slog.New(slog.NewTextHandler(&buf, nil))
+
+	require.True(t, w.config.Retention.enabled())
+
+	// The Start gate takes the retention branch (not the warn branch) when
+	// enabled; exercising the warn path directly here would be a misuse, so we
+	// assert the gate predicate and that no warn was emitted.
+	assert.NotContains(t, buf.String(), "retention is not configured")
+}
+
+func TestDefaultRetention_EnablesConservativeWindows(t *testing.T) {
+	q := queue.New(&mockStorage{})
+	w := NewWorker(q, DefaultRetention(), WithOwnershipAuditInterval(0))
+
+	cfg := w.config.Retention
+	assert.True(t, cfg.enabled())
+	assert.Equal(t, 7*24*time.Hour, cfg.CompletedAfter)
+	assert.Equal(t, 30*24*time.Hour, cfg.FailedAfter)
+	assert.Equal(t, 7*24*time.Hour, cfg.ConsumedSignalsAfter)
+}
+
+func TestRetentionDeleteCheckpointsOnComplete_SetsFlag(t *testing.T) {
+	q := queue.New(&mockStorage{})
+	w := NewWorker(q,
+		WithRetention(RetentionDeleteCheckpointsOnComplete()),
+		WithOwnershipAuditInterval(0),
+	)
+	assert.True(t, w.config.Retention.DeleteCheckpointsOnComplete)
+	// The opt-in alone does not start a retention sweep.
+	assert.False(t, w.config.Retention.enabled())
+}
+
+// TestRetentionDeleteCheckpointsOnComplete_WiredToStorage proves NewWorker
+// propagates the opt-in to a GormStorage backend (via SetDeleteCheckpointsOnComplete),
+// so a real success write GCs that job's checkpoints. Without the opt-in the
+// same backend keeps them (default-preserving for the dashboard).
+func TestRetentionDeleteCheckpointsOnComplete_WiredToStorage(t *testing.T) {
+	ctx := context.Background()
+
+	run := func(t *testing.T, optIn bool, wantCheckpoints int) {
+		_, store := newWorkerRetentionStore(t)
+		q := queue.New(store)
+		opts := []WorkerOption{WithOwnershipAuditInterval(0)}
+		if optIn {
+			opts = append(opts, WithRetention(RetentionDeleteCheckpointsOnComplete()))
+		}
+		// NewWorker is where the wiring happens.
+		_ = NewWorker(q, opts...)
+
+		job := &core.Job{ID: "wired-" + t.Name(), Type: "gc", Queue: "default", Status: core.StatusPending}
+		require.NoError(t, store.Enqueue(ctx, job))
+		got, err := store.Dequeue(ctx, []string{"default"}, "worker-1")
+		require.NoError(t, err)
+		require.NotNil(t, got)
+		require.NoError(t, store.SaveCheckpoint(ctx, &core.Checkpoint{JobID: got.ID, CallIndex: 0, CallType: "call", Result: []byte(`"x"`)}))
+
+		_, err = store.CompleteWithResult(ctx, got.ID, "worker-1", []byte(`"done"`))
+		require.NoError(t, err)
+
+		cps, err := store.GetCheckpoints(ctx, got.ID)
+		require.NoError(t, err)
+		assert.Len(t, cps, wantCheckpoints)
+	}
+
+	t.Run("opt-in deletes", func(t *testing.T) { run(t, true, 0) })
+	t.Run("default keeps", func(t *testing.T) { run(t, false, 1) })
+}
+
 func TestWithRetentionZeroConfigDisabled(t *testing.T) {
 	q := queue.New(&mockStorage{})
 	w := NewWorker(q, WithRetention(), WithRetention(RetentionInterval(10*time.Millisecond)))

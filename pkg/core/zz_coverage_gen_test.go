@@ -31,6 +31,8 @@ func TestSentinelErrorByMessage_AllSentinels(t *testing.T) {
 		ErrQueueNotPaused,
 		ErrCannotPauseStatus,
 		ErrJobNotCompleted,
+		ErrJobFailed,
+		ErrJobCancelled,
 		ErrNoResult,
 	}
 

@@ -137,7 +137,7 @@ func main() {
   {{< hextra/feature-card
     icon="lock-closed"
     title="Payload Encryption"
-    subtitle="Plug in a codec to transparently encrypt job arguments, results, and checkpoints at rest, with key rotation, at the storage boundary."
+    subtitle="Plug in a codec to transparently encrypt job arguments, results, checkpoints, and error text (last_error / dead-letter reason) at rest, with key rotation, at the storage boundary."
   >}}
 {{< /hextra/feature-grid >}}
 

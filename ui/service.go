@@ -993,6 +993,14 @@ func coreEventToProto(e core.Event) *jobsv1.Event {
 			Type:      "worker.resumed",
 			Timestamp: timestamppb.New(ev.Timestamp),
 		}
+	case *core.JobReclaimed:
+		return &jobsv1.Event{
+			Type:      "job.reclaimed",
+			JobId:     ev.JobID,
+			WorkerId:  ev.WorkerID,
+			Reason:    ev.Reason,
+			Timestamp: timestamppb.New(ev.Timestamp),
+		}
 	default:
 		return nil
 	}

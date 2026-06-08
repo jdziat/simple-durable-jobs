@@ -53,12 +53,34 @@ func WithCodec(c core.PayloadCodec) GormStorageOption {
 	}
 }
 
+// withoutDefaultPool disables the bounded connection pool that NewGormStorage
+// applies by default. It is unexported because it exists only so
+// NewGormStorageWithPool (which has already sized the pool itself, possibly to
+// an explicit unlimited) can opt out of the auto-default; it is not part of the
+// public API and is not re-exported through jobs.go.
+func withoutDefaultPool() GormStorageOption {
+	return func(s *GormStorage) {
+		s.skipDefaultPool = true
+	}
+}
+
 // GormStorage implements Storage using GORM.
 type GormStorage struct {
-	db           *gorm.DB
-	isSQLite     bool
-	lockDuration time.Duration
-	codec        core.PayloadCodec
+	db              *gorm.DB
+	isSQLite        bool
+	lockDuration    time.Duration
+	codec           core.PayloadCodec
+	skipDefaultPool bool
+
+	// deleteCheckpointsOnComplete, when true, deletes a job's checkpoints in the
+	// SAME transaction as its success terminal write (Complete /
+	// CompleteWithResult). It is OFF by default: the dashboard reads completed
+	// jobs' checkpoints to show finished-workflow phase results, so deleting them
+	// silently would blank that panel. Operators opt in via the worker's
+	// RetentionDeleteCheckpointsOnComplete option (wired through
+	// SetDeleteCheckpointsOnComplete) to bound the checkpoints table. Never
+	// affects the failure path — retry replay reads checkpoints.
+	deleteCheckpointsOnComplete bool
 }
 
 // NewGormStorage creates a new GORM-backed storage. For file-based SQLite under
@@ -75,6 +97,16 @@ type GormStorage struct {
 // completion writes transiently fail with SQLITE_BUSY/SQLITE_READONLY and can
 // exhaust the worker retry budget. This library receives an already-opened DB
 // and cannot set these itself — the PRAGMA below is only a best-effort fallback.
+//
+// Connection pool: NewGormStorage installs a bounded default pool via
+// applyDefaultPoolIfUnset unless the pool is already sized. PG/MySQL get
+// DefaultPoolConfig (MaxOpenConns 25, MaxIdleConns 10, ConnMaxLifetime 5m,
+// ConnMaxIdleTime 1m); SQLite gets a small, SQLite-safe pool (4 open, 2 idle, no
+// connection expiry). A freshly-opened gorm DB sits at database/sql defaults
+// (unlimited), so a non-zero MaxOpenConnections in the pool's Stats means the
+// caller already bounded it and we leave it untouched. The default is also
+// skipped when the storage is built through NewGormStorageWithPool, which sizes
+// the pool itself (including an explicit MaxOpenConns(0) for unlimited).
 func NewGormStorage(db *gorm.DB, opts ...GormStorageOption) *GormStorage {
 	// Detect SQLite by checking the dialect name
 	isSQLite := false
@@ -92,6 +124,12 @@ func NewGormStorage(db *gorm.DB, opts ...GormStorageOption) *GormStorage {
 	for _, opt := range opts {
 		opt(s)
 	}
+	// Apply a bounded default pool unless opted out (NewGormStorageWithPool) or
+	// the caller already sized the pool. Must run after the opts loop so
+	// withoutDefaultPool() is observed.
+	if !s.skipDefaultPool {
+		applyDefaultPoolIfUnset(db, isSQLite)
+	}
 	return s
 }
 
@@ -99,6 +137,15 @@ func NewGormStorage(db *gorm.DB, opts ...GormStorageOption) *GormStorage {
 // This is used by the worker when WithLockDuration is passed as a worker option.
 func (s *GormStorage) SetLockDuration(d time.Duration) {
 	s.lockDuration = d
+}
+
+// SetDeleteCheckpointsOnComplete toggles transactional checkpoint GC on the
+// success terminal write. The worker calls it when the opt-in
+// RetentionDeleteCheckpointsOnComplete option is set. Default (unset) preserves
+// completed-job checkpoints so the dashboard can still show their phase results.
+// It never affects the failure path; retry replay always keeps checkpoints.
+func (s *GormStorage) SetDeleteCheckpointsOnComplete(enabled bool) {
+	s.deleteCheckpointsOnComplete = enabled
 }
 
 // IsSQLite returns true if the storage is using SQLite.
@@ -501,25 +548,37 @@ func (s *GormStorage) dequeueSQLite(ctx context.Context, queues []string, worker
 
 // Complete marks a job as successfully completed.
 // Validates that the worker owns the job before completing.
+//
+// The status flip and the opt-in checkpoint GC are wrapped in one transaction so
+// the delete commits atomically with success: a crash either rolls back both
+// (the job stays running and is replayed) or commits both. Checkpoints are
+// deleted only when SetDeleteCheckpointsOnComplete(true) was set; the default
+// keeps them for the dashboard. A not-owned Complete deletes nothing.
 func (s *GormStorage) Complete(ctx context.Context, jobID string, workerID string) error {
 	now := time.Now()
-	result := s.db.WithContext(ctx).
-		Model(&core.Job{}).
-		Where("id = ? AND locked_by = ? AND status = ?", jobID, workerID, core.StatusRunning).
-		Updates(map[string]any{
-			"status":       core.StatusCompleted,
-			"completed_at": now,
-			"locked_by":    "",
-			"locked_until": nil,
-		})
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		result := tx.Model(&core.Job{}).
+			Where("id = ? AND locked_by = ? AND status = ?", jobID, workerID, core.StatusRunning).
+			Updates(map[string]any{
+				"status":       core.StatusCompleted,
+				"completed_at": now,
+				"locked_by":    "",
+				"locked_until": nil,
+			})
 
-	if result.Error != nil {
-		return result.Error
-	}
-	if result.RowsAffected == 0 {
-		return core.ErrJobNotOwned
-	}
-	return nil
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 0 {
+			return core.ErrJobNotOwned
+		}
+		if s.deleteCheckpointsOnComplete {
+			if err := tx.Where("job_id = ?", jobID).Delete(&core.Checkpoint{}).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 // CompleteWithResult marks a job completed and, when it is a sub-job, accounts
@@ -537,7 +596,9 @@ func (s *GormStorage) CompleteWithResult(ctx context.Context, jobID, workerID st
 		}
 		updates["result"] = encoded
 	}
-	return s.accountTerminalWithFanOut(ctx, jobID, workerID, updates, "completed_count")
+	// Success path: GC this job's checkpoints in the same tx ONLY when the
+	// opt-in is enabled (default off keeps them for the dashboard).
+	return s.accountTerminalWithFanOut(ctx, jobID, workerID, updates, "completed_count", s.deleteCheckpointsOnComplete)
 }
 
 // Fail marks a job as failed, optionally scheduling a retry.
@@ -546,9 +607,16 @@ func (s *GormStorage) CompleteWithResult(ctx context.Context, jobID, workerID st
 func (s *GormStorage) Fail(ctx context.Context, jobID string, workerID string, errMsg string, retryAt *time.Time) error {
 	// Sanitize error message to prevent sensitive data leakage
 	sanitizedErr := security.SanitizeErrorMessage(errMsg)
+	// Encrypt the handler error text at rest when a real codec is configured.
+	// PII can surface in retryable failures shown in the UI, so encode in both
+	// branches. Under the default identity codec this returns plaintext verbatim.
+	encErr, err := s.encodeErrorText("job last_error", jobID, sanitizedErr)
+	if err != nil {
+		return err
+	}
 
 	updates := map[string]any{
-		"last_error":   sanitizedErr,
+		"last_error":   encErr,
 		"locked_by":    "",
 		"locked_until": nil,
 	}
@@ -561,7 +629,9 @@ func (s *GormStorage) Fail(ctx context.Context, jobID string, workerID string, e
 		now := time.Now()
 		updates["completed_at"] = now
 		updates["dead_lettered_at"] = now
-		updates["dead_letter_reason"] = deadLetterReasonExpr(sanitizedErr)
+		// Label stays plaintext (fixed, non-PII); only the error suffix is
+		// encrypted, preserving the attempt>=max_retries CASE in SQL.
+		updates["dead_letter_reason"] = deadLetterReasonExpr(encErr)
 	}
 
 	result := s.db.WithContext(ctx).
@@ -583,14 +653,24 @@ func (s *GormStorage) Fail(ctx context.Context, jobID string, workerID string, e
 // transaction. Retryable failures must continue to use Fail.
 func (s *GormStorage) FailTerminalWithResult(ctx context.Context, jobID, workerID, errMsg string) (*core.FanOut, error) {
 	sanitizedErr := security.SanitizeErrorMessage(errMsg)
+	// Encrypt the error text at rest when a real codec is configured. The
+	// encoded form flows into both last_error and the dead_letter_reason suffix
+	// (the label stays plaintext via deadLetterReasonExpr). Identity codec → no-op.
+	encErr, err := s.encodeErrorText("job last_error", jobID, sanitizedErr)
+	if err != nil {
+		return nil, err
+	}
 	updates := map[string]any{
-		"last_error":        sanitizedErr,
+		"last_error":        encErr,
 		"status":            core.StatusFailed,
 		"locked_by":         "",
 		"locked_until":      nil,
-		deadLetterReasonKey: sanitizedErr,
+		deadLetterReasonKey: encErr,
 	}
-	return s.accountTerminalWithFanOut(ctx, jobID, workerID, updates, "failed_count")
+	// Terminal failure: NEVER delete checkpoints. They are retained for
+	// debugging/inspection and are still swept by terminal-job retention GC when
+	// a FailedAfter window is set.
+	return s.accountTerminalWithFanOut(ctx, jobID, workerID, updates, "failed_count", false)
 }
 
 func deadLetterReason(lastError string) string {
@@ -639,9 +719,16 @@ func fanOutCounterStmt(col string) (stmt string, ok bool) {
 // has a fan-out, or nil. Increments nothing and returns core.ErrJobNotOwned if the
 // worker no longer owns the running job.
 //
+// When deleteCheckpoints is true (success path with the opt-in enabled), this
+// job's checkpoints are deleted in the SAME transaction, after the ownership
+// guard confirms RowsAffected>0 and BEFORE the fan-out lookup, so even
+// non-fan-out jobs are GC'd. The delete commits or rolls back with the status
+// flip — a crash can never leave a completed job with orphaned checkpoints. The
+// failure path passes false (retry replay needs them).
+//
 // Note: this builds a per-attempt copy of jobUpdates because the transaction
 // body may be retried after serialization failures.
-func (s *GormStorage) accountTerminalWithFanOut(ctx context.Context, jobID, workerID string, jobUpdates map[string]any, fanOutCounterCol string) (*core.FanOut, error) {
+func (s *GormStorage) accountTerminalWithFanOut(ctx context.Context, jobID, workerID string, jobUpdates map[string]any, fanOutCounterCol string, deleteCheckpoints bool) (*core.FanOut, error) {
 	var fanOut core.FanOut
 	var hasFanOut bool
 
@@ -674,6 +761,15 @@ func (s *GormStorage) accountTerminalWithFanOut(ctx context.Context, jobID, work
 				return core.ErrJobNotOwned
 			}
 
+			// Opt-in checkpoint GC on the success terminal write, committed in
+			// this same tx. Placed before the fan-out early-return so non-fan-out
+			// jobs are GC'd too. A lost-ownership write never reaches here.
+			if deleteCheckpoints {
+				if err := tx.Where("job_id = ?", jobID).Delete(&core.Checkpoint{}).Error; err != nil {
+					return err
+				}
+			}
+
 			var job core.Job
 			if err := tx.Select("fan_out_id").First(&job, "id = ?", jobID).Error; err != nil {
 				return err
@@ -702,6 +798,29 @@ func (s *GormStorage) accountTerminalWithFanOut(ctx context.Context, jobID, work
 				return err
 			}
 			hasFanOut = true
+
+			// Advance the fan-out status IN THE SAME TRANSACTION as the
+			// counter increment. The increment UPDATE above row-locks the
+			// fan_outs row (PG/MySQL) or serializes the whole write tx
+			// (SQLite), so this re-read reflects the post-increment counts
+			// (read-your-writes), and exactly one transaction — the one whose
+			// increment makes the counts terminal — observes done==true. The
+			// status UPDATE is pending-guarded, so it is a no-op if the status
+			// was somehow already advanced. Committing the increment and the
+			// status advance together means the DB can never be observed as
+			// status='pending' with terminal counts on this path: a crash
+			// before the commit loses the increment (the sub-job re-runs under
+			// at-least-once semantics); a crash after leaves a terminal status
+			// the existing GetWaitingJobsToResume query can rescue.
+			if done, termStatus := fanOut.TerminalStatus(); done {
+				res := tx.Model(&core.FanOut{}).
+					Where("id = ? AND status = ?", *job.FanOutID, core.FanOutPending).
+					Updates(map[string]any{"status": termStatus, "updated_at": now})
+				if res.Error != nil {
+					return res.Error
+				}
+				fanOut.Status = termStatus
+			}
 			return nil
 		})
 	})
@@ -982,12 +1101,24 @@ func (s *GormStorage) FindOrphanedJobs(ctx context.Context, jobIDs []string, wor
 // Returns the IDs of the jobs whose locks were released so the caller can
 // cancel any local in-flight handlers — see core.Storage.ReleaseStaleLocks
 // for the rationale.
+//
+// The cutoff is compared against COALESCE(last_heartbeat_at, started_at,
+// locked_until): the last *contact* the owning worker made, not its stacked
+// lease expiry. last_heartbeat_at is the live anchor (refreshed every heartbeat);
+// started_at is the fallback for a job that was dequeued but has not yet sent its
+// first heartbeat; locked_until is the last-resort fallback for directly-inserted
+// or pre-existing rows that have neither column populated. This makes reclaim
+// latency ~staleDuration ("time since last contact") rather than the old
+// ~lockDuration+staleDuration, which the lease-stacking Dequeue/Heartbeat pushes
+// inflated. last_heartbeat_at was written for exactly this purpose but was
+// previously never read by the reaper.
 func (s *GormStorage) ReleaseStaleLocks(ctx context.Context, staleDuration time.Duration) ([]string, error) {
 	// The cutoff is computed on the DB clock for multi-worker backends so it is
-	// comparable with the DB-clock locked_until written by Dequeue/Heartbeat.
-	// Comparing a client-computed cutoff against a DB-written lock is exactly the
-	// skew bug this avoids: a reaper whose wall clock ran ahead would otherwise
-	// reclaim a lock that is still live on the owning worker.
+	// comparable with the DB-clock last_heartbeat_at/started_at/locked_until
+	// written by Dequeue/Heartbeat. Comparing a client-computed cutoff against a
+	// DB-written timestamp is exactly the skew bug this avoids: a reaper whose
+	// wall clock ran ahead would otherwise reclaim a lock that is still live on
+	// the owning worker.
 	var cutoff any
 	if s.useDBClock() {
 		cutoff = s.offsetExpr(-staleDuration)
@@ -1008,7 +1139,7 @@ func (s *GormStorage) ReleaseStaleLocks(ctx context.Context, staleDuration time.
 			// cap bounds the IN-list update without needing a stable sort.
 			if err := tx.Model(&core.Job{}).
 				Where("status = ?", core.StatusRunning).
-				Where("locked_until < ?", cutoff).
+				Where("COALESCE(last_heartbeat_at, started_at, locked_until) < ?", cutoff).
 				Limit(maxResumeBatch).
 				Pluck("id", &released).Error; err != nil {
 				return err
@@ -1637,6 +1768,45 @@ func (s *GormStorage) GetStalledFanOutParents(ctx context.Context, olderThan tim
 	return jobs, nil
 }
 
+// GetCompletablePendingFanOuts finds fan-outs that are still status='pending'
+// but whose persisted counts already satisfy a terminal condition while their
+// parent job sits in StatusWaiting — the exact post-crash state left when a
+// worker died between the counter-increment commit and the (pre-P2) separate
+// status-advance transaction, plus any legacy/non-atomic increment path.
+//
+// The arithmetic predicate (completed+failed+cancelled >= total) OR failed>0
+// OR cancelled>0 is a portable SUPERSET of every FanOut.TerminalStatus()
+// terminal condition (collect_all/threshold resolve at accounted>=total; the
+// default fail_fast and threshold early-fail resolve at failed>0/cancelled>0).
+// The final terminal decision is made in Go by the caller via TerminalStatus(),
+// so a non-terminal row that slips through is a harmless no-op. Restricting to
+// parent status='waiting' avoids touching fan-outs whose parent is still
+// running (that parent self-resolves via its own checkFanOutCompletion).
+//
+// olderThan keeps the query portable across SQLite/PostgreSQL/MySQL and avoids
+// racing the live completion path on freshly-terminal fan-outs. The LIMIT
+// matches GetStalledFanOutParents: recovery is idempotent and self-draining.
+func (s *GormStorage) GetCompletablePendingFanOuts(ctx context.Context, olderThan time.Time) ([]*core.FanOut, error) {
+	var fanOuts []*core.FanOut
+	err := s.db.WithContext(ctx).Raw(`
+		SELECT f.* FROM fan_outs f
+		INNER JOIN jobs j ON j.id = f.parent_job_id
+		WHERE f.status = ?
+		AND j.status = ?
+		AND f.created_at < ?
+		AND (
+			f.completed_count + f.failed_count + f.cancelled_count >= f.total_count
+			OR f.failed_count > 0
+			OR f.cancelled_count > 0
+		)
+		LIMIT ?
+	`, core.FanOutPending, core.StatusWaiting, olderThan, maxResumeBatch).Scan(&fanOuts).Error
+	if err != nil {
+		return nil, err
+	}
+	return fanOuts, nil
+}
+
 // SaveJobResult stores the serialized result for a job.
 func (s *GormStorage) SaveJobResult(ctx context.Context, jobID string, workerID string, result []byte) error {
 	encoded, err := s.encodePayload("job result", jobID, result)
@@ -1697,6 +1867,7 @@ func (s *GormStorage) PauseJob(ctx context.Context, jobID string) error {
 						"status":       core.StatusCancelled,
 						"completed_at": now,
 						"updated_at":   now,
+						// non-PII constant; intentionally stored plaintext
 						"last_error":   "cancelled by user",
 						"locked_by":    "",
 						"locked_until": nil,

@@ -114,6 +114,22 @@ func TestJobResumedBySignal_EventMarker(t *testing.T) {
 	assert.Equal(t, "ctx", e.SignalName)
 }
 
+func TestJobReclaimed_EventMarker(t *testing.T) {
+	e := &JobReclaimed{
+		JobID:     "jr",
+		WorkerID:  "w1",
+		Reason:    ReclaimReasonStaleLock,
+		Timestamp: time.Now(),
+	}
+	e.eventMarker()
+
+	var _ Event = e
+	assert.NotNil(t, e)
+	assert.Equal(t, "jr", e.JobID)
+	assert.Equal(t, "w1", e.WorkerID)
+	assert.Equal(t, ReclaimReasonStaleLock, e.Reason)
+}
+
 func TestQueuePaused_EventMarker(t *testing.T) {
 	e := &QueuePaused{
 		Queue:     "emails",
@@ -190,6 +206,7 @@ func TestAllEvents_ImplementEventInterface(t *testing.T) {
 		&JobPaused{},
 		&JobResumed{},
 		&JobResumedBySignal{},
+		&JobReclaimed{},
 		&SignalDelivered{},
 		&QueuePaused{},
 		&QueueResumed{},
@@ -198,7 +215,7 @@ func TestAllEvents_ImplementEventInterface(t *testing.T) {
 		&CustomEvent{},
 	)
 
-	assert.Len(t, events, 14, "all event types should be in the list")
+	assert.Len(t, events, 15, "all event types should be in the list")
 	for _, e := range events {
 		assert.NotNil(t, e)
 	}

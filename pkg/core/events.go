@@ -86,6 +86,39 @@ type JobResumedBySignal struct {
 
 func (*JobResumedBySignal) eventMarker() {}
 
+// Reclaim reasons distinguish the two lease-reclaim observation sides.
+const (
+	// ReclaimReasonStaleLock marks a reclaim performed by THIS worker's
+	// stale-lock reaper — it released an expired lock on a job whose owner is
+	// presumed dead. This is the actor side and the true crash leading-indicator
+	// ("I recovered N jobs from presumed-dead peers"); operators alert on it.
+	ReclaimReasonStaleLock = "stale_lock"
+	// ReclaimReasonOwnershipAudit marks a reclaim observed by the ownership
+	// audit — a peer reclaimed a job THIS worker was still running. This is the
+	// victim side ("a peer took N of my in-flight jobs"), indicating this worker
+	// was wrongly presumed dead or stalled.
+	ReclaimReasonOwnershipAudit = "ownership_audit"
+)
+
+// JobReclaimed is emitted when a worker reclaims a job whose owner is presumed
+// dead, or observes a peer reclaim one of its own in-flight jobs. Reason
+// ReclaimReasonStaleLock means THIS worker's reaper released an expired lock
+// (actor side); ReclaimReasonOwnershipAudit means the audit observed a peer
+// reclaim a job THIS worker was running (victim side). WorkerID is the worker
+// emitting the event.
+//
+// In a multi-process fleet the same logical reclaim can surface once on the
+// reaper (stale_lock) and once on the victim (ownership_audit), on different
+// workers — keep the reason separable and do not sum across reasons.
+type JobReclaimed struct {
+	JobID     string
+	WorkerID  string
+	Reason    string
+	Timestamp time.Time
+}
+
+func (*JobReclaimed) eventMarker() {}
+
 // SignalDelivered is emitted when a signal is successfully persisted for a job
 // (via Signal). It lets an orchestrator observe that a signal landed; the job
 // consumes it later via WaitForSignal/CheckSignal/DrainSignals.

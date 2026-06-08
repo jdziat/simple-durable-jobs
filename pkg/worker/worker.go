@@ -52,6 +52,7 @@ type Worker struct {
 
 	rateLimitStorageMissingLogged atomic.Bool
 	retentionStorageMissingLogged atomic.Bool
+	retentionUnconfiguredLogged   atomic.Bool
 
 	// futureSleepSuppressions memoizes (jobID -> run_at) for sleeping jobs the
 	// signal-resume backstop has already inspected, capping checkpoint lookups
@@ -84,6 +85,15 @@ type scheduledFireSeeder interface {
 
 type completeWithResultStorage interface {
 	CompleteWithResult(ctx context.Context, jobID, workerID string, result []byte) (*core.FanOut, error)
+}
+
+// completablePendingFanOutStorage is implemented by backends that can find
+// fan-outs left status='pending' with terminal counts and a waiting parent —
+// the post-crash strand the recovery poll heals by routing each row through the
+// same completeFanOut path the live worker uses. Optional: backends without it
+// simply skip the backstop (they still benefit from the in-tx status advance).
+type completablePendingFanOutStorage interface {
+	GetCompletablePendingFanOuts(ctx context.Context, olderThan time.Time) ([]*core.FanOut, error)
 }
 
 type failTerminalWithResultStorage interface {
@@ -151,6 +161,12 @@ const (
 	// over to another worker within one TTL.
 	recoveryLeaseTTL          = 15 * time.Second
 	defaultConcurrencySlotTTL = 45 * time.Minute
+	// checkpointWriteTimeout bounds a cancellation-immune checkpoint write. The
+	// handler activity has already run by the time we persist the checkpoint, so
+	// the write must land even if the per-job deadline/cancellation just fired —
+	// otherwise the side effect re-runs on replay. Mirrors the 5s detached
+	// budget used by releaseDequeuedJobOnShutdown (worker.go:447).
+	checkpointWriteTimeout = 5 * time.Second
 )
 
 var signalResumePollBatchSize = 100
@@ -162,7 +178,7 @@ func NewWorker(q *queue.Queue, opts ...WorkerOption) *Worker {
 		PollInterval:     100 * time.Millisecond,
 		WorkerID:         uuid.New().String(),
 		DrainTimeout:     30 * time.Second,
-		DequeueBatchSize: 1,
+		DequeueBatchSize: 10,
 	}
 
 	for _, opt := range opts {
@@ -203,6 +219,27 @@ func NewWorker(q *queue.Queue, opts ...WorkerOption) *Worker {
 	if config.FanOutRecoveryStaleAge <= 0 {
 		config.FanOutRecoveryStaleAge = 2 * time.Minute
 	}
+
+	// Clamp the heartbeat interval below StaleLockAge. The reaper now reclaims a
+	// job from its LAST CONTACT — COALESCE(last_heartbeat_at, started_at,
+	// locked_until) < now-StaleLockAge — instead of from the (stacked) lease, so
+	// last_heartbeat_at must be refreshed several times within a StaleLockAge
+	// window or a live, not-yet-heartbeated job would anchor on started_at and
+	// could be falsely reclaimed and double-run. runHeartbeat ticks once per
+	// interval with NO immediate first beat, so the unprotected window is one
+	// full interval; keeping interval <= StaleLockAge/3 guarantees ~3 beats land
+	// before the stale window elapses. The default StaleLockAge (45m → 15m) leaves
+	// the 2m default untouched; the chaos harness's 2s StaleLockAge drives it to
+	// ~667ms, comfortably below 2s, and the 200ms floor keeps a sub-second
+	// (documented-unsupported) StaleLockAge from hammering the DB.
+	hbInterval := 2 * time.Minute
+	if maxHB := config.StaleLockAge / 3; maxHB > 0 && maxHB < hbInterval {
+		hbInterval = maxHB
+	}
+	if hbInterval < 200*time.Millisecond {
+		hbInterval = 200 * time.Millisecond
+	}
+
 	if config.MaxRetryBackoff <= 0 {
 		config.MaxRetryBackoff = time.Minute
 	}
@@ -215,6 +252,19 @@ func NewWorker(q *queue.Queue, opts ...WorkerOption) *Worker {
 		}
 		if setter, ok := q.Storage().(lockDurationSetter); ok {
 			setter.SetLockDuration(config.LockDuration)
+		}
+	}
+
+	// Propagate the opt-in checkpoint-on-complete GC to the storage backend if
+	// supported. Default off: the dashboard reads completed jobs' checkpoints, so
+	// only an explicit RetentionDeleteCheckpointsOnComplete() flips it on. Backends
+	// without the setter (no GormStorage) silently ignore the opt-in.
+	if config.Retention.DeleteCheckpointsOnComplete {
+		type checkpointGCSetter interface {
+			SetDeleteCheckpointsOnComplete(bool)
+		}
+		if setter, ok := q.Storage().(checkpointGCSetter); ok {
+			setter.SetDeleteCheckpointsOnComplete(true)
 		}
 	}
 
@@ -249,7 +299,7 @@ func NewWorker(q *queue.Queue, opts ...WorkerOption) *Worker {
 		slotJobID:               make(map[string][]string),
 		queueRateBuckets:        queueRateBuckets,
 		futureSleepSuppressions: make(map[string]int64),
-		heartbeatInterval:       2 * time.Minute,
+		heartbeatInterval:       hbInterval,
 	}
 }
 
@@ -289,6 +339,8 @@ func (w *Worker) Start(ctx context.Context) error {
 
 	if w.config.Retention.enabled() {
 		w.goTracked(func() { w.runRetention(ctx) })
+	} else {
+		w.warnIfRetentionUnconfigured()
 	}
 
 	for i := 0; i < totalConcurrency; i++ {
@@ -471,6 +523,19 @@ func (w *Worker) goTracked(fn func()) {
 		defer w.wg.Done()
 		fn()
 	}()
+}
+
+// warnIfRetentionUnconfigured emits exactly one WARN per worker process (deduped
+// via CompareAndSwap, so repeated Start calls don't re-log) when no retention
+// window is configured. It makes the silent "retention is fully opt-in" footgun
+// loud: completed/failed/cancelled job rows and consumed signals accumulate
+// forever until an operator enables retention. Checkpoints can be bounded
+// independently via jobs.RetentionDeleteCheckpointsOnComplete(), so the message
+// points operators at both the row/signal sweep and the inline checkpoint GC.
+func (w *Worker) warnIfRetentionUnconfigured() {
+	if w.retentionUnconfiguredLogged.CompareAndSwap(false, true) {
+		w.logger.Warn("retention is not configured; completed/failed/cancelled job rows and consumed signals accumulate forever — enable jobs.WithRetention(...) or jobs.DefaultRetention() to bound table growth (add jobs.RetentionDeleteCheckpointsOnComplete() to also prune successful jobs' checkpoints)")
+	}
 }
 
 func (w *Worker) runRetention(ctx context.Context) {
@@ -1162,7 +1227,16 @@ func (w *Worker) executeHandler(ctx context.Context, job *core.Job, h *handler.H
 			return w.queue.GetHandler(name)
 		},
 		SaveCheckpoint: func(ctx context.Context, cp *core.Checkpoint) error {
-			return w.queue.Storage().SaveCheckpoint(ctx, cp)
+			// The activity already ran; the checkpoint must land even if the
+			// per-job deadline/cancellation fired microseconds after the handler
+			// returned, or the (possibly non-idempotent) side effect re-runs on
+			// replay. Strip cancellation/deadline from the INCOMING ctx (which
+			// preserves a long-lived ctx supplied via CallWithCheckpointCtx) and
+			// apply an independent bounded budget. WithoutCancel keeps ctx values
+			// (OTel span, hooks), so tracing/propagation is unaffected.
+			writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), checkpointWriteTimeout)
+			defer cancel()
+			return w.queue.Storage().SaveCheckpoint(writeCtx, cp)
 		},
 	}
 	jobCtx := intctx.WithJobContext(ctx, jc)
@@ -1325,16 +1399,22 @@ func (w *Worker) checkFanOutCompletion(ctx context.Context, fo *core.FanOut) err
 // Uses atomic status update to prevent race conditions when multiple workers
 // complete the last sub-jobs simultaneously.
 func (w *Worker) completeFanOut(ctx context.Context, fo *core.FanOut, status core.FanOutStatus) error {
-	// Atomic update: only succeeds if status is still 'pending'
-	// This prevents race where two workers both try to complete
+	// Atomic update: only succeeds if status is still 'pending'. This is a CAS
+	// that picks at most one winner among concurrent live completers.
 	updated, err := w.queue.Storage().UpdateFanOutStatus(ctx, fo.ID, status)
 	if err != nil {
 		return err
 	}
 	if !updated {
-		// Another worker already completed this fan-out
-		w.logger.Debug("fan-out already completed by another worker", "fan_out_id", fo.ID)
-		return nil
+		// The status was already advanced — and, with P2's in-tx advance, the
+		// VERY worker responsible for resuming the parent (the last sub-job's
+		// own terminal transaction advanced the status) sees updated==false
+		// here. We must NOT early-return: completeFanOut is only ever reached
+		// from checkFanOutCompletion when done==true, so we fall through to the
+		// idempotent cancel+resume below. ResumeJob (parent status=waiting CAS),
+		// CancelSubJobs (still-pending sub-jobs only), and the local CancelJob
+		// are all idempotent, so a concurrent/duplicate caller is single-effect.
+		w.logger.Debug("fan-out status already terminal; proceeding to idempotent resume", "fan_out_id", fo.ID)
 	}
 
 	// Cancel remaining sub-jobs if needed. CancelSubJobs only updates the
@@ -1688,6 +1768,35 @@ func (w *Worker) pollWaitingJobsOnce(ctx context.Context) {
 		}
 	}
 
+	// Rescue fan-outs left status='pending' with terminal counts and a waiting
+	// parent — the post-crash strand where a worker died between the
+	// counter-increment commit and the status advance (or any non-atomic
+	// increment path). Each row is driven through checkFanOutCompletion →
+	// completeFanOut, the SAME UpdateFanOutStatus CAS + idempotent resume the
+	// live path uses, so this can never double-resume. Reuses stalledCutoff and
+	// inherits the recovery-lease gating applied by pollWaitingJobs.
+	if cps, ok := w.queue.Storage().(completablePendingFanOutStorage); ok {
+		var completable []*core.FanOut
+		err = retryWithBackoff(ctx, *w.config.StorageRetry, func() error {
+			var queryErr error
+			completable, queryErr = cps.GetCompletablePendingFanOuts(ctx, stalledCutoff)
+			return queryErr
+		})
+		if err != nil {
+			if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+				w.logger.Error("failed to get completable pending fan-outs after retries", "error", err)
+			}
+			return
+		}
+		for _, fo := range completable {
+			if resumeErr := w.checkFanOutCompletion(ctx, fo); resumeErr != nil {
+				w.logger.Error("failed to complete stranded pending fan-out", "fan_out_id", fo.ID, "error", resumeErr)
+			} else {
+				w.logger.Info("rescued stranded pending fan-out via polling fallback", "fan_out_id", fo.ID)
+			}
+		}
+	}
+
 	// Resume jobs waiting on a signal that has arrived (or whose timeout wake
 	// deadline has passed). This is the backstop for the deliver-vs-suspend
 	// race — a signal delivered just before SuspendJob commits would otherwise
@@ -1815,6 +1924,21 @@ func (w *Worker) pruneExpiredFutureSleepMemos(now time.Time) {
 	w.futureSleepMu.Unlock()
 }
 
+// emitReclaimed publishes a JobReclaimed event and fires the OnJobReclaimed
+// hooks for a single reclaimed job. It is best-effort observability only: the
+// emit may be dropped on full subscriber buffers and the hook list is copied
+// under RLock before invocation, matching every other Call*Hooks. A duplicate
+// emit is harmless (it only nudges a monotonic counter).
+func (w *Worker) emitReclaimed(ctx context.Context, jobID, reason string) {
+	w.queue.Emit(&core.JobReclaimed{
+		JobID:     jobID,
+		WorkerID:  w.config.WorkerID,
+		Reason:    reason,
+		Timestamp: time.Now(),
+	})
+	w.queue.CallJobReclaimedHooks(ctx, jobID, reason)
+}
+
 // reapStaleLocks periodically releases locks on jobs that are stuck in running
 // status with expired locks. This handles cases where:
 // - A worker crashed without properly completing/failing the job
@@ -1855,6 +1979,10 @@ func (w *Worker) reapStaleLocks(ctx context.Context) {
 			// cancel latency down to "next heartbeat tick."
 			cancelledLocally := 0
 			for _, jobID := range released {
+				// A reclaim is observable even when the original handler ran
+				// on a different worker (no local cancel target); emit for
+				// every released ID so the leading crash-indicator is visible.
+				w.emitReclaimed(ctx, jobID, core.ReclaimReasonStaleLock)
 				if w.CancelJob(jobID) {
 					cancelledLocally++
 				}
@@ -1914,6 +2042,9 @@ func (w *Worker) runOwnershipAudit(ctx context.Context) {
 
 			cancelled := 0
 			for _, id := range orphaned {
+				// Emit for every orphaned ID — a peer reclaiming our in-flight
+				// job is observable even if the local handler already exited.
+				w.emitReclaimed(ctx, id, core.ReclaimReasonOwnershipAudit)
 				if w.CancelJob(id) {
 					cancelled++
 				}

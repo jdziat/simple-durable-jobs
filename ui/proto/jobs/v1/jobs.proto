@@ -108,6 +108,9 @@ message Event {
   Job job = 2;
   google.protobuf.Timestamp timestamp = 3;
   string queue = 4;
+  string job_id = 5;
+  string worker_id = 6;
+  string reason = 7;
 }
 
 // --- Requests/Responses ---

@@ -27,6 +27,7 @@ func TestCoreEventToProto_AllTypes(t *testing.T) {
 		{&core.QueueResumed{Queue: "default", Timestamp: now}, "queue.resumed"},
 		{&core.WorkerPaused{WorkerID: "w1", Timestamp: now}, "worker.paused"},
 		{&core.WorkerResumed{WorkerID: "w1", Timestamp: now}, "worker.resumed"},
+		{&core.JobReclaimed{JobID: "j1", WorkerID: "w1", Reason: core.ReclaimReasonStaleLock, Timestamp: now}, "job.reclaimed"},
 	}
 
 	for _, tt := range tests {
@@ -55,6 +56,23 @@ func TestCoreEventToProto_JobFields(t *testing.T) {
 	assert.Equal(t, "send-email", ev.Job.Type)
 	assert.Equal(t, int32(5), ev.Job.Priority)
 	assert.Equal(t, int32(2), ev.Job.Attempt)
+}
+
+func TestCoreEventToProto_JobReclaimedFields(t *testing.T) {
+	now := time.Now()
+
+	ev := coreEventToProto(&core.JobReclaimed{
+		JobID:     "j1",
+		WorkerID:  "w1",
+		Reason:    core.ReclaimReasonStaleLock,
+		Timestamp: now,
+	})
+	require.NotNil(t, ev)
+	assert.Equal(t, "job.reclaimed", ev.Type)
+	assert.Equal(t, "j1", ev.GetJobId())
+	assert.Equal(t, "w1", ev.GetWorkerId())
+	assert.Equal(t, "stale_lock", ev.GetReason())
+	assert.Nil(t, ev.Job)
 }
 
 func TestCoreEventToProto_QueueEvents_NoJobField(t *testing.T) {

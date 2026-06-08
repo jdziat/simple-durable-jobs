@@ -31,6 +31,8 @@ Ensures only one pending-or-running job with this `key` exists. If a matching jo
 
 Records a per-job timeout on the job record. The value is surfaced on the job metadata and in events — applications should enforce it via the handler's `context.Context` or external monitoring; the queue does not cancel handlers automatically.
 
+Even when a handler's own deadline or cancellation fires the moment a `Call()` step (or `SavePhaseCheckpoint()` phase) completes, that step's checkpoint is still persisted: the engine writes it on a detached context (cancellation/deadline stripped, with an independent ~5s budget), so a completed step is never lost and re-run on replay because the deadline expired microseconds after the handler returned.
+
 ### `WithHandlerBackoff(p BackoffPolicy) Option`
 
 Sets a registration-time retry backoff policy for the handler. This overrides

@@ -2,10 +2,19 @@ package storage
 
 import (
 	"bytes"
+	"encoding/base64"
 	"fmt"
+	"strings"
 
 	"github.com/jdziat/simple-durable-jobs/pkg/core"
 )
+
+// errTextTag marks an encrypted-then-base64 segment inside a plaintext-bearing
+// TEXT column (last_error / dead_letter_reason). The trailing colon is NOT in
+// the base64 alphabet, so the tag can never appear inside a base64 token. The
+// tag may sit AFTER a fixed label (e.g. "max retries exhausted: sdjenc:..."),
+// so decode scans for it with strings.Index rather than HasPrefix.
+const errTextTag = "sdjenc:"
 
 func (s *GormStorage) encodePayload(kind, id string, b []byte) ([]byte, error) {
 	if len(b) == 0 {
@@ -27,6 +36,54 @@ func (s *GormStorage) decodePayload(kind, id string, b []byte) ([]byte, error) {
 		return nil, fmt.Errorf("%w: %s %s: %w", core.ErrPayloadDecode, kind, id, err)
 	}
 	return decoded, nil
+}
+
+// encodeErrorText encrypts handler error text (last_error / dead_letter_reason
+// suffix) for storage in a TEXT column. Secretbox output contains NUL bytes and
+// non-UTF8 sequences that Postgres TEXT rejects and MySQL TEXT may mangle, so
+// the binary ciphertext is base64-encoded behind the errTextTag. Under the
+// default identity codec the bytes are unchanged (bytes.Equal short-circuit) and
+// the plaintext is stored verbatim — zero behavior change. Empty input stays
+// empty so the Requeue/RetryJob clear-to-"" sites are untouched.
+func (s *GormStorage) encodeErrorText(kind, id, plaintext string) (string, error) {
+	if plaintext == "" {
+		return "", nil
+	}
+	encoded, err := s.codec.Encode([]byte(plaintext))
+	if err != nil {
+		return "", fmt.Errorf("storage: encode %s payload %s: %w", kind, id, err)
+	}
+	if bytes.Equal(encoded, []byte(plaintext)) {
+		// Identity / pass-through codec: store readable plaintext, no tag.
+		return plaintext, nil
+	}
+	return errTextTag + base64.StdEncoding.EncodeToString(encoded), nil
+}
+
+// decodeErrorText reverses encodeErrorText. Untagged values (legacy plaintext or
+// identity codec) are returned verbatim. A tagged value whose token is not valid
+// base64 is a coincidental plaintext that merely contains the tag substring and
+// is returned untouched (soft pass-through). A tagged value with a valid-base64
+// token that the codec cannot open means wrong key / corruption and surfaces as
+// core.ErrPayloadDecode, mirroring decodePayload. The tag may follow a fixed
+// label, so any plaintext prefix before the tag is preserved.
+func (s *GormStorage) decodeErrorText(kind, id, stored string) (string, error) {
+	idx := strings.Index(stored, errTextTag)
+	if idx < 0 {
+		return stored, nil
+	}
+	prefix := stored[:idx]
+	token := stored[idx+len(errTextTag):]
+	raw, berr := base64.StdEncoding.DecodeString(token)
+	if berr != nil {
+		// Coincidental plaintext containing the tag but not our encoding.
+		return stored, nil
+	}
+	decoded, derr := s.codec.Decode(raw)
+	if derr != nil {
+		return "", fmt.Errorf("%w: %s %s: %w", core.ErrPayloadDecode, kind, id, derr)
+	}
+	return prefix + string(decoded), nil
 }
 
 func (s *GormStorage) encodedJobForCreate(job *core.Job) (*core.Job, error) {
@@ -66,8 +123,18 @@ func (s *GormStorage) decodeJobPayloads(job *core.Job) error {
 	if err != nil {
 		return err
 	}
+	le, err := s.decodeErrorText("job last_error", job.ID, job.LastError)
+	if err != nil {
+		return err
+	}
+	dr, err := s.decodeErrorText("job dead_letter_reason", job.ID, job.DeadLetterReason)
+	if err != nil {
+		return err
+	}
 	job.Args = args
 	job.Result = result
+	job.LastError = le
+	job.DeadLetterReason = dr
 	return nil
 }
 

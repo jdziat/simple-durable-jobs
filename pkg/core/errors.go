@@ -24,6 +24,8 @@ var (
 	ErrCannotPauseStatus  = errors.New("jobs: cannot pause job in current status")
 	ErrJobNotFound        = errors.New("jobs: job not found")
 	ErrJobNotCompleted    = errors.New("jobs: job has not completed")
+	ErrJobFailed          = errors.New("jobs: job failed")
+	ErrJobCancelled       = errors.New("jobs: job was cancelled")
 	ErrNoResult           = errors.New("jobs: completed job has no result")
 	// ErrCannotRequeueSubJob is returned by Requeue for a fan-out sub-job:
 	// requeuing it directly would double-count its parent's fan-out. Requeue the
@@ -127,6 +129,8 @@ var sentinelsByKey = map[string]error{
 	"ErrCannotPauseStatus":  ErrCannotPauseStatus,
 	"ErrJobNotFound":        ErrJobNotFound,
 	"ErrJobNotCompleted":    ErrJobNotCompleted,
+	"ErrJobFailed":          ErrJobFailed,
+	"ErrJobCancelled":       ErrJobCancelled,
 	"ErrNoResult":           ErrNoResult,
 }
 

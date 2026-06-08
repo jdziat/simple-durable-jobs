@@ -161,5 +161,5 @@ func TestWithDequeueBatchSizeClamps(t *testing.T) {
 	assert.Equal(t, maxDequeueBatch, high.DequeueBatchSize)
 
 	w := NewWorker(queue.New(&mockStorage{}))
-	assert.Equal(t, 1, w.config.DequeueBatchSize)
+	assert.Equal(t, 10, w.config.DequeueBatchSize)
 }

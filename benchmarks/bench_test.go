@@ -227,9 +227,12 @@ func benchmarkEndToEnd(b *testing.B, dequeueBatch int) {
 			jobs.WithPollInterval(benchPollInterval),
 			jobs.WithDrainTimeout(5 * time.Second),
 		}
-		if dequeueBatch > 1 {
-			opts = append(opts, jobs.WithDequeueBatchSize(dequeueBatch))
-		}
+		// Pin the dequeue batch size unconditionally so BenchmarkEndToEnd
+		// (dequeueBatch == 1) measures genuine single-row dequeue regardless of
+		// the worker's batched default, preserving the documented ~20 jobs/sec
+		// poll-floor row and keeping the checked-in benchstat baselines
+		// comparable. BenchmarkEndToEndBatchDequeue passes the batch size directly.
+		opts = append(opts, jobs.WithDequeueBatchSize(dequeueBatch))
 		worker := jobs.NewWorker(env.queue, opts...)
 
 		b.StartTimer()
