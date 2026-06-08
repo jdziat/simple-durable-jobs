@@ -28,7 +28,7 @@ jobs:
       # with a long timeout. -race stays on.
       GO_TEST_FLAGS: "-race -timeout=35m -run ^TestStress_"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       - name: Build test image
         run: docker compose build tests
@@ -58,6 +58,6 @@ jobs:
       matrix:
         backend: [postgres, mysql]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Run chaos harness
         run: bash scripts/chaos-test.sh ${{ matrix.backend }}
