@@ -606,6 +606,14 @@ func WithRetention(opts ...RetentionOption) WorkerOption {
 	return worker.WithRetention(opts...)
 }
 
+// DefaultRetention is an explicit opt-in conservative retention preset (NOT a
+// silent default): completed jobs 7 days, terminal failed/cancelled jobs 30
+// days, consumed signals 7 days. Tune individual windows by composing the
+// Retention* options under WithRetention instead.
+func DefaultRetention() WorkerOption {
+	return worker.DefaultRetention()
+}
+
 // RetentionCompletedAfter deletes completed jobs older than d. A non-positive
 // duration keeps completed jobs forever.
 func RetentionCompletedAfter(d time.Duration) RetentionOption {
@@ -633,6 +641,15 @@ func RetentionInterval(d time.Duration) RetentionOption {
 // RetentionBatchSize sets the maximum rows deleted in one pass.
 func RetentionBatchSize(n int) RetentionOption {
 	return worker.RetentionBatchSize(n)
+}
+
+// RetentionDeleteCheckpointsOnComplete opts in to deleting a successful job's
+// checkpoints transactionally with its completion, bounding the checkpoints
+// table without a background sweep. Off by default because the dashboard reads
+// completed jobs' checkpoints for finished-workflow phase results; the failure
+// path is never affected (retry replay keeps checkpoints).
+func RetentionDeleteCheckpointsOnComplete() RetentionOption {
+	return worker.RetentionDeleteCheckpointsOnComplete()
 }
 
 // WithQueueRateLimit applies a per-worker token bucket before dequeueing from

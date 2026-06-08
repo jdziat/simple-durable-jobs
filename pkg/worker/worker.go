@@ -52,6 +52,7 @@ type Worker struct {
 
 	rateLimitStorageMissingLogged atomic.Bool
 	retentionStorageMissingLogged atomic.Bool
+	retentionUnconfiguredLogged   atomic.Bool
 
 	// futureSleepSuppressions memoizes (jobID -> run_at) for sleeping jobs the
 	// signal-resume backstop has already inspected, capping checkpoint lookups
@@ -254,6 +255,19 @@ func NewWorker(q *queue.Queue, opts ...WorkerOption) *Worker {
 		}
 	}
 
+	// Propagate the opt-in checkpoint-on-complete GC to the storage backend if
+	// supported. Default off: the dashboard reads completed jobs' checkpoints, so
+	// only an explicit RetentionDeleteCheckpointsOnComplete() flips it on. Backends
+	// without the setter (no GormStorage) silently ignore the opt-in.
+	if config.Retention.DeleteCheckpointsOnComplete {
+		type checkpointGCSetter interface {
+			SetDeleteCheckpointsOnComplete(bool)
+		}
+		if setter, ok := q.Storage().(checkpointGCSetter); ok {
+			setter.SetDeleteCheckpointsOnComplete(true)
+		}
+	}
+
 	// Initialize per-queue concurrency counters
 	queueRunning := make(map[string]*atomic.Int32, len(config.Queues))
 	for name := range config.Queues {
@@ -325,6 +339,8 @@ func (w *Worker) Start(ctx context.Context) error {
 
 	if w.config.Retention.enabled() {
 		w.goTracked(func() { w.runRetention(ctx) })
+	} else {
+		w.warnIfRetentionUnconfigured()
 	}
 
 	for i := 0; i < totalConcurrency; i++ {
@@ -507,6 +523,19 @@ func (w *Worker) goTracked(fn func()) {
 		defer w.wg.Done()
 		fn()
 	}()
+}
+
+// warnIfRetentionUnconfigured emits exactly one WARN per worker process (deduped
+// via CompareAndSwap, so repeated Start calls don't re-log) when no retention
+// window is configured. It makes the silent "retention is fully opt-in" footgun
+// loud: completed/failed/cancelled job rows and consumed signals accumulate
+// forever until an operator enables retention. Checkpoints can be bounded
+// independently via jobs.RetentionDeleteCheckpointsOnComplete(), so the message
+// points operators at both the row/signal sweep and the inline checkpoint GC.
+func (w *Worker) warnIfRetentionUnconfigured() {
+	if w.retentionUnconfiguredLogged.CompareAndSwap(false, true) {
+		w.logger.Warn("retention is not configured; completed/failed/cancelled job rows and consumed signals accumulate forever — enable jobs.WithRetention(...) or jobs.DefaultRetention() to bound table growth (add jobs.RetentionDeleteCheckpointsOnComplete() to also prune successful jobs' checkpoints)")
+	}
 }
 
 func (w *Worker) runRetention(ctx context.Context) {

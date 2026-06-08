@@ -71,6 +71,16 @@ type GormStorage struct {
 	lockDuration    time.Duration
 	codec           core.PayloadCodec
 	skipDefaultPool bool
+
+	// deleteCheckpointsOnComplete, when true, deletes a job's checkpoints in the
+	// SAME transaction as its success terminal write (Complete /
+	// CompleteWithResult). It is OFF by default: the dashboard reads completed
+	// jobs' checkpoints to show finished-workflow phase results, so deleting them
+	// silently would blank that panel. Operators opt in via the worker's
+	// RetentionDeleteCheckpointsOnComplete option (wired through
+	// SetDeleteCheckpointsOnComplete) to bound the checkpoints table. Never
+	// affects the failure path — retry replay reads checkpoints.
+	deleteCheckpointsOnComplete bool
 }
 
 // NewGormStorage creates a new GORM-backed storage. For file-based SQLite under
@@ -117,6 +127,15 @@ func NewGormStorage(db *gorm.DB, opts ...GormStorageOption) *GormStorage {
 // This is used by the worker when WithLockDuration is passed as a worker option.
 func (s *GormStorage) SetLockDuration(d time.Duration) {
 	s.lockDuration = d
+}
+
+// SetDeleteCheckpointsOnComplete toggles transactional checkpoint GC on the
+// success terminal write. The worker calls it when the opt-in
+// RetentionDeleteCheckpointsOnComplete option is set. Default (unset) preserves
+// completed-job checkpoints so the dashboard can still show their phase results.
+// It never affects the failure path; retry replay always keeps checkpoints.
+func (s *GormStorage) SetDeleteCheckpointsOnComplete(enabled bool) {
+	s.deleteCheckpointsOnComplete = enabled
 }
 
 // IsSQLite returns true if the storage is using SQLite.
@@ -519,25 +538,37 @@ func (s *GormStorage) dequeueSQLite(ctx context.Context, queues []string, worker
 
 // Complete marks a job as successfully completed.
 // Validates that the worker owns the job before completing.
+//
+// The status flip and the opt-in checkpoint GC are wrapped in one transaction so
+// the delete commits atomically with success: a crash either rolls back both
+// (the job stays running and is replayed) or commits both. Checkpoints are
+// deleted only when SetDeleteCheckpointsOnComplete(true) was set; the default
+// keeps them for the dashboard. A not-owned Complete deletes nothing.
 func (s *GormStorage) Complete(ctx context.Context, jobID string, workerID string) error {
 	now := time.Now()
-	result := s.db.WithContext(ctx).
-		Model(&core.Job{}).
-		Where("id = ? AND locked_by = ? AND status = ?", jobID, workerID, core.StatusRunning).
-		Updates(map[string]any{
-			"status":       core.StatusCompleted,
-			"completed_at": now,
-			"locked_by":    "",
-			"locked_until": nil,
-		})
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		result := tx.Model(&core.Job{}).
+			Where("id = ? AND locked_by = ? AND status = ?", jobID, workerID, core.StatusRunning).
+			Updates(map[string]any{
+				"status":       core.StatusCompleted,
+				"completed_at": now,
+				"locked_by":    "",
+				"locked_until": nil,
+			})
 
-	if result.Error != nil {
-		return result.Error
-	}
-	if result.RowsAffected == 0 {
-		return core.ErrJobNotOwned
-	}
-	return nil
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 0 {
+			return core.ErrJobNotOwned
+		}
+		if s.deleteCheckpointsOnComplete {
+			if err := tx.Where("job_id = ?", jobID).Delete(&core.Checkpoint{}).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 // CompleteWithResult marks a job completed and, when it is a sub-job, accounts
@@ -555,7 +586,9 @@ func (s *GormStorage) CompleteWithResult(ctx context.Context, jobID, workerID st
 		}
 		updates["result"] = encoded
 	}
-	return s.accountTerminalWithFanOut(ctx, jobID, workerID, updates, "completed_count")
+	// Success path: GC this job's checkpoints in the same tx ONLY when the
+	// opt-in is enabled (default off keeps them for the dashboard).
+	return s.accountTerminalWithFanOut(ctx, jobID, workerID, updates, "completed_count", s.deleteCheckpointsOnComplete)
 }
 
 // Fail marks a job as failed, optionally scheduling a retry.
@@ -624,7 +657,10 @@ func (s *GormStorage) FailTerminalWithResult(ctx context.Context, jobID, workerI
 		"locked_until":      nil,
 		deadLetterReasonKey: encErr,
 	}
-	return s.accountTerminalWithFanOut(ctx, jobID, workerID, updates, "failed_count")
+	// Terminal failure: NEVER delete checkpoints. They are retained for
+	// debugging/inspection and are still swept by terminal-job retention GC when
+	// a FailedAfter window is set.
+	return s.accountTerminalWithFanOut(ctx, jobID, workerID, updates, "failed_count", false)
 }
 
 func deadLetterReason(lastError string) string {
@@ -673,9 +709,16 @@ func fanOutCounterStmt(col string) (stmt string, ok bool) {
 // has a fan-out, or nil. Increments nothing and returns core.ErrJobNotOwned if the
 // worker no longer owns the running job.
 //
+// When deleteCheckpoints is true (success path with the opt-in enabled), this
+// job's checkpoints are deleted in the SAME transaction, after the ownership
+// guard confirms RowsAffected>0 and BEFORE the fan-out lookup, so even
+// non-fan-out jobs are GC'd. The delete commits or rolls back with the status
+// flip — a crash can never leave a completed job with orphaned checkpoints. The
+// failure path passes false (retry replay needs them).
+//
 // Note: this builds a per-attempt copy of jobUpdates because the transaction
 // body may be retried after serialization failures.
-func (s *GormStorage) accountTerminalWithFanOut(ctx context.Context, jobID, workerID string, jobUpdates map[string]any, fanOutCounterCol string) (*core.FanOut, error) {
+func (s *GormStorage) accountTerminalWithFanOut(ctx context.Context, jobID, workerID string, jobUpdates map[string]any, fanOutCounterCol string, deleteCheckpoints bool) (*core.FanOut, error) {
 	var fanOut core.FanOut
 	var hasFanOut bool
 
@@ -706,6 +749,15 @@ func (s *GormStorage) accountTerminalWithFanOut(ctx context.Context, jobID, work
 			}
 			if update.RowsAffected == 0 {
 				return core.ErrJobNotOwned
+			}
+
+			// Opt-in checkpoint GC on the success terminal write, committed in
+			// this same tx. Placed before the fan-out early-return so non-fan-out
+			// jobs are GC'd too. A lost-ownership write never reaches here.
+			if deleteCheckpoints {
+				if err := tx.Where("job_id = ?", jobID).Delete(&core.Checkpoint{}).Error; err != nil {
+					return err
+				}
 			}
 
 			var job core.Job

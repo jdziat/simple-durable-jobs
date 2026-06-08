@@ -72,8 +72,19 @@ type RetentionConfig struct {
 	ConsumedSignalsAfter time.Duration
 	Interval             time.Duration
 	BatchSize            int
+
+	// DeleteCheckpointsOnComplete, when true, deletes a successful job's
+	// checkpoints in the same transaction as its completion to bound the
+	// checkpoints table. It is OFF by default because the dashboard reads
+	// completed jobs' checkpoints to render finished-workflow phase results;
+	// enabling it accepts an empty checkpoints panel for completed jobs in
+	// exchange for a bounded table. Never affects the failure path.
+	DeleteCheckpointsOnComplete bool
 }
 
+// enabled reports whether any background retention sweep should run. The
+// checkpoint-on-complete GC is NOT a sweep (it happens inline on the completion
+// write), so it does not by itself start the retention goroutine.
 func (c RetentionConfig) enabled() bool {
 	return c.CompletedAfter > 0 || c.FailedAfter > 0 || c.ConsumedSignalsAfter > 0
 }
@@ -250,6 +261,24 @@ func RateLimit(name string, perSecond float64, opts ...RateLimitOption) WorkerOp
 	})
 }
 
+// DefaultRetention is an EXPLICIT opt-in conservative retention preset — it is
+// NOT a silent default. It enables automatic GC of terminal job rows and
+// consumed signals with conservative windows (completed jobs 7 days, terminal
+// failed/cancelled jobs 30 days, consumed signals 7 days). Tune individual
+// windows by composing the Retention* options under WithRetention instead.
+//
+// This preset adds only the job-row/signal sweeps; it does NOT prune completed
+// jobs' checkpoints (those stay readable in the dashboard). To also GC a
+// successful job's checkpoints inline on completion, add
+// RetentionDeleteCheckpointsOnComplete().
+func DefaultRetention() WorkerOption {
+	return WithRetention(
+		RetentionCompletedAfter(7*24*time.Hour),
+		RetentionFailedAfter(30*24*time.Hour),
+		RetentionConsumedSignalsAfter(7*24*time.Hour),
+	)
+}
+
 // WithRetention enables optional automatic garbage collection when at least one
 // retention window is positive. With no positive windows it is a no-op and
 // starts no retention goroutine.
@@ -324,6 +353,21 @@ func RetentionInterval(d time.Duration) RetentionOption {
 func RetentionBatchSize(n int) RetentionOption {
 	return func(c *RetentionConfig) {
 		c.BatchSize = n
+	}
+}
+
+// RetentionDeleteCheckpointsOnComplete opts in to deleting a successful job's
+// checkpoints in the same transaction as its completion, bounding the
+// checkpoints table with no background sweep. It is OFF by default because the
+// dashboard reads completed jobs' checkpoints to show finished-workflow phase
+// results — enabling it blanks that panel for completed jobs. It NEVER affects
+// the failure path: retryable and dead-lettered jobs keep their checkpoints for
+// replay and inspection. Requires a storage backend that implements
+// SetDeleteCheckpointsOnComplete (the built-in GormStorage does); other backends
+// ignore it.
+func RetentionDeleteCheckpointsOnComplete() RetentionOption {
+	return func(c *RetentionConfig) {
+		c.DeleteCheckpointsOnComplete = true
 	}
 }
 
