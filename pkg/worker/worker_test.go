@@ -17,8 +17,10 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 
+	"github.com/jdziat/simple-durable-jobs/pkg/call"
 	"github.com/jdziat/simple-durable-jobs/pkg/core"
 	"github.com/jdziat/simple-durable-jobs/pkg/fanout"
+	"github.com/jdziat/simple-durable-jobs/pkg/jobctx"
 	"github.com/jdziat/simple-durable-jobs/pkg/queue"
 	"github.com/jdziat/simple-durable-jobs/pkg/schedule"
 	"github.com/jdziat/simple-durable-jobs/pkg/signal"
@@ -42,6 +44,7 @@ type mockStorage struct {
 	failFunc               func(ctx context.Context, jobID string, workerID string, errMsg string, retryAt *time.Time) error
 	heartbeatFunc          func(ctx context.Context, jobID string, workerID string) error
 	checkpointFunc         func(ctx context.Context, jobID string) ([]core.Checkpoint, error)
+	saveCheckpointFunc     func(ctx context.Context, cp *core.Checkpoint) error
 	waitingJobsFunc        func(ctx context.Context) ([]*core.Job, error)
 	stalledJobsFunc        func(ctx context.Context, olderThan time.Time) ([]*core.Job, error)
 	signalWaitingAfterFunc func(ctx context.Context, afterJobID string, limit int) ([]*core.Job, error)
@@ -121,7 +124,12 @@ func (m *mockStorage) EnqueueUnique(ctx context.Context, job *core.Job, uniqueKe
 	return nil
 }
 
-func (m *mockStorage) SaveCheckpoint(_ context.Context, _ *core.Checkpoint) error { return nil }
+func (m *mockStorage) SaveCheckpoint(ctx context.Context, cp *core.Checkpoint) error {
+	if m.saveCheckpointFunc != nil {
+		return m.saveCheckpointFunc(ctx, cp)
+	}
+	return nil
+}
 
 func (m *mockStorage) GetCheckpoints(ctx context.Context, jobID string) ([]core.Checkpoint, error) {
 	if m.checkpointFunc != nil {
@@ -2159,6 +2167,129 @@ func TestWorker_ExecuteHandler_GetCheckpointsError(t *testing.T) {
 	case <-time.After(1500 * time.Millisecond):
 		t.Fatal("job with checkpoint error did not result in failure")
 	}
+}
+
+// TestExecuteHandler_CheckpointWriteSurvivesJobCancellation is the regression
+// test for finding #4 (DEADBOLT P3): the default checkpoint write must land even
+// when the per-job context is already cancelled/expired as the handler returns,
+// or a non-idempotent side effect re-runs on replay.
+//
+// Under the old closure (return Storage().SaveCheckpoint(ctx, cp)) the captured
+// ctx carries the per-job cancellation, so captured.Err() == context.Canceled.
+// After the fix the closure wraps the incoming ctx with WithoutCancel + a bounded
+// deadline, so the storage write sees a live context.
+func TestExecuteHandler_CheckpointWriteSurvivesJobCancellation(t *testing.T) {
+	var (
+		capturedErr error
+		sawWrite    bool
+		capturedCP  *core.Checkpoint
+	)
+	mock := &mockStorage{
+		checkpointFunc: func(_ context.Context, _ string) ([]core.Checkpoint, error) {
+			return nil, nil
+		},
+		saveCheckpointFunc: func(ctx context.Context, cp *core.Checkpoint) error {
+			// Capture the ctx state AT THE STORAGE BOUNDARY — checking after the
+			// closure returns would observe its deferred cancel() instead.
+			sawWrite = true
+			capturedErr = ctx.Err()
+			capturedCP = cp
+			return nil
+		},
+	}
+	q := queue.New(mock)
+
+	const jobType = "phase-checkpoint-job"
+	q.Register(jobType, func(c context.Context, _ struct{}) error {
+		return jobctx.SavePhaseCheckpoint(c, "phase", "v")
+	})
+
+	h, ok := q.GetHandler(jobType)
+	require.True(t, ok, "handler must be registered")
+
+	w := NewWorker(q, WithStaleLockInterval(0))
+
+	// A pre-cancelled per-job context: this is exactly the state when the per-job
+	// deadline fires microseconds after the activity returns but before the
+	// checkpoint is persisted.
+	jobCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	job := &core.Job{
+		ID:    "phase-job-1",
+		Type:  jobType,
+		Queue: "default",
+		Args:  []byte(`{}`),
+	}
+
+	_, err := w.executeHandler(jobCtx, job, h)
+	require.NoError(t, err)
+
+	require.True(t, sawWrite, "storage must have received a checkpoint write")
+	// The crux of the regression: the storage boundary sees a live context even
+	// though the per-job context was cancelled before the write.
+	require.NoError(t, capturedErr,
+		"checkpoint write context must not be cancelled (was %v)", capturedErr)
+	require.NotNil(t, capturedCP)
+	require.Equal(t, "phase", capturedCP.CallType,
+		"the phase checkpoint must be the one written")
+}
+
+// TestExecuteHandler_CheckpointWriteSurvivesJobCancellation_CallPath proves the
+// protection covers the default Call path too, not only SavePhaseCheckpoint —
+// the nested-call checkpoint must also land with a non-cancelled storage ctx.
+func TestExecuteHandler_CheckpointWriteSurvivesJobCancellation_CallPath(t *testing.T) {
+	var (
+		capturedErr error
+		sawWrite    bool
+		capturedCP  *core.Checkpoint
+	)
+	mock := &mockStorage{
+		checkpointFunc: func(_ context.Context, _ string) ([]core.Checkpoint, error) {
+			return nil, nil
+		},
+		saveCheckpointFunc: func(ctx context.Context, cp *core.Checkpoint) error {
+			sawWrite = true
+			capturedErr = ctx.Err()
+			capturedCP = cp
+			return nil
+		},
+	}
+	q := queue.New(mock)
+
+	const subHandler = "call-sub"
+	q.Register(subHandler, func(_ context.Context, _ struct{}) (string, error) {
+		return "ok", nil
+	})
+
+	const parentType = "call-parent-job"
+	q.Register(parentType, func(c context.Context, _ struct{}) error {
+		_, err := call.Call[string](c, subHandler, struct{}{})
+		return err
+	})
+
+	h, ok := q.GetHandler(parentType)
+	require.True(t, ok, "parent handler must be registered")
+
+	w := NewWorker(q, WithStaleLockInterval(0))
+
+	jobCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	job := &core.Job{
+		ID:    "call-parent-1",
+		Type:  parentType,
+		Queue: "default",
+		Args:  []byte(`{}`),
+	}
+
+	_, err := w.executeHandler(jobCtx, job, h)
+	require.NoError(t, err)
+
+	require.True(t, sawWrite, "the nested Call checkpoint must be written")
+	require.NoError(t, capturedErr,
+		"nested Call checkpoint write context must not be cancelled (was %v)", capturedErr)
+	require.NotNil(t, capturedCP)
 }
 
 // ---------------------------------------------------------------------------

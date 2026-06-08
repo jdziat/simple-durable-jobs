@@ -160,6 +160,12 @@ const (
 	// over to another worker within one TTL.
 	recoveryLeaseTTL          = 15 * time.Second
 	defaultConcurrencySlotTTL = 45 * time.Minute
+	// checkpointWriteTimeout bounds a cancellation-immune checkpoint write. The
+	// handler activity has already run by the time we persist the checkpoint, so
+	// the write must land even if the per-job deadline/cancellation just fired —
+	// otherwise the side effect re-runs on replay. Mirrors the 5s detached
+	// budget used by releaseDequeuedJobOnShutdown (worker.go:447).
+	checkpointWriteTimeout = 5 * time.Second
 )
 
 var signalResumePollBatchSize = 100
@@ -1171,7 +1177,16 @@ func (w *Worker) executeHandler(ctx context.Context, job *core.Job, h *handler.H
 			return w.queue.GetHandler(name)
 		},
 		SaveCheckpoint: func(ctx context.Context, cp *core.Checkpoint) error {
-			return w.queue.Storage().SaveCheckpoint(ctx, cp)
+			// The activity already ran; the checkpoint must land even if the
+			// per-job deadline/cancellation fired microseconds after the handler
+			// returned, or the (possibly non-idempotent) side effect re-runs on
+			// replay. Strip cancellation/deadline from the INCOMING ctx (which
+			// preserves a long-lived ctx supplied via CallWithCheckpointCtx) and
+			// apply an independent bounded budget. WithoutCancel keeps ctx values
+			// (OTel span, hooks), so tracing/propagation is unaffected.
+			writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), checkpointWriteTimeout)
+			defer cancel()
+			return w.queue.Storage().SaveCheckpoint(writeCtx, cp)
 		},
 	}
 	jobCtx := intctx.WithJobContext(ctx, jc)
