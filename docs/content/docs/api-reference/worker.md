@@ -98,7 +98,7 @@ Sets how often the worker checks for stale running jobs. Default is 5 minutes. S
 
 ### `WithStaleLockAge(d time.Duration) WorkerOption`
 
-Sets how long a lock must be expired before the job is reclaimed. Default is 45 minutes.
+Sets how long the owning worker must have made no contact before its job is reclaimed (reset to pending). The reaper anchors on last contact — it reclaims `status=running` jobs where `COALESCE(last_heartbeat_at, started_at, locked_until)` is older than `StaleLockAge` — not on lease (`LockedUntil`) expiry, so a still-running worker that keeps heartbeating is never reclaimed even if its stacked lease has lapsed. Default is 45 minutes. See [Stale Lock Reaper]({{< relref "/docs/advanced/stale-lock-reaper" >}}).
 
 ### `worker.WithLockDuration(d time.Duration) WorkerOption`
 

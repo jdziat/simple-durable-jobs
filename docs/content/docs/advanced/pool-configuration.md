@@ -5,12 +5,49 @@ weight: 2
 
 A job queue system opens many concurrent database connections -- one per worker
 goroutine, plus connections for heartbeats, scheduling, and the stale lock
-reaper. Without proper pool configuration the database can be overwhelmed by
-connection churn, or workers can stall waiting for an available connection.
+reaper. To keep that from overwhelming the database, `NewGormStorage` installs a
+bounded default pool automatically (see below), so you get a safe pool without
+writing any configuration. Pool tuning is an *optional optimization* on top of
+that default -- you reach for it to match a specific workload (higher
+concurrency, latency-sensitive paths, or a tight cloud connection cap), not to
+avoid an unbounded pool.
 
 The `simple-durable-jobs` library exposes Go's `database/sql` pool settings
 through a clean option-based API so you can tune connection usage to match your
 workload.
+
+## Default Pool (Applied Automatically)
+
+`NewGormStorage(db)` installs a bounded connection pool unless the pool has
+already been sized. You do not have to configure anything to be safe -- the
+unbounded-by-default behavior of `database/sql` is overridden for you.
+
+| Driver | MaxOpen | MaxIdle | MaxLifetime | MaxIdleTime |
+|--------|--------:|--------:|------------:|------------:|
+| PostgreSQL / MySQL | 25 | 10 | 5 min | 1 min |
+| SQLite | 4 | 2 | none | none |
+
+PostgreSQL and MySQL receive `DefaultPoolConfig()` values (25/10/5 min/1 min) --
+the real guard against exhausting a Postgres `max_connections` limit. SQLite
+receives a small, single-writer-friendly pool (4 open, 2 idle) with **no
+connection expiry**: a zero lifetime/idle-time keeps the sole connection of an
+in-memory (`:memory:`) database from being dropped (which would silently discard
+the database) and keeps WAL connections warm.
+
+The default is applied only when the pool is still unset. The constructor checks
+the underlying `*sql.DB` and skips the default when:
+
+- The caller already sized the pool before construction (any non-zero
+  `MaxOpenConns`, e.g. a `db.DB().SetMaxOpenConns(...)` or `ConfigurePool` call
+  made before `NewGormStorage`).
+- Storage is created via `NewGormStorageWithPool`, which has already sized the
+  pool itself -- including an explicit `MaxOpenConns(0)` meaning *unlimited*. The
+  auto-default is suppressed in this case so your unlimited choice is honored
+  rather than silently re-bounded.
+
+A `nil` DB, or a DB whose `*sql.DB` cannot be obtained (a mock or
+dialector-only connection), is skipped silently so construction stays
+panic-free.
 
 ## Creating Storage with Pool Configuration
 

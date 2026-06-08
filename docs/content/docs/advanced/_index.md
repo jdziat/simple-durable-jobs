@@ -19,7 +19,7 @@ Production tuning for Simple Durable Jobs. These pages cover the knobs you reach
   {{< card link="batch-dequeue/" title="Batch Dequeue" icon="collection" subtitle="Opt in to bounded worker-side batch dequeue to claim multiple due jobs per poll when storage supports it." >}}
   {{< card link="transactional-checkpoints/" title="Transactional Checkpoints" icon="database" subtitle="Commit a phase checkpoint in the same GORM transaction as the business effect it protects." >}}
   {{< card link="transactional-enqueue/" title="Transactional Enqueue" icon="database" subtitle="Persist jobs inside your own GORM transaction so business rows and jobs commit or roll back together." >}}
-  {{< card link="payload-codec/" title="Payload Codec" icon="lock-closed" subtitle="Encrypt or transform job arguments, results, checkpoints, and signal payloads at the GORM storage boundary." >}}
+  {{< card link="payload-codec/" title="Payload Codec" icon="lock-closed" subtitle="Encrypt or transform job arguments, results, checkpoints, signal payloads, and error text (last_error / dead_letter_reason) at the GORM storage boundary." >}}
   {{< card link="authorization/" title="Dashboard Authorization" icon="shield-check" subtitle="Add optional per-action authorization for mutating dashboard RPCs while keeping identity extraction in your own middleware." >}}
   {{< card link="execution-middleware/" title="Execution Middleware" icon="adjustments" subtitle="Wrap handler execution with interceptors for logging, auth context, panic classification, and error mapping." >}}
   {{< card link="concurrency-caps/" title="Concurrency Caps" icon="adjustments" subtitle="Cap parallelism fleet-wide and per-key (e.g. at most N jobs per customer) with DB-coordinated concurrency slots." >}}

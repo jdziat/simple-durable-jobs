@@ -37,6 +37,8 @@ mux.Handle("/jobs/", http.StripPrefix("/jobs", ui.Handler(storage,
 
 Creates a new GORM-based storage implementation.
 
+Applies a bounded default connection pool unless the pool is already sized. For PostgreSQL/MySQL it installs `DefaultPoolConfig()` (MaxOpen 25, MaxIdle 10, MaxLifetime 5min, MaxIdleTime 1min); for SQLite it installs a small SQLite-safe pool (MaxOpen 4, MaxIdle 2, no connection expiry). The default is skipped when the caller has already bounded the pool (a non-zero `MaxOpenConns` set before construction) or uses `NewGormStorageWithPool`, so unbounded is no longer the out-of-the-box default and presets are an optional optimization rather than a requirement.
+
 ### `NewGormStorageWithPool(db *gorm.DB, opts ...PoolOption) (*GormStorage, error)`
 
 Creates storage with connection pool configuration.

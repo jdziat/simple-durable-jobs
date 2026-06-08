@@ -97,5 +97,18 @@ var (
     ErrQueueAlreadyPaused error
     ErrQueueNotPaused     error
     ErrCannotPauseStatus  error // Attempted to pause a job in an incompatible status
+
+    // Returned by LoadResult when retrieving a job's persisted return value:
+    ErrJobNotCompleted    error // Job is in a genuinely non-terminal state (pending, running, retrying, waiting, paused) — keep polling
+    ErrJobFailed          error // Job failed; the wrapping message embeds job.LastError — stop polling
+    ErrJobCancelled       error // Job was cancelled — stop polling
+    ErrNoResult           error // Job completed but has no persisted result value
 )
 ```
+
+When polling for a job's result with `LoadResult`, only `ErrJobNotCompleted`
+signals a non-terminal state — it is returned for `pending`, `running`,
+`retrying`, `waiting`, and `paused`, but **not** for `cancelled` (which has its
+own `ErrJobCancelled`). A poller keeps polling on `ErrJobNotCompleted` and stops
+on `ErrJobFailed` or `ErrJobCancelled` (both terminal). All four are
+`errors.Is`-matchable.

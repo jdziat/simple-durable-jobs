@@ -367,7 +367,11 @@ func SafeSQLiteDSN(path string) string {
 	return path + sep + safeSQLiteDSNQuery
 }
 
-// NewGormStorage creates a new GORM-backed storage.
+// NewGormStorage creates a new GORM-backed storage. Unless the caller has
+// already sized the pool (or opts out via NewGormStorageWithPool), it installs a
+// bounded default connection pool: DefaultPoolConfig (25 open / 10 idle / 5m
+// lifetime / 1m idle) for PostgreSQL and MySQL, and a small SQLite-safe pool
+// (4 open / 2 idle, no connection expiry) for SQLite.
 func NewGormStorage(db *gorm.DB, opts ...GormStorageOption) *GormStorage {
 	return storage.NewGormStorage(db, opts...)
 }
@@ -720,7 +724,12 @@ func WithStaleLockInterval(d time.Duration) WorkerOption {
 	return worker.WithStaleLockInterval(d)
 }
 
-// WithStaleLockAge sets how long a lock must be expired before reclaim.
+// WithStaleLockAge sets how long the owning worker must have made no contact
+// before a running job is reclaimed. Reclaim anchors on the last contact —
+// COALESCE(last_heartbeat_at, started_at, locked_until) older than StaleLockAge —
+// not on lease (LockedUntil) expiry, so a job whose lease has been pushed into
+// the future is still reclaimed once its last contact is stale. The default is
+// 45 minutes.
 func WithStaleLockAge(d time.Duration) WorkerOption {
 	return worker.WithStaleLockAge(d)
 }
@@ -733,9 +742,13 @@ func WithLockDuration(d time.Duration) WorkerOption {
 }
 
 // WithFanOutRecoveryStaleAge sets how old a pending fan-out must be before the
-// worker resumes a parent that crashed mid-enqueue (recovery for an
-// incompletely-enqueued fan-out). Default is 2 minutes; non-positive keeps the
-// default (recovery cannot be disabled).
+// worker's polling backstop heals it. This single cutoff gates two recovery
+// paths: resuming a parent that crashed mid-enqueue (an incompletely-enqueued
+// fan-out), and the terminal-strand sweep (GetCompletablePendingFanOuts) that
+// completes a fan-out left status=pending with terminal counts and a waiting
+// parent after a crash between the last sub-job's terminal write and the parent
+// resume. Default is 2 minutes; non-positive keeps the default (recovery cannot
+// be disabled).
 func WithFanOutRecoveryStaleAge(d time.Duration) WorkerOption {
 	return worker.WithFanOutRecoveryStaleAge(d)
 }

@@ -97,6 +97,16 @@ type GormStorage struct {
 // completion writes transiently fail with SQLITE_BUSY/SQLITE_READONLY and can
 // exhaust the worker retry budget. This library receives an already-opened DB
 // and cannot set these itself — the PRAGMA below is only a best-effort fallback.
+//
+// Connection pool: NewGormStorage installs a bounded default pool via
+// applyDefaultPoolIfUnset unless the pool is already sized. PG/MySQL get
+// DefaultPoolConfig (MaxOpenConns 25, MaxIdleConns 10, ConnMaxLifetime 5m,
+// ConnMaxIdleTime 1m); SQLite gets a small, SQLite-safe pool (4 open, 2 idle, no
+// connection expiry). A freshly-opened gorm DB sits at database/sql defaults
+// (unlimited), so a non-zero MaxOpenConnections in the pool's Stats means the
+// caller already bounded it and we leave it untouched. The default is also
+// skipped when the storage is built through NewGormStorageWithPool, which sizes
+// the pool itself (including an explicit MaxOpenConns(0) for unlimited).
 func NewGormStorage(db *gorm.DB, opts ...GormStorageOption) *GormStorage {
 	// Detect SQLite by checking the dialect name
 	isSQLite := false

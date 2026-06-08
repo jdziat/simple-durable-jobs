@@ -35,6 +35,41 @@ Retrieves a previously saved phase checkpoint. Returns the result and true if fo
 
 ---
 
+## Retrieving Results
+
+### `LoadResult[T any](ctx context.Context, q *Queue, jobID string) (T, error)`
+
+Decodes the persisted return value of a completed job into `T`. This is the primary way to read a job's result from outside its handler — for example, a caller polling for the outcome of a job it enqueued.
+
+The returned error discriminates terminal from non-terminal states, and every sentinel is `errors.Is`-matchable:
+
+| Outcome | Returned error | Poller action |
+| --- | --- | --- |
+| Job completed with a result | `nil` (value decoded into `T`) | done |
+| Job completed but stored no result | `ErrNoResult` | done |
+| Job failed | error wrapping `ErrJobFailed` (its message embeds the job's `LastError`) | stop |
+| Job cancelled | error wrapping `ErrJobCancelled` | stop |
+| Job still `pending`, `running`, `retrying`, `waiting`, or `paused` | `ErrJobNotCompleted` | keep polling |
+
+`ErrJobNotCompleted` is returned **only** for genuinely non-terminal states; cancelled and failed jobs return their own sentinels so a poller stops instead of spinning. The result-fetch error is also wrapped if `T` cannot be JSON-decoded from the stored value.
+
+```go
+result, err := jobs.LoadResult[Output](ctx, queue, jobID)
+switch {
+case err == nil:
+    // result is ready
+case errors.Is(err, jobs.ErrJobNotCompleted):
+    // not terminal yet — keep polling
+case errors.Is(err, jobs.ErrJobFailed),
+    errors.Is(err, jobs.ErrJobCancelled):
+    // terminal failure — stop
+}
+```
+
+See [Error Handling]({{< relref "/docs/api-reference/error-handling" >}}) for the full result-polling discrimination.
+
+---
+
 ## Durable Timers
 
 ### `Sleep(ctx context.Context, d time.Duration) error`
@@ -70,6 +105,8 @@ subJobs := []jobs.SubJob{
 Spawns sub-jobs in parallel and waits for all results. Must be called from within a job handler. On first execution FanOut marks the parent job `waiting`, enqueues the sub-jobs, and returns `(nil, *WaitingError)` — the worker treats that signal as "suspend, not fail". When the sub-jobs complete the worker resumes the parent, FanOut replays, detects the completed fan-out via a checkpoint, and returns the collected results.
 
 Sub-jobs receive a deterministic `UniqueKey` of the form `fanout-<fanOutID>-<index>` so a crashed parent can replay without inserting duplicate children.
+
+If a worker crashes between completing the final sub-job and resuming the parent, the parent does not stall forever. A polling backstop scans for fan-outs left `pending` whose persisted counts already satisfy a terminal condition while the parent job still sits in `waiting`, and drives each one through the same completion path the live resume uses. The sweep only considers fan-outs older than `WithFanOutRecoveryStaleAge` (default 2 minutes), so a stranded parent is resumed within that window. Recovery reuses the live CAS/idempotent-resume path and can never double-resume. See [Guarantees]({{< relref "/docs/advanced/guarantees" >}}) for the underlying transactional invariant.
 
 ```go
 results, err := jobs.FanOut[ProcessedItem](ctx, subJobs, jobs.FailFast())

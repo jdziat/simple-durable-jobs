@@ -71,16 +71,16 @@ for the full contract, backend support tiers, and crash-recovery tuning.
 - **Rate Limiting** - Per-queue token buckets and an optional fleet-wide limiter (throttle waits don't burn retry attempts)
 - **Retries with Backoff** - Configurable retry logic with exponential backoff and jitter
 - **Dead-Letter Queue** - Explicit dead-letter metadata with list/count/requeue triage
-- **Retention / GC** - Automatic pruning of terminal jobs by per-status age window and consumed signals by opt-in age window
+- **Retention / GC** - Automatic pruning of terminal jobs by per-status age window and consumed signals by opt-in age window; opt-in transactional checkpoint GC (`RetentionDeleteCheckpointsOnComplete`) bounds checkpoint growth, and a worker started with no retention configured logs a one-time WARN
 - **Execution Middleware** - Interceptors that wrap handler execution
-- **Payload Codec** - Pluggable encryption-at-rest for job arguments, results, and checkpoints
+- **Payload Codec** - Pluggable encryption-at-rest for job arguments, results, checkpoints, and error text (`last_error` and the dead-letter reason suffix)
 - **Workflow Versioning** - GetVersion markers to evolve in-flight workflows safely across deploys
 - **Metrics** - Optional Prometheus / OpenTelemetry metrics exporter (queue depth, latency, throughput, failures)
 - **Observability** - Hooks, event streams, OpenTelemetry tracing, and an embedded web dashboard
 - **Embedded Web UI** - Real-time monitoring dashboard with stats, event streaming, and job actions (incl. cancel)
 - **Dashboard Authorization** - Optional per-action authorization for mutating dashboard RPCs
 - **Stale Lock Reaper** - Automatically reclaims stuck running jobs after worker crashes
-- **Connection Pool Presets** - Pre-built pool configurations for different workloads
+- **Connection Pool Presets** - `NewGormStorage` installs a safe bounded default pool out of the box (unbounded is no longer the default), so presets are an optional optimization, not a requirement, for different workloads
 - **Testing Utilities** - The jobstest package: SQLite fixtures and enqueue assertions
 - **Simple API** - Minimal boilerplate, type-safe handlers
 
@@ -361,6 +361,11 @@ go func() {
             // Handle failure
         case *jobs.JobPaused:
             // Handle pause
+        case *jobs.JobReclaimed:
+            // A stale lock was reclaimed after a presumed worker crash
+            // (Reason == jobs.ReclaimReasonStaleLock) — a crash leading-indicator.
+            // Also observable via queue.OnJobReclaimed(...) and the
+            // jobs.leases.reclaimed metric counter.
         }
     }
 }()
@@ -412,6 +417,23 @@ return jobs.NoRetry(errors.New("invalid input"))
 return jobs.RetryAfter(5 * time.Minute, errors.New("rate limited"))
 ```
 
+When polling for a job's result, `jobs.LoadResult[T]` returns sentinel errors you
+can discriminate with `errors.Is` to decide whether to keep polling or stop:
+
+```go
+result, err := jobs.LoadResult[ResultT](ctx, queue, jobID)
+switch {
+case err == nil:
+    // result is ready
+case errors.Is(err, jobs.ErrJobNotCompleted):
+    // still non-terminal (pending/running/retrying/waiting/paused) — keep polling
+case errors.Is(err, jobs.ErrJobFailed):
+    // job failed; the wrapped error embeds the job's last error
+case errors.Is(err, jobs.ErrJobCancelled):
+    // job was cancelled — stop polling
+}
+```
+
 ## Database Support
 
 The library uses GORM, supporting:
@@ -430,6 +452,14 @@ storage := jobs.NewGormStorage(db)
 // With connection pool tuning
 storage := jobs.NewGormStorageWithPool(db, jobs.HighConcurrencyPoolConfig())
 ```
+
+`NewGormStorage(db)` applies a safe bounded default pool unless the pool is
+already sized — `DefaultPoolConfig` (25 max open / 10 idle / 5m lifetime / 1m
+idle) for PostgreSQL and MySQL, and a small SQLite-safe pool (4 open / 2 idle,
+no connection expiry) for SQLite. The default is skipped if you size the pool
+before constructing storage or use `NewGormStorageWithPool` (including an
+explicit `MaxOpenConns(0)` for unbounded), so presets are an optional
+optimization rather than a requirement to be safe.
 
 ## Package Structure
 

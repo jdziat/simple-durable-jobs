@@ -16,6 +16,12 @@ the job from its last durable checkpoint. The same is true for nested
 *after* the nested handler runs and *before* its checkpoint is saved will run
 that step again on replay.
 
+A completed `Call()` or `SavePhaseCheckpoint` writes its checkpoint on a
+cancellation- and deadline-immune detached context (a fixed ~5s budget), so a
+per-job `Timeout` that fires *as the activity returns* will not lose the
+checkpoint and re-run the step. That detached window narrows the crash gap to a
+genuine process/machine death — the case the statement above describes.
+
 **Your handlers — and every `Call()` step — must be idempotent.** Use a unique
 key, an upsert, or an external dedup guard for any side effect that must not
 happen twice (charging a card, sending an email, calling a non-idempotent API).
@@ -38,7 +44,18 @@ What the library does guarantee:
   clock skew between workers cannot cause a live lock to be reclaimed early.
 - **Checkpointed workflows** — completed `Call()` steps are not re-executed on
   replay (subject to the at-least-once window above), and fan-in counters are
-  updated atomically with the sub-job's terminal transition.
+  updated atomically with the sub-job's terminal transition. The fan-out's
+  *status* advance commits in that same terminal transaction, so a terminal
+  fan-out is never observable as `status=pending` with terminal counts. If a
+  worker crashes between the final sub-job's terminal write and resuming the
+  waiting parent, a recovery sweep (`GetCompletablePendingFanOuts`, gated by
+  `WithFanOutRecoveryStaleAge`, default 2m) heals any parent stranded in
+  `waiting`.
+- **Atomic signal consumption** — consuming a signal
+  (`WaitForSignal`/`WaitForSignalTimeout`/`DrainSignals`) persists the consume
+  and its replay checkpoint in a single transaction, so a crash mid-wait cannot
+  wedge a waiting job or drop a drained signal: the transaction either rolls
+  back cleanly (nothing consumed) or commits both.
 
 ## Backend support tiers
 
@@ -64,14 +81,25 @@ is almost certainly wrong for short jobs. The relevant knobs:
 - `WithLockDuration(d)` — how long a lease is held before it is considered
   expired (default 45m). Set this to comfortably exceed your longest job plus a
   couple of heartbeat intervals.
-- `WithStaleLockAge(d)` — how long an expired lock must remain expired before the
-  reaper reclaims it (default 45m).
+- `WithStaleLockAge(d)` — how long the owning worker must have made **no
+  contact** before the reaper reclaims the job (default 45m). The anchor is
+  `COALESCE(last_heartbeat_at, started_at, locked_until)` — the worker's last
+  contact (a live heartbeat, else when it started, else the lease as a last
+  resort), measured as *time since last contact*, not lease expiry — so reclaim
+  latency is roughly `StaleLockAge`, regardless of how far an in-flight lease has
+  been pushed out.
+  `StaleLockAge` also governs the heartbeat interval: it is clamped to
+  `StaleLockAge/3` (with a 200ms floor), so a live worker refreshes its
+  last-contact timestamp several times within the stale window and an active job
+  is never falsely reclaimed.
 - `WithStaleLockInterval(d)` — how often the reaper runs (default 5m).
 
 For sub-minute jobs, something like `WithLockDuration(2*time.Minute)`,
 `WithStaleLockAge(2*time.Minute)`, `WithStaleLockInterval(10*time.Second)` gives
-fast recovery without flapping. The heartbeat extends the lock while a handler is
-actively running, so a legitimately long job is not reclaimed mid-flight.
+fast recovery without flapping. Shortening `StaleLockAge` also shortens the
+heartbeat interval (via the `StaleLockAge/3` clamp), keeping the last-contact
+anchor fresh; a legitimately long job that keeps heartbeating is not reclaimed
+mid-flight.
 
 ## Failed jobs are the dead-letter set
 

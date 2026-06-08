@@ -51,6 +51,17 @@ Dead-lettered jobs keep their original job row, arguments, last error, and DLQ
 metadata for inspection. After fixing code or an external dependency, replay a
 job with `Requeue`:
 
+With a payload codec configured, `last_error` and the error suffix of
+`dead_letter_reason` are encrypted at rest, just like job arguments and results.
+The fixed `dead_letter_reason` label (such as `max retries exhausted: `) stays
+plaintext so the SQL retries-exhausted classification keeps working; only the
+appended error text is encrypted. Both values are decoded transparently on
+readback through storage and in the dashboard, so triage helpers and the embedded
+UI show readable text. Direct SQL against the `last_error` and `dead_letter_reason`
+columns sees the ciphertext form (base64 behind an `sdjenc:` tag). Under the
+default identity codec the error text is stored verbatim. See
+[Payload Codec]({{< relref "/docs/advanced/payload-codec" >}}) for details.
+
 ```go
 ok, err := jobs.Requeue(ctx, q, jobID)
 if err != nil {
