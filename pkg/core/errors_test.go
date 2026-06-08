@@ -70,6 +70,18 @@ func TestErrJobNotFound_IsMatchable(t *testing.T) {
 	assert.Equal(t, ErrJobNotFound, SentinelErrorByMessage(ErrJobNotFound.Error()))
 }
 
+func TestErrJobFailedCancelled_Matchable(t *testing.T) {
+	wrappedFailed := fmt.Errorf("%w: boom", ErrJobFailed)
+	assert.True(t, errors.Is(wrappedFailed, ErrJobFailed))
+	assert.False(t, errors.Is(wrappedFailed, ErrJobNotCompleted))
+	assert.Equal(t, ErrJobFailed, SentinelErrorByMessage(ErrJobFailed.Error()))
+
+	wrappedCancelled := fmt.Errorf("%w: job-123", ErrJobCancelled)
+	assert.True(t, errors.Is(wrappedCancelled, ErrJobCancelled))
+	assert.False(t, errors.Is(wrappedCancelled, ErrJobNotCompleted))
+	assert.Equal(t, ErrJobCancelled, SentinelErrorByMessage(ErrJobCancelled.Error()))
+}
+
 func TestRehydrate_NoSentinelSwapForPlainUserError(t *testing.T) {
 	user := errors.New(ErrDuplicateJob.Error())
 	assert.False(t, errors.Is(user, ErrDuplicateJob))

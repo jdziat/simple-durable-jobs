@@ -293,6 +293,8 @@ var (
 	ErrQueueNameTooLong      = core.ErrQueueNameTooLong
 	ErrJobArgsTooLarge       = core.ErrJobArgsTooLarge
 	ErrJobNotCompleted       = core.ErrJobNotCompleted
+	ErrJobFailed             = core.ErrJobFailed
+	ErrJobCancelled          = core.ErrJobCancelled
 	ErrJobNotOwned           = core.ErrJobNotOwned
 	ErrDuplicateJob          = core.ErrDuplicateJob
 	ErrUniqueKeyTooLong      = core.ErrUniqueKeyTooLong
@@ -1071,8 +1073,11 @@ func DrainSignals[T any](ctx context.Context, name string) ([]T, error) {
 // LoadResult decodes the persisted return value of a completed job into T.
 //
 // Returns:
-//   - ErrJobNotCompleted if the job has not reached a terminal state.
-//   - An error containing job.LastError if the job failed.
+//   - ErrJobNotCompleted only when the job is in a genuinely non-terminal state
+//     (pending, running, retrying, waiting, or paused) — a poller should keep polling.
+//   - An error wrapping ErrJobFailed (whose message embeds job.LastError) if the
+//     job failed — errors.Is(err, ErrJobFailed) lets a poller stop.
+//   - An error wrapping ErrJobCancelled if the job was cancelled.
 //   - ErrNoResult if the job completed but has no persisted result value.
 //   - An error wrapping the JSON decode failure if Result cannot be unmarshaled into T.
 func LoadResult[T any](ctx context.Context, q *Queue, jobID string) (T, error) {
@@ -1095,7 +1100,9 @@ func LoadResult[T any](ctx context.Context, q *Queue, jobID string) (T, error) {
 		}
 		return out, nil
 	case core.StatusFailed:
-		return zero, fmt.Errorf("jobs: job %s failed: %s", jobID, job.LastError)
+		return zero, fmt.Errorf("%w: %s", core.ErrJobFailed, job.LastError)
+	case core.StatusCancelled:
+		return zero, fmt.Errorf("%w: %s", core.ErrJobCancelled, jobID)
 	default:
 		return zero, core.ErrJobNotCompleted
 	}

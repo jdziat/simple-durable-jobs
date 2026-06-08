@@ -656,6 +656,63 @@ func TestLoadResult_FailedJobReturnsError(t *testing.T) {
 	_, err := jobs.LoadResult[string](context.Background(), q, "job-failed")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "boom")
+	require.ErrorIs(t, err, jobs.ErrJobFailed)
+	require.NotErrorIs(t, err, jobs.ErrJobNotCompleted)
+}
+
+func TestLoadResult_CancelledJobReturnsSentinel(t *testing.T) {
+	q, store := setupTestStorage(t)
+	require.NoError(t, store.Enqueue(context.Background(), &jobs.Job{
+		ID:     "job-cancelled",
+		Type:   "x",
+		Status: jobs.StatusCancelled,
+	}))
+
+	_, err := jobs.LoadResult[string](context.Background(), q, "job-cancelled")
+	require.Error(t, err)
+	require.ErrorIs(t, err, jobs.ErrJobCancelled)
+	require.NotErrorIs(t, err, jobs.ErrJobNotCompleted)
+}
+
+func TestLoadResult_PollerDiscrimination(t *testing.T) {
+	q, store := setupTestStorage(t)
+	ctx := context.Background()
+
+	cases := []struct {
+		name         string
+		status       jobs.JobStatus
+		wantSentinel error
+	}{
+		{"running", jobs.StatusRunning, jobs.ErrJobNotCompleted},
+		{"waiting", jobs.StatusWaiting, jobs.ErrJobNotCompleted},
+		{"failed", jobs.StatusFailed, jobs.ErrJobFailed},
+		{"cancelled", jobs.StatusCancelled, jobs.ErrJobCancelled},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			id := "poller-" + tc.name
+			require.NoError(t, store.Enqueue(ctx, &jobs.Job{
+				ID:        id,
+				Type:      "x",
+				Status:    tc.status,
+				LastError: "boom",
+			}))
+
+			_, err := jobs.LoadResult[string](ctx, q, id)
+			require.Error(t, err)
+
+			// A poller can branch on the three sentinels via errors.Is alone,
+			// with no substring matching.
+			for _, sentinel := range []error{jobs.ErrJobNotCompleted, jobs.ErrJobFailed, jobs.ErrJobCancelled} {
+				if sentinel == tc.wantSentinel {
+					require.ErrorIs(t, err, sentinel, "expected %s to match", tc.name)
+				} else {
+					require.NotErrorIs(t, err, sentinel, "expected %s NOT to match", tc.name)
+				}
+			}
+		})
+	}
 }
 
 func TestLoadResult_CompletedWithNilResult(t *testing.T) {
