@@ -13,6 +13,11 @@ import (
 // hammering the database; the reaper itself can never be turned off.
 const minStaleLockInterval = 1 * time.Second
 
+// minPollInterval is the floor for the dequeue poll cadence set via
+// WithPollInterval. A positive duration below it is clamped up (not
+// discarded); see WithPollInterval.
+const minPollInterval = 50 * time.Millisecond
+
 const maxDequeueBatch = 1000
 
 const (
@@ -399,12 +404,19 @@ func DisableRetry() WorkerOption {
 
 // WithPollInterval sets the interval between job polling attempts.
 // Lower values increase throughput but also database load.
-// Default is 100ms. Minimum is 50ms to prevent database overload.
+//
+// The default is 100ms and the floor is 50ms (to prevent database overload). A
+// positive duration below 50ms is clamped up to 50ms (it is not discarded). A
+// non-positive duration is ignored and the existing value is kept.
 func WithPollInterval(d time.Duration) WorkerOption {
 	return workerOptionFunc(func(c *WorkerConfig) {
-		if d >= 50*time.Millisecond {
-			c.PollInterval = d
+		if d <= 0 {
+			return // ignore non-positive: keep whatever default/prior value applies
 		}
+		if d < minPollInterval {
+			d = minPollInterval
+		}
+		c.PollInterval = d
 	})
 }
 

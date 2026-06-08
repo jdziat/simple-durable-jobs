@@ -666,7 +666,10 @@ func DisableRetry() WorkerOption {
 
 // WithPollInterval sets the interval between job polling attempts.
 // Lower values increase throughput but also database load.
-// Default is 100ms. Minimum is 50ms to prevent database overload.
+//
+// The default is 100ms and the floor is 50ms (to prevent database overload). A
+// positive duration below 50ms is clamped up to 50ms (it is not discarded). A
+// non-positive duration is ignored and the existing value is kept.
 func WithPollInterval(d time.Duration) WorkerOption {
 	return worker.WithPollInterval(d)
 }

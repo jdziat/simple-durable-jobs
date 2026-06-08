@@ -74,7 +74,7 @@ Enables the scheduler for recurring jobs.
 
 ### `WithPollInterval(d time.Duration) WorkerOption`
 
-Sets how often the worker polls for new jobs.
+Sets how often the worker polls for new jobs. The default is 100ms and the floor is 50ms (to prevent database overload). A positive value below 50ms is clamped up to 50ms (it is not discarded); a non-positive value is ignored and the previous/default interval is kept.
 
 ### `WithStorageRetry(config RetryConfig) WorkerOption`
 

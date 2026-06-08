@@ -699,13 +699,13 @@ func TestWorker_CancelJobCancelsRunningJob(t *testing.T) {
 // Options tests
 // ---------------------------------------------------------------------------
 
-func TestWithPollInterval_SetsBelowMinimum(t *testing.T) {
+func TestWithPollInterval_ClampsBelowMinimumUp(t *testing.T) {
 	config := WorkerConfig{PollInterval: 100 * time.Millisecond}
 
-	// Values below 50 ms must be ignored.
+	// A positive value below 50 ms is clamped UP to the 50 ms floor, not discarded.
 	WithPollInterval(10 * time.Millisecond).ApplyWorker(&config)
 
-	assert.Equal(t, 100*time.Millisecond, config.PollInterval)
+	assert.Equal(t, 50*time.Millisecond, config.PollInterval)
 }
 
 func TestWithPollInterval_SetsValidValue(t *testing.T) {
@@ -722,6 +722,18 @@ func TestWithPollInterval_SetsExactMinimum(t *testing.T) {
 	WithPollInterval(50 * time.Millisecond).ApplyWorker(&config)
 
 	assert.Equal(t, 50*time.Millisecond, config.PollInterval)
+}
+
+func TestWithPollInterval_NonPositiveKeepsDefault(t *testing.T) {
+	config := WorkerConfig{PollInterval: 100 * time.Millisecond}
+
+	// A zero duration is ignored: the existing value is kept.
+	WithPollInterval(0).ApplyWorker(&config)
+	assert.Equal(t, 100*time.Millisecond, config.PollInterval)
+
+	// A negative duration is ignored too.
+	WithPollInterval(-1 * time.Millisecond).ApplyWorker(&config)
+	assert.Equal(t, 100*time.Millisecond, config.PollInterval)
 }
 
 func TestWithDrainTimeout_SetsValue(t *testing.T) {
