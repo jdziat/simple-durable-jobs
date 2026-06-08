@@ -58,6 +58,7 @@ type mockStorage struct {
 	resumeJobFunc          func(ctx context.Context, jobID string) (bool, error)
 	cancelSubJobsFunc      func(ctx context.Context, fanOutID string) ([]string, error)
 	findOrphanedFunc       func(jobIDs []string) ([]string, error)
+	completablePendingFunc func(ctx context.Context, olderThan time.Time) ([]*core.FanOut, error)
 
 	// enqueue tracking
 	enqueueMu         sync.Mutex
@@ -268,6 +269,13 @@ func (m *mockStorage) GetWaitingJobsToResume(ctx context.Context) ([]*core.Job, 
 func (m *mockStorage) GetStalledFanOutParents(ctx context.Context, olderThan time.Time) ([]*core.Job, error) {
 	if m.stalledJobsFunc != nil {
 		return m.stalledJobsFunc(ctx, olderThan)
+	}
+	return nil, nil
+}
+
+func (m *mockStorage) GetCompletablePendingFanOuts(ctx context.Context, olderThan time.Time) ([]*core.FanOut, error) {
+	if m.completablePendingFunc != nil {
+		return m.completablePendingFunc(ctx, olderThan)
 	}
 	return nil, nil
 }
@@ -2216,6 +2224,97 @@ func TestWorker_PollWaitingJobs_ResumesStalledFanOutParent(t *testing.T) {
 	assert.True(t, sawCutoff.Load(), "stalled fan-out query should use configured stale age cutoff")
 }
 
+// TestPollWaitingJobsOnce_RescuesStrandedTerminalFanOut is the crash/replay
+// regression test for finding #2: a fan-out left status='pending' with terminal
+// counts and a waiting parent (the post-crash strand that NEITHER existing
+// recovery query rescues) must be healed in a single poll cycle. It drives the
+// stranded row through the same completeFanOut path the live worker uses —
+// UpdateFanOutStatus CAS + ResumeJob — proving the backstop is wired end-to-end.
+func TestPollWaitingJobsOnce_RescuesStrandedTerminalFanOut(t *testing.T) {
+	stranded := &core.FanOut{
+		ID:             "fo-stranded",
+		ParentJobID:    "parent-stranded",
+		TotalCount:     2,
+		CompletedCount: 2,
+		Strategy:       core.StrategyCollectAll,
+		Status:         core.FanOutPending,
+	}
+	statusUpdated := make(chan core.FanOutStatus, 1)
+	resumed := make(chan string, 1)
+
+	mock := &mockStorage{
+		completablePendingFunc: func(_ context.Context, _ time.Time) ([]*core.FanOut, error) {
+			return []*core.FanOut{stranded}, nil
+		},
+		updateFanOutStatusFunc: func(_ context.Context, fanOutID string, status core.FanOutStatus) (bool, error) {
+			assert.Equal(t, stranded.ID, fanOutID)
+			statusUpdated <- status
+			return true, nil
+		},
+		resumeJobFunc: func(_ context.Context, jobID string) (bool, error) {
+			resumed <- jobID
+			return true, nil
+		},
+	}
+	q := queue.New(mock)
+	w := NewWorker(q,
+		WithStorageRetry(RetryConfig{MaxAttempts: 1}),
+		WithFanOutRecoveryStaleAge(30*time.Second),
+	)
+
+	w.pollWaitingJobsOnce(context.Background())
+
+	select {
+	case status := <-statusUpdated:
+		assert.Equal(t, core.FanOutCompleted, status)
+	case <-time.After(time.Second):
+		t.Fatal("UpdateFanOutStatus was not called for the stranded pending fan-out")
+	}
+	select {
+	case jobID := <-resumed:
+		assert.Equal(t, stranded.ParentJobID, jobID)
+	case <-time.After(time.Second):
+		t.Fatal("ResumeJob was not called for the stranded fan-out's parent")
+	}
+}
+
+// TestCompleteFanOut_ResumesWhenStatusAlreadyTerminal guards against
+// re-introducing the early-return regression: with P2's in-tx advance, the very
+// worker responsible for resuming sees UpdateFanOutStatus return (false,nil)
+// because its own terminal transaction already advanced the status. completeFanOut
+// must still fall through to the idempotent ResumeJob.
+func TestCompleteFanOut_ResumesWhenStatusAlreadyTerminal(t *testing.T) {
+	resumed := make(chan string, 1)
+	mock := &mockStorage{
+		updateFanOutStatusFunc: func(_ context.Context, _ string, _ core.FanOutStatus) (bool, error) {
+			return false, nil // status already advanced in-tx
+		},
+		resumeJobFunc: func(_ context.Context, jobID string) (bool, error) {
+			resumed <- jobID
+			return true, nil
+		},
+	}
+	q := queue.New(mock)
+	w := NewWorker(q, WithStorageRetry(RetryConfig{MaxAttempts: 1}))
+
+	fo := &core.FanOut{
+		ID:             "fo-already-terminal",
+		ParentJobID:    "parent-already-terminal",
+		TotalCount:     2,
+		CompletedCount: 2,
+		Strategy:       core.StrategyCollectAll,
+		Status:         core.FanOutCompleted,
+	}
+	require.NoError(t, w.completeFanOut(context.Background(), fo, core.FanOutCompleted))
+
+	select {
+	case jobID := <-resumed:
+		assert.Equal(t, fo.ParentJobID, jobID)
+	case <-time.After(time.Second):
+		t.Fatal("ResumeJob must be called even when UpdateFanOutStatus reports !updated")
+	}
+}
+
 func TestWorker_PollSignalWaitingJobs_PagesPastMemoizedFutureSleeps(t *testing.T) {
 	origBatchSize := signalResumePollBatchSize
 	signalResumePollBatchSize = 3
@@ -3411,14 +3510,17 @@ func TestWorker_CheckFanOutCompletion_ThresholdAllCancelledNoActive(t *testing.T
 }
 
 // TestWorker_CompleteFanOut_AlreadyCompletedByAnotherWorker exercises the
-// branch where UpdateFanOutStatus returns (false, nil) — another worker won
-// the race and completeFanOut should return nil without calling ResumeJob.
+// branch where UpdateFanOutStatus returns (false, nil). Under P2's in-tx status
+// advance this is the COMMON case for the worker that just completed the last
+// sub-job (its own terminal transaction already advanced the status), so
+// completeFanOut must NOT early-return: it falls through to the idempotent
+// ResumeJob. The parent-row CAS keeps concurrent/duplicate callers single-effect.
 func TestWorker_CompleteFanOut_AlreadyCompletedByAnotherWorker(t *testing.T) {
 	resumeCalled := false
 
 	mock := &mockStorage{
 		updateFanOutStatusFunc: func(_ context.Context, _ string, _ core.FanOutStatus) (bool, error) {
-			return false, nil // another worker already completed
+			return false, nil // status already advanced (in-tx, or by another worker)
 		},
 		resumeJobFunc: func(_ context.Context, _ string) (bool, error) {
 			resumeCalled = true
@@ -3435,7 +3537,7 @@ func TestWorker_CompleteFanOut_AlreadyCompletedByAnotherWorker(t *testing.T) {
 
 	err := w.completeFanOut(context.Background(), fo, core.FanOutCompleted)
 	require.NoError(t, err)
-	assert.False(t, resumeCalled, "ResumeJob must not be called when update was a no-op")
+	assert.True(t, resumeCalled, "ResumeJob must still be called when the status was already terminal (in-tx advance)")
 }
 
 // TestWorker_CompleteFanOut_CancelOnFailCancelsSubJobs exercises the

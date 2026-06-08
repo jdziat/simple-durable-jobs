@@ -2591,6 +2591,206 @@ func TestGetStalledFanOutParents_LimitsBatch(t *testing.T) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+// P2 — atomic in-tx fan-out status advance + recovery backstop
+// ──────────────────────────────────────────────────────────────────────────────
+
+// TestCompleteWithResult_AdvancesFanOutStatusInSameTx proves the fan-out status
+// transitions to 'completed' inside the same transaction as the terminal
+// counter increment — no separate worker-layer UpdateFanOutStatus call is made
+// anywhere in this test, so a status of 'completed' after the final sub-job can
+// only come from the in-tx advance.
+func TestCompleteWithResult_AdvancesFanOutStatusInSameTx(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	// collect_all, total=2; createP2BFanOut uses StrategyCollectAll.
+	fo := createP2BFanOut(t, ctx, s, core.FanOutPending)
+	sub1 := createRunningP2BJob(t, ctx, s, &fo.ID, "worker-1")
+	sub2 := createRunningP2BJob(t, ctx, s, &fo.ID, "worker-1")
+
+	updated, err := s.CompleteWithResult(ctx, sub1.ID, "worker-1", []byte(`{"i":1}`))
+	require.NoError(t, err)
+	require.NotNil(t, updated)
+	assert.Equal(t, 1, updated.CompletedCount)
+
+	mid, err := s.GetFanOut(ctx, fo.ID)
+	require.NoError(t, err)
+	require.NotNil(t, mid)
+	assert.Equal(t, core.FanOutPending, mid.Status, "fan-out must stay pending until the final sub-job")
+	assert.Equal(t, 1, mid.CompletedCount)
+
+	updated, err = s.CompleteWithResult(ctx, sub2.ID, "worker-1", []byte(`{"i":2}`))
+	require.NoError(t, err)
+	require.NotNil(t, updated)
+	assert.Equal(t, 2, updated.CompletedCount)
+	assert.Equal(t, core.FanOutCompleted, updated.Status, "returned fan-out reflects the in-tx terminal status")
+
+	final, err := s.GetFanOut(ctx, fo.ID)
+	require.NoError(t, err)
+	require.NotNil(t, final)
+	assert.Equal(t, core.FanOutCompleted, final.Status, "status advanced atomically with the increment")
+	assert.Equal(t, 2, final.CompletedCount)
+}
+
+// TestFailTerminalWithResult_AdvancesFanOutStatusInSameTx proves the fail_fast
+// fan-out transitions to 'failed' in the same transaction that increments
+// failed_count, again with no worker-layer status call.
+func TestFailTerminalWithResult_AdvancesFanOutStatusInSameTx(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	fo := &core.FanOut{
+		ID:          p2bID(t, "fo"),
+		ParentJobID: p2bID(t, "parent"),
+		TotalCount:  3,
+		Strategy:    core.StrategyFailFast,
+		Status:      core.FanOutPending,
+	}
+	require.NoError(t, s.CreateFanOut(ctx, fo))
+	sub := createRunningP2BJob(t, ctx, s, &fo.ID, "worker-1")
+
+	updated, err := s.FailTerminalWithResult(ctx, sub.ID, "worker-1", "boom")
+	require.NoError(t, err)
+	require.NotNil(t, updated)
+	assert.Equal(t, 1, updated.FailedCount)
+	assert.Equal(t, core.FanOutFailed, updated.Status, "fail_fast advances on the first failure")
+
+	final, err := s.GetFanOut(ctx, fo.ID)
+	require.NoError(t, err)
+	require.NotNil(t, final)
+	assert.Equal(t, core.FanOutFailed, final.Status, "status advanced atomically with the increment")
+	assert.Equal(t, 1, final.FailedCount)
+}
+
+// TestGetCompletablePendingFanOuts asserts the recovery backstop returns exactly
+// the fan-outs that are stranded pending-with-terminal-counts under a waiting
+// parent, and excludes in-flight, recent, running-parent, and already-terminal
+// rows. Mirrors the structure of TestGetStalledFanOutParents.
+func TestGetCompletablePendingFanOuts(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	old := time.Now().Add(-10 * time.Minute)
+	recent := time.Now()
+	cutoff := time.Now().Add(-2 * time.Minute)
+
+	// (a) crash-stranded collect_all: pending, completed==total, waiting parent, old → returned.
+	strandedParent := &core.Job{Type: "wf.stranded", Queue: "default", Status: core.StatusWaiting}
+	require.NoError(t, s.Enqueue(ctx, strandedParent))
+	stranded := &core.FanOut{
+		ParentJobID:    strandedParent.ID,
+		TotalCount:     2,
+		CompletedCount: 2,
+		Strategy:       core.StrategyCollectAll,
+		Status:         core.FanOutPending,
+		CreatedAt:      old,
+	}
+	require.NoError(t, s.CreateFanOut(ctx, stranded))
+
+	// (b) fail_fast pending with failed_count==1, waiting parent, old → returned.
+	failParent := &core.Job{Type: "wf.fail", Queue: "default", Status: core.StatusWaiting}
+	require.NoError(t, s.Enqueue(ctx, failParent))
+	failFan := &core.FanOut{
+		ParentJobID: failParent.ID,
+		TotalCount:  3,
+		FailedCount: 1,
+		Strategy:    core.StrategyFailFast,
+		Status:      core.FanOutPending,
+		CreatedAt:   old,
+	}
+	require.NoError(t, s.CreateFanOut(ctx, failFan))
+
+	// (c) genuinely in-flight pending (counts < total, no failures) → excluded.
+	inflightParent := &core.Job{Type: "wf.inflight", Queue: "default", Status: core.StatusWaiting}
+	require.NoError(t, s.Enqueue(ctx, inflightParent))
+	require.NoError(t, s.CreateFanOut(ctx, &core.FanOut{
+		ParentJobID:    inflightParent.ID,
+		TotalCount:     3,
+		CompletedCount: 1,
+		Strategy:       core.StrategyCollectAll,
+		Status:         core.FanOutPending,
+		CreatedAt:      old,
+	}))
+
+	// (d) pending with terminal counts but parent status='running' → excluded.
+	runningParent := &core.Job{Type: "wf.running", Queue: "default", Status: core.StatusRunning}
+	require.NoError(t, s.Enqueue(ctx, runningParent))
+	require.NoError(t, s.CreateFanOut(ctx, &core.FanOut{
+		ParentJobID:    runningParent.ID,
+		TotalCount:     2,
+		CompletedCount: 2,
+		Strategy:       core.StrategyCollectAll,
+		Status:         core.FanOutPending,
+		CreatedAt:      old,
+	}))
+
+	// (e) pending terminal but created_at recent (after cutoff) → excluded.
+	recentParent := &core.Job{Type: "wf.recent", Queue: "default", Status: core.StatusWaiting}
+	require.NoError(t, s.Enqueue(ctx, recentParent))
+	require.NoError(t, s.CreateFanOut(ctx, &core.FanOut{
+		ParentJobID:    recentParent.ID,
+		TotalCount:     2,
+		CompletedCount: 2,
+		Strategy:       core.StrategyCollectAll,
+		Status:         core.FanOutPending,
+		CreatedAt:      recent,
+	}))
+
+	// (f) already-terminal status='completed' → excluded.
+	doneParent := &core.Job{Type: "wf.done", Queue: "default", Status: core.StatusWaiting}
+	require.NoError(t, s.Enqueue(ctx, doneParent))
+	require.NoError(t, s.CreateFanOut(ctx, &core.FanOut{
+		ParentJobID:    doneParent.ID,
+		TotalCount:     2,
+		CompletedCount: 2,
+		Strategy:       core.StrategyCollectAll,
+		Status:         core.FanOutCompleted,
+		CreatedAt:      old,
+	}))
+
+	got, err := s.GetCompletablePendingFanOuts(ctx, cutoff)
+	require.NoError(t, err)
+
+	gotParents := make(map[string]bool, len(got))
+	for _, fo := range got {
+		gotParents[fo.ParentJobID] = true
+	}
+	assert.Len(t, got, 2)
+	assert.True(t, gotParents[strandedParent.ID], "crash-stranded collect_all must be returned")
+	assert.True(t, gotParents[failParent.ID], "fail_fast with a failure must be returned")
+	assert.False(t, gotParents[inflightParent.ID], "in-flight fan-out must be excluded")
+	assert.False(t, gotParents[runningParent.ID], "running-parent fan-out must be excluded")
+	assert.False(t, gotParents[recentParent.ID], "recent fan-out must be excluded")
+	assert.False(t, gotParents[doneParent.ID], "already-terminal fan-out must be excluded")
+}
+
+// TestGetCompletablePendingFanOuts_LimitsBatch mirrors the stalled-parent batch
+// cap: the backstop returns at most maxResumeBatch rows per tick.
+func TestGetCompletablePendingFanOuts_LimitsBatch(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	old := time.Now().Add(-10 * time.Minute)
+	cutoff := time.Now().Add(-2 * time.Minute)
+	for i := 0; i < maxResumeBatch+25; i++ {
+		parent := &core.Job{Type: "wf.stranded", Queue: "default", Status: core.StatusWaiting}
+		require.NoError(t, s.Enqueue(ctx, parent))
+		require.NoError(t, s.CreateFanOut(ctx, &core.FanOut{
+			ParentJobID:    parent.ID,
+			TotalCount:     2,
+			CompletedCount: 2,
+			Strategy:       core.StrategyCollectAll,
+			Status:         core.FanOutPending,
+			CreatedAt:      old,
+		}))
+	}
+
+	got, err := s.GetCompletablePendingFanOuts(ctx, cutoff)
+	require.NoError(t, err)
+	assert.Len(t, got, maxResumeBatch)
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // EnqueueBatch — additional edge cases
 // ──────────────────────────────────────────────────────────────────────────────
 

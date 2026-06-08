@@ -86,6 +86,15 @@ type completeWithResultStorage interface {
 	CompleteWithResult(ctx context.Context, jobID, workerID string, result []byte) (*core.FanOut, error)
 }
 
+// completablePendingFanOutStorage is implemented by backends that can find
+// fan-outs left status='pending' with terminal counts and a waiting parent —
+// the post-crash strand the recovery poll heals by routing each row through the
+// same completeFanOut path the live worker uses. Optional: backends without it
+// simply skip the backstop (they still benefit from the in-tx status advance).
+type completablePendingFanOutStorage interface {
+	GetCompletablePendingFanOuts(ctx context.Context, olderThan time.Time) ([]*core.FanOut, error)
+}
+
 type failTerminalWithResultStorage interface {
 	FailTerminalWithResult(ctx context.Context, jobID, workerID, errMsg string) (*core.FanOut, error)
 }
@@ -1325,16 +1334,22 @@ func (w *Worker) checkFanOutCompletion(ctx context.Context, fo *core.FanOut) err
 // Uses atomic status update to prevent race conditions when multiple workers
 // complete the last sub-jobs simultaneously.
 func (w *Worker) completeFanOut(ctx context.Context, fo *core.FanOut, status core.FanOutStatus) error {
-	// Atomic update: only succeeds if status is still 'pending'
-	// This prevents race where two workers both try to complete
+	// Atomic update: only succeeds if status is still 'pending'. This is a CAS
+	// that picks at most one winner among concurrent live completers.
 	updated, err := w.queue.Storage().UpdateFanOutStatus(ctx, fo.ID, status)
 	if err != nil {
 		return err
 	}
 	if !updated {
-		// Another worker already completed this fan-out
-		w.logger.Debug("fan-out already completed by another worker", "fan_out_id", fo.ID)
-		return nil
+		// The status was already advanced — and, with P2's in-tx advance, the
+		// VERY worker responsible for resuming the parent (the last sub-job's
+		// own terminal transaction advanced the status) sees updated==false
+		// here. We must NOT early-return: completeFanOut is only ever reached
+		// from checkFanOutCompletion when done==true, so we fall through to the
+		// idempotent cancel+resume below. ResumeJob (parent status=waiting CAS),
+		// CancelSubJobs (still-pending sub-jobs only), and the local CancelJob
+		// are all idempotent, so a concurrent/duplicate caller is single-effect.
+		w.logger.Debug("fan-out status already terminal; proceeding to idempotent resume", "fan_out_id", fo.ID)
 	}
 
 	// Cancel remaining sub-jobs if needed. CancelSubJobs only updates the
@@ -1685,6 +1700,35 @@ func (w *Worker) pollWaitingJobsOnce(ctx context.Context) {
 			w.logger.Error("failed to resume stalled fan-out parent after retries", "job_id", job.ID, "error", resumeErr)
 		} else {
 			w.logger.Info("resumed stalled fan-out parent via polling fallback", "job_id", job.ID)
+		}
+	}
+
+	// Rescue fan-outs left status='pending' with terminal counts and a waiting
+	// parent — the post-crash strand where a worker died between the
+	// counter-increment commit and the status advance (or any non-atomic
+	// increment path). Each row is driven through checkFanOutCompletion →
+	// completeFanOut, the SAME UpdateFanOutStatus CAS + idempotent resume the
+	// live path uses, so this can never double-resume. Reuses stalledCutoff and
+	// inherits the recovery-lease gating applied by pollWaitingJobs.
+	if cps, ok := w.queue.Storage().(completablePendingFanOutStorage); ok {
+		var completable []*core.FanOut
+		err = retryWithBackoff(ctx, *w.config.StorageRetry, func() error {
+			var queryErr error
+			completable, queryErr = cps.GetCompletablePendingFanOuts(ctx, stalledCutoff)
+			return queryErr
+		})
+		if err != nil {
+			if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+				w.logger.Error("failed to get completable pending fan-outs after retries", "error", err)
+			}
+			return
+		}
+		for _, fo := range completable {
+			if resumeErr := w.checkFanOutCompletion(ctx, fo); resumeErr != nil {
+				w.logger.Error("failed to complete stranded pending fan-out", "fan_out_id", fo.ID, "error", resumeErr)
+			} else {
+				w.logger.Info("rescued stranded pending fan-out via polling fallback", "fan_out_id", fo.ID)
+			}
 		}
 	}
 

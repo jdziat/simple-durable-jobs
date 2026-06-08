@@ -736,6 +736,29 @@ func (s *GormStorage) accountTerminalWithFanOut(ctx context.Context, jobID, work
 				return err
 			}
 			hasFanOut = true
+
+			// Advance the fan-out status IN THE SAME TRANSACTION as the
+			// counter increment. The increment UPDATE above row-locks the
+			// fan_outs row (PG/MySQL) or serializes the whole write tx
+			// (SQLite), so this re-read reflects the post-increment counts
+			// (read-your-writes), and exactly one transaction — the one whose
+			// increment makes the counts terminal — observes done==true. The
+			// status UPDATE is pending-guarded, so it is a no-op if the status
+			// was somehow already advanced. Committing the increment and the
+			// status advance together means the DB can never be observed as
+			// status='pending' with terminal counts on this path: a crash
+			// before the commit loses the increment (the sub-job re-runs under
+			// at-least-once semantics); a crash after leaves a terminal status
+			// the existing GetWaitingJobsToResume query can rescue.
+			if done, termStatus := fanOut.TerminalStatus(); done {
+				res := tx.Model(&core.FanOut{}).
+					Where("id = ? AND status = ?", *job.FanOutID, core.FanOutPending).
+					Updates(map[string]any{"status": termStatus, "updated_at": now})
+				if res.Error != nil {
+					return res.Error
+				}
+				fanOut.Status = termStatus
+			}
 			return nil
 		})
 	})
@@ -1669,6 +1692,45 @@ func (s *GormStorage) GetStalledFanOutParents(ctx context.Context, olderThan tim
 		return nil, err
 	}
 	return jobs, nil
+}
+
+// GetCompletablePendingFanOuts finds fan-outs that are still status='pending'
+// but whose persisted counts already satisfy a terminal condition while their
+// parent job sits in StatusWaiting — the exact post-crash state left when a
+// worker died between the counter-increment commit and the (pre-P2) separate
+// status-advance transaction, plus any legacy/non-atomic increment path.
+//
+// The arithmetic predicate (completed+failed+cancelled >= total) OR failed>0
+// OR cancelled>0 is a portable SUPERSET of every FanOut.TerminalStatus()
+// terminal condition (collect_all/threshold resolve at accounted>=total; the
+// default fail_fast and threshold early-fail resolve at failed>0/cancelled>0).
+// The final terminal decision is made in Go by the caller via TerminalStatus(),
+// so a non-terminal row that slips through is a harmless no-op. Restricting to
+// parent status='waiting' avoids touching fan-outs whose parent is still
+// running (that parent self-resolves via its own checkFanOutCompletion).
+//
+// olderThan keeps the query portable across SQLite/PostgreSQL/MySQL and avoids
+// racing the live completion path on freshly-terminal fan-outs. The LIMIT
+// matches GetStalledFanOutParents: recovery is idempotent and self-draining.
+func (s *GormStorage) GetCompletablePendingFanOuts(ctx context.Context, olderThan time.Time) ([]*core.FanOut, error) {
+	var fanOuts []*core.FanOut
+	err := s.db.WithContext(ctx).Raw(`
+		SELECT f.* FROM fan_outs f
+		INNER JOIN jobs j ON j.id = f.parent_job_id
+		WHERE f.status = ?
+		AND j.status = ?
+		AND f.created_at < ?
+		AND (
+			f.completed_count + f.failed_count + f.cancelled_count >= f.total_count
+			OR f.failed_count > 0
+			OR f.cancelled_count > 0
+		)
+		LIMIT ?
+	`, core.FanOutPending, core.StatusWaiting, olderThan, maxResumeBatch).Scan(&fanOuts).Error
+	if err != nil {
+		return nil, err
+	}
+	return fanOuts, nil
 }
 
 // SaveJobResult stores the serialized result for a job.
