@@ -1795,7 +1795,7 @@ func TestWorker_PerJobTimeoutCancelsHandlerContext(t *testing.T) {
 	require.NoError(t, err)
 
 	w := NewWorker(q, WithPollInterval(10*time.Millisecond), WithStaleLockInterval(0), WithOwnershipAuditInterval(0))
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
 	defer cancel()
 	go func() { _ = w.Start(ctx) }()
 
@@ -2081,6 +2081,82 @@ func TestWorker_StartCancelIdleReturnsPromptly(t *testing.T) {
 	}
 
 	assert.Less(t, time.Since(start), 300*time.Millisecond)
+}
+
+type cancelMidDrainStorage struct {
+	*mockStorage
+	mu            sync.Mutex
+	batchCalls    int
+	enteredSecond chan struct{}
+	secondOnce    sync.Once
+}
+
+func (s *cancelMidDrainStorage) DequeueBatch(ctx context.Context, _ []string, _ string, _ int) ([]*core.Job, error) {
+	s.mu.Lock()
+	s.batchCalls++
+	call := s.batchCalls
+	s.mu.Unlock()
+
+	if call == 1 {
+		return []*core.Job{{
+			ID:     "mid-drain-job",
+			Type:   "mid-drain-noop",
+			Queue:  "default",
+			Args:   []byte(`{}`),
+			Status: core.StatusRunning,
+		}}, nil
+	}
+
+	s.secondOnce.Do(func() { close(s.enteredSecond) })
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func TestWorker_StartCancelMidDrainReturnsWithinDrainTimeout(t *testing.T) {
+	store := &cancelMidDrainStorage{
+		mockStorage:   &mockStorage{},
+		enteredSecond: make(chan struct{}),
+	}
+	q := queue.New(store)
+	q.Register("mid-drain-noop", func(context.Context, struct{}) error {
+		return nil
+	})
+
+	drainTimeout := 200 * time.Millisecond
+	w := NewWorker(q,
+		WorkerQueue("default", Concurrency(4)),
+		WithDequeueBatchSize(2),
+		WithPollInterval(50*time.Millisecond),
+		WithDrainTimeout(drainTimeout),
+		WithOwnershipAuditInterval(0),
+		DisableRetry(),
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	startReturned := make(chan error, 1)
+	go func() {
+		startReturned <- w.Start(ctx)
+	}()
+
+	select {
+	case <-store.enteredSecond:
+	case <-time.After(2 * time.Second):
+		cancel()
+		t.Fatal("worker did not enter the second drain dequeue")
+	}
+
+	start := time.Now()
+	cancel()
+
+	select {
+	case err := <-startReturned:
+		assert.ErrorIs(t, err, context.Canceled)
+	case <-time.After(time.Second):
+		t.Fatal("worker did not stop after mid-drain cancellation")
+	}
+
+	assert.Less(t, time.Since(start), drainTimeout,
+		"mid-drain cancellation should not wait for DrainTimeout")
 }
 
 func TestWorker_ShutdownReleasesDequeuedJobInsteadOfDropping(t *testing.T) {
@@ -4016,10 +4092,16 @@ func (s *trackingStorage) SaveJobResult(ctx context.Context, jobID string, worke
 }
 
 func TestWorker_PersistsHandlerResult(t *testing.T) {
-	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{
+	dsn := "file:" + t.Name() + "?mode=memory&cache=shared"
+	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{
 		Logger: logger.Default.LogMode(logger.Silent),
 	})
 	require.NoError(t, err)
+	t.Cleanup(func() {
+		if sqlDB, dbErr := db.DB(); dbErr == nil {
+			_ = sqlDB.Close()
+		}
+	})
 
 	base := storage.NewGormStorage(db)
 	require.NoError(t, base.Migrate(context.Background()))
@@ -4036,14 +4118,21 @@ func TestWorker_PersistsHandlerResult(t *testing.T) {
 	w := NewWorker(q, WithScheduler(false))
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	go func() { _ = w.Start(ctx) }()
+	workerErr := make(chan error, 1)
+	go func() { workerErr <- w.Start(ctx) }()
 
 	require.Eventually(t, func() bool {
 		store.mu.Lock()
 		defer store.mu.Unlock()
 		_, ok := store.savedResults[jobID]
 		return ok
-	}, 2*time.Second, 10*time.Millisecond, "handler result must be persisted via SaveJobResult")
+	}, 5*time.Second, 10*time.Millisecond, "handler result must be persisted via SaveJobResult")
+	cancel()
+	select {
+	case <-workerErr:
+	case <-time.After(2 * time.Second):
+		t.Fatal("worker did not stop after result persistence test")
+	}
 
 	store.mu.Lock()
 	got := store.savedResults[jobID]

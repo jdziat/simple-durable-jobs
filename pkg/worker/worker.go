@@ -167,6 +167,7 @@ const (
 	// otherwise the side effect re-runs on replay. Mirrors the 5s detached
 	// budget used by releaseDequeuedJobOnShutdown (worker.go:447).
 	checkpointWriteTimeout = 5 * time.Second
+	maxDrainIterations     = 1000
 )
 
 var signalResumePollBatchSize = 100
@@ -306,6 +307,9 @@ func NewWorker(q *queue.Queue, opts ...WorkerOption) *Worker {
 // Start begins processing jobs. Blocks until context is cancelled.
 // Per-queue concurrency is enforced: each queue only dequeues up to its
 // configured concurrency limit.
+// The dispatcher drains available work within each poll interval; setting
+// DequeueBatchSize to 1 with a slow PollInterval approximates the legacy
+// once-per-tick dispatch behavior.
 func (w *Worker) Start(ctx context.Context) error {
 	totalConcurrency := 0
 	for _, c := range w.config.Queues {
@@ -369,25 +373,56 @@ func (w *Worker) Start(ctx context.Context) error {
 			}
 			return ctx.Err()
 		case <-ticker.C:
-			// Skip dequeue if paused
-			if w.IsPaused() {
-				continue
-			}
+			w.drainDequeuedJobs(ctx, jobsChan, totalConcurrency)
+		}
+	}
+}
 
-			// Build list of queues that have available capacity
-			availableQueues := w.queuesWithCapacity()
-			if len(availableQueues) == 0 {
-				continue
-			}
+func (w *Worker) drainDequeuedJobs(ctx context.Context, jobsChan chan<- *core.Job, totalConcurrency int) {
+	deadline := time.Now().Add(w.config.PollInterval)
+	initialQueues := w.queuesWithCapacity()
+	releaseBudget := w.dequeueSlots(initialQueues, totalConcurrency)
+	if releaseBudget <= 0 {
+		return
+	}
 
-			jobs, err := w.dequeueAvailableJobs(ctx, availableQueues, totalConcurrency)
-			if err != nil {
-				if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-					w.logger.Error("failed to dequeue after retries", "error", err)
-				}
-				continue
+	releasedThisTick := 0
+	for iteration := 0; iteration < maxDrainIterations; iteration++ {
+		if ctx.Err() != nil {
+			return
+		}
+		if w.IsPaused() {
+			return
+		}
+
+		availableQueues := w.queuesWithCapacity()
+		if len(availableQueues) == 0 {
+			return
+		}
+
+		slots := w.dequeueSlots(availableQueues, totalConcurrency)
+		if slots <= 0 {
+			return
+		}
+
+		jobs, err := w.dequeueAvailableJobs(ctx, availableQueues, totalConcurrency)
+		if err != nil {
+			if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+				w.logger.Error("failed to dequeue after retries", "error", err)
 			}
-			w.dispatchDequeuedJobs(ctx, jobsChan, jobs)
+			return
+		}
+
+		dispatched, released := w.dispatchDequeuedJobs(ctx, jobsChan, jobs)
+		releasedThisTick += released
+		if dispatched == 0 {
+			return
+		}
+		if releasedThisTick >= releaseBudget {
+			return
+		}
+		if !time.Now().Before(deadline) {
+			return
 		}
 	}
 }
@@ -448,42 +483,50 @@ func (w *Worker) totalCapacityAcrossQueues(queues []string) int {
 	return total
 }
 
-func (w *Worker) dispatchDequeuedJobs(ctx context.Context, jobsChan chan<- *core.Job, jobs []*core.Job) {
+func (w *Worker) dispatchDequeuedJobs(ctx context.Context, jobsChan chan<- *core.Job, jobs []*core.Job) (dispatched int, released int) {
 	for _, job := range jobs {
 		if job == nil {
 			continue
 		}
 		if !w.tryTrackQueueJob(job.ID, job.Queue) {
 			w.releaseDequeuedJobOnShutdown(ctx, job)
+			released++
 			continue
 		}
 		if !w.tryConsumeQueueRateLimit(job.Queue) {
 			w.releaseDequeuedJobOnShutdown(ctx, job)
+			released++
 			continue
 		}
 		if ok := w.tryConsumeRateLimits(ctx, job); !ok {
 			w.refundQueueRateLimit(job.Queue)
 			w.releaseDequeuedJobOnShutdown(ctx, job)
+			released++
 			continue
 		}
 		if ok := w.tryAcquireConcurrencySlots(ctx, job); !ok {
 			w.refundQueueRateLimit(job.Queue)
 			w.releaseDequeuedJobOnShutdown(ctx, job)
+			released++
 			continue
 		}
 		if ctx.Err() != nil {
 			w.refundQueueRateLimit(job.Queue)
 			w.releaseDequeuedJobOnShutdown(ctx, job)
+			released++
 			continue
 		}
 
 		select {
 		case jobsChan <- job:
+			dispatched++
 		case <-ctx.Done():
 			w.refundQueueRateLimit(job.Queue)
 			w.releaseDequeuedJobOnShutdown(ctx, job)
+			released++
 		}
 	}
+	return dispatched, released
 }
 
 func (w *Worker) releaseDequeuedJobOnShutdown(ctx context.Context, job *core.Job) {
