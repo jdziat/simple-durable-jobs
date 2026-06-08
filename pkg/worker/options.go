@@ -180,7 +180,9 @@ type WorkerConfig struct {
 
 	// DequeueBatchSize is the maximum number of jobs a worker asks storage to
 	// claim in one polling round when the backend implements the optional batch
-	// dequeue capability. Default: 1 (single-row dequeue).
+	// dequeue capability. Default: 10 (batched dequeue; lifts the
+	// one-claim-per-poll throughput floor). Set to 1 to force strict single-row
+	// dequeue.
 	DequeueBatchSize int
 
 	// Retention configures optional automatic garbage collection for terminal

@@ -178,7 +178,7 @@ func NewWorker(q *queue.Queue, opts ...WorkerOption) *Worker {
 		PollInterval:     100 * time.Millisecond,
 		WorkerID:         uuid.New().String(),
 		DrainTimeout:     30 * time.Second,
-		DequeueBatchSize: 1,
+		DequeueBatchSize: 10,
 	}
 
 	for _, opt := range opts {
