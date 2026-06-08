@@ -102,6 +102,9 @@ type (
 	// JobResumedBySignal is emitted when a signal wakes a waiting job.
 	JobResumedBySignal = core.JobResumedBySignal
 
+	// JobReclaimed is emitted when a worker reclaims a job from a presumed-dead owner.
+	JobReclaimed = core.JobReclaimed
+
 	// CheckpointSaved is emitted when a checkpoint is saved.
 	CheckpointSaved = core.CheckpointSaved
 
@@ -254,6 +257,15 @@ const (
 	FanOutPending   = core.FanOutPending
 	FanOutCompleted = core.FanOutCompleted
 	FanOutFailed    = core.FanOutFailed
+)
+
+// Reclaim reason constants for the JobReclaimed event. ReclaimReasonStaleLock
+// marks a reclaim by this worker's stale-lock reaper (the crash leading
+// indicator); ReclaimReasonOwnershipAudit marks a peer reclaiming one of this
+// worker's in-flight jobs.
+const (
+	ReclaimReasonStaleLock      = core.ReclaimReasonStaleLock
+	ReclaimReasonOwnershipAudit = core.ReclaimReasonOwnershipAudit
 )
 
 // Determinism mode constants, in increasing order of strictness:

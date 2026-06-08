@@ -36,6 +36,7 @@ type Queue struct {
 	onComplete []func(context.Context, *core.Job)
 	onFail     []func(context.Context, *core.Job, error)
 	onRetry    []func(context.Context, *core.Job, int, error)
+	onReclaim  []func(context.Context, string, string)
 
 	// Enqueue middleware chain
 	enqueueMiddleware []EnqueueMiddleware
@@ -511,6 +512,16 @@ func (q *Queue) OnRetry(fn func(context.Context, *core.Job, int, error)) {
 	q.mu.Unlock()
 }
 
+// OnJobReclaimed registers a callback for when a job lease is reclaimed from a
+// presumed-dead owner (stale-lock reaper) or observed reclaimed by a peer
+// (ownership audit). The callback receives the job ID and the reclaim reason
+// (core.ReclaimReasonStaleLock or core.ReclaimReasonOwnershipAudit).
+func (q *Queue) OnJobReclaimed(fn func(ctx context.Context, jobID, reason string)) {
+	q.mu.Lock()
+	q.onReclaim = append(q.onReclaim, fn)
+	q.mu.Unlock()
+}
+
 // Events returns a best-effort channel for receiving queue events.
 // Events may be dropped when a subscriber is slow and its buffer fills.
 // Clients that need a complete view should periodically resync from storage.
@@ -634,6 +645,18 @@ func (q *Queue) CallRetryHooks(ctx context.Context, job *core.Job, attempt int, 
 
 	for _, fn := range hooks {
 		fn(ctx, job, attempt, err)
+	}
+}
+
+// CallJobReclaimedHooks calls all registered job-reclaimed hooks.
+func (q *Queue) CallJobReclaimedHooks(ctx context.Context, jobID, reason string) {
+	q.mu.RLock()
+	hooks := make([]func(context.Context, string, string), len(q.onReclaim))
+	copy(hooks, q.onReclaim)
+	q.mu.RUnlock()
+
+	for _, fn := range hooks {
+		fn(ctx, jobID, reason)
 	}
 }
 

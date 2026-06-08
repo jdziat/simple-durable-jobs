@@ -1059,6 +1059,116 @@ func TestWorker_StartWaitsForStaleLockReaperToFinish(t *testing.T) {
 	}
 }
 
+// TestWorker_StaleLockReaper_EmitsJobReclaimed verifies that when the
+// stale-lock reaper releases jobs, each released ID surfaces as a
+// core.JobReclaimed event (Reason=stale_lock, WorkerID=this worker) AND
+// fires the OnJobReclaimed hook. This is the leading-indicator observability
+// the un-alertable slog-only reaper lacked.
+func TestWorker_StaleLockReaper_EmitsJobReclaimed(t *testing.T) {
+	mock := &mockStorage{releasedIDs: []string{"job-1", "job-2"}}
+	q := queue.New(mock)
+
+	// Subscribe BEFORE Start so no emitted event is missed.
+	ch := q.Events()
+	defer q.Unsubscribe(ch)
+
+	var hookCount atomic.Int32
+	q.OnJobReclaimed(func(_ context.Context, _, reason string) {
+		if reason == core.ReclaimReasonStaleLock {
+			hookCount.Add(1)
+		}
+	})
+
+	w := NewWorker(q, WithStaleLockAge(1*time.Minute), WithOwnershipAuditInterval(0))
+	w.config.StaleLockInterval = 30 * time.Millisecond
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	go func() { _ = w.Start(ctx) }()
+
+	// Drain events until we see a stale-lock reclaim for one of our IDs.
+	deadline := time.After(time.Second)
+	var sawReclaim bool
+	var gotReason, gotWorkerID, gotJobID string
+loop:
+	for {
+		select {
+		case ev := <-ch:
+			if rc, ok := ev.(*core.JobReclaimed); ok {
+				sawReclaim = true
+				gotReason = rc.Reason
+				gotWorkerID = rc.WorkerID
+				gotJobID = rc.JobID
+				break loop
+			}
+		case <-deadline:
+			break loop
+		}
+	}
+	cancel()
+
+	require.True(t, sawReclaim, "expected at least one JobReclaimed event from the reaper")
+	assert.Equal(t, core.ReclaimReasonStaleLock, gotReason)
+	assert.Equal(t, w.config.WorkerID, gotWorkerID)
+	assert.Contains(t, []string{"job-1", "job-2"}, gotJobID)
+
+	assert.Eventually(t, func() bool { return hookCount.Load() >= 1 }, time.Second, 5*time.Millisecond,
+		"OnJobReclaimed hook should fire for stale-lock reclaims")
+}
+
+// TestWorker_OwnershipAudit_EmitsJobReclaimed is the kill/recovery
+// observability test for the victim side: when a peer reclaims an in-flight
+// job, the ownership audit must turn that silent slog line into an emitted,
+// hookable core.JobReclaimed event (Reason=ownership_audit).
+func TestWorker_OwnershipAudit_EmitsJobReclaimed(t *testing.T) {
+	mock := &mockStorage{}
+	mock.findOrphanedFunc = func(_ []string) ([]string, error) {
+		return []string{"job-9"}, nil
+	}
+	q := queue.New(mock)
+
+	ch := q.Events()
+	defer q.Unsubscribe(ch)
+
+	w := NewWorker(q,
+		DisableRetry(),
+		WithOwnershipAuditInterval(20*time.Millisecond),
+	)
+	// Make the reaper effectively dormant so it can't emit a competing event.
+	w.config.StaleLockInterval = time.Hour
+
+	// Seed a running job so the audit snapshot is non-empty. Safe: no jobs are
+	// dequeued in this test, so processJob never touches the map.
+	w.runningJobsMu.Lock()
+	w.runningJobs["job-9"] = func() {}
+	w.runningJobsMu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go w.runOwnershipAudit(ctx)
+
+	deadline := time.After(time.Second)
+	var rc *core.JobReclaimed
+loop:
+	for {
+		select {
+		case ev := <-ch:
+			if got, ok := ev.(*core.JobReclaimed); ok {
+				rc = got
+				break loop
+			}
+		case <-deadline:
+			break loop
+		}
+	}
+	cancel()
+
+	require.NotNil(t, rc, "expected a JobReclaimed event from the ownership audit")
+	assert.Equal(t, core.ReclaimReasonOwnershipAudit, rc.Reason)
+	assert.Equal(t, "job-9", rc.JobID)
+	assert.Equal(t, w.config.WorkerID, rc.WorkerID)
+}
+
 // ---------------------------------------------------------------------------
 // Pause / Resume state tests (unit-level, no SQLite)
 // ---------------------------------------------------------------------------

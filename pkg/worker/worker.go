@@ -1895,6 +1895,21 @@ func (w *Worker) pruneExpiredFutureSleepMemos(now time.Time) {
 	w.futureSleepMu.Unlock()
 }
 
+// emitReclaimed publishes a JobReclaimed event and fires the OnJobReclaimed
+// hooks for a single reclaimed job. It is best-effort observability only: the
+// emit may be dropped on full subscriber buffers and the hook list is copied
+// under RLock before invocation, matching every other Call*Hooks. A duplicate
+// emit is harmless (it only nudges a monotonic counter).
+func (w *Worker) emitReclaimed(ctx context.Context, jobID, reason string) {
+	w.queue.Emit(&core.JobReclaimed{
+		JobID:     jobID,
+		WorkerID:  w.config.WorkerID,
+		Reason:    reason,
+		Timestamp: time.Now(),
+	})
+	w.queue.CallJobReclaimedHooks(ctx, jobID, reason)
+}
+
 // reapStaleLocks periodically releases locks on jobs that are stuck in running
 // status with expired locks. This handles cases where:
 // - A worker crashed without properly completing/failing the job
@@ -1935,6 +1950,10 @@ func (w *Worker) reapStaleLocks(ctx context.Context) {
 			// cancel latency down to "next heartbeat tick."
 			cancelledLocally := 0
 			for _, jobID := range released {
+				// A reclaim is observable even when the original handler ran
+				// on a different worker (no local cancel target); emit for
+				// every released ID so the leading crash-indicator is visible.
+				w.emitReclaimed(ctx, jobID, core.ReclaimReasonStaleLock)
 				if w.CancelJob(jobID) {
 					cancelledLocally++
 				}
@@ -1994,6 +2013,9 @@ func (w *Worker) runOwnershipAudit(ctx context.Context) {
 
 			cancelled := 0
 			for _, id := range orphaned {
+				// Emit for every orphaned ID — a peer reclaiming our in-flight
+				// job is observable even if the local handler already exited.
+				w.emitReclaimed(ctx, id, core.ReclaimReasonOwnershipAudit)
 				if w.CancelJob(id) {
 					cancelled++
 				}

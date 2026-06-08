@@ -69,6 +69,30 @@ func TestInstrument_RecordsLifecycleMetrics(t *testing.T) {
 	})
 }
 
+func TestInstrument_RecordsLeaseReclaimed(t *testing.T) {
+	ctx := context.Background()
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	defer func() { _ = mp.Shutdown(ctx) }()
+
+	q := queue.New(noDepthStorage{})
+	Instrument(q, WithMeterProvider(mp))
+
+	q.CallJobReclaimedHooks(ctx, "job-1", "stale_lock")
+	q.CallJobReclaimedHooks(ctx, "job-2", "ownership_audit")
+
+	rm := collectMetrics(t, reader)
+
+	// Each reason lands on its own data point — operators must not sum across
+	// reasons (stale_lock = actor/crash indicator, ownership_audit = victim).
+	assertCounterPoint(t, rm, metricLeasesReclaimed, 1, map[string]string{
+		attrReason: "stale_lock",
+	})
+	assertCounterPoint(t, rm, metricLeasesReclaimed, 1, map[string]string{
+		attrReason: "ownership_audit",
+	})
+}
+
 func TestInstrument_RecordsQueueDepthGauge(t *testing.T) {
 	ctx := context.Background()
 	store := newSQLiteStore(t)
