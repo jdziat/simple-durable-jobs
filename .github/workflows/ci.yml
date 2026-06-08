@@ -9,6 +9,10 @@ on:
 permissions:
   contents: write
 
+# CI pins Go to 1.25.11 (matches go.mod's `toolchain` directive) so setup-go
+# installs it directly: no on-the-fly sum.golang.org toolchain download
+# (which flaked Lint) and CI runs the patched stdlib. Bump with go.mod.
+
 jobs:
   test-backends:
     name: Tests (${{ matrix.backend }})
@@ -30,7 +34,7 @@ jobs:
             db: mysql
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       - name: Build test image
         run: docker compose build tests
@@ -53,7 +57,7 @@ jobs:
       # combined result to Codecov (a single-backend profile understates the
       # storage layer's real coverage).
       - name: Upload coverage artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
           name: coverage-${{ matrix.backend }}
@@ -66,15 +70,15 @@ jobs:
     needs: [test-backends]
     if: always()
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
-          go-version: '1.25'
+          go-version: '1.25.11'
 
       - name: Download coverage artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: coverage-*
           path: coverage-raw
@@ -88,12 +92,12 @@ jobs:
             echo "no coverage profiles found; skipping merge"
             exit 0
           fi
-          go run github.com/wadey/gocovmerge@latest "${files[@]}" > coverage-merged.out
+          go run github.com/wadey/gocovmerge@v0.0.0-20160331181800-b5bfa59ec0ad "${files[@]}" > coverage-merged.out
           echo "Merged coverage:"
           go tool cover -func=coverage-merged.out | tail -1
 
       - name: Upload merged coverage to Codecov
-        uses: codecov/codecov-action@v4
+        uses: codecov/codecov-action@b9fd7d16f6d7d1b5d2bec1a2887e65ceed900238 # v4.6.0
         with:
           files: ./coverage-merged.out
           fail_ci_if_error: false
@@ -103,15 +107,15 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
-          go-version: '1.25'
+          go-version: '1.25.11'
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: '20'
 
@@ -131,7 +135,7 @@ jobs:
         run: npx playwright test
 
       - name: Upload Playwright report
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
           name: playwright-report
@@ -142,15 +146,15 @@ jobs:
     name: Lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
-          go-version: '1.25'
+          go-version: '1.25.11'
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: '20'
 
@@ -159,38 +163,45 @@ jobs:
         run: npm install && npm run build
 
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v6
+        uses: golangci/golangci-lint-action@9fae48acfc02a90574d7c304a1758ef9895495fa # v7.0.1
         with:
-          version: latest
-          install-mode: goinstall
+          version: v2.8.0
+          install-mode: binary
           args: --timeout=5m
 
   govulncheck:
     name: govulncheck
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
-          go-version-file: 'go.mod'
+          go-version: '1.25.11'
 
-      # Use @latest so CI picks up the newest vulnerability database handling.
+      # Pinned for reproducibility. govulncheck still fetches the current
+      # vulnerability database at runtime, so the pinned binary stays current on
+      # advisories; bump the pin deliberately (Dependabot tracks Actions).
       # ./... covers only the root module; docs/ is excluded by its own go.mod.
       - name: Run govulncheck
-        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.3.0 ./...
 
   api-compat:
     name: api-compat
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      # fetch-depth: 0 so gorelease sees the version tags and infers the correct
+      # base version; a shallow clone compares against the wrong tag and fails
+      # once a release has been published.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
-          go-version-file: 'go.mod'
+          go-version: '1.25.11'
 
       # Enforces VERSIONING.md's v1 stability promise: incompatible changes fail
       # this gate, while additive minor changes are allowed and expected.
@@ -226,7 +237,7 @@ jobs:
     env:
       CHAOS_DURATION: "25"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Run chaos smoke
         run: bash scripts/chaos-test.sh postgres
 
@@ -235,15 +246,15 @@ jobs:
     runs-on: ubuntu-latest
     needs: [test-backends, lint]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
-          go-version: '1.25'
+          go-version: '1.25.11'
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: '20'
 
@@ -264,11 +275,11 @@ jobs:
     needs: [build, govulncheck, api-compat, chaos-smoke, test-e2e]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           fetch-depth: 0
 
-      - uses: go-semantic-release/action@v1
+      - uses: go-semantic-release/action@2e9dc4247a6004f8377781bef4cb9dad273a741f # v1.24.1
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           changelog-generator-opt: "emojis=true"
