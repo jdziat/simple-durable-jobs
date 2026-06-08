@@ -33,19 +33,23 @@ import (
 const instrumentationName = "github.com/jdziat/simple-durable-jobs/pkg/metrics"
 
 const (
-	metricJobsStarted     = "jobs.started"
-	metricJobsCompleted   = "jobs.completed"
-	metricJobsFailed      = "jobs.failed"
-	metricJobsRetried     = "jobs.retried"
-	metricJobWaitDuration = "jobs.wait.duration"
-	metricJobRunDuration  = "jobs.run.duration"
-	metricQueueDepth      = "jobs.queue.depth"
-	metricLeasesReclaimed = "jobs.leases.reclaimed"
+	metricJobsStarted      = "jobs.started"
+	metricJobsCompleted    = "jobs.completed"
+	metricJobsFailed       = "jobs.failed"
+	metricJobsRetried      = "jobs.retried"
+	metricJobWaitDuration  = "jobs.wait.duration"
+	metricJobRunDuration   = "jobs.run.duration"
+	metricQueueDepth       = "jobs.queue.depth"
+	metricBacklogOldestAge = "jobs.queue.backlog.oldest_age"
+	metricDeadLetterDepth  = "jobs.dead_letter.depth"
+	metricQueueSaturation  = "jobs.queue.saturation"
+	metricLeasesReclaimed  = "jobs.leases.reclaimed"
 
-	attrQueue   = "queue"
-	attrJobType = "job.type"
-	attrOutcome = "outcome"
-	attrReason  = "reason"
+	attrQueue    = "queue"
+	attrJobType  = "job.type"
+	attrOutcome  = "outcome"
+	attrReason   = "reason"
+	attrWorkerID = "worker.id"
 
 	outcomeStarted   = "started"
 	outcomeCompleted = "completed"
@@ -91,6 +95,8 @@ func Instrument(q *queue.Queue, opts ...InstrumentOption) {
 	}
 
 	registerQueueDepthGauge(meter, q.Storage())
+	registerBacklogOldestAgeGauge(meter, q.Storage())
+	registerDeadLetterDepthGauge(meter, q.Storage())
 
 	q.OnJobStart(startHook(inst))
 	q.OnJobComplete(completeHook(inst))
@@ -245,6 +251,64 @@ type queueRunningCountSource interface {
 	QueueRunningCounts(context.Context) (map[string]int, error)
 }
 
+type queueOldestPendingAtSource interface {
+	QueueOldestPendingAt(context.Context) (map[string]time.Time, error)
+}
+
+type queueDeadLetterCountSource interface {
+	QueueDeadLetterCounts(context.Context) (map[string]int, error)
+}
+
+// QueueRunningSnapshotFunc returns a point-in-time running job count by queue.
+type QueueRunningSnapshotFunc func(context.Context) (map[string]int, error)
+
+// InstrumentQueueSaturation registers jobs.queue.saturation for a worker.
+// The worker supplies its configured per-queue capacity and a running-count
+// snapshot source because storage cannot know worker-local capacity.
+func InstrumentQueueSaturation(workerID string, capacities map[string]int, running QueueRunningSnapshotFunc, opts ...InstrumentOption) {
+	if running == nil {
+		slog.Default().Warn("queue saturation gauge disabled", "error", "missing running count source")
+		return
+	}
+
+	cfg := &instrumentConfig{}
+	for _, opt := range opts {
+		opt(cfg)
+	}
+	if cfg.meterProvider == nil {
+		cfg.meterProvider = otel.GetMeterProvider()
+	}
+
+	capacitySnapshot := make(map[string]int, len(capacities))
+	for queueName, capacity := range capacities {
+		capacitySnapshot[queueName] = capacity
+	}
+
+	meter := cfg.meterProvider.Meter(instrumentationName)
+	_, err := meter.Float64ObservableGauge(metricQueueSaturation,
+		metric.WithUnit("1"),
+		metric.WithDescription("Worker-local running jobs divided by configured capacity by queue."),
+		metric.WithFloat64Callback(func(ctx context.Context, observer metric.Float64Observer) error {
+			runningCounts, err := running(ctx)
+			if err != nil {
+				return err
+			}
+			for queueName, capacity := range capacitySnapshot {
+				if capacity <= 0 {
+					continue
+				}
+				observer.Observe(float64(runningCounts[queueName])/float64(capacity), metric.WithAttributes(
+					attribute.String(attrWorkerID, workerID),
+					attribute.String(attrQueue, queueName),
+				))
+			}
+			return nil
+		}))
+	if err != nil {
+		slog.Default().Warn("queue saturation gauge disabled", "error", err)
+	}
+}
+
 func registerQueueDepthGauge(meter metric.Meter, s core.Storage) {
 	pending, ok := s.(queuePendingCountSource)
 	if !ok {
@@ -267,6 +331,61 @@ func registerQueueDepthGauge(meter metric.Meter, s core.Storage) {
 		}))
 	if err != nil {
 		slog.Default().Warn("queue depth gauge disabled", "error", err)
+	}
+}
+
+func registerBacklogOldestAgeGauge(meter metric.Meter, s core.Storage) {
+	source, ok := s.(queueOldestPendingAtSource)
+	if !ok {
+		slog.Default().Warn("storage backend does not support backlog oldest age metrics; backlog oldest age gauge disabled")
+		return
+	}
+
+	_, err := meter.Float64ObservableGauge(metricBacklogOldestAge,
+		metric.WithUnit("s"),
+		metric.WithDescription("Age in seconds of the oldest pending job by queue."),
+		metric.WithFloat64Callback(func(ctx context.Context, observer metric.Float64Observer) error {
+			oldestByQueue, err := source.QueueOldestPendingAt(ctx)
+			if err != nil {
+				return err
+			}
+			now := time.Now()
+			for queueName, oldest := range oldestByQueue {
+				age := now.Sub(oldest)
+				if age < 0 {
+					continue
+				}
+				observer.Observe(age.Seconds(), metric.WithAttributes(attribute.String(attrQueue, queueName)))
+			}
+			return nil
+		}))
+	if err != nil {
+		slog.Default().Warn("backlog oldest age gauge disabled", "error", err)
+	}
+}
+
+func registerDeadLetterDepthGauge(meter metric.Meter, s core.Storage) {
+	source, ok := s.(queueDeadLetterCountSource)
+	if !ok {
+		slog.Default().Warn("storage backend does not support dead letter depth metrics; dead letter depth gauge disabled")
+		return
+	}
+
+	_, err := meter.Int64ObservableGauge(metricDeadLetterDepth,
+		metric.WithUnit("{job}"),
+		metric.WithDescription("Current dead-letter job depth by queue."),
+		metric.WithInt64Callback(func(ctx context.Context, observer metric.Int64Observer) error {
+			counts, err := source.QueueDeadLetterCounts(ctx)
+			if err != nil {
+				return err
+			}
+			for queueName, count := range counts {
+				observer.Observe(int64(count), metric.WithAttributes(attribute.String(attrQueue, queueName)))
+			}
+			return nil
+		}))
+	if err != nil {
+		slog.Default().Warn("dead letter depth gauge disabled", "error", err)
 	}
 }
 
