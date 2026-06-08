@@ -564,9 +564,16 @@ func (s *GormStorage) CompleteWithResult(ctx context.Context, jobID, workerID st
 func (s *GormStorage) Fail(ctx context.Context, jobID string, workerID string, errMsg string, retryAt *time.Time) error {
 	// Sanitize error message to prevent sensitive data leakage
 	sanitizedErr := security.SanitizeErrorMessage(errMsg)
+	// Encrypt the handler error text at rest when a real codec is configured.
+	// PII can surface in retryable failures shown in the UI, so encode in both
+	// branches. Under the default identity codec this returns plaintext verbatim.
+	encErr, err := s.encodeErrorText("job last_error", jobID, sanitizedErr)
+	if err != nil {
+		return err
+	}
 
 	updates := map[string]any{
-		"last_error":   sanitizedErr,
+		"last_error":   encErr,
 		"locked_by":    "",
 		"locked_until": nil,
 	}
@@ -579,7 +586,9 @@ func (s *GormStorage) Fail(ctx context.Context, jobID string, workerID string, e
 		now := time.Now()
 		updates["completed_at"] = now
 		updates["dead_lettered_at"] = now
-		updates["dead_letter_reason"] = deadLetterReasonExpr(sanitizedErr)
+		// Label stays plaintext (fixed, non-PII); only the error suffix is
+		// encrypted, preserving the attempt>=max_retries CASE in SQL.
+		updates["dead_letter_reason"] = deadLetterReasonExpr(encErr)
 	}
 
 	result := s.db.WithContext(ctx).
@@ -601,12 +610,19 @@ func (s *GormStorage) Fail(ctx context.Context, jobID string, workerID string, e
 // transaction. Retryable failures must continue to use Fail.
 func (s *GormStorage) FailTerminalWithResult(ctx context.Context, jobID, workerID, errMsg string) (*core.FanOut, error) {
 	sanitizedErr := security.SanitizeErrorMessage(errMsg)
+	// Encrypt the error text at rest when a real codec is configured. The
+	// encoded form flows into both last_error and the dead_letter_reason suffix
+	// (the label stays plaintext via deadLetterReasonExpr). Identity codec → no-op.
+	encErr, err := s.encodeErrorText("job last_error", jobID, sanitizedErr)
+	if err != nil {
+		return nil, err
+	}
 	updates := map[string]any{
-		"last_error":        sanitizedErr,
+		"last_error":        encErr,
 		"status":            core.StatusFailed,
 		"locked_by":         "",
 		"locked_until":      nil,
-		deadLetterReasonKey: sanitizedErr,
+		deadLetterReasonKey: encErr,
 	}
 	return s.accountTerminalWithFanOut(ctx, jobID, workerID, updates, "failed_count")
 }
@@ -1715,6 +1731,7 @@ func (s *GormStorage) PauseJob(ctx context.Context, jobID string) error {
 						"status":       core.StatusCancelled,
 						"completed_at": now,
 						"updated_at":   now,
+						// non-PII constant; intentionally stored plaintext
 						"last_error":   "cancelled by user",
 						"locked_by":    "",
 						"locked_until": nil,
