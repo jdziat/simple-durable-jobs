@@ -1039,12 +1039,24 @@ func (s *GormStorage) FindOrphanedJobs(ctx context.Context, jobIDs []string, wor
 // Returns the IDs of the jobs whose locks were released so the caller can
 // cancel any local in-flight handlers — see core.Storage.ReleaseStaleLocks
 // for the rationale.
+//
+// The cutoff is compared against COALESCE(last_heartbeat_at, started_at,
+// locked_until): the last *contact* the owning worker made, not its stacked
+// lease expiry. last_heartbeat_at is the live anchor (refreshed every heartbeat);
+// started_at is the fallback for a job that was dequeued but has not yet sent its
+// first heartbeat; locked_until is the last-resort fallback for directly-inserted
+// or pre-existing rows that have neither column populated. This makes reclaim
+// latency ~staleDuration ("time since last contact") rather than the old
+// ~lockDuration+staleDuration, which the lease-stacking Dequeue/Heartbeat pushes
+// inflated. last_heartbeat_at was written for exactly this purpose but was
+// previously never read by the reaper.
 func (s *GormStorage) ReleaseStaleLocks(ctx context.Context, staleDuration time.Duration) ([]string, error) {
 	// The cutoff is computed on the DB clock for multi-worker backends so it is
-	// comparable with the DB-clock locked_until written by Dequeue/Heartbeat.
-	// Comparing a client-computed cutoff against a DB-written lock is exactly the
-	// skew bug this avoids: a reaper whose wall clock ran ahead would otherwise
-	// reclaim a lock that is still live on the owning worker.
+	// comparable with the DB-clock last_heartbeat_at/started_at/locked_until
+	// written by Dequeue/Heartbeat. Comparing a client-computed cutoff against a
+	// DB-written timestamp is exactly the skew bug this avoids: a reaper whose
+	// wall clock ran ahead would otherwise reclaim a lock that is still live on
+	// the owning worker.
 	var cutoff any
 	if s.useDBClock() {
 		cutoff = s.offsetExpr(-staleDuration)
@@ -1065,7 +1077,7 @@ func (s *GormStorage) ReleaseStaleLocks(ctx context.Context, staleDuration time.
 			// cap bounds the IN-list update without needing a stable sort.
 			if err := tx.Model(&core.Job{}).
 				Where("status = ?", core.StatusRunning).
-				Where("locked_until < ?", cutoff).
+				Where("COALESCE(last_heartbeat_at, started_at, locked_until) < ?", cutoff).
 				Limit(maxResumeBatch).
 				Pluck("id", &released).Error; err != nil {
 				return err

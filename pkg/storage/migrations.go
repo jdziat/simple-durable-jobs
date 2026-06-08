@@ -165,6 +165,11 @@ var schemaMigrations = []schemaMigration{
 		Name:    "scheduled_fire_last_fired_at",
 		Up:      migrateScheduledFireLastFiredAt,
 	},
+	{
+		Version: 8,
+		Name:    "stale_lock_reaper_index",
+		Up:      migrateStaleLockReaperIndex,
+	},
 }
 
 // applyPendingMigrations runs every migration whose version is absent from the
@@ -400,5 +405,35 @@ func migrateScheduledFireLastFiredAt(ctx context.Context, db *gorm.DB, dialect s
 			}
 		}
 		return nil
+	}
+}
+
+// migrateStaleLockReaperIndex adds an index supporting the reaper's new
+// freshness predicate: ReleaseStaleLocks now selects running rows where
+// COALESCE(last_heartbeat_at, started_at, locked_until) < cutoff. No column is
+// added — last_heartbeat_at/started_at/locked_until already exist on core.Job
+// and are created by AutoMigrate; this migration is index-only.
+//
+// Postgres/SQLite support partial + expression indexes, so they index the
+// COALESCE expression over only running rows. MySQL has neither partial nor a
+// version-stable functional index, so it gets a status-led composite index
+// instead. The index is a pure optimization (running rows are few); correctness
+// never depends on it.
+func migrateStaleLockReaperIndex(ctx context.Context, db *gorm.DB, dialect string) error {
+	switch dialect {
+	case dialectMySQL:
+		m := db.Migrator()
+		if !m.HasIndex(&core.Job{}, "idx_jobs_stale_lock") {
+			if err := db.Exec(
+				"CREATE INDEX idx_jobs_stale_lock ON jobs (status, last_heartbeat_at, started_at, locked_until)",
+			).Error; err != nil && !isBenignDDLError(err) {
+				return fmt.Errorf("create idx_jobs_stale_lock: %w", err)
+			}
+		}
+		return nil
+	default:
+		return db.Exec(
+			"CREATE INDEX IF NOT EXISTS idx_jobs_stale_lock ON jobs (COALESCE(last_heartbeat_at, started_at, locked_until)) WHERE status = 'running'",
+		).Error
 	}
 }

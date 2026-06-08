@@ -1405,6 +1405,29 @@ func TestNewWorker_DefaultsApplied(t *testing.T) {
 	assert.Equal(t, map[string]int{"default": 10}, w.config.Queues)
 }
 
+// TestNewWorker_ClampsHeartbeatIntervalBelowStaleLockAge proves the reaper-safety
+// clamp: with the reaper now reclaiming from last contact, the heartbeat must
+// refresh last_heartbeat_at at least ~3x within StaleLockAge, so the interval is
+// clamped to StaleLockAge/3.
+func TestNewWorker_ClampsHeartbeatIntervalBelowStaleLockAge(t *testing.T) {
+	mock := &mockStorage{}
+	q := queue.New(mock)
+	w := NewWorker(q, WithStaleLockAge(3*time.Second))
+
+	assert.Equal(t, 1*time.Second, w.heartbeatInterval, "heartbeat interval must clamp to StaleLockAge/3")
+	assert.Less(t, w.heartbeatInterval, 3*time.Second)
+}
+
+// TestNewWorker_DefaultHeartbeatIntervalUnchanged confirms the default
+// StaleLockAge (45m → 15m) leaves the 2m heartbeat default in place.
+func TestNewWorker_DefaultHeartbeatIntervalUnchanged(t *testing.T) {
+	mock := &mockStorage{}
+	q := queue.New(mock)
+	w := NewWorker(q)
+
+	assert.Equal(t, 2*time.Minute, w.heartbeatInterval)
+}
+
 func TestNewWorker_CustomQueuesPreserved(t *testing.T) {
 	mock := &mockStorage{}
 	q := queue.New(mock)

@@ -719,11 +719,15 @@ func TestReleaseStaleLocks_ResetsExpiredRunningJobsToPending(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, got)
 
-	// Manually push locked_until into the past so the reaper can find it
+	// Manually push started_at AND locked_until into the past so the reaper
+	// finds it: the reaper now anchors on COALESCE(last_heartbeat_at,
+	// started_at, locked_until), and Dequeue set started_at to ~now, so pushing
+	// only locked_until would leave the row out of the cutoff. last_heartbeat_at
+	// is NULL here (this test never heartbeats).
 	past := time.Now().Add(-2 * time.Hour)
 	err = s.db.Model(&core.Job{}).
 		Where("id = ?", got.ID).
-		Update("locked_until", past).Error
+		Updates(map[string]any{"started_at": past, "locked_until": past}).Error
 	require.NoError(t, err)
 
 	released, err := s.ReleaseStaleLocks(ctx, 1*time.Hour)
@@ -749,10 +753,12 @@ func TestReleaseStaleLocks_ReapedJobIsOrphanedAndDequeuable(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, got)
 
+	// Anchor on last contact: push started_at AND locked_until into the past
+	// (last_heartbeat_at is NULL — no heartbeat in this test).
 	past := time.Now().Add(-2 * time.Hour)
 	require.NoError(t, s.db.Model(&core.Job{}).
 		Where("id = ?", got.ID).
-		Update("locked_until", past).Error)
+		Updates(map[string]any{"started_at": past, "locked_until": past}).Error)
 
 	released, err := s.ReleaseStaleLocks(ctx, time.Hour)
 	require.NoError(t, err)
@@ -809,6 +815,105 @@ func TestReleaseStaleLocks_LimitsBatch(t *testing.T) {
 	released, err := s.ReleaseStaleLocks(ctx, time.Hour)
 	require.NoError(t, err)
 	assert.Len(t, released, maxResumeBatch)
+}
+
+// TestReleaseStaleLocks_ReclaimsByLastContactNotStackedLease is the bug-catcher
+// for #3: the reaper must reclaim a crashed worker's job based on its LAST
+// CONTACT (last_heartbeat_at/started_at), not its stacked lease (locked_until),
+// which Heartbeat/Dequeue keep pushing into the future. Under the OLD
+// `locked_until < cutoff` predicate this job (future lease) would never be
+// reclaimed despite no contact for 2h.
+func TestReleaseStaleLocks_ReclaimsByLastContactNotStackedLease(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	require.NoError(t, s.Enqueue(ctx, newTestJob("default", "task.run")))
+
+	got, err := s.Dequeue(ctx, []string{"default"}, "worker-1")
+	require.NoError(t, err)
+	require.NotNil(t, got)
+
+	// Establish a real last_heartbeat_at, then simulate a worker that crashed 2h
+	// ago whose lease was last stacked 1h into the FUTURE.
+	require.NoError(t, s.Heartbeat(ctx, got.ID, "worker-1"))
+	past := time.Now().Add(-2 * time.Hour)
+	future := time.Now().Add(1 * time.Hour)
+	require.NoError(t, s.db.Model(&core.Job{}).
+		Where("id = ?", got.ID).
+		Updates(map[string]any{
+			"last_heartbeat_at": past,
+			"started_at":        past,
+			"locked_until":      future,
+		}).Error)
+
+	released, err := s.ReleaseStaleLocks(ctx, time.Hour)
+	require.NoError(t, err)
+	require.Equal(t, []string{got.ID}, released, "stale-by-last-contact job must be reclaimed despite a future lease")
+
+	row, err := s.GetJob(ctx, got.ID)
+	require.NoError(t, err)
+	require.NotNil(t, row)
+	assert.Equal(t, core.StatusPending, row.Status)
+	assert.Empty(t, row.LockedBy)
+}
+
+// TestReleaseStaleLocks_NullHeartbeatFallsBackToStartedAt covers the COALESCE
+// middle term: a job dequeued but never heartbeated (last_heartbeat_at NULL)
+// must be reclaimed once started_at falls past the cutoff, even with a fresh
+// (future) lease.
+func TestReleaseStaleLocks_NullHeartbeatFallsBackToStartedAt(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	require.NoError(t, s.Enqueue(ctx, newTestJob("default", "task.run")))
+
+	got, err := s.Dequeue(ctx, []string{"default"}, "worker-1")
+	require.NoError(t, err)
+	require.NotNil(t, got)
+
+	// No heartbeat → last_heartbeat_at stays NULL. Push started_at far past, keep
+	// the lease fresh in the future.
+	past := time.Now().Add(-2 * time.Hour)
+	future := time.Now().Add(1 * time.Hour)
+	require.NoError(t, s.db.Model(&core.Job{}).
+		Where("id = ?", got.ID).
+		Updates(map[string]any{"started_at": past, "locked_until": future}).Error)
+
+	released, err := s.ReleaseStaleLocks(ctx, time.Hour)
+	require.NoError(t, err)
+	require.Equal(t, []string{got.ID}, released, "should reclaim via started_at fallback")
+
+	row, err := s.GetJob(ctx, got.ID)
+	require.NoError(t, err)
+	assert.Equal(t, core.StatusPending, row.Status)
+}
+
+// TestReleaseStaleLocks_NullHeartbeatAndStartedFallsBackToLockedUntil covers the
+// COALESCE last term: a directly-inserted running row with NULL heartbeat and
+// NULL started_at (a pre-migration / edge row shape) must still be reclaimed via
+// the locked_until fallback when the lease itself is in the past.
+func TestReleaseStaleLocks_NullHeartbeatAndStartedFallsBackToLockedUntil(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	past := time.Now().Add(-2 * time.Hour)
+	job := &core.Job{
+		Type:        "task.stale",
+		Queue:       "default",
+		Status:      core.StatusRunning,
+		LockedBy:    "worker-stale",
+		LockedUntil: &past,
+		// StartedAt and LastHeartbeatAt left nil.
+	}
+	require.NoError(t, s.Enqueue(ctx, job))
+
+	released, err := s.ReleaseStaleLocks(ctx, time.Hour)
+	require.NoError(t, err)
+	require.Equal(t, []string{job.ID}, released, "should reclaim via locked_until last-resort fallback")
+
+	row, err := s.GetJob(ctx, job.ID)
+	require.NoError(t, err)
+	assert.Equal(t, core.StatusPending, row.Status)
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

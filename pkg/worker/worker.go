@@ -218,6 +218,27 @@ func NewWorker(q *queue.Queue, opts ...WorkerOption) *Worker {
 	if config.FanOutRecoveryStaleAge <= 0 {
 		config.FanOutRecoveryStaleAge = 2 * time.Minute
 	}
+
+	// Clamp the heartbeat interval below StaleLockAge. The reaper now reclaims a
+	// job from its LAST CONTACT — COALESCE(last_heartbeat_at, started_at,
+	// locked_until) < now-StaleLockAge — instead of from the (stacked) lease, so
+	// last_heartbeat_at must be refreshed several times within a StaleLockAge
+	// window or a live, not-yet-heartbeated job would anchor on started_at and
+	// could be falsely reclaimed and double-run. runHeartbeat ticks once per
+	// interval with NO immediate first beat, so the unprotected window is one
+	// full interval; keeping interval <= StaleLockAge/3 guarantees ~3 beats land
+	// before the stale window elapses. The default StaleLockAge (45m → 15m) leaves
+	// the 2m default untouched; the chaos harness's 2s StaleLockAge drives it to
+	// ~667ms, comfortably below 2s, and the 200ms floor keeps a sub-second
+	// (documented-unsupported) StaleLockAge from hammering the DB.
+	hbInterval := 2 * time.Minute
+	if maxHB := config.StaleLockAge / 3; maxHB > 0 && maxHB < hbInterval {
+		hbInterval = maxHB
+	}
+	if hbInterval < 200*time.Millisecond {
+		hbInterval = 200 * time.Millisecond
+	}
+
 	if config.MaxRetryBackoff <= 0 {
 		config.MaxRetryBackoff = time.Minute
 	}
@@ -264,7 +285,7 @@ func NewWorker(q *queue.Queue, opts ...WorkerOption) *Worker {
 		slotJobID:               make(map[string][]string),
 		queueRateBuckets:        queueRateBuckets,
 		futureSleepSuppressions: make(map[string]int64),
-		heartbeatInterval:       2 * time.Minute,
+		heartbeatInterval:       hbInterval,
 	}
 }
 
