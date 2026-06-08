@@ -8,6 +8,7 @@ import (
 	"math/rand"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -31,6 +32,19 @@ type app struct {
 
 type subArgs struct {
 	Index int `json:"index"`
+}
+
+// waiterArgs is the payload for the chaos.signal_waiter scenario: how many
+// signals the waiter must consume (one per WaitForSignal call).
+type waiterArgs struct {
+	Count int `json:"count"`
+}
+
+// signalTarget is the scan struct for chaos_signal_targets, which records the
+// (waiter job_id, signal count) pairs the chaos.signal_sender delivers to.
+type signalTarget struct {
+	JobID    string `gorm:"column:job_id"`
+	SigCount int    `gorm:"column:sig_count"`
 }
 
 type invariant struct {
@@ -125,6 +139,10 @@ func ensureLedger(ctx context.Context, db *gorm.DB, dialect string) error {
 				id BIGINT AUTO_INCREMENT PRIMARY KEY,
 				fired_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 			)`,
+			`CREATE TABLE IF NOT EXISTS chaos_signal_targets (
+				job_id VARCHAR(191) NOT NULL PRIMARY KEY,
+				sig_count INT NOT NULL
+			)`,
 		}
 	} else {
 		stmts = []string{
@@ -138,6 +156,10 @@ func ensureLedger(ctx context.Context, db *gorm.DB, dialect string) error {
 			`CREATE TABLE IF NOT EXISTS chaos_ticks (
 				id bigserial PRIMARY KEY,
 				fired_at timestamptz NOT NULL DEFAULT now()
+			)`,
+			`CREATE TABLE IF NOT EXISTS chaos_signal_targets (
+				job_id text PRIMARY KEY,
+				sig_count int NOT NULL
 			)`,
 		}
 	}
@@ -248,6 +270,93 @@ func registerHandlers(q *jobs.Queue, db *gorm.DB, dialect string) {
 		}
 	})
 
+	// chaos.signal_waiter defends P1 (atomic signal consume + replay checkpoint).
+	// It consumes exactly args.Count signals named "sig" — calling WaitForSignal on
+	// EVERY iteration (never skipped on replay, since WaitForSignal's own
+	// (CallIndex, "signal:sig") checkpoint keeps the consume ordering deterministic).
+	// Each successful consume records an idempotent downstream effect. A P1
+	// lost-signal (consumed_at committed without its checkpoint) re-consumes the
+	// next FIFO signal on replay, leaving the waiter one short at the final
+	// iteration -> WaitForSignal returns nil -> SuspendJob -> wedged forever, which
+	// INV-SIGNAL-EXACTLY-ONCE catches as consumed<expected AND unfinished_waiters>0.
+	q.Register("chaos.signal_waiter", func(ctx context.Context, args waiterArgs) error {
+		jobID := jobs.JobIDFromContext(ctx)
+		for i := 0; i < args.Count; i++ {
+			if _, err := jobs.WaitForSignal[int](ctx, "sig"); err != nil {
+				return err
+			}
+			marker := "sig-consumed:" + strconv.Itoa(i)
+			if err := insertEffect(ctx, db, jobID, marker); err != nil {
+				if isDuplicate(err) {
+					// Benign at-least-once replay: the consume already landed; record
+					// the duplicate as an INFO-only re-exec marker and move on.
+					_ = insertEffectIgnoreDuplicate(ctx, db, dialect, jobID, "sig-reexec:"+strconv.Itoa(i))
+					continue
+				}
+				return err
+			}
+		}
+		return nil
+	})
+
+	// chaos.signal_sender delivers the signals each waiter is waiting on. It reads
+	// the (job_id, sig_count) targets seeded BEFORE it was enqueued, so the targets
+	// always exist when it runs. Each (target, seq) send is guarded by a phase
+	// checkpoint so a killed-and-retried sender does not flood the buffered signals
+	// table; the waiter consumes exactly Count regardless.
+	q.Register("chaos.signal_sender", func(ctx context.Context, _ struct{}) error {
+		var targets []signalTarget
+		if err := db.WithContext(ctx).Raw(`SELECT job_id, sig_count FROM chaos_signal_targets`).Scan(&targets).Error; err != nil {
+			return err
+		}
+		for _, t := range targets {
+			for seq := 0; seq < t.SigCount; seq++ {
+				phase := fmt.Sprintf("sent:%s:%d", t.JobID, seq)
+				if _, done := jobs.LoadPhaseCheckpoint[bool](ctx, phase); done {
+					continue
+				}
+				if err := jobs.Signal(ctx, q, t.JobID, "sig", seq); err != nil {
+					return err
+				}
+				if err := jobs.SavePhaseCheckpoint(ctx, phase, true); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	})
+
+	// chaos.timer defends the durable-timer path and P3 (crash-resistant checkpoint
+	// write). It Sleeps 2s (suspending via &WaitingError, resumed on the ORIGINAL
+	// checkpointed deadline) then performs ONE effect using the atomic transaction
+	// pattern proven by chaos.pipeline: insertEffect + SavePhaseCheckpointTx commit
+	// together, so a SIGKILL either commits both (replay short-circuits via
+	// LoadPhaseCheckpoint) or neither (replay redoes cleanly). A lost timer effect
+	// shows as fired<expected; a doubled one as a duplicate timer-fired or a
+	// timer-reexec marker; a wedge as an unfinished chaos.timer row.
+	q.Register("chaos.timer", func(ctx context.Context, _ struct{}) error {
+		jobID := jobs.JobIDFromContext(ctx)
+		if err := jobs.Sleep(ctx, 2*time.Second); err != nil {
+			return err
+		}
+		if _, done := jobs.LoadPhaseCheckpoint[string](ctx, "timer-effect"); done {
+			return nil
+		}
+		err := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			if e := insertEffect(ctx, tx, jobID, "timer-fired"); e != nil {
+				return e
+			}
+			return jobs.SavePhaseCheckpointTx(ctx, tx, "timer-effect", "ok")
+		})
+		if err != nil {
+			if isDuplicate(err) {
+				_ = insertEffectIgnoreDuplicate(ctx, db, dialect, jobID, "timer-reexec")
+			}
+			return err
+		}
+		return nil
+	})
+
 	q.Register("chaos.tick", func(ctx context.Context, _ struct{}) error {
 		stmt := `INSERT INTO chaos_ticks DEFAULT VALUES`
 		if dialect == "mysql" {
@@ -325,8 +434,34 @@ func runSeed(ctx context.Context, a *app) error {
 	}
 	wg.Wait()
 
-	fmt.Printf("seeded workload: unit=%d pipeline_tx=%d pipeline_window=%d fanout=%d slow=%d unique_attempts=50 unique_inserted=%d duplicate_rejected=%d unique_errors=%d\n",
-		counts["chaos.unit"], counts["chaos.pipeline"], counts["chaos.pipeline_window"], counts["chaos.fanout"], counts["chaos.slow"], uniqueOK, uniqueDup, uniqueErr)
+	// Signal + timer durability scenarios (P6). Seed each waiter's target row
+	// BEFORE enqueueing the sender so the sender always finds its targets. The
+	// sender is enqueued AFTER all targets are recorded.
+	const (
+		signalWaiters    = 10
+		signalsPerWaiter = 3
+		timerJobs        = 15
+	)
+	for i := 0; i < signalWaiters; i++ {
+		id, err := a.q.Enqueue(ctx, "chaos.signal_waiter", waiterArgs{Count: signalsPerWaiter}, jobs.Retries(10))
+		if err != nil {
+			return fmt.Errorf("enqueue signal_waiter: %w", err)
+		}
+		if err := insertSignalTarget(ctx, a.db, id, signalsPerWaiter); err != nil {
+			return fmt.Errorf("record signal target: %w", err)
+		}
+	}
+	if _, err := a.q.Enqueue(ctx, "chaos.signal_sender", struct{}{}, jobs.Retries(20)); err != nil {
+		return fmt.Errorf("enqueue signal_sender: %w", err)
+	}
+	for i := 0; i < timerJobs; i++ {
+		if _, err := a.q.Enqueue(ctx, "chaos.timer", struct{}{}, jobs.Retries(10)); err != nil {
+			return fmt.Errorf("enqueue timer: %w", err)
+		}
+	}
+
+	fmt.Printf("seeded workload: unit=%d pipeline_tx=%d pipeline_window=%d fanout=%d slow=%d unique_attempts=50 unique_inserted=%d duplicate_rejected=%d unique_errors=%d signal_waiters=%d signals_per_waiter=%d timers=%d\n",
+		counts["chaos.unit"], counts["chaos.pipeline"], counts["chaos.pipeline_window"], counts["chaos.fanout"], counts["chaos.slow"], uniqueOK, uniqueDup, uniqueErr, signalWaiters, signalsPerWaiter, timerJobs)
 	return nil
 }
 
@@ -335,7 +470,7 @@ func resetHarnessData(ctx context.Context, db *gorm.DB, dialect string) error {
 		// MySQL TRUNCATE can't target multiple tables or CASCADE; truncate each
 		// with FK checks off (the schema has no inter-table FKs, but this keeps
 		// the order-independent regardless).
-		tables := []string{"chaos_effects", "chaos_ticks", "checkpoints", "fan_outs", "jobs", "queue_states", "scheduled_fires", "leases"}
+		tables := []string{"chaos_effects", "chaos_ticks", "chaos_signal_targets", "signals", "checkpoints", "fan_outs", "jobs", "queue_states", "scheduled_fires", "leases"}
 		return db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 			if err := tx.Exec(`SET FOREIGN_KEY_CHECKS=0`).Error; err != nil {
 				return err
@@ -348,7 +483,7 @@ func resetHarnessData(ctx context.Context, db *gorm.DB, dialect string) error {
 			return tx.Exec(`SET FOREIGN_KEY_CHECKS=1`).Error
 		})
 	}
-	return db.WithContext(ctx).Exec(`TRUNCATE TABLE chaos_effects, chaos_ticks, checkpoints, fan_outs, jobs, queue_states, scheduled_fires, leases RESTART IDENTITY CASCADE`).Error
+	return db.WithContext(ctx).Exec(`TRUNCATE TABLE chaos_effects, chaos_ticks, chaos_signal_targets, signals, checkpoints, fan_outs, jobs, queue_states, scheduled_fires, leases RESTART IDENTITY CASCADE`).Error
 }
 
 func runCheck(ctx context.Context, a *app) error {
@@ -363,6 +498,8 @@ func runCheck(ctx context.Context, a *app) error {
 		checkFanOutCounts(ctx, a.db),
 		checkUnique(ctx, a.db),
 		checkSchedule(ctx, a.db),
+		checkSignalExactlyOnce(ctx, a.db),
+		checkTimerExactlyOnce(ctx, a.db),
 	}
 
 	hardFailed := 0
@@ -390,7 +527,7 @@ func waitForDrain(ctx context.Context, db *gorm.DB, timeout, quietFor time.Durat
 	quietSince := time.Time{}
 	for time.Now().Before(deadline) {
 		var active int64
-		if err := db.WithContext(ctx).Raw(`SELECT count(*) FROM jobs WHERE status IN ('pending','running')`).Scan(&active).Error; err != nil {
+		if err := db.WithContext(ctx).Raw(`SELECT count(*) FROM jobs WHERE status IN ('pending','running','waiting')`).Scan(&active).Error; err != nil {
 			return err
 		}
 		if active == 0 {
@@ -512,6 +649,50 @@ func checkSchedule(ctx context.Context, db *gorm.DB) invariant {
 		pass:   got <= maxExpected,
 		detail: fmt.Sprintf("ticks_in_%s_window=%d max_expected_single_scheduler=%d", window, got, maxExpected),
 	}
+}
+
+// checkSignalExactlyOnce defends P1: every seeded signal is consumed exactly once
+// and no waiter is left wedged. A P1 lost-signal regression manifests as
+// consumed<expected AND/OR a chaos.signal_waiter row stuck in a non-completed
+// status. The at-least-once re-exec count is reported for visibility only (the
+// downstream effect is idempotent by design and never fails this HARD check).
+// expected>0 guards against a vacuous PASS when seeding produced nothing.
+func checkSignalExactlyOnce(ctx context.Context, db *gorm.DB) invariant {
+	var expected, consumed, unfinished, reexec int64
+	db.WithContext(ctx).Raw(`SELECT COALESCE(SUM(sig_count),0) FROM chaos_signal_targets`).Scan(&expected)
+	db.WithContext(ctx).Raw(`SELECT count(*) FROM chaos_effects WHERE marker LIKE 'sig-consumed:%'`).Scan(&consumed)
+	db.WithContext(ctx).Raw(`SELECT count(*) FROM jobs WHERE type = 'chaos.signal_waiter' AND status <> 'completed'`).Scan(&unfinished)
+	db.WithContext(ctx).Raw(`SELECT count(*) FROM chaos_effects WHERE marker LIKE 'sig-reexec:%'`).Scan(&reexec)
+	pass := expected > 0 && consumed == expected && unfinished == 0
+	return invariant{
+		name:   "INV-SIGNAL-EXACTLY-ONCE",
+		level:  "HARD",
+		pass:   pass,
+		detail: fmt.Sprintf("expected=%d consumed=%d unfinished_waiters=%d at_least_once_reexec=%d", expected, consumed, unfinished, reexec),
+	}
+}
+
+// checkTimerExactlyOnce defends the durable-timer path and P3: each timer fires
+// its effect exactly once with no re-execution and no wedge. A lost effect shows
+// as fired<expected, a doubled effect as reexec>0 (or a duplicate timer-fired),
+// and a re-sleep/wedge as unfinished>0. expected>0 guards against a vacuous PASS.
+func checkTimerExactlyOnce(ctx context.Context, db *gorm.DB) invariant {
+	var expected, fired, reexec, unfinished int64
+	db.WithContext(ctx).Raw(`SELECT count(*) FROM jobs WHERE type = 'chaos.timer'`).Scan(&expected)
+	db.WithContext(ctx).Raw(`SELECT count(*) FROM chaos_effects WHERE marker = 'timer-fired'`).Scan(&fired)
+	db.WithContext(ctx).Raw(`SELECT count(*) FROM chaos_effects WHERE marker = 'timer-reexec'`).Scan(&reexec)
+	db.WithContext(ctx).Raw(`SELECT count(*) FROM jobs WHERE type = 'chaos.timer' AND status <> 'completed'`).Scan(&unfinished)
+	pass := expected > 0 && fired == expected && reexec == 0 && unfinished == 0
+	return invariant{
+		name:   "INV-TIMER-EXACTLY-ONCE",
+		level:  "HARD",
+		pass:   pass,
+		detail: fmt.Sprintf("expected=%d fired=%d reexec=%d unfinished=%d", expected, fired, reexec, unfinished),
+	}
+}
+
+func insertSignalTarget(ctx context.Context, db *gorm.DB, jobID string, n int) error {
+	return db.WithContext(ctx).Exec(`INSERT INTO chaos_signal_targets (job_id, sig_count) VALUES (?, ?)`, jobID, n).Error
 }
 
 func insertEffect(ctx context.Context, db *gorm.DB, jobID, marker string) error {
