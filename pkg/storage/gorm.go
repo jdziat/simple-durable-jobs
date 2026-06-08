@@ -53,12 +53,24 @@ func WithCodec(c core.PayloadCodec) GormStorageOption {
 	}
 }
 
+// withoutDefaultPool disables the bounded connection pool that NewGormStorage
+// applies by default. It is unexported because it exists only so
+// NewGormStorageWithPool (which has already sized the pool itself, possibly to
+// an explicit unlimited) can opt out of the auto-default; it is not part of the
+// public API and is not re-exported through jobs.go.
+func withoutDefaultPool() GormStorageOption {
+	return func(s *GormStorage) {
+		s.skipDefaultPool = true
+	}
+}
+
 // GormStorage implements Storage using GORM.
 type GormStorage struct {
-	db           *gorm.DB
-	isSQLite     bool
-	lockDuration time.Duration
-	codec        core.PayloadCodec
+	db              *gorm.DB
+	isSQLite        bool
+	lockDuration    time.Duration
+	codec           core.PayloadCodec
+	skipDefaultPool bool
 }
 
 // NewGormStorage creates a new GORM-backed storage. For file-based SQLite under
@@ -91,6 +103,12 @@ func NewGormStorage(db *gorm.DB, opts ...GormStorageOption) *GormStorage {
 	}
 	for _, opt := range opts {
 		opt(s)
+	}
+	// Apply a bounded default pool unless opted out (NewGormStorageWithPool) or
+	// the caller already sized the pool. Must run after the opts loop so
+	// withoutDefaultPool() is observed.
+	if !s.skipDefaultPool {
+		applyDefaultPoolIfUnset(db, isSQLite)
 	}
 	return s
 }

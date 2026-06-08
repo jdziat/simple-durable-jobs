@@ -41,6 +41,55 @@ func DefaultPoolConfig() PoolConfig {
 	}
 }
 
+// sqliteDefaultPoolConfig returns a small, SQLite-safe default pool.
+//
+// SQLite has a single writer, so a tight pool both bounds writer contention
+// (the SQLITE_BUSY churn this repo has flaked on before) and keeps WAL read
+// parallelism. ConnMaxLifetime/ConnMaxIdleTime are deliberately 0 so the sole
+// connection of an in-memory (:memory:) database is never expired and dropped
+// (which would silently discard the database) and WAL connections stay warm.
+func sqliteDefaultPoolConfig() PoolConfig {
+	return PoolConfig{
+		MaxOpenConns:    4,
+		MaxIdleConns:    2,
+		ConnMaxLifetime: 0,
+		ConnMaxIdleTime: 0,
+	}
+}
+
+// applyDefaultPoolIfUnset applies a bounded default connection pool to db, but
+// only when the caller has not already configured one. A freshly-opened gorm
+// DB sits at database/sql defaults (MaxOpenConns=0 => unlimited), so a non-zero
+// MaxOpenConnections in Stats() means the caller already bounded the pool and
+// we leave it untouched. PG/MySQL get DefaultPoolConfig (the real footgun fix
+// against Postgres max_connections); SQLite gets the small SQLite-safe config.
+//
+// It never returns an error or panics: a nil db, or a DB whose *sql.DB cannot
+// be obtained (mock/dialector-only), is silently skipped so construction stays
+// panic-free.
+func applyDefaultPoolIfUnset(db *gorm.DB, isSQLite bool) {
+	if db == nil {
+		return
+	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		return
+	}
+	if sqlDB.Stats().MaxOpenConnections != 0 {
+		// Caller already bounded the pool (e.g. SetMaxOpenConns before
+		// NewGormStorage); respect it.
+		return
+	}
+	cfg := DefaultPoolConfig()
+	if isSQLite {
+		cfg = sqliteDefaultPoolConfig()
+	}
+	sqlDB.SetMaxOpenConns(cfg.MaxOpenConns)
+	sqlDB.SetMaxIdleConns(cfg.MaxIdleConns)
+	sqlDB.SetConnMaxLifetime(cfg.ConnMaxLifetime)
+	sqlDB.SetConnMaxIdleTime(cfg.ConnMaxIdleTime)
+}
+
 // PoolOption configures connection pool settings.
 type PoolOption interface {
 	applyPool(*PoolConfig)
@@ -118,7 +167,10 @@ func NewGormStorageWithPool(db *gorm.DB, opts ...PoolOption) (*GormStorage, erro
 	if err := ConfigurePool(db, opts...); err != nil {
 		return nil, err
 	}
-	return NewGormStorage(db), nil
+	// ConfigurePool has already sized the pool (possibly to an explicit
+	// MaxOpenConns(0)=unlimited the docs promise), so skip the auto-default —
+	// otherwise the MaxOpenConnections==0 detection would wrongly re-bound it.
+	return NewGormStorage(db, withoutDefaultPool()), nil
 }
 
 // HighConcurrencyPoolConfig returns pool settings optimized for high-concurrency workloads.
