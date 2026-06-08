@@ -259,7 +259,9 @@ jobs:
     runs-on: ubuntu-latest
     # The trust gates are release-blocking: a vulnerability finding or an
     # incompatible API change must stop the tag, not just fail a check.
-    needs: [build, govulncheck, api-compat]
+    # A HARD crash/recovery invariant failure (chaos-smoke) or a broken
+    # embedded-dashboard e2e run (test-e2e) must likewise stop the tag.
+    needs: [build, govulncheck, api-compat, chaos-smoke, test-e2e]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     steps:
       - uses: actions/checkout@v4
