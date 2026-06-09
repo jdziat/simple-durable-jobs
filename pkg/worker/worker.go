@@ -1584,7 +1584,7 @@ func (w *Worker) completeFanOut(ctx context.Context, fo *core.FanOut, status cor
 	}
 
 	// Resume parent job — retry a few times because the parent might still be
-	// transitioning from running → waiting (SuspendJob hasn't completed yet).
+	// transitioning from running → waiting (MarkWaiting hasn't completed yet).
 	var resumed bool
 	for attempt := 0; attempt < 5; attempt++ {
 		resumed, err = w.queue.Storage().ResumeJob(ctx, fo.ParentJobID)
@@ -1938,7 +1938,7 @@ func (w *Worker) pollWaitingJobsOnce(ctx context.Context) {
 
 	// Resume jobs waiting on a signal that has arrived (or whose timeout wake
 	// deadline has passed). This is the backstop for the deliver-vs-suspend
-	// race — a signal delivered just before SuspendJob commits would otherwise
+	// race — a signal delivered just before MarkWaiting commits would otherwise
 	// miss the event-driven resume and leave the job waiting forever.
 	if sr, ok := w.queue.Storage().(signalResumeStorage); ok {
 		w.pollSignalWaitingJobs(ctx, sr)

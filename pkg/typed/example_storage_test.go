@@ -122,7 +122,7 @@ func (s *exampleStorage) CancelSubJob(context.Context, string) (*core.FanOut, er
 	return nil, nil
 }
 
-func (s *exampleStorage) SuspendJob(context.Context, string, string) error { return nil }
+func (s *exampleStorage) MarkWaiting(context.Context, string, string) error { return nil }
 
 func (s *exampleStorage) ResumeJob(context.Context, string) (bool, error) { return false, nil }
 

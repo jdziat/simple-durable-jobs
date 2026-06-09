@@ -88,7 +88,7 @@ func FanOut[T any](ctx context.Context, subJobs []SubJob, opts ...Option) ([]Res
 		}
 
 		// Fan-out not complete, mark waiting again.
-		if err := jc.Storage.SuspendJob(ctx, jc.Job.ID, jc.WorkerID); err != nil {
+		if err := jc.Storage.MarkWaiting(ctx, jc.Job.ID, jc.WorkerID); err != nil {
 			return nil, fmt.Errorf("failed to mark job waiting: %w", err)
 		}
 		return nil, &WaitingError{FanOutID: fanOutID}
@@ -139,7 +139,7 @@ func FanOut[T any](ctx context.Context, subJobs []SubJob, opts ...Option) ([]Res
 	// If we enqueue first, a fast worker can complete a sub-job and call
 	// ResumeJob before we update the status — ResumeJob finds status=running
 	// instead of waiting, and the parent is stuck forever.
-	if err := jc.Storage.SuspendJob(ctx, jc.Job.ID, jc.WorkerID); err != nil {
+	if err := jc.Storage.MarkWaiting(ctx, jc.Job.ID, jc.WorkerID); err != nil {
 		return nil, fmt.Errorf("failed to mark job waiting: %w", err)
 	}
 
@@ -267,17 +267,6 @@ func IsWaitingError(err error) bool {
 	_, ok := err.(*WaitingError)
 	return ok
 }
-
-// SuspendError is the previous name for WaitingError.
-//
-// Deprecated: Use WaitingError. The control-flow signal aligns with the
-// core.StatusWaiting status the parent job carries while its sub-jobs run.
-type SuspendError = WaitingError
-
-// IsSuspendError reports whether err is a waiting-for-fan-out signal.
-//
-// Deprecated: Use IsWaitingError.
-func IsSuspendError(err error) bool { return IsWaitingError(err) }
 
 // CollectResults gathers results from completed sub-jobs.
 // Called when parent job resumes after fan-out.

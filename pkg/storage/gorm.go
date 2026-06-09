@@ -65,6 +65,8 @@ func withoutDefaultPool() GormStorageOption {
 }
 
 // GormStorage implements Storage using GORM.
+var _ core.Storage = (*GormStorage)(nil)
+
 type GormStorage struct {
 	db              *gorm.DB
 	isSQLite        bool
@@ -1059,9 +1061,9 @@ func (s *GormStorage) Release(ctx context.Context, jobID, workerID string) error
 //   - status IN ('cancelled','completed','failed')  (job is done by some path)
 //
 // The status NOT IN ('waiting','paused') guard is essential: a parent that
-// calls FanOut/Call from inside its handler suspends ITSELF via SuspendJob,
+// calls FanOut/Call from inside its handler suspends ITSELF via MarkWaiting,
 // which sets status='waiting' and clears locked_by to the empty string. During
-// the window between SuspendJob and the handler returning the WaitingError, the
+// the window between MarkWaiting and the handler returning the WaitingError, the
 // parent is still present in the worker's runningJobs map, yet its row has
 // locked_by="" — which would otherwise match "locked_by != workerID" and make
 // the ownership audit cancel the worker's own in-flight handler. That spurious
@@ -1497,9 +1499,9 @@ func (s *GormStorage) CancelSubJob(ctx context.Context, jobID string) (*core.Fan
 
 // --- Waiting job operations ---
 
-// SuspendJob suspends a job to waiting status.
+// MarkWaiting suspends a job to waiting status.
 // Returns ErrJobNotOwned if the job is no longer owned by this worker.
-func (s *GormStorage) SuspendJob(ctx context.Context, jobID string, workerID string) error {
+func (s *GormStorage) MarkWaiting(ctx context.Context, jobID string, workerID string) error {
 	result := s.db.WithContext(ctx).
 		Model(&core.Job{}).
 		Where("id = ? AND locked_by = ?", jobID, workerID).

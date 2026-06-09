@@ -162,7 +162,7 @@ func (m *mockStorage) CancelSubJob(ctx context.Context, jobID string) (*core.Fan
 	return nil, nil
 }
 
-func (m *mockStorage) SuspendJob(ctx context.Context, jobID string, workerID string) error {
+func (m *mockStorage) MarkWaiting(ctx context.Context, jobID string, workerID string) error {
 	return nil
 }
 

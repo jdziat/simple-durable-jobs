@@ -173,7 +173,7 @@ func (s *minimalStorage) CancelSubJobs(ctx context.Context, fanOutID string) ([]
 func (s *minimalStorage) CancelSubJob(ctx context.Context, jobID string) (*core.FanOut, error) {
 	return nil, nil
 }
-func (s *minimalStorage) SuspendJob(ctx context.Context, jobID, workerID string) error {
+func (s *minimalStorage) MarkWaiting(ctx context.Context, jobID, workerID string) error {
 	s.suspended[jobID] = true
 	return nil
 }

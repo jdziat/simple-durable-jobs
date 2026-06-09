@@ -65,13 +65,6 @@ func TestGenIsWaitingError_NilAndRegular(t *testing.T) {
 	assert.False(t, jobs.IsWaitingError(errors.New("ordinary failure")))
 }
 
-func TestGenIsWaitingError_MatchesIsSuspendError(t *testing.T) {
-	// IsSuspendError is the deprecated alias and must agree with IsWaitingError.
-	err := errors.New("plain")
-	assert.Equal(t, jobs.IsSuspendError(err), jobs.IsWaitingError(err))
-	assert.Equal(t, jobs.IsSuspendError(nil), jobs.IsWaitingError(nil))
-}
-
 // ---------------------------------------------------------------------------
 // Call / FanOut / SavePhaseCheckpoint / LoadPhaseCheckpoint (0%).
 // These facade functions are single-statement delegations. Without an active

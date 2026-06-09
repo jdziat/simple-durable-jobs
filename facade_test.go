@@ -575,19 +575,6 @@ func TestFacadeConstants_FanOutStatusValues(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// TestFacadeIsSuspendError - IsSuspendError recognises non-suspend errors
-// ---------------------------------------------------------------------------
-
-func TestFacadeIsSuspendError_ReturnsFalseForRegularError(t *testing.T) {
-	err := errors.New("not a suspend")
-	assert.False(t, jobs.IsSuspendError(err))
-}
-
-func TestFacadeIsSuspendError_ReturnsFalseForNil(t *testing.T) {
-	assert.False(t, jobs.IsSuspendError(nil))
-}
-
-// ---------------------------------------------------------------------------
 // LoadResult[T] tests
 // ---------------------------------------------------------------------------
 

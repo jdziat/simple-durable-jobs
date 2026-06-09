@@ -969,14 +969,6 @@ func IsWaitingError(err error) bool {
 	return fanout.IsWaitingError(err)
 }
 
-// IsSuspendError reports whether err is a waiting-for-fan-out signal.
-//
-// Deprecated: Use IsWaitingError. The naming was revised to match
-// core.StatusWaiting, which is the actual status the parent job carries.
-func IsSuspendError(err error) bool {
-	return fanout.IsWaitingError(err)
-}
-
 // Requeue resets a terminally failed or cancelled job back to pending so it
 // runs again from scratch. Exhausted failed jobs are the dead-letter set; query
 // them with ListDeadLettered/CountDeadLettered and replay one with Requeue.

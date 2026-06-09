@@ -17,7 +17,7 @@ import (
 )
 
 // fakeSignalStore implements the (unexported) signalStorage capability plus the
-// SuspendJob bits pkg/signal needs. It embeds core.Storage so it satisfies the
+// MarkWaiting bits pkg/signal needs. It embeds core.Storage so it satisfies the
 // full interface; only the methods exercised here are implemented (others would
 // panic, but aren't called).
 type fakeSignalStore struct {
@@ -119,14 +119,14 @@ func (f *fakeSignalStore) restoreAt(i int, sig *core.Signal) {
 	f.pending = append(f.pending[:i], append([]*core.Signal{sig}, f.pending[i:]...)...)
 }
 
-func (f *fakeSignalStore) SuspendJob(_ context.Context, _, _ string) error {
+func (f *fakeSignalStore) MarkWaiting(_ context.Context, _, _ string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.suspended++
 	return nil
 }
 
-func (f *fakeSignalStore) SuspendJobWithDeadline(_ context.Context, _, _ string, d time.Duration) error {
+func (f *fakeSignalStore) MarkWaitingWithDeadline(_ context.Context, _, _ string, d time.Duration) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.suspended++

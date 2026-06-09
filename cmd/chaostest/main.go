@@ -277,7 +277,7 @@ func registerHandlers(q *jobs.Queue, db *gorm.DB, dialect string) {
 	// Each successful consume records an idempotent downstream effect. A P1
 	// lost-signal (consumed_at committed without its checkpoint) re-consumes the
 	// next FIFO signal on replay, leaving the waiter one short at the final
-	// iteration -> WaitForSignal returns nil -> SuspendJob -> wedged forever, which
+	// iteration -> WaitForSignal returns nil -> MarkWaiting -> wedged forever, which
 	// INV-SIGNAL-EXACTLY-ONCE catches as consumed<expected AND unfinished_waiters>0.
 	q.Register("chaos.signal_waiter", func(ctx context.Context, args waiterArgs) error {
 		jobID := jobs.JobIDFromContext(ctx)

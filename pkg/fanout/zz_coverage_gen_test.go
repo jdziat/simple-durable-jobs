@@ -49,11 +49,11 @@ func (s *errStorage) GetSubJobs(ctx context.Context, fanOutID string) ([]*core.J
 	return s.minimalStorage.GetSubJobs(ctx, fanOutID)
 }
 
-func (s *errStorage) SuspendJob(ctx context.Context, jobID, workerID string) error {
+func (s *errStorage) MarkWaiting(ctx context.Context, jobID, workerID string) error {
 	if s.suspendErr != nil {
 		return s.suspendErr
 	}
-	return s.minimalStorage.SuspendJob(ctx, jobID, workerID)
+	return s.minimalStorage.MarkWaiting(ctx, jobID, workerID)
 }
 
 func (s *errStorage) CreateFanOut(ctx context.Context, fo *core.FanOut) error {
@@ -223,7 +223,7 @@ func TestGen_FanOut_Resume_EnqueueBatchError(t *testing.T) {
 	assert.Contains(t, err.Error(), "failed to enqueue sub-jobs")
 }
 
-func TestGen_FanOut_Resume_SuspendJobError(t *testing.T) {
+func TestGen_FanOut_Resume_MarkWaitingError(t *testing.T) {
 	store := newErrStorage()
 	parentID := "p-resume-suspend-err"
 	jc := makeErrJobCtx(store, parentID, "default")
@@ -236,7 +236,7 @@ func TestGen_FanOut_Resume_SuspendJobError(t *testing.T) {
 		Status:      core.FanOutPending,
 	}
 	// Pre-populate the persisted sub-job so the EnqueueBatch branch is skipped
-	// and we reach SuspendJob directly.
+	// and we reach MarkWaiting directly.
 	store.jobs["sub-existing"] = &core.Job{
 		ID:          "sub-existing",
 		FanOutID:    &fanOutID,
@@ -281,7 +281,7 @@ func TestGen_FanOut_First_SaveCheckpointError(t *testing.T) {
 	assert.Contains(t, err.Error(), "failed to save fan-out checkpoint")
 }
 
-func TestGen_FanOut_First_SuspendJobError(t *testing.T) {
+func TestGen_FanOut_First_MarkWaitingError(t *testing.T) {
 	store := newErrStorage()
 	parentID := "p-first-suspend-err"
 	jc := makeErrJobCtx(store, parentID, "default")
