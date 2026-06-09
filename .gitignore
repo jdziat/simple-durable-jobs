@@ -77,3 +77,4 @@ ui/cmd/e2etestserver/e2etestserver
 e2etestserver
 /chaostest
 cmd/chaostest/chaostest
+/sdj
