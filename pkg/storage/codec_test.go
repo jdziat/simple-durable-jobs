@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -209,6 +210,75 @@ func TestGormStorageSecretboxReadsLegacyPlaintextJob(t *testing.T) {
 	}
 }
 
+func TestGormStorageTenantMetadataRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	db := openCodecTestDBs(t)["sqlite"]
+	s := NewGormStorage(db)
+	require.NoError(t, s.Migrate(ctx))
+
+	job := &core.Job{
+		Type:     "metadata.roundtrip",
+		Args:     []byte(`{"ok":true}`),
+		Tenant:   "tenant-a",
+		Metadata: map[string]string{"env": "prod", "region": "us"},
+	}
+	require.NoError(t, s.Enqueue(ctx, job))
+
+	got, err := s.GetJob(ctx, job.ID)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, "tenant-a", got.Tenant)
+	assert.Equal(t, map[string]string{"env": "prod", "region": "us"}, got.Metadata)
+}
+
+func TestGormStorageSecretboxBypassesTenantAndMetadata(t *testing.T) {
+	for name, db := range openCodecTestDBs(t) {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			var key [32]byte
+			for i := range key {
+				key[i] = byte(i + 1)
+			}
+			codec, err := payloadcodec.NewSecretbox(key)
+			require.NoError(t, err)
+			s := NewGormStorage(db, WithCodec(codec))
+			require.NoError(t, s.Migrate(ctx))
+			t.Cleanup(func() { cleanupCodecExternalDB(t, db) })
+
+			args := []byte(`{"secret":"plain-args"}`)
+			job := &core.Job{
+				Type:     "metadata.codec",
+				Args:     args,
+				Tenant:   "tenant-plain",
+				Metadata: map[string]string{"env": "prod", "team": "billing"},
+			}
+			require.NoError(t, s.Enqueue(ctx, job))
+
+			rawArgs := rawJobBytes(t, db, job.ID, "args")
+			require.NotEqual(t, args, rawArgs)
+			assert.NotContains(t, string(rawArgs), "plain-args")
+			assert.Equal(t, "tenant-plain", rawJobString(t, db, job.ID, "tenant"))
+
+			rawMetadata := rawJobString(t, db, job.ID, "metadata")
+			assert.Contains(t, rawMetadata, `"env":"prod"`)
+			assert.Contains(t, rawMetadata, `"team":"billing"`)
+			assert.False(t, strings.Contains(rawMetadata, "sdjenc:"))
+
+			found, total, err := s.SearchJobs(ctx, core.JobFilter{
+				Tenant:       "tenant-plain",
+				MetaContains: &core.MetadataMap{"env": "prod"},
+				Limit:        10,
+			})
+			require.NoError(t, err)
+			assert.Equal(t, int64(1), total)
+			require.Len(t, found, 1)
+			assert.Equal(t, job.ID, found[0].ID)
+			assert.Equal(t, args, found[0].Args)
+			assert.Equal(t, job.Metadata, found[0].Metadata)
+		})
+	}
+}
+
 func rawJobBytes(t *testing.T, db *gorm.DB, jobID, column string) []byte {
 	t.Helper()
 	query := ""
@@ -221,6 +291,22 @@ func rawJobBytes(t *testing.T, db *gorm.DB, jobID, column string) []byte {
 		t.Fatalf("unsupported jobs payload column %q", column)
 	}
 	var out []byte
+	require.NoError(t, db.Raw(query, jobID).Row().Scan(&out))
+	return out
+}
+
+func rawJobString(t *testing.T, db *gorm.DB, jobID, column string) string {
+	t.Helper()
+	query := ""
+	switch column {
+	case "tenant":
+		query = "SELECT tenant FROM jobs WHERE id = ?"
+	case "metadata":
+		query = "SELECT metadata FROM jobs WHERE id = ?"
+	default:
+		t.Fatalf("unsupported jobs string column %q", column)
+	}
+	var out string
 	require.NoError(t, db.Raw(query, jobID).Row().Scan(&out))
 	return out
 }

@@ -68,6 +68,72 @@ func TestSearchJobs_EscapesLikeMetacharacters(t *testing.T) {
 	assert.Equal(t, "literal-underscore-_", underscoreMatches[0].ID)
 }
 
+func TestSearchJobs_FiltersTenantAndMetadata(t *testing.T) {
+	ctx := context.Background()
+	store := newUITestStorage(t)
+	now := time.Now()
+
+	jobs := []*core.Job{
+		{
+			ID:        "tenant-a-match",
+			Type:      "work",
+			Queue:     "default",
+			Status:    core.StatusPending,
+			Tenant:    "tenant-a",
+			Metadata:  map[string]string{"env": "prod", "region": "us"},
+			Args:      []byte(`{}`),
+			CreatedAt: now,
+		},
+		{
+			ID:        "tenant-a-dev",
+			Type:      "work",
+			Queue:     "default",
+			Status:    core.StatusPending,
+			Tenant:    "tenant-a",
+			Metadata:  map[string]string{"env": "dev", "region": "us"},
+			Args:      []byte(`{}`),
+			CreatedAt: now.Add(time.Second),
+		},
+		{
+			ID:        "tenant-b-prod",
+			Type:      "work",
+			Queue:     "default",
+			Status:    core.StatusPending,
+			Tenant:    "tenant-b",
+			Metadata:  map[string]string{"env": "prod", "region": "eu"},
+			Args:      []byte(`{}`),
+			CreatedAt: now.Add(2 * time.Second),
+		},
+	}
+	for _, job := range jobs {
+		require.NoError(t, store.Enqueue(ctx, job))
+	}
+
+	tenantMatches, tenantTotal, err := store.SearchJobs(ctx, core.JobFilter{Tenant: "tenant-a", Limit: 10})
+	require.NoError(t, err)
+	assert.Equal(t, int64(2), tenantTotal)
+	assert.ElementsMatch(t, []string{"tenant-a-match", "tenant-a-dev"}, jobIDs(tenantMatches))
+
+	metaMatches, metaTotal, err := store.SearchJobs(ctx, core.JobFilter{
+		MetaContains: &core.MetadataMap{"env": "prod", "region": "us"},
+		Limit:        10,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), metaTotal)
+	require.Len(t, metaMatches, 1)
+	assert.Equal(t, "tenant-a-match", metaMatches[0].ID)
+
+	combinedMatches, combinedTotal, err := store.SearchJobs(ctx, core.JobFilter{
+		Tenant:       "tenant-b",
+		MetaContains: &core.MetadataMap{"env": "prod"},
+		Limit:        10,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), combinedTotal)
+	require.Len(t, combinedMatches, 1)
+	assert.Equal(t, "tenant-b-prod", combinedMatches[0].ID)
+}
+
 func TestCountActiveWorkers_CountsDistinctRunningLockHolders(t *testing.T) {
 	ctx := context.Background()
 	store := newUITestStorage(t)

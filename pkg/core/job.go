@@ -19,18 +19,25 @@ const (
 	StatusPaused    JobStatus = "paused"    // Paused, won't be picked up
 )
 
+// MetadataMap stores queryable string metadata for jobs and job filters.
+type MetadataMap map[string]string
+
 // Job represents a unit of work to be processed.
 type Job struct {
-	ID             string        `gorm:"primaryKey;size:36"`
-	Type           string        `gorm:"index;size:255;not null"`
-	Args           []byte        `gorm:"type:bytes"`
-	Queue          string        `gorm:"index;size:255;default:'default'"`
-	Priority       int           `gorm:"index;default:0"`
-	Status         JobStatus     `gorm:"index;size:20;default:'pending'"`
-	PreviousStatus JobStatus     `gorm:"size:20"` // Status before pause, for restoration
-	Attempt        int           `gorm:"default:0"`
-	MaxRetries     int           `gorm:"default:3"`
-	Timeout        time.Duration `gorm:"not null;default:0"`
+	ID    string `gorm:"primaryKey;size:36"`
+	Type  string `gorm:"index;size:255;not null"`
+	Args  []byte `gorm:"type:bytes"`
+	Queue string `gorm:"index;size:255;default:'default'"`
+	// Tenant identifies the tenant that owns this job.
+	Tenant string `gorm:"size:255;column:tenant"`
+	// Metadata stores queryable string tags for this job.
+	Metadata       map[string]string `gorm:"serializer:json;column:metadata"`
+	Priority       int               `gorm:"index;default:0"`
+	Status         JobStatus         `gorm:"index;size:20;default:'pending'"`
+	PreviousStatus JobStatus         `gorm:"size:20"` // Status before pause, for restoration
+	Attempt        int               `gorm:"default:0"`
+	MaxRetries     int               `gorm:"default:3"`
+	Timeout        time.Duration     `gorm:"not null;default:0"`
 	// Determinism is the replay strictness mode
 	// (0=ExplicitCheckpoints,1=Strict,2=BestEffort).
 	// BestEffort relaxes the Call replay type-mismatch guard.
