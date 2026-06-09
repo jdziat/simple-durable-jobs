@@ -16,12 +16,12 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 
-	"github.com/jdziat/simple-durable-jobs/pkg/core"
-	"github.com/jdziat/simple-durable-jobs/pkg/queue"
-	"github.com/jdziat/simple-durable-jobs/pkg/schedule"
-	storagepackage "github.com/jdziat/simple-durable-jobs/pkg/storage"
-	jobsv1 "github.com/jdziat/simple-durable-jobs/ui/gen/jobs/v1"
-	"github.com/jdziat/simple-durable-jobs/ui/gen/jobs/v1/jobsv1connect"
+	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/v2/pkg/queue"
+	"github.com/jdziat/simple-durable-jobs/v2/pkg/schedule"
+	storagepackage "github.com/jdziat/simple-durable-jobs/v2/pkg/storage"
+	jobsv1 "github.com/jdziat/simple-durable-jobs/v2/ui/gen/jobs/v1"
+	"github.com/jdziat/simple-durable-jobs/v2/ui/gen/jobs/v1/jobsv1connect"
 )
 
 // ---------------------------------------------------------------------------
@@ -105,7 +105,7 @@ func (m *mockStorage) CancelSubJobs(_ context.Context, _ string) ([]string, erro
 func (m *mockStorage) CancelSubJob(_ context.Context, _ string) (*core.FanOut, error) {
 	return nil, nil
 }
-func (m *mockStorage) SuspendJob(_ context.Context, _, _ string) error               { return nil }
+func (m *mockStorage) MarkWaiting(_ context.Context, _, _ string) error              { return nil }
 func (m *mockStorage) ResumeJob(_ context.Context, _ string) (bool, error)           { return false, nil }
 func (m *mockStorage) GetWaitingJobsToResume(_ context.Context) ([]*core.Job, error) { return nil, nil }
 func (m *mockStorage) GetStalledFanOutParents(_ context.Context, _ time.Time) ([]*core.Job, error) {

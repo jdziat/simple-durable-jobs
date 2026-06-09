@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/jdziat/simple-durable-jobs/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
 )
 
 func TestWithJobContextAndGetJobContext(t *testing.T) {

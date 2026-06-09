@@ -4,8 +4,8 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/jdziat/simple-durable-jobs/pkg/core"
-	"github.com/jdziat/simple-durable-jobs/pkg/queue"
+	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/v2/pkg/queue"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -171,22 +171,4 @@ func TestIsWaitingError_FalseForNil(t *testing.T) {
 func TestIsWaitingError_FalseForFanOutError(t *testing.T) {
 	err := &Error{TotalCount: 2, FailedCount: 1}
 	assert.False(t, IsWaitingError(err))
-}
-
-// TestSuspendErrorAliasContract pins the additive-deprecation contract:
-// SuspendError and WaitingError must be the same type so downstream code
-// using either literal keeps working, and IsSuspendError / IsWaitingError
-// must each recognize values built with the other name.
-func TestSuspendErrorAliasContract(t *testing.T) {
-	// Constructing with the deprecated name is caught by the new detector.
-	//nolint:staticcheck // intentionally exercising the deprecated alias
-	viaOld := &SuspendError{FanOutID: "fo-old"}
-	assert.True(t, IsWaitingError(viaOld),
-		"IsWaitingError must recognize values built with the deprecated name")
-
-	// Constructing with the new name is caught by the deprecated detector.
-	viaNew := &WaitingError{FanOutID: "fo-new"}
-	//nolint:staticcheck // intentionally exercising the deprecated alias
-	assert.True(t, IsSuspendError(viaNew),
-		"IsSuspendError must keep working for callers that have not migrated")
 }

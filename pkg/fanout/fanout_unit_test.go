@@ -9,10 +9,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jdziat/simple-durable-jobs/pkg/core"
-	intctx "github.com/jdziat/simple-durable-jobs/pkg/internal/context"
-	"github.com/jdziat/simple-durable-jobs/pkg/queue"
-	"github.com/jdziat/simple-durable-jobs/pkg/security"
+	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
+	intctx "github.com/jdziat/simple-durable-jobs/v2/pkg/internal/context"
+	"github.com/jdziat/simple-durable-jobs/v2/pkg/queue"
+	"github.com/jdziat/simple-durable-jobs/v2/pkg/security"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -173,7 +173,7 @@ func (s *minimalStorage) CancelSubJobs(ctx context.Context, fanOutID string) ([]
 func (s *minimalStorage) CancelSubJob(ctx context.Context, jobID string) (*core.FanOut, error) {
 	return nil, nil
 }
-func (s *minimalStorage) SuspendJob(ctx context.Context, jobID, workerID string) error {
+func (s *minimalStorage) MarkWaiting(ctx context.Context, jobID, workerID string) error {
 	s.suspended[jobID] = true
 	return nil
 }

@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	jobs "github.com/jdziat/simple-durable-jobs"
-	"github.com/jdziat/simple-durable-jobs/pkg/fanout"
+	jobs "github.com/jdziat/simple-durable-jobs/v2"
+	"github.com/jdziat/simple-durable-jobs/v2/pkg/fanout"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/driver/sqlite"
@@ -572,19 +572,6 @@ func TestFacadeConstants_FanOutStrategyValues(t *testing.T) {
 func TestFacadeConstants_FanOutStatusValues(t *testing.T) {
 	assert.NotEqual(t, jobs.FanOutPending, jobs.FanOutCompleted)
 	assert.NotEqual(t, jobs.FanOutCompleted, jobs.FanOutFailed)
-}
-
-// ---------------------------------------------------------------------------
-// TestFacadeIsSuspendError - IsSuspendError recognises non-suspend errors
-// ---------------------------------------------------------------------------
-
-func TestFacadeIsSuspendError_ReturnsFalseForRegularError(t *testing.T) {
-	err := errors.New("not a suspend")
-	assert.False(t, jobs.IsSuspendError(err))
-}
-
-func TestFacadeIsSuspendError_ReturnsFalseForNil(t *testing.T) {
-	assert.False(t, jobs.IsSuspendError(nil))
 }
 
 // ---------------------------------------------------------------------------

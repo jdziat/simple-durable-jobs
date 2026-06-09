@@ -3,7 +3,7 @@ package fanout
 import (
 	"time"
 
-	"github.com/jdziat/simple-durable-jobs/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
 )
 
 // Option configures fan-out behavior.

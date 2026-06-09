@@ -19,9 +19,9 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/jdziat/simple-durable-jobs/pkg/core"
-	intctx "github.com/jdziat/simple-durable-jobs/pkg/internal/context"
-	"github.com/jdziat/simple-durable-jobs/pkg/security"
+	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
+	intctx "github.com/jdziat/simple-durable-jobs/v2/pkg/internal/context"
+	"github.com/jdziat/simple-durable-jobs/v2/pkg/security"
 )
 
 // maxSignalNameLen bounds the signal name (matches the storage column size).
@@ -37,7 +37,7 @@ const SleepCheckpointType = "_sleep"
 var ErrSignalNameReserved = errors.New("signal: names starting with _ are reserved for internal use")
 
 // signalStorage is the optional storage capability signals require. GormStorage
-// implements it; backends that don't get core.ErrStorageNoSignals. SuspendJob
+// implements it; backends that don't get core.ErrStorageNoSignals. MarkWaiting
 // (indefinite wait) is part of core.Storage and used directly.
 type signalStorage interface {
 	SendSignal(ctx context.Context, jobID, name string, payload []byte) error
@@ -51,7 +51,7 @@ type signalStorage interface {
 	// replay checkpoint built from the batch in ONE transaction (the closure is
 	// always invoked, even for an empty batch).
 	DrainSignalsTx(ctx context.Context, jobID, name string, buildCheckpoint func(sigs []*core.Signal) (*core.Checkpoint, error)) ([]*core.Signal, error)
-	SuspendJobWithDeadline(ctx context.Context, jobID, workerID string, d time.Duration) error
+	MarkWaitingWithDeadline(ctx context.Context, jobID, workerID string, d time.Duration) error
 }
 
 // WaitingError signals the worker that the job has suspended itself into
@@ -176,7 +176,7 @@ func WaitForSignal[T any](ctx context.Context, name string) (T, error) {
 	if sig == nil {
 		// No signal yet — suspend until one arrives (resumed by the Signal()
 		// fast path or the signal-resume poll). NO checkpoint written.
-		if err := jc.Storage.SuspendJob(ctx, jc.Job.ID, jc.WorkerID); err != nil {
+		if err := jc.Storage.MarkWaiting(ctx, jc.Job.ID, jc.WorkerID); err != nil {
 			return zero, fmt.Errorf("signal: suspend: %w", err)
 		}
 		return zero, &WaitingError{Name: name}
@@ -324,7 +324,7 @@ func WaitForSignalTimeout[T any](ctx context.Context, name string, d time.Durati
 		}
 	}
 	remaining := max(time.Until(time.Unix(0, tc.DeadlineUnixNano)), 0)
-	if err := ss.SuspendJobWithDeadline(ctx, jc.Job.ID, jc.WorkerID, remaining); err != nil {
+	if err := ss.MarkWaitingWithDeadline(ctx, jc.Job.ID, jc.WorkerID, remaining); err != nil {
 		return zero, false, fmt.Errorf("signal: suspend: %w", err)
 	}
 	return zero, false, &WaitingError{Name: name}
@@ -400,7 +400,7 @@ func sleepUntil(ctx context.Context, deadline time.Time, immediate bool) error {
 	}
 
 	remaining := max(time.Until(time.Unix(0, sc.DeadlineUnixNano)), 0)
-	if err := ss.SuspendJobWithDeadline(ctx, jc.Job.ID, jc.WorkerID, remaining); err != nil {
+	if err := ss.MarkWaitingWithDeadline(ctx, jc.Job.ID, jc.WorkerID, remaining); err != nil {
 		return fmt.Errorf("signal: sleep suspend: %w", err)
 	}
 	return &WaitingError{Name: SleepCheckpointType}

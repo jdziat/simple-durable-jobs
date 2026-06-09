@@ -1,4 +1,4 @@
-module github.com/jdziat/simple-durable-jobs
+module github.com/jdziat/simple-durable-jobs/v2
 
 go 1.25.5
 

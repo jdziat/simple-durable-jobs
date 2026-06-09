@@ -6,6 +6,6 @@
 //   - Concurrency and queue configuration
 //   - Scheduler for recurring jobs
 //
-// Most users should import the root package github.com/jdziat/simple-durable-jobs
+// Most users should import the root package github.com/jdziat/simple-durable-jobs/v2
 // which provides access to worker configuration through queue.NewWorker().
 package worker

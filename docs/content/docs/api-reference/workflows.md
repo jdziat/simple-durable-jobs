@@ -151,7 +151,7 @@ if jobs.IsWaitingError(err) {
 }
 ```
 
-`IsSuspendError` is the prior name and is still exported as a deprecated alias.
+`IsSuspendError` was the prior name in v1 and was removed in v2; use `IsWaitingError`.
 
 ---
 

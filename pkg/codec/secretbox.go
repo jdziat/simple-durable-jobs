@@ -9,7 +9,7 @@ import (
 
 	"golang.org/x/crypto/nacl/secretbox"
 
-	"github.com/jdziat/simple-durable-jobs/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
 )
 
 var (

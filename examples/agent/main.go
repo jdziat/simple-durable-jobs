@@ -16,7 +16,7 @@ import (
 	"strings"
 	"time"
 
-	jobs "github.com/jdziat/simple-durable-jobs"
+	jobs "github.com/jdziat/simple-durable-jobs/v2"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"

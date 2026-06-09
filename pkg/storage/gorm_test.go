@@ -16,7 +16,7 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 
-	"github.com/jdziat/simple-durable-jobs/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
 )
 
 // newTestStorage creates a fresh storage instance for each test.
@@ -2265,7 +2265,7 @@ func TestGetScheduledFireTime(t *testing.T) {
 // Suspend / Resume
 // ──────────────────────────────────────────────────────────────────────────────
 
-func TestSuspendJob_AndResumeJob(t *testing.T) {
+func TestMarkWaiting_AndResumeJob(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStorage(t)
 
@@ -2276,7 +2276,7 @@ func TestSuspendJob_AndResumeJob(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, got)
 
-	require.NoError(t, s.SuspendJob(ctx, got.ID, "worker-1"))
+	require.NoError(t, s.MarkWaiting(ctx, got.ID, "worker-1"))
 
 	suspended, err := s.GetJob(ctx, got.ID)
 	require.NoError(t, err)
@@ -2292,7 +2292,7 @@ func TestSuspendJob_AndResumeJob(t *testing.T) {
 	assert.Equal(t, core.StatusPending, after.Status)
 }
 
-func TestSuspendJob_FailsWhenWorkerDoesNotOwnJob(t *testing.T) {
+func TestMarkWaiting_FailsWhenWorkerDoesNotOwnJob(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStorage(t)
 
@@ -2303,7 +2303,7 @@ func TestSuspendJob_FailsWhenWorkerDoesNotOwnJob(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, got)
 
-	err = s.SuspendJob(ctx, got.ID, "wrong-worker")
+	err = s.MarkWaiting(ctx, got.ID, "wrong-worker")
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, core.ErrJobNotOwned))
 }
@@ -2332,7 +2332,7 @@ func TestResumeJob_DecrementsAttemptCounter(t *testing.T) {
 	require.NotNil(t, got)
 	assert.Equal(t, 1, got.Attempt)
 
-	require.NoError(t, s.SuspendJob(ctx, got.ID, "worker-1"))
+	require.NoError(t, s.MarkWaiting(ctx, got.ID, "worker-1"))
 	_, err = s.ResumeJob(ctx, got.ID)
 	require.NoError(t, err)
 
@@ -2491,7 +2491,7 @@ func TestGetWaitingJobsToResume_ReturnsJobsWithCompletedFanOut(t *testing.T) {
 	got, err := s.Dequeue(ctx, []string{"default"}, "worker-1")
 	require.NoError(t, err)
 	require.NotNil(t, got)
-	require.NoError(t, s.SuspendJob(ctx, got.ID, "worker-1"))
+	require.NoError(t, s.MarkWaiting(ctx, got.ID, "worker-1"))
 
 	// Create a completed fan-out pointing at the parent
 	fanOut := &core.FanOut{
@@ -2517,7 +2517,7 @@ func TestGetWaitingJobsToResume_DoesNotReturnPendingFanOut(t *testing.T) {
 	got, err := s.Dequeue(ctx, []string{"default"}, "worker-1")
 	require.NoError(t, err)
 	require.NotNil(t, got)
-	require.NoError(t, s.SuspendJob(ctx, got.ID, "worker-1"))
+	require.NoError(t, s.MarkWaiting(ctx, got.ID, "worker-1"))
 
 	// Fan-out still pending – parent should NOT be in resume list
 	fanOut := &core.FanOut{
@@ -2551,7 +2551,7 @@ func TestGetWaitingJobsToResume_SkipsParentsWithPendingFanOuts(t *testing.T) {
 	got, err := s.Dequeue(ctx, []string{"default"}, "worker-1")
 	require.NoError(t, err)
 	require.NotNil(t, got)
-	require.NoError(t, s.SuspendJob(ctx, got.ID, "worker-1"))
+	require.NoError(t, s.MarkWaiting(ctx, got.ID, "worker-1"))
 
 	// Sequential fan-outs: phase 1 done, phase 2 still running.
 	fanOut1 := &core.FanOut{ParentJobID: parent.ID, TotalCount: 1, Status: core.FanOutCompleted}
@@ -2579,7 +2579,7 @@ func TestGetWaitingJobsToResume_DeduplicatesParentsWithMultipleTerminatedFanOuts
 	got, err := s.Dequeue(ctx, []string{"default"}, "worker-1")
 	require.NoError(t, err)
 	require.NotNil(t, got)
-	require.NoError(t, s.SuspendJob(ctx, got.ID, "worker-1"))
+	require.NoError(t, s.MarkWaiting(ctx, got.ID, "worker-1"))
 
 	// Three terminated fan-outs, no pending — parent should appear once.
 	for _, status := range []core.FanOutStatus{core.FanOutCompleted, core.FanOutCompleted, core.FanOutFailed} {
@@ -3247,10 +3247,10 @@ func TestUnpauseJob_NotFound(t *testing.T) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// SuspendJob — ownership and error paths
+// MarkWaiting — ownership and error paths
 // ──────────────────────────────────────────────────────────────────────────────
 
-func TestSuspendJob_Success(t *testing.T) {
+func TestMarkWaiting_Success(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStorage(t)
 
@@ -3262,7 +3262,7 @@ func TestSuspendJob_Success(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, got)
 
-	require.NoError(t, s.SuspendJob(ctx, got.ID, "w1"))
+	require.NoError(t, s.MarkWaiting(ctx, got.ID, "w1"))
 
 	after, err := s.GetJob(ctx, got.ID)
 	require.NoError(t, err)
@@ -3765,9 +3765,9 @@ func TestCancelSubJob_DBError(t *testing.T) {
 	assert.Error(t, err)
 }
 
-func TestSuspendJob_DBError(t *testing.T) {
+func TestMarkWaiting_DBError(t *testing.T) {
 	s := closedStorage(t)
-	err := s.SuspendJob(context.Background(), "j1", "w1")
+	err := s.MarkWaiting(context.Background(), "j1", "w1")
 	assert.Error(t, err)
 }
 
@@ -4255,7 +4255,7 @@ func TestFindOrphanedJobs_UnknownIDsAreNotReturned(t *testing.T) {
 
 // TestFindOrphanedJobs_DoesNotFlagSelfSuspended is the regression test for the
 // ownership-audit false-cancel. When a handler calls FanOut/Call it suspends
-// its OWN parent job via SuspendJob, which sets status='waiting' and clears
+// its OWN parent job via MarkWaiting, which sets status='waiting' and clears
 // locked_by to "". The parent is still in the worker's runningJobs map until
 // the handler returns, so the ownership audit queries FindOrphanedJobs for it.
 // Before the fix, locked_by="" matched "locked_by != workerID" and the audit
@@ -4274,7 +4274,7 @@ func TestFindOrphanedJobs_DoesNotFlagSelfSuspended(t *testing.T) {
 
 	// Drive the real production transition: the handler suspends its own
 	// parent to wait on a fan-out. This sets status=waiting, locked_by="".
-	require.NoError(t, s.SuspendJob(ctx, job.ID, "worker-A"))
+	require.NoError(t, s.MarkWaiting(ctx, job.ID, "worker-A"))
 
 	// The audit must NOT flag the job the worker just suspended for itself.
 	orphaned, err := s.FindOrphanedJobs(ctx, []string{job.ID}, "worker-A")

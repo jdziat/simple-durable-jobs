@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	jobs "github.com/jdziat/simple-durable-jobs"
+	jobs "github.com/jdziat/simple-durable-jobs/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -63,13 +63,6 @@ func TestGenMustCron_PanicsOnInvalid(t *testing.T) {
 func TestGenIsWaitingError_NilAndRegular(t *testing.T) {
 	assert.False(t, jobs.IsWaitingError(nil))
 	assert.False(t, jobs.IsWaitingError(errors.New("ordinary failure")))
-}
-
-func TestGenIsWaitingError_MatchesIsSuspendError(t *testing.T) {
-	// IsSuspendError is the deprecated alias and must agree with IsWaitingError.
-	err := errors.New("plain")
-	assert.Equal(t, jobs.IsSuspendError(err), jobs.IsWaitingError(err))
-	assert.Equal(t, jobs.IsSuspendError(nil), jobs.IsWaitingError(nil))
 }
 
 // ---------------------------------------------------------------------------

@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jdziat/simple-durable-jobs/pkg/core"
-	"github.com/jdziat/simple-durable-jobs/pkg/security"
+	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/v2/pkg/security"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -162,7 +162,7 @@ func (m *mockStorage) CancelSubJob(ctx context.Context, jobID string) (*core.Fan
 	return nil, nil
 }
 
-func (m *mockStorage) SuspendJob(ctx context.Context, jobID string, workerID string) error {
+func (m *mockStorage) MarkWaiting(ctx context.Context, jobID string, workerID string) error {
 	return nil
 }
 

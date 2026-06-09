@@ -7,9 +7,9 @@ import (
 	"log/slog"
 	"testing"
 
-	"github.com/jdziat/simple-durable-jobs/pkg/core"
-	intctx "github.com/jdziat/simple-durable-jobs/pkg/internal/context"
-	"github.com/jdziat/simple-durable-jobs/pkg/internal/handler"
+	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
+	intctx "github.com/jdziat/simple-durable-jobs/v2/pkg/internal/context"
+	"github.com/jdziat/simple-durable-jobs/v2/pkg/internal/handler"
 )
 
 // TestCallBestEffortReplayLogsWarning covers the jc.Logger != nil branch in the

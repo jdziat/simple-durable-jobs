@@ -17,14 +17,14 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 
-	"github.com/jdziat/simple-durable-jobs/pkg/call"
-	"github.com/jdziat/simple-durable-jobs/pkg/core"
-	"github.com/jdziat/simple-durable-jobs/pkg/fanout"
-	"github.com/jdziat/simple-durable-jobs/pkg/jobctx"
-	"github.com/jdziat/simple-durable-jobs/pkg/queue"
-	"github.com/jdziat/simple-durable-jobs/pkg/schedule"
-	"github.com/jdziat/simple-durable-jobs/pkg/signal"
-	"github.com/jdziat/simple-durable-jobs/pkg/storage"
+	"github.com/jdziat/simple-durable-jobs/v2/pkg/call"
+	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/v2/pkg/fanout"
+	"github.com/jdziat/simple-durable-jobs/v2/pkg/jobctx"
+	"github.com/jdziat/simple-durable-jobs/v2/pkg/queue"
+	"github.com/jdziat/simple-durable-jobs/v2/pkg/schedule"
+	"github.com/jdziat/simple-durable-jobs/v2/pkg/signal"
+	"github.com/jdziat/simple-durable-jobs/v2/pkg/storage"
 )
 
 // mockStorage is a minimal in-memory implementation of core.Storage used for
@@ -258,7 +258,7 @@ func (m *mockStorage) CancelSubJob(_ context.Context, _ string) (*core.FanOut, e
 	return nil, nil
 }
 
-func (m *mockStorage) SuspendJob(_ context.Context, _ string, _ string) error { return nil }
+func (m *mockStorage) MarkWaiting(_ context.Context, _ string, _ string) error { return nil }
 
 func (m *mockStorage) ResumeJob(ctx context.Context, jobID string) (bool, error) {
 	if m.resumeJobFunc != nil {
@@ -4441,7 +4441,7 @@ func TestOwnershipAudit_CancelsOrphanedLocalHandlers(t *testing.T) {
 // TestOwnershipAudit_DoesNotCancelSelfSuspendedJob is the worker-level
 // regression test for the ownership-audit false-cancel. It uses a REAL
 // GormStorage (not the mock) because the bug lived in FindOrphanedJobs' SQL:
-// a parent that calls FanOut/Call suspends ITSELF via SuspendJob (status=
+// a parent that calls FanOut/Call suspends ITSELF via MarkWaiting (status=
 // 'waiting', locked_by=""), but remains in runningJobs until the handler
 // returns. Before the fix, the audit's FindOrphanedJobs flagged that row
 // (locked_by="" != workerID) and CancelJob fired on the worker's own live
@@ -4460,7 +4460,7 @@ func TestOwnershipAudit_DoesNotCancelSelfSuspendedJob(t *testing.T) {
 		DisableRetry(),
 		WithOwnershipAuditInterval(10*time.Millisecond),
 	)
-	// Use the worker's own (auto-generated) ID so Dequeue/SuspendJob and the
+	// Use the worker's own (auto-generated) ID so Dequeue/MarkWaiting and the
 	// audit all agree on ownership — the audit calls FindOrphanedJobs with
 	// w.config.WorkerID.
 	workerID := w.config.WorkerID
@@ -4477,7 +4477,7 @@ func TestOwnershipAudit_DoesNotCancelSelfSuspendedJob(t *testing.T) {
 	w.runningJobsMu.Lock()
 	w.runningJobs[job.ID] = func() { cancelled.Add(1) }
 	w.runningJobsMu.Unlock()
-	require.NoError(t, store.SuspendJob(ctx, job.ID, workerID))
+	require.NoError(t, store.MarkWaiting(ctx, job.ID, workerID))
 
 	auditCtx, cancel := context.WithCancel(ctx)
 	defer cancel()

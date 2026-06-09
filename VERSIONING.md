@@ -30,15 +30,16 @@ Deprecated API stays and keeps working for the remainder of the current major
 version; it carries a `// Deprecated:` doc comment pointing at the replacement.
 Removal happens only in the next major version.
 
-Currently deprecated / planned changes for the next major (`v2`):
+Shipped in `v2.0.0` (the deliberate major cut — see `MIGRATION-v2.md`):
 
-- `IsSuspendError` → use `IsWaitingError`.
-- The `core.Storage.SuspendJob` method will be renamed to `MarkWaiting`
-  (the status it sets is `waiting`). It remains `SuspendJob` through all of
-  `v1` to avoid breaking external `Storage` implementations.
+- Module import path moved to `github.com/jdziat/simple-durable-jobs/v2`.
+- `core.Storage.SuspendJob` → `MarkWaiting` and `SuspendJobWithDeadline` →
+  `MarkWaitingWithDeadline` (the status they set is `waiting`).
+- Removed the deprecated `IsSuspendError` and `SuspendError` aliases
+  (use `IsWaitingError` / `WaitingError`).
 
-When `v2` happens it will: perform these renames, drop the deprecated aliases,
-move to the `/v2` module import path, and ship with a migration guide.
+No database/schema change and no other API change: a v1.x worker and a v2.0.0
+worker interoperate on the same database, so rolling deploys are safe.
 
 ## Changelog
 

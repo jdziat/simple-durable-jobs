@@ -9,7 +9,7 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 
-	"github.com/jdziat/simple-durable-jobs/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
 )
 
 // SendSignal persists a named signal for a job. It is buffered: a signal sent
@@ -324,9 +324,9 @@ func (s *GormStorage) DeleteConsumedSignalsOlderThan(ctx context.Context, age ti
 	return deleted, err
 }
 
-// SuspendJobWithDeadline moves an owned running job into StatusWaiting and parks
+// MarkWaitingWithDeadline moves an owned running job into StatusWaiting and parks
 // run_at at (now + d) as the wake deadline, so the signal-resume poll wakes it to
-// time out if no signal arrives first. Like SuspendJob but with the wake
+// time out if no signal arrives first. Like MarkWaiting but with the wake
 // deadline.
 //
 // run_at is computed on the DATABASE clock (offsetExpr) on multi-worker backends:
@@ -334,7 +334,7 @@ func (s *GormStorage) DeleteConsumedSignalsOlderThan(ctx context.Context, age ti
 // another worker), so anchoring both to the single DB clock removes the wall-clock
 // skew that would otherwise make the timeout fire early or late. SQLite is
 // single-clock, so it uses the caller's time.
-func (s *GormStorage) SuspendJobWithDeadline(ctx context.Context, jobID, workerID string, d time.Duration) error {
+func (s *GormStorage) MarkWaitingWithDeadline(ctx context.Context, jobID, workerID string, d time.Duration) error {
 	var runAt any
 	if s.useDBClock() {
 		runAt = s.offsetExpr(d)
@@ -367,7 +367,7 @@ func (s *GormStorage) SuspendJobWithDeadline(ctx context.Context, jobID, workerI
 //
 // This is the signal analogue of GetStalledFanOutParents and closes the same
 // deliver-vs-suspend race: a signal delivered in the window between the handler
-// deciding to wait and SuspendJob committing would otherwise leave the job
+// deciding to wait and MarkWaiting committing would otherwise leave the job
 // waiting forever with the event-driven resume already missed.
 func (s *GormStorage) GetSignalWaitingJobsToResume(ctx context.Context) ([]*core.Job, error) {
 	return s.GetSignalWaitingJobsToResumeAfter(ctx, "", maxResumeBatch)

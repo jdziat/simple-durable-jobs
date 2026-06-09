@@ -4,7 +4,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/jdziat/simple-durable-jobs/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
 )
 
 type exampleStorage struct {
@@ -122,7 +122,7 @@ func (s *exampleStorage) CancelSubJob(context.Context, string) (*core.FanOut, er
 	return nil, nil
 }
 
-func (s *exampleStorage) SuspendJob(context.Context, string, string) error { return nil }
+func (s *exampleStorage) MarkWaiting(context.Context, string, string) error { return nil }
 
 func (s *exampleStorage) ResumeJob(context.Context, string) (bool, error) { return false, nil }
 
