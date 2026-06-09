@@ -208,13 +208,43 @@ jobs:
       - name: Run gorelease
         run: |
           report_path="${RUNNER_TEMP:-/tmp}/gorelease-report.txt"
-
           # Pinned (x/exp has no stable releases): the grep below is coupled to
           # gorelease's report format, so a floating @latest could silently turn
           # this gate into a no-op if the header wording ever changes. Bump the
           # pin deliberately and re-verify the grep when updating.
+          GORELEASE="golang.org/x/exp/cmd/gorelease@v0.0.0-20260603202125-055de637280b"
+
+          # Major-version-cut detection. At a /vN bump (N>=2) there is no vN.* tag
+          # yet, so a BARE gorelease infers no base and passes VACUOUSLY — the gate
+          # would protect nothing on the one PR that contains every intended break.
+          # On that boundary we instead compare against the previous major's latest
+          # tag, PRINT the break ledger for human review, and refuse to pass only if
+          # gorelease produced no comparison at all. Incompatible changes are EXPECTED
+          # for a major and are NOT failed here. The strict check below re-arms
+          # automatically once vN.0.0 is tagged (bare gorelease then finds a vN base).
+          module="$(go list -m)"
+          major="${module##*/v}"
+          case "$major" in (''|*[!0-9]*) major=1 ;; esac
+          if [ "$major" -ge 2 ] && ! git tag | grep -qE "^v${major}\."; then
+            prev=$((major - 1))
+            base="$(git tag | grep -E "^v${prev}\." | sort -V | tail -1)"
+            echo "::notice::major-version cut (module=$module, no v${major} tag); break ledger vs ${base:-<none>}:"
+            set +e
+            go run "$GORELEASE" -base="$base" > "$report_path" 2>&1
+            set -e
+            cat "$report_path"
+            if [ -z "$base" ] || [ ! -s "$report_path" ] || grep -qiE "no previous version|no version to compare|could not" "$report_path"; then
+              echo "api-compat: gorelease produced no comparison against '${base:-<none>}' at the major boundary; refusing to pass vacuously."
+              exit 1
+            fi
+            echo "::notice::major-version cut: incompatible changes are EXPECTED; review the ledger above (path-change noise is normal)."
+            exit 0
+          fi
+
+          # Normal path: enforce VERSIONING.md's stability promise WITHIN the current
+          # major — incompatible changes fail, additive minor changes are expected.
           set +e
-          go run golang.org/x/exp/cmd/gorelease@v0.0.0-20260603202125-055de637280b > "$report_path" 2>&1
+          go run "$GORELEASE" > "$report_path" 2>&1
           gorelease_status=$?
           set -e
 
@@ -278,6 +308,34 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+
+      # Major-bump guard. semantic-release infers a MAJOR only from a breaking
+      # marker (a `<type>!:` subject or a `BREAKING CHANGE:` footer). If the module
+      # path is already /vN (N>=2) but no vN.* tag exists yet and the commits since
+      # the last tag carry NO breaking marker, semantic-release would compute a
+      # MINOR and silently mis-tag the major as a v(N-1).x release (the v1.3.0
+      # squash-title incident). Fail loudly before tagging so the commit message
+      # can be fixed and the run retried.
+      - name: Guard the major-version bump
+        run: |
+          module="$(go list -m)"
+          major="${module##*/v}"
+          case "$major" in (''|*[!0-9]*) major=1 ;; esac
+          if [ "$major" -ge 2 ] && ! git tag | grep -qE "^v${major}\."; then
+            last="$(git describe --tags --abbrev=0 2>/dev/null || echo '')"
+            range="${last:+${last}..}HEAD"
+            if ! git log "$range" --format='%s%n%b' \
+                 | grep -qE '^[a-z]+(\([^)]*\))?!:|^BREAKING CHANGE'; then
+              echo "::error::module is ${module} (v${major}) but no breaking-change commit since ${last:-<root>}; semantic-release would mis-tag a minor instead of v${major}.0.0. Add a '<type>!:' subject or a 'BREAKING CHANGE:' footer."
+              exit 1
+            fi
+            echo "::notice::major bump guard OK — breaking-change commit present for v${major}.0.0."
+          fi
 
       - uses: go-semantic-release/action@2e9dc4247a6004f8377781bef4cb9dad273a741f # v1.24.1
         with:
