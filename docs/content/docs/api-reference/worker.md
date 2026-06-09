@@ -133,7 +133,7 @@ Sets how long the owning worker must have made no contact before its job is recl
 Overrides the per-dequeue lock duration (default: 45 minutes). Useful when your jobs routinely run longer than the default lock window and the built-in heartbeat is not enough. Currently exposed via the `pkg/worker` subpackage rather than the root facade:
 
 ```go
-import "github.com/jdziat/simple-durable-jobs/pkg/worker"
+import "github.com/jdziat/simple-durable-jobs/v2/pkg/worker"
 
 w := queue.NewWorker(worker.WithLockDuration(2 * time.Hour))
 ```

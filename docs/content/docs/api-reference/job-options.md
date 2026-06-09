@@ -23,6 +23,49 @@ Schedules the job to run at a specific time.
 
 Assigns the job to a specific queue.
 
+### `WithTenant(tenant string) Option`
+
+Sets the tenant that owns the job. The value is persisted on `Job.Tenant` and
+can be used by dashboard/API filters through `JobFilter.Tenant`.
+
+```go
+jobID, err := queue.Enqueue(ctx, "sync-account", args,
+    jobs.WithTenant("tenant-a"),
+)
+```
+
+### `WithMetadata(metadata map[string]string) Option`
+
+Replaces the job metadata map with a defensive copy. Metadata is persisted on
+`Job.Metadata` as string key/value tags for filtering and operational display.
+
+```go
+jobID, err := queue.Enqueue(ctx, "sync-account", args,
+    jobs.WithMetadata(map[string]string{
+        "region": "us",
+        "plan":   "pro",
+    }),
+)
+```
+
+### `WithMeta(key, value string) Option`
+
+Adds or replaces one metadata key/value pair. If you combine it with
+`WithMetadata`, option order matters: `WithMetadata` replaces metadata set by
+earlier metadata options, while later `WithMeta` calls update the map.
+
+```go
+jobID, err := queue.Enqueue(ctx, "sync-account", args,
+    jobs.WithMetadata(map[string]string{"region": "us"}),
+    jobs.WithMeta("plan", "pro"),
+)
+```
+
+Storage UI filters expose `JobFilter.MetaContains` for metadata search.
+`GormStorage` implements it as portable substring matching over serialized JSON
+metadata, not exact structured key/value matching, so values containing the same
+serialized fragment can over-match.
+
 ### `Unique(key string) Option`
 
 Ensures only one pending-or-running job with this `key` exists. If a matching job already exists, `Queue.Enqueue` returns `ErrDuplicateJob`. The uniqueness check runs inside a transaction with row-level locking on Postgres/MySQL and relies on SQLite's writer serialization. The key has no TTL — the guard releases as soon as the existing job reaches `completed`, `failed`, or `cancelled`.

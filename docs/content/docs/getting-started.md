@@ -25,7 +25,7 @@ stateDiagram-v2
 ## Installation
 
 ```bash
-go get github.com/jdziat/simple-durable-jobs
+go get github.com/jdziat/simple-durable-jobs/v2
 ```
 
 You'll also need a database driver. For development, SQLite works great:
@@ -50,15 +50,15 @@ package main
 import (
     "context"
 
-    jobs "github.com/jdziat/simple-durable-jobs"
+    jobs "github.com/jdziat/simple-durable-jobs/v2"
     "gorm.io/driver/sqlite"
     "gorm.io/gorm"
 )
 
 func main() {
-    // Open database connection. The SQLite DSN parameters are required for safe
-    // concurrent workers (see the SQLite concurrency note below).
-    db, err := gorm.Open(sqlite.Open("jobs.db?_journal_mode=WAL&_busy_timeout=5000&_txlock=immediate"), &gorm.Config{})
+    // Open database connection. SafeSQLiteDSN adds the SQLite parameters
+    // required for safe concurrent workers (see the SQLite concurrency note below).
+    db, err := gorm.Open(sqlite.Open(jobs.SafeSQLiteDSN("jobs.db")), &gorm.Config{})
     if err != nil {
         panic(err)
     }
@@ -114,6 +114,45 @@ queue.Register("process-number", func(ctx context.Context, n int) error {
 queue.Register("calculate", func(ctx context.Context, x int) (int, error) {
     return x * 2, nil
 })
+```
+
+The string-keyed `Register` path is still useful for remote producers, dynamic job names, and interoperability with non-Go systems. For compile-time checked producer code, use the typed API:
+
+```go
+import typed "github.com/jdziat/simple-durable-jobs/v2/pkg/typed"
+
+type SendEmailResult struct {
+    MessageID string `json:"message_id"`
+}
+
+sendEmail := typed.Define(queue, "send-email", func(ctx context.Context, args SendEmailArgs) (SendEmailResult, error) {
+    fmt.Printf("Sending email to %s\n", args.To)
+    return SendEmailResult{MessageID: "msg_123"}, nil
+})
+
+cleanup := typed.DefineVoid(queue, "cleanup", func(ctx context.Context, _ struct{}) error {
+    fmt.Println("Cleaning up")
+    return nil
+})
+
+// Producer-only process: create a typed handle without registering a local handler.
+remoteSendEmail := typed.Declare[SendEmailArgs, SendEmailResult](queue, "send-email")
+
+jobID, err := sendEmail.Enqueue(ctx, SendEmailArgs{To: "user@example.com"})
+if err != nil {
+    return err
+}
+
+// Inside another job handler, Call runs the job as a checkpointed nested step.
+result, err := sendEmail.Call(ctx, SendEmailArgs{To: "user@example.com"})
+
+// Outside the handler, Load decodes the persisted result for a completed job.
+loaded, err := sendEmail.Load(ctx, jobID)
+
+_, err = cleanup.Enqueue(ctx, struct{}{})
+_, err = remoteSendEmail.EnqueueRemote(ctx, SendEmailArgs{To: "remote@example.com"})
+_ = result
+_ = loaded
 ```
 
 ### 3. Enqueue Jobs
@@ -276,7 +315,7 @@ worker.Pause(jobs.PauseModeAggressive)
 Mount a monitoring dashboard into your HTTP server:
 
 ```go
-import "github.com/jdziat/simple-durable-jobs/ui"
+import "github.com/jdziat/simple-durable-jobs/v2/ui"
 
 ctx, cancel := context.WithCancel(context.Background())
 defer cancel()

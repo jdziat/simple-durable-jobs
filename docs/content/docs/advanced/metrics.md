@@ -20,8 +20,8 @@ import (
 	"context"
 	"net/http"
 
-	jobs "github.com/jdziat/simple-durable-jobs"
-	jobsmetrics "github.com/jdziat/simple-durable-jobs/pkg/metrics"
+	jobs "github.com/jdziat/simple-durable-jobs/v2"
+	jobsmetrics "github.com/jdziat/simple-durable-jobs/v2/pkg/metrics"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )

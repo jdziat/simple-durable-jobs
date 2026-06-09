@@ -6,7 +6,7 @@ weight: 1
 ## Package `jobs`
 
 ```go
-import jobs "github.com/jdziat/simple-durable-jobs"
+import jobs "github.com/jdziat/simple-durable-jobs/v2"
 ```
 
 ---

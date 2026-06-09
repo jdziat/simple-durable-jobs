@@ -25,6 +25,7 @@ description: "A Go library for durable job queues with checkpointed workflows, f
 
 <div class="sdj-hero-buttons">
 {{< hextra/hero-button text="Get Started" link="docs/getting-started/" >}}
+{{< hextra/hero-button text="Migrate to v2" link="docs/migration-v1-to-v2/" style="background:transparent;border:1px solid var(--sdj-accent);color:var(--sdj-accent)" >}}
 {{< hextra/hero-button text="Live Demo  →" link="docs/live-demo/" style="background:transparent;border:1px solid var(--sdj-accent);color:var(--sdj-accent)" >}}
 </div>
 
@@ -53,7 +54,7 @@ import (
 	"context"
 	"fmt"
 
-	jobs "github.com/jdziat/simple-durable-jobs"
+	jobs "github.com/jdziat/simple-durable-jobs/v2"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )

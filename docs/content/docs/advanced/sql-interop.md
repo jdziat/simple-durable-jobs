@@ -10,9 +10,9 @@ Prefer the Go API when you can. Raw SQL enqueue bypasses validation, enqueue mid
 
 ## Stability Caveat
 
-The database schema changes only through the versioned migration runner. Within v1, migrations are forward-only and safe to apply to an existing database; always run `Migrate()` on deploy. See the repository [versioning policy](https://github.com/jdziat/simple-durable-jobs/blob/main/VERSIONING.md).
+The database schema changes only through the versioned migration runner. Within a major version, migrations are forward-only and safe to apply to an existing database; always run `Migrate()` on deploy. See the repository [versioning policy](https://github.com/jdziat/simple-durable-jobs/blob/main/VERSIONING.md).
 
-For v1, this page documents INSERT-only enqueue of pending jobs. Minor releases may add nullable or defaulted columns. The contract is that v1 will not remove or rename the existing required columns, but raw producers should name columns explicitly and tolerate additional columns.
+This page documents the current INSERT-only enqueue contract for pending jobs. Minor releases may add nullable or defaulted columns. The contract is that a major version will not remove or rename the existing required columns, but raw producers should name columns explicitly and tolerate additional columns.
 
 ## Minimal Insert Contract
 
