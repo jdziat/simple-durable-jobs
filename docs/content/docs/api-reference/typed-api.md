@@ -59,6 +59,64 @@ cleanup := typed.DefineVoid(queue, "cleanup", func(ctx context.Context, args Cle
 
 ---
 
+## Workflow primitives
+
+Typed definitions cover the job name, argument type, and result type. Workflow
+primitives are package-level functions because their result type is independent
+from any single `Def[A, R]`.
+
+### `FanOut[T any](ctx context.Context, subJobs []fanout.SubJob, opts ...fanout.Option) ([]typed.Result[T], error)`
+
+Spawns sub-jobs and decodes each successful sub-job result as `T`, matching
+`jobs.FanOut[T]` behavior.
+
+```go
+subs := []typed.SubJob{
+    typed.SubJobOf(processItem, ProcessItemArgs{ID: "item-1"}),
+}
+results, err := typed.FanOut[ProcessItemResult](ctx, subs)
+```
+
+### `SubJobOf[A any, R any](def *Def[A, R], args A, opts ...queue.Option) typed.SubJob`
+
+Builds a fan-out sub-job from a typed definition. The sub-job still routes by
+the definition's string job name, but `args` must match the definition's
+argument type.
+
+### `WaitForSignal[T any](ctx context.Context, name string) (T, error)`
+
+Consumes the oldest pending signal of `name` and decodes the payload as `T`.
+
+```go
+approval, err := typed.WaitForSignal[Approval](ctx, "approval")
+```
+
+### `WaitForSignalTimeout[T any](ctx context.Context, name string, d time.Duration) (T, bool, error)`
+
+Waits for a typed signal until the durable deadline. It returns `ok=false` when
+the deadline wins.
+
+```go
+approval, ok, err := typed.WaitForSignalTimeout[Approval](ctx, "approval", time.Hour)
+```
+
+### `Signal(ctx context.Context, q *queue.Queue, jobID, name string, payload any) error`
+
+Sends a signal to a specific job ID, preserving the root
+`jobs.Signal(ctx, q, jobID, name, payload)` shape. The payload is still accepted
+as `any` because senders often live outside the workflow and may not share a
+typed definition handle for the receiving wait.
+
+```go
+err := typed.Signal(ctx, queue, jobID, "approval", Approval{ApprovedBy: "alice"})
+```
+
+The typed package deliberately does not wrap everything from the root facade.
+Use root `jobs.Sleep`, `jobs.CheckSignal`, `jobs.DrainSignals`, result helpers,
+and operational APIs when you need them. The typed package also avoids importing
+the root package; it delegates to `pkg/fanout`, `pkg/signal`, and `pkg/queue` so
+it remains a thin typed layer over the same durable engine.
+
 ## `Def[A, R]`
 
 ### `(*Def[A, R]) Name() string`

@@ -6,6 +6,7 @@ import (
 	"time"
 
 	jobs "github.com/jdziat/simple-durable-jobs/v2"
+	typed "github.com/jdziat/simple-durable-jobs/v2/pkg/typed"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
@@ -18,6 +19,14 @@ type exampleOrder struct {
 type exampleProcessedOrder struct {
 	ID      uint `gorm:"primaryKey"`
 	OrderID string
+}
+
+type exampleTypedEmail struct {
+	To string
+}
+
+type exampleTypedEmailResult struct {
+	MessageID string
 }
 
 func ExampleNew() {
@@ -51,6 +60,30 @@ func ExampleNew() {
 		_ = worker.Start(ctx)
 	}()
 	cancel()
+}
+
+func ExampleDefine() {
+	ctx := context.Background()
+
+	db, err := gorm.Open(sqlite.Open(jobs.SafeSQLiteDSN("jobs.db")), &gorm.Config{})
+	if err != nil {
+		panic(err)
+	}
+	store := jobs.NewGormStorage(db)
+	if err := store.Migrate(ctx); err != nil {
+		panic(err)
+	}
+
+	q := jobs.New(store)
+	sendEmail := typed.Define(q, "typed-send-email", func(ctx context.Context, args exampleTypedEmail) (exampleTypedEmailResult, error) {
+		return exampleTypedEmailResult{MessageID: "msg_" + args.To}, nil
+	})
+
+	jobID, err := sendEmail.Enqueue(ctx, exampleTypedEmail{To: "user@example.com"})
+	if err != nil {
+		panic(err)
+	}
+	_, _ = sendEmail.Load(ctx, jobID)
 }
 
 // ExampleNew_enqueueOptions enqueues onto a named queue with per-job options.

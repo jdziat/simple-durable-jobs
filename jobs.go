@@ -344,8 +344,12 @@ var (
 	DefaultCallRetries = queue.DefaultCallRetries
 
 	IdentityCodec = core.IdentityCodec
-	NopCodec      = core.NopCodec
 )
+
+// NopCodec is an alias for IdentityCodec.
+//
+// Deprecated: use IdentityCodec.
+var NopCodec = IdentityCodec
 
 const safeSQLiteDSNQuery = "_journal_mode=WAL&_busy_timeout=5000&_txlock=immediate"
 
@@ -564,26 +568,36 @@ func RetryAfter(d time.Duration, err error) error {
 }
 
 // ValidateJobTypeName validates a job type name.
+//
+// Deprecated: internal helper; will be unexported in v3.
 func ValidateJobTypeName(name string) error {
 	return security.ValidateJobTypeName(name)
 }
 
 // ValidateQueueName validates a queue name.
+//
+// Deprecated: internal helper; will be unexported in v3.
 func ValidateQueueName(name string) error {
 	return security.ValidateQueueName(name)
 }
 
 // SanitizeErrorMessage truncates and sanitizes error messages for storage.
+//
+// Deprecated: internal helper; will be unexported in v3.
 func SanitizeErrorMessage(msg string) string {
 	return security.SanitizeErrorMessage(msg)
 }
 
 // ClampRetries ensures retry count is within limits.
+//
+// Deprecated: internal helper; will be unexported in v3.
 func ClampRetries(n int) int {
 	return security.ClampRetries(n)
 }
 
 // ClampConcurrency ensures concurrency is within limits.
+//
+// Deprecated: internal helper; will be unexported in v3.
 func ClampConcurrency(n int) int {
 	return security.ClampConcurrency(n)
 }

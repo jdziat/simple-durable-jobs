@@ -18,6 +18,8 @@ type identityCodec struct{}
 var IdentityCodec PayloadCodec = identityCodec{}
 
 // NopCodec is an alias for IdentityCodec.
+//
+// Deprecated: use IdentityCodec.
 var NopCodec = IdentityCodec
 
 func (identityCodec) Encode(plaintext []byte) ([]byte, error) {

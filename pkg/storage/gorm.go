@@ -1,4 +1,3 @@
-// Package storage provides storage implementations for the jobs package.
 package storage
 
 import (

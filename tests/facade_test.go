@@ -129,24 +129,24 @@ func TestFacade_SecurityConstants(t *testing.T) {
 // TestFacade_HelperFunctions verifies helper functions are exported.
 func TestFacade_HelperFunctions(t *testing.T) {
 	// ValidateJobTypeName
-	assert.NoError(t, jobs.ValidateJobTypeName("valid-name"))
-	assert.Error(t, jobs.ValidateJobTypeName(""))
+	assert.NoError(t, jobs.ValidateJobTypeName("valid-name")) //nolint:staticcheck // deprecated facade helper remains covered for v2 compatibility
+	assert.Error(t, jobs.ValidateJobTypeName(""))             //nolint:staticcheck // deprecated facade helper remains covered for v2 compatibility
 
 	// ValidateQueueName
-	assert.NoError(t, jobs.ValidateQueueName("valid-queue"))
-	assert.Error(t, jobs.ValidateQueueName(""))
+	assert.NoError(t, jobs.ValidateQueueName("valid-queue")) //nolint:staticcheck // deprecated facade helper remains covered for v2 compatibility
+	assert.Error(t, jobs.ValidateQueueName(""))              //nolint:staticcheck // deprecated facade helper remains covered for v2 compatibility
 
 	// SanitizeErrorMessage
-	sanitized := jobs.SanitizeErrorMessage("test error")
+	sanitized := jobs.SanitizeErrorMessage("test error") //nolint:staticcheck // deprecated facade helper remains covered for v2 compatibility
 	assert.NotEmpty(t, sanitized)
 
 	// ClampRetries
-	assert.Equal(t, 5, jobs.ClampRetries(5))
-	assert.Equal(t, jobs.MaxRetries, jobs.ClampRetries(1000))
+	assert.Equal(t, 5, jobs.ClampRetries(5))                  //nolint:staticcheck // deprecated facade helper remains covered for v2 compatibility
+	assert.Equal(t, jobs.MaxRetries, jobs.ClampRetries(1000)) //nolint:staticcheck // deprecated facade helper remains covered for v2 compatibility
 
 	// ClampConcurrency
-	assert.Equal(t, 5, jobs.ClampConcurrency(5))
-	assert.Equal(t, jobs.MaxConcurrency, jobs.ClampConcurrency(10000))
+	assert.Equal(t, 5, jobs.ClampConcurrency(5))                       //nolint:staticcheck // deprecated facade helper remains covered for v2 compatibility
+	assert.Equal(t, jobs.MaxConcurrency, jobs.ClampConcurrency(10000)) //nolint:staticcheck // deprecated facade helper remains covered for v2 compatibility
 }
 
 // TestFacade_OptionFunctions verifies option functions are exported.

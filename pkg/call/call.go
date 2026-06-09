@@ -1,4 +1,3 @@
-// Package call provides the durable Call function for nested job calls.
 package call
 
 import (

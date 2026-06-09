@@ -1,4 +1,3 @@
-// Package handler provides reflection-based handler execution for the jobs package.
 package handler
 
 import (

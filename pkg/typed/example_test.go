@@ -191,6 +191,58 @@ func ExampleDef_Load() {
 	// Output: true
 }
 
+func ExampleFanOut() {
+	results, err := typed.FanOut[exampleResult](context.Background(), nil)
+
+	fmt.Println(len(results), err == nil)
+	// Output: 0 true
+}
+
+func ExampleSignal() {
+	ctx := context.Background()
+	q, _, cleanup := newExampleDurableQueue()
+	defer cleanup()
+
+	def := typed.DefineVoid(q, "typedExampleSignal", func(_ context.Context, _ exampleArgs) error {
+		return nil
+	})
+	jobID, err := def.Enqueue(ctx, exampleArgs{UserID: "u-123"})
+	if err != nil {
+		panic(err)
+	}
+	if err := typed.Signal(ctx, q, jobID, "approved", true); err != nil {
+		panic(err)
+	}
+
+	fmt.Println(jobID != "")
+	// Output: true
+}
+
+func ExampleWaitForSignal() {
+	_, err := typed.WaitForSignal[bool](context.Background(), "approved")
+
+	fmt.Println(err != nil)
+	// Output: true
+}
+
+func ExampleWaitForSignalTimeout() {
+	_, _, err := typed.WaitForSignalTimeout[bool](context.Background(), "approved", time.Second)
+
+	fmt.Println(err != nil)
+	// Output: true
+}
+
+func ExampleSubJobOf() {
+	q := queue.New(nil)
+	def := typed.Define(q, "typedExampleSubJobOf", func(_ context.Context, a exampleArgs) (exampleResult, error) {
+		return exampleResult{Greeting: a.UserID}, nil
+	})
+
+	sub := typed.SubJobOf(def, exampleArgs{UserID: "u-123"})
+	fmt.Println(sub.Type)
+	// Output: typedExampleSubJobOf
+}
+
 func newExampleDurableQueue() (*queue.Queue, core.Storage, func()) {
 	path, err := os.MkdirTemp("", "typed-example-*")
 	if err != nil {

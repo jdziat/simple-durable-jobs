@@ -153,6 +153,130 @@ func TestDefineVoid(t *testing.T) {
 	assert.Equal(t, args{Name: "side-effect", Count: 1}, seen)
 }
 
+func TestTypedSubJobOfUsesDefinitionNameAndTypedArgs(t *testing.T) {
+	q, _ := newTestQueue(t, nil)
+	def := typed.Define(q, "typedSubJobOf", func(_ context.Context, a args) (result, error) {
+		return result{Message: a.Name, Total: a.Count}, nil
+	})
+
+	sub := typed.SubJobOf(def, args{Name: "sub", Count: 9}, queue.QueueOpt("typed-sub"), queue.Priority(7))
+
+	assert.Equal(t, def.Name(), sub.Type)
+	assert.Equal(t, args{Name: "sub", Count: 9}, sub.Args)
+	assert.Equal(t, "typed-sub", sub.Queue)
+	assert.Equal(t, 7, sub.Priority)
+	assert.True(t, sub.PrioritySet)
+}
+
+func TestTypedSignalAndWaitForSignalResumeWorkflow(t *testing.T) {
+	ctx := context.Background()
+	q, store := newTestQueue(t, nil)
+	events := q.Events()
+	defer q.Unsubscribe(events)
+
+	def := typed.Define(q, "typedSignalWait", func(ctx context.Context, a args) (result, error) {
+		approved, err := typed.WaitForSignal[bool](ctx, "approved")
+		if err != nil {
+			return result{}, err
+		}
+		if !approved {
+			return result{}, fmt.Errorf("not approved")
+		}
+		return result{Message: "approved:" + a.Name, Total: a.Count}, nil
+	})
+
+	jobID, err := def.Enqueue(ctx, args{Name: "workflow", Count: 3})
+	require.NoError(t, err)
+	runWorkerUntilStatus(t, q, store, jobID, core.StatusWaiting)
+
+	require.NoError(t, typed.Signal(ctx, q, jobID, "approved", true))
+	runWorkerUntilStatus(t, q, store, jobID, core.StatusCompleted)
+
+	got, err := def.Load(ctx, jobID)
+	require.NoError(t, err)
+	assert.Equal(t, result{Message: "approved:workflow", Total: 3}, got)
+
+	assert.Eventually(t, func() bool {
+		for {
+			select {
+			case event := <-events:
+				if delivered, ok := event.(*core.SignalDelivered); ok {
+					return delivered.JobID == jobID && delivered.Name == "approved"
+				}
+			default:
+				return false
+			}
+		}
+	}, time.Second, 10*time.Millisecond)
+}
+
+func TestTypedWaitForSignalTimeoutConsumesBufferedSignal(t *testing.T) {
+	ctx := context.Background()
+	q, store := newTestQueue(t, nil)
+
+	def := typed.Define(q, "typedSignalTimeout", func(ctx context.Context, _ args) (result, error) {
+		value, ok, err := typed.WaitForSignalTimeout[string](ctx, "ready", time.Minute)
+		if err != nil {
+			return result{}, err
+		}
+		if !ok {
+			return result{}, fmt.Errorf("timed out")
+		}
+		return result{Message: value, Total: len(value)}, nil
+	})
+
+	jobID, err := def.Enqueue(ctx, args{Name: "timeout", Count: 1})
+	require.NoError(t, err)
+	require.NoError(t, typed.Signal(ctx, q, jobID, "ready", "go"))
+
+	runWorkerUntilStatus(t, q, store, jobID, core.StatusCompleted)
+	got, err := def.Load(ctx, jobID)
+	require.NoError(t, err)
+	assert.Equal(t, result{Message: "go", Total: 2}, got)
+}
+
+func TestTypedSignalRejectsStorageWithoutSignalSupport(t *testing.T) {
+	q := queue.New(newExampleStorage())
+
+	err := typed.Signal(context.Background(), q, "missing", "ready", true)
+
+	require.ErrorIs(t, err, core.ErrStorageNoSignals)
+}
+
+func TestTypedFanOutRunsTypedSubJobs(t *testing.T) {
+	ctx := context.Background()
+	q, store := newTestQueue(t, nil)
+
+	child := typed.Define(q, "typedFanOutChild", func(_ context.Context, a args) (result, error) {
+		return result{Message: "child:" + a.Name, Total: a.Count + 1}, nil
+	})
+	parent := typed.Define(q, "typedFanOutParent", func(ctx context.Context, values []args) ([]result, error) {
+		subJobs := make([]typed.SubJob, len(values))
+		for i, value := range values {
+			subJobs[i] = typed.SubJobOf(child, value)
+		}
+		results, err := typed.FanOut[result](ctx, subJobs)
+		if err != nil {
+			return nil, err
+		}
+		return []result{results[0].Value, results[1].Value}, nil
+	})
+
+	jobID, err := parent.Enqueue(ctx, []args{
+		{Name: "a", Count: 1},
+		{Name: "b", Count: 2},
+	})
+	require.NoError(t, err)
+
+	runWorkerUntilStatus(t, q, store, jobID, core.StatusCompleted)
+	got, err := parent.Load(ctx, jobID)
+	require.NoError(t, err)
+	assert.Equal(t, []result{
+		{Message: "child:a", Total: 2},
+		{Message: "child:b", Total: 3},
+	}, got)
+}
+
 func TestCompileTimeTypeMismatchFixture(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()

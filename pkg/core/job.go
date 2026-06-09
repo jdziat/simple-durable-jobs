@@ -1,4 +1,3 @@
-// Package core provides the domain models and interfaces for the jobs package.
 package core
 
 import (
