@@ -10,7 +10,7 @@ weight: 10
 Imports:
 
 ```go
-import jobsotel "github.com/jdziat/simple-durable-jobs/pkg/otel"
+import jobsotel "github.com/jdziat/simple-durable-jobs/v2/pkg/otel"
 ```
 
 Attaches tracing to a queue with no hand-rolled hook wiring. By default the instrumentation uses the global `TracerProvider`; pass `jobsotel.WithTracerProvider(tp)` to override.

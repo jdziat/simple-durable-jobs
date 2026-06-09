@@ -7,6 +7,7 @@ Complete, copy-paste-runnable code examples for common use cases. Jump to what y
 
 {{< cards cols="3" >}}
   {{< card link="#basic-job-processing" title="Basic Job Processing" icon="play" subtitle="Fire-and-forget jobs." >}}
+  {{< card link="#typed-api" title="Typed API" icon="code" subtitle="Typed definitions, enqueue, calls, and result loading." >}}
   {{< card link="#durable-workflows" title="Durable Workflows" icon="refresh" subtitle="Checkpointed multi-step work." >}}
   {{< card link="#fan-outfan-in" title="Fan-Out / Fan-In" icon="share" subtitle="Parallel sub-jobs + aggregation." >}}
   {{< card link="#scheduled-jobs" title="Scheduled Jobs" icon="clock" subtitle="Cron and interval schedules." >}}
@@ -34,7 +35,7 @@ import (
     "fmt"
     "time"
 
-    jobs "github.com/jdziat/simple-durable-jobs"
+    jobs "github.com/jdziat/simple-durable-jobs/v2"
     "gorm.io/driver/sqlite"
     "gorm.io/gorm"
 )
@@ -73,6 +74,33 @@ type EmailArgs struct {
 
 ---
 
+## Typed API
+
+Typed definitions keep the existing string-keyed routing model while giving Go
+producers compile-time checked arguments and results.
+
+```go
+import typed "github.com/jdziat/simple-durable-jobs/v2/pkg/typed"
+
+sendEmail := typed.Define(queue, "send-email", func(ctx context.Context, args EmailArgs) (EmailResult, error) {
+    return EmailResult{MessageID: "msg_123"}, nil
+})
+
+jobID, err := sendEmail.Enqueue(ctx, EmailArgs{To: "user@example.com"})
+if err != nil {
+    panic(err)
+}
+
+result, err := sendEmail.Load(ctx, jobID)
+_ = result
+```
+
+[View typed basic example](https://github.com/jdziat/simple-durable-jobs/tree/main/examples/typed/basic)
+
+[View typed workflow example](https://github.com/jdziat/simple-durable-jobs/tree/main/examples/typed/workflow)
+
+---
+
 ## Durable Workflows
 
 Multi-step workflows with automatic checkpointing and crash recovery.
@@ -84,7 +112,7 @@ import (
     "context"
     "fmt"
 
-    jobs "github.com/jdziat/simple-durable-jobs"
+    jobs "github.com/jdziat/simple-durable-jobs/v2"
     "gorm.io/driver/sqlite"
     "gorm.io/gorm"
 )
@@ -173,7 +201,7 @@ import (
     "context"
     "fmt"
 
-    jobs "github.com/jdziat/simple-durable-jobs"
+    jobs "github.com/jdziat/simple-durable-jobs/v2"
     "gorm.io/driver/sqlite"
     "gorm.io/gorm"
 )
@@ -292,7 +320,7 @@ import (
     "fmt"
     "time"
 
-    jobs "github.com/jdziat/simple-durable-jobs"
+    jobs "github.com/jdziat/simple-durable-jobs/v2"
     "gorm.io/driver/sqlite"
     "gorm.io/gorm"
 )
@@ -348,7 +376,7 @@ import (
     "context"
     "fmt"
 
-    jobs "github.com/jdziat/simple-durable-jobs"
+    jobs "github.com/jdziat/simple-durable-jobs/v2"
     "gorm.io/driver/sqlite"
     "gorm.io/gorm"
 )
@@ -393,7 +421,7 @@ import (
     "errors"
     "time"
 
-    jobs "github.com/jdziat/simple-durable-jobs"
+    jobs "github.com/jdziat/simple-durable-jobs/v2"
     "gorm.io/driver/sqlite"
     "gorm.io/gorm"
 )
@@ -448,7 +476,7 @@ import (
     "context"
     "log"
 
-    jobs "github.com/jdziat/simple-durable-jobs"
+    jobs "github.com/jdziat/simple-durable-jobs/v2"
     "gorm.io/driver/sqlite"
     "gorm.io/gorm"
 )
@@ -510,7 +538,7 @@ import (
     "flag"
     "fmt"
 
-    jobs "github.com/jdziat/simple-durable-jobs"
+    jobs "github.com/jdziat/simple-durable-jobs/v2"
     "gorm.io/driver/postgres"
     "gorm.io/gorm"
 )
@@ -592,7 +620,7 @@ queue.ResumeJob(ctx, jobID)
 Mount a full-featured monitoring dashboard into any Go HTTP server.
 
 ```go
-import "github.com/jdziat/simple-durable-jobs/ui"
+import "github.com/jdziat/simple-durable-jobs/v2/ui"
 
 ctx, cancel := context.WithCancel(context.Background())
 defer cancel()
@@ -738,7 +766,7 @@ queue.Register("agent-workflow", func(ctx context.Context, task AgentTask) error
 Optional Prometheus/OpenTelemetry metrics for queue depth, lifecycle counters, and duration histograms.
 
 ```go
-import jobsmetrics "github.com/jdziat/simple-durable-jobs/pkg/metrics"
+import jobsmetrics "github.com/jdziat/simple-durable-jobs/v2/pkg/metrics"
 
 handler, meterProvider, err := jobsmetrics.NewPrometheusHandler()
 if err != nil {

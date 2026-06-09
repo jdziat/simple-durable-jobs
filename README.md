@@ -44,10 +44,12 @@ for the full contract, backend support tiers, and crash-recovery tuning.
 
 - [Getting Started](https://jdziat.github.io/simple-durable-jobs/docs/getting-started/)
 - [API Reference](https://jdziat.github.io/simple-durable-jobs/docs/api-reference/)
+- [Typed API](https://jdziat.github.io/simple-durable-jobs/docs/api-reference/typed-api/) - Compile-time checked job definitions over the same durable queue
 - [Examples](https://jdziat.github.io/simple-durable-jobs/docs/examples/)
 - [Benchmarks](https://jdziat.github.io/simple-durable-jobs/docs/benchmarks/) - Measured numbers, methodology, and throughput tuning
 - [Choosing a Job System](https://jdziat.github.io/simple-durable-jobs/docs/comparison/) - An honest comparison vs River, Temporal, and Asynq
 - [Migrating from River](https://jdziat.github.io/simple-durable-jobs/docs/migrating-from-river/) / [Migrating from Asynq](https://jdziat.github.io/simple-durable-jobs/docs/migrating-from-asynq/)
+- [Migrating from v1 to v2](https://jdziat.github.io/simple-durable-jobs/docs/migration-v1-to-v2/) - Mechanical `/v2` import-path migration and storage rename notes
 - [Embedded Web UI](https://jdziat.github.io/simple-durable-jobs/docs/embedded-ui/)
 - [Live Demo](https://jdziat.github.io/simple-durable-jobs/docs/live-demo/)
 - [Guarantees & Production Readiness](https://jdziat.github.io/simple-durable-jobs/docs/advanced/guarantees/) - Execution semantics, backend tiers, crash-recovery tuning
@@ -90,6 +92,8 @@ for the full contract, backend support tiers, and crash-recovery tuning.
 ```bash
 go get github.com/jdziat/simple-durable-jobs/v2
 ```
+
+Upgrading from v1? See [MIGRATION-v2.md](./MIGRATION-v2.md).
 
 ## Quick Start
 
@@ -139,6 +143,8 @@ type EmailArgs struct {
     Subject string `json:"subject"`
 }
 ```
+
+Prefer compile-time checked producer handles? See the [typed API reference](https://jdziat.github.io/simple-durable-jobs/docs/api-reference/typed-api/) for `Define`, `Declare`, `DefineVoid`, and typed `Enqueue`/`Call`/`Load`.
 
 ## Durable Workflows
 

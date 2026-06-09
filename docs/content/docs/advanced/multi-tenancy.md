@@ -4,28 +4,75 @@ weight: 66
 toc: true
 ---
 
-Simple Durable Jobs does not provide schema-level multi-tenancy. The built-in pattern is implicit tenancy: put tenant identity in queue names, job arguments, metrics labels, and worker admission controls while all jobs still live in the same database tables.
+Simple Durable Jobs does not provide schema-level multi-tenancy. The built-in tenant support is a persisted owner label: set it with `jobs.WithTenant(...)`, read it from `Job.Tenant`, and use `JobFilter.Tenant` in UI/search queries. All jobs still live in the same database tables.
 
 Use this when tenants share an application database and you need fair scheduling or noisy-neighbor controls. Do not use it as a substitute for regulatory, contractual, or security isolation.
 
-## Pattern
+For API details, see [Job Options]({{< relref "/docs/api-reference/job-options" >}}) for `WithTenant` and [Types]({{< relref "/docs/api-reference/types" >}}) for `Job.Tenant` and `JobFilter.Tenant`.
 
-Tenant-scoped queues make ownership visible and easy to filter:
+## Primary Pattern: Set `Job.Tenant`
+
+Use `WithTenant` on every tenant-owned enqueue. Keep the tenant in your application arguments too when the handler needs it to load tenant-owned rows, but use `Job.Tenant` as the queue's operational label.
 
 ```go
-queueName := "tenant-" + tenantID
 jobID, err := queue.Enqueue(ctx, "tenant.import", ImportArgs{
 	TenantID: tenantID,
 	FileID:   fileID,
-}, jobs.QueueOpt(queueName), jobs.Unique("tenant:"+tenantID+":import:"+fileID))
+},
+	jobs.WithTenant(tenantID),
+	jobs.Unique("tenant:"+tenantID+":import:"+fileID),
+)
+if err != nil {
+	return err
+}
+_ = jobID
 ```
+
+Inside handlers or middleware, `JobFromContext` exposes the persisted job record:
+
+```go
+queue.Register("tenant.import", func(ctx context.Context, args ImportArgs) error {
+	job := jobs.JobFromContext(ctx)
+	if job == nil || job.Tenant == "" {
+		return fmt.Errorf("missing tenant")
+	}
+
+	// Load tenant-owned application rows by job.Tenant and args.FileID.
+	// Keep side effects idempotent; jobs are at-least-once.
+	return runImport(ctx, job.Tenant, args.FileID)
+})
+```
+
+`JobFilter.Tenant` is the storage/UI filter field for exact tenant matches. The embedded dashboard and UI API use this filter shape; `GormStorage.SearchJobs` applies it as `tenant = ?`. Code that calls UI-capable storage directly can use the `ui.JobFilter` alias.
+
+```go
+matches, total, err := store.SearchJobs(ctx, ui.JobFilter{
+	Tenant: "acme",
+	Limit:  50,
+})
+if err != nil {
+	return err
+}
+_ = matches
+_ = total
+```
+
+## Fairness Controls
+
+The tenant field is a label and query filter. Worker dequeue is still scoped by queue names, not by tenant, so use per-key worker controls when you need tenant-level fairness on a shared queue.
 
 Per-key concurrency caps limit in-flight work for each tenant across the worker fleet:
 
 ```go
+func tenantFromJob(job *jobs.Job) string {
+	if job.Tenant == "" {
+		return "unknown"
+	}
+	return job.Tenant
+}
+
 worker := queue.NewWorker(
-	jobs.WorkerQueue("tenant-a", jobs.Concurrency(10)),
-	jobs.WorkerQueue("tenant-b", jobs.Concurrency(10)),
+	jobs.WorkerQueue("imports", jobs.Concurrency(20)),
 	jobs.ConcurrencyCap("tenant-imports", 2, jobs.CapKey(tenantFromJob)),
 )
 ```
@@ -34,17 +81,16 @@ Per-key rate limits limit admission rate for each tenant when the storage backen
 
 ```go
 worker := queue.NewWorker(
-	jobs.WorkerQueue("tenant-a", jobs.Concurrency(10)),
-	jobs.WorkerQueue("tenant-b", jobs.Concurrency(10)),
-	jobs.RateLimit("tenant-api", 5, jobs.RateLimitKey(tenantFromJob)),
+	jobs.WorkerQueue("imports", jobs.Concurrency(20)),
+	jobs.RateLimit("tenant-import-starts", 1, jobs.RateLimitKey(tenantFromJob)),
 )
 ```
 
-Metrics and dashboards should keep the tenant visible. Queue names are already part of queue depth and dashboard filtering, so `tenant-<id>` queues provide a practical operational handle. If you emit application metrics in handlers, include the same tenant label there.
+Metrics and dashboards should keep the tenant visible. `Job.Tenant` is available for job search/filtering, and application metrics emitted from handlers should include the same tenant label.
 
 ## Worked Example
 
-This example uses a tenant field in the job arguments as the shared key for queue selection, concurrency, and rate limiting.
+This example uses `WithTenant` as the queue's tenant label, keeps the tenant in handler arguments for application data access, and partitions concurrency/rate limits by `Job.Tenant`.
 
 ```go
 type ImportArgs struct {
@@ -53,32 +99,38 @@ type ImportArgs struct {
 }
 
 func tenantFromJob(job *jobs.Job) string {
-	var args ImportArgs
-	if err := json.Unmarshal(job.Args, &args); err != nil || args.TenantID == "" {
+	if job.Tenant == "" {
 		return "unknown"
 	}
-	return args.TenantID
+	return job.Tenant
 }
 
 queue.Register("tenant.import", func(ctx context.Context, args ImportArgs) error {
-	// Load tenant-owned application rows by args.TenantID and args.FileID.
+	job := jobs.JobFromContext(ctx)
+	if job == nil || job.Tenant == "" {
+		return fmt.Errorf("missing tenant")
+	}
+
+	// Load tenant-owned application rows by job.Tenant and args.FileID.
 	// Keep side effects idempotent; jobs are at-least-once.
-	return runImport(ctx, args.TenantID, args.FileID)
+	return runImport(ctx, job.Tenant, args.FileID)
 })
 
 for _, tenantID := range []string{"acme", "globex"} {
-	queueName := "tenant-" + tenantID
 	if _, err := queue.Enqueue(ctx, "tenant.import", ImportArgs{
 		TenantID: tenantID,
 		FileID:   "file-001",
-	}, jobs.QueueOpt(queueName), jobs.Unique(queueName+":file-001")); err != nil {
+	},
+		jobs.QueueOpt("imports"),
+		jobs.WithTenant(tenantID),
+		jobs.Unique("tenant:"+tenantID+":import:file-001"),
+	); err != nil {
 		return err
 	}
 }
 
 worker := queue.NewWorker(
-	jobs.WorkerQueue("tenant-acme", jobs.Concurrency(10)),
-	jobs.WorkerQueue("tenant-globex", jobs.Concurrency(10)),
+	jobs.WorkerQueue("imports", jobs.Concurrency(20)),
 	jobs.ConcurrencyCap("tenant-imports", 2, jobs.CapKey(tenantFromJob)),
 	jobs.RateLimit("tenant-import-starts", 1, jobs.RateLimitKey(tenantFromJob)),
 	jobs.WithPollInterval(100*time.Millisecond),
@@ -87,13 +139,37 @@ worker := queue.NewWorker(
 return worker.Start(ctx)
 ```
 
-With this setup, each tenant queue can be filtered in the dashboard, each tenant can have at most two imports running under the cap, and each tenant starts at roughly one admitted job per second under the fleet-wide rate limit. The cap and rate limit are partitioned by `tenantFromJob`, so tenant `acme` and tenant `globex` do not consume each other's slots.
+With this setup, each job stores its tenant in `Job.Tenant`, UI/search filters can select tenant `acme` with `JobFilter.Tenant`, each tenant can have at most two imports running under the cap, and each tenant starts at roughly one admitted job per second under the fleet-wide rate limit. The cap and rate limit are partitioned by `tenantFromJob`, so tenant `acme` and tenant `globex` do not consume each other's slots.
 
 For a runnable version of the cap and rate-limit mechanics, see the [rate-limit example](https://github.com/jdziat/simple-durable-jobs/tree/main/examples/ratelimit).
 
+## Optional: Queue-per-tenant Isolation
+
+Tenant-scoped queues are still useful when you want queue-level routing, pause/resume, worker pools, or dashboard queue filters per tenant. Combine them with `WithTenant` instead of using queue names as the only tenant record:
+
+```go
+queueName := "tenant-" + tenantID
+jobID, err := queue.Enqueue(ctx, "tenant.import", ImportArgs{
+	TenantID: tenantID,
+	FileID:   fileID,
+},
+	jobs.QueueOpt(queueName),
+	jobs.WithTenant(tenantID),
+	jobs.Unique("tenant:"+tenantID+":import:"+fileID),
+)
+if err != nil {
+	return err
+}
+_ = jobID
+```
+
+This gives operators a queue handle such as `tenant-acme`, while still preserving the first-class `Job.Tenant` label for job records and tenant filters.
+
 ## What This Does Not Give
 
-This pattern does not provide row-level isolation. Jobs from every tenant are rows in the same `jobs` table.
+This pattern does not provide row-level isolation. Jobs from every tenant are rows in the same `jobs` table, even when `Job.Tenant` is set.
+
+It does not provide tenant-scoped dequeue. Workers dequeue by queue name and job status; use queue-per-tenant routing or per-key concurrency/rate limits when dispatch must be partitioned.
 
 It does not provide separate retention policies per tenant. Retention runs by terminal status and age, not by tenant.
 

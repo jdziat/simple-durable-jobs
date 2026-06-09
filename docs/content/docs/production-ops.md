@@ -294,9 +294,9 @@ rows. Retention deletes are permanent. See [Retention GC]({{< relref
 "/docs/advanced/retention-gc" >}}) for checkpoint GC, batch sizing, and storage
 support details.
 
-## OPENLINE v1.9.0 Coverage
+## Operational Coverage
 
-This page covers the operational surfaces added in OPENLINE v1.9.0:
+This page covers these operational surfaces:
 
 | Packet | Surface | Coverage |
 |---|---|---|
