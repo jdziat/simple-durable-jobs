@@ -51,6 +51,7 @@ for the full contract, backend support tiers, and crash-recovery tuning.
 - [Embedded Web UI](https://jdziat.github.io/simple-durable-jobs/docs/embedded-ui/)
 - [Live Demo](https://jdziat.github.io/simple-durable-jobs/docs/live-demo/)
 - [Guarantees & Production Readiness](https://jdziat.github.io/simple-durable-jobs/docs/advanced/guarantees/) - Execution semantics, backend tiers, crash-recovery tuning
+- [Production Operations](https://jdziat.github.io/simple-durable-jobs/docs/production-ops/) - Deployment topology, migrations, graceful drain, health probes, CLI, throughput tuning, metrics, DLQ, and retention runbooks
 - [Advanced Topics](https://jdziat.github.io/simple-durable-jobs/docs/advanced/) - Transactional enqueue, dead-letter queue, retention/GC, rate limiting, concurrency caps, metrics, workflow versioning, payload codec, execution middleware, dashboard authorization, and testing utilities
 
 ## Features
