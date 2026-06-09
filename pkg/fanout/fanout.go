@@ -16,6 +16,7 @@ import (
 // FanOut spawns sub-jobs in parallel and waits for all results.
 // Checkpoints progress - safe to retry if parent crashes.
 // When sub-jobs are created, the parent job is moved to StatusWaiting.
+// Fan-out children inherit the parent job's Tenant and Metadata.
 // The worker should detect WaitingError and stop processing.
 func FanOut[T any](ctx context.Context, subJobs []SubJob, opts ...Option) ([]Result[T], error) {
 	if len(subJobs) == 0 {
@@ -210,12 +211,16 @@ func buildSubJobs(subJobs []SubJob, cfg *config, jc *intctx.JobContext, fanOutID
 			rootID = &jc.Job.ID
 		}
 
+		// Fan-out children inherit the parent's tenant and metadata so tenant
+		// scope and queryable context flow consistently through the workflow.
 		jobID := uuid.New().String()
 		jobs[i] = &core.Job{
 			ID:          jobID,
 			Type:        sj.Type,
 			Args:        args,
 			Queue:       queue,
+			Tenant:      jc.Job.Tenant,
+			Metadata:    cloneMetadata(jc.Job.Metadata),
 			Priority:    priority,
 			MaxRetries:  retries,
 			Timeout:     sj.Timeout,
@@ -227,6 +232,17 @@ func buildSubJobs(subJobs []SubJob, cfg *config, jc *intctx.JobContext, fanOutID
 		}
 	}
 	return jobs, nil
+}
+
+func cloneMetadata(m map[string]string) map[string]string {
+	if len(m) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
 }
 
 // WaitingError signals the worker that the job has moved into

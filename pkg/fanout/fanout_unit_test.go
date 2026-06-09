@@ -316,6 +316,37 @@ func TestFanOut_FirstExecution_SuspendsAndReturnsError(t *testing.T) {
 	assert.Equal(t, 2, subJobCount)
 }
 
+func TestFanOut_FirstExecution_InheritsTenantAndMetadata(t *testing.T) {
+	store := newMinimalStorage()
+	jc := makeJobCtx(store, "parent-metadata", "default")
+	jc.Job.Tenant = "tenant-a"
+	jc.Job.Metadata = map[string]string{"env": "prod", "trace": "abc"}
+	ctx := buildCtx(jc, nil)
+
+	_, err := FanOut[string](ctx, []SubJob{
+		{Type: "do-work", Args: "item-1"},
+		{Type: "do-work", Args: "item-2"},
+	})
+	require.Error(t, err)
+	require.True(t, IsWaitingError(err))
+
+	subJobs := make([]*core.Job, 0, 2)
+	for _, job := range store.jobs {
+		if job.ParentJobID != nil {
+			subJobs = append(subJobs, job)
+		}
+	}
+	require.Len(t, subJobs, 2)
+	for _, job := range subJobs {
+		assert.Equal(t, "tenant-a", job.Tenant)
+		assert.Equal(t, map[string]string{"env": "prod", "trace": "abc"}, job.Metadata)
+	}
+
+	subJobs[0].Metadata["env"] = "mutated"
+	assert.Equal(t, "prod", jc.Job.Metadata["env"])
+	assert.Equal(t, "prod", subJobs[1].Metadata["env"])
+}
+
 func TestFanOut_HandlerLookup_MissingHandler_ReturnsError(t *testing.T) {
 	store := newMinimalStorage()
 	jc := makeJobCtx(store, "parent-lookup", "default")

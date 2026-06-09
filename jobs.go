@@ -79,6 +79,9 @@ type (
 	// PayloadCodec transforms serialized payload bytes at the storage boundary.
 	PayloadCodec = core.PayloadCodec
 
+	// MetadataMap stores queryable string metadata for jobs and job filters.
+	MetadataMap = core.MetadataMap
+
 	// DeadLetterFilter scopes dead-letter triage queries.
 	DeadLetterFilter = core.DeadLetterFilter
 
@@ -592,6 +595,22 @@ func QueueOpt(name string) Option {
 	return queue.QueueOpt(name)
 }
 
+// WithTenant sets the tenant that owns the job.
+func WithTenant(t string) Option {
+	return queue.WithTenant(t)
+}
+
+// WithMetadata replaces the job metadata with a defensive copy of m.
+// It replaces any metadata set by earlier WithMetadata or WithMeta options.
+func WithMetadata(m map[string]string) Option {
+	return queue.WithMetadata(m)
+}
+
+// WithMeta adds or replaces one metadata key/value pair.
+func WithMeta(key, value string) Option {
+	return queue.WithMeta(key, value)
+}
+
 // Priority sets the job priority (higher = runs first).
 func Priority(p int) Option {
 	return queue.Priority(p)
@@ -862,12 +881,14 @@ func JobIDFromContext(ctx context.Context) string {
 // Fan-out functions
 
 // Sub creates a sub-job definition for use with FanOut.
+// Fan-out children inherit the parent job's Tenant and Metadata.
 func Sub(jobType string, args any, opts ...Option) SubJob {
 	return fanout.Sub(jobType, args, opts...)
 }
 
 // FanOut spawns sub-jobs in parallel and waits for all results.
 // Checkpoints progress - safe to retry if parent crashes.
+// Fan-out children inherit the parent job's Tenant and Metadata.
 // Returns a slice of Result[T] with success/failure for each sub-job.
 func FanOut[T any](ctx context.Context, subJobs []SubJob, opts ...FanOutOption) ([]fanout.Result[T], error) {
 	return fanout.FanOut[T](ctx, subJobs, opts...)

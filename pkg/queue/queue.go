@@ -266,6 +266,9 @@ func (q *Queue) buildJob(name string, args any, options *Options) (*core.Job, er
 			return nil, err
 		}
 	}
+	if len(options.Tenant) > security.MaxQueueNameLength {
+		return nil, fmt.Errorf("jobs: tenant exceeds maximum length")
+	}
 
 	argsBytes, err := json.Marshal(args)
 	if err != nil {
@@ -291,6 +294,8 @@ func (q *Queue) buildJob(name string, args any, options *Options) (*core.Job, er
 		Type:        name,
 		Args:        argsBytes,
 		Queue:       options.Queue,
+		Tenant:      options.Tenant,
+		Metadata:    cloneOptionsMetadata(options.Metadata),
 		Priority:    options.Priority,
 		MaxRetries:  maxRetries,
 		UniqueKey:   options.UniqueKey,
@@ -310,6 +315,13 @@ func (q *Queue) buildJob(name string, args any, options *Options) (*core.Job, er
 	}
 
 	return job, nil
+}
+
+func cloneOptionsMetadata(m *core.MetadataMap) map[string]string {
+	if m == nil {
+		return nil
+	}
+	return cloneMetadata(map[string]string(*m))
 }
 
 // EnqueueBatch adds multiple jobs to the queue in one storage operation.

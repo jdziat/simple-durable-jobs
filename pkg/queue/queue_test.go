@@ -3,11 +3,13 @@ package queue
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/jdziat/simple-durable-jobs/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/pkg/security"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -342,6 +344,48 @@ func TestQueue_Enqueue_WithOptions(t *testing.T) {
 	assert.Equal(t, 100, job.Priority)
 	assert.Equal(t, 5, job.MaxRetries)
 	assert.Equal(t, 30*time.Second, job.Timeout)
+}
+
+func TestQueue_Enqueue_WithTenantAndMetadata(t *testing.T) {
+	store := newMockStorage()
+	q := New(store)
+
+	q.Register("test-job", func(ctx context.Context, args string) error {
+		return nil
+	})
+
+	meta := map[string]string{"trace": "abc", "plan": "pro"}
+	jobID, err := q.Enqueue(context.Background(), "test-job", "hello",
+		WithTenant("tenant-a"),
+		WithMetadata(meta),
+		WithMeta("region", "us"),
+	)
+	require.NoError(t, err)
+
+	meta["trace"] = "mutated"
+	job, err := store.GetJob(context.Background(), jobID)
+	require.NoError(t, err)
+	assert.Equal(t, "tenant-a", job.Tenant)
+	assert.Equal(t, map[string]string{
+		"trace":  "abc",
+		"plan":   "pro",
+		"region": "us",
+	}, job.Metadata)
+}
+
+func TestQueue_Enqueue_TenantTooLongReturnsError(t *testing.T) {
+	store := newMockStorage()
+	q := New(store)
+
+	q.Register("test-job", func(ctx context.Context, args string) error {
+		return nil
+	})
+
+	_, err := q.Enqueue(context.Background(), "test-job", "hello",
+		WithTenant(strings.Repeat("t", security.MaxQueueNameLength+1)),
+	)
+	require.Error(t, err)
+	assert.EqualError(t, err, "jobs: tenant exceeds maximum length")
 }
 
 func TestQueue_Enqueue_DeterminismOption(t *testing.T) {

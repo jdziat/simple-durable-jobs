@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -148,6 +149,15 @@ func (s *GormStorage) SearchJobs(ctx context.Context, filter core.JobFilter) ([]
 	if filter.Type != "" {
 		q = q.Where("type = ?", filter.Type)
 	}
+	if filter.Tenant != "" {
+		q = q.Where("tenant = ?", filter.Tenant)
+	}
+	if filter.MetaContains != nil {
+		for key, value := range *filter.MetaContains {
+			pattern := `%` + escapeLikePattern(metadataPairFragment(key, value)) + `%`
+			q = q.Where(metadataTextExpression(s)+" LIKE ? ESCAPE ?", pattern, `\`)
+		}
+	}
 	if filter.Search != "" {
 		searchTerm := filter.Search
 		if len(searchTerm) > maxUISearchLength {
@@ -158,7 +168,7 @@ func (s *GormStorage) SearchJobs(ctx context.Context, filter core.JobFilter) ([]
 		if strings.Contains(strings.ToLower(s.db.Name()), "mysql") {
 			argsExpr = "CONVERT(args USING utf8mb4)"
 		}
-		q = q.Where("id LIKE ? ESCAPE '\\' OR "+argsExpr+" LIKE ? ESCAPE '\\'", search, search)
+		q = q.Where("id LIKE ? ESCAPE ? OR "+argsExpr+" LIKE ? ESCAPE ?", search, `\`, search, `\`)
 	}
 	if !filter.Since.IsZero() {
 		q = q.Where("created_at >= ?", filter.Since)
@@ -186,6 +196,23 @@ func (s *GormStorage) SearchJobs(ctx context.Context, filter core.JobFilter) ([]
 		return nil, 0, err
 	}
 	return jobs, total, nil
+}
+
+func metadataTextExpression(s *GormStorage) string {
+	switch s.dialect() {
+	case dialectPostgres:
+		return "metadata::text"
+	default:
+		return "CAST(metadata AS CHAR)"
+	}
+}
+
+func metadataPairFragment(key, value string) string {
+	pair, err := json.Marshal(map[string]string{key: value})
+	if err != nil {
+		return fmt.Sprintf(`"%s":"%s"`, key, value)
+	}
+	return strings.TrimSuffix(strings.TrimPrefix(string(pair), "{"), "}")
 }
 
 func clampUIPagination(limit, offset int) (int, int) {

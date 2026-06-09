@@ -10,7 +10,11 @@ import (
 
 // Options holds configuration for job enqueueing and registration.
 type Options struct {
-	Queue          string
+	Queue string
+	// Tenant identifies the tenant that owns an enqueued job.
+	Tenant string
+	// Metadata stores queryable string tags for an enqueued job.
+	Metadata       *core.MetadataMap
 	Priority       int
 	MaxRetries     int
 	Delay          time.Duration
@@ -59,6 +63,32 @@ func (f optionFunc) Apply(o *Options) { f(o) }
 func QueueOpt(name string) Option {
 	return optionFunc(func(o *Options) {
 		o.Queue = name
+	})
+}
+
+// WithTenant sets the tenant that owns the job.
+func WithTenant(t string) Option {
+	return optionFunc(func(o *Options) {
+		o.Tenant = t
+	})
+}
+
+// WithMetadata replaces the job metadata with a defensive copy of m.
+// It replaces any metadata set by earlier WithMetadata or WithMeta options.
+func WithMetadata(m map[string]string) Option {
+	return optionFunc(func(o *Options) {
+		o.Metadata = cloneMetadataMap(m)
+	})
+}
+
+// WithMeta adds or replaces one metadata key/value pair.
+func WithMeta(key, value string) Option {
+	return optionFunc(func(o *Options) {
+		if o.Metadata == nil {
+			metadata := make(core.MetadataMap, 1)
+			o.Metadata = &metadata
+		}
+		(*o.Metadata)[key] = value
 	})
 }
 
@@ -152,3 +182,23 @@ var (
 	DefaultJobRetries  = 2
 	DefaultCallRetries = 3
 )
+
+func cloneMetadata(m map[string]string) map[string]string {
+	if len(m) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
+}
+
+func cloneMetadataMap(m map[string]string) *core.MetadataMap {
+	cloned := cloneMetadata(m)
+	if cloned == nil {
+		return nil
+	}
+	metadata := core.MetadataMap(cloned)
+	return &metadata
+}

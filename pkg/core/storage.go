@@ -130,9 +130,16 @@ type JobFilter struct {
 	Status string
 	Queue  string
 	Type   string
-	Search string
-	Since  time.Time
-	Until  time.Time
-	Limit  int
-	Offset int
+	// Tenant matches jobs owned by exactly this tenant.
+	Tenant string
+	// MetaContains requires every key/value pair to appear in the job metadata.
+	// GormStorage implements this as a portable CAST-LIKE predicate over the
+	// serialized JSON text; it is a substring match and may over-match values
+	// containing the same JSON-fragment text.
+	MetaContains *MetadataMap
+	Search       string
+	Since        time.Time
+	Until        time.Time
+	Limit        int
+	Offset       int
 }
