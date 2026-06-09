@@ -29,6 +29,24 @@ func (m *batchMockStorage) DequeueBatch(_ context.Context, _ []string, _ string,
 	return m.batchJobs, nil
 }
 
+type perQueueMockStorage struct {
+	*batchMockStorage
+	perQueueJobs    []*core.Job
+	perQueueBudgets map[string]int
+	perQueueCalls   int
+}
+
+func (m *perQueueMockStorage) DequeueBatchPerQueue(_ context.Context, _ string, budgets map[string]int) ([]*core.Job, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.perQueueCalls++
+	m.perQueueBudgets = make(map[string]int, len(budgets))
+	for queueName, budget := range budgets {
+		m.perQueueBudgets[queueName] = budget
+	}
+	return m.perQueueJobs, nil
+}
+
 type releaseStateStorage struct {
 	*mockStorage
 	mu   sync.Mutex
@@ -75,6 +93,53 @@ func TestWorkerBatchDequeueRequestsFreeCapacityBoundedByOption(t *testing.T) {
 	require.Len(t, jobs, 2)
 	assert.Equal(t, 3, store.batchLimit)
 	assert.Equal(t, 1, store.batchCalls)
+}
+
+func TestWorkerBatchDequeuePrefersPerQueueBudgets(t *testing.T) {
+	store := &perQueueMockStorage{
+		batchMockStorage: &batchMockStorage{mockStorage: &mockStorage{}},
+		perQueueJobs: []*core.Job{
+			{ID: "job-1", Type: "work", Queue: "hot"},
+			{ID: "job-2", Type: "work", Queue: "idle"},
+		},
+	}
+	w := NewWorker(queue.New(store),
+		WorkerQueue("hot", Concurrency(3)),
+		WorkerQueue("idle", Concurrency(2)),
+		WithDequeueBatchSize(2),
+		DisableRetry(),
+	)
+	w.trackQueueJob("running-1", "hot")
+	w.trackQueueJob("running-2", "hot")
+
+	jobs, err := w.dequeueAvailableJobs(context.Background(), []string{"hot", "idle"}, 5)
+	require.NoError(t, err)
+	require.Len(t, jobs, 2)
+	assert.Equal(t, 1, store.perQueueCalls)
+	assert.Equal(t, 0, store.batchCalls)
+	assert.Equal(t, map[string]int{"hot": 1, "idle": 1}, store.perQueueBudgets)
+}
+
+func TestWorkerDequeueQueueBudgetsIncludesEveryQueueWhenSlotsConstrained(t *testing.T) {
+	w := NewWorker(queue.New(&mockStorage{}),
+		WorkerQueue("alpha", Concurrency(10)),
+		WorkerQueue("beta", Concurrency(10)),
+		WorkerQueue("gamma", Concurrency(10)),
+		DisableRetry(),
+	)
+
+	budgets := w.dequeueQueueBudgets(w.queuesWithCapacity(), 5)
+
+	require.Len(t, budgets, 3)
+	total := 0
+	for _, queueName := range []string{"alpha", "beta", "gamma"} {
+		budget, ok := budgets[queueName]
+		require.True(t, ok, "queue %q was omitted", queueName)
+		assert.Positive(t, budget, "queue %q had no budget", queueName)
+		assert.LessOrEqual(t, budget, 10)
+		total += budget
+	}
+	assert.Equal(t, 5, total)
 }
 
 func TestWorkerBatchDequeueFallsBackWhenStorageLacksCapability(t *testing.T) {

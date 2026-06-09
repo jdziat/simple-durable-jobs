@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"runtime/debug"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -102,6 +103,10 @@ type failTerminalWithResultStorage interface {
 
 type batchDequeuer interface {
 	DequeueBatch(ctx context.Context, queues []string, workerID string, limit int) ([]*core.Job, error)
+}
+
+type perQueueDequeuer interface {
+	DequeueBatchPerQueue(ctx context.Context, workerID string, budgets map[string]int) ([]*core.Job, error)
 }
 
 type concurrencySlotStorage interface {
@@ -433,6 +438,9 @@ func (w *Worker) dequeueAvailableJobs(ctx context.Context, availableQueues []str
 		return nil, nil
 	}
 	if slots > 1 {
+		if pqd, ok := w.queue.Storage().(perQueueDequeuer); ok {
+			return w.dequeueBatchPerQueueWithRetry(ctx, pqd, w.dequeueQueueBudgets(availableQueues, slots), slots)
+		}
 		if bd, ok := w.queue.Storage().(batchDequeuer); ok {
 			return w.dequeueBatchWithRetry(ctx, bd, availableQueues, slots)
 		}
@@ -481,6 +489,63 @@ func (w *Worker) totalCapacityAcrossQueues(queues []string) int {
 		}
 	}
 	return total
+}
+
+func (w *Worker) dequeueQueueBudgets(queues []string, limit int) map[string]int {
+	budgets := make(map[string]int, len(queues))
+	if limit <= 0 {
+		return budgets
+	}
+
+	type queueCapacity struct {
+		name      string
+		remaining int
+	}
+	capacities := make([]queueCapacity, 0, len(queues))
+	for _, name := range queues {
+		maxConcurrency, ok := w.config.Queues[name]
+		if !ok {
+			continue
+		}
+		used := 0
+		if counter, ok := w.queueRunning[name]; ok {
+			used = int(counter.Load())
+		}
+		if remaining := maxConcurrency - used; remaining > 0 {
+			capacities = append(capacities, queueCapacity{name: name, remaining: remaining})
+		}
+	}
+	sort.Slice(capacities, func(i, j int) bool {
+		return capacities[i].name < capacities[j].name
+	})
+
+	remainingLimit := limit
+	if remainingLimit >= len(capacities) {
+		for i := range capacities {
+			budgets[capacities[i].name] = 1
+			capacities[i].remaining--
+			remainingLimit--
+		}
+	}
+	for remainingLimit > 0 {
+		progressed := false
+		for i := range capacities {
+			if remainingLimit <= 0 {
+				break
+			}
+			if capacities[i].remaining <= 0 {
+				continue
+			}
+			budgets[capacities[i].name]++
+			capacities[i].remaining--
+			remainingLimit--
+			progressed = true
+		}
+		if !progressed {
+			break
+		}
+	}
+	return budgets
 }
 
 func (w *Worker) dispatchDequeuedJobs(ctx context.Context, jobsChan chan<- *core.Job, jobs []*core.Job) (dispatched int, released int) {
@@ -904,6 +969,30 @@ func (w *Worker) dequeueBatchWithRetry(ctx context.Context, storage batchDequeue
 	err := retryWithBackoff(ctx, *w.config.DequeueRetry, func() error {
 		var dequeueErr error
 		jobs, dequeueErr = storage.DequeueBatch(ctx, queues, w.config.WorkerID, limit)
+		return dequeueErr
+	})
+	return jobs, err
+}
+
+func (w *Worker) dequeueBatchPerQueueWithRetry(ctx context.Context, storage perQueueDequeuer, budgets map[string]int, limit int) ([]*core.Job, error) {
+	if limit <= 0 || len(budgets) == 0 {
+		return []*core.Job{}, nil
+	}
+	cappedBudgets := make(map[string]int, len(budgets))
+	for queueName, budget := range budgets {
+		if budget <= 0 {
+			continue
+		}
+		cappedBudgets[queueName] = budget
+	}
+	if len(cappedBudgets) == 0 {
+		return []*core.Job{}, nil
+	}
+
+	var jobs []*core.Job
+	err := retryWithBackoff(ctx, *w.config.DequeueRetry, func() error {
+		var dequeueErr error
+		jobs, dequeueErr = storage.DequeueBatchPerQueue(ctx, w.config.WorkerID, cappedBudgets)
 		return dequeueErr
 	})
 	return jobs, err

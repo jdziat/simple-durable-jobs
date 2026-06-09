@@ -83,6 +83,57 @@ func TestDequeueBatch_CorrectnessAndPausedQueues(t *testing.T) {
 	assert.Empty(t, paused.LockedBy)
 }
 
+func TestDequeueBatchPerQueue_SkipsQueuesAtBudgetWithoutOverClaiming(t *testing.T) {
+	s := newTestStorage(t)
+	ctx := context.Background()
+	base := time.Now().Add(-time.Hour).UTC()
+
+	seed := []struct {
+		id       string
+		queue    string
+		priority int
+		created  time.Time
+	}{
+		{"hot-01", "hot", 100, base.Add(0 * time.Second)},
+		{"hot-02", "hot", 99, base.Add(1 * time.Second)},
+		{"hot-03", "hot", 98, base.Add(2 * time.Second)},
+		{"idle-01", "idle", 90, base.Add(3 * time.Second)},
+		{"idle-02", "idle", 89, base.Add(4 * time.Second)},
+	}
+	for _, item := range seed {
+		require.NoError(t, s.db.WithContext(ctx).Create(&core.Job{
+			ID:        item.id,
+			Type:      "work",
+			Queue:     item.queue,
+			Priority:  item.priority,
+			Status:    core.StatusPending,
+			CreatedAt: item.created,
+		}).Error)
+	}
+
+	got, err := s.DequeueBatchPerQueue(ctx, "w1", map[string]int{"hot": 1, "idle": 2})
+	require.NoError(t, err)
+	require.Len(t, got, 3)
+	assert.Equal(t, []string{"hot-01", "idle-01", "idle-02"}, jobIDs(got))
+
+	for _, id := range []string{"hot-02", "hot-03"} {
+		stored, err := s.GetJob(ctx, id)
+		require.NoError(t, err)
+		require.NotNil(t, stored)
+		assert.Equal(t, core.StatusPending, stored.Status)
+		assert.Empty(t, stored.LockedBy)
+		assert.Equal(t, 0, stored.Attempt)
+	}
+	for _, id := range []string{"hot-01", "idle-01", "idle-02"} {
+		stored, err := s.GetJob(ctx, id)
+		require.NoError(t, err)
+		require.NotNil(t, stored)
+		assert.Equal(t, core.StatusRunning, stored.Status)
+		assert.Equal(t, "w1", stored.LockedBy)
+		assert.Equal(t, 1, stored.Attempt)
+	}
+}
+
 func TestDequeueBatch_ConcurrentCallersDoNotDoubleDispatch(t *testing.T) {
 	s := newConcurrentTestStorage(t)
 	ctx := context.Background()

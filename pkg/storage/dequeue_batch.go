@@ -20,6 +20,34 @@ const maxLockedBatchEmptyRetries = 20
 // Dequeue. This is an optional storage capability; it is intentionally not part
 // of core.Storage so external storage implementations remain source-compatible.
 func (s *GormStorage) DequeueBatch(ctx context.Context, queues []string, workerID string, limit int) ([]*core.Job, error) {
+	return s.dequeueBatch(ctx, queues, workerID, limit, nil)
+}
+
+// DequeueBatchPerQueue fetches and locks due jobs for the provided queues,
+// claiming at most budgets[q] jobs from each queue while preserving the same
+// global ordering as Dequeue.
+func (s *GormStorage) DequeueBatchPerQueue(ctx context.Context, workerID string, budgets map[string]int) ([]*core.Job, error) {
+	if len(budgets) == 0 {
+		return []*core.Job{}, nil
+	}
+	queues := make([]string, 0, len(budgets))
+	limit := 0
+	normalizedBudgets := make(map[string]int, len(budgets))
+	for queueName, budget := range budgets {
+		if budget <= 0 {
+			continue
+		}
+		queues = append(queues, queueName)
+		normalizedBudgets[queueName] = budget
+		limit += budget
+		if limit > maxDequeueBatch {
+			limit = maxDequeueBatch
+		}
+	}
+	return s.dequeueBatch(ctx, queues, workerID, limit, normalizedBudgets)
+}
+
+func (s *GormStorage) dequeueBatch(ctx context.Context, queues []string, workerID string, limit int, perQueueBudgets map[string]int) ([]*core.Job, error) {
 	if limit <= 0 {
 		return []*core.Job{}, nil
 	}
@@ -37,9 +65,9 @@ func (s *GormStorage) DequeueBatch(ctx context.Context, queues []string, workerI
 	}
 
 	if s.isSQLite {
-		return s.dequeueBatchSQLite(ctx, activeQueues, workerID, limit)
+		return s.dequeueBatchSQLite(ctx, activeQueues, workerID, limit, perQueueBudgets)
 	}
-	return s.dequeueBatchLocked(ctx, activeQueues, workerID, limit)
+	return s.dequeueBatchLocked(ctx, activeQueues, workerID, limit, perQueueBudgets)
 }
 
 func activeQueuesExcludingPaused(queues, pausedQueues []string) []string {
@@ -56,20 +84,27 @@ func activeQueuesExcludingPaused(queues, pausedQueues []string) []string {
 	return activeQueues
 }
 
-func (s *GormStorage) dequeueBatchLocked(ctx context.Context, queues []string, workerID string, limit int) ([]*core.Job, error) {
+func (s *GormStorage) dequeueBatchLocked(ctx context.Context, queues []string, workerID string, limit int, perQueueBudgets map[string]int) ([]*core.Job, error) {
 	nowExpr := s.nowExpr()
 	lockUntilExpr := s.offsetExpr(s.lockDuration)
 	silentDB := s.db.Session(&gorm.Session{Logger: s.db.Logger.LogMode(logger.Silent)})
 
 	claimedIDs := make([]string, 0, limit)
+	claimedPerQueue := make(map[string]int, len(perQueueBudgets))
 	emptyRetries := 0
 	for len(claimedIDs) < limit {
 		var batchIDs []string
+		batchQueueCounts := make(map[string]int, len(perQueueBudgets))
 		err := s.withSerializationRetry(ctx, func() error {
 			batchIDs = nil
+			batchQueueCounts = make(map[string]int, len(perQueueBudgets))
 			return silentDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 				remaining := limit - len(claimedIDs)
 				batchIDs = make([]string, 0, remaining)
+				txClaimedPerQueue := make(map[string]int, len(claimedPerQueue)+len(perQueueBudgets))
+				for queueName, count := range claimedPerQueue {
+					txClaimedPerQueue[queueName] = count
+				}
 				claimedInTx := make(map[string]struct{}, remaining)
 				for _, id := range claimedIDs {
 					claimedInTx[id] = struct{}{}
@@ -106,6 +141,7 @@ func (s *GormStorage) dequeueBatchLocked(ctx context.Context, queues []string, w
 					}
 
 					claimIDs := make([]string, 0, len(candidates))
+					claimQueues := make(map[string]int, len(candidates))
 					for _, job := range candidates {
 						var queueState core.QueueState
 						if err := tx.First(&queueState, "queue = ?", job.Queue).Error; err == nil && queueState.Paused {
@@ -114,7 +150,13 @@ func (s *GormStorage) dequeueBatchLocked(ctx context.Context, queues []string, w
 						} else if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
 							return err
 						}
+						if budget, ok := perQueueBudgets[job.Queue]; ok && txClaimedPerQueue[job.Queue] >= budget {
+							skippedIDs = append(skippedIDs, job.ID)
+							continue
+						}
 						claimIDs = append(claimIDs, job.ID)
+						claimQueues[job.Queue]++
+						txClaimedPerQueue[job.Queue]++
 					}
 					if len(claimIDs) == 0 {
 						continue
@@ -135,6 +177,9 @@ func (s *GormStorage) dequeueBatchLocked(ctx context.Context, queues []string, w
 						batchIDs = append(batchIDs, id)
 						claimedInTx[id] = struct{}{}
 					}
+					for queueName, count := range claimQueues {
+						batchQueueCounts[queueName] += count
+					}
 				}
 				return nil
 			})
@@ -145,8 +190,14 @@ func (s *GormStorage) dequeueBatchLocked(ctx context.Context, queues []string, w
 
 		if len(batchIDs) > 0 {
 			claimedIDs = append(claimedIDs, batchIDs...)
+			for queueName, count := range batchQueueCounts {
+				claimedPerQueue[queueName] += count
+			}
 			emptyRetries = 0
 			continue
+		}
+		if len(perQueueBudgets) > 0 {
+			break
 		}
 
 		hasMore, err := s.hasClaimableBatchJob(ctx, queues)
@@ -208,7 +259,7 @@ func sleepDequeueBatchRetry(ctx context.Context, d time.Duration) error {
 	}
 }
 
-func (s *GormStorage) dequeueBatchSQLite(ctx context.Context, queues []string, workerID string, limit int) ([]*core.Job, error) {
+func (s *GormStorage) dequeueBatchSQLite(ctx context.Context, queues []string, workerID string, limit int, perQueueBudgets map[string]int) ([]*core.Job, error) {
 	now := time.Now()
 	lockUntil := now.Add(s.lockDuration)
 
@@ -216,6 +267,7 @@ func (s *GormStorage) dequeueBatchSQLite(ctx context.Context, queues []string, w
 	err := s.withSerializationRetry(ctx, func() error {
 		jobs = nil
 		claimedIDs := make(map[string]struct{}, limit)
+		claimedPerQueue := make(map[string]int, len(perQueueBudgets))
 		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 			for len(jobs) < limit {
 				var job core.Job
@@ -246,6 +298,10 @@ func (s *GormStorage) dequeueBatchSQLite(ctx context.Context, queues []string, w
 				} else if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
 					return err
 				}
+				if budget, ok := perQueueBudgets[job.Queue]; ok && claimedPerQueue[job.Queue] >= budget {
+					claimedIDs[job.ID] = struct{}{}
+					continue
+				}
 
 				updateResult := tx.Model(&core.Job{}).
 					Where("id = ?", job.ID).
@@ -272,6 +328,7 @@ func (s *GormStorage) dequeueBatchSQLite(ctx context.Context, queues []string, w
 				job.Attempt++
 				jobs = append(jobs, &job)
 				claimedIDs[job.ID] = struct{}{}
+				claimedPerQueue[job.Queue]++
 			}
 			return nil
 		})
