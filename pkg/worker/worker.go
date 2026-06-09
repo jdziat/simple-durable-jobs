@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"runtime/debug"
 	"sort"
 	"sync"
@@ -20,6 +21,7 @@ import (
 	"github.com/jdziat/simple-durable-jobs/pkg/schedule"
 	"github.com/jdziat/simple-durable-jobs/pkg/security"
 	"github.com/jdziat/simple-durable-jobs/pkg/signal"
+	"github.com/jdziat/simple-durable-jobs/pkg/storage"
 )
 
 // Worker processes jobs from the queue.
@@ -30,6 +32,7 @@ type Worker struct {
 	wg     sync.WaitGroup
 
 	// Pause state
+	started   atomic.Bool
 	paused    atomic.Bool
 	pauseMode atomic.Value // stores core.PauseMode
 
@@ -172,6 +175,7 @@ const (
 	// otherwise the side effect re-runs on replay. Mirrors the 5s detached
 	// budget used by releaseDequeuedJobOnShutdown (worker.go:447).
 	checkpointWriteTimeout = 5 * time.Second
+	healthCheckTimeout     = 5 * time.Second
 	maxDrainIterations     = 1000
 )
 
@@ -316,6 +320,9 @@ func NewWorker(q *queue.Queue, opts ...WorkerOption) *Worker {
 // DequeueBatchSize to 1 with a slow PollInterval approximates the legacy
 // once-per-tick dispatch behavior.
 func (w *Worker) Start(ctx context.Context) error {
+	w.started.Store(true)
+	defer w.started.Store(false)
+
 	totalConcurrency := 0
 	for _, c := range w.config.Queues {
 		totalConcurrency += c
@@ -2239,6 +2246,66 @@ func (w *Worker) Resume() {
 // IsPaused returns true if the worker is paused.
 func (w *Worker) IsPaused() bool {
 	return w.paused.Load()
+}
+
+// WorkerHealth is a point-in-time snapshot of local worker state.
+type WorkerHealth struct {
+	// RunningCount is the number of jobs currently executing on this worker.
+	RunningCount int
+
+	// Paused reports whether this worker is operator-paused.
+	Paused bool
+
+	// Started reports whether Start is currently running.
+	Started bool
+}
+
+// Health returns a point-in-time snapshot of local worker state.
+func (w *Worker) Health() WorkerHealth {
+	return WorkerHealth{
+		RunningCount: w.RunningJobCount(),
+		Paused:       w.IsPaused(),
+		Started:      w.started.Load(),
+	}
+}
+
+// HealthHandler returns a standalone probe handler for headless workers.
+//
+// The returned handler registers /healthz and /readyz. /healthz is a liveness
+// probe: it always returns 200 OK and performs zero database work. /readyz is a
+// readiness probe: it returns 200 OK when the storage backend either does not
+// expose storage.Healther or its Ping method succeeds, and returns 503 Service
+// Unavailable when Ping fails.
+//
+// Operator pause is a reversible control-plane state, not a readiness failure:
+// pausing the worker does not make /readyz return 503.
+func (w *Worker) HealthHandler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", func(rw http.ResponseWriter, _ *http.Request) {
+		rw.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("/readyz", func(rw http.ResponseWriter, r *http.Request) {
+		healther, ok := w.queue.Storage().(storage.Healther)
+		if !ok {
+			// Readiness cannot verify backing storage without the optional Ping
+			// capability, so degrade to ready because there is no positive
+			// evidence the worker is unhealthy.
+			rw.WriteHeader(http.StatusOK)
+			return
+		}
+
+		// Operator pause is a reversible control-plane state, not a readiness
+		// failure. Do not consult IsPaused here or orchestration will restart
+		// deliberately quiesced workers.
+		ctx, cancel := context.WithTimeout(r.Context(), healthCheckTimeout)
+		defer cancel()
+		if err := healther.Ping(ctx); err != nil {
+			rw.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		rw.WriteHeader(http.StatusOK)
+	})
+	return mux
 }
 
 // PauseMode returns the current pause mode.
