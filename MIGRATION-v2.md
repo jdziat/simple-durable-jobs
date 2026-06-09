@@ -56,15 +56,21 @@ If you have a hand-written `core.Storage` implementation, rename the method
 ```go
 // before
 func (s *MyStore) SuspendJob(ctx context.Context, jobID, workerID string) error { ... }
-func (s *MyStore) SuspendJobWithDeadline(ctx context.Context, jobID, workerID string, deadline time.Time) error { ... }
+func (s *MyStore) SuspendJobWithDeadline(ctx context.Context, jobID, workerID string, d time.Duration) error { ... }
 // after
 func (s *MyStore) MarkWaiting(ctx context.Context, jobID, workerID string) error { ... }
-func (s *MyStore) MarkWaitingWithDeadline(ctx context.Context, jobID, workerID string, deadline time.Time) error { ... }
+func (s *MyStore) MarkWaitingWithDeadline(ctx context.Context, jobID, workerID string, d time.Duration) error { ... }
 ```
 
-A new `var _ core.Storage = (*storage.GormStorage)(nil)` assertion in the
-library will catch any interface drift at compile time; add the same assertion
-to your own implementation to get a clear compile error if you miss the rename.
+Add `var _ core.Storage = (*MyStore)(nil)` next to your implementation to catch
+drift in `core.Storage` methods at compile time, including a missed `MarkWaiting`
+rename. That assertion does **not** guard `MarkWaitingWithDeadline`: it is an
+optional signal/durable-timer capability discovered at runtime via type
+assertion against an unexported `signalStorage` interface in `pkg/signal`. A
+wrong or missing `MarkWaitingWithDeadline` signature produces no compile error;
+signal timeout waits and durable timers instead degrade to `core.ErrStorageNoSignals`
+at runtime. Double-check the `d time.Duration` signature by hand, or cover your
+signal/timeout-wait path with a test.
 
 ## Step 3 — `IsSuspendError` → `IsWaitingError`, `SuspendError` → `WaitingError`
 
