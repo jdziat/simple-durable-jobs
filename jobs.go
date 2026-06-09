@@ -45,6 +45,7 @@ import (
 	"github.com/jdziat/simple-durable-jobs/pkg/security"
 	"github.com/jdziat/simple-durable-jobs/pkg/signal"
 	"github.com/jdziat/simple-durable-jobs/pkg/storage"
+	"github.com/jdziat/simple-durable-jobs/pkg/typed"
 	"github.com/jdziat/simple-durable-jobs/pkg/worker"
 )
 
@@ -137,6 +138,9 @@ type (
 
 	// DeterminismMode controls Call replay strictness.
 	DeterminismMode = queue.DeterminismMode
+
+	// Def is a typed handle to a registered job definition.
+	Def[A any, R any] = typed.Def[A, R]
 
 	// ScheduledJob holds configuration for a recurring job.
 	ScheduledJob = queue.ScheduledJob
@@ -345,6 +349,60 @@ const safeSQLiteDSNQuery = "_journal_mode=WAL&_busy_timeout=5000&_txlock=immedia
 // New creates a new Queue with the given storage backend.
 func New(s Storage) *Queue {
 	return queue.New(s)
+}
+
+// Define registers a typed job handler and returns its typed definition.
+//
+// Define panics on invalid registration, matching Queue.Register. Use DefineE
+// when handler names or functions are configuration-driven and should return
+// errors instead.
+func Define[A any, R any](
+	q *Queue,
+	name string,
+	fn func(context.Context, A) (R, error),
+	opts ...Option,
+) *Def[A, R] {
+	return typed.Define(q, name, fn, opts...)
+}
+
+// DefineE registers a typed job handler and returns validation errors.
+//
+// The handler is registered through Queue.RegisterE, so routing remains
+// string-keyed and execution uses the same handler path as the untyped API.
+func DefineE[A any, R any](
+	q *Queue,
+	name string,
+	fn func(context.Context, A) (R, error),
+	opts ...Option,
+) (*Def[A, R], error) {
+	return typed.DefineE(q, name, fn, opts...)
+}
+
+// Declare returns a typed definition handle without registering a handler.
+//
+// Use Declare in producer-only processes that enqueue work for workers running
+// elsewhere. The returned handle remains string-routed by name and does not
+// create a type-keyed registry.
+//
+// Warning: A and R are unchecked on this producer-only EnqueueRemote path.
+// There is no registered handler for Declare to validate them against, so they
+// must be hand-synchronized with the remote worker's handler signature or the
+// worker will fail to decode the payload.
+func Declare[A any, R any](q *Queue, name string) *Def[A, R] {
+	return typed.Declare[A, R](q, name)
+}
+
+// DefineVoid registers an error-only typed job handler.
+//
+// DefineVoid adapts fn to a handler returning struct{} so a completed job has a
+// typed result value that can be used with Def.Call and Def.Load.
+func DefineVoid[A any](
+	q *Queue,
+	name string,
+	fn func(context.Context, A) error,
+	opts ...Option,
+) *Def[A, struct{}] {
+	return typed.DefineVoid(q, name, fn, opts...)
 }
 
 // SafeSQLiteDSN returns path with the recommended SQLite DSN parameters for
