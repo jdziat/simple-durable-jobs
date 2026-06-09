@@ -1,4 +1,3 @@
-// Package schedule provides scheduling implementations for the jobs package.
 package schedule
 
 import (

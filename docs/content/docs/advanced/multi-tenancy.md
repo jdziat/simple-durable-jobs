@@ -4,7 +4,7 @@ weight: 66
 toc: true
 ---
 
-Simple Durable Jobs does not provide schema-level multi-tenancy. The built-in tenant support is a persisted owner label: set it with `jobs.WithTenant(...)`, read it from `Job.Tenant`, and use `JobFilter.Tenant` in UI/search queries. All jobs still live in the same database tables.
+Simple Durable Jobs does not provide schema-level multi-tenancy. The built-in tenant support is a persisted owner label: set it with `jobs.WithTenant(...)`, read it from `Job.Tenant`, and filter programmatically with `SearchJobs` and `JobFilter.Tenant`. Tenant filtering is not yet surfaced in the embedded dashboard (planned for v2.3.0). All jobs still live in the same database tables.
 
 Use this when tenants share an application database and you need fair scheduling or noisy-neighbor controls. Do not use it as a substitute for regulatory, contractual, or security isolation.
 
@@ -43,7 +43,7 @@ queue.Register("tenant.import", func(ctx context.Context, args ImportArgs) error
 })
 ```
 
-`JobFilter.Tenant` is the storage/UI filter field for exact tenant matches. The embedded dashboard and UI API use this filter shape; `GormStorage.SearchJobs` applies it as `tenant = ?`. Code that calls UI-capable storage directly can use the `ui.JobFilter` alias.
+`JobFilter.Tenant` is the storage filter field for exact tenant matches. `GormStorage.SearchJobs` applies it as `tenant = ?`, and code that calls UI-capable storage directly can use the `ui.JobFilter` alias. This tenant filter is not yet surfaced in the embedded dashboard (planned for v2.3.0).
 
 ```go
 matches, total, err := store.SearchJobs(ctx, ui.JobFilter{
@@ -139,7 +139,7 @@ worker := queue.NewWorker(
 return worker.Start(ctx)
 ```
 
-With this setup, each job stores its tenant in `Job.Tenant`, UI/search filters can select tenant `acme` with `JobFilter.Tenant`, each tenant can have at most two imports running under the cap, and each tenant starts at roughly one admitted job per second under the fleet-wide rate limit. The cap and rate limit are partitioned by `tenantFromJob`, so tenant `acme` and tenant `globex` do not consume each other's slots.
+With this setup, each job stores its tenant in `Job.Tenant`, programmatic calls to `SearchJobs` can select tenant `acme` with `JobFilter.Tenant`, each tenant can have at most two imports running under the cap, and each tenant starts at roughly one admitted job per second under the fleet-wide rate limit. The tenant filter is not yet surfaced in the embedded dashboard (planned for v2.3.0). The cap and rate limit are partitioned by `tenantFromJob`, so tenant `acme` and tenant `globex` do not consume each other's slots.
 
 For a runnable version of the cap and rate-limit mechanics, see the [rate-limit example](https://github.com/jdziat/simple-durable-jobs/tree/main/examples/ratelimit).
 

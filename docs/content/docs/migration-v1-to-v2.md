@@ -1,6 +1,6 @@
 ---
 title: "Migrating from v1 to v2"
-weight: 9
+weight: 8
 ---
 
 v2.0.0 is a deliberately small, mechanical major release. It contains no new

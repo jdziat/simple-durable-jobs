@@ -69,6 +69,7 @@ for the full contract, backend support tiers, and crash-recovery tuning.
 - **Priority Queues** - Higher priority jobs run first
 - **Transactional Enqueue** - Enqueue inside your own DB transaction (outbox pattern) so business rows and jobs commit together
 - **Transactional Checkpoints** - Save phase checkpoints in the same DB transaction as the business effect they protect
+- **Job Metadata & Multi-tenancy** - Persist tenant labels and metadata tags for programmatic search, fairness controls, and operations
 - **Batch Enqueue & Dequeue** - Bulk insert plus buffered worker-side batch dequeue for throughput
 - **Concurrency Caps** - Fleet-wide and per-key concurrency limits, not just per-process
 - **Rate Limiting** - Per-queue token buckets and an optional fleet-wide limiter (throttle waits don't burn retry attempts)
@@ -82,6 +83,7 @@ for the full contract, backend support tiers, and crash-recovery tuning.
 - **Observability** - Hooks, event streams, OpenTelemetry tracing, and an embedded web dashboard
 - **Embedded Web UI** - Real-time monitoring dashboard with stats, event streaming, and job actions (incl. cancel)
 - **Dashboard Authorization** - Optional per-action authorization for mutating dashboard RPCs
+- **Operations CLI (`sdj`)** - Inspect, requeue, purge, and operate jobs from the [`sdj` binary](./docs/content/docs/production-ops.md)
 - **Stale Lock Reaper** - Automatically reclaims stuck running jobs after worker crashes
 - **Connection Pool Presets** - `NewGormStorage` installs a safe bounded default pool out of the box (unbounded is no longer the default), so presets are an optional optimization, not a requirement, for different workloads
 - **Testing Utilities** - The jobstest package: SQLite fixtures and enqueue assertions
@@ -333,10 +335,15 @@ queue.Enqueue(ctx, "task", args,
     jobs.At(scheduledAt),                 // Run at a specific time
     jobs.Timeout(30 * time.Minute),       // Recorded on the job; enforce via ctx
     jobs.QueueOpt("critical"),            // Assign to named queue
+    jobs.WithTenant("tenant-a"),          // Persist tenant owner label
+    jobs.WithMeta("region", "us"),        // Add queryable metadata
     jobs.Unique("order-123"),             // Deduplicate by key; ErrDuplicateJob if taken
     jobs.Determinism(jobs.Strict),        // Policy for Call() replay on restart
 )
 ```
+
+See the [multi-tenancy guide](./docs/content/docs/advanced/multi-tenancy.md)
+for tenant labels, metadata, and per-tenant fairness controls.
 
 ## Observability
 
@@ -476,8 +483,10 @@ The library is organized into a layered architecture with a clean facade:
 simple-durable-jobs/
 ├── jobs.go                    # Root facade - import this package
 ├── pause.go                   # Standalone pause/resume functions
+├── cmd/sdj/                   # Operations CLI
 ├── docs/                      # Documentation site (Hugo + Hextra theme, own go.mod)
 ├── pkg/
+│   ├── codec/                 # pkg/codec: payload codecs, including secretbox encryption-at-rest
 │   ├── core/                  # Domain models (Job, FanOut, Storage, Event, errors)
 │   ├── storage/               # GormStorage implementation
 │   ├── queue/                 # Queue orchestration, event system, pause operations
@@ -485,6 +494,9 @@ simple-durable-jobs/
 │   ├── schedule/              # Schedule implementations (Every, Daily, Cron)
 │   ├── call/                  # Durable Call[T] function
 │   ├── fanout/                # Fan-out/fan-in patterns (Sub, FanOut, helpers)
+│   ├── signal/                # pkg/signal: durable workflow signals and timers
+│   ├── typed/                 # pkg/typed: typed definitions and workflow primitives
+│   ├── metrics/               # pkg/metrics: Prometheus/OpenTelemetry metrics
 │   ├── otel/                  # Optional OpenTelemetry tracing integration
 │   ├── jobctx/                # Job context helpers (JobFromContext, phase checkpoints)
 │   ├── security/              # Validation and sanitization
@@ -510,6 +522,7 @@ All public types and functions are re-exported through the facade for a clean AP
 ## Examples
 
 - [Basic Usage](./examples/basic/) - Simple job processing
+- [Typed API](./examples/typed/) - Typed definitions, enqueue, calls, and result loading
 - [Workflows](./examples/workflow/) - Multi-step durable workflows
 - [Scheduled Jobs](./examples/scheduled/) - Recurring job scheduling
 - [Distributed](./examples/distributed/) - Multiple workers

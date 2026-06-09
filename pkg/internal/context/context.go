@@ -1,4 +1,3 @@
-// Package context provides context helpers for the jobs package.
 package context
 
 import (

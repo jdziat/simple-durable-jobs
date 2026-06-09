@@ -1,4 +1,3 @@
-// Package queue provides the Queue orchestrator for the jobs package.
 package queue
 
 import (
@@ -24,6 +23,8 @@ type Options struct {
 	determinismSet bool
 	prioritySet    bool
 	// Timezone is reserved for future use and is currently ignored; schedules evaluate in UTC.
+	//
+	// Deprecated: never read; schedules evaluate in UTC. Will be removed in v3.
 	Timezone *time.Location
 	Timeout  time.Duration // max wall time for handler execution; 0 means no limit
 	Backoff  core.BackoffPolicy

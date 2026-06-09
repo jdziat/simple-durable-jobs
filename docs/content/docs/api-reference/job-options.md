@@ -26,7 +26,9 @@ Assigns the job to a specific queue.
 ### `WithTenant(tenant string) Option`
 
 Sets the tenant that owns the job. The value is persisted on `Job.Tenant` and
-can be used by dashboard/API filters through `JobFilter.Tenant`.
+can be filtered programmatically with `SearchJobs` and `JobFilter.Tenant`. This
+tenant filter is not yet surfaced in the embedded dashboard (planned for
+v2.3.0).
 
 ```go
 jobID, err := queue.Enqueue(ctx, "sync-account", args,

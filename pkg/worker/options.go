@@ -1,4 +1,3 @@
-// Package worker provides the Worker job processor for the jobs package.
 package worker
 
 import (

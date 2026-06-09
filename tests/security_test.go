@@ -27,7 +27,7 @@ func TestSecurity_ValidateJobTypeName_Valid(t *testing.T) {
 	}
 
 	for _, name := range validNames {
-		err := jobs.ValidateJobTypeName(name)
+		err := jobs.ValidateJobTypeName(name) //nolint:staticcheck // deprecated facade helper remains covered for v2 compatibility
 		assert.NoError(t, err, "Expected %q to be valid", name)
 	}
 }
@@ -44,7 +44,7 @@ func TestSecurity_ValidateJobTypeName_Invalid(t *testing.T) {
 	}
 
 	for _, name := range invalidNames {
-		err := jobs.ValidateJobTypeName(name)
+		err := jobs.ValidateJobTypeName(name) //nolint:staticcheck // deprecated facade helper remains covered for v2 compatibility
 		assert.Error(t, err, "Expected %q to be invalid", name)
 	}
 }
@@ -79,7 +79,7 @@ func TestSecurity_SanitizeErrorMessage(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := jobs.SanitizeErrorMessage(tt.input)
+			result := jobs.SanitizeErrorMessage(tt.input) //nolint:staticcheck // deprecated facade helper remains covered for v2 compatibility
 			assert.Equal(t, tt.expected, result)
 		})
 	}
@@ -87,7 +87,7 @@ func TestSecurity_SanitizeErrorMessage(t *testing.T) {
 
 func TestSecurity_SanitizeErrorMessage_Truncation(t *testing.T) {
 	longMessage := strings.Repeat("a", 5000)
-	result := jobs.SanitizeErrorMessage(longMessage)
+	result := jobs.SanitizeErrorMessage(longMessage) //nolint:staticcheck // deprecated facade helper remains covered for v2 compatibility
 
 	assert.LessOrEqual(t, len(result), jobs.MaxErrorMessageLength)
 	assert.True(t, strings.HasSuffix(result, "..."))
@@ -108,7 +108,7 @@ func TestSecurity_ClampRetries(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		result := jobs.ClampRetries(tt.input)
+		result := jobs.ClampRetries(tt.input) //nolint:staticcheck // deprecated facade helper remains covered for v2 compatibility
 		assert.Equal(t, tt.expected, result, "ClampRetries(%d)", tt.input)
 	}
 }
@@ -129,7 +129,7 @@ func TestSecurity_ClampConcurrency(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		result := jobs.ClampConcurrency(tt.input)
+		result := jobs.ClampConcurrency(tt.input) //nolint:staticcheck // deprecated facade helper remains covered for v2 compatibility
 		assert.Equal(t, tt.expected, result, "ClampConcurrency(%d)", tt.input)
 	}
 }

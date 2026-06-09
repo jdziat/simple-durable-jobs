@@ -1,4 +1,3 @@
-// Package security provides validation, sanitization, and limits for the jobs package.
 package security
 
 import (
