@@ -170,6 +170,11 @@ var schemaMigrations = []schemaMigration{
 		Name:    "stale_lock_reaper_index",
 		Up:      migrateStaleLockReaperIndex,
 	},
+	{
+		Version: 9,
+		Name:    "dequeue_order_index",
+		Up:      migrateDequeueOrderIndex,
+	},
 }
 
 // applyPendingMigrations runs every migration whose version is absent from the
@@ -434,6 +439,35 @@ func migrateStaleLockReaperIndex(ctx context.Context, db *gorm.DB, dialect strin
 	default:
 		return db.Exec(
 			"CREATE INDEX IF NOT EXISTS idx_jobs_stale_lock ON jobs (COALESCE(last_heartbeat_at, started_at, locked_until)) WHERE status = 'running'",
+		).Error
+	}
+}
+
+// migrateDequeueOrderIndex adds an order-first dequeue index for the
+// multi-queue query shape:
+//
+//	status='pending' AND queue IN (...) ORDER BY priority DESC, created_at ASC
+//
+// The v1 idx_jobs_dequeue remains in place for queue-filtered scans, but live
+// EXPLAIN showed multi-queue dequeue fell back to a full scan + filesort on
+// MySQL and a status/queue scan + Sort on Postgres. This index lets the planner
+// walk pending jobs directly in global priority order and filter the queue from
+// the index, avoiding the sort for the LIMIT/SKIP LOCKED hot path.
+func migrateDequeueOrderIndex(ctx context.Context, db *gorm.DB, dialect string) error {
+	switch dialect {
+	case dialectMySQL:
+		m := db.Migrator()
+		if !m.HasIndex(&core.Job{}, "idx_jobs_dequeue_order") {
+			if err := db.WithContext(ctx).Exec(
+				"CREATE INDEX idx_jobs_dequeue_order ON jobs (status, priority DESC, created_at ASC, queue)",
+			).Error; err != nil && !isBenignDDLError(err) {
+				return fmt.Errorf("create idx_jobs_dequeue_order: %w", err)
+			}
+		}
+		return nil
+	default:
+		return db.WithContext(ctx).Exec(
+			"CREATE INDEX IF NOT EXISTS idx_jobs_dequeue_order ON jobs (priority DESC, created_at ASC, queue) WHERE status = 'pending'",
 		).Error
 	}
 }

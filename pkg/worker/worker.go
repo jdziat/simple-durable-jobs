@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"runtime/debug"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -19,6 +21,7 @@ import (
 	"github.com/jdziat/simple-durable-jobs/pkg/schedule"
 	"github.com/jdziat/simple-durable-jobs/pkg/security"
 	"github.com/jdziat/simple-durable-jobs/pkg/signal"
+	"github.com/jdziat/simple-durable-jobs/pkg/storage"
 )
 
 // Worker processes jobs from the queue.
@@ -29,6 +32,7 @@ type Worker struct {
 	wg     sync.WaitGroup
 
 	// Pause state
+	started   atomic.Bool
 	paused    atomic.Bool
 	pauseMode atomic.Value // stores core.PauseMode
 
@@ -104,6 +108,10 @@ type batchDequeuer interface {
 	DequeueBatch(ctx context.Context, queues []string, workerID string, limit int) ([]*core.Job, error)
 }
 
+type perQueueDequeuer interface {
+	DequeueBatchPerQueue(ctx context.Context, workerID string, budgets map[string]int) ([]*core.Job, error)
+}
+
 type concurrencySlotStorage interface {
 	TryAcquireConcurrencySlot(ctx context.Context, slotName, jobID, workerID string, limit int, ttl time.Duration) (bool, error)
 	ReleaseConcurrencySlot(ctx context.Context, slotName, jobID string) error
@@ -167,6 +175,8 @@ const (
 	// otherwise the side effect re-runs on replay. Mirrors the 5s detached
 	// budget used by releaseDequeuedJobOnShutdown (worker.go:447).
 	checkpointWriteTimeout = 5 * time.Second
+	healthCheckTimeout     = 5 * time.Second
+	maxDrainIterations     = 1000
 )
 
 var signalResumePollBatchSize = 100
@@ -306,7 +316,13 @@ func NewWorker(q *queue.Queue, opts ...WorkerOption) *Worker {
 // Start begins processing jobs. Blocks until context is cancelled.
 // Per-queue concurrency is enforced: each queue only dequeues up to its
 // configured concurrency limit.
+// The dispatcher drains available work within each poll interval; setting
+// DequeueBatchSize to 1 with a slow PollInterval approximates the legacy
+// once-per-tick dispatch behavior.
 func (w *Worker) Start(ctx context.Context) error {
+	w.started.Store(true)
+	defer w.started.Store(false)
+
 	totalConcurrency := 0
 	for _, c := range w.config.Queues {
 		totalConcurrency += c
@@ -369,25 +385,56 @@ func (w *Worker) Start(ctx context.Context) error {
 			}
 			return ctx.Err()
 		case <-ticker.C:
-			// Skip dequeue if paused
-			if w.IsPaused() {
-				continue
-			}
+			w.drainDequeuedJobs(ctx, jobsChan, totalConcurrency)
+		}
+	}
+}
 
-			// Build list of queues that have available capacity
-			availableQueues := w.queuesWithCapacity()
-			if len(availableQueues) == 0 {
-				continue
-			}
+func (w *Worker) drainDequeuedJobs(ctx context.Context, jobsChan chan<- *core.Job, totalConcurrency int) {
+	deadline := time.Now().Add(w.config.PollInterval)
+	initialQueues := w.queuesWithCapacity()
+	releaseBudget := w.dequeueSlots(initialQueues, totalConcurrency)
+	if releaseBudget <= 0 {
+		return
+	}
 
-			jobs, err := w.dequeueAvailableJobs(ctx, availableQueues, totalConcurrency)
-			if err != nil {
-				if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-					w.logger.Error("failed to dequeue after retries", "error", err)
-				}
-				continue
+	releasedThisTick := 0
+	for iteration := 0; iteration < maxDrainIterations; iteration++ {
+		if ctx.Err() != nil {
+			return
+		}
+		if w.IsPaused() {
+			return
+		}
+
+		availableQueues := w.queuesWithCapacity()
+		if len(availableQueues) == 0 {
+			return
+		}
+
+		slots := w.dequeueSlots(availableQueues, totalConcurrency)
+		if slots <= 0 {
+			return
+		}
+
+		jobs, err := w.dequeueAvailableJobs(ctx, availableQueues, totalConcurrency)
+		if err != nil {
+			if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+				w.logger.Error("failed to dequeue after retries", "error", err)
 			}
-			w.dispatchDequeuedJobs(ctx, jobsChan, jobs)
+			return
+		}
+
+		dispatched, released := w.dispatchDequeuedJobs(ctx, jobsChan, jobs)
+		releasedThisTick += released
+		if dispatched == 0 {
+			return
+		}
+		if releasedThisTick >= releaseBudget {
+			return
+		}
+		if !time.Now().Before(deadline) {
+			return
 		}
 	}
 }
@@ -398,6 +445,9 @@ func (w *Worker) dequeueAvailableJobs(ctx context.Context, availableQueues []str
 		return nil, nil
 	}
 	if slots > 1 {
+		if pqd, ok := w.queue.Storage().(perQueueDequeuer); ok {
+			return w.dequeueBatchPerQueueWithRetry(ctx, pqd, w.dequeueQueueBudgets(availableQueues, slots), slots)
+		}
 		if bd, ok := w.queue.Storage().(batchDequeuer); ok {
 			return w.dequeueBatchWithRetry(ctx, bd, availableQueues, slots)
 		}
@@ -448,42 +498,107 @@ func (w *Worker) totalCapacityAcrossQueues(queues []string) int {
 	return total
 }
 
-func (w *Worker) dispatchDequeuedJobs(ctx context.Context, jobsChan chan<- *core.Job, jobs []*core.Job) {
+func (w *Worker) dequeueQueueBudgets(queues []string, limit int) map[string]int {
+	budgets := make(map[string]int, len(queues))
+	if limit <= 0 {
+		return budgets
+	}
+
+	type queueCapacity struct {
+		name      string
+		remaining int
+	}
+	capacities := make([]queueCapacity, 0, len(queues))
+	for _, name := range queues {
+		maxConcurrency, ok := w.config.Queues[name]
+		if !ok {
+			continue
+		}
+		used := 0
+		if counter, ok := w.queueRunning[name]; ok {
+			used = int(counter.Load())
+		}
+		if remaining := maxConcurrency - used; remaining > 0 {
+			capacities = append(capacities, queueCapacity{name: name, remaining: remaining})
+		}
+	}
+	sort.Slice(capacities, func(i, j int) bool {
+		return capacities[i].name < capacities[j].name
+	})
+
+	remainingLimit := limit
+	if remainingLimit >= len(capacities) {
+		for i := range capacities {
+			budgets[capacities[i].name] = 1
+			capacities[i].remaining--
+			remainingLimit--
+		}
+	}
+	for remainingLimit > 0 {
+		progressed := false
+		for i := range capacities {
+			if remainingLimit <= 0 {
+				break
+			}
+			if capacities[i].remaining <= 0 {
+				continue
+			}
+			budgets[capacities[i].name]++
+			capacities[i].remaining--
+			remainingLimit--
+			progressed = true
+		}
+		if !progressed {
+			break
+		}
+	}
+	return budgets
+}
+
+func (w *Worker) dispatchDequeuedJobs(ctx context.Context, jobsChan chan<- *core.Job, jobs []*core.Job) (dispatched int, released int) {
 	for _, job := range jobs {
 		if job == nil {
 			continue
 		}
 		if !w.tryTrackQueueJob(job.ID, job.Queue) {
 			w.releaseDequeuedJobOnShutdown(ctx, job)
+			released++
 			continue
 		}
 		if !w.tryConsumeQueueRateLimit(job.Queue) {
 			w.releaseDequeuedJobOnShutdown(ctx, job)
+			released++
 			continue
 		}
 		if ok := w.tryConsumeRateLimits(ctx, job); !ok {
 			w.refundQueueRateLimit(job.Queue)
 			w.releaseDequeuedJobOnShutdown(ctx, job)
+			released++
 			continue
 		}
 		if ok := w.tryAcquireConcurrencySlots(ctx, job); !ok {
 			w.refundQueueRateLimit(job.Queue)
 			w.releaseDequeuedJobOnShutdown(ctx, job)
+			released++
 			continue
 		}
 		if ctx.Err() != nil {
 			w.refundQueueRateLimit(job.Queue)
 			w.releaseDequeuedJobOnShutdown(ctx, job)
+			released++
 			continue
 		}
 
 		select {
 		case jobsChan <- job:
+			dispatched++
 		case <-ctx.Done():
 			w.refundQueueRateLimit(job.Queue)
 			w.releaseDequeuedJobOnShutdown(ctx, job)
+			released++
 		}
 	}
+	return dispatched, released
 }
 
 func (w *Worker) releaseDequeuedJobOnShutdown(ctx context.Context, job *core.Job) {
@@ -861,6 +976,30 @@ func (w *Worker) dequeueBatchWithRetry(ctx context.Context, storage batchDequeue
 	err := retryWithBackoff(ctx, *w.config.DequeueRetry, func() error {
 		var dequeueErr error
 		jobs, dequeueErr = storage.DequeueBatch(ctx, queues, w.config.WorkerID, limit)
+		return dequeueErr
+	})
+	return jobs, err
+}
+
+func (w *Worker) dequeueBatchPerQueueWithRetry(ctx context.Context, storage perQueueDequeuer, budgets map[string]int, limit int) ([]*core.Job, error) {
+	if limit <= 0 || len(budgets) == 0 {
+		return []*core.Job{}, nil
+	}
+	cappedBudgets := make(map[string]int, len(budgets))
+	for queueName, budget := range budgets {
+		if budget <= 0 {
+			continue
+		}
+		cappedBudgets[queueName] = budget
+	}
+	if len(cappedBudgets) == 0 {
+		return []*core.Job{}, nil
+	}
+
+	var jobs []*core.Job
+	err := retryWithBackoff(ctx, *w.config.DequeueRetry, func() error {
+		var dequeueErr error
+		jobs, dequeueErr = storage.DequeueBatchPerQueue(ctx, w.config.WorkerID, cappedBudgets)
 		return dequeueErr
 	})
 	return jobs, err
@@ -2107,6 +2246,66 @@ func (w *Worker) Resume() {
 // IsPaused returns true if the worker is paused.
 func (w *Worker) IsPaused() bool {
 	return w.paused.Load()
+}
+
+// WorkerHealth is a point-in-time snapshot of local worker state.
+type WorkerHealth struct {
+	// RunningCount is the number of jobs currently executing on this worker.
+	RunningCount int
+
+	// Paused reports whether this worker is operator-paused.
+	Paused bool
+
+	// Started reports whether Start is currently running.
+	Started bool
+}
+
+// Health returns a point-in-time snapshot of local worker state.
+func (w *Worker) Health() WorkerHealth {
+	return WorkerHealth{
+		RunningCount: w.RunningJobCount(),
+		Paused:       w.IsPaused(),
+		Started:      w.started.Load(),
+	}
+}
+
+// HealthHandler returns a standalone probe handler for headless workers.
+//
+// The returned handler registers /healthz and /readyz. /healthz is a liveness
+// probe: it always returns 200 OK and performs zero database work. /readyz is a
+// readiness probe: it returns 200 OK when the storage backend either does not
+// expose storage.Healther or its Ping method succeeds, and returns 503 Service
+// Unavailable when Ping fails.
+//
+// Operator pause is a reversible control-plane state, not a readiness failure:
+// pausing the worker does not make /readyz return 503.
+func (w *Worker) HealthHandler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", func(rw http.ResponseWriter, _ *http.Request) {
+		rw.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("/readyz", func(rw http.ResponseWriter, r *http.Request) {
+		healther, ok := w.queue.Storage().(storage.Healther)
+		if !ok {
+			// Readiness cannot verify backing storage without the optional Ping
+			// capability, so degrade to ready because there is no positive
+			// evidence the worker is unhealthy.
+			rw.WriteHeader(http.StatusOK)
+			return
+		}
+
+		// Operator pause is a reversible control-plane state, not a readiness
+		// failure. Do not consult IsPaused here or orchestration will restart
+		// deliberately quiesced workers.
+		ctx, cancel := context.WithTimeout(r.Context(), healthCheckTimeout)
+		defer cancel()
+		if err := healther.Ping(ctx); err != nil {
+			rw.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		rw.WriteHeader(http.StatusOK)
+	})
+	return mux
 }
 
 // PauseMode returns the current pause mode.

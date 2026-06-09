@@ -45,6 +45,19 @@ Blocks until all running jobs complete (after a graceful pause) or the timeout e
 
 Returns the number of currently executing jobs.
 
+### `(*Worker) Health() WorkerHealth`
+
+Returns a local point-in-time health snapshot with `RunningCount`, `Paused`, and
+`Started`.
+
+### `(*Worker) HealthHandler() http.Handler`
+
+Returns a standalone probe handler for headless workers. It registers
+`/healthz` and `/readyz`: `/healthz` always returns `200 OK` without touching
+storage, while `/readyz` calls storage `Ping(ctx)` when the backend implements
+`storage.Healther` and returns `503 Service Unavailable` on ping failure.
+Operator pause does not make `/readyz` fail. See [Production Operations]({{< relref "/docs/production-ops" >}}).
+
 ### `(*Worker) CancelJob(jobID string) bool`
 
 Cancels a specific running job's context. Returns true if the job was found and cancelled, false if the job was not running on this worker.
@@ -76,6 +89,18 @@ Enables the scheduler for recurring jobs.
 
 Sets how often the worker polls for new jobs. The default is 100ms and the floor is 50ms (to prevent database overload). A positive value below 50ms is clamped up to 50ms (it is not discarded); a non-positive value is ignored and the previous/default interval is kept.
 
+### `WithDequeueBatchSize(n int) WorkerOption`
+
+Sets the per-poll cap for optional batch dequeue. The default is `10`; values
+are clamped to `[1, 1000]`. Set `WithDequeueBatchSize(1)` to force single-row
+claims.
+
+### `WithDrainTimeout(d time.Duration) WorkerOption`
+
+Sets how long `Start` waits for in-flight handlers to finish after its context
+is cancelled. Default is 30 seconds. A non-positive duration aborts
+immediately.
+
 ### `WithStorageRetry(config RetryConfig) WorkerOption`
 
 Configures retry behavior for storage operations. See [Storage Retry]({{< relref "/docs/advanced/storage-retry" >}}) for when and why.
@@ -94,7 +119,10 @@ Disables retry for both storage and dequeue operations.
 
 ### `WithStaleLockInterval(d time.Duration) WorkerOption`
 
-Sets how often the worker checks for stale running jobs. Default is 5 minutes. Set to 0 to disable. See [Stale Lock Reaper]({{< relref "/docs/advanced/stale-lock-reaper" >}}) for the full story.
+Sets how often the worker checks for stale running jobs. Default is 5 minutes.
+The stale-lock reaper cannot be disabled: non-positive values keep the default,
+and positive values below the 1s floor are clamped up. See [Stale Lock
+Reaper]({{< relref "/docs/advanced/stale-lock-reaper" >}}) for the full story.
 
 ### `WithStaleLockAge(d time.Duration) WorkerOption`
 

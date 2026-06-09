@@ -123,6 +123,90 @@ func TestInstrument_RecordsQueueDepthGauge(t *testing.T) {
 	})
 }
 
+func TestInstrument_RecordsBacklogOldestAgeGauge(t *testing.T) {
+	ctx := context.Background()
+	store := newSQLiteStore(t)
+	createdAt := time.Now().Add(-5 * time.Minute)
+
+	require.NoError(t, store.Enqueue(ctx, &core.Job{ID: "pending-alpha", Type: "email", Queue: "alpha", CreatedAt: createdAt}))
+	require.NoError(t, store.Enqueue(ctx, &core.Job{ID: "running-alpha", Type: "email", Queue: "alpha", Status: core.StatusRunning, CreatedAt: createdAt.Add(-time.Hour)}))
+
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	defer func() { _ = mp.Shutdown(ctx) }()
+
+	q := queue.New(store)
+	Instrument(q, WithMeterProvider(mp))
+
+	rm := collectMetrics(t, reader)
+	assertFloatGaugePoint(t, rm, metricBacklogOldestAge, func(value float64) bool {
+		return value > 0
+	}, map[string]string{
+		attrQueue: "alpha",
+	})
+}
+
+func TestInstrument_RecordsDeadLetterDepthGauge(t *testing.T) {
+	ctx := context.Background()
+	store := newSQLiteStore(t)
+
+	seedDeadLetteredJob(t, store, "alpha-1", "alpha")
+	seedDeadLetteredJob(t, store, "alpha-2", "alpha")
+	seedDeadLetteredJob(t, store, "beta-1", "beta")
+
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	defer func() { _ = mp.Shutdown(ctx) }()
+
+	q := queue.New(store)
+	Instrument(q, WithMeterProvider(mp))
+
+	rm := collectMetrics(t, reader)
+	assertGaugePoint(t, rm, metricDeadLetterDepth, 2, map[string]string{
+		attrQueue: "alpha",
+	})
+	assertGaugePoint(t, rm, metricDeadLetterDepth, 1, map[string]string{
+		attrQueue: "beta",
+	})
+}
+
+func TestInstrumentQueueSaturation_RecordsWorkerGauge(t *testing.T) {
+	ctx := context.Background()
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	defer func() { _ = mp.Shutdown(ctx) }()
+
+	InstrumentQueueSaturation("worker-1", map[string]int{
+		"alpha": 4,
+		"beta":  2,
+		"zero":  0,
+	}, func(context.Context) (map[string]int, error) {
+		return map[string]int{
+			"alpha": 3,
+			"beta":  1,
+			"zero":  10,
+		}, nil
+	}, WithMeterProvider(mp))
+
+	rm := collectMetrics(t, reader)
+	assertFloatGaugePoint(t, rm, metricQueueSaturation, func(value float64) bool {
+		return value == 0.75
+	}, map[string]string{
+		attrWorkerID: "worker-1",
+		attrQueue:    "alpha",
+	})
+	assertFloatGaugePoint(t, rm, metricQueueSaturation, func(value float64) bool {
+		return value == 0.5
+	}, map[string]string{
+		attrWorkerID: "worker-1",
+		attrQueue:    "beta",
+	})
+	assertMissingFloatGaugePoint(t, rm, metricQueueSaturation, map[string]string{
+		attrWorkerID: "worker-1",
+		attrQueue:    "zero",
+	})
+}
+
 func TestInstrument_SkipsQueueDepthGaugeWithoutCapability(t *testing.T) {
 	ctx := context.Background()
 	reader := sdkmetric.NewManualReader()
@@ -206,6 +290,34 @@ func assertGaugePoint(t *testing.T, rm metricdata.ResourceMetrics, name string, 
 	t.Fatalf("metric %s missing data point with attributes %v", name, attrs)
 }
 
+func assertFloatGaugePoint(t *testing.T, rm metricdata.ResourceMetrics, name string, match func(float64) bool, attrs map[string]string) {
+	t.Helper()
+	m := findMetric(rm, name)
+	require.NotNil(t, m, "metric %s not found", name)
+	gauge, ok := m.Data.(metricdata.Gauge[float64])
+	require.True(t, ok, "metric %s has type %T", name, m.Data)
+	for _, point := range gauge.DataPoints {
+		if attributesMatch(point.Attributes, attrs) {
+			assert.True(t, match(point.Value), "metric %s value %v did not match expectation", name, point.Value)
+			return
+		}
+	}
+	t.Fatalf("metric %s missing data point with attributes %v", name, attrs)
+}
+
+func assertMissingFloatGaugePoint(t *testing.T, rm metricdata.ResourceMetrics, name string, attrs map[string]string) {
+	t.Helper()
+	m := findMetric(rm, name)
+	require.NotNil(t, m, "metric %s not found", name)
+	gauge, ok := m.Data.(metricdata.Gauge[float64])
+	require.True(t, ok, "metric %s has type %T", name, m.Data)
+	for _, point := range gauge.DataPoints {
+		if attributesMatch(point.Attributes, attrs) {
+			t.Fatalf("metric %s had unexpected data point with attributes %v", name, attrs)
+		}
+	}
+}
+
 func assertHistogramPoint(t *testing.T, rm metricdata.ResourceMetrics, name string, attrs map[string]string) {
 	t.Helper()
 	m := findMetric(rm, name)
@@ -234,4 +346,14 @@ func attributesMatch(set attribute.Set, expected map[string]string) bool {
 
 type noDepthStorage struct {
 	core.Storage
+}
+
+func seedDeadLetteredJob(t *testing.T, store *storage.GormStorage, id, queueName string) {
+	t.Helper()
+	ctx := context.Background()
+	require.NoError(t, store.Enqueue(ctx, &core.Job{ID: id, Type: "work", Queue: queueName, MaxRetries: 1}))
+	job, err := store.Dequeue(ctx, []string{queueName}, "worker-1")
+	require.NoError(t, err)
+	require.NotNil(t, job)
+	require.NoError(t, store.Fail(ctx, job.ID, "worker-1", "boom", nil))
 }

@@ -16,6 +16,7 @@ Welcome to the **Simple Durable Jobs** documentation — a Go library for durabl
   {{< card link="getting-started/" title="Getting Started" icon="play" subtitle="Install the library, wire up storage, register handlers, enqueue jobs, and run a worker." >}}
   {{< card link="examples/" title="Examples" icon="code" subtitle="Copy-paste-runnable examples: workflows, fan-out/fan-in, scheduling, priorities, error handling, and more." >}}
   {{< card link="embedded-ui/" title="Embedded Web UI" icon="chart-bar" subtitle="Mount the real-time monitoring dashboard into your own HTTP server." >}}
+  {{< card link="production-ops/" title="Production Operations" icon="shield-check" subtitle="Run workers in production: migrations, graceful drain, probes, CLI, throughput tuning, metrics, DLQ, and retention." >}}
   {{< card link="live-demo/" title="Live Demo" icon="play" subtitle="Try the dashboard in your browser on simulated data — no backend required." >}}
   {{< card link="benchmarks/" title="Benchmarks" icon="chart-bar" subtitle="Measured enqueue, end-to-end, workflow, and dispatch-latency results with reproduction commands." >}}
   {{< card link="comparison/" title="Choosing a Job System" icon="scale" subtitle="Honest comparison with River, Temporal, and Asynq, including where each is stronger." >}}
