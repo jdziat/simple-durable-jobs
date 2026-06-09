@@ -93,8 +93,8 @@ func (a app) run(ctx context.Context, args []string) int {
 	}
 	if code != exitOK || len(rest) == 0 {
 		if len(rest) == 0 && code == exitOK {
-			fmt.Fprint(a.stderr, usageText)
-			fmt.Fprintln(a.stderr, "\nmissing subcommand; run `sdj help` for usage")
+			_, _ = fmt.Fprint(a.stderr, usageText)
+			_, _ = fmt.Fprintln(a.stderr, "\nmissing subcommand; run `sdj help` for usage")
 			return exitError
 		}
 		return code
@@ -113,10 +113,10 @@ func (a app) run(ctx context.Context, args []string) int {
 		if len(rest) != 1 {
 			return a.fail("version accepts no arguments")
 		}
-		fmt.Fprintf(a.stdout, "sdj %s\n", version)
+		_, _ = fmt.Fprintf(a.stdout, "sdj %s\n", version)
 		return exitOK
 	case "help", "-h", "--help":
-		fmt.Fprint(a.stdout, usageText)
+		_, _ = fmt.Fprint(a.stdout, usageText)
 		return exitOK
 	default:
 		return a.fail("unknown command %q; valid commands: migrate, queues, dlq, health, version, help", rest[0])
@@ -130,7 +130,7 @@ func (a app) parseGlobals(args []string) (globalOptions, []string, int) {
 	fs.StringVar(&opts.driver, "driver", "sqlite", "Database driver: sqlite, postgres, mysql")
 	fs.StringVar(&opts.dsn, "dsn", "", "Database connection string")
 	showVersion := fs.Bool("version", false, "Print sdj version")
-	fs.Usage = func() { fmt.Fprint(fs.Output(), usageText) }
+	fs.Usage = func() { _, _ = fmt.Fprint(fs.Output(), usageText) }
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return opts, nil, exitHandled
@@ -138,7 +138,7 @@ func (a app) parseGlobals(args []string) (globalOptions, []string, int) {
 		return opts, nil, exitError
 	}
 	if *showVersion {
-		fmt.Fprintf(a.stdout, "sdj %s\n", version)
+		_, _ = fmt.Fprintf(a.stdout, "sdj %s\n", version)
 		return opts, nil, exitHandled
 	}
 	return opts, fs.Args(), exitOK
@@ -169,7 +169,7 @@ Usage:
 	if err := opened.store.Migrate(ctx); err != nil {
 		return a.fail("migrate failed; verify the DSN, database permissions, and schema migration access: %s", userError(err))
 	}
-	fmt.Fprintln(a.stdout, "migrations applied successfully")
+	_, _ = fmt.Fprintln(a.stdout, "migrations applied successfully")
 	return exitOK
 }
 
@@ -211,12 +211,12 @@ Usage:
 
 	queues := collectQueueNames(pending, dlq, oldest)
 	if len(queues) == 0 {
-		fmt.Fprintln(a.stdout, "No queues found. Pending and dead-letter counts are both zero.")
+		_, _ = fmt.Fprintln(a.stdout, "No queues found. Pending and dead-letter counts are both zero.")
 		return exitOK
 	}
 
 	tw := tabwriter.NewWriter(a.stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "QUEUE\tPENDING\tDLQ\tOLDEST_PENDING\tBACKLOG_AGE")
+	_, _ = fmt.Fprintln(tw, "QUEUE\tPENDING\tDLQ\tOLDEST_PENDING\tBACKLOG_AGE")
 	now := time.Now()
 	for _, q := range queues {
 		oldestText := "-"
@@ -225,7 +225,7 @@ Usage:
 			oldestText = ts.UTC().Format(time.RFC3339)
 			ageText = roundDuration(now.Sub(ts))
 		}
-		fmt.Fprintf(tw, "%s\t%d\t%d\t%s\t%s\n", q, pending[q], dlq[q], oldestText, ageText)
+		_, _ = fmt.Fprintf(tw, "%s\t%d\t%d\t%s\t%s\n", q, pending[q], dlq[q], oldestText, ageText)
 	}
 	if err := tw.Flush(); err != nil {
 		return a.fail("could not write queues output: %s", userError(err))
@@ -235,8 +235,8 @@ Usage:
 
 func (a app) runDLQ(ctx context.Context, globals globalOptions, args []string) int {
 	if len(args) == 0 {
-		fmt.Fprint(a.stderr, dlqUsageText)
-		fmt.Fprintln(a.stderr, "\nmissing dlq subcommand; valid commands: list, requeue")
+		_, _ = fmt.Fprint(a.stderr, dlqUsageText)
+		_, _ = fmt.Fprintln(a.stderr, "\nmissing dlq subcommand; valid commands: list, requeue")
 		return exitError
 	}
 	switch args[0] {
@@ -245,7 +245,7 @@ func (a app) runDLQ(ctx context.Context, globals globalOptions, args []string) i
 	case "requeue":
 		return a.runDLQRequeue(ctx, globals, args[1:])
 	case "help", "-h", "--help":
-		fmt.Fprint(a.stdout, dlqUsageText)
+		_, _ = fmt.Fprint(a.stdout, dlqUsageText)
 		return exitOK
 	default:
 		return a.fail("unknown dlq command %q; valid dlq commands: list, requeue", args[0])
@@ -298,7 +298,7 @@ Usage:
 
 	if idsOnly {
 		for _, job := range dead {
-			fmt.Fprintln(a.stdout, job.ID)
+			_, _ = fmt.Fprintln(a.stdout, job.ID)
 		}
 		return exitOK
 	}
@@ -309,18 +309,18 @@ Usage:
 		return exitOK
 	}
 	if len(dead) == 0 {
-		fmt.Fprintln(a.stdout, "No dead-lettered jobs found.")
+		_, _ = fmt.Fprintln(a.stdout, "No dead-lettered jobs found.")
 		return exitOK
 	}
 
 	tw := tabwriter.NewWriter(a.stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "ID\tQUEUE\tTYPE\tPRIORITY\tATTEMPT\tMAX_RETRIES\tDEAD_LETTERED_AT\tLAST_ERROR\tREASON")
+	_, _ = fmt.Fprintln(tw, "ID\tQUEUE\tTYPE\tPRIORITY\tATTEMPT\tMAX_RETRIES\tDEAD_LETTERED_AT\tLAST_ERROR\tREASON")
 	for _, job := range dead {
 		deadAt := "-"
 		if job.DeadLetteredAt != nil {
 			deadAt = job.DeadLetteredAt.UTC().Format(time.RFC3339)
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%d\t%d\t%d\t%s\t%s\t%s\n",
+		_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%d\t%d\t%d\t%s\t%s\t%s\n",
 			job.ID,
 			job.Queue,
 			job.Type,
@@ -367,7 +367,7 @@ Usage:
 	if !requeued {
 		return a.fail("job %q was not requeued; verify the ID exists and the job is failed or cancelled", jobID)
 	}
-	fmt.Fprintf(a.stdout, "requeued %s\n", jobID)
+	_, _ = fmt.Fprintf(a.stdout, "requeued %s\n", jobID)
 	return exitOK
 }
 
@@ -396,7 +396,7 @@ Usage:
 	if err := opened.store.Ping(ctx); err != nil {
 		return a.fail("storage health check failed; verify the database is reachable and credentials are valid: %s", userError(err))
 	}
-	fmt.Fprintln(a.stdout, "OK")
+	_, _ = fmt.Fprintln(a.stdout, "OK")
 	return exitOK
 }
 
@@ -404,8 +404,8 @@ func (a app) newFlagSet(name, description string) *flag.FlagSet {
 	fs := flag.NewFlagSet(name, flag.ContinueOnError)
 	fs.SetOutput(a.stderr)
 	fs.Usage = func() {
-		fmt.Fprint(fs.Output(), description)
-		fmt.Fprintln(fs.Output(), "\nOptions:")
+		_, _ = fmt.Fprint(fs.Output(), description)
+		_, _ = fmt.Fprintln(fs.Output(), "\nOptions:")
 		fs.PrintDefaults()
 	}
 	return fs
@@ -424,14 +424,14 @@ func (a app) parseSubcommand(fs *flag.FlagSet, args []string) int {
 func (a app) openStore(opts globalOptions) (openedStore, bool) {
 	opened, err := openStore(opts)
 	if err != nil {
-		fmt.Fprintln(a.stderr, err)
+		_, _ = fmt.Fprintln(a.stderr, err)
 		return openedStore{}, false
 	}
 	return opened, true
 }
 
 func (a app) fail(format string, args ...any) int {
-	fmt.Fprintf(a.stderr, format+"\n", args...)
+	_, _ = fmt.Fprintf(a.stderr, format+"\n", args...)
 	return exitError
 }
 

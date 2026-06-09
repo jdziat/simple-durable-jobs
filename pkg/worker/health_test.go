@@ -105,7 +105,7 @@ func ExampleWorker_HealthHandler() {
 		fmt.Println(err)
 		return
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	fmt.Println(resp.StatusCode)
 

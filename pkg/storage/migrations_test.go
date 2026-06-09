@@ -149,12 +149,12 @@ func TestDequeueExplainPlanMySQL(t *testing.T) {
 	requireMigrationRecorded(t, ctx, db, 9, "dequeue_order_index")
 
 	query := buildDequeueExplainQuery(db, []string{"default", "critical"}, 25)
-	sqlText := db.Dialector.Explain(query.Statement.SQL.String(), query.Statement.Vars...)
+	sqlText := db.Explain(query.Statement.SQL.String(), query.Statement.Vars...)
 	t.Logf("mysql dequeue query:\n%s", sqlText)
 
 	rows, err := db.Raw("EXPLAIN "+query.Statement.SQL.String(), query.Statement.Vars...).Rows()
 	require.NoError(t, err, "mysql explain")
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	plan := scanExplainRows(t, rows)
 	require.NotEmpty(t, plan)
@@ -166,7 +166,7 @@ func TestDequeueExplainPlanMySQL(t *testing.T) {
 
 	jsonRows, err := db.Raw("EXPLAIN FORMAT=JSON "+query.Statement.SQL.String(), query.Statement.Vars...).Rows()
 	require.NoError(t, err, "mysql explain json")
-	defer jsonRows.Close()
+	defer func() { _ = jsonRows.Close() }()
 
 	jsonPlan := scanExplainRows(t, jsonRows)
 	require.NotEmpty(t, jsonPlan)
@@ -197,12 +197,12 @@ func TestDequeueExplainPlanPostgres(t *testing.T) {
 	requireMigrationRecorded(t, ctx, db, 9, "dequeue_order_index")
 
 	query := buildDequeueExplainQuery(db, []string{"default", "critical"}, 25)
-	sqlText := db.Dialector.Explain(query.Statement.SQL.String(), query.Statement.Vars...)
+	sqlText := db.Explain(query.Statement.SQL.String(), query.Statement.Vars...)
 	t.Logf("postgres dequeue query:\n%s", sqlText)
 
 	rows, err := db.Raw("EXPLAIN (ANALYZE, BUFFERS) "+query.Statement.SQL.String(), query.Statement.Vars...).Rows()
 	require.NoError(t, err, "postgres explain")
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	plan := scanExplainRows(t, rows)
 	require.NotEmpty(t, plan)
