@@ -6,6 +6,6 @@
 // The Storage interface is defined in pkg/core and must be implemented
 // by any custom storage backend.
 //
-// Most users should import the root package github.com/jdziat/simple-durable-jobs
+// Most users should import the root package github.com/jdziat/simple-durable-jobs/v2
 // which provides NewGormStorage() to create storage instances.
 package storage

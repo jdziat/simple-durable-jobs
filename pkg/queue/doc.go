@@ -6,6 +6,6 @@
 //   - Hook registration for job lifecycle events
 //   - Event subscription for monitoring
 //
-// Most users should import the root package github.com/jdziat/simple-durable-jobs
+// Most users should import the root package github.com/jdziat/simple-durable-jobs/v2
 // which re-exports Queue and all option functions.
 package queue

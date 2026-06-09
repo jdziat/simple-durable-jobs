@@ -14,7 +14,7 @@ import (
 	"syscall"
 	"time"
 
-	jobs "github.com/jdziat/simple-durable-jobs"
+	jobs "github.com/jdziat/simple-durable-jobs/v2"
 	"gorm.io/driver/mysql"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"

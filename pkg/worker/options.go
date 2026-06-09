@@ -4,8 +4,8 @@ package worker
 import (
 	"time"
 
-	"github.com/jdziat/simple-durable-jobs/pkg/core"
-	"github.com/jdziat/simple-durable-jobs/pkg/security"
+	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/v2/pkg/security"
 )
 
 // minStaleLockInterval is the floor for the stale-lock reaper cadence set via

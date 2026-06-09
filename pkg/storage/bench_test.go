@@ -6,7 +6,7 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/jdziat/simple-durable-jobs/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
 )
 
 // Benchmarks for the hot storage paths. Run against the production backend to

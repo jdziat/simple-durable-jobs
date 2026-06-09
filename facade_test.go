@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	jobs "github.com/jdziat/simple-durable-jobs"
-	"github.com/jdziat/simple-durable-jobs/pkg/fanout"
+	jobs "github.com/jdziat/simple-durable-jobs/v2"
+	"github.com/jdziat/simple-durable-jobs/v2/pkg/fanout"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/driver/sqlite"

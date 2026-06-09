@@ -12,7 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
 
-	"github.com/jdziat/simple-durable-jobs/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
 )
 
 // skipIfNotPostgres skips the test when TEST_DATABASE_URL is not set.

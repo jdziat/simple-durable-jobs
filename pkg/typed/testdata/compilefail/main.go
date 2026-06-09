@@ -3,8 +3,8 @@ package main
 import (
 	"context"
 
-	"github.com/jdziat/simple-durable-jobs/pkg/queue"
-	"github.com/jdziat/simple-durable-jobs/pkg/typed"
+	"github.com/jdziat/simple-durable-jobs/v2/pkg/queue"
+	"github.com/jdziat/simple-durable-jobs/v2/pkg/typed"
 )
 
 type args struct {

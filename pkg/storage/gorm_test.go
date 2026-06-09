@@ -16,7 +16,7 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 
-	"github.com/jdziat/simple-durable-jobs/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
 )
 
 // newTestStorage creates a fresh storage instance for each test.

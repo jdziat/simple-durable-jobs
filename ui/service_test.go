@@ -16,12 +16,12 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 
-	"github.com/jdziat/simple-durable-jobs/pkg/core"
-	"github.com/jdziat/simple-durable-jobs/pkg/queue"
-	"github.com/jdziat/simple-durable-jobs/pkg/schedule"
-	storagepackage "github.com/jdziat/simple-durable-jobs/pkg/storage"
-	jobsv1 "github.com/jdziat/simple-durable-jobs/ui/gen/jobs/v1"
-	"github.com/jdziat/simple-durable-jobs/ui/gen/jobs/v1/jobsv1connect"
+	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/v2/pkg/queue"
+	"github.com/jdziat/simple-durable-jobs/v2/pkg/schedule"
+	storagepackage "github.com/jdziat/simple-durable-jobs/v2/pkg/storage"
+	jobsv1 "github.com/jdziat/simple-durable-jobs/v2/ui/gen/jobs/v1"
+	"github.com/jdziat/simple-durable-jobs/v2/ui/gen/jobs/v1/jobsv1connect"
 )
 
 // ---------------------------------------------------------------------------

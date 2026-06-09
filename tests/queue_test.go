@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jdziat/simple-durable-jobs"
+	"github.com/jdziat/simple-durable-jobs/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"

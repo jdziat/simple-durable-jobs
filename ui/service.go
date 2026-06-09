@@ -12,11 +12,11 @@ import (
 	"connectrpc.com/connect"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
-	"github.com/jdziat/simple-durable-jobs/pkg/core"
-	"github.com/jdziat/simple-durable-jobs/pkg/queue"
-	"github.com/jdziat/simple-durable-jobs/pkg/security"
-	jobsv1 "github.com/jdziat/simple-durable-jobs/ui/gen/jobs/v1"
-	"github.com/jdziat/simple-durable-jobs/ui/gen/jobs/v1/jobsv1connect"
+	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/v2/pkg/queue"
+	"github.com/jdziat/simple-durable-jobs/v2/pkg/security"
+	jobsv1 "github.com/jdziat/simple-durable-jobs/v2/ui/gen/jobs/v1"
+	"github.com/jdziat/simple-durable-jobs/v2/ui/gen/jobs/v1/jobsv1connect"
 )
 
 const (

@@ -8,7 +8,7 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 
-	"github.com/jdziat/simple-durable-jobs/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
 )
 
 // TryConsumeRate attempts to consume one unit from a named fixed-window rate

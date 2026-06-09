@@ -2,7 +2,7 @@
 //
 // Usage:
 //
-//	import jobsotel "github.com/jdziat/simple-durable-jobs/pkg/otel"
+//	import jobsotel "github.com/jdziat/simple-durable-jobs/v2/pkg/otel"
 //
 //	queue := jobs.New(storage)
 //	jobsotel.Instrument(queue)
@@ -24,11 +24,11 @@ import (
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
 
-	"github.com/jdziat/simple-durable-jobs/pkg/core"
-	"github.com/jdziat/simple-durable-jobs/pkg/queue"
+	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/v2/pkg/queue"
 )
 
-const instrumentationName = "github.com/jdziat/simple-durable-jobs/pkg/otel"
+const instrumentationName = "github.com/jdziat/simple-durable-jobs/v2/pkg/otel"
 
 // instrumentConfig holds configuration for the OTel integration.
 type instrumentConfig struct {

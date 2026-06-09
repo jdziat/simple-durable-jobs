@@ -8,8 +8,8 @@ import (
 	"reflect"
 	"time"
 
-	"github.com/jdziat/simple-durable-jobs/pkg/core"
-	"github.com/jdziat/simple-durable-jobs/pkg/security"
+	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/v2/pkg/security"
 )
 
 // Handler holds metadata about a registered job handler.

@@ -9,10 +9,10 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/jdziat/simple-durable-jobs/pkg/core"
-	intctx "github.com/jdziat/simple-durable-jobs/pkg/internal/context"
-	"github.com/jdziat/simple-durable-jobs/pkg/jobctx"
-	"github.com/jdziat/simple-durable-jobs/pkg/queue"
+	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
+	intctx "github.com/jdziat/simple-durable-jobs/v2/pkg/internal/context"
+	"github.com/jdziat/simple-durable-jobs/v2/pkg/jobctx"
+	"github.com/jdziat/simple-durable-jobs/v2/pkg/queue"
 )
 
 // TestWorker_StrictDeterminism_FailsOnDroppedCall verifies that a job running in

@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	jobs "github.com/jdziat/simple-durable-jobs"
+	jobs "github.com/jdziat/simple-durable-jobs/v2"
 )
 
 func TestRunMigrateAndQueuesSQLite(t *testing.T) {

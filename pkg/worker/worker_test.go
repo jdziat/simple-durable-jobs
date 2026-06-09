@@ -17,14 +17,14 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 
-	"github.com/jdziat/simple-durable-jobs/pkg/call"
-	"github.com/jdziat/simple-durable-jobs/pkg/core"
-	"github.com/jdziat/simple-durable-jobs/pkg/fanout"
-	"github.com/jdziat/simple-durable-jobs/pkg/jobctx"
-	"github.com/jdziat/simple-durable-jobs/pkg/queue"
-	"github.com/jdziat/simple-durable-jobs/pkg/schedule"
-	"github.com/jdziat/simple-durable-jobs/pkg/signal"
-	"github.com/jdziat/simple-durable-jobs/pkg/storage"
+	"github.com/jdziat/simple-durable-jobs/v2/pkg/call"
+	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/v2/pkg/fanout"
+	"github.com/jdziat/simple-durable-jobs/v2/pkg/jobctx"
+	"github.com/jdziat/simple-durable-jobs/v2/pkg/queue"
+	"github.com/jdziat/simple-durable-jobs/v2/pkg/schedule"
+	"github.com/jdziat/simple-durable-jobs/v2/pkg/signal"
+	"github.com/jdziat/simple-durable-jobs/v2/pkg/storage"
 )
 
 // mockStorage is a minimal in-memory implementation of core.Storage used for

@@ -18,12 +18,12 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 
-	"github.com/jdziat/simple-durable-jobs/pkg/codec"
-	"github.com/jdziat/simple-durable-jobs/pkg/core"
-	"github.com/jdziat/simple-durable-jobs/pkg/queue"
-	"github.com/jdziat/simple-durable-jobs/pkg/storage"
-	"github.com/jdziat/simple-durable-jobs/pkg/typed"
-	"github.com/jdziat/simple-durable-jobs/pkg/worker"
+	"github.com/jdziat/simple-durable-jobs/v2/pkg/codec"
+	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/v2/pkg/queue"
+	"github.com/jdziat/simple-durable-jobs/v2/pkg/storage"
+	"github.com/jdziat/simple-durable-jobs/v2/pkg/typed"
+	"github.com/jdziat/simple-durable-jobs/v2/pkg/worker"
 )
 
 type args struct {
@@ -46,7 +46,7 @@ func TestTypedPackageDoesNotImportRoot(t *testing.T) {
 	require.NoError(t, err)
 
 	for _, dep := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		assert.NotEqual(t, "github.com/jdziat/simple-durable-jobs", dep)
+		assert.NotEqual(t, "github.com/jdziat/simple-durable-jobs/v2", dep)
 	}
 }
 

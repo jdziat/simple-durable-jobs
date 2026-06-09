@@ -2,7 +2,7 @@
 //
 // Usage:
 //
-//	import jobsmetrics "github.com/jdziat/simple-durable-jobs/pkg/metrics"
+//	import jobsmetrics "github.com/jdziat/simple-durable-jobs/v2/pkg/metrics"
 //
 //	queue := jobs.New(storage)
 //	jobsmetrics.Instrument(queue)
@@ -26,11 +26,11 @@ import (
 	"go.opentelemetry.io/otel/metric"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 
-	"github.com/jdziat/simple-durable-jobs/pkg/core"
-	"github.com/jdziat/simple-durable-jobs/pkg/queue"
+	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/v2/pkg/queue"
 )
 
-const instrumentationName = "github.com/jdziat/simple-durable-jobs/pkg/metrics"
+const instrumentationName = "github.com/jdziat/simple-durable-jobs/v2/pkg/metrics"
 
 const (
 	metricJobsStarted      = "jobs.started"

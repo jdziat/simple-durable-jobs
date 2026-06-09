@@ -9,10 +9,10 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/jdziat/simple-durable-jobs/pkg/core"
-	intctx "github.com/jdziat/simple-durable-jobs/pkg/internal/context"
-	"github.com/jdziat/simple-durable-jobs/pkg/internal/handler"
-	"github.com/jdziat/simple-durable-jobs/pkg/security"
+	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
+	intctx "github.com/jdziat/simple-durable-jobs/v2/pkg/internal/context"
+	"github.com/jdziat/simple-durable-jobs/v2/pkg/internal/handler"
+	"github.com/jdziat/simple-durable-jobs/v2/pkg/security"
 )
 
 // Call executes a durable nested job call.

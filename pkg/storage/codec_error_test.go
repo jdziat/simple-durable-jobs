@@ -9,9 +9,9 @@ import (
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
 
-	payloadcodec "github.com/jdziat/simple-durable-jobs/pkg/codec"
-	"github.com/jdziat/simple-durable-jobs/pkg/core"
-	"github.com/jdziat/simple-durable-jobs/pkg/security"
+	payloadcodec "github.com/jdziat/simple-durable-jobs/v2/pkg/codec"
+	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/v2/pkg/security"
 )
 
 // rawJobErrorText reads last_error / dead_letter_reason directly via SQL as a

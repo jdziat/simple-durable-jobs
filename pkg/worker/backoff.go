@@ -4,7 +4,7 @@ import (
 	"math/rand"
 	"time"
 
-	"github.com/jdziat/simple-durable-jobs/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
 )
 
 // BackoffPolicy computes the delay before a failed job is retried.

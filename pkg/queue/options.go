@@ -4,8 +4,8 @@ package queue
 import (
 	"time"
 
-	"github.com/jdziat/simple-durable-jobs/pkg/core"
-	"github.com/jdziat/simple-durable-jobs/pkg/security"
+	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/v2/pkg/security"
 )
 
 // Options holds configuration for job enqueueing and registration.

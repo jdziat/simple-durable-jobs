@@ -6,8 +6,8 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/jdziat/simple-durable-jobs/pkg/core"
-	intctx "github.com/jdziat/simple-durable-jobs/pkg/internal/context"
+	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
+	intctx "github.com/jdziat/simple-durable-jobs/v2/pkg/internal/context"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -19,10 +19,10 @@ import (
 type errStorage struct {
 	*minimalStorage
 
-	getFanOutErr   error
-	getFanOutNil   bool // force GetFanOut to return (nil, nil)
-	getSubJobsErr  error
-	suspendErr     error
+	getFanOutErr    error
+	getFanOutNil    bool // force GetFanOut to return (nil, nil)
+	getSubJobsErr   error
+	suspendErr      error
 	createFanOutErr error
 	saveCheckpoint  func(ctx context.Context, cp *core.Checkpoint) error
 	resumeErr       error
