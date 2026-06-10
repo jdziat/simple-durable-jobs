@@ -12,7 +12,7 @@
 
   type ProtoTimestamp = { toDate?: () => Date }
 
-  const periods: Period[] = ['1h', '24h', '7d']
+  const periods: Period[] = ['1h', '24h', '7d', '30d']
 
   let chartPeriod = $state<Period>('1h')
   let chartQueue = $state('')
@@ -77,7 +77,7 @@
 
   function terminalThroughputPerMinute(series: HistorySeries, period: Period): number {
     const total = series.completed.reduce((sum, value) => sum + value, 0) + series.failed.reduce((sum, value) => sum + value, 0)
-    const minutes = period === '1h' ? 60 : period === '24h' ? 1440 : 10080
+    const minutes = period === '1h' ? 60 : period === '24h' ? 1440 : period === '7d' ? 10080 : 43200
     return total / minutes
   }
 

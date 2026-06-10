@@ -41,6 +41,8 @@ type statsCollectorOptionFunc func(*StatsCollector)
 func (f statsCollectorOptionFunc) apply(sc *StatsCollector) { f(sc) }
 
 // WithStatsCollectorRetention sets the retention duration for stats rows.
+// Default: 31 days, so the dashboard's 30d throughput window always has data.
+// Lower it to reduce stats-table growth if you do not use the longer windows.
 func WithStatsCollectorRetention(d time.Duration) StatsCollectorOption {
 	return statsCollectorOptionFunc(func(sc *StatsCollector) {
 		sc.retention = d
@@ -61,7 +63,7 @@ func NewStatsCollector(q *queue.Queue, stats StatsStorage, opts ...StatsCollecto
 	sc := &StatsCollector{
 		queue:     q,
 		stats:     stats,
-		retention: 7 * 24 * time.Hour,
+		retention: 31 * 24 * time.Hour, // covers the dashboard's longest (30d) throughput window
 		logger:    slog.Default(),
 		counters:  make(map[string]*statCounters),
 		ready:     make(chan struct{}),

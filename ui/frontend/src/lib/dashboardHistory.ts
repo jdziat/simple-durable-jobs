@@ -1,4 +1,4 @@
-export type Period = '1h' | '24h' | '7d'
+export type Period = '1h' | '24h' | '7d' | '30d'
 export type HistorySeries = { completed: number[]; failed: number[]; labels: string[] }
 export type HistoryPoint = { timestamp?: { toDate(): Date }; value: bigint | number }
 

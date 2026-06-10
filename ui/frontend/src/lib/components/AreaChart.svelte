@@ -7,7 +7,7 @@
   }: {
     completed: number[]
     failed: number[]
-    period: '1h' | '24h' | '7d'
+    period: '1h' | '24h' | '7d' | '30d'
     labels?: string[]
   } = $props()
 
@@ -47,9 +47,9 @@
     return result
   }
 
-  function bucketLabel(index: number, total: number, p: '1h' | '24h' | '7d'): string {
+  function bucketLabel(index: number, total: number, p: '1h' | '24h' | '7d' | '30d'): string {
     const now = Date.now()
-    const span = p === '1h' ? 3600000 : p === '24h' ? 86400000 : 604800000
+    const span = p === '1h' ? 3600000 : p === '24h' ? 86400000 : p === '7d' ? 604800000 : 2592000000
     const date = new Date(now - span + (total <= 1 ? span : (index / (total - 1)) * span))
     return new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', timeZoneName: 'short' }).format(date)
   }

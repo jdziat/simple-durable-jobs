@@ -355,15 +355,19 @@ func seedStatsHistory(ctx context.Context, statsStore ui.StatsStorage, now time.
 	queues := []string{"default", "emails"}
 	nowMin := now.Truncate(time.Minute)
 
-	// Historical span: 7 full days at 15-minute granularity with a diurnal wave,
-	// so the 24h and 7d throughput windows show a real day/night shape and the
-	// 1h / 24h / 7d selector visibly changes the chart. The most recent ~75
-	// minutes are then overwritten at 1-minute granularity (below) so the 1h
-	// window is smooth. Counts are per-bucket; the y-axis auto-scales.
-	weekAgo := nowMin.Add(-7 * 24 * time.Hour)
+	// Historical span: 31 full days with a diurnal wave so every throughput
+	// window (1h / 24h / 7d / 30d) shows a real day/night shape and the selector
+	// visibly changes the chart. Granularity is tiered to keep startup fast while
+	// covering each window's bucket size: 15-minute within the last ~25h (feeds
+	// the 24h view's 30m buckets) and hourly before that (feeds 7d's 3h and 30d's
+	// 12h buckets). The most recent ~75 minutes are overwritten at 1-minute
+	// granularity (below) so the 1h window is smooth. Counts are per-bucket; the
+	// y-axis auto-scales.
+	monthAgo := nowMin.Add(-31 * 24 * time.Hour)
+	denseSince := nowMin.Add(-25 * time.Hour)
 	recentStart := nowMin.Add(-75 * time.Minute)
 	histBuckets := 0
-	for ts := weekAgo; ts.Before(recentStart); ts = ts.Add(15 * time.Minute) {
+	for ts := monthAgo; ts.Before(recentStart); {
 		// Diurnal factor: busy 09:00-18:00, quiet overnight (deterministic).
 		hour := ts.Hour()
 		dayFactor := int64(1)
@@ -374,11 +378,19 @@ func seedStatsHistory(ctx context.Context, statsStore ui.StatsStorage, now time.
 			dayFactor = 3
 		}
 		minuteOfDay := ts.Hour()*60 + ts.Minute()
+		// Each row counts jobs over the interval it represents, so a fixed-width
+		// chart bucket sums to a comparable total whether it was sourced from
+		// hourly or 15-minute rows (otherwise the denser recent tier would spike).
+		intervalMin := int64(15)
+		if ts.Before(denseSince) {
+			intervalMin = 60
+		}
 		for queueIndex, queueName := range queues {
-			completed := dayFactor*int64(8+((minuteOfDay/15+queueIndex*5)%12)) + int64(queueIndex*4)
+			ratePerMin := dayFactor*int64(1+((minuteOfDay/15+queueIndex*5)%3)) + int64(queueIndex)
+			completed := ratePerMin * intervalMin
 			failed := int64(0)
 			if (minuteOfDay/15+queueIndex*3)%23 == 0 {
-				failed = dayFactor + int64(minuteOfDay%4)
+				failed = (dayFactor + int64(minuteOfDay%4)) * intervalMin / 15
 			}
 			if err := statsStore.UpsertStatCounters(ctx, queueName, ts, completed, failed, 0); err != nil {
 				return fmt.Errorf("failed to seed stat counters for %s at %s: %w", queueName, ts.Format(time.RFC3339), err)
@@ -393,6 +405,11 @@ func seedStatsHistory(ctx context.Context, statsStore ui.StatsStorage, now time.
 			}
 		}
 		histBuckets++
+		if ts.Before(denseSince) {
+			ts = ts.Add(time.Hour) // coarse for the 7d / 30d windows
+		} else {
+			ts = ts.Add(15 * time.Minute) // dense for the 24h window
+		}
 	}
 
 	// Recent window: dense 1-minute granularity for a smooth 1h view.
@@ -436,7 +453,7 @@ func seedStatsHistory(ctx context.Context, statsStore ui.StatsStorage, now time.
 		}
 	}
 
-	log.Printf("Seeded stats history for %d queues: 7d at 15m granularity (%d buckets) + last 71m at 1m granularity", len(queues), histBuckets)
+	log.Printf("Seeded stats history for %d queues: 31d tiered (hourly + 15m, %d buckets) + last 71m at 1m granularity", len(queues), histBuckets)
 	return nil
 }
 

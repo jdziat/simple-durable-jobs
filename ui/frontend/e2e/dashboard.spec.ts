@@ -74,25 +74,31 @@ test.describe('Dashboard', () => {
     await expect(periodSelector.getByText('1h')).toBeVisible()
     await expect(periodSelector.getByText('24h')).toBeVisible()
     await expect(periodSelector.getByText('7d')).toBeVisible()
+    await expect(periodSelector.getByText('30d')).toBeVisible()
   })
 
   test('switching period changes the throughput window', async ({ page }) => {
     const periodSelector = page.locator('.period-selector')
     const firstBucket = page.locator('.chart-section table tbody tr').first().locator('td').first()
 
-    // 1h: the earliest bucket is ~an hour ago.
-    await periodSelector.getByText('1h', { exact: true }).click()
-    await expect(page.locator('.chart-section')).toContainText('over 1h')
-    await expect(firstBucket).not.toHaveText('')
-    const oneHourStart = (await firstBucket.textContent())?.trim() ?? ''
+    const windowStart = async (label: string, subtitle: string, previous?: string) => {
+      await periodSelector.getByText(label, { exact: true }).click()
+      await expect(page.locator('.chart-section')).toContainText(`over ${subtitle}`)
+      if (previous !== undefined) {
+        // The earliest bucket must move (the window genuinely changed — the bug
+        // was every range rendering the same data).
+        await expect(firstBucket).not.toHaveText(previous)
+      } else {
+        await expect(firstBucket).not.toHaveText('')
+      }
+      return (await firstBucket.textContent())?.trim() ?? ''
+    }
 
-    // 7d: the earliest bucket must move back ~a week, so the window genuinely
-    // changed (this is the bug: it used to render the same data for every range).
-    await periodSelector.getByText('7d', { exact: true }).click()
-    await expect(page.locator('.chart-section')).toContainText('over 7d')
-    await expect(firstBucket).not.toHaveText(oneHourStart)
-    const sevenDayStart = (await firstBucket.textContent())?.trim() ?? ''
-    expect(sevenDayStart).not.toBe(oneHourStart)
+    // Each longer range pushes the earliest bucket further back, and all four differ.
+    const oneHour = await windowStart('1h', '1h')
+    const sevenDay = await windowStart('7d', '7d', oneHour)
+    const thirtyDay = await windowStart('30d', '30d', sevenDay)
+    expect(new Set([oneHour, sevenDay, thirtyDay]).size).toBe(3)
   })
 
   test('stat cards link to filtered job lists', async ({ page }) => {
