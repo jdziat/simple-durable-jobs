@@ -2,9 +2,13 @@ package queue
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -202,6 +206,18 @@ func (q *Queue) enqueueTxWithOptions(ctx context.Context, tx *gorm.DB, name stri
 	}
 
 	persist := func(ctx context.Context, j *core.Job) error {
+		if scopeHash, ttl := uniqueLockScope(j, options); scopeHash != "" {
+			txEnqueuer, ok := q.storage.(storage.TxUniqueLockEnqueuer)
+			if !ok {
+				return core.ErrStorageNoUniqueLocks
+			}
+			jobID, err := txEnqueuer.EnqueueWithUniqueLockTx(ctx, tx, j, scopeHash, ttl)
+			if err != nil {
+				return fmt.Errorf("jobs: failed to enqueue: %w", err)
+			}
+			j.ID = jobID
+			return nil
+		}
 		if options.UniqueKey != "" {
 			err := txEnqueuer.EnqueueUniqueTx(ctx, tx, j, options.UniqueKey)
 			if err != nil {
@@ -233,6 +249,18 @@ func (q *Queue) enqueueWithOptions(ctx context.Context, name string, args any, o
 
 	// Build the persist function that the middleware chain will eventually call
 	persist := func(ctx context.Context, j *core.Job) error {
+		if scopeHash, ttl := uniqueLockScope(j, options); scopeHash != "" {
+			enqueuer, ok := q.storage.(core.UniqueLockEnqueuer)
+			if !ok {
+				return core.ErrStorageNoUniqueLocks
+			}
+			jobID, err := enqueuer.EnqueueWithUniqueLock(ctx, j, scopeHash, ttl)
+			if err != nil {
+				return fmt.Errorf("jobs: failed to enqueue: %w", err)
+			}
+			j.ID = jobID
+			return nil
+		}
 		if options.UniqueKey != "" {
 			if err := q.storage.EnqueueUnique(ctx, j, options.UniqueKey); err != nil {
 				if errors.Is(err, core.ErrDuplicateJob) {
@@ -263,6 +291,11 @@ func (q *Queue) buildJob(name string, args any, options *Options) (*core.Job, er
 	}
 	if options.UniqueKey != "" {
 		if err := security.ValidateUniqueKey(options.UniqueKey); err != nil {
+			return nil, err
+		}
+	}
+	if options.IdempotencyKey != "" {
+		if err := security.ValidateUniqueKey(options.IdempotencyKey); err != nil {
 			return nil, err
 		}
 	}
@@ -315,6 +348,34 @@ func (q *Queue) buildJob(name string, args any, options *Options) (*core.Job, er
 	}
 
 	return job, nil
+}
+
+func uniqueLockScope(job *core.Job, options *Options) (string, time.Duration) {
+	if job == nil || options == nil || options.UniqueLockTTL <= 0 {
+		return "", 0
+	}
+	if options.IdempotencyKey != "" {
+		return uniqueScopeHash([]byte(job.Queue), []byte(job.Type), []byte("key"), []byte(options.IdempotencyKey)), options.UniqueLockTTL
+	}
+	if options.UniqueForTTL > 0 {
+		return uniqueScopeHash([]byte(job.Queue), []byte(job.Type), []byte("args"), job.Args), options.UniqueForTTL
+	}
+	return "", 0
+}
+
+func uniqueScopeHash(parts ...[]byte) string {
+	h := sha256.New()
+	for _, part := range parts {
+		writeHashPart(h, part)
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func writeHashPart(h hash.Hash, part []byte) {
+	var size [8]byte
+	binary.BigEndian.PutUint64(size[:], uint64(len(part)))
+	_, _ = h.Write(size[:])
+	_, _ = h.Write(part)
 }
 
 func cloneOptionsMetadata(m *core.MetadataMap) map[string]string {

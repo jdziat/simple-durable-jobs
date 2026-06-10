@@ -176,6 +176,10 @@ func registerHandlers(q *jobs.Queue, db *gorm.DB, dialect string) {
 		return insertEffect(ctx, db, jobs.JobIDFromContext(ctx), "done")
 	})
 
+	q.Register("chaos.unique_windowed", func(ctx context.Context, _ struct{}) error {
+		return insertEffect(ctx, db, jobs.JobIDFromContext(ctx), "windowed-done")
+	})
+
 	q.Register("chaos.pipeline", func(ctx context.Context, _ struct{}) error {
 		jobID := jobs.JobIDFromContext(ctx)
 		for _, phase := range []string{"extract", "transform", "load"} {
@@ -434,6 +438,27 @@ func runSeed(ctx context.Context, a *app) error {
 	}
 	wg.Wait()
 
+	var uniqueWindowedOK, uniqueWindowedErr int
+	windowedIDs := make(map[string]struct{})
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			time.Sleep(time.Duration(rand.Intn(25)) * time.Millisecond)
+			id, err := a.q.Enqueue(ctx, "chaos.unique_windowed", struct{}{}, jobs.IdempotencyKey("windowed-dup-key-1", 24*time.Hour), jobs.Retries(0))
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				uniqueWindowedErr++
+				log.Printf("windowed unique enqueue error: %v", err)
+				return
+			}
+			uniqueWindowedOK++
+			windowedIDs[id] = struct{}{}
+		}()
+	}
+	wg.Wait()
+
 	// Signal + timer durability scenarios (P6). Seed each waiter's target row
 	// BEFORE enqueueing the sender so the sender always finds its targets. The
 	// sender is enqueued AFTER all targets are recorded.
@@ -460,8 +485,8 @@ func runSeed(ctx context.Context, a *app) error {
 		}
 	}
 
-	fmt.Printf("seeded workload: unit=%d pipeline_tx=%d pipeline_window=%d fanout=%d slow=%d unique_attempts=50 unique_inserted=%d duplicate_rejected=%d unique_errors=%d signal_waiters=%d signals_per_waiter=%d timers=%d\n",
-		counts["chaos.unit"], counts["chaos.pipeline"], counts["chaos.pipeline_window"], counts["chaos.fanout"], counts["chaos.slow"], uniqueOK, uniqueDup, uniqueErr, signalWaiters, signalsPerWaiter, timerJobs)
+	fmt.Printf("seeded workload: unit=%d pipeline_tx=%d pipeline_window=%d fanout=%d slow=%d unique_attempts=50 unique_inserted=%d duplicate_rejected=%d unique_errors=%d windowed_unique_attempts=50 windowed_unique_ok=%d windowed_unique_returned_ids=%d windowed_unique_errors=%d signal_waiters=%d signals_per_waiter=%d timers=%d\n",
+		counts["chaos.unit"], counts["chaos.pipeline"], counts["chaos.pipeline_window"], counts["chaos.fanout"], counts["chaos.slow"], uniqueOK, uniqueDup, uniqueErr, uniqueWindowedOK, len(windowedIDs), uniqueWindowedErr, signalWaiters, signalsPerWaiter, timerJobs)
 	return nil
 }
 
@@ -470,7 +495,7 @@ func resetHarnessData(ctx context.Context, db *gorm.DB, dialect string) error {
 		// MySQL TRUNCATE can't target multiple tables or CASCADE; truncate each
 		// with FK checks off (the schema has no inter-table FKs, but this keeps
 		// the order-independent regardless).
-		tables := []string{"chaos_effects", "chaos_ticks", "chaos_signal_targets", "signals", "checkpoints", "fan_outs", "jobs", "queue_states", "scheduled_fires", "leases"}
+		tables := []string{"chaos_effects", "chaos_ticks", "chaos_signal_targets", "signals", "checkpoints", "fan_outs", "jobs", "unique_locks", "queue_states", "scheduled_fires", "leases"}
 		return db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 			if err := tx.Exec(`SET FOREIGN_KEY_CHECKS=0`).Error; err != nil {
 				return err
@@ -483,7 +508,7 @@ func resetHarnessData(ctx context.Context, db *gorm.DB, dialect string) error {
 			return tx.Exec(`SET FOREIGN_KEY_CHECKS=1`).Error
 		})
 	}
-	return db.WithContext(ctx).Exec(`TRUNCATE TABLE chaos_effects, chaos_ticks, chaos_signal_targets, signals, checkpoints, fan_outs, jobs, queue_states, scheduled_fires, leases RESTART IDENTITY CASCADE`).Error
+	return db.WithContext(ctx).Exec(`TRUNCATE TABLE chaos_effects, chaos_ticks, chaos_signal_targets, signals, checkpoints, fan_outs, jobs, unique_locks, queue_states, scheduled_fires, leases RESTART IDENTITY CASCADE`).Error
 }
 
 func runCheck(ctx context.Context, a *app) error {
@@ -497,6 +522,7 @@ func runCheck(ctx context.Context, a *app) error {
 		checkNoWedge(ctx, a.db),
 		checkFanOutCounts(ctx, a.db),
 		checkUnique(ctx, a.db),
+		checkUniqueWindowed(ctx, a.db),
 		checkSchedule(ctx, a.db),
 		checkSignalExactlyOnce(ctx, a.db),
 		checkTimerExactlyOnce(ctx, a.db),
@@ -617,6 +643,17 @@ func checkUnique(ctx context.Context, db *gorm.DB) invariant {
 		level:  "HARD",
 		pass:   count == 1,
 		detail: fmt.Sprintf("jobs_with_dup_key_1=%d", count),
+	}
+}
+
+func checkUniqueWindowed(ctx context.Context, db *gorm.DB) invariant {
+	var count int64
+	db.WithContext(ctx).Raw(`SELECT count(*) FROM jobs WHERE type = 'chaos.unique_windowed'`).Scan(&count)
+	return invariant{
+		name:   "INV-UNIQUE-WINDOWED",
+		level:  "HARD",
+		pass:   count == 1,
+		detail: fmt.Sprintf("jobs_with_windowed_dup_key_1=%d", count),
 	}
 }
 

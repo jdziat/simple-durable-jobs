@@ -25,6 +25,12 @@ const (
 	defaultRetentionBatchSize = 1000
 )
 
+const (
+	defaultUniqueLockSweepInterval = time.Hour
+	minUniqueLockSweepInterval     = 100 * time.Millisecond
+	defaultUniqueLockSweepBatch    = 1000
+)
+
 // WorkerOption configures a Worker.
 type WorkerOption interface {
 	ApplyWorker(*WorkerConfig)
@@ -42,6 +48,21 @@ type RateLimitOption func(*RateLimitConfig)
 
 // RetentionOption configures automatic retention.
 type RetentionOption func(*RetentionConfig)
+
+// UniqueLockSweepOption configures automatic unique-lock garbage collection.
+type UniqueLockSweepOption func(*UniqueLockSweepConfig)
+
+// UniqueLockSweepConfig controls automatic deletion of expired windowed
+// enqueue deduplication locks.
+type UniqueLockSweepConfig struct {
+	Disabled  bool
+	Interval  time.Duration
+	BatchSize int
+}
+
+func (c UniqueLockSweepConfig) enabled() bool {
+	return !c.Disabled
+}
 
 // ConcurrencyCapConfig describes a DB-backed concurrency cap. If Key is nil,
 // the cap is fleet-wide and uses Name as the slot name. If Key is set, the
@@ -188,6 +209,11 @@ type WorkerConfig struct {
 	// jobs and consumed signals. It is disabled by default; zero windows keep
 	// rows forever.
 	Retention RetentionConfig
+
+	// UniqueLockSweep configures automatic garbage collection for expired
+	// IdempotencyKey/UniqueFor locks. It is enabled by default and independent
+	// from Retention so windowed enqueue deduplication self-bounds its table.
+	UniqueLockSweep UniqueLockSweepConfig
 }
 
 // Concurrency sets the concurrency for a queue.
@@ -302,6 +328,57 @@ func WithRetention(opts ...RetentionOption) WorkerOption {
 		}
 		c.Retention = cfg
 	})
+}
+
+// WithUniqueLockSweep configures automatic garbage collection of expired
+// IdempotencyKey/UniqueFor locks. The sweep is enabled by default; use
+// UniqueLockSweepDisabled to turn it off. With no explicit interval or batch
+// size, it runs hourly and deletes up to 1000 expired locks per pass.
+func WithUniqueLockSweep(opts ...UniqueLockSweepOption) WorkerOption {
+	return workerOptionFunc(func(c *WorkerConfig) {
+		cfg := c.UniqueLockSweep
+		for _, opt := range opts {
+			opt(&cfg)
+		}
+		if cfg.enabled() {
+			if cfg.Interval <= 0 {
+				cfg.Interval = defaultUniqueLockSweepInterval
+			}
+			if cfg.Interval < minUniqueLockSweepInterval {
+				cfg.Interval = minUniqueLockSweepInterval
+			}
+			if cfg.BatchSize <= 0 {
+				cfg.BatchSize = defaultUniqueLockSweepBatch
+			}
+		}
+		c.UniqueLockSweep = cfg
+	})
+}
+
+// UniqueLockSweepInterval sets the expired unique-lock scan cadence.
+// Non-positive values use the default and very small positive values are
+// clamped to a small floor.
+func UniqueLockSweepInterval(d time.Duration) UniqueLockSweepOption {
+	return func(c *UniqueLockSweepConfig) {
+		c.Interval = d
+	}
+}
+
+// UniqueLockSweepBatchSize sets the maximum expired unique-lock rows deleted in
+// one pass. Non-positive values use the default.
+func UniqueLockSweepBatchSize(n int) UniqueLockSweepOption {
+	return func(c *UniqueLockSweepConfig) {
+		c.BatchSize = n
+	}
+}
+
+// UniqueLockSweepDisabled disables automatic deletion of expired
+// IdempotencyKey/UniqueFor locks. Disabling the sweep means the unique_locks
+// table grows until the application deletes expired rows some other way.
+func UniqueLockSweepDisabled() UniqueLockSweepOption {
+	return func(c *UniqueLockSweepConfig) {
+		c.Disabled = true
+	}
 }
 
 // RetentionCompletedAfter deletes completed jobs older than d. A non-positive

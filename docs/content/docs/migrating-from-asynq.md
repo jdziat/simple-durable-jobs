@@ -17,7 +17,7 @@ Asynq is a Redis-backed Go task queue. Simple Durable Jobs is a SQL-backed Go jo
 | `asynq.Server` | `queue.NewWorker(...).Start(ctx)` |
 | `ServeMux.HandleFunc` | `queue.Register("name", handler)` |
 | Queue option | `jobs.QueueOpt("queue")` |
-| `Unique(...)` | `jobs.Unique(key)` |
+| `Unique(...)` | `jobs.IdempotencyKey(key, ttl)` or `jobs.UniqueFor(ttl)` |
 | `ProcessIn(...)` | `jobs.Delay(duration)` |
 | `ProcessAt(...)` | `jobs.At(time)` |
 | Max retry option | `jobs.Retries(n)` |
@@ -134,6 +134,12 @@ Redis-specific behavior does not carry over. If you use Redis key inspection, Re
 The backing database changes. Simple Durable Jobs stores jobs in PostgreSQL, MySQL, or SQLite through GORM; it does not use Redis as a broker.
 
 Retry counts map to `jobs.Retries(n)`. Delays map to `jobs.Delay(d)` or `jobs.At(t)`. Handler-controlled retry timing maps to returning `jobs.RetryAfter(d, err)`.
+
+Asynq's `Unique(ttl)` is a time-window deduplication option. Map a
+caller-supplied key to `jobs.IdempotencyKey(key, ttl)`, or use
+`jobs.UniqueFor(ttl)` when the job's queue, name, and arguments identify the
+work. `jobs.Unique(key)` is narrower: it only prevents another pending or
+running job with the same key.
 
 There is no workflow checkpointing equivalent in Asynq. If your Asynq task currently chains follow-up tasks manually, consider a Simple Durable Jobs workflow handler with `jobs.Call[T]` checkpoints or `jobs.FanOut[T]`.
 

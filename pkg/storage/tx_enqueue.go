@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"
@@ -20,7 +21,14 @@ type TxEnqueuer interface {
 	EnqueueBatchTx(ctx context.Context, tx *gorm.DB, jobs []*core.Job) error
 }
 
+// TxUniqueLockEnqueuer is the optional storage capability for atomic windowed
+// enqueue deduplication inside a caller-owned GORM transaction.
+type TxUniqueLockEnqueuer interface {
+	EnqueueWithUniqueLockTx(ctx context.Context, tx *gorm.DB, job *core.Job, scopeHash string, ttl time.Duration) (string, error)
+}
+
 var _ TxEnqueuer = (*GormStorage)(nil)
+var _ TxUniqueLockEnqueuer = (*GormStorage)(nil)
 
 // EnqueueTx adds a job using the caller-supplied transaction handle.
 func (s *GormStorage) EnqueueTx(ctx context.Context, tx *gorm.DB, job *core.Job) error {
@@ -76,6 +84,16 @@ func (s *GormStorage) EnqueueUniqueTx(ctx context.Context, tx *gorm.DB, job *cor
 		return core.ErrDuplicateJob
 	}
 	return nil
+}
+
+// EnqueueWithUniqueLockTx adds a job under a time-bounded unique lock using
+// the caller-supplied transaction handle.
+func (s *GormStorage) EnqueueWithUniqueLockTx(ctx context.Context, tx *gorm.DB, job *core.Job, scopeHash string, ttl time.Duration) (string, error) {
+	if scopeHash == "" || ttl <= 0 {
+		return "", core.ErrStorageNoUniqueLocks
+	}
+	fillEnqueueDefaults(job)
+	return s.enqueueWithUniqueLockDB(ctx, tx.WithContext(ctx), job, scopeHash, ttl)
 }
 
 // EnqueueBatchTx inserts multiple jobs using the caller-supplied transaction handle.

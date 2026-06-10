@@ -175,6 +175,11 @@ var schemaMigrations = []schemaMigration{
 		Name:    "dequeue_order_index",
 		Up:      migrateDequeueOrderIndex,
 	},
+	{
+		Version: 10,
+		Name:    "unique_locks",
+		Up:      migrateUniqueLocks,
+	},
 }
 
 // applyPendingMigrations runs every migration whose version is absent from the
@@ -468,6 +473,64 @@ func migrateDequeueOrderIndex(ctx context.Context, db *gorm.DB, dialect string) 
 	default:
 		return db.WithContext(ctx).Exec(
 			"CREATE INDEX IF NOT EXISTS idx_jobs_dequeue_order ON jobs (priority DESC, created_at ASC, queue) WHERE status = 'pending'",
+		).Error
+	}
+}
+
+func migrateUniqueLocks(ctx context.Context, db *gorm.DB, dialect string) error {
+	m := db.Migrator()
+	if !m.HasTable(&core.UniqueLock{}) {
+		switch dialect {
+		case dialectMySQL:
+			if err := db.WithContext(ctx).Exec(`
+				CREATE TABLE unique_locks (
+					scope_hash VARCHAR(64) NOT NULL,
+					job_id VARCHAR(36) NOT NULL,
+					expires_at DATETIME(6) NOT NULL,
+					created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+					PRIMARY KEY (scope_hash)
+				)
+			`).Error; err != nil && !isBenignDDLError(err) {
+				return fmt.Errorf("create unique_locks table: %w", err)
+			}
+		case dialectPostgres:
+			if err := db.WithContext(ctx).Exec(`
+				CREATE TABLE IF NOT EXISTS unique_locks (
+					scope_hash VARCHAR(64) PRIMARY KEY,
+					job_id VARCHAR(36) NOT NULL,
+					expires_at timestamp with time zone NOT NULL,
+					created_at timestamp with time zone NOT NULL DEFAULT NOW()
+				)
+			`).Error; err != nil {
+				return fmt.Errorf("create unique_locks table: %w", err)
+			}
+		default:
+			if err := db.WithContext(ctx).Exec(`
+				CREATE TABLE IF NOT EXISTS unique_locks (
+					scope_hash VARCHAR(64) PRIMARY KEY,
+					job_id VARCHAR(36) NOT NULL,
+					expires_at datetime NOT NULL,
+					created_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP
+				)
+			`).Error; err != nil {
+				return fmt.Errorf("create unique_locks table: %w", err)
+			}
+		}
+	}
+
+	switch dialect {
+	case dialectMySQL:
+		if !m.HasIndex(&core.UniqueLock{}, "idx_unique_locks_expires_at") {
+			if err := db.WithContext(ctx).Exec(
+				"CREATE INDEX idx_unique_locks_expires_at ON unique_locks (expires_at)",
+			).Error; err != nil && !isBenignDDLError(err) {
+				return fmt.Errorf("create idx_unique_locks_expires_at: %w", err)
+			}
+		}
+		return nil
+	default:
+		return db.WithContext(ctx).Exec(
+			"CREATE INDEX IF NOT EXISTS idx_unique_locks_expires_at ON unique_locks (expires_at)",
 		).Error
 	}
 }

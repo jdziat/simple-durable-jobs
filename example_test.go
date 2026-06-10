@@ -114,6 +114,58 @@ func ExampleNew_enqueueOptions() {
 	}
 }
 
+func ExampleIdempotencyKey() {
+	ctx := context.Background()
+
+	db, err := gorm.Open(sqlite.Open(jobs.SafeSQLiteDSN("jobs.db")), &gorm.Config{})
+	if err != nil {
+		panic(err)
+	}
+	store := jobs.NewGormStorage(db)
+	if err := store.Migrate(ctx); err != nil {
+		panic(err)
+	}
+
+	q := jobs.New(store)
+	q.Register("charge-card", func(ctx context.Context, paymentID string) error {
+		return nil
+	})
+
+	jobID, err := q.Enqueue(ctx, "charge-card", "pay_123",
+		jobs.IdempotencyKey("request-abc", 24*time.Hour),
+	)
+	if err != nil {
+		panic(err)
+	}
+	_ = jobID
+}
+
+func ExampleUniqueFor() {
+	ctx := context.Background()
+
+	db, err := gorm.Open(sqlite.Open(jobs.SafeSQLiteDSN("jobs.db")), &gorm.Config{})
+	if err != nil {
+		panic(err)
+	}
+	store := jobs.NewGormStorage(db)
+	if err := store.Migrate(ctx); err != nil {
+		panic(err)
+	}
+
+	q := jobs.New(store)
+	q.Register("sync-account", func(ctx context.Context, accountID string) error {
+		return nil
+	})
+
+	jobID, err := q.Enqueue(ctx, "sync-account", "acct_123",
+		jobs.UniqueFor(time.Hour),
+	)
+	if err != nil {
+		panic(err)
+	}
+	_ = jobID
+}
+
 // ExampleNew_transactional enqueues a job atomically with a business-row
 // write using a caller-supplied transaction: the job is committed iff the
 // order row commits (transactional/outbox enqueue).

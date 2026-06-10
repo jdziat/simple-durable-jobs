@@ -126,6 +126,11 @@ func TestMigrationsApplyAndRecordAllVersions(t *testing.T) {
 		require.Equal(t, expectedNames[version], row.Name)
 		require.False(t, row.AppliedAt.IsZero(), "migration %d should have applied_at", version)
 	}
+
+	require.Equal(t, "unique_locks", expectedNames[10])
+	requireMigrationRecorded(t, ctx, s.DB(), 10, "unique_locks")
+	require.True(t, s.DB().Migrator().HasTable(&core.UniqueLock{}), "unique_locks table should exist")
+	require.True(t, s.DB().Migrator().HasIndex(&core.UniqueLock{}, "idx_unique_locks_expires_at"), "unique_locks expiry index should exist")
 }
 
 func TestDequeueExplainPlanMySQL(t *testing.T) {

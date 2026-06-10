@@ -18,6 +18,7 @@ River and Simple Durable Jobs both fit Go applications that want workers close t
 | Queue name | `jobs.QueueOpt("queue")` and `jobs.WorkerQueue("queue", ...)` |
 | Periodic jobs | `queue.Schedule(name, args, jobs.Every(...))`, `jobs.Daily`, `jobs.Weekly`, `jobs.Cron` |
 | Unique jobs | `jobs.Unique(key)` |
+| `UniqueOpts.ByPeriod` | `jobs.UniqueFor(ttl)` |
 | Retries | `jobs.Retries(n)` plus worker backoff options |
 | Worker process | `queue.NewWorker(...).Start(ctx)` |
 
@@ -125,6 +126,11 @@ River-specific PostgreSQL features and APIs do not carry over. If your current d
 You do not have to leave PostgreSQL. Simple Durable Jobs supports PostgreSQL through GORM and is happiest in production on PostgreSQL or MySQL. SQLite is useful for local development and single-process tests.
 
 Retry counts map to `jobs.Retries(n)`. Worker retry timing maps to `jobs.WithBackoff(...)`, `jobs.DefaultBackoffPolicy()`, or handler-returned `jobs.RetryAfter(...)`.
+
+River uniqueness by period maps to `jobs.UniqueFor(ttl)` when the job arguments
+identify the work. If your River key is caller-supplied, use
+`jobs.IdempotencyKey(key, ttl)` instead. `jobs.Unique(key)` is only an
+active-job guard and releases when the first job leaves pending/running.
 
 There is no direct equivalent for River's Postgres-specialized low-latency wakeup path. Workers poll; lower `jobs.WithPollInterval(...)` reduces latency at the cost of more database traffic, and `jobs.WithDequeueBatchSize(...)` improves drain throughput.
 

@@ -54,9 +54,10 @@ type Worker struct {
 	// with WithQueueRateLimit.
 	queueRateBuckets map[string]*tokenBucket
 
-	rateLimitStorageMissingLogged atomic.Bool
-	retentionStorageMissingLogged atomic.Bool
-	retentionUnconfiguredLogged   atomic.Bool
+	rateLimitStorageMissingLogged  atomic.Bool
+	retentionStorageMissingLogged  atomic.Bool
+	retentionUnconfiguredLogged    atomic.Bool
+	uniqueLockStorageMissingLogged atomic.Bool
 
 	// futureSleepSuppressions memoizes (jobID -> run_at) for sleeping jobs the
 	// signal-resume backstop has already inspected, capping checkpoint lookups
@@ -123,6 +124,10 @@ type rateLimiterStorage interface {
 
 type retentionStorage interface {
 	DeleteTerminalJobsOlderThan(ctx context.Context, status core.JobStatus, age time.Duration, limit int) (int64, error)
+}
+
+type uniqueLockSweepStorage interface {
+	DeleteExpiredUniqueLocks(ctx context.Context, limit int) (int64, error)
 }
 
 // consumedSignalRetentionStorage is implemented by backends that can prune
@@ -351,6 +356,10 @@ func (w *Worker) Start(ctx context.Context) error {
 	// counterpart.
 	if w.config.OwnershipAuditInterval > 0 {
 		w.goTracked(func() { w.runOwnershipAudit(ctx) })
+	}
+
+	if w.config.UniqueLockSweep.enabled() {
+		w.goTracked(func() { w.runUniqueLockSweep(ctx) })
 	}
 
 	if w.config.Retention.enabled() {
@@ -723,6 +732,56 @@ func (w *Worker) deleteConsumedSignals(ctx context.Context, storage consumedSign
 		if err != nil {
 			if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 				w.logger.Warn("retention GC consumed-signal pass failed", "error", err)
+			}
+			return
+		}
+		if deleted < int64(batchSize) {
+			return
+		}
+	}
+}
+
+func (w *Worker) runUniqueLockSweep(ctx context.Context) {
+	storage, ok := w.queue.Storage().(uniqueLockSweepStorage)
+	if !ok {
+		if w.uniqueLockStorageMissingLogged.CompareAndSwap(false, true) {
+			w.logger.Warn("storage backend does not support unique lock GC; windowed enqueue deduplication lock sweep disabled")
+		}
+		return
+	}
+
+	cfg := w.config.UniqueLockSweep
+	interval := cfg.Interval
+	if interval <= 0 {
+		interval = defaultUniqueLockSweepInterval
+	}
+	if interval < minUniqueLockSweepInterval {
+		interval = minUniqueLockSweepInterval
+	}
+	batchSize := cfg.BatchSize
+	if batchSize <= 0 {
+		batchSize = defaultUniqueLockSweepBatch
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			w.deleteExpiredUniqueLocks(ctx, storage, batchSize)
+		}
+	}
+}
+
+func (w *Worker) deleteExpiredUniqueLocks(ctx context.Context, storage uniqueLockSweepStorage, batchSize int) {
+	for ctx.Err() == nil {
+		deleted, err := storage.DeleteExpiredUniqueLocks(ctx, batchSize)
+		if err != nil {
+			if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+				w.logger.Warn("unique lock GC pass failed", "error", err)
 			}
 			return
 		}
