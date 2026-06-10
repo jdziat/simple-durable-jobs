@@ -64,6 +64,8 @@ message Job {
   optional google.protobuf.Timestamp dead_lettered_at = 19;
   string dead_letter_reason = 20;
   string worker = 21;
+  string tenant = 22;
+  map<string, string> metadata = 23;
 }
 
 message Checkpoint {
@@ -148,6 +150,8 @@ message ListJobsRequest {
   google.protobuf.Timestamp until = 6;
   int32 page = 7;
   int32 limit = 8;
+  string tenant = 9;
+  map<string, string> meta_contains = 10;
 }
 message ListJobsResponse {
   repeated Job jobs = 1;

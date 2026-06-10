@@ -34,6 +34,7 @@
   type ConfirmState =
     | { kind: 'cancel'; id: string }
     | { kind: 'delete'; id: string }
+    | { kind: 'requeue'; id: string }
     | null
 
   const limit = 20
@@ -68,6 +69,7 @@
   let page = $state(1)
   let statusFilter = $state('')
   let queueFilter = $state('')
+  let tenantFilter = $state('')
   let typeFilter = $state('')
   let searchQuery = $state('')
   let sortKey = $state('createdAt')
@@ -89,6 +91,7 @@
   let activeFilters = $derived([
     ...(statusFilter ? [{ key: 'status', label: `status: ${statusFilter}` }] : []),
     ...(queueFilter ? [{ key: 'queue', label: `queue: ${queueFilter}` }] : []),
+    ...(tenantFilter ? [{ key: 'tenant', label: `tenant: ${tenantFilter}` }] : []),
     ...(typeFilter ? [{ key: 'type', label: `type: ${typeFilter}` }] : []),
     ...(searchQuery ? [{ key: 'search', label: `search: ${searchQuery}` }] : []),
   ])
@@ -151,6 +154,7 @@
     const params = new URLSearchParams()
     if (statusFilter) params.set('status', statusFilter)
     if (queueFilter) params.set('queue', queueFilter)
+    if (tenantFilter) params.set('tenant', tenantFilter)
     if (typeFilter) params.set('type', typeFilter)
     if (searchQuery) params.set('search', searchQuery)
     if (page > 1) params.set('page', String(page))
@@ -163,6 +167,7 @@
     const params = new URLSearchParams(query)
     statusFilter = initialStatus || params.get('status') || ''
     queueFilter = initialQueue || params.get('queue') || ''
+    tenantFilter = params.get('tenant') || ''
     typeFilter = params.get('type') || ''
     searchQuery = params.get('search') || ''
     page = Math.max(1, Number(params.get('page') || 1) || 1)
@@ -180,6 +185,7 @@
   function removeFilter(key: string) {
     if (key === 'status') statusFilter = ''
     if (key === 'queue') queueFilter = ''
+    if (key === 'tenant') tenantFilter = ''
     if (key === 'type') typeFilter = ''
     if (key === 'search') searchQuery = ''
     scheduleApply()
@@ -188,6 +194,7 @@
   function clearFilters() {
     statusFilter = ''
     queueFilter = ''
+    tenantFilter = ''
     typeFilter = ''
     searchQuery = ''
     page = 1
@@ -221,6 +228,7 @@
       const response = await jobsClient.listJobs({
         status: statusFilter,
         queue: queueFilter,
+        tenant: tenantFilter,
         type: typeFilter,
         search: searchQuery,
         page,
@@ -257,6 +265,19 @@
       loadJobs()
     } catch (e) {
       toast.push({ kind: 'err', msg: e instanceof Error ? e.message : 'Failed to retry job' })
+    }
+  }
+
+  async function confirmRequeue() {
+    if (confirmState?.kind !== 'requeue') return
+    const id = confirmState.id
+    confirmState = null
+    try {
+      await jobsClient.retryJob({ id })
+      toast.push({ kind: 'ok', msg: 'job requeued' })
+      loadJobs()
+    } catch (e) {
+      toast.push({ kind: 'err', msg: e instanceof Error ? e.message : 'Failed to requeue job' })
     }
   }
 
@@ -369,6 +390,12 @@
     />
     <input
       type="text"
+      placeholder="Tenant..."
+      bind:value={tenantFilter}
+      oninput={() => scheduleApply()}
+    />
+    <input
+      type="text"
       placeholder="Type..."
       bind:value={typeFilter}
       oninput={() => scheduleApply()}
@@ -448,7 +475,9 @@
       <RelativeTime ts={job.createdAt} mode="both" />
     {:else if column.key === 'actions'}
       <div class="actions" role="presentation" onclick={(event) => event.stopPropagation()} onkeydown={(event) => event.stopPropagation()}>
-        {#if job.status === 'failed'}
+        {#if job.deadLetteredAt}
+          <Button variant="secondary" size="sm" class="btn-requeue" onclick={() => { confirmState = { kind: 'requeue', id: job.id } }}>Requeue</Button>
+        {:else if job.status === 'failed'}
           <Button variant="secondary" size="sm" class="btn-retry" onclick={() => retryJob(job.id)}>Retry</Button>
         {/if}
         {#if job.status === 'pending' || job.status === 'running'}
@@ -529,6 +558,16 @@
       confirmWord="DELETE"
       confirmLabel="Delete job"
       onConfirm={confirmDelete}
+      onCancel={() => { confirmState = null }}
+    />
+  {:else if confirmState?.kind === 'requeue'}
+    <ConfirmDialog
+      title="Requeue dead-lettered job"
+      body="Requeue this dead-lettered job? This clears the dead-letter state and queues it again while preserving existing checkpoints. The CLI sdj dlq requeue command replays from scratch; this dashboard action resumes from checkpoints."
+      blastRadius={`Requeues ${confirmState.id}. Previously saved checkpoints remain available for replay.`}
+      confirmWord="REQUEUE"
+      confirmLabel="Requeue"
+      onConfirm={confirmRequeue}
       onCancel={() => { confirmState = null }}
     />
   {/if}

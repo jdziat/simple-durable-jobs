@@ -105,8 +105,8 @@ func seedE2EData(ctx context.Context, store *storage.GormStorage, db *gorm.DB) e
 
 	// Pending jobs (5 total: 3 in default, 2 in emails)
 	pendingJobs := []*core.Job{
-		{ID: "e2e-pending-001", Type: "SendEmail", Queue: "default", Status: core.StatusPending, Priority: 5, MaxRetries: 3, Args: mustJSON(map[string]any{"to": "user@example.com"}), CreatedAt: now.Add(-10 * time.Minute)},
-		{ID: "e2e-pending-002", Type: "GenerateReport", Queue: "default", Status: core.StatusPending, Priority: 3, MaxRetries: 3, Args: mustJSON(map[string]any{"report_id": 42}), CreatedAt: now.Add(-9 * time.Minute)},
+		{ID: "e2e-pending-001", Type: "SendEmail", Queue: "default", Tenant: "acme", Metadata: core.MetadataMap{"region": "us-east", "team": "payments"}, Status: core.StatusPending, Priority: 5, MaxRetries: 3, Args: mustJSON(map[string]any{"to": "user@example.com"}), CreatedAt: now.Add(-10 * time.Minute)},
+		{ID: "e2e-pending-002", Type: "GenerateReport", Queue: "default", Tenant: "globex", Metadata: core.MetadataMap{"region": "eu-west", "team": "analytics"}, Status: core.StatusPending, Priority: 3, MaxRetries: 3, Args: mustJSON(map[string]any{"report_id": 42}), CreatedAt: now.Add(-9 * time.Minute)},
 		{ID: "e2e-pending-003", Type: "ProcessOrder", Queue: "default", Status: core.StatusPending, Priority: 7, MaxRetries: 5, Args: mustJSON(map[string]any{"order_id": 1001}), CreatedAt: now.Add(-8 * time.Minute)},
 		{ID: "e2e-pending-004", Type: "SendEmail", Queue: "emails", Status: core.StatusPending, Priority: 5, MaxRetries: 3, Args: mustJSON(map[string]any{"to": "admin@example.com"}), CreatedAt: now.Add(-7 * time.Minute)},
 		{ID: "e2e-pending-005", Type: "SendNotification", Queue: "emails", Status: core.StatusPending, Priority: 1, MaxRetries: 3, Args: mustJSON(map[string]any{"channel": "slack"}), CreatedAt: now.Add(-6 * time.Minute)},
@@ -150,6 +150,14 @@ func seedE2EData(ctx context.Context, store *storage.GormStorage, db *gorm.DB) e
 			StartedAt:   &startedAt,
 			CompletedAt: &completedAt,
 		}
+		if i == 0 {
+			completedJobs[i].Tenant = "acme"
+			completedJobs[i].Metadata = core.MetadataMap{"region": "us-east", "team": "payments", "tier": "gold"}
+		}
+		if i == 1 {
+			completedJobs[i].Tenant = "globex"
+			completedJobs[i].Metadata = core.MetadataMap{"region": "eu-west", "team": "analytics", "tier": "silver"}
+		}
 	}
 
 	// Failed jobs (5 total)
@@ -189,6 +197,48 @@ func seedE2EData(ctx context.Context, store *storage.GormStorage, db *gorm.DB) e
 			StartedAt:        &startedAt,
 			CompletedAt:      &completedAt,
 		}
+		if i == 2 {
+			failedJobs[i].Tenant = "acme"
+			failedJobs[i].Metadata = core.MetadataMap{"region": "us-east", "team": "payments"}
+		}
+	}
+	deadLetteredJobs := []*core.Job{
+		{
+			ID:               "e2e-failed-006",
+			Type:             "SendWebhook",
+			Queue:            "default",
+			Tenant:           "beta",
+			Metadata:         core.MetadataMap{"region": "eu-west", "team": "fulfillment"},
+			Status:           core.StatusFailed,
+			Priority:         5,
+			Attempt:          3,
+			MaxRetries:       3,
+			Args:             mustJSON(map[string]any{"url": "https://example.invalid/webhook"}),
+			LastError:        "webhook endpoint returned 502",
+			DeadLetteredAt:   ptrTime(now.Add(-90 * time.Minute)),
+			DeadLetterReason: "max retries exhausted: webhook endpoint returned 502",
+			CreatedAt:        now.Add(-2 * time.Hour),
+			StartedAt:        ptrTime(now.Add(-2*time.Hour + 5*time.Second)),
+			CompletedAt:      ptrTime(now.Add(-90 * time.Minute)),
+		},
+		{
+			ID:               "e2e-failed-007",
+			Type:             "ProcessRefund",
+			Queue:            "default",
+			Tenant:           "acme",
+			Metadata:         core.MetadataMap{"region": "us-west", "team": "support"},
+			Status:           core.StatusFailed,
+			Priority:         4,
+			Attempt:          3,
+			MaxRetries:       3,
+			Args:             mustJSON(map[string]any{"refund_id": 7007}),
+			LastError:        "refund approval timed out",
+			DeadLetteredAt:   ptrTime(now.Add(-80 * time.Minute)),
+			DeadLetterReason: "max retries exhausted: refund approval timed out",
+			CreatedAt:        now.Add(-110 * time.Minute),
+			StartedAt:        ptrTime(now.Add(-110*time.Minute + 5*time.Second)),
+			CompletedAt:      ptrTime(now.Add(-80 * time.Minute)),
+		},
 	}
 
 	// Paused jobs (2 total)
@@ -245,11 +295,12 @@ func seedE2EData(ctx context.Context, store *storage.GormStorage, db *gorm.DB) e
 	}
 
 	// Enqueue all jobs
-	allJobs := make([]*core.Job, 0, 30)
+	allJobs := make([]*core.Job, 0, 32)
 	allJobs = append(allJobs, pendingJobs...)
 	allJobs = append(allJobs, runningJobs...)
 	allJobs = append(allJobs, completedJobs...)
 	allJobs = append(allJobs, failedJobs...)
+	allJobs = append(allJobs, deadLetteredJobs...)
 	allJobs = append(allJobs, pausedJobs...)
 	allJobs = append(allJobs, cancelledJobs...)
 	allJobs = append(allJobs, workflowJobs...)
@@ -350,4 +401,8 @@ func seedStatsHistory(ctx context.Context, statsStore ui.StatsStorage, now time.
 func mustJSON(v any) []byte {
 	b, _ := json.Marshal(v)
 	return b
+}
+
+func ptrTime(t time.Time) *time.Time {
+	return &t
 }

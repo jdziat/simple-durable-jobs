@@ -129,6 +129,68 @@ func TestRunEmptyStatesSQLite(t *testing.T) {
 	}
 }
 
+func TestRunDLQListTenantAndMetadataSQLite(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "jobs.db")
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--driver", "sqlite", "--dsn", dbPath, "migrate"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("migrate exit code = %d, stderr = %q", code, stderr.String())
+	}
+
+	store := openSQLiteStoreForTest(t, dbPath)
+	seedCLIDeadLetterJob(t, store, "dlq-acme-prod", "emails", "tenant-a", jobs.MetadataMap{"env": "prod"})
+	seedCLIDeadLetterJob(t, store, "dlq-acme-dev", "emails", "tenant-a", jobs.MetadataMap{"env": "dev"})
+	seedCLIDeadLetterJob(t, store, "dlq-globex-prod", "emails", "tenant-b", jobs.MetadataMap{"env": "prod"})
+
+	stdout.Reset()
+	stderr.Reset()
+	code = run([]string{"--driver", "sqlite", "--dsn", dbPath, "dlq", "list", "--tenant", "tenant-a", "--metadata", "env=prod", "--ids-only"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("dlq list exit code = %d, stderr = %q", code, stderr.String())
+	}
+	got := stdout.String()
+	if !strings.Contains(got, "dlq-acme-prod") {
+		t.Fatalf("stdout = %q, want filtered job", got)
+	}
+	for _, notWant := range []string{"dlq-acme-dev", "dlq-globex-prod"} {
+		if strings.Contains(got, notWant) {
+			t.Fatalf("stdout = %q, did not want %q", got, notWant)
+		}
+	}
+}
+
+func TestRunDLQRequeueBulkSQLite(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "jobs.db")
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--driver", "sqlite", "--dsn", dbPath, "migrate"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("migrate exit code = %d, stderr = %q", code, stderr.String())
+	}
+
+	store := openSQLiteStoreForTest(t, dbPath)
+	seedCLIDeadLetterJob(t, store, "dlq-acme-1", "emails", "tenant-a", nil)
+	seedCLIDeadLetterJob(t, store, "dlq-acme-2", "emails", "tenant-a", nil)
+	seedCLIDeadLetterJob(t, store, "dlq-globex-1", "emails", "tenant-b", nil)
+
+	stdout.Reset()
+	stderr.Reset()
+	code = run([]string{"--driver", "sqlite", "--dsn", dbPath, "dlq", "requeue", "--queue", "emails", "--tenant", "tenant-a"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("dlq requeue exit code = %d, stderr = %q", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "requeued 2 jobs") {
+		t.Fatalf("stdout = %q, want bulk count", stdout.String())
+	}
+
+	dead, err := store.ListDeadLettered(context.Background(), jobs.DeadLetterFilter{Limit: 10})
+	if err != nil {
+		t.Fatalf("list dead-lettered: %v", err)
+	}
+	if len(dead) != 1 || dead[0].ID != "dlq-globex-1" {
+		t.Fatalf("remaining dead-lettered = %v, want only dlq-globex-1", dead)
+	}
+}
+
 func TestRunHelpExitCodes(t *testing.T) {
 	tests := [][]string{
 		{"-h"},
@@ -247,4 +309,26 @@ func openSQLiteStoreForTest(t *testing.T, path string) *jobs.GormStorage {
 	}
 	t.Cleanup(func() { closeStore(opened) })
 	return opened.store
+}
+
+func seedCLIDeadLetterJob(t *testing.T, store *jobs.GormStorage, id, queue, tenant string, metadata jobs.MetadataMap) {
+	t.Helper()
+	now := time.Now()
+	err := store.DB().Create(&jobs.Job{
+		ID:               id,
+		Type:             "send-email",
+		Queue:            queue,
+		Tenant:           tenant,
+		Metadata:         metadata,
+		Status:           jobs.StatusFailed,
+		Attempt:          1,
+		MaxRetries:       1,
+		LastError:        "boom",
+		DeadLetteredAt:   &now,
+		DeadLetterReason: "max retries exhausted: boom",
+		CompletedAt:      &now,
+	}).Error
+	if err != nil {
+		t.Fatalf("seed dlq job %s: %v", id, err)
+	}
 }

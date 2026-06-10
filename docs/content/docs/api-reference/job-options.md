@@ -26,9 +26,9 @@ Assigns the job to a specific queue.
 ### `WithTenant(tenant string) Option`
 
 Sets the tenant that owns the job. The value is persisted on `Job.Tenant` and
-can be filtered programmatically with `SearchJobs` and `JobFilter.Tenant`. This
-tenant filter is not yet surfaced in the embedded dashboard (planned for
-v2.3.0).
+can be filtered programmatically with `SearchJobs` and `JobFilter.Tenant`. The
+embedded dashboard's Jobs view also exposes a tenant filter, and job detail
+pages display the tenant value.
 
 ```go
 jobID, err := queue.Enqueue(ctx, "sync-account", args,
@@ -40,6 +40,7 @@ jobID, err := queue.Enqueue(ctx, "sync-account", args,
 
 Replaces the job metadata map with a defensive copy. Metadata is persisted on
 `Job.Metadata` as string key/value tags for filtering and operational display.
+The embedded dashboard displays these tags on the job detail page.
 
 ```go
 jobID, err := queue.Enqueue(ctx, "sync-account", args,

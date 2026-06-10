@@ -125,6 +125,8 @@ interface MockJob {
   id: string
   type: string
   queue: QueueName
+  tenant?: string
+  metadata?: Record<string, string>
   status: Status | 'cancelled'
   priority: number
   attempt: number
@@ -181,6 +183,8 @@ function makeJob(overrides: Partial<MockJob> = {}): MockJob {
     id: overrides.id ?? uid(),
     type,
     queue,
+    tenant: overrides.tenant,
+    metadata: overrides.metadata,
     status,
     priority: overrides.priority ?? randInt(0, 10),
     attempt: overrides.attempt ?? (status === 'failed' ? randInt(1, 3) : status === 'completed' ? 1 : 0),
@@ -224,6 +228,8 @@ function seedJobs(): void {
     id: 'job_demo_dead_lettered',
     type: 'send-webhook',
     queue: 'critical',
+    tenant: 'acme',
+    metadata: { region: 'us-east', team: 'payments' },
     status: 'failed',
     attempt: 3,
     maxRetries: 3,
@@ -232,6 +238,28 @@ function seedJobs(): void {
     lastError: 'HTTP 503 Service Unavailable',
     deadLetteredAt,
     deadLetterReason: 'max retries exhausted: HTTP 503 Service Unavailable',
+  }))
+
+  jobs.push(makeJob({
+    id: 'job_demo_tenant_acme',
+    type: 'charge-payment',
+    queue: 'critical',
+    tenant: 'acme',
+    metadata: { region: 'us-east', team: 'payments', tier: 'gold' },
+    status: 'completed',
+    createdAt: minutesAgo(22),
+    lastError: '',
+  }))
+
+  jobs.push(makeJob({
+    id: 'job_demo_tenant_globex',
+    type: 'generate-report',
+    queue: 'default',
+    tenant: 'globex',
+    metadata: { region: 'eu-west', team: 'analytics' },
+    status: 'pending',
+    createdAt: minutesAgo(11),
+    lastError: '',
   }))
 }
 
@@ -262,6 +290,8 @@ function seedWorkflows(): void {
     type: 'process-batch-orders',
     status: 'running',
     queue: 'critical',
+    tenant: 'acme',
+    metadata: { region: 'us-east', workflow: 'batch-orders' },
     createdAt: batchRootCreated,
     startedAt: batchRootStarted,
     completedAt: null,
@@ -297,6 +327,8 @@ function seedWorkflows(): void {
       type: 'process-single-order',
       status: 'completed',
       queue: 'critical',
+      tenant: 'acme',
+      metadata: { region: 'us-east', workflow: 'batch-orders' },
       parentJobId: batchRootId,
       rootJobId: batchRootId,
       fanOutId: batchFanOutId,
@@ -320,6 +352,8 @@ function seedWorkflows(): void {
     type: 'process-single-order',
     status: 'running',
     queue: 'critical',
+    tenant: 'acme',
+    metadata: { region: 'us-east', workflow: 'batch-orders' },
     parentJobId: batchRootId,
     rootJobId: batchRootId,
     fanOutId: batchFanOutId,
@@ -341,6 +375,8 @@ function seedWorkflows(): void {
     type: 'process-single-order',
     status: 'pending',
     queue: 'critical',
+    tenant: 'acme',
+    metadata: { region: 'us-east', workflow: 'batch-orders' },
     parentJobId: batchRootId,
     rootJobId: batchRootId,
     fanOutId: batchFanOutId,
@@ -369,6 +405,8 @@ function seedWorkflows(): void {
     type: 'etl-pipeline',
     status: 'running',
     queue: 'default',
+    tenant: 'globex',
+    metadata: { region: 'eu-west', workflow: 'etl' },
     createdAt: etlRootCreated,
     startedAt: etlRootStarted,
     completedAt: null,
@@ -404,6 +442,8 @@ function seedWorkflows(): void {
       type: 'transform-record-batch',
       status: 'completed',
       queue: 'default',
+      tenant: 'globex',
+      metadata: { region: 'eu-west', workflow: 'etl' },
       parentJobId: etlRootId,
       rootJobId: etlRootId,
       fanOutId: etlFanOutId,
@@ -434,6 +474,8 @@ function seedWorkflows(): void {
     type: 'send-bulk-notifications',
     status: 'failed',
     queue: 'emails',
+    tenant: 'initech',
+    metadata: { region: 'us-west', workflow: 'notifications' },
     createdAt: notifRootCreated,
     startedAt: notifRootStarted,
     completedAt: notifRootCompleted,
@@ -469,6 +511,8 @@ function seedWorkflows(): void {
       type: 'send-notification',
       status: 'completed',
       queue: 'emails',
+      tenant: 'initech',
+      metadata: { region: 'us-west', workflow: 'notifications' },
       parentJobId: notifRootId,
       rootJobId: notifRootId,
       fanOutId: notifFanOutId,
@@ -493,6 +537,8 @@ function seedWorkflows(): void {
     type: 'send-notification',
     status: 'failed',
     queue: 'emails',
+    tenant: 'initech',
+    metadata: { region: 'us-west', workflow: 'notifications' },
     parentJobId: notifRootId,
     rootJobId: notifRootId,
     fanOutId: notifFanOutId,
@@ -515,6 +561,8 @@ function seedWorkflows(): void {
       type: 'send-notification',
       status: 'cancelled',
       queue: 'emails',
+      tenant: 'initech',
+      metadata: { region: 'us-west', workflow: 'notifications' },
       parentJobId: notifRootId,
       rootJobId: notifRootId,
       fanOutId: notifFanOutId,
@@ -701,6 +749,8 @@ function toProtoJob(j: MockJob): Job {
     id: j.id,
     type: j.type,
     queue: j.queue,
+    tenant: j.tenant ?? '',
+    metadata: j.metadata ?? {},
     status: j.status,
     priority: j.priority,
     attempt: j.attempt,
@@ -834,8 +884,10 @@ export const mockJobsClient = {
     req: {
       status?: string
       queue?: string
+      tenant?: string
       type?: string
       search?: string
+      metaContains?: Record<string, string>
       page?: number
       limit?: number
     },
@@ -849,14 +901,24 @@ export const mockJobsClient = {
       filtered = filtered.filter((j) => j.status === req.status)
     }
     if (req.queue) filtered = filtered.filter((j) => j.queue === req.queue)
+    if (req.tenant) filtered = filtered.filter((j) => (j.tenant ?? '') === req.tenant)
     if (req.type) filtered = filtered.filter((j) => j.type === req.type)
+    if (req.metaContains) {
+      filtered = filtered.filter((j) =>
+        Object.entries(req.metaContains ?? {}).every(([key, value]) => (j.metadata ?? {})[key] === value),
+      )
+    }
     if (req.search) {
       const s = req.search.toLowerCase()
       filtered = filtered.filter(
         (j) =>
           j.id.toLowerCase().includes(s) ||
           j.type.toLowerCase().includes(s) ||
-          j.queue.toLowerCase().includes(s),
+          j.queue.toLowerCase().includes(s) ||
+          (j.tenant ?? '').toLowerCase().includes(s) ||
+          Object.entries(j.metadata ?? {}).some(([key, value]) =>
+            key.toLowerCase().includes(s) || value.toLowerCase().includes(s),
+          ),
       )
     }
 

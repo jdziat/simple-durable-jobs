@@ -121,5 +121,7 @@ jobstest.RequireEnqueued(t, q, "send-email",
 
 ## Current limits
 
-`jobstest` does not provide fake-clock or time-skipping helpers yet. That support
-is planned once durable timers are first-class in Simple Durable Jobs.
+`jobstest` does not provide an injectable clock or time-skipping helpers. For
+time-sensitive behavior, prefer short real durations, bounded contexts, and the
+isolated `jobstest` queue/storage fixtures so tests stay fast without depending
+on shared wall-clock state.

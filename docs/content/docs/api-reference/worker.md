@@ -81,6 +81,27 @@ slot name and the cap applies across the fleet. With `CapKey(func(*Job) string)`
 the effective slot name is `name + ":" + key`, so the cap applies independently
 per key. See [Concurrency Caps]({{< relref "/docs/advanced/concurrency-caps" >}}).
 
+### `RateLimit(name string, perSecond float64, opts ...RateLimitOption) WorkerOption`
+
+Adds an optional database-backed fixed-window rate limit shared by every worker
+using a storage backend with rate-limit support. The bundled `GormStorage`
+implements it. When the limit is full, the worker releases the dequeued job back
+to pending without consuming a retry attempt. See [Rate Limiting]({{< relref "/docs/advanced/rate-limiting" >}}).
+
+### `RateLimitKey(func(*Job) string) RateLimitOption`
+
+Partitions a fleet-wide rate limit by a key derived from the job. The effective
+limit name is `name + ":" + key`, so tenants, accounts, or customers can each
+receive an independent allowance under the same worker configuration. See [Rate
+Limiting]({{< relref "/docs/advanced/rate-limiting" >}}).
+
+### `WithQueueRateLimit(queue string, perSecond float64, burst int) WorkerOption`
+
+Adds a per-worker token bucket for one queue. The worker checks this local
+bucket before dequeueing, so an empty bucket does not touch the database and does
+not consume a retry attempt. This limit is local to the worker process; running
+more workers multiplies total throughput. See [Rate Limiting]({{< relref "/docs/advanced/rate-limiting" >}}).
+
 ### `WithScheduler(enabled bool) WorkerOption`
 
 Enables the scheduler for recurring jobs.

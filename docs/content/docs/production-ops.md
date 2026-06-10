@@ -89,11 +89,13 @@ sdj --driver postgres --dsn postgres://user:pass@localhost/db queues
 # List dead-lettered jobs.
 sdj --driver postgres --dsn postgres://user:pass@localhost/db dlq list
 sdj --driver postgres --dsn postgres://user:pass@localhost/db dlq list --queue emails --type send-email --limit 100 --offset 0
+sdj --driver postgres --dsn postgres://user:pass@localhost/db dlq list --queue emails --tenant acme --metadata env=prod
 sdj --driver postgres --dsn postgres://user:pass@localhost/db dlq list --json
 sdj --driver postgres --dsn postgres://user:pass@localhost/db dlq list --ids-only
 
-# Requeue one dead-lettered job by id.
+# Requeue one dead-lettered job by id, or a filtered dead-lettered batch.
 sdj --driver postgres --dsn postgres://user:pass@localhost/db dlq requeue <jobID>
+sdj --driver postgres --dsn postgres://user:pass@localhost/db dlq requeue --queue emails --tenant acme
 
 # Ping storage and print OK on success.
 sdj --driver postgres --dsn postgres://user:pass@localhost/db health
@@ -101,9 +103,11 @@ sdj --driver postgres --dsn postgres://user:pass@localhost/db health
 
 Each subcommand accepts `-h` for its command-specific usage. `dlq list` prints a
 table by default; `--json` emits a JSON array and `--ids-only` emits one job ID
-per line for scripts. `dlq requeue` succeeds only when the target job exists and
-is failed or cancelled; fan-out sub-jobs must be handled by requeueing their
-parent.
+per line for scripts. `dlq list --tenant` and repeated `--metadata key=value`
+filters narrow triage to one tenant or metadata slice. `dlq requeue` succeeds
+only when the target job exists and is failed or cancelled; fan-out sub-jobs
+must be handled by requeueing their parent. `dlq requeue --queue` and
+`--tenant` requeue every matching dead-lettered job.
 
 ## Health Probes
 
@@ -124,6 +128,20 @@ The handler registers two endpoints:
 
 `GormStorage` implements `storage.Healther` with `Ping(ctx) error`, backed by
 `sql.DB.PingContext`.
+
+Kubernetes probes can point at the two endpoints separately:
+
+```yaml
+livenessProbe:
+  exec:
+    command: ["wget", "-qO-", "127.0.0.1:8080/healthz"]
+  periodSeconds: 10
+readinessProbe:
+  exec:
+    command: ["wget", "-qO-", "127.0.0.1:8080/readyz"]
+  periodSeconds: 10
+  failureThreshold: 3
+```
 
 Operator pause is not a readiness failure. `Worker.Pause(...)` is a reversible
 control-plane state, so a paused worker still returns `200 OK` from `/readyz` as
@@ -184,8 +202,8 @@ The index is order-first:
 The existing `idx_jobs_dequeue` remains for queue-filtered scans. The new index
 lets planners walk pending jobs in global priority order and filter queues from
 the index, which avoids sort-heavy plans on the `ORDER BY priority DESC,
-created_at ASC LIMIT ...` dequeue hot path. The P1 EXPLAIN tests document the
-reason: MySQL moved from a full scan with `Using filesort` to
+created_at ASC LIMIT ...` dequeue hot path. The dequeue EXPLAIN tests document
+the reason: MySQL moved from a full scan with `Using filesort` to
 `idx_jobs_dequeue_order` with `Using index condition`; PostgreSQL moved to an
 `Index Scan using idx_jobs_dequeue_order` without a Sort node.
 
@@ -252,6 +270,7 @@ separate archive table.
 
    ```bash
    sdj --driver postgres --dsn "$DATABASE_URL" dlq list --queue emails --limit 50
+   sdj --driver postgres --dsn "$DATABASE_URL" dlq list --queue emails --tenant acme --metadata env=prod
    sdj --driver postgres --dsn "$DATABASE_URL" dlq list --queue emails --ids-only
    ```
 
@@ -264,10 +283,17 @@ separate archive table.
    sdj --driver postgres --dsn "$DATABASE_URL" dlq requeue <jobID>
    ```
 
+   Or requeue a filtered batch:
+
+   ```bash
+   sdj --driver postgres --dsn "$DATABASE_URL" dlq requeue --queue emails --tenant acme
+   ```
+
 Requeue clears DLQ metadata, resets execution state, and deletes checkpoints so
-the workflow starts from the beginning. Handlers still must be idempotent. See
-[Dead-Letter Queue]({{< relref "/docs/advanced/dead-letter-queue" >}}) for the
-full API and retention caveats.
+the workflow starts from the beginning. The dashboard Requeue button instead
+clears the dead-letter state and resumes from existing checkpoints. Handlers
+still must be idempotent. See [Dead-Letter Queue]({{< relref
+"/docs/advanced/dead-letter-queue" >}}) for the full API and retention caveats.
 
 ## Retention And GC
 
@@ -298,12 +324,12 @@ support details.
 
 This page covers these operational surfaces:
 
-| Packet | Surface | Coverage |
-|---|---|---|
-| P1 | `idx_jobs_dequeue_order` / migration v9 `dequeue_order_index` | [Dequeue Index](#dequeue-index) |
-| P2 | `jobs.queue.depth`, `jobs.queue.backlog.oldest_age`, `jobs.dead_letter.depth`, `jobs.queue.saturation` | [Metrics And Alerts](#metrics-and-alerts) |
-| P3 | `storage.Healther`, `GormStorage.Ping(ctx)` | [Health Probes](#health-probes) |
-| P4 | Work-conserving drain loop | [Throughput Tuning](#throughput-tuning) |
-| P5 | `DequeueBatchPerQueue(ctx, workerID, budgets)` fair-share claim budget | [Throughput Tuning](#throughput-tuning) |
-| P6 | `Worker.Health()`, `Worker.HealthHandler()`, `/healthz`, `/readyz` | [Health Probes](#health-probes) |
-| P7 | `sdj migrate`, `sdj queues`, `sdj dlq list`, `sdj dlq requeue`, `sdj health` | [The `sdj` CLI](#the-sdj-cli) |
+| Surface | Section |
+|---|---|
+| `idx_jobs_dequeue_order` / migration v9 `dequeue_order_index` | [Dequeue Index](#dequeue-index) |
+| `jobs.queue.depth`, `jobs.queue.backlog.oldest_age`, `jobs.dead_letter.depth`, `jobs.queue.saturation` | [Metrics And Alerts](#metrics-and-alerts) |
+| `storage.Healther`, `GormStorage.Ping(ctx)` | [Health Probes](#health-probes) |
+| Work-conserving drain loop | [Throughput Tuning](#throughput-tuning) |
+| `DequeueBatchPerQueue(ctx, workerID, budgets)` fair-share claim budget | [Throughput Tuning](#throughput-tuning) |
+| `Worker.Health()`, `Worker.HealthHandler()`, `/healthz`, `/readyz` | [Health Probes](#health-probes) |
+| `sdj migrate`, `sdj queues`, `sdj dlq list`, `sdj dlq requeue`, `sdj health` | [The `sdj` CLI](#the-sdj-cli) |
