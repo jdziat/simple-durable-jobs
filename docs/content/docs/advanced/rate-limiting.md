@@ -8,7 +8,7 @@ weight: 10
 `WithQueueRateLimit(queue, perSecond, burst)` adds a per-worker token bucket for
 one queue. The worker checks this bucket before dequeueing, so an empty bucket
 means no database row is touched and no retry attempt is consumed. See the
-[Worker API reference]({{< relref "/docs/api-reference/worker#withqueueratelimitqueue-string-persecond-int-burst-int-workeroption" >}})
+[Worker API reference]({{< relref "/docs/api-reference/worker#withqueueratelimitqueue-string-persecond-float64-burst-int-workeroption" >}})
 for the option signature.
 
 ```go
@@ -27,7 +27,7 @@ workers multiplies the total rate.
 `RateLimit(name, perSecond, opts...)` adds a database-backed fixed-window limit
 shared by every worker using a storage backend that implements the optional rate
 limit capability. The bundled `GormStorage` implements it. See the
-[Worker API reference]({{< relref "/docs/api-reference/worker#ratelimitname-string-persecond-int-opts-ratelimitoption-workeroption" >}})
+[Worker API reference]({{< relref "/docs/api-reference/worker#ratelimitname-string-persecond-float64-opts-ratelimitoption-workeroption" >}})
 for the option signature.
 
 ```go
@@ -44,7 +44,7 @@ call failure hooks and does not consume a retry attempt.
 ## Per-key throttle
 
 Use `RateLimitKey` when each tenant, account, or customer should have an
-independent quota. See the [Worker API reference]({{< relref "/docs/api-reference/worker#ratelimitkeyfuncjob-job-string-ratelimitoption" >}})
+independent quota. See the [Worker API reference]({{< relref "/docs/api-reference/worker#ratelimitkeyfuncjob-string-ratelimitoption" >}})
 for the option signature.
 
 ```go
