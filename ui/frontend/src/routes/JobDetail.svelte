@@ -117,24 +117,28 @@
     }
   }
 
+  function clearWorkflow() {
+    workflowRoot = null
+    workflowFanOuts = []
+    workflowChildren = []
+  }
+
   async function loadWorkflow(jobData: { parentJobId?: string; rootJobId?: string; fanOutId?: string; id: string }) {
-    if (!jobData.parentJobId && !jobData.fanOutId) {
-      workflowRoot = null
-      workflowFanOuts = []
-      workflowChildren = []
-      return
-    }
     try {
       const rootId = jobData.rootJobId || jobData.id
       const response = await jobsClient.getWorkflow({ jobId: rootId })
       if (!mounted) return
-      if (response.root) {
+      const hasWorkflowContext = response.children.length > 0 || response.fanOuts.length > 0 || !!jobData.parentJobId || !!jobData.fanOutId
+      if (response.root && hasWorkflowContext) {
         workflowRoot = response.root
         workflowFanOuts = response.fanOuts
         workflowChildren = response.children
+      } else {
+        clearWorkflow()
       }
     } catch {
       // Workflow context is optional for standalone jobs.
+      if (mounted) clearWorkflow()
     }
   }
 
@@ -424,17 +428,6 @@
           </div>
         </section>
 
-        {#if workflowRoot}
-          <section class="workflow-section panel">
-            <h4>Workflow Timeline</h4>
-            <WaterfallChart
-              root={workflowRoot}
-              fanOuts={workflowFanOuts}
-              children={workflowChildren}
-              onJobClick={(jobId) => navigate(`#/jobs/${jobId}`)}
-            />
-          </section>
-        {/if}
       </div>
 
       <div class="right-pane">
@@ -536,6 +529,17 @@
         </div>
       </div>
     </div>
+
+    {#if workflowRoot}
+      <section class="workflow-section panel">
+        <WaterfallChart
+          root={workflowRoot}
+          fanOuts={workflowFanOuts}
+          children={workflowChildren}
+          onJobClick={(jobId) => navigate(`#/jobs/${jobId}`)}
+        />
+      </section>
+    {/if}
   {/if}
 
   {#if confirmState?.kind === 'cancel'}
@@ -660,8 +664,7 @@
 
   .section-heading,
   .panel-header h4,
-  .checkpoints h4,
-  .workflow-section h4 {
+  .checkpoints h4 {
     margin: 0;
     color: var(--fg-secondary);
     font-size: var(--fs-label);
@@ -869,10 +872,14 @@
 
   .workflow-section {
     min-width: 0;
+    width: 100%;
+    margin-top: var(--sp-4);
   }
 
-  .workflow-section h4 {
-    margin-bottom: var(--sp-3);
+  .workflow-section :global(.waterfall-chart) {
+    border: 0;
+    background: transparent;
+    box-shadow: none;
   }
 
   .error-banner {
