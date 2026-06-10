@@ -109,6 +109,8 @@ func periodBucket(period string) time.Duration {
 		return 30 * time.Minute // ~48 buckets
 	case "7d":
 		return 3 * time.Hour // ~56 buckets
+	case "30d":
+		return 12 * time.Hour // ~60 buckets
 	default:
 		return time.Minute // 1h -> 60 buckets
 	}
@@ -1054,6 +1056,8 @@ func parsePeriod(period string) (since, until time.Time) {
 		since = until.Add(-24 * time.Hour)
 	case "7d":
 		since = until.Add(-7 * 24 * time.Hour)
+	case "30d":
+		since = until.Add(-30 * 24 * time.Hour)
 	default:
 		since = until.Add(-1 * time.Hour)
 	}

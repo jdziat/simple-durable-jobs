@@ -41,7 +41,9 @@ func WithQueue(q *queue.Queue) Option {
 	})
 }
 
-// WithStatsRetention sets how long stats rows are kept. Default: 7 days.
+// WithStatsRetention sets how long stats rows are kept. Default: 31 days, so the
+// dashboard's longest (30d) throughput window always has data. Lower it to reduce
+// stats-table growth if you do not use the longer windows.
 func WithStatsRetention(d time.Duration) Option {
 	return optionFunc(func(c *config) {
 		c.statsRetention = d

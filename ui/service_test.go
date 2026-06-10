@@ -862,6 +862,7 @@ func TestGetStatsHistory_BucketsSpanWindowPerPeriod(t *testing.T) {
 		"1h":  {55 * time.Minute, 61 * time.Minute, 55, 62},
 		"24h": {23 * time.Hour, 25 * time.Hour, 44, 52},
 		"7d":  {6 * 24 * time.Hour, 8 * 24 * time.Hour, 52, 60},
+		"30d": {29 * 24 * time.Hour, 31 * 24 * time.Hour, 56, 64},
 	}
 	counts := map[string]int{}
 	for period, want := range cases {
@@ -883,6 +884,7 @@ func TestGetStatsHistory_BucketsSpanWindowPerPeriod(t *testing.T) {
 	// Distinct windows resolve to distinct grids.
 	assert.NotEqual(t, counts["1h"], counts["24h"])
 	assert.NotEqual(t, counts["24h"], counts["7d"])
+	assert.NotEqual(t, counts["7d"], counts["30d"])
 }
 
 func TestGetStatsHistory_StorageError(t *testing.T) {
@@ -930,7 +932,7 @@ func TestGetStatsHistory_SortedByTimestamp(t *testing.T) {
 func TestGetStatsHistory_AllPeriods(t *testing.T) {
 	// With no rows, every period still returns a window-spanning all-zero grid so
 	// the time axis reflects the window; the frontend renders this as "no data".
-	periods := []string{"1h", "24h", "7d", "", "bad"}
+	periods := []string{"1h", "24h", "7d", "30d", "", "bad"}
 	for _, p := range periods {
 		mockStats := &mockStatsStorage{
 			getStatsHistoryFn: func(_ context.Context, _ string, _, _ time.Time) ([]JobStat, error) {
