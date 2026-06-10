@@ -19,6 +19,9 @@ type Options struct {
 	Delay          time.Duration
 	RunAt          *time.Time
 	UniqueKey      string
+	IdempotencyKey string
+	UniqueForTTL   time.Duration
+	UniqueLockTTL  time.Duration
 	Determinism    DeterminismMode
 	determinismSet bool
 	prioritySet    bool
@@ -146,6 +149,28 @@ func WithHandlerBackoff(p core.BackoffPolicy) Option {
 func Unique(key string) Option {
 	return optionFunc(func(o *Options) {
 		o.UniqueKey = key
+	})
+}
+
+// IdempotencyKey deduplicates enqueue attempts with the same caller-supplied
+// key for ttl. A duplicate enqueue during the window returns the original job
+// ID without creating a second job.
+func IdempotencyKey(key string, ttl time.Duration) Option {
+	return optionFunc(func(o *Options) {
+		o.IdempotencyKey = key
+		o.UniqueForTTL = 0
+		o.UniqueLockTTL = ttl
+	})
+}
+
+// UniqueFor deduplicates enqueue attempts with the same queue, job name, and
+// canonical plaintext arguments for ttl. A duplicate enqueue during the window
+// returns the original job ID without creating a second job.
+func UniqueFor(ttl time.Duration) Option {
+	return optionFunc(func(o *Options) {
+		o.IdempotencyKey = ""
+		o.UniqueForTTL = ttl
+		o.UniqueLockTTL = ttl
 	})
 }
 

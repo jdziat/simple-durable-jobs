@@ -108,6 +108,43 @@ Larger batches clear backlog faster but hold database write locks longer. Shorte
 intervals reduce how long old rows remain visible after crossing the retention
 window, at the cost of more frequent scans.
 
+## Windowed unique-lock GC
+
+`jobs.IdempotencyKey` and `jobs.UniqueFor` use a separate `unique_locks` table
+to remember time-windowed enqueue deduplication keys. Each row stores the
+deduplication scope, the original job ID returned to duplicate enqueue callers,
+and the window expiry time. This table is separate from the active-job
+`Unique` guard, so it can keep deduplicating after the original job has already
+completed.
+
+Expired `unique_locks` rows are swept by a worker background loop. Unlike
+retention, this sweep is default-on so windowed enqueue deduplication bounds its
+own table even when terminal-job retention is not configured. By default, the
+sweep runs every hour and deletes up to 1000 expired locks per pass.
+
+Tune the cadence and batch size with `WithUniqueLockSweep`:
+
+```go
+w := jobs.NewWorker(q,
+	jobs.WithUniqueLockSweep(
+		jobs.UniqueLockSweepInterval(time.Hour),
+		jobs.UniqueLockSweepBatchSize(1000),
+	),
+)
+```
+
+You can disable the sweep if another process owns unique-lock cleanup:
+
+```go
+w := jobs.NewWorker(q,
+	jobs.WithUniqueLockSweep(jobs.UniqueLockSweepDisabled()),
+)
+```
+
+Disabling this sweep means expired `unique_locks` rows remain until your own
+cleanup deletes them. Live deduplication still treats expired rows as
+replaceable at enqueue time, but the table will grow without a sweeper.
+
 ## Checkpoints
 
 Checkpoints are the per-call replay markers that make a job exactly-once. They

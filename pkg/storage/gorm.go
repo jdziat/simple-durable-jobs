@@ -185,6 +185,7 @@ func (s *GormStorage) Migrate(ctx context.Context) error {
 			&core.Signal{},
 			&core.ConcurrencySlot{},
 			&core.RateLimitWindow{},
+			&core.UniqueLock{},
 			&core.SchemaMigration{},
 		); err != nil {
 			return err

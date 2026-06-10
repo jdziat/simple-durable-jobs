@@ -73,6 +73,50 @@ serialized fragment can over-match.
 
 Ensures only one pending-or-running job with this `key` exists. If a matching job already exists, `Queue.Enqueue` returns `ErrDuplicateJob`. The uniqueness check runs inside a transaction with row-level locking on Postgres/MySQL and relies on SQLite's writer serialization. The key has no TTL — the guard releases as soon as the existing job reaches `completed`, `failed`, or `cancelled`.
 
+### `IdempotencyKey(key string, ttl time.Duration) Option`
+
+Deduplicates enqueue attempts with the same caller-supplied key for `ttl`.
+The scope is the queue, job name, and key. If a live idempotency window already
+exists, `Queue.Enqueue` returns the original job ID and does not create another
+job row.
+
+Use this for API request idempotency, such as honoring an HTTP
+`Idempotency-Key` header for 24 hours.
+
+```go
+jobID, err := queue.Enqueue(ctx, "charge-card", paymentID,
+    jobs.IdempotencyKey(requestID, 24*time.Hour),
+)
+```
+
+### `UniqueFor(ttl time.Duration) Option`
+
+Deduplicates enqueue attempts with the same queue, job name, and canonical
+plaintext arguments for `ttl`. Here "canonical" means the `json.Marshal` output
+of your normalized arguments; map keys are sorted by the encoder, but slice
+order and numeric representation are still your responsibility. If a matching
+live window already exists,
+`Queue.Enqueue` returns the original job ID and creates no second job row.
+
+Use this when the job arguments themselves identify the work, such as "sync
+this account at most once per hour".
+
+```go
+jobID, err := queue.Enqueue(ctx, "sync-account", args,
+    jobs.UniqueFor(time.Hour),
+)
+```
+
+`Unique` and the windowed options solve different problems. `Unique` is an
+active-job guard: it blocks another pending or running job with the same key,
+then releases when that job becomes terminal. `IdempotencyKey` and `UniqueFor`
+are time-window guards: they keep deduplicating until the TTL expires, even if
+the original job completed quickly.
+
+If you set `Unique` together with `IdempotencyKey` or `UniqueFor` on one
+enqueue, the windowed unique-lock path takes precedence. The duplicate returns
+the original job ID rather than `ErrDuplicateJob`.
+
 ### `Timeout(d time.Duration) Option`
 
 Records a per-job timeout on the job record. The value is surfaced on the job metadata and in events — applications should enforce it via the handler's `context.Context` or external monitoring; the queue does not cancel handlers automatically.

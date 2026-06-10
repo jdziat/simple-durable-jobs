@@ -169,6 +169,12 @@ type (
 	// RateLimitOption configures a RateLimit.
 	RateLimitOption = worker.RateLimitOption
 
+	// UniqueLockSweepConfig controls automatic GC of expired windowed enqueue locks.
+	UniqueLockSweepConfig = worker.UniqueLockSweepConfig
+
+	// UniqueLockSweepOption configures automatic unique-lock GC.
+	UniqueLockSweepOption = worker.UniqueLockSweepOption
+
 	// RetentionConfig controls automatic retention.
 	RetentionConfig = worker.RetentionConfig
 
@@ -330,6 +336,7 @@ var (
 	ErrStorageNoTxEnqueue    = core.ErrStorageNoTxEnqueue
 	ErrStorageNoTxCheckpoint = core.ErrStorageNoTxCheckpoint
 	ErrStorageNoBatchDequeue = core.ErrStorageNoBatchDequeue
+	ErrStorageNoUniqueLocks  = core.ErrStorageNoUniqueLocks
 	ErrPayloadDecode         = core.ErrPayloadDecode
 
 	ErrUnsupportedWorkflowVersion = jobctx.ErrUnsupportedWorkflowVersion
@@ -662,6 +669,20 @@ func Unique(key string) Option {
 	return queue.Unique(key)
 }
 
+// IdempotencyKey deduplicates enqueue attempts with the same caller-supplied
+// key for ttl. A duplicate enqueue during the window returns the original job
+// ID without creating a second job.
+func IdempotencyKey(key string, ttl time.Duration) Option {
+	return queue.IdempotencyKey(key, ttl)
+}
+
+// UniqueFor deduplicates enqueue attempts with the same queue, job name, and
+// canonical plaintext arguments for ttl. A duplicate enqueue during the window
+// returns the original job ID without creating a second job.
+func UniqueFor(ttl time.Duration) Option {
+	return queue.UniqueFor(ttl)
+}
+
 // Determinism sets the Call replay mode.
 func Determinism(mode DeterminismMode) Option {
 	return queue.Determinism(mode)
@@ -745,6 +766,30 @@ func RetentionBatchSize(n int) RetentionOption {
 // path is never affected (retry replay keeps checkpoints).
 func RetentionDeleteCheckpointsOnComplete() RetentionOption {
 	return worker.RetentionDeleteCheckpointsOnComplete()
+}
+
+// WithUniqueLockSweep configures automatic garbage collection of expired
+// IdempotencyKey/UniqueFor locks. The sweep is enabled by default; use
+// UniqueLockSweepDisabled to turn it off.
+func WithUniqueLockSweep(opts ...UniqueLockSweepOption) WorkerOption {
+	return worker.WithUniqueLockSweep(opts...)
+}
+
+// UniqueLockSweepInterval sets the expired unique-lock scan cadence.
+func UniqueLockSweepInterval(d time.Duration) UniqueLockSweepOption {
+	return worker.UniqueLockSweepInterval(d)
+}
+
+// UniqueLockSweepBatchSize sets the maximum expired unique-lock rows deleted in
+// one pass.
+func UniqueLockSweepBatchSize(n int) UniqueLockSweepOption {
+	return worker.UniqueLockSweepBatchSize(n)
+}
+
+// UniqueLockSweepDisabled disables automatic deletion of expired
+// IdempotencyKey/UniqueFor locks.
+func UniqueLockSweepDisabled() UniqueLockSweepOption {
+	return worker.UniqueLockSweepDisabled()
 }
 
 // WithQueueRateLimit applies a per-worker token bucket before dequeueing from
