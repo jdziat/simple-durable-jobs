@@ -76,6 +76,25 @@ test.describe('Dashboard', () => {
     await expect(periodSelector.getByText('7d')).toBeVisible()
   })
 
+  test('switching period changes the throughput window', async ({ page }) => {
+    const periodSelector = page.locator('.period-selector')
+    const firstBucket = page.locator('.chart-section table tbody tr').first().locator('td').first()
+
+    // 1h: the earliest bucket is ~an hour ago.
+    await periodSelector.getByText('1h', { exact: true }).click()
+    await expect(page.locator('.chart-section')).toContainText('over 1h')
+    await expect(firstBucket).not.toHaveText('')
+    const oneHourStart = (await firstBucket.textContent())?.trim() ?? ''
+
+    // 7d: the earliest bucket must move back ~a week, so the window genuinely
+    // changed (this is the bug: it used to render the same data for every range).
+    await periodSelector.getByText('7d', { exact: true }).click()
+    await expect(page.locator('.chart-section')).toContainText('over 7d')
+    await expect(firstBucket).not.toHaveText(oneHourStart)
+    const sevenDayStart = (await firstBucket.textContent())?.trim() ?? ''
+    expect(sevenDayStart).not.toBe(oneHourStart)
+  })
+
   test('stat cards link to filtered job lists', async ({ page }) => {
     await expect(metricCard(page, 'Failed')).toHaveAttribute('href', '#/jobs?status=failed')
     await expect(metricCard(page, 'Pending')).toHaveAttribute('href', '#/jobs?status=pending')

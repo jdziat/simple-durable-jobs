@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sort"
 	"sync/atomic"
 	"time"
 
@@ -91,37 +90,65 @@ func (s *jobsService) GetStatsHistory(ctx context.Context, req *connect.Request[
 		return nil, connect.NewError(connect.CodeInternal, err)
 	}
 
-	// Aggregate completed and failed into DataPoint slices
-	completedMap := make(map[int64]int64)
-	failedMap := make(map[int64]int64)
-	for _, st := range stats {
-		ts := st.Timestamp.Unix()
-		completedMap[ts] += st.Completed
-		failedMap[ts] += st.Failed
-	}
-
-	resp := &jobsv1.GetStatsHistoryResponse{}
-	for ts, val := range completedMap {
-		resp.Completed = append(resp.Completed, &jobsv1.DataPoint{
-			Timestamp: timestamppb.New(time.Unix(ts, 0)),
-			Value:     val,
-		})
-	}
-	for ts, val := range failedMap {
-		resp.Failed = append(resp.Failed, &jobsv1.DataPoint{
-			Timestamp: timestamppb.New(time.Unix(ts, 0)),
-			Value:     val,
-		})
-	}
-
-	sort.Slice(resp.Completed, func(i, j int) bool {
-		return resp.Completed[i].Timestamp.AsTime().Before(resp.Completed[j].Timestamp.AsTime())
-	})
-	sort.Slice(resp.Failed, func(i, j int) bool {
-		return resp.Failed[i].Timestamp.AsTime().Before(resp.Failed[j].Timestamp.AsTime())
-	})
+	// Bucket the raw per-minute rows into a fixed, evenly-spaced grid that spans
+	// the WHOLE requested window. This is what makes the 1h / 24h / 7d selector
+	// actually change the chart: each period uses a period-appropriate bucket
+	// size, so the returned series both covers the full window (so the time axis
+	// reflects 1h vs 7d) and stays bounded (so 7d is not 10k raw points). Empty
+	// buckets are emitted as zeros so the index-based chart maps index→time.
+	resp := bucketStatsHistory(stats, since, until, periodBucket(req.Msg.Period))
 
 	return connect.NewResponse(resp), nil
+}
+
+// periodBucket returns the time-bucket width for a throughput period, chosen so
+// each window resolves to a similar, readable number of points (~48-90).
+func periodBucket(period string) time.Duration {
+	switch period {
+	case "24h":
+		return 30 * time.Minute // ~48 buckets
+	case "7d":
+		return 3 * time.Hour // ~56 buckets
+	default:
+		return time.Minute // 1h -> 60 buckets
+	}
+}
+
+// bucketStatsHistory aggregates raw stat rows into a contiguous grid of buckets
+// of width `bucket` spanning [since, until], emitting one Completed and one
+// Failed DataPoint per bucket (zeros included) in ascending time order.
+func bucketStatsHistory(stats []JobStat, since, until time.Time, bucket time.Duration) *jobsv1.GetStatsHistoryResponse {
+	resp := &jobsv1.GetStatsHistoryResponse{}
+	if bucket <= 0 {
+		bucket = time.Minute
+	}
+	// Align the window start down to a bucket boundary so buckets are stable.
+	start := since.Truncate(bucket)
+	if until.Before(start) {
+		until = start
+	}
+	n := int(until.Sub(start)/bucket) + 1
+	if n < 1 {
+		n = 1
+	}
+	completed := make([]int64, n)
+	failed := make([]int64, n)
+	for _, st := range stats {
+		idx := int(st.Timestamp.Sub(start) / bucket)
+		if idx < 0 || idx >= n {
+			continue
+		}
+		completed[idx] += st.Completed
+		failed[idx] += st.Failed
+	}
+	resp.Completed = make([]*jobsv1.DataPoint, n)
+	resp.Failed = make([]*jobsv1.DataPoint, n)
+	for i := 0; i < n; i++ {
+		ts := timestamppb.New(start.Add(time.Duration(i) * bucket))
+		resp.Completed[i] = &jobsv1.DataPoint{Timestamp: ts, Value: completed[i]}
+		resp.Failed[i] = &jobsv1.DataPoint{Timestamp: ts, Value: failed[i]}
+	}
+	return resp
 }
 
 // ListJobs returns a paginated list of jobs with filters.

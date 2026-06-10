@@ -811,7 +811,10 @@ func TestGetStatsHistory_NilStatsStorage(t *testing.T) {
 }
 
 func TestGetStatsHistory_WithStats(t *testing.T) {
-	ts := time.Now().Truncate(time.Minute)
+	// Two adjacent minute rows fall into two adjacent 1-minute buckets within the
+	// 1h grid. The response is a full window-spanning grid (~60 buckets), with the
+	// raw counts preserved in their buckets and every other bucket zero.
+	ts := time.Now().Truncate(time.Minute).Add(-2 * time.Minute)
 	statsRows := []JobStat{
 		{Queue: "default", Timestamp: ts, Completed: 5, Failed: 2},
 		{Queue: "default", Timestamp: ts.Add(time.Minute), Completed: 3, Failed: 1},
@@ -826,8 +829,60 @@ func TestGetStatsHistory_WithStats(t *testing.T) {
 	svc := newJobsService(&mockStorage{}, nil, mockStats)
 	resp, err := svc.GetStatsHistory(context.Background(), connect.NewRequest(&jobsv1.GetStatsHistoryRequest{Period: "1h"}))
 	require.NoError(t, err)
-	assert.Len(t, resp.Msg.Completed, 2)
-	assert.Len(t, resp.Msg.Failed, 2)
+	// Full 1h grid at 1-minute buckets.
+	assert.Greater(t, len(resp.Msg.Completed), 55)
+	assert.Equal(t, len(resp.Msg.Completed), len(resp.Msg.Failed))
+	// Raw counts are preserved (summed across the grid).
+	var totalCompleted, totalFailed int64
+	for _, dp := range resp.Msg.Completed {
+		totalCompleted += dp.Value
+	}
+	for _, dp := range resp.Msg.Failed {
+		totalFailed += dp.Value
+	}
+	assert.Equal(t, int64(8), totalCompleted)
+	assert.Equal(t, int64(3), totalFailed)
+}
+
+func TestGetStatsHistory_BucketsSpanWindowPerPeriod(t *testing.T) {
+	// The returned grid must span the WHOLE requested window (so the time axis
+	// reflects 1h vs 24h vs 7d) and stay bounded, and the three periods must
+	// produce distinct, period-appropriate point counts.
+	mockStats := &mockStatsStorage{
+		getStatsHistoryFn: func(_ context.Context, _ string, _, _ time.Time) ([]JobStat, error) {
+			return nil, nil
+		},
+	}
+	svc := newJobsService(&mockStorage{}, nil, mockStats)
+
+	cases := map[string]struct {
+		minSpan, maxSpan time.Duration
+		minN, maxN       int
+	}{
+		"1h":  {55 * time.Minute, 61 * time.Minute, 55, 62},
+		"24h": {23 * time.Hour, 25 * time.Hour, 44, 52},
+		"7d":  {6 * 24 * time.Hour, 8 * 24 * time.Hour, 52, 60},
+	}
+	counts := map[string]int{}
+	for period, want := range cases {
+		resp, err := svc.GetStatsHistory(context.Background(), connect.NewRequest(&jobsv1.GetStatsHistoryRequest{Period: period}))
+		require.NoError(t, err)
+		pts := resp.Msg.Completed
+		require.NotEmpty(t, pts)
+		span := pts[len(pts)-1].Timestamp.AsTime().Sub(pts[0].Timestamp.AsTime())
+		assert.GreaterOrEqual(t, span, want.minSpan, "period %s span", period)
+		assert.LessOrEqual(t, span, want.maxSpan, "period %s span", period)
+		assert.GreaterOrEqual(t, len(pts), want.minN, "period %s count", period)
+		assert.LessOrEqual(t, len(pts), want.maxN, "period %s count", period)
+		counts[period] = len(pts)
+		// Buckets are ascending.
+		for i := 1; i < len(pts); i++ {
+			assert.True(t, pts[i-1].Timestamp.AsTime().Before(pts[i].Timestamp.AsTime()))
+		}
+	}
+	// Distinct windows resolve to distinct grids.
+	assert.NotEqual(t, counts["1h"], counts["24h"])
+	assert.NotEqual(t, counts["24h"], counts["7d"])
 }
 
 func TestGetStatsHistory_StorageError(t *testing.T) {
@@ -845,8 +900,8 @@ func TestGetStatsHistory_StorageError(t *testing.T) {
 }
 
 func TestGetStatsHistory_SortedByTimestamp(t *testing.T) {
-	ts := time.Now().Truncate(time.Minute)
-	// Provide stats out of order; response should be sorted ascending.
+	ts := time.Now().Truncate(time.Minute).Add(-3 * time.Minute)
+	// Provide stats out of order; the bucketed grid is always ascending.
 	statsRows := []JobStat{
 		{Queue: "default", Timestamp: ts.Add(2 * time.Minute), Completed: 30},
 		{Queue: "default", Timestamp: ts, Completed: 10},
@@ -860,13 +915,21 @@ func TestGetStatsHistory_SortedByTimestamp(t *testing.T) {
 	svc := newJobsService(&mockStorage{}, nil, mockStats)
 	resp, err := svc.GetStatsHistory(context.Background(), connect.NewRequest(&jobsv1.GetStatsHistoryRequest{Period: "1h"}))
 	require.NoError(t, err)
-	require.Len(t, resp.Msg.Completed, 3)
-	// Verify ascending timestamp order.
-	assert.True(t, resp.Msg.Completed[0].Timestamp.AsTime().Before(resp.Msg.Completed[1].Timestamp.AsTime()))
-	assert.True(t, resp.Msg.Completed[1].Timestamp.AsTime().Before(resp.Msg.Completed[2].Timestamp.AsTime()))
+	require.NotEmpty(t, resp.Msg.Completed)
+	// Verify the full grid is ascending and the out-of-order input is preserved.
+	var total int64
+	for i, dp := range resp.Msg.Completed {
+		total += dp.Value
+		if i > 0 {
+			assert.True(t, resp.Msg.Completed[i-1].Timestamp.AsTime().Before(dp.Timestamp.AsTime()))
+		}
+	}
+	assert.Equal(t, int64(60), total)
 }
 
 func TestGetStatsHistory_AllPeriods(t *testing.T) {
+	// With no rows, every period still returns a window-spanning all-zero grid so
+	// the time axis reflects the window; the frontend renders this as "no data".
 	periods := []string{"1h", "24h", "7d", "", "bad"}
 	for _, p := range periods {
 		mockStats := &mockStatsStorage{
@@ -877,7 +940,16 @@ func TestGetStatsHistory_AllPeriods(t *testing.T) {
 		svc := newJobsService(&mockStorage{}, nil, mockStats)
 		resp, err := svc.GetStatsHistory(context.Background(), connect.NewRequest(&jobsv1.GetStatsHistoryRequest{Period: p}))
 		require.NoError(t, err, "period=%q", p)
-		assert.Empty(t, resp.Msg.Completed, "period=%q", p)
+		require.NotEmpty(t, resp.Msg.Completed, "period=%q", p)
+		assert.Equal(t, len(resp.Msg.Completed), len(resp.Msg.Failed), "period=%q", p)
+		var total int64
+		for _, dp := range resp.Msg.Completed {
+			total += dp.Value
+		}
+		for _, dp := range resp.Msg.Failed {
+			total += dp.Value
+		}
+		assert.Zero(t, total, "period=%q: empty input must yield an all-zero grid", p)
 	}
 }
 

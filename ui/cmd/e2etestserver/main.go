@@ -352,9 +352,51 @@ func seedE2EData(ctx context.Context, store *storage.GormStorage, db *gorm.DB) e
 }
 
 func seedStatsHistory(ctx context.Context, statsStore ui.StatsStorage, now time.Time) error {
-	start := now.Truncate(time.Minute).Add(-70 * time.Minute)
 	queues := []string{"default", "emails"}
+	nowMin := now.Truncate(time.Minute)
 
+	// Historical span: 7 full days at 15-minute granularity with a diurnal wave,
+	// so the 24h and 7d throughput windows show a real day/night shape and the
+	// 1h / 24h / 7d selector visibly changes the chart. The most recent ~75
+	// minutes are then overwritten at 1-minute granularity (below) so the 1h
+	// window is smooth. Counts are per-bucket; the y-axis auto-scales.
+	weekAgo := nowMin.Add(-7 * 24 * time.Hour)
+	recentStart := nowMin.Add(-75 * time.Minute)
+	histBuckets := 0
+	for ts := weekAgo; ts.Before(recentStart); ts = ts.Add(15 * time.Minute) {
+		// Diurnal factor: busy 09:00-18:00, quiet overnight (deterministic).
+		hour := ts.Hour()
+		dayFactor := int64(1)
+		switch {
+		case hour >= 9 && hour < 18:
+			dayFactor = 5
+		case hour >= 6 && hour < 22:
+			dayFactor = 3
+		}
+		minuteOfDay := ts.Hour()*60 + ts.Minute()
+		for queueIndex, queueName := range queues {
+			completed := dayFactor*int64(8+((minuteOfDay/15+queueIndex*5)%12)) + int64(queueIndex*4)
+			failed := int64(0)
+			if (minuteOfDay/15+queueIndex*3)%23 == 0 {
+				failed = dayFactor + int64(minuteOfDay%4)
+			}
+			if err := statsStore.UpsertStatCounters(ctx, queueName, ts, completed, failed, 0); err != nil {
+				return fmt.Errorf("failed to seed stat counters for %s at %s: %w", queueName, ts.Format(time.RFC3339), err)
+			}
+			// Hourly queue-depth snapshots over the historical span.
+			if ts.Minute() == 0 {
+				pending := int64(3 + ((hour + queueIndex*2) % 9))
+				running := int64(1 + ((hour + queueIndex) % 3))
+				if err := statsStore.SnapshotQueueDepth(ctx, queueName, ts, pending, running); err != nil {
+					return fmt.Errorf("failed to seed queue depth for %s at %s: %w", queueName, ts.Format(time.RFC3339), err)
+				}
+			}
+		}
+		histBuckets++
+	}
+
+	// Recent window: dense 1-minute granularity for a smooth 1h view.
+	start := nowMin.Add(-70 * time.Minute)
 	for minute := 0; minute <= 70; minute++ {
 		ts := start.Add(time.Duration(minute) * time.Minute)
 		for queueIndex, queueName := range queues {
@@ -394,7 +436,7 @@ func seedStatsHistory(ctx context.Context, statsStore ui.StatsStorage, now time.
 		}
 	}
 
-	log.Printf("Seeded stats history for %d queues across 71 minute buckets", len(queues))
+	log.Printf("Seeded stats history for %d queues: 7d at 15m granularity (%d buckets) + last 71m at 1m granularity", len(queues), histBuckets)
 	return nil
 }
 
