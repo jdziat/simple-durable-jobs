@@ -21,20 +21,36 @@
   const BAR_HEIGHT = 24
   const AXIS_HEIGHT = 36
   const MIN_TIMELINE_WIDTH = 640
-  const LABEL_WIDTH = 260
-  const MONO_ADVANCE = 7
+  const LABEL_WIDTH_MIN = 420
+  const LABEL_WIDTH_MAX = 520
+  const LABEL_WIDTH_VW = 32
+  const MOBILE_LABEL_WIDTH_MIN = 300
+  const MOBILE_LABEL_WIDTH_MAX = 360
+  const MOBILE_LABEL_WIDTH_VW = 42
+  const MOBILE_BREAKPOINT = 720
+  const TIMELINE_LEFT_INSET = 6
+  const RIGHT_GUTTER = 8
+  const MIN_BAR_WIDTH = 14
+  const ONGOING_BAR_MIN_WIDTH = 72
+  const ONGOING_BAR_MAX_WIDTH = 160
+  const OUTLIER_RATIO = 8
+  const OUTLIER_MIN_DELTA_MS = 60_000
 
   type RootRow = { type: 'root'; job: Job; indent: 0 }
   type FanOutHeaderRow = { type: 'fanout-header'; fanOut: FanOut; indent: 1 }
   type SubjobRow = { type: 'subjob'; job: Job; indent: 1 | 2 }
   type Row = RootRow | FanOutHeaderRow | SubjobRow
+  type BarCoords = { x: number; width: number; pending: boolean; ongoing: boolean; naturalEndX: number }
 
   let selectedJob = $state<Job | null>(null)
   let selectedFanOut = $state<FanOut | null>(null)
   let focusedJob = $state<Job | null>(null)
   let resolvingIds = $state<Set<string>>(new Set())
   let scrollEl = $state<HTMLDivElement | null>(null)
+  let labelWidth = $state(LABEL_WIDTH_MIN)
   let timelineWidth = $state(MIN_TIMELINE_WIDTH)
+  let timelineInnerWidth = $derived(Math.max(1, timelineWidth - TIMELINE_LEFT_INSET - RIGHT_GUTTER))
+  let timelinePlotEnd = $derived(TIMELINE_LEFT_INSET + timelineInnerWidth)
 
   let previousStatuses = new Map<string, string>()
   let resolveTimer: ReturnType<typeof setTimeout> | null = null
@@ -65,7 +81,9 @@
     resizeObserver?.disconnect()
     resizeObserver = new ResizeObserver(entries => {
       const width = entries[0]?.contentRect.width ?? 0
-      timelineWidth = Math.max(MIN_TIMELINE_WIDTH, Math.floor(width - LABEL_WIDTH))
+      const nextLabelWidth = responsiveLabelWidth(width)
+      labelWidth = nextLabelWidth
+      timelineWidth = Math.max(MIN_TIMELINE_WIDTH, Math.floor(width - nextLabelWidth))
     })
     resizeObserver.observe(scrollEl)
 
@@ -123,19 +141,55 @@
     return result
   })
 
-  const timeStart = $derived(root.createdAt?.toDate() ?? new Date())
-  const timeEnd = $derived.by(() => {
+  const timeDomain = $derived.by(() => {
     const now = Date.now()
-    let max = root.completedAt?.toDate()?.getTime() ?? now
-    for (const job of children) {
-      const completed = job.completedAt?.toDate()?.getTime()
-      const started = job.startedAt?.toDate()?.getTime()
+    let fullMin = root.createdAt?.toDate()?.getTime() ?? now
+    let fullMax = fullMin
+    let finiteMin = Number.POSITIVE_INFINITY
+    let finiteMax = Number.NEGATIVE_INFINITY
+    let hasFiniteWork = false
+    let longestOpenEnded = 0
+
+    for (const job of [root, ...children]) {
       const created = job.createdAt?.toDate()?.getTime()
-      max = Math.max(max, completed ?? started ?? created ?? now)
+      const started = job.startedAt?.toDate()?.getTime()
+      const completed = job.completedAt?.toDate()?.getTime()
+      const start = started ?? created
+      const end = completed ?? started ?? created
+
+      if (start) fullMin = Math.min(fullMin, start)
+      if (created) fullMin = Math.min(fullMin, created)
+      fullMax = Math.max(fullMax, completed ?? (started ? now : (created ?? now)), end ?? now)
+
+      if (start && completed && completed >= start) {
+        hasFiniteWork = true
+        finiteMin = Math.min(finiteMin, start)
+        finiteMax = Math.max(finiteMax, completed)
+      }
+
+      if (started && !completed) {
+        longestOpenEnded = Math.max(longestOpenEnded, now - started)
+      }
     }
-    return new Date(Math.max(max, now))
+
+    const fullRange = Math.max(fullMax - fullMin, 1)
+    const finiteRange = hasFiniteWork ? Math.max(finiteMax - finiteMin, 1) : fullRange
+    const shouldFocusFiniteWork =
+      hasFiniteWork &&
+      longestOpenEnded > finiteRange * OUTLIER_RATIO &&
+      longestOpenEnded - finiteRange > OUTLIER_MIN_DELTA_MS
+
+    if (shouldFocusFiniteWork) {
+      const padding = Math.max(1000, finiteRange * 0.12)
+      return { start: finiteMin - padding, end: finiteMax + padding, focused: true }
+    }
+
+    return { start: fullMin, end: fullMax, focused: false }
   })
+  const timeStart = $derived(new Date(timeDomain.start))
+  const timeEnd = $derived(new Date(timeDomain.end))
   const timeRange = $derived(Math.max(timeEnd.getTime() - timeStart.getTime(), 1))
+  const minimapHeight = $derived(Math.max(22, Math.min(48, rows.filter(row => row.type !== 'fanout-header').length * 4 + 8)))
 
   const ticks = $derived.by(() => {
     const rangeMin = timeRange / 60_000
@@ -156,7 +210,7 @@
     for (const fanOut of sortedFanOuts) {
       const jobs = childrenByFanOut.get(fanOut.id) ?? []
       const starts = jobs.map(job => barCoords(job).x).filter(x => Number.isFinite(x))
-      if (starts.length > 0) map.set(fanOut.id, Math.max(0, Math.min(...starts) - 8))
+      if (starts.length > 0) map.set(fanOut.id, Math.max(TIMELINE_LEFT_INSET, Math.min(...starts) - 8))
     }
     return map
   })
@@ -179,25 +233,50 @@
   }
 
   function xForTime(time: number): number {
-    return Math.max(0, Math.min(timelineWidth, ((time - timeStart.getTime()) / timeRange) * timelineWidth))
+    const offset = ((time - timeStart.getTime()) / timeRange) * timelineInnerWidth
+    return TIMELINE_LEFT_INSET + Math.max(0, Math.min(timelineInnerWidth, offset))
   }
 
-  function barCoords(job: Job): { x: number; width: number; pending: boolean } {
+  function effectiveEndForJob(job: Job): number {
+    const now = Date.now()
+    const completed = job.completedAt?.toDate()?.getTime()
+    if (completed) return completed
+
+    const started = job.startedAt?.toDate()?.getTime()
+    if (started) return now
+
+    return job.createdAt?.toDate()?.getTime() ?? now
+  }
+
+  function barCoords(job: Job): BarCoords {
     const now = Date.now()
     const created = job.createdAt?.toDate()?.getTime() ?? now
     const started = job.startedAt?.toDate()?.getTime()
     const completed = job.completedAt?.toDate()?.getTime()
 
     if (!started && !completed) {
-      return { x: xForTime(created), width: 0, pending: true }
+      const x = xForTime(created)
+      return { x, width: 0, pending: true, ongoing: false, naturalEndX: x }
     }
 
     const start = started ?? created
-    const end = completed ?? now
+    const end = completed ?? effectiveEndForJob(job)
+    const x = xForTime(start)
+    const naturalEndX = xForTime(end)
+    const naturalWidth = Math.max(MIN_BAR_WIDTH, naturalEndX - x)
+
+    if (started && !completed) {
+      const capWidth = clamp(timelineInnerWidth * 0.16, ONGOING_BAR_MIN_WIDTH, ONGOING_BAR_MAX_WIDTH)
+      const width = Math.min(naturalWidth, capWidth, Math.max(MIN_BAR_WIDTH, timelinePlotEnd - x))
+      return { x, width: Math.max(MIN_BAR_WIDTH, width), pending: false, ongoing: true, naturalEndX }
+    }
+
     return {
-      x: xForTime(start),
-      width: Math.max(6, xForTime(end) - xForTime(start)),
+      x,
+      width: naturalWidth,
       pending: false,
+      ongoing: false,
+      naturalEndX,
     }
   }
 
@@ -230,8 +309,18 @@
     return id.length > len ? `${id.slice(0, len)}...` : id
   }
 
-  function monoWidth(text: string, pad = 12): number {
-    return Math.max(36, text.length * MONO_ADVANCE + pad)
+  function responsiveLabelWidth(containerWidth: number): number {
+    if (containerWidth <= 0) return LABEL_WIDTH_MIN
+
+    if (containerWidth <= MOBILE_BREAKPOINT) {
+      return clamp(containerWidth * (MOBILE_LABEL_WIDTH_VW / 100), MOBILE_LABEL_WIDTH_MIN, MOBILE_LABEL_WIDTH_MAX)
+    }
+
+    return clamp(containerWidth * (LABEL_WIDTH_VW / 100), LABEL_WIDTH_MIN, LABEL_WIDTH_MAX)
+  }
+
+  function clamp(value: number, min: number, max: number): number {
+    return Math.min(max, Math.max(min, value))
   }
 
   function formatJson(bytes: Uint8Array | undefined): string {
@@ -273,6 +362,17 @@
     event.stopPropagation()
     onJobClick(jobId)
   }
+
+  function minimapY(rowIndex: number): number {
+    const plottableRows = rows.filter(row => row.type !== 'fanout-header').length
+    if (plottableRows <= 1) return Math.max(7, minimapHeight / 2 - 2)
+    const step = (minimapHeight - 10) / Math.max(1, plottableRows - 1)
+    let index = 0
+    for (const row of rows.slice(0, rowIndex)) {
+      if (row.type !== 'fanout-header') index += 1
+    }
+    return 5 + index * step
+  }
 </script>
 
 <div class="waterfall-chart">
@@ -282,10 +382,10 @@
       <div class="summary-stats">
         <span class="stat"><span class="stat-count">{totalJobs}</span> jobs</span>
         <span class="stat-sep">|</span>
-        <span class="stat stat-completed"><span class="stat-dot role-ok"></span>{completedJobs}</span>
-        <span class="stat stat-running"><span class="stat-dot role-info"></span>{runningJobs}</span>
+        <span class="stat stat-completed"><span class="stat-dot role-ok"></span><span class="stat-count">{completedJobs}</span> completed</span>
+        <span class="stat stat-running"><span class="stat-dot role-info"></span><span class="stat-count">{runningJobs}</span> running</span>
         {#if failedJobs > 0}
-          <span class="stat stat-failed"><span class="stat-dot role-danger"></span>{failedJobs}</span>
+          <span class="stat stat-failed"><span class="stat-dot role-danger"></span><span class="stat-count">{failedJobs}</span> failed</span>
         {/if}
         {#if totalDurationMs !== null}
           <span class="stat-sep">|</span>
@@ -304,14 +404,18 @@
   </div>
 
   <div class="minimap" aria-hidden="true">
-    <svg width="100%" height="22" viewBox={`0 0 ${timelineWidth} 22`}>
-      {#each rows as row}
+    <svg width="100%" height={minimapHeight} viewBox={`0 0 ${timelineWidth} ${minimapHeight}`}>
+      {#each rows as row, rowIndex}
         {#if row.type !== 'fanout-header'}
           {@const c = barCoords(row.job)}
+          {@const y = minimapY(rowIndex)}
           {#if c.pending}
-            <rect class={`bar bar-${statusSlug(row.job.status)} ${roleClass(row.job.status)}`} x={c.x} y="8" width="5" height="5" rx="1" transform={`rotate(45 ${c.x + 2.5} 10.5)`} />
+            <rect class={`bar bar-${statusSlug(row.job.status)} ${roleClass(row.job.status)}`} x={c.x} y={y} width="5" height="5" rx="1" transform={`rotate(45 ${c.x + 2.5} ${y + 2.5})`} />
           {:else}
-            <rect class={`bar bar-${statusSlug(row.job.status)} ${roleClass(row.job.status)}`} x={c.x} y="7" width={c.width} height="8" rx="2" />
+            <rect class={`bar bar-${statusSlug(row.job.status)} ${roleClass(row.job.status)}`} x={c.x} y={y} width={c.width} height="3" rx="1.5" />
+            {#if c.ongoing}
+              <path class={`ongoing-marker ${roleClass(row.job.status)}`} d={`M ${c.x + c.width + 3} ${y - 1} L ${c.x + c.width + 8} ${y + 1.5} L ${c.x + c.width + 3} ${y + 4}`} />
+            {/if}
           {/if}
         {/if}
       {/each}
@@ -321,13 +425,13 @@
   <div
     class="gantt-scroll"
     bind:this={scrollEl}
-    style={`--label-width:${LABEL_WIDTH}px;--timeline-width:${timelineWidth}px;`}
+    style={`--label-width:${labelWidth}px;--timeline-width:${timelineWidth}px;`}
   >
     <div class="axis-row">
       <div class="label-gutter axis-label">Job</div>
       <div class="timeline">
         <svg width={timelineWidth} height={AXIS_HEIGHT} role="img" aria-label="Workflow time axis">
-          <line class="axis-line" x1="0" y1={AXIS_HEIGHT - 6} x2={timelineWidth} y2={AXIS_HEIGHT - 6} />
+          <line class="axis-line" x1={TIMELINE_LEFT_INSET} y1={AXIS_HEIGHT - 6} x2={timelinePlotEnd} y2={AXIS_HEIGHT - 6} />
           {#each ticks as tick}
             <g>
               <line class="tick-grid" x1={tick.x} y1={AXIS_HEIGHT - 6} x2={tick.x} y2={AXIS_HEIGHT} />
@@ -354,7 +458,7 @@
         <div class="label-gutter">
           {#if row.type === 'fanout-header'}
             <div class="fanout-label" style={`padding-left:${row.indent * 16}px`}>
-              <span class="strategy-badge" style={`width:${monoWidth(row.fanOut.strategy || 'fanout', 26)}px`}>{row.fanOut.strategy || 'fanout'}</span>
+              <span class="strategy-badge">{row.fanOut.strategy || 'fanout'}</span>
               <span class="fanout-progress">{row.fanOut.completedCount}/{row.fanOut.totalCount} completed</span>
               {#if row.fanOut.failedCount > 0}
                 <span class="fanout-failed">{row.fanOut.failedCount} failed</span>
@@ -366,22 +470,20 @@
               <span class={`status-dot ${roleClass(row.job.status)}`}></span>
               <a href="#/jobs/{row.job.id}" class="job-link" onclick={(event) => navigateJob(event, row.job.id)}>
                 <span class="job-type">{row.job.type}</span>
-                <span class="job-meta">
-                  <span>{truncateId(row.job.id)}</span>
-                  <span class="queue-badge" style={`width:${monoWidth(row.job.queue, 10)}px`}>{row.job.queue}</span>
-                </span>
-                <StatusBadge status={row.job.status} />
+                <span class="job-id">{row.job.id}</span>
+                <span class="queue-badge">{row.job.queue}</span>
               </a>
+              <StatusBadge status={row.job.status} />
             </div>
           {/if}
         </div>
 
         <div class="timeline">
           <svg width={timelineWidth} height={ROW_HEIGHT} role="img" aria-label={row.type === 'fanout-header' ? `Fan-out ${row.fanOut.strategy}` : `${row.job.type} ${row.job.status}`}>
-            <line class="row-rule" x1="0" y1="0" x2={timelineWidth} y2="0" />
+            <line class="row-rule" x1="0" y1="0" x2={timelinePlotEnd} y2="0" />
             {#if row.type === 'fanout-header'}
               {#if connectorByFanOut.get(row.fanOut.id) !== undefined}
-                <line class="connector-spine" x1={connectorByFanOut.get(row.fanOut.id)} y1={ROW_HEIGHT / 2} x2={timelineWidth} y2={ROW_HEIGHT / 2} />
+                <line class="connector-spine" x1={connectorByFanOut.get(row.fanOut.id)} y1={ROW_HEIGHT / 2} x2={timelinePlotEnd} y2={ROW_HEIGHT / 2} />
               {/if}
             {:else}
               {@const c = barCoords(row.job)}
@@ -402,16 +504,27 @@
                   transform={`rotate(45 ${c.x} ${ROW_HEIGHT / 2})`}
                 />
               {:else}
-                <rect
-                  class={`bar bar-${statusSlug(row.job.status)} ${roleClass(row.job.status)}`}
-                  class:bar-running={row.job.status === 'running'}
-                  class:resolve-fill={resolvingIds.has(row.job.id)}
-                  x={c.x}
-                  y={(ROW_HEIGHT - BAR_HEIGHT) / 2}
-                  width={c.width}
-                  height={BAR_HEIGHT}
-                  rx="4"
-                />
+                <g>
+                  {#if dur !== null}
+                    <title>{row.job.type}: {formatDuration(dur)} ({row.job.status})</title>
+                  {:else}
+                    <title>{row.job.type}: {row.job.status}</title>
+                  {/if}
+                  <rect
+                    class={`bar bar-${statusSlug(row.job.status)} ${roleClass(row.job.status)}`}
+                    class:bar-running={row.job.status === 'running'}
+                    class:resolve-fill={resolvingIds.has(row.job.id)}
+                    x={c.x}
+                    y={(ROW_HEIGHT - BAR_HEIGHT) / 2}
+                    width={c.width}
+                    height={BAR_HEIGHT}
+                    rx="4"
+                  />
+                  {#if c.ongoing}
+                    <line class={`ongoing-tail ${roleClass(row.job.status)}`} x1={c.x + c.width + 6} y1={ROW_HEIGHT / 2} x2={timelinePlotEnd} y2={ROW_HEIGHT / 2} />
+                    <path class={`ongoing-marker ${roleClass(row.job.status)}`} d={`M ${c.x + c.width + 4} ${ROW_HEIGHT / 2 - 7} L ${c.x + c.width + 12} ${ROW_HEIGHT / 2} L ${c.x + c.width + 4} ${ROW_HEIGHT / 2 + 7}`} />
+                  {/if}
+                </g>
                 {#if c.width > 56 && dur !== null}
                   <text class="bar-label" x={c.x + 8} y={ROW_HEIGHT / 2 + 4}>{formatDuration(dur)}</text>
                 {/if}
@@ -449,7 +562,7 @@
           {#if onJobClick}
             <button class="btn-view" type="button" onclick={() => onJobClick?.(job.id)}>View Full Detail</button>
           {/if}
-          <button class="btn-close" type="button" onclick={() => selectedJob = null} aria-label="Close">x</button>
+          <button class="btn-close" type="button" onclick={() => selectedJob = null} aria-label="Close">&times;</button>
         </div>
       </div>
 
@@ -515,7 +628,7 @@
           <h5>Fan-Out: {fo.strategy}</h5>
           <StatusBadge status={fo.status} />
         </div>
-        <button class="btn-close" type="button" onclick={() => selectedFanOut = null} aria-label="Close">x</button>
+        <button class="btn-close" type="button" onclick={() => selectedFanOut = null} aria-label="Close">&times;</button>
       </div>
 
       <div class="detail-grid">
@@ -638,6 +751,9 @@
   }
 
   .gantt-scroll {
+    --label-width: clamp(420px, 32vw, 520px);
+    --label-gutter-pad-right: var(--sp-3);
+
     overflow-x: auto;
     -webkit-overflow-scrolling: touch;
   }
@@ -670,9 +786,12 @@
     z-index: 2;
     display: flex;
     align-items: center;
+    width: var(--label-width);
+    overflow: hidden;
+    box-sizing: border-box;
     min-width: 0;
     min-height: 48px;
-    padding: 0 var(--sp-3);
+    padding: 0 var(--label-gutter-pad-right) 0 var(--sp-3);
     border-right: var(--border);
     background: inherit;
   }
@@ -724,8 +843,14 @@
     display: flex;
     align-items: center;
     gap: var(--sp-2);
+    overflow: hidden;
     min-width: 0;
     width: 100%;
+  }
+
+  .fanout-label {
+    gap: 6px;
+    white-space: nowrap;
   }
 
   .strategy-badge,
@@ -746,25 +871,60 @@
     white-space: nowrap;
   }
 
+  .strategy-badge {
+    flex: 0 1 auto;
+    max-width: 12ch;
+    padding: 0 8px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .queue-badge {
+    flex: 0 0 auto;
+    width: max-content;
+    max-width: none;
+    padding: 0 6px;
+    overflow: visible;
+    text-overflow: clip;
+  }
+
   .fanout-progress {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
     color: var(--fg-secondary);
     font-family: var(--font-mono);
-    font-size: var(--fs-label);
+    font-size: var(--fs-micro);
+    text-overflow: ellipsis;
     white-space: nowrap;
   }
 
   .fanout-failed {
+    flex: 0 0 auto;
     color: var(--sig-danger);
     font-family: var(--font-mono);
-    font-size: var(--fs-label);
+    font-size: var(--fs-micro);
     font-weight: var(--fw-head);
     white-space: nowrap;
   }
 
+  .fanout-label :global(.status) {
+    flex: 0 0 auto;
+    max-width: none;
+    overflow: visible;
+    padding-inline: 6px;
+    font-size: var(--fs-micro);
+    text-overflow: clip;
+  }
+
   .job-link {
     display: grid;
-    gap: var(--sp-1);
+    grid-template-columns: minmax(0, 13ch) minmax(0, 1fr) max-content;
+    align-items: center;
+    flex: 1 1 auto;
+    gap: var(--sp-2);
     min-width: 0;
+    overflow: hidden;
     color: inherit;
     text-decoration: none;
   }
@@ -775,6 +935,7 @@
   }
 
   .job-type {
+    min-width: 0;
     overflow: hidden;
     color: var(--fg-primary);
     font-size: var(--fs-body);
@@ -784,15 +945,22 @@
     white-space: nowrap;
   }
 
-  .job-meta {
-    display: flex;
-    align-items: center;
-    gap: var(--sp-2);
+  .job-id {
     min-width: 0;
+    overflow: hidden;
     color: var(--fg-secondary);
     font-family: var(--font-mono);
     font-size: var(--fs-micro);
     font-feature-settings: var(--num);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .job-label :global(.status) {
+    flex: 0 0 auto;
+    max-width: none;
+    overflow: visible;
+    text-overflow: clip;
   }
 
   .bar {
@@ -809,6 +977,22 @@
 
   .bar-running {
     animation: wf-scan var(--dur-sweep) var(--ease) infinite alternate;
+  }
+
+  .ongoing-tail {
+    stroke: currentColor;
+    stroke-width: 2;
+    stroke-dasharray: 5 6;
+    opacity: 0.42;
+  }
+
+  .ongoing-marker {
+    fill: none;
+    stroke: currentColor;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    stroke-width: 2;
+    opacity: 0.95;
   }
 
   .resolve-fill {
@@ -1010,13 +1194,21 @@
       border-radius: var(--radius-panel);
     }
 
-    .axis-row,
-    .chart-row {
-      grid-template-columns: 210px var(--timeline-width);
+    .gantt-scroll {
+      --label-width: clamp(300px, 42vw, 360px);
+      --label-gutter-pad-right: var(--sp-3);
     }
 
     .label-gutter {
-      padding: 0 var(--sp-2);
+      padding: 0 var(--label-gutter-pad-right) 0 var(--sp-2);
+    }
+
+    .job-link {
+      grid-template-columns: minmax(0, 12ch) minmax(0, 1fr);
+    }
+
+    .queue-badge {
+      display: none;
     }
 
     .detail-grid {

@@ -77,9 +77,9 @@ test.describe('Workflows Page', () => {
     await page.waitForSelector('.waterfall-chart', { timeout: 10000 })
 
     await expect(page.locator('.waterfall-chart svg').first()).toBeVisible()
-    await expect(page.locator(`a[href="#/jobs/${JOBS.WORKFLOW_CHILD_1}"]`).locator('.status')).toHaveText('completed')
-    await expect(page.locator(`a[href="#/jobs/${JOBS.WORKFLOW_CHILD_2}"]`).locator('.status')).toHaveText('running')
-    await expect(page.locator(`a[href="#/jobs/${JOBS.WORKFLOW_CHILD_3}"]`).locator('.status')).toHaveText('pending')
+    await expect(page.locator(`.job-label:has(a[href="#/jobs/${JOBS.WORKFLOW_CHILD_1}"]) .status`)).toHaveText('completed')
+    await expect(page.locator(`.job-label:has(a[href="#/jobs/${JOBS.WORKFLOW_CHILD_2}"]) .status`)).toHaveText('running')
+    await expect(page.locator(`.job-label:has(a[href="#/jobs/${JOBS.WORKFLOW_CHILD_3}"]) .status`)).toHaveText('pending')
   })
 
   test('waterfall svg fills resolve through signal tokens', async ({ page }) => {
