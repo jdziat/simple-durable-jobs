@@ -112,22 +112,73 @@ func TestDeadLetterQueries_FilterPaginationAndCount(t *testing.T) {
 	assert.EqualValues(t, 2, count)
 }
 
+func TestDeadLetterQueries_TenantMetadataAndSearch(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	base := time.Now().UTC().Add(-time.Hour).Truncate(time.Millisecond)
+	seedDeadLetterJobWithDetails(t, s, &core.Job{
+		ID:       "dlq-acme-prod",
+		Type:     "sync",
+		Queue:    "default",
+		Tenant:   "tenant-a",
+		Metadata: core.MetadataMap{"env": "prod", "region": "us"},
+		Args:     []byte(`{"account":"needle"}`),
+	}, base.Add(3*time.Minute))
+	seedDeadLetterJobWithDetails(t, s, &core.Job{
+		ID:       "dlq-acme-dev",
+		Type:     "sync",
+		Queue:    "default",
+		Tenant:   "tenant-a",
+		Metadata: core.MetadataMap{"env": "dev", "region": "us"},
+		Args:     []byte(`{"account":"other"}`),
+	}, base.Add(2*time.Minute))
+	seedDeadLetterJobWithDetails(t, s, &core.Job{
+		ID:       "dlq-globex-prod",
+		Type:     "sync",
+		Queue:    "default",
+		Tenant:   "tenant-b",
+		Metadata: core.MetadataMap{"env": "prod", "region": "eu"},
+		Args:     []byte(`{"account":"needle"}`),
+	}, base.Add(time.Minute))
+
+	filter := core.DeadLetterFilter{
+		Tenant:       "tenant-a",
+		MetaContains: &core.MetadataMap{"env": "prod"},
+		Search:       "needle",
+		Limit:        10,
+	}
+	matches, err := s.ListDeadLettered(ctx, filter)
+	require.NoError(t, err)
+	require.Len(t, matches, 1)
+	assert.Equal(t, "dlq-acme-prod", matches[0].ID)
+
+	total, err := s.CountDeadLettered(ctx, filter)
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, total)
+}
+
 func seedDeadLetterJob(t *testing.T, s *GormStorage, id, queue, jobType string, at time.Time) {
 	t.Helper()
+	seedDeadLetterJobWithDetails(t, s, &core.Job{
+		ID:    id,
+		Type:  jobType,
+		Queue: queue,
+	}, at)
+}
+
+func seedDeadLetterJobWithDetails(t *testing.T, s *GormStorage, job *core.Job, at time.Time) {
+	t.Helper()
 	ctx := context.Background()
+	job.Status = core.StatusFailed
+	job.Attempt = 1
+	job.MaxRetries = 1
+	job.LastError = "boom"
+	job.DeadLetteredAt = &at
+	job.DeadLetterReason = "max retries exhausted: boom"
+	job.CompletedAt = &at
 	require.NoError(t, s.withSerializationRetry(ctx, func() error {
-		return s.db.WithContext(ctx).Create(&core.Job{
-			ID:               id,
-			Type:             jobType,
-			Queue:            queue,
-			Status:           core.StatusFailed,
-			Attempt:          1,
-			MaxRetries:       1,
-			LastError:        "boom",
-			DeadLetteredAt:   &at,
-			DeadLetterReason: "max retries exhausted: boom",
-			CompletedAt:      &at,
-		}).Error
+		return s.db.WithContext(ctx).Create(job).Error
 	}))
 }
 

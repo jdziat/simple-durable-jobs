@@ -52,6 +52,23 @@ func (s *GormStorage) deadLetterQuery(ctx context.Context, filter core.DeadLette
 	if filter.Type != "" {
 		q = q.Where("type = ?", filter.Type)
 	}
+	if filter.Tenant != "" {
+		q = q.Where("tenant = ?", filter.Tenant)
+	}
+	if filter.MetaContains != nil {
+		for key, value := range *filter.MetaContains {
+			pattern := `%` + escapeLikePattern(metadataPairFragment(key, value)) + `%`
+			q = q.Where(metadataTextExpression(s)+" LIKE ? ESCAPE ?", pattern, `\`)
+		}
+	}
+	if filter.Search != "" {
+		searchTerm := filter.Search
+		if len(searchTerm) > maxUISearchLength {
+			searchTerm = searchTerm[:maxUISearchLength]
+		}
+		search := "%" + escapeLikePattern(searchTerm) + "%"
+		q = q.Where("id LIKE ? ESCAPE ? OR "+argsTextExpression(s)+" LIKE ? ESCAPE ?", search, `\`, search, `\`)
+	}
 	return q
 }
 

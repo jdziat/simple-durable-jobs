@@ -164,11 +164,7 @@ func (s *GormStorage) SearchJobs(ctx context.Context, filter core.JobFilter) ([]
 			searchTerm = searchTerm[:maxUISearchLength]
 		}
 		search := "%" + escapeLikePattern(searchTerm) + "%"
-		argsExpr := "CAST(args AS TEXT)"
-		if strings.Contains(strings.ToLower(s.db.Name()), "mysql") {
-			argsExpr = "CONVERT(args USING utf8mb4)"
-		}
-		q = q.Where("id LIKE ? ESCAPE ? OR "+argsExpr+" LIKE ? ESCAPE ?", search, `\`, search, `\`)
+		q = q.Where("id LIKE ? ESCAPE ? OR "+argsTextExpression(s)+" LIKE ? ESCAPE ?", search, `\`, search, `\`)
 	}
 	if !filter.Since.IsZero() {
 		q = q.Where("created_at >= ?", filter.Since)
@@ -204,6 +200,17 @@ func metadataTextExpression(s *GormStorage) string {
 		return "metadata::text"
 	default:
 		return "CAST(metadata AS CHAR)"
+	}
+}
+
+func argsTextExpression(s *GormStorage) string {
+	switch s.dialect() {
+	case dialectPostgres:
+		return "convert_from(args,'UTF8')"
+	case dialectMySQL:
+		return "CONVERT(args USING utf8mb4)"
+	default:
+		return "CAST(args AS TEXT)"
 	}
 }
 

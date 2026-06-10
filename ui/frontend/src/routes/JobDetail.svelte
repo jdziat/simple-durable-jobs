@@ -21,6 +21,8 @@
     id: string
     type: string
     queue: string
+    tenant: string
+    metadata: Record<string, string>
     status: string
     priority: number
     attempt: number
@@ -47,6 +49,7 @@
   type ConfirmState =
     | { kind: 'cancel'; id: string }
     | { kind: 'delete'; id: string }
+    | { kind: 'requeue'; id: string }
     | null
 
   let job = $state<JobDetail | null>(null)
@@ -66,6 +69,7 @@
 
   let displayStatus = $derived(job?.deadLetteredAt ? 'dead-lettered' : (job?.status ?? ''))
   let isRunning = $derived(job?.status === 'running' && !job.deadLetteredAt)
+  let metadataEntries = $derived(Object.entries(job?.metadata ?? {}).sort(([a], [b]) => a.localeCompare(b)))
 
   function toDate(value: { toDate?: () => Date } | undefined): Date | null {
     if (!value?.toDate) return null
@@ -156,6 +160,8 @@
         id: j.id,
         type: j.type,
         queue: j.queue,
+        tenant: j.tenant,
+        metadata: { ...j.metadata },
         status: j.status,
         priority: j.priority,
         attempt: j.attempt,
@@ -204,6 +210,18 @@
       loadJob()
     } catch (e) {
       toast.push({ kind: 'err', msg: e instanceof Error ? e.message : 'Failed to retry job' })
+    }
+  }
+
+  async function confirmRequeue() {
+    if (confirmState?.kind !== 'requeue') return
+    confirmState = null
+    try {
+      await jobsClient.retryJob({ id })
+      toast.push({ kind: 'ok', msg: 'job requeued' })
+      loadJob()
+    } catch (e) {
+      toast.push({ kind: 'err', msg: e instanceof Error ? e.message : 'Failed to requeue job' })
     }
   }
 
@@ -263,6 +281,11 @@
     confirmState = { kind: 'delete', id: job.id }
   }
 
+  function openRequeue() {
+    if (!job) return
+    confirmState = { kind: 'requeue', id: job.id }
+  }
+
   onMount(() => {
     mounted = true
     loadJob()
@@ -317,6 +340,10 @@
             <span class="value mono">{job.queue || '—'}</span>
           </div>
           <div class="meta-item">
+            <span class="label">Tenant</span>
+            <span class="value mono">{job.tenant || '—'}</span>
+          </div>
+          <div class="meta-item">
             <span class="label">Attempts/Max</span>
             <span class="value mono" use:deltaFlash={`${job.attempt}/${job.maxRetries}`}>{job.attempt}/{job.maxRetries}</span>
           </div>
@@ -331,6 +358,24 @@
               <CopyButton text={job.worker} />
             {/if}
           </div>
+        </section>
+
+        <section class="job-metadata panel">
+          <div class="section-heading">Job Metadata</div>
+          {#if metadataEntries.length > 0}
+            <table>
+              <tbody>
+                {#each metadataEntries as [key, value]}
+                  <tr>
+                    <th>{key}</th>
+                    <td>{value}</td>
+                  </tr>
+                {/each}
+              </tbody>
+            </table>
+          {:else}
+            <span class="muted">—</span>
+          {/if}
         </section>
 
         <section class="timestamps panel">
@@ -407,7 +452,10 @@
           <section class="dead-letter-box panel">
             <div class="panel-header">
               <h4>Dead-letter</h4>
-              <CopyButton text={job.deadLetterReason || job.lastError} />
+              <div class="panel-header-actions">
+                <Button variant="secondary" size="sm" class="btn-requeue" onclick={openRequeue}>Requeue</Button>
+                <CopyButton text={job.deadLetterReason || job.lastError} />
+              </div>
             </div>
             <div class="dead-letter-meta">
               <span class="label">Dead-lettered</span>
@@ -470,7 +518,9 @@
         {/if}
 
         <div class="actions">
-          {#if job.status === 'failed' && !job.deadLetteredAt}
+          {#if job.deadLetteredAt}
+            <Button variant="secondary" class="btn-requeue" onclick={openRequeue}>Requeue</Button>
+          {:else if job.status === 'failed'}
             <Button variant="secondary" class="btn-retry" onclick={retryJob}>Retry</Button>
           {/if}
           {#if (job.status === 'pending' || job.status === 'running') && !job.deadLetteredAt}
@@ -506,6 +556,16 @@
       confirmWord="DELETE"
       confirmLabel="Delete job"
       onConfirm={confirmDelete}
+      onCancel={() => { confirmState = null }}
+    />
+  {:else if confirmState?.kind === 'requeue'}
+    <ConfirmDialog
+      title="Requeue dead-lettered job"
+      body="Requeue this dead-lettered job? This clears the dead-letter state and queues it again while preserving existing checkpoints. The CLI sdj dlq requeue command replays from scratch; this dashboard action resumes from checkpoints."
+      blastRadius={`Requeues ${confirmState.id}. Previously saved checkpoints remain available for replay.`}
+      confirmWord="REQUEUE"
+      confirmLabel="Requeue"
+      onConfirm={confirmRequeue}
       onCancel={() => { confirmState = null }}
     />
   {/if}
@@ -609,7 +669,8 @@
   }
 
   .meta,
-  .timestamps {
+  .timestamps,
+  .job-metadata {
     display: grid;
     gap: var(--sp-3);
   }
@@ -661,6 +722,42 @@
     justify-content: space-between;
     gap: var(--sp-3);
     margin-bottom: var(--sp-3);
+  }
+
+  .panel-header-actions {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--sp-2);
+  }
+
+  .job-metadata table {
+    width: 100%;
+    border-collapse: collapse;
+  }
+
+  .job-metadata th,
+  .job-metadata td {
+    padding: var(--sp-2) 0;
+    border-bottom: var(--border);
+    text-align: left;
+    vertical-align: top;
+  }
+
+  .job-metadata th {
+    width: 38%;
+    padding-right: var(--sp-3);
+    color: var(--fg-secondary);
+    font-family: var(--font-mono);
+    font-size: var(--fs-label);
+    font-weight: var(--fw-body);
+    overflow-wrap: anywhere;
+  }
+
+  .job-metadata td {
+    color: var(--fg-primary);
+    font-family: var(--font-mono);
+    font-size: var(--fs-label);
+    overflow-wrap: anywhere;
   }
 
   .error-box {

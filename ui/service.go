@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"sort"
-	"strings"
 	"sync/atomic"
 	"time"
 
@@ -606,10 +605,13 @@ func (s *jobsService) searchJobs(ctx context.Context, req *jobsv1.ListJobsReques
 			return nil, 0, connect.NewError(connect.CodeUnimplemented, fmt.Errorf("dead-lettered job filter requires storage with DLQ query support"))
 		}
 		filter := core.DeadLetterFilter{
-			Queue:  req.Queue,
-			Type:   req.Type,
-			Limit:  limit,
-			Offset: (page - 1) * limit,
+			Queue:        req.Queue,
+			Type:         req.Type,
+			Tenant:       req.Tenant,
+			MetaContains: metadataMapFromProto(req.MetaContains),
+			Search:       req.Search,
+			Limit:        limit,
+			Offset:       (page - 1) * limit,
 		}
 		jobs, err := deadLettered.ListDeadLettered(ctx, filter)
 		if err != nil {
@@ -619,38 +621,24 @@ func (s *jobsService) searchJobs(ctx context.Context, req *jobsv1.ListJobsReques
 		if err != nil {
 			return nil, 0, err
 		}
-		if req.Search != "" {
-			jobs = filterDeadLetterSearch(jobs, req.Search)
-		}
 		return jobs, total, nil
 	}
 
 	// Check if storage implements UIStorage
 	if ui, ok := s.storage.(UIStorage); ok {
 		return ui.SearchJobs(ctx, JobFilter{
-			Status: req.Status,
-			Queue:  req.Queue,
-			Type:   req.Type,
-			Search: req.Search,
-			Limit:  limit,
-			Offset: (page - 1) * limit,
+			Status:       req.Status,
+			Queue:        req.Queue,
+			Type:         req.Type,
+			Tenant:       req.Tenant,
+			MetaContains: metadataMapFromProto(req.MetaContains),
+			Search:       req.Search,
+			Limit:        limit,
+			Offset:       (page - 1) * limit,
 		})
 	}
 
 	return nil, 0, connect.NewError(connect.CodeUnimplemented, fmt.Errorf("ListJobs requires storage with UI search support"))
-}
-
-func filterDeadLetterSearch(jobs []*core.Job, search string) []*core.Job {
-	search = strings.ToLower(search)
-	filtered := jobs[:0]
-	for _, job := range jobs {
-		if strings.Contains(strings.ToLower(job.ID), search) ||
-			strings.Contains(strings.ToLower(job.Type), search) ||
-			strings.Contains(strings.ToLower(job.Queue), search) {
-			filtered = append(filtered, job)
-		}
-	}
-	return filtered
 }
 
 func (s *jobsService) collectWorkflowTree(ctx context.Context, root *core.Job) ([]*jobsv1.FanOut, []*jobsv1.Job, error) {
@@ -872,6 +860,8 @@ func jobToProto(j *core.Job) *jobsv1.Job {
 		FanOutIndex: int32(j.FanOutIndex),
 		Result:      redactBytes(j.Result),
 		Worker:      j.LockedBy,
+		Tenant:      j.Tenant,
+		Metadata:    metadataMapToProto(j.Metadata),
 	}
 	if j.StartedAt != nil {
 		pb.StartedAt = timestamppb.New(*j.StartedAt)
@@ -896,6 +886,28 @@ func jobToProto(j *core.Job) *jobsv1.Job {
 	}
 	pb.DeadLetterReason = j.DeadLetterReason
 	return pb
+}
+
+func metadataMapFromProto(metadata map[string]string) *core.MetadataMap {
+	if len(metadata) == 0 {
+		return nil
+	}
+	out := make(core.MetadataMap, len(metadata))
+	for key, value := range metadata {
+		out[key] = value
+	}
+	return &out
+}
+
+func metadataMapToProto(metadata map[string]string) map[string]string {
+	if len(metadata) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(metadata))
+	for key, value := range metadata {
+		out[key] = value
+	}
+	return out
 }
 
 func fanOutToProto(f *core.FanOut) *jobsv1.FanOut {

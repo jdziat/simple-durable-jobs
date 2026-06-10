@@ -115,6 +115,16 @@ export class Job extends Message<Job> {
    */
   worker = "";
 
+  /**
+   * @generated from field: string tenant = 22;
+   */
+  tenant = "";
+
+  /**
+   * @generated from field: map<string, string> metadata = 23;
+   */
+  metadata: { [key: string]: string } = {};
+
   constructor(data?: PartialMessage<Job>) {
     super();
     proto3.util.initPartial(data, this);
@@ -144,6 +154,8 @@ export class Job extends Message<Job> {
     { no: 19, name: "dead_lettered_at", kind: "message", T: Timestamp, opt: true },
     { no: 20, name: "dead_letter_reason", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 21, name: "worker", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 22, name: "tenant", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 23, name: "metadata", kind: "map", K: 9 /* ScalarType.STRING */, V: {kind: "scalar", T: 9 /* ScalarType.STRING */} },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): Job {
@@ -448,6 +460,21 @@ export class Event extends Message<Event> {
    */
   queue = "";
 
+  /**
+   * @generated from field: string job_id = 5;
+   */
+  jobId = "";
+
+  /**
+   * @generated from field: string worker_id = 6;
+   */
+  workerId = "";
+
+  /**
+   * @generated from field: string reason = 7;
+   */
+  reason = "";
+
   constructor(data?: PartialMessage<Event>) {
     super();
     proto3.util.initPartial(data, this);
@@ -460,6 +487,9 @@ export class Event extends Message<Event> {
     { no: 2, name: "job", kind: "message", T: Job },
     { no: 3, name: "timestamp", kind: "message", T: Timestamp },
     { no: 4, name: "queue", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "job_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 6, name: "worker_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 7, name: "reason", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): Event {
@@ -756,6 +786,16 @@ export class ListJobsRequest extends Message<ListJobsRequest> {
    */
   limit = 0;
 
+  /**
+   * @generated from field: string tenant = 9;
+   */
+  tenant = "";
+
+  /**
+   * @generated from field: map<string, string> meta_contains = 10;
+   */
+  metaContains: { [key: string]: string } = {};
+
   constructor(data?: PartialMessage<ListJobsRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -772,6 +812,8 @@ export class ListJobsRequest extends Message<ListJobsRequest> {
     { no: 6, name: "until", kind: "message", T: Timestamp },
     { no: 7, name: "page", kind: "scalar", T: 5 /* ScalarType.INT32 */ },
     { no: 8, name: "limit", kind: "scalar", T: 5 /* ScalarType.INT32 */ },
+    { no: 9, name: "tenant", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 10, name: "meta_contains", kind: "map", K: 9 /* ScalarType.STRING */, V: {kind: "scalar", T: 9 /* ScalarType.STRING */} },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListJobsRequest {

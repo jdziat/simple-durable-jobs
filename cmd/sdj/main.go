@@ -56,10 +56,11 @@ const dlqUsageText = `Manage dead-lettered jobs and print list/requeue results.
 Usage:
   sdj [--driver sqlite|postgres|mysql] --dsn <dsn> dlq list [options]
   sdj [--driver sqlite|postgres|mysql] --dsn <dsn> dlq requeue <jobID>
+  sdj [--driver sqlite|postgres|mysql] --dsn <dsn> dlq requeue --queue q [--tenant t]
 
 Commands:
   list              List dead-lettered jobs as a table, JSON, or IDs only
-  requeue           Requeue one dead-lettered job by id
+  requeue           Requeue one dead-lettered job by id or a filtered batch
 `
 
 type globalOptions struct {
@@ -70,6 +71,47 @@ type globalOptions struct {
 type openedStore struct {
 	store *jobs.GormStorage
 	close func() error
+}
+
+type metadataFlags map[string]string
+
+func (m *metadataFlags) String() string {
+	if m == nil || len(*m) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(*m))
+	for key := range *m {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, key := range keys {
+		parts = append(parts, key+"="+(*m)[key])
+	}
+	return strings.Join(parts, ",")
+}
+
+func (m *metadataFlags) Set(value string) error {
+	key, val, ok := strings.Cut(value, "=")
+	if !ok || key == "" {
+		return fmt.Errorf("metadata filter must be key=value")
+	}
+	if *m == nil {
+		*m = make(metadataFlags)
+	}
+	(*m)[key] = val
+	return nil
+}
+
+func (m metadataFlags) metadataMap() *jobs.MetadataMap {
+	if len(m) == 0 {
+		return nil
+	}
+	out := make(jobs.MetadataMap, len(m))
+	for key, value := range m {
+		out[key] = value
+	}
+	return &out
 }
 
 func main() {
@@ -254,15 +296,18 @@ func (a app) runDLQ(ctx context.Context, globals globalOptions, args []string) i
 
 func (a app) runDLQList(ctx context.Context, globals globalOptions, args []string) int {
 	var filter jobs.DeadLetterFilter
+	var metadata metadataFlags
 	var jsonOutput, idsOnly bool
 	fs := a.newFlagSet("dlq list", `List dead-lettered jobs and print a table, JSON array, or one job ID per line.
 
 Usage:
-  sdj --driver sqlite --dsn ./jobs.db dlq list [--queue q] [--type t] [--limit n] [--json|--ids-only]
-  sdj --driver postgres --dsn postgres://user:pass@localhost/db dlq list --queue default
+  sdj --driver sqlite --dsn ./jobs.db dlq list [--queue q] [--tenant t] [--metadata k=v] [--type t] [--limit n] [--json|--ids-only]
+  sdj --driver postgres --dsn postgres://user:pass@localhost/db dlq list --queue default --tenant acme
 `)
 	fs.StringVar(&filter.Queue, "queue", "", "Filter by queue")
 	fs.StringVar(&filter.Type, "type", "", "Filter by job type")
+	fs.StringVar(&filter.Tenant, "tenant", "", "Filter by tenant")
+	fs.Var(&metadata, "metadata", "Filter by metadata key=value; repeat for multiple pairs")
 	fs.IntVar(&filter.Limit, "limit", 50, "Maximum jobs to list")
 	fs.IntVar(&filter.Offset, "offset", 0, "Jobs to skip")
 	fs.BoolVar(&jsonOutput, "json", false, "Print jobs as a JSON array")
@@ -285,6 +330,7 @@ Usage:
 	if jsonOutput && idsOnly {
 		return a.fail("dlq list accepts only one machine-readable mode; choose --json or --ids-only")
 	}
+	filter.MetaContains = metadata.metadataMap()
 
 	opened, ok := a.openStore(globals)
 	if !ok {
@@ -339,27 +385,40 @@ Usage:
 }
 
 func (a app) runDLQRequeue(ctx context.Context, globals globalOptions, args []string) int {
-	fs := a.newFlagSet("dlq requeue", `Requeue one dead-lettered job by id and print whether it was requeued.
+	var filter jobs.DeadLetterFilter
+	fs := a.newFlagSet("dlq requeue", `Requeue one dead-lettered job by id, or requeue a filtered dead-lettered batch.
 
 Usage:
   sdj --driver sqlite --dsn ./jobs.db dlq requeue <jobID>
   sdj --driver postgres --dsn postgres://user:pass@localhost/db dlq requeue <jobID>
+  sdj --driver postgres --dsn postgres://user:pass@localhost/db dlq requeue --queue emails --tenant acme
 `)
+	fs.StringVar(&filter.Queue, "queue", "", "Bulk requeue dead-lettered jobs in this queue")
+	fs.StringVar(&filter.Tenant, "tenant", "", "Bulk requeue dead-lettered jobs for this tenant")
 	if code := a.parseSubcommand(fs, args); code != exitOK {
 		if code == exitHandled {
 			return exitOK
 		}
 		return code
 	}
-	if fs.NArg() != 1 {
-		return a.fail("dlq requeue requires exactly one job id")
+	if fs.NArg() > 1 {
+		return a.fail("dlq requeue accepts at most one job id")
 	}
-	jobID := fs.Arg(0)
+	if fs.NArg() == 1 && (filter.Queue != "" || filter.Tenant != "") {
+		return a.fail("dlq requeue accepts either one job id or --queue/--tenant filters, not both")
+	}
+	if fs.NArg() == 0 && filter.Queue == "" && filter.Tenant == "" {
+		return a.fail("dlq requeue requires one job id or at least one bulk filter: --queue or --tenant")
+	}
 	opened, ok := a.openStore(globals)
 	if !ok {
 		return exitError
 	}
 	defer closeStore(opened)
+	if fs.NArg() == 0 {
+		return a.runDLQRequeueBulk(ctx, opened.store, filter)
+	}
+	jobID := fs.Arg(0)
 	requeued, err := opened.store.Requeue(ctx, jobID)
 	if err != nil {
 		return a.fail("could not requeue job %q; verify the job is not a fan-out sub-job and storage is healthy: %s", jobID, userError(err))
@@ -368,6 +427,38 @@ Usage:
 		return a.fail("job %q was not requeued; verify the ID exists and the job is failed or cancelled", jobID)
 	}
 	_, _ = fmt.Fprintf(a.stdout, "requeued %s\n", jobID)
+	return exitOK
+}
+
+func (a app) runDLQRequeueBulk(ctx context.Context, store *jobs.GormStorage, filter jobs.DeadLetterFilter) int {
+	const batchLimit = 1000
+	filter.Limit = batchLimit
+	filter.Offset = 0
+
+	var requeued int
+	for {
+		dead, err := store.ListDeadLettered(ctx, filter)
+		if err != nil {
+			return a.fail("could not list dead-lettered jobs for bulk requeue; verify migrations have run and filters are valid: %s", userError(err))
+		}
+		if len(dead) == 0 {
+			break
+		}
+		for _, job := range dead {
+			ok, err := store.Requeue(ctx, job.ID)
+			if err != nil {
+				return a.fail("could not requeue job %q; verify the job is not a fan-out sub-job and storage is healthy: %s", job.ID, userError(err))
+			}
+			if ok {
+				requeued++
+			}
+		}
+		if len(dead) < batchLimit {
+			break
+		}
+	}
+
+	_, _ = fmt.Fprintf(a.stdout, "requeued %d jobs\n", requeued)
 	return exitOK
 }
 

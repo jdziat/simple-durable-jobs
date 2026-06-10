@@ -17,6 +17,8 @@ export const JOBS = {
   // (their status/retry assertions don't collide with the Dead-lettered badge)
   // and the DLQ assertions stay stable regardless of test order.
   DEADLETTERED_1: 'e2e-failed-003',
+  DEADLETTERED_REQUEUE: 'e2e-failed-006',
+  DEADLETTERED_ACME_2: 'e2e-failed-007',
   PAUSED_1: 'e2e-paused-001',
   PAUSED_2: 'e2e-paused-002',
   CANCELLED_1: 'e2e-cancelled-001',
@@ -28,15 +30,48 @@ export const JOBS = {
 
 export const QUEUES = ['default', 'emails'] as const
 
+export const TENANTS = {
+  ACME: 'acme',
+  BETA: 'beta',
+  GLOBEX: 'globex',
+} as const
+
+export const METADATA = {
+  ACME_PAYMENTS: {
+    region: 'us-east',
+    team: 'payments',
+  },
+  ACME_COMPLETED: {
+    region: 'us-east',
+    team: 'payments',
+    tier: 'gold',
+  },
+  ACME_SUPPORT: {
+    region: 'us-west',
+    team: 'support',
+  },
+  BETA_FULFILLMENT: {
+    region: 'eu-west',
+    team: 'fulfillment',
+  },
+  GLOBEX_ANALYTICS: {
+    region: 'eu-west',
+    team: 'analytics',
+    tier: 'silver',
+  },
+} as const
+
 // Expected counts based on seed data
 export const COUNTS = {
-  PENDING: 5,
-  RUNNING: 3 + 1, // 3 standalone + 1 workflow running child (+ workflow root running)
+  PENDING: 5 + 1, // 5 standalone + 1 workflow pending child
+  RUNNING: 3 + 2, // 3 standalone + workflow root + 1 workflow running child
   COMPLETED: 10 + 1, // 10 standalone + 1 workflow completed child
-  FAILED: 5,
+  FAILED: 7,
   PAUSED: 2,
   CANCELLED: 1,
-  TOTAL: 30, // 5+3+10+5+2+1+4(workflow)
+  TOTAL: 32, // 5+3+10+7+2+1+4(workflow)
+  DEADLETTERED_ACME: 2,
+  GLOBEX: 2,
 } as const
 
 export const FAILED_ERRORS = [
