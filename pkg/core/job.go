@@ -26,12 +26,12 @@ type Job struct {
 	ID    string `gorm:"primaryKey;size:36"`
 	Type  string `gorm:"index;size:255;not null"`
 	Args  []byte `gorm:"type:bytes"`
-	Queue string `gorm:"index;size:255;default:'default'"`
+	Queue string `gorm:"size:255;default:'default'"`
 	// Tenant identifies the tenant that owns this job.
 	Tenant string `gorm:"size:255;column:tenant"`
 	// Metadata stores queryable string tags for this job.
 	Metadata       map[string]string `gorm:"serializer:json;column:metadata"`
-	Priority       int               `gorm:"index;default:0"`
+	Priority       int               `gorm:"default:0"`
 	Status         JobStatus         `gorm:"index;size:20;default:'pending'"`
 	PreviousStatus JobStatus         `gorm:"size:20"` // Status before pause, for restoration
 	Attempt        int               `gorm:"default:0"`
@@ -47,12 +47,12 @@ type Job struct {
 	RunAt            *time.Time `gorm:"index"`
 	StartedAt        *time.Time
 	CompletedAt      *time.Time
-	CreatedAt        time.Time  `gorm:"autoCreateTime"`
-	UpdatedAt        time.Time  `gorm:"autoUpdateTime"`
-	LockedBy         string     `gorm:"size:255"`
-	LockedUntil      *time.Time `gorm:"index"`
+	CreatedAt        time.Time `gorm:"autoCreateTime"`
+	UpdatedAt        time.Time `gorm:"autoUpdateTime"`
+	LockedBy         string    `gorm:"size:255"`
+	LockedUntil      *time.Time
 	LastHeartbeatAt  *time.Time // Tracks when the last heartbeat was received
-	UniqueKey        string     `gorm:"index;size:255"` // For job deduplication
+	UniqueKey        string     `gorm:"size:255"` // For job deduplication
 
 	// Parent-child relationship
 	ParentJobID *string `gorm:"index;size:36"`

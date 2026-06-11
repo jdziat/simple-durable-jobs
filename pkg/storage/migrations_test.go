@@ -240,16 +240,21 @@ func seedDequeueExplainJobs(t *testing.T, ctx context.Context, db *gorm.DB) {
 
 	now := time.Now().UTC()
 	queues := []string{"default", "critical", "bulk"}
+	statuses := []core.JobStatus{core.StatusCompleted, core.StatusFailed, core.StatusRunning, core.StatusCancelled}
 	jobs := make([]*core.Job, 0, 2400)
 	for i := 0; i < 2400; i++ {
 		createdAt := now.Add(-time.Duration(2400-i) * time.Second)
+		status := statuses[i%len(statuses)]
+		if i%10 == 0 {
+			status = core.StatusPending
+		}
 		job := &core.Job{
 			ID:         fmt.Sprintf("explain-%04d", i),
 			Type:       "explain.dequeue",
 			Args:       []byte(`{}`),
 			Queue:      queues[i%len(queues)],
 			Priority:   i % 17,
-			Status:     core.StatusPending,
+			Status:     status,
 			MaxRetries: 3,
 			CreatedAt:  createdAt,
 			UpdatedAt:  createdAt,

@@ -47,7 +47,6 @@ func TestPostgresSchemaAssertions(t *testing.T) {
 	defs := map[string]string{
 		"idx_jobs_dead_lettered_at":   "dead_lettered_at IS NOT NULL",
 		"idx_jobs_active_unique":      "WHERE",
-		"idx_jobs_dequeue":            "WHERE",
 		"idx_jobs_dequeue_order":      "WHERE",
 		"idx_jobs_retention_terminal": "WHERE",
 		"idx_jobs_stale_lock":         "COALESCE",
@@ -57,6 +56,16 @@ func TestPostgresSchemaAssertions(t *testing.T) {
 		require.Contains(t, strings.ToUpper(indexDef), strings.ToUpper(mustContain), "%s definition:\n%s", indexName, indexDef)
 	}
 	require.Contains(t, postgresIndexDef(t, db, "idx_jobs_stale_lock"), "WHERE", "idx_jobs_stale_lock must stay partial")
+
+	for _, indexName := range []string{
+		"idx_jobs_priority",
+		"idx_jobs_queue",
+		"idx_jobs_locked_until",
+		"idx_jobs_dequeue",
+		"idx_jobs_unique_key",
+	} {
+		require.False(t, postgresIndexExists(t, db, indexName), "%s must not exist after migration", indexName)
+	}
 }
 
 func TestMySQLSchemaAssertions(t *testing.T) {
@@ -100,6 +109,16 @@ func TestMySQLSchemaAssertions(t *testing.T) {
 		  AND GENERATION_EXPRESSION <> ''
 	`).Scan(&activeUniqueKeyCount).Error)
 	require.Equal(t, 1, activeUniqueKeyCount, "active_unique_key generated column must exist")
+
+	for _, indexName := range []string{
+		"idx_jobs_priority",
+		"idx_jobs_queue",
+		"idx_jobs_locked_until",
+		"idx_jobs_dequeue",
+	} {
+		require.False(t, mysqlIndexExists(t, db, indexName), "%s must not exist after migration", indexName)
+	}
+	require.True(t, mysqlIndexExists(t, db, "idx_jobs_unique_key"), "idx_jobs_unique_key must remain on mysql")
 }
 
 func requireMySQLDeadLetteredAtPrecision(t *testing.T, db *gorm.DB, want int) {
@@ -125,6 +144,26 @@ func postgresIndexDef(t *testing.T, db *gorm.DB, indexName string) string {
 	`, indexName).Scan(&indexDef).Error)
 	require.NotEmpty(t, indexDef, "%s must exist", indexName)
 	return indexDef
+}
+
+func postgresIndexExists(t *testing.T, db *gorm.DB, indexName string) bool {
+	t.Helper()
+	var exists bool
+	require.NoError(t, db.Raw("SELECT to_regclass(?) IS NOT NULL", indexName).Scan(&exists).Error)
+	return exists
+}
+
+func mysqlIndexExists(t *testing.T, db *gorm.DB, indexName string) bool {
+	t.Helper()
+	var count int
+	require.NoError(t, db.Raw(`
+		SELECT COUNT(*)
+		FROM information_schema.STATISTICS
+		WHERE TABLE_SCHEMA = DATABASE()
+		  AND TABLE_NAME = 'jobs'
+		  AND INDEX_NAME = ?
+	`, indexName).Scan(&count).Error)
+	return count > 0
 }
 
 func postgresDSNWithSearchPath(t *testing.T, dsn, schemaName string) string {

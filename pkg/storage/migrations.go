@@ -185,6 +185,11 @@ var schemaMigrations = []schemaMigration{
 		Name:    "fix_dead_letter_index",
 		Up:      migrateFixDeadLetterIndex,
 	},
+	{
+		Version: 12,
+		Name:    "drop_redundant_job_indexes",
+		Up:      migrateDropRedundantJobIndexes,
+	},
 }
 
 // applyPendingMigrations runs every migration whose version is absent from the
@@ -579,5 +584,45 @@ func migrateFixDeadLetterIndex(ctx context.Context, db *gorm.DB, dialect string)
 		return db.WithContext(ctx).Exec(
 			"CREATE INDEX IF NOT EXISTS idx_jobs_dead_lettered_at ON jobs (dead_lettered_at) WHERE dead_lettered_at IS NOT NULL",
 		).Error
+	}
+}
+
+func migrateDropRedundantJobIndexes(ctx context.Context, db *gorm.DB, dialect string) error {
+	switch dialect {
+	case dialectMySQL:
+		m := db.Migrator()
+		for _, indexName := range []string{
+			"idx_jobs_priority",
+			"idx_jobs_queue",
+			"idx_jobs_locked_until",
+			"idx_jobs_dequeue",
+		} {
+			if m.HasIndex(&core.Job{}, indexName) {
+				if err := m.DropIndex(&core.Job{}, indexName); err != nil && !isBenignDDLError(err) {
+					return fmt.Errorf("drop %s: %w", indexName, err)
+				}
+			}
+		}
+		if !m.HasIndex(&core.Job{}, "idx_jobs_unique_key") {
+			if err := db.WithContext(ctx).Exec(
+				"CREATE INDEX idx_jobs_unique_key ON jobs (unique_key)",
+			).Error; err != nil && !isBenignDDLError(err) {
+				return fmt.Errorf("create idx_jobs_unique_key: %w", err)
+			}
+		}
+		return nil
+	default:
+		for _, indexName := range []string{
+			"idx_jobs_priority",
+			"idx_jobs_queue",
+			"idx_jobs_locked_until",
+			"idx_jobs_dequeue",
+			"idx_jobs_unique_key",
+		} {
+			if err := db.WithContext(ctx).Exec("DROP INDEX IF EXISTS " + indexName).Error; err != nil {
+				return fmt.Errorf("drop %s: %w", indexName, err)
+			}
+		}
+		return nil
 	}
 }

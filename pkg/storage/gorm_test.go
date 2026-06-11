@@ -115,7 +115,7 @@ func TestNewGormStorage_NilDB(t *testing.T) {
 	assert.False(t, s.IsSQLite(), "nil db should not claim SQLite")
 }
 
-func TestMigrate_DequeueIndexExists(t *testing.T) {
+func TestMigrate_DequeueOrderIndexExists(t *testing.T) {
 	ctx := context.Background()
 	db := openTestDB(t)
 	s := NewGormStorage(db)
@@ -123,27 +123,33 @@ func TestMigrate_DequeueIndexExists(t *testing.T) {
 	require.NoError(t, s.Migrate(ctx))
 	require.NoError(t, s.Migrate(ctx), "migrate should be idempotent")
 
-	var indexName string
-	switch {
-	case s.IsSQLite():
-		require.NoError(t, s.DB().Raw(
-			"SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?",
-			"idx_jobs_dequeue",
-		).Scan(&indexName).Error)
-	case strings.EqualFold(s.DB().Name(), "postgres"):
-		require.NoError(t, s.DB().Raw(
-			"SELECT indexname FROM pg_indexes WHERE tablename = ? AND indexname = ?",
-			"jobs", "idx_jobs_dequeue",
-		).Scan(&indexName).Error)
-	case strings.EqualFold(s.DB().Name(), "mysql"):
-		require.NoError(t, s.DB().Raw(
-			"SELECT index_name FROM information_schema.statistics WHERE table_schema = DATABASE() AND table_name = ? AND index_name = ? LIMIT 1",
-			"jobs", "idx_jobs_dequeue",
-		).Scan(&indexName).Error)
-	default:
-		t.Fatalf("unsupported test dialect %q", s.DB().Name())
+	findIndex := func(want string) string {
+		t.Helper()
+		var indexName string
+		switch {
+		case s.IsSQLite():
+			require.NoError(t, s.DB().Raw(
+				"SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?",
+				want,
+			).Scan(&indexName).Error)
+		case strings.EqualFold(s.DB().Name(), "postgres"):
+			require.NoError(t, s.DB().Raw(
+				"SELECT indexname FROM pg_indexes WHERE tablename = ? AND indexname = ?",
+				"jobs", want,
+			).Scan(&indexName).Error)
+		case strings.EqualFold(s.DB().Name(), "mysql"):
+			require.NoError(t, s.DB().Raw(
+				"SELECT index_name FROM information_schema.statistics WHERE table_schema = DATABASE() AND table_name = ? AND index_name = ? LIMIT 1",
+				"jobs", want,
+			).Scan(&indexName).Error)
+		default:
+			t.Fatalf("unsupported test dialect %q", s.DB().Name())
+		}
+		return indexName
 	}
-	assert.Equal(t, "idx_jobs_dequeue", indexName)
+
+	assert.Empty(t, findIndex("idx_jobs_dequeue"))
+	assert.Equal(t, "idx_jobs_dequeue_order", findIndex("idx_jobs_dequeue_order"))
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
