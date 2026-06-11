@@ -175,6 +175,24 @@ func (s *GormStorage) Migrate(ctx context.Context) error {
 	// AutoMigrate does check-then-create, which is not concurrency-safe on its
 	// own — two workers can both try to CREATE the same table/index).
 	return s.withMigrationLock(ctx, func(db *gorm.DB) error {
+		if s.dialect() == dialectMySQL {
+			if err := requireMySQLUTCSession(ctx, db); err != nil {
+				return err
+			}
+		}
+
+		// The core.Job dispatcher columns carry `not null` tags so AutoMigrate
+		// keeps them NOT NULL and never drifts them back to nullable (a drift
+		// would force a table-copy MODIFY on every MySQL startup). AutoMigrate
+		// runs before the versioned migrations, so backfill any pre-existing
+		// NULLs (only reachable via raw SQL — the Go model never writes them)
+		// FIRST, otherwise AutoMigrate's SET NOT NULL would fail on a populated
+		// table. Idempotent + cheap: after the first migrate the columns are
+		// NOT NULL, so the predicate is constraint-excluded.
+		if err := backfillDispatcherNulls(ctx, db, s.dialect()); err != nil {
+			return err
+		}
+
 		if err := db.AutoMigrate(
 			&core.Job{},
 			&core.Checkpoint{},
@@ -207,6 +225,45 @@ func (s *GormStorage) Migrate(ctx context.Context) error {
 
 		return s.applyPendingMigrations(ctx, db)
 	})
+}
+
+// backfillDispatcherNulls fills any pre-existing NULL dispatcher columns with
+// their defaults BEFORE AutoMigrate applies the `not null` tags, so AutoMigrate's
+// SET NOT NULL cannot fail on a populated table. Such NULLs are only reachable via
+// raw SQL (the Go model never writes them). PG/MySQL only; on a fresh DB the jobs
+// table does not exist yet (AutoMigrate creates it NOT NULL from the tags), so
+// skip. Idempotent + cheap: once the columns are NOT NULL the predicate is
+// constraint-excluded (no scan).
+func backfillDispatcherNulls(ctx context.Context, db *gorm.DB, dialect string) error {
+	if dialect != dialectPostgres && dialect != dialectMySQL {
+		return nil
+	}
+	if !db.Migrator().HasTable(&core.Job{}) {
+		return nil
+	}
+	return db.WithContext(ctx).Exec(`
+		UPDATE jobs
+		SET status = COALESCE(status, 'pending'),
+		    queue = COALESCE(queue, 'default'),
+		    priority = COALESCE(priority, 0),
+		    attempt = COALESCE(attempt, 0),
+		    max_retries = COALESCE(max_retries, 3)
+		WHERE status IS NULL OR queue IS NULL OR priority IS NULL
+		   OR attempt IS NULL OR max_retries IS NULL
+	`).Error
+}
+
+func requireMySQLUTCSession(ctx context.Context, db *gorm.DB) error {
+	var offsetSeconds int64
+	if err := db.WithContext(ctx).Raw(
+		"SELECT TIMESTAMPDIFF(SECOND, UTC_TIMESTAMP(6), NOW(6))",
+	).Scan(&offsetSeconds).Error; err != nil {
+		return fmt.Errorf("storage: check MySQL session clock: %w", err)
+	}
+	if offsetSeconds != 0 {
+		return fmt.Errorf("storage: MySQL session clock is not UTC; NOW(6) drives DB-clock lock/lease writes; set time_zone='+00:00' or loc=UTC in the DSN")
+	}
+	return nil
 }
 
 // Enqueue adds a job to the queue.

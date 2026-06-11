@@ -2141,6 +2141,23 @@ func TestEnqueueUnique_DifferentKeysCreateDifferentJobs(t *testing.T) {
 	assert.NotEqual(t, job1.ID, job2.ID)
 }
 
+func TestEnqueueUnique_CaseDifferingKeysCreateDifferentJobs(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	upper := &core.Job{Type: "case.dedup", Queue: "default"}
+	lower := &core.Job{Type: "case.dedup", Queue: "default"}
+	require.NoError(t, s.EnqueueUnique(ctx, upper, "MyKey"))
+	require.NoError(t, s.EnqueueUnique(ctx, lower, "mykey"))
+	assert.NotEqual(t, upper.ID, lower.ID)
+
+	var count int64
+	require.NoError(t, s.DB().Model(&core.Job{}).
+		Where("unique_key IN ?", []string{"MyKey", "mykey"}).
+		Count(&count).Error)
+	assert.EqualValues(t, 2, count, "case-differing unique keys must be distinct")
+}
+
 func TestEnqueueUnique_Concurrent_NoDuplicates(t *testing.T) {
 	ctx := context.Background()
 	s := newConcurrentTestStorage(t)

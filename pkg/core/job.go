@@ -26,16 +26,16 @@ type Job struct {
 	ID    string `gorm:"primaryKey;size:36"`
 	Type  string `gorm:"index;size:255;not null"`
 	Args  []byte `gorm:"type:bytes"`
-	Queue string `gorm:"size:255;default:'default'"`
+	Queue string `gorm:"size:255;default:'default';not null"`
 	// Tenant identifies the tenant that owns this job.
 	Tenant string `gorm:"size:255;column:tenant"`
 	// Metadata stores queryable string tags for this job.
 	Metadata       map[string]string `gorm:"serializer:json;column:metadata"`
-	Priority       int               `gorm:"default:0"`
-	Status         JobStatus         `gorm:"index;size:20;default:'pending'"`
+	Priority       int               `gorm:"default:0;not null"`
+	Status         JobStatus         `gorm:"index;size:20;default:'pending';not null"`
 	PreviousStatus JobStatus         `gorm:"size:20"` // Status before pause, for restoration
-	Attempt        int               `gorm:"default:0"`
-	MaxRetries     int               `gorm:"default:3"`
+	Attempt        int               `gorm:"default:0;not null"`
+	MaxRetries     int               `gorm:"default:3;not null"`
 	Timeout        time.Duration     `gorm:"not null;default:0"`
 	// Determinism is the replay strictness mode
 	// (0=ExplicitCheckpoints,1=Strict,2=BestEffort).

@@ -200,6 +200,11 @@ var schemaMigrations = []schemaMigration{
 		Name:    "integrity_foreign_keys",
 		Up:      migrateIntegrityForeignKeys,
 	},
+	{
+		Version: 15,
+		Name:    "dialect_correctness",
+		Up:      migrateDialectCorrectness,
+	},
 }
 
 // applyPendingMigrations runs every migration whose version is absent from the
@@ -736,6 +741,144 @@ func migrateIntegrityForeignKeys(ctx context.Context, db *gorm.DB, dialect strin
 				return fmt.Errorf("add %s: %w", key.name, err)
 			}
 		}
+	}
+	return nil
+}
+
+func migrateDialectCorrectness(ctx context.Context, db *gorm.DB, dialect string) error {
+	switch dialect {
+	case dialectMySQL:
+		return migrateMySQLDialectCorrectness(ctx, db)
+	case dialectPostgres:
+		return migratePostgresDialectCorrectness(ctx, db)
+	default:
+		return nil
+	}
+}
+
+func migrateMySQLDialectCorrectness(ctx context.Context, db *gorm.DB) error {
+	const collation = "utf8mb4_0900_as_cs"
+
+	uniqueKeyCollation, err := mysqlColumnCollation(ctx, db, "unique_key")
+	if err != nil {
+		return fmt.Errorf("read unique_key collation: %w", err)
+	}
+	if uniqueKeyCollation != collation {
+		if err := db.WithContext(ctx).Exec(
+			"ALTER TABLE jobs MODIFY unique_key VARCHAR(255) COLLATE utf8mb4_0900_as_cs",
+		).Error; err != nil {
+			return fmt.Errorf("modify unique_key collation: %w", err)
+		}
+	}
+
+	activeUniqueKeyCollation, err := mysqlColumnCollation(ctx, db, "active_unique_key")
+	if err != nil {
+		return fmt.Errorf("read active_unique_key collation: %w", err)
+	}
+	if activeUniqueKeyCollation != collation {
+		if err := db.WithContext(ctx).Exec(
+			"ALTER TABLE jobs MODIFY active_unique_key VARCHAR(255) COLLATE utf8mb4_0900_as_cs " +
+				"GENERATED ALWAYS AS (CASE WHEN status IN ('pending','running') AND unique_key <> '' " +
+				"THEN unique_key ELSE NULL END) STORED",
+		).Error; err != nil {
+			return fmt.Errorf("modify active_unique_key collation: %w", err)
+		}
+	}
+
+	dispatcherNotNull, err := mysqlDispatcherColumnsNotNull(ctx, db)
+	if err != nil {
+		return fmt.Errorf("read dispatcher column nullability: %w", err)
+	}
+	if !dispatcherNotNull {
+		if err := db.WithContext(ctx).Exec(
+			"ALTER TABLE jobs " +
+				"MODIFY status VARCHAR(20) NOT NULL DEFAULT 'pending', " +
+				"MODIFY queue VARCHAR(255) NOT NULL DEFAULT 'default', " +
+				"MODIFY priority BIGINT NOT NULL DEFAULT 0, " +
+				"MODIFY attempt BIGINT NOT NULL DEFAULT 0, " +
+				"MODIFY max_retries BIGINT NOT NULL DEFAULT 3",
+		).Error; err != nil {
+			return fmt.Errorf("modify dispatcher columns not null: %w", err)
+		}
+	}
+
+	return nil
+}
+
+func mysqlColumnCollation(ctx context.Context, db *gorm.DB, columnName string) (string, error) {
+	var collation sql.NullString
+	if err := db.WithContext(ctx).Raw(`
+		SELECT COLLATION_NAME
+		FROM information_schema.COLUMNS
+		WHERE TABLE_SCHEMA = DATABASE()
+		  AND TABLE_NAME = 'jobs'
+		  AND COLUMN_NAME = ?
+	`, columnName).Scan(&collation).Error; err != nil {
+		return "", err
+	}
+	if !collation.Valid {
+		return "", nil
+	}
+	return collation.String, nil
+}
+
+func mysqlDispatcherColumnsNotNull(ctx context.Context, db *gorm.DB) (bool, error) {
+	var count int
+	if err := db.WithContext(ctx).Raw(`
+		SELECT COUNT(*)
+		FROM information_schema.COLUMNS
+		WHERE TABLE_SCHEMA = DATABASE()
+		  AND TABLE_NAME = 'jobs'
+		  AND COLUMN_NAME IN ('status', 'queue', 'priority', 'attempt', 'max_retries')
+		  AND IS_NULLABLE = 'NO'
+	`).Scan(&count).Error; err != nil {
+		return false, err
+	}
+	return count == 5, nil
+}
+
+func migratePostgresDialectCorrectness(ctx context.Context, db *gorm.DB) error {
+	if err := db.WithContext(ctx).Exec(`
+		UPDATE jobs
+		SET status = COALESCE(status, 'pending'),
+		    queue = COALESCE(queue, 'default'),
+		    priority = COALESCE(priority, 0),
+		    attempt = COALESCE(attempt, 0),
+		    max_retries = COALESCE(max_retries, 3)
+		WHERE status IS NULL
+		   OR queue IS NULL
+		   OR priority IS NULL
+		   OR attempt IS NULL
+		   OR max_retries IS NULL
+	`).Error; err != nil {
+		return fmt.Errorf("backfill dispatcher column nulls: %w", err)
+	}
+	if err := db.WithContext(ctx).Exec(
+		"ALTER TABLE jobs " +
+			"ALTER COLUMN status SET NOT NULL, " +
+			"ALTER COLUMN queue SET NOT NULL, " +
+			"ALTER COLUMN priority SET NOT NULL, " +
+			"ALTER COLUMN attempt SET NOT NULL, " +
+			"ALTER COLUMN max_retries SET NOT NULL",
+	).Error; err != nil {
+		return fmt.Errorf("set dispatcher columns not null: %w", err)
+	}
+
+	var thresholdType string
+	if err := db.WithContext(ctx).Raw(`
+		SELECT data_type
+		FROM information_schema.COLUMNS
+		WHERE table_schema = CURRENT_SCHEMA()
+		  AND table_name = 'fan_outs'
+		  AND column_name = 'threshold'
+	`).Scan(&thresholdType).Error; err != nil {
+		return fmt.Errorf("read fan_outs.threshold type: %w", err)
+	}
+	if thresholdType == "double precision" {
+		return nil
+	}
+	if err := db.WithContext(ctx).Exec("ALTER TABLE fan_outs ALTER COLUMN threshold TYPE double precision").Error; err != nil {
+		return fmt.Errorf("alter fan_outs.threshold type: %w", err)
 	}
 	return nil
 }
