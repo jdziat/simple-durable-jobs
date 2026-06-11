@@ -68,6 +68,7 @@ func TestPostgresSchemaAssertions(t *testing.T) {
 	} {
 		require.False(t, postgresIndexExists(t, db, indexName), "%s must not exist after migration", indexName)
 	}
+	requirePostgresCascadeFKs(t, db)
 }
 
 func TestMySQLSchemaAssertions(t *testing.T) {
@@ -134,6 +135,34 @@ func TestMySQLSchemaAssertions(t *testing.T) {
 	}
 	require.True(t, mysqlIndexExists(t, db, "idx_jobs_unique_key"), "idx_jobs_unique_key must remain on mysql")
 	require.True(t, mysqlIndexExists(t, db, "idx_jobs_dequeue_eligible"), "idx_jobs_dequeue_eligible must exist on mysql")
+	requireMySQLCascadeFKs(t, db)
+}
+
+func requirePostgresCascadeFKs(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	var count int
+	require.NoError(t, db.Raw(`
+		SELECT COUNT(*)
+		FROM pg_constraint
+		WHERE contype = 'f'
+		  AND conname IN ('fk_checkpoints_job', 'fk_signals_job', 'fk_fanouts_parent')
+		  AND confdeltype = 'c'
+		  AND conrelid IN ('checkpoints'::regclass, 'signals'::regclass, 'fan_outs'::regclass)
+	`).Scan(&count).Error)
+	require.Equal(t, 3, count, "postgres cascade FKs must exist")
+}
+
+func requireMySQLCascadeFKs(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	var count int
+	require.NoError(t, db.Raw(`
+		SELECT COUNT(*)
+		FROM information_schema.REFERENTIAL_CONSTRAINTS
+		WHERE CONSTRAINT_SCHEMA = DATABASE()
+		  AND CONSTRAINT_NAME IN ('fk_checkpoints_job', 'fk_signals_job', 'fk_fanouts_parent')
+		  AND DELETE_RULE = 'CASCADE'
+	`).Scan(&count).Error)
+	require.Equal(t, 3, count, "mysql cascade FKs must exist")
 }
 
 func requireMySQLDeadLetteredAtPrecision(t *testing.T, db *gorm.DB, want int) {

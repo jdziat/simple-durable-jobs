@@ -38,6 +38,8 @@ func (s *GormStorage) DeleteTerminalJobsOlderThan(ctx context.Context, status co
 				Where("status = ?", status).
 				Where("completed_at IS NOT NULL").
 				Where("completed_at < ?", cutoff).
+				Where("NOT EXISTS (SELECT 1 FROM jobs c WHERE (c.parent_job_id = jobs.id OR c.root_job_id = jobs.id) AND c.status NOT IN ('completed','failed','cancelled'))").
+				Where("NOT EXISTS (SELECT 1 FROM fan_outs f WHERE f.parent_job_id = jobs.id AND f.status = 'pending')").
 				Order("completed_at ASC, id ASC").
 				Limit(limit)
 			if !s.isSQLite {
@@ -48,6 +50,9 @@ func (s *GormStorage) DeleteTerminalJobsOlderThan(ctx context.Context, status co
 			}
 			if len(ids) == 0 {
 				return nil
+			}
+			if err := tx.Where("parent_job_id IN ?", ids).Delete(&core.FanOut{}).Error; err != nil {
+				return err
 			}
 			if err := tx.Where("job_id IN ?", ids).Delete(&core.Checkpoint{}).Error; err != nil {
 				return err

@@ -40,6 +40,18 @@ func newTestJob(queue, jobType string) *core.Job {
 	}
 }
 
+func seedTestJob(t *testing.T, ctx context.Context, s *GormStorage, id string, status core.JobStatus) {
+	t.Helper()
+	require.NoError(t, s.db.WithContext(ctx).
+		Where("id = ?", id).
+		FirstOrCreate(&core.Job{
+			ID:     id,
+			Type:   "fixture.job",
+			Queue:  "default",
+			Status: status,
+		}).Error)
+}
+
 // newConcurrentTestStorage returns a storage whose underlying DB can be
 // accessed from multiple goroutines at once. Plain openTestDB on SQLite
 // uses ":memory:" which gives each pooled connection its own isolated
@@ -1487,9 +1499,11 @@ func createRunningP2BJob(t *testing.T, ctx context.Context, s *GormStorage, fanO
 
 func createP2BFanOut(t *testing.T, ctx context.Context, s *GormStorage, status core.FanOutStatus) *core.FanOut {
 	t.Helper()
+	parentID := p2bID(t, "parent")
+	seedTestJob(t, ctx, s, parentID, core.StatusWaiting)
 	fo := &core.FanOut{
 		ID:          p2bID(t, "fo"),
-		ParentJobID: p2bID(t, "parent"),
+		ParentJobID: parentID,
 		TotalCount:  2,
 		Strategy:    core.StrategyCollectAll,
 		Status:      status,
@@ -2751,9 +2765,11 @@ func TestFailTerminalWithResult_AdvancesFanOutStatusInSameTx(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStorage(t)
 
+	parentID := p2bID(t, "parent")
+	seedTestJob(t, ctx, s, parentID, core.StatusWaiting)
 	fo := &core.FanOut{
 		ID:          p2bID(t, "fo"),
-		ParentJobID: p2bID(t, "parent"),
+		ParentJobID: parentID,
 		TotalCount:  3,
 		Strategy:    core.StrategyFailFast,
 		Status:      core.FanOutPending,
@@ -3284,6 +3300,7 @@ func TestMarkWaiting_Success(t *testing.T) {
 func TestCancelSubJob_CancelsPendingSubJob(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStorage(t)
+	seedTestJob(t, ctx, s, "parent-1", core.StatusWaiting)
 
 	// Create a fan-out.
 	fo := &core.FanOut{
@@ -3323,6 +3340,7 @@ func TestCancelSubJob_CancelsPendingSubJob(t *testing.T) {
 func TestCancelSubJobs_CancelsMultiplePending(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStorage(t)
+	seedTestJob(t, ctx, s, "parent-1", core.StatusWaiting)
 
 	fo := &core.FanOut{
 		ID:          "fo-multi",
@@ -3362,6 +3380,7 @@ func TestCancelSubJobs_CancelsMultiplePending(t *testing.T) {
 func TestIncrementFanOutCancelled_ReturnsUpdatedFanOut(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStorage(t)
+	seedTestJob(t, ctx, s, "p1", core.StatusWaiting)
 
 	fo := &core.FanOut{
 		ID:          "fo-inc-cancel",
@@ -3388,6 +3407,7 @@ func TestIncrementFanOutCancelled_ReturnsUpdatedFanOut(t *testing.T) {
 func TestUpdateFanOutStatus_CompleteThenFail(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStorage(t)
+	seedTestJob(t, ctx, s, "p1", core.StatusWaiting)
 
 	fo := &core.FanOut{
 		ID:          "fo-status",

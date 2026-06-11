@@ -70,17 +70,7 @@ func TestCall_ReturnsCheckpointedResult(t *testing.T) {
 		return n * 2, nil
 	})
 
-	// Simulate pre-existing checkpoint
 	jobID := "test-job"
-	checkpoint := &jobs.Checkpoint{
-		ID:        "cp-1",
-		JobID:     jobID,
-		CallIndex: 0,
-		CallType:  "nested",
-		Result:    []byte(`100`),
-	}
-	err := store.SaveCheckpoint(context.Background(), checkpoint)
-	require.NoError(t, err)
 
 	queue.Register("parent", func(ctx context.Context, _ struct{}) error {
 		result, err := jobs.Call[int](ctx, "nested", 5)
@@ -89,7 +79,8 @@ func TestCall_ReturnsCheckpointedResult(t *testing.T) {
 		return nil
 	})
 
-	// Create job with pre-existing checkpoints
+	// Enqueue the job first, then seed its pre-existing checkpoint — the
+	// checkpoints.job_id FK (migration v14) requires the job row to exist.
 	job := &jobs.Job{
 		ID:     jobID,
 		Type:   "parent",
@@ -97,8 +88,17 @@ func TestCall_ReturnsCheckpointedResult(t *testing.T) {
 		Queue:  "default",
 		Status: jobs.StatusPending,
 	}
-	err = store.Enqueue(context.Background(), job)
-	require.NoError(t, err)
+	require.NoError(t, store.Enqueue(context.Background(), job))
+
+	// Simulate pre-existing checkpoint
+	checkpoint := &jobs.Checkpoint{
+		ID:        "cp-1",
+		JobID:     jobID,
+		CallIndex: 0,
+		CallType:  "nested",
+		Result:    []byte(`100`),
+	}
+	require.NoError(t, store.SaveCheckpoint(context.Background(), checkpoint))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -388,17 +388,7 @@ func TestCall_CheckpointedErrorReturned(t *testing.T) {
 		return "", errors.New("original error")
 	})
 
-	// Simulate pre-existing checkpoint with error
 	jobID := "test-error-job"
-	checkpoint := &jobs.Checkpoint{
-		ID:        "cp-err",
-		JobID:     jobID,
-		CallIndex: 0,
-		CallType:  "failing",
-		Error:     "checkpointed error",
-	}
-	err := store.SaveCheckpoint(context.Background(), checkpoint)
-	require.NoError(t, err)
 
 	var capturedErr error
 	queue.Register("parent-error", func(ctx context.Context, _ struct{}) error {
@@ -407,7 +397,8 @@ func TestCall_CheckpointedErrorReturned(t *testing.T) {
 		return err
 	})
 
-	// Create job with pre-existing checkpoints
+	// Enqueue the job first, then seed its pre-existing checkpoint — the
+	// checkpoints.job_id FK (migration v14) requires the job row to exist.
 	job := &jobs.Job{
 		ID:     jobID,
 		Type:   "parent-error",
@@ -415,8 +406,17 @@ func TestCall_CheckpointedErrorReturned(t *testing.T) {
 		Queue:  "default",
 		Status: jobs.StatusPending,
 	}
-	err = store.Enqueue(context.Background(), job)
-	require.NoError(t, err)
+	require.NoError(t, store.Enqueue(context.Background(), job))
+
+	// Simulate pre-existing checkpoint with error
+	checkpoint := &jobs.Checkpoint{
+		ID:        "cp-err",
+		JobID:     jobID,
+		CallIndex: 0,
+		CallType:  "failing",
+		Error:     "checkpointed error",
+	}
+	require.NoError(t, store.SaveCheckpoint(context.Background(), checkpoint))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

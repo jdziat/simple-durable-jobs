@@ -13,13 +13,19 @@ import (
 	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
 )
 
+func sendTestSignal(t *testing.T, ctx context.Context, s *GormStorage, jobID, name string, payload []byte) {
+	t.Helper()
+	seedTestJob(t, ctx, s, jobID, core.StatusWaiting)
+	require.NoError(t, s.SendSignal(ctx, jobID, name, payload))
+}
+
 func TestSendConsumeSignal_FIFO(t *testing.T) {
 	s := newTestStorage(t)
 	ctx := context.Background()
 
-	require.NoError(t, s.SendSignal(ctx, "j1", "ctx", []byte(`"a"`)))
-	require.NoError(t, s.SendSignal(ctx, "j1", "ctx", []byte(`"b"`)))
-	require.NoError(t, s.SendSignal(ctx, "j1", "other", []byte(`"x"`)))
+	sendTestSignal(t, ctx, s, "j1", "ctx", []byte(`"a"`))
+	sendTestSignal(t, ctx, s, "j1", "ctx", []byte(`"b"`))
+	sendTestSignal(t, ctx, s, "j1", "other", []byte(`"x"`))
 
 	got1, err := s.ConsumeSignal(ctx, "j1", "ctx")
 	require.NoError(t, err)
@@ -45,7 +51,7 @@ func TestSendConsumeSignal_FIFO(t *testing.T) {
 func TestPeekSignal_DoesNotConsume(t *testing.T) {
 	s := newTestStorage(t)
 	ctx := context.Background()
-	require.NoError(t, s.SendSignal(ctx, "j1", "ctx", []byte(`"v"`)))
+	sendTestSignal(t, ctx, s, "j1", "ctx", []byte(`"v"`))
 
 	p1, err := s.PeekSignal(ctx, "j1", "ctx")
 	require.NoError(t, err)
@@ -66,9 +72,9 @@ func TestDrainSignals(t *testing.T) {
 	s := newTestStorage(t)
 	ctx := context.Background()
 	for _, p := range [][]byte{[]byte(`"a"`), []byte(`"b"`), []byte(`"c"`)} {
-		require.NoError(t, s.SendSignal(ctx, "j1", "ctx", p))
+		sendTestSignal(t, ctx, s, "j1", "ctx", p)
 	}
-	require.NoError(t, s.SendSignal(ctx, "j1", "other", []byte(`"x"`)))
+	sendTestSignal(t, ctx, s, "j1", "other", []byte(`"x"`))
 
 	drained, err := s.DrainSignals(ctx, "j1", "ctx")
 	require.NoError(t, err)
@@ -99,18 +105,18 @@ func TestGetSignalWaitingJobsToResume(t *testing.T) {
 	future := time.Now().Add(time.Hour)
 
 	mkJob("has-signal", core.StatusWaiting, nil) // waiting + a pending signal → resume
-	require.NoError(t, s.SendSignal(ctx, "has-signal", "ctx", []byte(`1`)))
+	sendTestSignal(t, ctx, s, "has-signal", "ctx", []byte(`1`))
 	mkJob("timed-out", core.StatusWaiting, &past)       // waiting + deadline passed → resume
 	mkJob("still-waiting", core.StatusWaiting, &future) // waiting, no signal, future deadline → NOT yet
 	mkJob("plain-waiting", core.StatusWaiting, nil)     // waiting, no signal, no deadline → NOT
 	mkJob("running-signal", core.StatusRunning, nil)    // running (not waiting) → NOT
-	require.NoError(t, s.SendSignal(ctx, "running-signal", "ctx", []byte(`1`)))
+	sendTestSignal(t, ctx, s, "running-signal", "ctx", []byte(`1`))
 
 	// A parent still waiting on a pending fan-out must NOT be signal-resumed even
 	// if it has a pending signal — resuming would replay and re-suspend on the
 	// incomplete fan-out. The signal stays buffered for when the fan-out finishes.
 	mkJob("fanout-parent", core.StatusWaiting, nil)
-	require.NoError(t, s.SendSignal(ctx, "fanout-parent", "ctx", []byte(`1`)))
+	sendTestSignal(t, ctx, s, "fanout-parent", "ctx", []byte(`1`))
 	require.NoError(t, s.db.WithContext(ctx).Create(&core.FanOut{
 		ID: "fo1", ParentJobID: "fanout-parent", Status: core.FanOutPending, TotalCount: 1,
 	}).Error)
@@ -137,7 +143,7 @@ func TestGetSignalWaitingJobsToResumeAfter_KeysetPagesInIDOrder(t *testing.T) {
 		require.NoError(t, s.db.WithContext(ctx).Create(&core.Job{
 			ID: id, Type: "wf", Queue: "default", Status: core.StatusWaiting,
 		}).Error)
-		require.NoError(t, s.SendSignal(ctx, id, "ctx", []byte(`1`)))
+		sendTestSignal(t, ctx, s, id, "ctx", []byte(`1`))
 	}
 
 	first, err := s.GetSignalWaitingJobsToResumeAfter(ctx, "", 2)
@@ -186,8 +192,8 @@ func TestResumeSignalWaitingJob(t *testing.T) {
 func TestGetPendingSignalName(t *testing.T) {
 	s := newTestStorage(t)
 	ctx := context.Background()
-	require.NoError(t, s.SendSignal(ctx, "j1", "first", []byte(`1`)))
-	require.NoError(t, s.SendSignal(ctx, "j1", "second", []byte(`2`)))
+	sendTestSignal(t, ctx, s, "j1", "first", []byte(`1`))
+	sendTestSignal(t, ctx, s, "j1", "second", []byte(`2`))
 	_, err := s.ConsumeSignal(ctx, "j1", "first")
 	require.NoError(t, err)
 
@@ -235,7 +241,7 @@ func validCheckpoint(jobID string, sig *core.Signal) *core.Checkpoint {
 func TestConsumeSignalTx_AtomicConsumeAndCheckpoint(t *testing.T) {
 	s := newTestStorage(t)
 	ctx := context.Background()
-	require.NoError(t, s.SendSignal(ctx, "j1", "ctx", []byte(`"hi"`)))
+	sendTestSignal(t, ctx, s, "j1", "ctx", []byte(`"hi"`))
 
 	sig, err := s.ConsumeSignalTx(ctx, "j1", "ctx", func(sig *core.Signal) (*core.Checkpoint, error) {
 		return validCheckpoint("j1", sig), nil
@@ -260,7 +266,7 @@ func TestConsumeSignalTx_AtomicConsumeAndCheckpoint(t *testing.T) {
 func TestConsumeSignalTx_RollbackLeavesSignalAndNoCheckpoint(t *testing.T) {
 	s := newTestStorage(t)
 	ctx := context.Background()
-	require.NoError(t, s.SendSignal(ctx, "j1", "ctx", []byte(`"hi"`)))
+	sendTestSignal(t, ctx, s, "j1", "ctx", []byte(`"hi"`))
 
 	// The checkpoint-build closure fails: the whole consume+checkpoint must roll
 	// back. This is the crash/replay regression proof at the tx layer — the old
@@ -310,6 +316,7 @@ func TestDrainSignalsTx_AlwaysCheckpointsAndRollsBack(t *testing.T) {
 	t.Run("empty still checkpoints", func(t *testing.T) {
 		s := newTestStorage(t)
 		ctx := context.Background()
+		seedTestJob(t, ctx, s, "j1", core.StatusWaiting)
 		var called bool
 		sigs, err := s.DrainSignalsTx(ctx, "j1", "ctx", func(sigs []*core.Signal) (*core.Checkpoint, error) {
 			called = true
@@ -328,7 +335,7 @@ func TestDrainSignalsTx_AlwaysCheckpointsAndRollsBack(t *testing.T) {
 		s := newTestStorage(t)
 		ctx := context.Background()
 		for _, p := range [][]byte{[]byte(`"a"`), []byte(`"b"`), []byte(`"c"`)} {
-			require.NoError(t, s.SendSignal(ctx, "j1", "ctx", p))
+			sendTestSignal(t, ctx, s, "j1", "ctx", p)
 		}
 		sigs, err := s.DrainSignalsTx(ctx, "j1", "ctx", func(sigs []*core.Signal) (*core.Checkpoint, error) {
 			return drainCheckpoint(sigs), nil
@@ -347,7 +354,7 @@ func TestDrainSignalsTx_AlwaysCheckpointsAndRollsBack(t *testing.T) {
 		s := newTestStorage(t)
 		ctx := context.Background()
 		for _, p := range [][]byte{[]byte(`"a"`), []byte(`"b"`), []byte(`"c"`)} {
-			require.NoError(t, s.SendSignal(ctx, "j1", "ctx", p))
+			sendTestSignal(t, ctx, s, "j1", "ctx", p)
 		}
 		_, err := s.DrainSignalsTx(ctx, "j1", "ctx", func([]*core.Signal) (*core.Checkpoint, error) {
 			return nil, errors.New("boom")
@@ -369,7 +376,7 @@ func TestConsumeSignal_ConcurrentDisjoint(t *testing.T) {
 	ctx := context.Background()
 	const n = 20
 	for i := 0; i < n; i++ {
-		require.NoError(t, s.SendSignal(ctx, "j1", "ctx", []byte(`1`)))
+		sendTestSignal(t, ctx, s, "j1", "ctx", []byte(`1`))
 	}
 	var mu sync.Mutex
 	seen := map[string]int{}

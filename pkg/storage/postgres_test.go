@@ -149,6 +149,7 @@ func TestCancelSubJobs_PostgreSQL_ConcurrentCompletionKeepsFanOutCountsConsisten
 	s := newTestStorage(t)
 
 	const subQueue = "cancel-race-q"
+	seedTestJob(t, ctx, s, "parent", core.StatusWaiting)
 	fanOut := &core.FanOut{ID: "fo-cancel-race", ParentJobID: "parent", TotalCount: 3}
 	require.NoError(t, s.CreateFanOut(ctx, fanOut))
 

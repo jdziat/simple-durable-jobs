@@ -195,6 +195,11 @@ var schemaMigrations = []schemaMigration{
 		Name:    "dequeue_eligibility_index",
 		Up:      migrateDequeueEligibilityIndex,
 	},
+	{
+		Version: 14,
+		Name:    "integrity_foreign_keys",
+		Up:      migrateIntegrityForeignKeys,
+	},
 }
 
 // applyPendingMigrations runs every migration whose version is absent from the
@@ -243,7 +248,8 @@ func isBenignDDLError(err error) bool {
 	m := err.Error()
 	return strings.Contains(m, "Error 1061") || strings.Contains(m, "Duplicate key name") || // index already exists
 		strings.Contains(m, "Error 1060") || strings.Contains(m, "Duplicate column name") || // column already exists
-		strings.Contains(m, "Error 1091") || strings.Contains(m, "check that column/key exists") // dropping a missing index
+		strings.Contains(m, "Error 1091") || strings.Contains(m, "check that column/key exists") || // dropping a missing index
+		strings.Contains(m, "Error 1826") || strings.Contains(m, "Duplicate foreign key constraint name") // FK already exists
 }
 
 // migrateReworkDequeueIndex replaces the original idx_jobs_dequeue, whose column
@@ -668,4 +674,68 @@ func migrateDequeueEligibilityIndex(ctx context.Context, db *gorm.DB, dialect st
 		}
 		return nil
 	}
+}
+
+func migrateIntegrityForeignKeys(ctx context.Context, db *gorm.DB, dialect string) error {
+	switch dialect {
+	case dialectPostgres, dialectMySQL:
+		// Continue below.
+	default:
+		// SQLite test/prod DSNs have foreign_keys=OFF, and adding a FK to an
+		// existing SQLite table requires a full table rebuild. SQLite integrity
+		// rests on the app-level workflow-aware retention instead.
+		return nil
+	}
+
+	for _, stmt := range []string{
+		"DELETE FROM checkpoints WHERE NOT EXISTS (SELECT 1 FROM jobs j WHERE j.id = checkpoints.job_id)",
+		"DELETE FROM signals WHERE NOT EXISTS (SELECT 1 FROM jobs j WHERE j.id = signals.job_id)",
+		"DELETE FROM fan_outs WHERE NOT EXISTS (SELECT 1 FROM jobs j WHERE j.id = fan_outs.parent_job_id)",
+	} {
+		if err := db.WithContext(ctx).Exec(stmt).Error; err != nil {
+			return fmt.Errorf("pre-clean integrity orphans: %w", err)
+		}
+	}
+
+	type foreignKey struct {
+		model any
+		table string
+		name  string
+		col   string
+	}
+	const jobsRef = "REFERENCES jobs(id) ON DELETE CASCADE"
+	keys := []foreignKey{
+		{model: &core.Checkpoint{}, table: "checkpoints", name: "fk_checkpoints_job", col: "job_id"},
+		{model: &core.Signal{}, table: "signals", name: "fk_signals_job", col: "job_id"},
+		{model: &core.FanOut{}, table: "fan_outs", name: "fk_fanouts_parent", col: "parent_job_id"},
+	}
+
+	// S16: these VALIDATE / FK-add statements run under the fleet migration
+	// lock. On huge populated installs operators should run them out-of-band.
+	m := db.Migrator()
+	for _, key := range keys {
+		if m.HasConstraint(key.model, key.name) {
+			continue
+		}
+		switch dialect {
+		case dialectPostgres:
+			if err := db.WithContext(ctx).Exec(
+				fmt.Sprintf("ALTER TABLE %s ADD CONSTRAINT %s FOREIGN KEY (%s) %s NOT VALID", key.table, key.name, key.col, jobsRef),
+			).Error; err != nil {
+				return fmt.Errorf("add %s: %w", key.name, err)
+			}
+			if err := db.WithContext(ctx).Exec(
+				fmt.Sprintf("ALTER TABLE %s VALIDATE CONSTRAINT %s", key.table, key.name),
+			).Error; err != nil {
+				return fmt.Errorf("validate %s: %w", key.name, err)
+			}
+		case dialectMySQL:
+			if err := db.WithContext(ctx).Exec(
+				fmt.Sprintf("ALTER TABLE %s ADD CONSTRAINT %s FOREIGN KEY (%s) %s", key.table, key.name, key.col, jobsRef),
+			).Error; err != nil && !isBenignDDLError(err) {
+				return fmt.Errorf("add %s: %w", key.name, err)
+			}
+		}
+	}
+	return nil
 }

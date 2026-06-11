@@ -27,6 +27,8 @@ func TestIsBenignDDLError(t *testing.T) {
 		{"Duplicate column name 'x'", true},
 		{"Error 1091 (42000): Can't DROP 'idx'; check that column/key exists", true},
 		{"check that column/key exists", true},
+		{"Error 1826 (HY000): Duplicate foreign key constraint name 'fk_checkpoints_job'", true},
+		{"Duplicate foreign key constraint name 'fk'", true},
 		{"Error 1146: Table doesn't exist", false},
 		{"some unrelated error", false},
 		{"", false},
@@ -102,7 +104,7 @@ func TestRunMigrations_ConcurrentSafe(t *testing.T) {
 
 	var versions []int
 	require.NoError(t, s.db.Model(&core.SchemaMigration{}).Order("version").Pluck("version", &versions).Error)
-	assert.Equal(t, []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13}, versions, "every migration recorded exactly once")
+	assert.Equal(t, []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14}, versions, "every migration recorded exactly once")
 	assert.False(t, s.db.Migrator().HasIndex(&core.Job{}, "idx_jobs_dequeue"), "redundant dequeue index absent after v12")
 
 	// Pathological single-connection pool must not deadlock (lock + work share
@@ -339,6 +341,7 @@ func TestSeedScheduledFire_InsertIfAbsent(t *testing.T) {
 func TestSaveCheckpoint_PersistsErrorCause(t *testing.T) {
 	s := newTestStorage(t)
 	ctx := context.Background()
+	seedTestJob(t, ctx, s, "job-1", core.StatusRunning)
 
 	orig := core.NoRetry(assertErr("payment declined"))
 	message, cause, kind, delay := core.CheckpointErrorFields(orig)

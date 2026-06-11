@@ -1656,17 +1656,22 @@ func (s *GormStorage) Requeue(ctx context.Context, jobID string) (bool, error) {
 
 // deleteFanOutSubtree deletes the entire fan-out tree rooted at rootJobID: every
 // fan-out it spawned directly or transitively, all of those sub-jobs, and their
-// checkpoints. The root job row itself is NOT touched. Used by Requeue so
+// checkpoints/signals. The root job row itself is NOT touched. Used by Requeue so
 // replaying a parent re-dispatches a fresh tree instead of orphaning the old one
 // at any depth (a sub-job may itself be a fan-out parent).
 //
-// It descends level by level, deleting each level before expanding the next.
-// parent_job_id/fan_out_id are plain columns (no FK), so a child fan-out is
-// still findable by its (now-deleted) parent sub-job's id; and because each
-// level's rows are deleted as it is visited, even cyclically corrupt data cannot
-// loop (the depth cap is just extra insurance). IN-lists stay bounded to one
-// level's width rather than the whole tree.
+// Two phases. Phase 1 is a read-only level-by-level descent that collects every
+// fan-out id and sub-job id in the tree WITHOUT deleting anything, so the
+// parent_job_id/fan_out_id chains stay intact for the whole walk. Phase 2 then
+// deletes the collected rows. This ordering is required because migration v14
+// added fk_fanouts_parent (fan_outs.parent_job_id -> jobs.id ON DELETE CASCADE):
+// deleting a level's sub-jobs cascade-removes the NEXT level's fan_outs rows, so
+// a delete-as-you-descend walk would lose the frontier and orphan grandchildren
+// (there is no FK on jobs.fan_out_id, so the cascade stops at fan_outs and the
+// grandchild sub-jobs would be stranded). The depth cap bounds cyclically corrupt
+// data; IN-lists stay bounded to one level's width during the walk.
 func (s *GormStorage) deleteFanOutSubtree(tx *gorm.DB, rootJobID string) error {
+	var allFanOutIDs, allSubJobIDs []string
 	frontier := []string{rootJobID}
 	for depth := 0; len(frontier) > 0 && depth < maxFanOutTreeDepth; depth++ {
 		var fanOutIDs []string
@@ -1676,7 +1681,7 @@ func (s *GormStorage) deleteFanOutSubtree(tx *gorm.DB, rootJobID string) error {
 			return err
 		}
 		if len(fanOutIDs) == 0 {
-			return nil // reached the leaves
+			break // reached the leaves
 		}
 
 		var subJobIDs []string
@@ -1686,22 +1691,34 @@ func (s *GormStorage) deleteFanOutSubtree(tx *gorm.DB, rootJobID string) error {
 			return err
 		}
 
-		if len(subJobIDs) > 0 {
-			if err := tx.Where("job_id IN ?", subJobIDs).Delete(&core.Checkpoint{}).Error; err != nil {
-				return err
-			}
-			if err := tx.Where("id IN ?", subJobIDs).Delete(&core.Job{}).Error; err != nil {
-				return err
-			}
-		}
-		if err := tx.Where("id IN ?", fanOutIDs).Delete(&core.FanOut{}).Error; err != nil {
+		allFanOutIDs = append(allFanOutIDs, fanOutIDs...)
+		allSubJobIDs = append(allSubJobIDs, subJobIDs...)
+
+		// Descend into the sub-jobs just collected; their child fan-outs are
+		// still present (nothing deleted yet) and findable by parent_job_id.
+		frontier = subJobIDs
+	}
+
+	if len(allSubJobIDs) > 0 {
+		// Delete dependents explicitly so the behavior holds on SQLite too (no FK
+		// there). On PG/MySQL deleting the sub-jobs also cascade-removes their
+		// checkpoints/signals/fan_outs, making these deletes idempotent.
+		if err := tx.Where("job_id IN ?", allSubJobIDs).Delete(&core.Checkpoint{}).Error; err != nil {
 			return err
 		}
-
-		// Sub-jobs just deleted may themselves have spawned fan-outs; expand
-		// into them next. Their child fan-out rows are still present and remain
-		// findable by parent_job_id (a plain column).
-		frontier = subJobIDs
+		if err := tx.Where("job_id IN ?", allSubJobIDs).Delete(&core.Signal{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("id IN ?", allSubJobIDs).Delete(&core.Job{}).Error; err != nil {
+			return err
+		}
+	}
+	if len(allFanOutIDs) > 0 {
+		// Root-level fan_outs (parent_job_id = the untouched root) are not reached
+		// by the sub-job cascade, so delete the collected fan_outs explicitly.
+		if err := tx.Where("id IN ?", allFanOutIDs).Delete(&core.FanOut{}).Error; err != nil {
+			return err
+		}
 	}
 	return nil
 }
