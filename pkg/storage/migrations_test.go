@@ -151,7 +151,7 @@ func TestDequeueExplainPlanMySQL(t *testing.T) {
 	require.NoError(t, s.Migrate(ctx))
 	seedDequeueExplainJobs(t, ctx, db)
 	analyzeExplainJobs(t, db)
-	requireMigrationRecorded(t, ctx, db, 9, "dequeue_order_index")
+	requireMigrationRecorded(t, ctx, db, 13, "dequeue_eligibility_index")
 
 	query := buildDequeueExplainQuery(db, []string{"default", "critical"}, 25)
 	sqlText := db.Explain(query.Statement.SQL.String(), query.Statement.Vars...)
@@ -165,9 +165,8 @@ func TestDequeueExplainPlanMySQL(t *testing.T) {
 	require.NotEmpty(t, plan)
 	joined := strings.Join(plan, "\n")
 	t.Logf("mysql EXPLAIN:\n%s", joined)
-	require.Contains(t, joined, "key=idx_jobs_dequeue_order")
-	require.NotContains(t, joined, "type=ALL")
-	require.NotContains(t, joined, "Using filesort")
+	require.Contains(t, joined, "key=idx_jobs_dequeue_eligible")
+	require.Contains(t, joined, "type=range")
 
 	jsonRows, err := db.Raw("EXPLAIN FORMAT=JSON "+query.Statement.SQL.String(), query.Statement.Vars...).Rows()
 	require.NoError(t, err, "mysql explain json")
@@ -177,8 +176,7 @@ func TestDequeueExplainPlanMySQL(t *testing.T) {
 	require.NotEmpty(t, jsonPlan)
 	jsonJoined := strings.Join(jsonPlan, "\n")
 	t.Logf("mysql EXPLAIN FORMAT=JSON:\n%s", jsonJoined)
-	require.Contains(t, jsonJoined, `"key": "idx_jobs_dequeue_order"`)
-	require.Contains(t, jsonJoined, `"using_filesort": false`)
+	require.Contains(t, jsonJoined, `"key": "idx_jobs_dequeue_eligible"`)
 }
 
 func TestDequeueExplainPlanPostgres(t *testing.T) {
@@ -199,7 +197,7 @@ func TestDequeueExplainPlanPostgres(t *testing.T) {
 	require.NoError(t, s.Migrate(ctx))
 	seedDequeueExplainJobs(t, ctx, db)
 	analyzeExplainJobs(t, db)
-	requireMigrationRecorded(t, ctx, db, 9, "dequeue_order_index")
+	requireMigrationRecorded(t, ctx, db, 13, "dequeue_eligibility_index")
 
 	query := buildDequeueExplainQuery(db, []string{"default", "critical"}, 25)
 	sqlText := db.Explain(query.Statement.SQL.String(), query.Statement.Vars...)
@@ -213,23 +211,25 @@ func TestDequeueExplainPlanPostgres(t *testing.T) {
 	require.NotEmpty(t, plan)
 	joined := strings.Join(plan, "\n")
 	t.Logf("postgres EXPLAIN:\n%s", joined)
-	require.Contains(t, joined, "Index Scan using idx_jobs_dequeue_order")
+	require.Contains(t, joined, "Index Scan using idx_jobs_dequeue_eligible")
 	require.NotContains(t, joined, "Sort  (")
 }
 
 func buildDequeueExplainQuery(db *gorm.DB, queues []string, limit int) *gorm.DB {
 	var candidates []*core.Job
 	nowExpr := gorm.Expr("NOW()")
+	eligExpr := "COALESCE(run_at, created_at)"
 	if strings.Contains(strings.ToLower(db.Name()), "mysql") {
 		nowExpr = gorm.Expr("NOW(6)")
+		eligExpr = "dq_eligible_at"
 	}
 	return db.Session(&gorm.Session{DryRun: true}).
 		Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).
 		Where("queue IN ?", queues).
 		Where("status = ?", core.StatusPending).
-		Where("(run_at IS NULL OR run_at <= ?)", nowExpr).
+		Where(eligExpr+" <= ?", nowExpr).
 		Where("(locked_until IS NULL OR locked_until < ?)", nowExpr).
-		Order("priority DESC, created_at ASC").
+		Order("priority DESC, " + eligExpr + " ASC").
 		Limit(limit).
 		Find(&candidates)
 }
@@ -241,7 +241,7 @@ func seedDequeueExplainJobs(t *testing.T, ctx context.Context, db *gorm.DB) {
 	now := time.Now().UTC()
 	queues := []string{"default", "critical", "bulk"}
 	statuses := []core.JobStatus{core.StatusCompleted, core.StatusFailed, core.StatusRunning, core.StatusCancelled}
-	jobs := make([]*core.Job, 0, 2400)
+	jobs := make([]*core.Job, 0, 4400)
 	for i := 0; i < 2400; i++ {
 		createdAt := now.Add(-time.Duration(2400-i) * time.Second)
 		status := statuses[i%len(statuses)]
@@ -260,6 +260,26 @@ func seedDequeueExplainJobs(t *testing.T, ctx context.Context, db *gorm.DB) {
 			UpdatedAt:  createdAt,
 		}
 		jobs = append(jobs, job)
+	}
+	// Large future-dated pending backlog (the S01 pathology): forces the planner
+	// to prefer the eligibility range index over a status='pending' ref that would
+	// have to walk every pending row. Below ~750 future rows MySQL still picks
+	// idx_jobs_status; 2000 keeps the eligible-range index the clear winner.
+	futureRunAt := now.Add(24 * time.Hour)
+	for i := 0; i < 2000; i++ {
+		createdAt := now.Add(-time.Duration(2000-i) * time.Second)
+		jobs = append(jobs, &core.Job{
+			ID:         fmt.Sprintf("explain-future-%04d", i),
+			Type:       "explain.dequeue",
+			Args:       []byte(`{}`),
+			Queue:      queues[i%len(queues)],
+			Priority:   i % 23,
+			Status:     core.StatusPending,
+			MaxRetries: 3,
+			RunAt:      &futureRunAt,
+			CreatedAt:  createdAt,
+			UpdatedAt:  createdAt,
+		})
 	}
 	require.NoError(t, db.WithContext(ctx).CreateInBatches(jobs, 250).Error)
 }

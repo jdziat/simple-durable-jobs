@@ -149,7 +149,8 @@ func TestMigrate_DequeueOrderIndexExists(t *testing.T) {
 	}
 
 	assert.Empty(t, findIndex("idx_jobs_dequeue"))
-	assert.Equal(t, "idx_jobs_dequeue_order", findIndex("idx_jobs_dequeue_order"))
+	assert.Empty(t, findIndex("idx_jobs_dequeue_order"))
+	assert.Equal(t, "idx_jobs_dequeue_eligible", findIndex("idx_jobs_dequeue_eligible"))
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

@@ -190,6 +190,11 @@ var schemaMigrations = []schemaMigration{
 		Name:    "drop_redundant_job_indexes",
 		Up:      migrateDropRedundantJobIndexes,
 	},
+	{
+		Version: 13,
+		Name:    "dequeue_eligibility_index",
+		Up:      migrateDequeueEligibilityIndex,
+	},
 }
 
 // applyPendingMigrations runs every migration whose version is absent from the
@@ -622,6 +627,44 @@ func migrateDropRedundantJobIndexes(ctx context.Context, db *gorm.DB, dialect st
 			if err := db.WithContext(ctx).Exec("DROP INDEX IF EXISTS " + indexName).Error; err != nil {
 				return fmt.Errorf("drop %s: %w", indexName, err)
 			}
+		}
+		return nil
+	}
+}
+
+func migrateDequeueEligibilityIndex(ctx context.Context, db *gorm.DB, dialect string) error {
+	switch dialect {
+	case dialectMySQL:
+		m := db.Migrator()
+		if !m.HasColumn(&core.Job{}, "dq_eligible_at") {
+			if err := db.WithContext(ctx).Exec(
+				"ALTER TABLE jobs ADD COLUMN dq_eligible_at datetime(6) " +
+					"GENERATED ALWAYS AS (IF(status = 'pending', COALESCE(run_at, created_at), NULL)) STORED",
+			).Error; err != nil && !isBenignDDLError(err) {
+				return fmt.Errorf("add dq_eligible_at column: %w", err)
+			}
+		}
+		if !m.HasIndex(&core.Job{}, "idx_jobs_dequeue_eligible") {
+			if err := db.WithContext(ctx).Exec(
+				"CREATE INDEX idx_jobs_dequeue_eligible ON jobs (dq_eligible_at, priority, queue)",
+			).Error; err != nil && !isBenignDDLError(err) {
+				return fmt.Errorf("create idx_jobs_dequeue_eligible: %w", err)
+			}
+		}
+		if m.HasIndex(&core.Job{}, "idx_jobs_dequeue_order") {
+			if err := m.DropIndex(&core.Job{}, "idx_jobs_dequeue_order"); err != nil && !isBenignDDLError(err) {
+				return fmt.Errorf("drop idx_jobs_dequeue_order: %w", err)
+			}
+		}
+		return nil
+	default:
+		if err := db.WithContext(ctx).Exec(
+			"CREATE INDEX IF NOT EXISTS idx_jobs_dequeue_eligible ON jobs (priority DESC, (COALESCE(run_at, created_at)), queue) WHERE status = 'pending'",
+		).Error; err != nil {
+			return fmt.Errorf("create idx_jobs_dequeue_eligible: %w", err)
+		}
+		if err := db.WithContext(ctx).Exec("DROP INDEX IF EXISTS idx_jobs_dequeue_order").Error; err != nil {
+			return fmt.Errorf("drop idx_jobs_dequeue_order: %w", err)
 		}
 		return nil
 	}

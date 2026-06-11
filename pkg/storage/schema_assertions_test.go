@@ -47,7 +47,7 @@ func TestPostgresSchemaAssertions(t *testing.T) {
 	defs := map[string]string{
 		"idx_jobs_dead_lettered_at":   "dead_lettered_at IS NOT NULL",
 		"idx_jobs_active_unique":      "WHERE",
-		"idx_jobs_dequeue_order":      "WHERE",
+		"idx_jobs_dequeue_eligible":   "WHERE",
 		"idx_jobs_retention_terminal": "WHERE",
 		"idx_jobs_stale_lock":         "COALESCE",
 	}
@@ -56,6 +56,7 @@ func TestPostgresSchemaAssertions(t *testing.T) {
 		require.Contains(t, strings.ToUpper(indexDef), strings.ToUpper(mustContain), "%s definition:\n%s", indexName, indexDef)
 	}
 	require.Contains(t, postgresIndexDef(t, db, "idx_jobs_stale_lock"), "WHERE", "idx_jobs_stale_lock must stay partial")
+	require.Contains(t, strings.ToUpper(postgresIndexDef(t, db, "idx_jobs_dequeue_eligible")), "COALESCE")
 
 	for _, indexName := range []string{
 		"idx_jobs_priority",
@@ -63,6 +64,7 @@ func TestPostgresSchemaAssertions(t *testing.T) {
 		"idx_jobs_locked_until",
 		"idx_jobs_dequeue",
 		"idx_jobs_unique_key",
+		"idx_jobs_dequeue_order",
 	} {
 		require.False(t, postgresIndexExists(t, db, indexName), "%s must not exist after migration", indexName)
 	}
@@ -110,15 +112,28 @@ func TestMySQLSchemaAssertions(t *testing.T) {
 	`).Scan(&activeUniqueKeyCount).Error)
 	require.Equal(t, 1, activeUniqueKeyCount, "active_unique_key generated column must exist")
 
+	var dequeueEligibleCount int
+	require.NoError(t, db.Raw(`
+		SELECT COUNT(*)
+		FROM information_schema.COLUMNS
+		WHERE TABLE_SCHEMA = DATABASE()
+		  AND TABLE_NAME = 'jobs'
+		  AND COLUMN_NAME = 'dq_eligible_at'
+		  AND GENERATION_EXPRESSION <> ''
+	`).Scan(&dequeueEligibleCount).Error)
+	require.Equal(t, 1, dequeueEligibleCount, "dq_eligible_at generated column must exist")
+
 	for _, indexName := range []string{
 		"idx_jobs_priority",
 		"idx_jobs_queue",
 		"idx_jobs_locked_until",
 		"idx_jobs_dequeue",
+		"idx_jobs_dequeue_order",
 	} {
 		require.False(t, mysqlIndexExists(t, db, indexName), "%s must not exist after migration", indexName)
 	}
 	require.True(t, mysqlIndexExists(t, db, "idx_jobs_unique_key"), "idx_jobs_unique_key must remain on mysql")
+	require.True(t, mysqlIndexExists(t, db, "idx_jobs_dequeue_eligible"), "idx_jobs_dequeue_eligible must exist on mysql")
 }
 
 func requireMySQLDeadLetteredAtPrecision(t *testing.T, db *gorm.DB, want int) {

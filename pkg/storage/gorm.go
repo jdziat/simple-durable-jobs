@@ -410,6 +410,7 @@ func (s *GormStorage) Dequeue(ctx context.Context, queues []string, workerID str
 	// add a predicate that assumes the two reads are equal.
 	nowExpr := s.nowExpr()
 	lockUntilExpr := s.offsetExpr(s.lockDuration)
+	eligExpr := s.dequeueEligibleExpr()
 	silentDB := s.db.Session(&gorm.Session{Logger: s.db.Logger.LogMode(logger.Silent)})
 	err = silentDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		// FOR UPDATE SKIP LOCKED ensures:
@@ -419,9 +420,9 @@ func (s *GormStorage) Dequeue(ctx context.Context, queues []string, workerID str
 		result := tx.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).
 			Where("queue IN ?", activeQueues).
 			Where("status = ?", core.StatusPending).
-			Where("(run_at IS NULL OR run_at <= ?)", nowExpr).
+			Where(eligExpr+" <= ?", nowExpr).
 			Where("(locked_until IS NULL OR locked_until < ?)", nowExpr).
-			Order("priority DESC, created_at ASC").
+			Order("priority DESC, " + eligExpr + " ASC").
 			First(&job)
 
 		if result.Error != nil {
@@ -475,15 +476,16 @@ func (s *GormStorage) Dequeue(ctx context.Context, queues []string, workerID str
 // This is NOT safe for multiple concurrent workers - use PostgreSQL for production.
 func (s *GormStorage) dequeueSQLite(ctx context.Context, queues []string, workerID string, now time.Time, lockUntil time.Time) (*core.Job, error) {
 	var job core.Job
+	eligExpr := s.dequeueEligibleExpr()
 
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		// Find a candidate job
 		result := tx.
 			Where("queue IN ?", queues).
 			Where("status = ?", core.StatusPending).
-			Where("(run_at IS NULL OR run_at <= ?)", now).
+			Where(eligExpr+" <= ?", now).
 			Where("(locked_until IS NULL OR locked_until < ?)", now).
-			Order("priority DESC, created_at ASC").
+			Order("priority DESC, " + eligExpr + " ASC").
 			First(&job)
 
 		if result.Error != nil {
@@ -914,9 +916,9 @@ func (s *GormStorage) GetDueJobs(ctx context.Context, queues []string, limit int
 	err = s.db.WithContext(ctx).
 		Where("queue IN ?", activeQueues).
 		Where("status = ?", core.StatusPending).
-		Where("(run_at IS NULL OR run_at <= ?)", nowVal).
+		Where(s.dequeueEligibleExpr()+" <= ?", nowVal).
 		Where("(locked_until IS NULL OR locked_until < ?)", nowVal).
-		Order("priority DESC, created_at ASC").
+		Order("priority DESC, " + s.dequeueEligibleExpr() + " ASC").
 		Limit(limit).
 		Find(&jobList).Error
 
