@@ -42,7 +42,7 @@ type Job struct {
 	// BestEffort relaxes the Call replay type-mismatch guard.
 	Determinism      int        `gorm:"not null;default:0"`
 	LastError        string     `gorm:"type:text"`
-	DeadLetteredAt   *time.Time `gorm:"index"`
+	DeadLetteredAt   *time.Time `gorm:"precision:6"`
 	DeadLetterReason string     `gorm:"type:text"`
 	RunAt            *time.Time `gorm:"index"`
 	StartedAt        *time.Time

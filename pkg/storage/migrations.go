@@ -180,6 +180,11 @@ var schemaMigrations = []schemaMigration{
 		Name:    "unique_locks",
 		Up:      migrateUniqueLocks,
 	},
+	{
+		Version: 11,
+		Name:    "fix_dead_letter_index",
+		Up:      migrateFixDeadLetterIndex,
+	},
 }
 
 // applyPendingMigrations runs every migration whose version is absent from the
@@ -531,6 +536,48 @@ func migrateUniqueLocks(ctx context.Context, db *gorm.DB, dialect string) error 
 	default:
 		return db.WithContext(ctx).Exec(
 			"CREATE INDEX IF NOT EXISTS idx_unique_locks_expires_at ON unique_locks (expires_at)",
+		).Error
+	}
+}
+
+func migrateFixDeadLetterIndex(ctx context.Context, db *gorm.DB, dialect string) error {
+	switch dialect {
+	case dialectMySQL:
+		var precision sql.NullInt64
+		if err := db.WithContext(ctx).Raw(`
+			SELECT DATETIME_PRECISION
+			FROM information_schema.COLUMNS
+			WHERE TABLE_SCHEMA = DATABASE()
+			  AND TABLE_NAME = 'jobs'
+			  AND COLUMN_NAME = 'dead_lettered_at'
+		`).Scan(&precision).Error; err != nil {
+			return fmt.Errorf("read dead_lettered_at precision: %w", err)
+		}
+		if precision.Valid && precision.Int64 == 6 {
+			return nil
+		}
+		if err := db.WithContext(ctx).Exec(
+			"ALTER TABLE jobs MODIFY COLUMN dead_lettered_at DATETIME(6) NULL",
+		).Error; err != nil && !isBenignDDLError(err) {
+			return fmt.Errorf("modify dead_lettered_at precision: %w", err)
+		}
+		return nil
+	case dialectPostgres:
+		if err := db.WithContext(ctx).Exec("ALTER TABLE jobs ALTER COLUMN dead_lettered_at TYPE timestamp with time zone").Error; err != nil {
+			return fmt.Errorf("normalize dead_lettered_at type: %w", err)
+		}
+		if err := db.WithContext(ctx).Exec("DROP INDEX IF EXISTS idx_jobs_dead_lettered_at").Error; err != nil {
+			return fmt.Errorf("drop idx_jobs_dead_lettered_at: %w", err)
+		}
+		return db.WithContext(ctx).Exec(
+			"CREATE INDEX IF NOT EXISTS idx_jobs_dead_lettered_at ON jobs (dead_lettered_at) WHERE dead_lettered_at IS NOT NULL",
+		).Error
+	default:
+		if err := db.WithContext(ctx).Exec("DROP INDEX IF EXISTS idx_jobs_dead_lettered_at").Error; err != nil {
+			return fmt.Errorf("drop idx_jobs_dead_lettered_at: %w", err)
+		}
+		return db.WithContext(ctx).Exec(
+			"CREATE INDEX IF NOT EXISTS idx_jobs_dead_lettered_at ON jobs (dead_lettered_at) WHERE dead_lettered_at IS NOT NULL",
 		).Error
 	}
 }
