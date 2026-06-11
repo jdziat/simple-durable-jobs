@@ -388,7 +388,13 @@ func (s *GormStorage) GetFanOutsByParents(ctx context.Context, parentJobIDs []st
 		Where("parent_job_id IN ?", parentJobIDs).
 		Order("parent_job_id ASC, created_at ASC").
 		Find(&fanOuts).Error
-	return fanOuts, err
+	if err != nil {
+		return nil, err
+	}
+	if err := overlayLiveFanOutCountsBatch(s.db.WithContext(ctx), fanOuts); err != nil {
+		return nil, err
+	}
+	return fanOuts, nil
 }
 
 // GetSubJobsByFanOuts retrieves sub-jobs for multiple fan-outs in one query.

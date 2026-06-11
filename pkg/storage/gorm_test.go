@@ -1512,6 +1512,22 @@ func createP2BFanOut(t *testing.T, ctx context.Context, s *GormStorage, status c
 	return fo
 }
 
+func seedFanOutChild(t *testing.T, ctx context.Context, s *GormStorage, fanOutID string, status core.JobStatus) *core.Job {
+	t.Helper()
+	job := &core.Job{
+		Type:     "fanout.child",
+		Queue:    "default",
+		Status:   status,
+		FanOutID: &fanOutID,
+	}
+	if status == core.StatusCompleted || status == core.StatusFailed || status == core.StatusCancelled {
+		now := time.Now()
+		job.CompletedAt = &now
+	}
+	require.NoError(t, s.Enqueue(ctx, job))
+	return job
+}
+
 func TestCompleteWithResult_AtomicIncrementOnce(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStorage(t)
@@ -1627,7 +1643,7 @@ func TestCompleteWithResult_LivenessGuard_NoCountOnTerminalFanOut(t *testing.T) 
 	require.NoError(t, err)
 	require.NotNil(t, updated)
 	assert.Equal(t, core.FanOutFailed, updated.Status)
-	assert.Equal(t, 0, updated.CompletedCount)
+	assert.Equal(t, 1, updated.CompletedCount)
 
 	row, err := s.GetJob(ctx, job.ID)
 	require.NoError(t, err)
@@ -1637,7 +1653,11 @@ func TestCompleteWithResult_LivenessGuard_NoCountOnTerminalFanOut(t *testing.T) 
 	after, err := s.GetFanOut(ctx, fo.ID)
 	require.NoError(t, err)
 	require.NotNil(t, after)
-	assert.Equal(t, 0, after.CompletedCount)
+	assert.Equal(t, 1, after.CompletedCount)
+
+	var persisted core.FanOut
+	require.NoError(t, s.DB().First(&persisted, "id = ?", fo.ID).Error)
+	assert.Equal(t, 0, persisted.CompletedCount)
 }
 
 func TestFailTerminalWithResult_AtomicIncrementOnce(t *testing.T) {
@@ -1720,7 +1740,7 @@ func TestFailTerminalWithResult_LivenessGuard_NoCountOnTerminalFanOut(t *testing
 	require.NoError(t, err)
 	require.NotNil(t, updated)
 	assert.Equal(t, core.FanOutFailed, updated.Status)
-	assert.Equal(t, 0, updated.FailedCount)
+	assert.Equal(t, 1, updated.FailedCount)
 
 	row, err := s.GetJob(ctx, job.ID)
 	require.NoError(t, err)
@@ -1730,7 +1750,11 @@ func TestFailTerminalWithResult_LivenessGuard_NoCountOnTerminalFanOut(t *testing
 	after, err := s.GetFanOut(ctx, fo.ID)
 	require.NoError(t, err)
 	require.NotNil(t, after)
-	assert.Equal(t, 0, after.FailedCount)
+	assert.Equal(t, 1, after.FailedCount)
+
+	var persisted core.FanOut
+	require.NoError(t, s.DB().First(&persisted, "id = ?", fo.ID).Error)
+	assert.Equal(t, 0, persisted.FailedCount)
 }
 
 func TestCreateFanOut_PreservesExistingID(t *testing.T) {
@@ -1759,11 +1783,13 @@ func TestIncrementFanOutCompleted(t *testing.T) {
 	fanOut := &core.FanOut{ParentJobID: parent.ID, TotalCount: 3}
 	require.NoError(t, s.CreateFanOut(ctx, fanOut))
 
+	seedFanOutChild(t, ctx, s, fanOut.ID, core.StatusCompleted)
 	updated, err := s.IncrementFanOutCompleted(ctx, fanOut.ID)
 	require.NoError(t, err)
 	require.NotNil(t, updated)
 	assert.Equal(t, 1, updated.CompletedCount)
 
+	seedFanOutChild(t, ctx, s, fanOut.ID, core.StatusCompleted)
 	updated, err = s.IncrementFanOutCompleted(ctx, fanOut.ID)
 	require.NoError(t, err)
 	assert.Equal(t, 2, updated.CompletedCount)
@@ -1779,6 +1805,7 @@ func TestIncrementFanOutFailed(t *testing.T) {
 	fanOut := &core.FanOut{ParentJobID: parent.ID, TotalCount: 3}
 	require.NoError(t, s.CreateFanOut(ctx, fanOut))
 
+	seedFanOutChild(t, ctx, s, fanOut.ID, core.StatusFailed)
 	updated, err := s.IncrementFanOutFailed(ctx, fanOut.ID)
 	require.NoError(t, err)
 	require.NotNil(t, updated)
@@ -1795,6 +1822,7 @@ func TestIncrementFanOutCancelled(t *testing.T) {
 	fanOut := &core.FanOut{ParentJobID: parent.ID, TotalCount: 3}
 	require.NoError(t, s.CreateFanOut(ctx, fanOut))
 
+	seedFanOutChild(t, ctx, s, fanOut.ID, core.StatusCancelled)
 	updated, err := s.IncrementFanOutCancelled(ctx, fanOut.ID)
 	require.NoError(t, err)
 	require.NotNil(t, updated)
@@ -2738,10 +2766,13 @@ func TestGetStalledFanOutParents_LimitsBatch(t *testing.T) {
 // ──────────────────────────────────────────────────────────────────────────────
 
 // TestCompleteWithResult_AdvancesFanOutStatusInSameTx proves the fan-out status
-// transitions to 'completed' inside the same transaction as the terminal
-// counter increment — no separate worker-layer UpdateFanOutStatus call is made
-// anywhere in this test, so a status of 'completed' after the final sub-job can
-// only come from the in-tx advance.
+// transitions to 'completed' synchronously from CompleteWithResult itself —
+// after P7, via accountTerminalWithFanOut's post-commit child-job COUNT and
+// pending-guarded resolve (no longer a per-child counter increment; the resolve
+// is a second transaction after the child's terminal write commits). No separate
+// worker-layer UpdateFanOutStatus call is made anywhere in this test, so a
+// 'completed' status after the final sub-job can only come from
+// CompleteWithResult's own resolution.
 func TestCompleteWithResult_AdvancesFanOutStatusInSameTx(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStorage(t)
@@ -2823,14 +2854,15 @@ func TestGetCompletablePendingFanOuts(t *testing.T) {
 	strandedParent := &core.Job{Type: "wf.stranded", Queue: "default", Status: core.StatusWaiting}
 	require.NoError(t, s.Enqueue(ctx, strandedParent))
 	stranded := &core.FanOut{
-		ParentJobID:    strandedParent.ID,
-		TotalCount:     2,
-		CompletedCount: 2,
-		Strategy:       core.StrategyCollectAll,
-		Status:         core.FanOutPending,
-		CreatedAt:      old,
+		ParentJobID: strandedParent.ID,
+		TotalCount:  2,
+		Strategy:    core.StrategyCollectAll,
+		Status:      core.FanOutPending,
+		CreatedAt:   old,
 	}
 	require.NoError(t, s.CreateFanOut(ctx, stranded))
+	seedFanOutChild(t, ctx, s, stranded.ID, core.StatusCompleted)
+	seedFanOutChild(t, ctx, s, stranded.ID, core.StatusCompleted)
 
 	// (b) fail_fast pending with failed_count==1, waiting parent, old → returned.
 	failParent := &core.Job{Type: "wf.fail", Queue: "default", Status: core.StatusWaiting}
@@ -2838,59 +2870,61 @@ func TestGetCompletablePendingFanOuts(t *testing.T) {
 	failFan := &core.FanOut{
 		ParentJobID: failParent.ID,
 		TotalCount:  3,
-		FailedCount: 1,
 		Strategy:    core.StrategyFailFast,
 		Status:      core.FanOutPending,
 		CreatedAt:   old,
 	}
 	require.NoError(t, s.CreateFanOut(ctx, failFan))
+	seedFanOutChild(t, ctx, s, failFan.ID, core.StatusFailed)
 
 	// (c) genuinely in-flight pending (counts < total, no failures) → excluded.
 	inflightParent := &core.Job{Type: "wf.inflight", Queue: "default", Status: core.StatusWaiting}
 	require.NoError(t, s.Enqueue(ctx, inflightParent))
 	require.NoError(t, s.CreateFanOut(ctx, &core.FanOut{
-		ParentJobID:    inflightParent.ID,
-		TotalCount:     3,
-		CompletedCount: 1,
-		Strategy:       core.StrategyCollectAll,
-		Status:         core.FanOutPending,
-		CreatedAt:      old,
+		ParentJobID: inflightParent.ID,
+		TotalCount:  3,
+		Strategy:    core.StrategyCollectAll,
+		Status:      core.FanOutPending,
+		CreatedAt:   old,
 	}))
 
 	// (d) pending with terminal counts but parent status='running' → excluded.
 	runningParent := &core.Job{Type: "wf.running", Queue: "default", Status: core.StatusRunning}
 	require.NoError(t, s.Enqueue(ctx, runningParent))
-	require.NoError(t, s.CreateFanOut(ctx, &core.FanOut{
-		ParentJobID:    runningParent.ID,
-		TotalCount:     2,
-		CompletedCount: 2,
-		Strategy:       core.StrategyCollectAll,
-		Status:         core.FanOutPending,
-		CreatedAt:      old,
-	}))
+	runningFan := &core.FanOut{
+		ParentJobID: runningParent.ID,
+		TotalCount:  2,
+		Strategy:    core.StrategyCollectAll,
+		Status:      core.FanOutPending,
+		CreatedAt:   old,
+	}
+	require.NoError(t, s.CreateFanOut(ctx, runningFan))
+	seedFanOutChild(t, ctx, s, runningFan.ID, core.StatusCompleted)
+	seedFanOutChild(t, ctx, s, runningFan.ID, core.StatusCompleted)
 
 	// (e) pending terminal but created_at recent (after cutoff) → excluded.
 	recentParent := &core.Job{Type: "wf.recent", Queue: "default", Status: core.StatusWaiting}
 	require.NoError(t, s.Enqueue(ctx, recentParent))
-	require.NoError(t, s.CreateFanOut(ctx, &core.FanOut{
-		ParentJobID:    recentParent.ID,
-		TotalCount:     2,
-		CompletedCount: 2,
-		Strategy:       core.StrategyCollectAll,
-		Status:         core.FanOutPending,
-		CreatedAt:      recent,
-	}))
+	recentFan := &core.FanOut{
+		ParentJobID: recentParent.ID,
+		TotalCount:  2,
+		Strategy:    core.StrategyCollectAll,
+		Status:      core.FanOutPending,
+		CreatedAt:   recent,
+	}
+	require.NoError(t, s.CreateFanOut(ctx, recentFan))
+	seedFanOutChild(t, ctx, s, recentFan.ID, core.StatusCompleted)
+	seedFanOutChild(t, ctx, s, recentFan.ID, core.StatusCompleted)
 
 	// (f) already-terminal status='completed' → excluded.
 	doneParent := &core.Job{Type: "wf.done", Queue: "default", Status: core.StatusWaiting}
 	require.NoError(t, s.Enqueue(ctx, doneParent))
 	require.NoError(t, s.CreateFanOut(ctx, &core.FanOut{
-		ParentJobID:    doneParent.ID,
-		TotalCount:     2,
-		CompletedCount: 2,
-		Strategy:       core.StrategyCollectAll,
-		Status:         core.FanOutCompleted,
-		CreatedAt:      old,
+		ParentJobID: doneParent.ID,
+		TotalCount:  2,
+		Strategy:    core.StrategyCollectAll,
+		Status:      core.FanOutCompleted,
+		CreatedAt:   old,
 	}))
 
 	got, err := s.GetCompletablePendingFanOuts(ctx, cutoff)
@@ -2920,14 +2954,16 @@ func TestGetCompletablePendingFanOuts_LimitsBatch(t *testing.T) {
 	for i := 0; i < maxResumeBatch+25; i++ {
 		parent := &core.Job{Type: "wf.stranded", Queue: "default", Status: core.StatusWaiting}
 		require.NoError(t, s.Enqueue(ctx, parent))
-		require.NoError(t, s.CreateFanOut(ctx, &core.FanOut{
-			ParentJobID:    parent.ID,
-			TotalCount:     2,
-			CompletedCount: 2,
-			Strategy:       core.StrategyCollectAll,
-			Status:         core.FanOutPending,
-			CreatedAt:      old,
-		}))
+		fanOut := &core.FanOut{
+			ParentJobID: parent.ID,
+			TotalCount:  2,
+			Strategy:    core.StrategyCollectAll,
+			Status:      core.FanOutPending,
+			CreatedAt:   old,
+		}
+		require.NoError(t, s.CreateFanOut(ctx, fanOut))
+		seedFanOutChild(t, ctx, s, fanOut.ID, core.StatusCompleted)
+		seedFanOutChild(t, ctx, s, fanOut.ID, core.StatusCompleted)
 	}
 
 	got, err := s.GetCompletablePendingFanOuts(ctx, cutoff)
@@ -3408,10 +3444,12 @@ func TestIncrementFanOutCancelled_ReturnsUpdatedFanOut(t *testing.T) {
 	}
 	require.NoError(t, s.CreateFanOut(ctx, fo))
 
+	seedFanOutChild(t, ctx, s, "fo-inc-cancel", core.StatusCancelled)
 	result, err := s.IncrementFanOutCancelled(ctx, "fo-inc-cancel")
 	require.NoError(t, err)
 	assert.Equal(t, 1, result.CancelledCount)
 
+	seedFanOutChild(t, ctx, s, "fo-inc-cancel", core.StatusCancelled)
 	result2, err := s.IncrementFanOutCancelled(ctx, "fo-inc-cancel")
 	require.NoError(t, err)
 	assert.Equal(t, 2, result2.CancelledCount)

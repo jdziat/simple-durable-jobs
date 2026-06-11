@@ -41,22 +41,6 @@ func TestIsBenignDDLError(t *testing.T) {
 	}
 }
 
-// TestFanOutCounterStmt confirms the allow-list maps the two real counters and
-// rejects anything else (the defense against SQL injection via the column name).
-func TestFanOutCounterStmt(t *testing.T) {
-	stmt, ok := fanOutCounterStmt("completed_count")
-	assert.True(t, ok)
-	assert.Contains(t, stmt, "completed_count = completed_count + 1")
-
-	stmt, ok = fanOutCounterStmt("failed_count")
-	assert.True(t, ok)
-	assert.Contains(t, stmt, "failed_count = failed_count + 1")
-
-	stmt, ok = fanOutCounterStmt("cancelled_count; DROP TABLE jobs")
-	assert.False(t, ok)
-	assert.Empty(t, stmt)
-}
-
 // TestRunMigrations_ConcurrentSafe simulates a fleet calling Migrate() at once
 // against a not-yet-migrated database. Before the concurrency fix this crashed
 // most callers (index DROP/CREATE and ledger-INSERT races); it must now return
