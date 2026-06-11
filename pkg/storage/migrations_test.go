@@ -215,6 +215,45 @@ func TestDequeueExplainPlanPostgres(t *testing.T) {
 	require.NotContains(t, joined, "Sort  (")
 }
 
+func TestDeadLetterMetaContainsExplainPlanPostgres(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL not set")
+	}
+	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{
+		Logger: logger.Default.LogMode(logger.Silent),
+	})
+	require.NoError(t, err, "open postgres test db")
+	closeDBOnCleanup(t, db)
+	cleanupExternalDB(t, db)
+	t.Cleanup(func() { cleanupExternalDB(t, db) })
+
+	ctx := context.Background()
+	s := NewGormStorage(db)
+	require.NoError(t, s.Migrate(ctx))
+	seedDeadLetterMetaExplainJobs(t, ctx, db)
+	analyzeExplainJobs(t, db)
+	requireMigrationRecorded(t, ctx, db, 16, "dlq_metadata_index")
+
+	rows, err := db.Raw(`
+		EXPLAIN
+		SELECT id
+		FROM jobs
+		WHERE dead_lettered_at IS NOT NULL
+		  AND (NULLIF(metadata, '')::jsonb) @> ?::jsonb
+	`, `{"region":"us"}`).Rows()
+	require.NoError(t, err, "postgres dlq metadata explain")
+	defer func() { _ = rows.Close() }()
+
+	plan := scanExplainRows(t, rows)
+	require.NotEmpty(t, plan)
+	joined := strings.Join(plan, "\n")
+	t.Logf("postgres DLQ metadata EXPLAIN:\n%s", joined)
+	require.Contains(t, joined, "Bitmap Index Scan")
+	require.Contains(t, joined, "idx_jobs_metadata_gin")
+	require.NotContains(t, joined, "Seq Scan")
+}
+
 func buildDequeueExplainQuery(db *gorm.DB, queues []string, limit int) *gorm.DB {
 	var candidates []*core.Job
 	nowExpr := gorm.Expr("NOW()")
@@ -279,6 +318,36 @@ func seedDequeueExplainJobs(t *testing.T, ctx context.Context, db *gorm.DB) {
 			RunAt:      &futureRunAt,
 			CreatedAt:  createdAt,
 			UpdatedAt:  createdAt,
+		})
+	}
+	require.NoError(t, db.WithContext(ctx).CreateInBatches(jobs, 250).Error)
+}
+
+func seedDeadLetterMetaExplainJobs(t *testing.T, ctx context.Context, db *gorm.DB) {
+	t.Helper()
+	require.NoError(t, db.WithContext(ctx).Where("1 = 1").Delete(&core.Job{}).Error)
+
+	now := time.Now().UTC()
+	jobs := make([]*core.Job, 0, 5000)
+	for i := 0; i < 5000; i++ {
+		deadLetteredAt := now.Add(-time.Duration(i) * time.Second)
+		region := "eu"
+		if i%200 == 0 {
+			region = "us"
+		}
+		jobs = append(jobs, &core.Job{
+			ID:               fmt.Sprintf("dlqmeta-%04d", i),
+			Type:             "explain.dlqmeta",
+			Args:             []byte(`{}`),
+			Queue:            "default",
+			Status:           core.StatusFailed,
+			MaxRetries:       1,
+			Metadata:         core.MetadataMap{"region": region, "env": "prod"},
+			DeadLetteredAt:   &deadLetteredAt,
+			DeadLetterReason: "max retries exhausted: boom",
+			CompletedAt:      &deadLetteredAt,
+			CreatedAt:        deadLetteredAt,
+			UpdatedAt:        deadLetteredAt,
 		})
 	}
 	require.NoError(t, db.WithContext(ctx).CreateInBatches(jobs, 250).Error)

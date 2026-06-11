@@ -158,6 +158,58 @@ func TestDeadLetterQueries_TenantMetadataAndSearch(t *testing.T) {
 	assert.EqualValues(t, 1, total)
 }
 
+func TestDeadLetterQueries_MetaContainsRequiresAllPairs(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	base := time.Now().UTC().Add(-time.Hour).Truncate(time.Millisecond)
+	seedDeadLetterJobWithDetails(t, s, &core.Job{
+		ID:       "dlq-region-us-prod",
+		Type:     "sync",
+		Queue:    "default",
+		Metadata: core.MetadataMap{"env": "prod", "region": "us", "tier": "gold"},
+	}, base.Add(3*time.Minute))
+	seedDeadLetterJobWithDetails(t, s, &core.Job{
+		ID:       "dlq-region-us-dev",
+		Type:     "sync",
+		Queue:    "default",
+		Metadata: core.MetadataMap{"env": "dev", "region": "us", "tier": "gold"},
+	}, base.Add(2*time.Minute))
+	seedDeadLetterJobWithDetails(t, s, &core.Job{
+		ID:       "dlq-region-eu-prod",
+		Type:     "sync",
+		Queue:    "default",
+		Metadata: core.MetadataMap{"env": "prod", "region": "eu", "tier": "silver"},
+	}, base.Add(time.Minute))
+	seedDeadLetterJobWithDetails(t, s, &core.Job{
+		ID:       "dlq-no-match",
+		Type:     "sync",
+		Queue:    "default",
+		Metadata: core.MetadataMap{"env": "stage", "region": "ap"},
+	}, base)
+
+	regionFilter := core.DeadLetterFilter{
+		MetaContains: &core.MetadataMap{"region": "us"},
+		Limit:        10,
+	}
+	regionMatches, err := s.ListDeadLettered(ctx, regionFilter)
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []string{"dlq-region-us-prod", "dlq-region-us-dev"}, deadLetterJobIDs(regionMatches))
+
+	multiPairFilter := core.DeadLetterFilter{
+		MetaContains: &core.MetadataMap{"env": "prod", "region": "us"},
+		Limit:        10,
+	}
+	multiPairMatches, err := s.ListDeadLettered(ctx, multiPairFilter)
+	require.NoError(t, err)
+	require.Len(t, multiPairMatches, 1)
+	assert.Equal(t, "dlq-region-us-prod", multiPairMatches[0].ID)
+
+	total, err := s.CountDeadLettered(ctx, multiPairFilter)
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, total)
+}
+
 func seedDeadLetterJob(t *testing.T, s *GormStorage, id, queue, jobType string, at time.Time) {
 	t.Helper()
 	seedDeadLetterJobWithDetails(t, s, &core.Job{

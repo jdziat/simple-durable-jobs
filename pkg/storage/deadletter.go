@@ -55,12 +55,7 @@ func (s *GormStorage) deadLetterQuery(ctx context.Context, filter core.DeadLette
 	if filter.Tenant != "" {
 		q = q.Where("tenant = ?", filter.Tenant)
 	}
-	if filter.MetaContains != nil {
-		for key, value := range *filter.MetaContains {
-			pattern := `%` + escapeLikePattern(metadataPairFragment(key, value)) + `%`
-			q = q.Where(metadataTextExpression(s)+" LIKE ? ESCAPE ?", pattern, `\`)
-		}
-	}
+	q = applyMetaContains(s, q, filter.MetaContains)
 	if filter.Search != "" {
 		searchTerm := filter.Search
 		if len(searchTerm) > maxUISearchLength {

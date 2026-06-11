@@ -205,6 +205,11 @@ var schemaMigrations = []schemaMigration{
 		Name:    "dialect_correctness",
 		Up:      migrateDialectCorrectness,
 	},
+	{
+		Version: 16,
+		Name:    "dlq_metadata_index",
+		Up:      migrateDLQMetadataIndex,
+	},
 }
 
 // applyPendingMigrations runs every migration whose version is absent from the
@@ -752,6 +757,40 @@ func migrateDialectCorrectness(ctx context.Context, db *gorm.DB, dialect string)
 	case dialectPostgres:
 		return migratePostgresDialectCorrectness(ctx, db)
 	default:
+		return nil
+	}
+}
+
+func migrateDLQMetadataIndex(ctx context.Context, db *gorm.DB, dialect string) error {
+	switch dialect {
+	case dialectPostgres:
+		if err := db.WithContext(ctx).Exec(
+			"CREATE INDEX IF NOT EXISTS idx_jobs_metadata_gin ON jobs USING GIN ((NULLIF(metadata, '')::jsonb) jsonb_path_ops)",
+		).Error; err != nil {
+			return fmt.Errorf("create idx_jobs_metadata_gin: %w", err)
+		}
+		if err := db.WithContext(ctx).Exec(
+			"CREATE INDEX IF NOT EXISTS idx_jobs_tenant ON jobs (tenant)",
+		).Error; err != nil {
+			return fmt.Errorf("create idx_jobs_tenant: %w", err)
+		}
+		return nil
+	case dialectMySQL:
+		m := db.Migrator()
+		if !m.HasIndex(&core.Job{}, "idx_jobs_tenant") {
+			if err := db.WithContext(ctx).Exec(
+				"CREATE INDEX idx_jobs_tenant ON jobs (tenant)",
+			).Error; err != nil && !isBenignDDLError(err) {
+				return fmt.Errorf("create idx_jobs_tenant: %w", err)
+			}
+		}
+		return nil
+	default:
+		if err := db.WithContext(ctx).Exec(
+			"CREATE INDEX IF NOT EXISTS idx_jobs_tenant ON jobs (tenant)",
+		).Error; err != nil {
+			return fmt.Errorf("create idx_jobs_tenant: %w", err)
+		}
 		return nil
 	}
 }

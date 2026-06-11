@@ -58,6 +58,11 @@ func TestPostgresSchemaAssertions(t *testing.T) {
 	}
 	require.Contains(t, postgresIndexDef(t, db, "idx_jobs_stale_lock"), "WHERE", "idx_jobs_stale_lock must stay partial")
 	require.Contains(t, strings.ToUpper(postgresIndexDef(t, db, "idx_jobs_dequeue_eligible")), "COALESCE")
+	metadataIndexDef := postgresIndexDef(t, db, "idx_jobs_metadata_gin")
+	require.Contains(t, strings.ToLower(metadataIndexDef), "using gin", "idx_jobs_metadata_gin definition:\n%s", metadataIndexDef)
+	require.Contains(t, strings.ToUpper(metadataIndexDef), "NULLIF(METADATA", "idx_jobs_metadata_gin definition:\n%s", metadataIndexDef)
+	require.Contains(t, metadataIndexDef, "jsonb_path_ops", "idx_jobs_metadata_gin definition:\n%s", metadataIndexDef)
+	require.True(t, postgresIndexExists(t, db, "idx_jobs_tenant"), "idx_jobs_tenant must exist")
 
 	for _, indexName := range []string{
 		"idx_jobs_priority",
@@ -145,6 +150,7 @@ func TestMySQLSchemaAssertions(t *testing.T) {
 	}
 	require.True(t, mysqlIndexExists(t, db, "idx_jobs_unique_key"), "idx_jobs_unique_key must remain on mysql")
 	require.True(t, mysqlIndexExists(t, db, "idx_jobs_dequeue_eligible"), "idx_jobs_dequeue_eligible must exist on mysql")
+	require.True(t, mysqlIndexExists(t, db, "idx_jobs_tenant"), "idx_jobs_tenant must exist on mysql")
 	requireMySQLCascadeFKs(t, db)
 	requireMySQLUniqueKeyCollations(t, db)
 	requireMySQLDispatcherColumnsNotNull(t, db)
