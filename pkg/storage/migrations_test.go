@@ -133,6 +133,25 @@ func TestMigrationsApplyAndRecordAllVersions(t *testing.T) {
 	require.True(t, s.DB().Migrator().HasIndex(&core.UniqueLock{}, "idx_unique_locks_expires_at"), "unique_locks expiry index should exist")
 }
 
+func TestMigrateSecondRunDoesNotUpdateJobs(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+	s := NewGormStorage(db)
+	require.NoError(t, s.Migrate(ctx))
+
+	capture := &stmtCaptureLogger{Interface: logger.Default.LogMode(logger.Silent)}
+	capturedDB := db.Session(&gorm.Session{Logger: capture})
+	require.NoError(t, NewGormStorage(capturedDB).Migrate(ctx))
+
+	for _, stmt := range capture.stmts {
+		lower := strings.ToLower(stmt)
+		updatesJobs := strings.Contains(lower, "update jobs") ||
+			strings.Contains(lower, "update `jobs`") ||
+			strings.Contains(lower, `update "jobs"`)
+		require.Falsef(t, updatesJobs, "a steady-state 2nd Migrate must not UPDATE jobs: %s", stmt)
+	}
+}
+
 func TestDequeueExplainPlanMySQL(t *testing.T) {
 	dsn := os.Getenv("TEST_MYSQL_URL")
 	if dsn == "" {

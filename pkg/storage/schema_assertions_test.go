@@ -65,6 +65,20 @@ func TestPostgresSchemaAssertions(t *testing.T) {
 	}
 	require.Contains(t, postgresIndexDef(t, db, "idx_jobs_stale_lock"), "WHERE", "idx_jobs_stale_lock must stay partial")
 	require.Contains(t, strings.ToUpper(postgresIndexDef(t, db, "idx_jobs_dequeue_eligible")), "COALESCE")
+	parentNonterminalDef := strings.ToLower(postgresIndexDef(t, db, "idx_jobs_parent_nonterminal"))
+	require.Contains(t, parentNonterminalDef, "parent_job_id", "idx_jobs_parent_nonterminal definition:\n%s", parentNonterminalDef)
+	require.Contains(t, parentNonterminalDef, "where", "idx_jobs_parent_nonterminal must stay partial:\n%s", parentNonterminalDef)
+	require.True(t,
+		strings.Contains(parentNonterminalDef, "not in") || strings.Contains(parentNonterminalDef, "<> all"),
+		"idx_jobs_parent_nonterminal must filter terminal statuses:\n%s", parentNonterminalDef,
+	)
+	rootNonterminalDef := strings.ToLower(postgresIndexDef(t, db, "idx_jobs_root_nonterminal"))
+	require.Contains(t, rootNonterminalDef, "root_job_id", "idx_jobs_root_nonterminal definition:\n%s", rootNonterminalDef)
+	require.Contains(t, rootNonterminalDef, "where", "idx_jobs_root_nonterminal must stay partial:\n%s", rootNonterminalDef)
+	require.True(t,
+		strings.Contains(rootNonterminalDef, "not in") || strings.Contains(rootNonterminalDef, "<> all"),
+		"idx_jobs_root_nonterminal must filter terminal statuses:\n%s", rootNonterminalDef,
+	)
 	metadataIndexDef := postgresIndexDef(t, db, "idx_jobs_metadata_gin")
 	require.Contains(t, strings.ToLower(metadataIndexDef), "using gin", "idx_jobs_metadata_gin definition:\n%s", metadataIndexDef)
 	require.Contains(t, strings.ToUpper(metadataIndexDef), "NULLIF(METADATA", "idx_jobs_metadata_gin definition:\n%s", metadataIndexDef)
@@ -157,6 +171,10 @@ func TestMySQLSchemaAssertions(t *testing.T) {
 	}
 	require.True(t, mysqlIndexExists(t, db, "idx_jobs_unique_key"), "idx_jobs_unique_key must remain on mysql")
 	require.True(t, mysqlIndexExists(t, db, "idx_jobs_dequeue_eligible"), "idx_jobs_dequeue_eligible must exist on mysql")
+	requireMySQLGeneratedVarchar36Column(t, db, "pending_parent_ref")
+	requireMySQLGeneratedVarchar36Column(t, db, "pending_root_ref")
+	require.True(t, mysqlIndexExists(t, db, "idx_jobs_parent_nonterminal"), "idx_jobs_parent_nonterminal must exist on mysql")
+	require.True(t, mysqlIndexExists(t, db, "idx_jobs_root_nonterminal"), "idx_jobs_root_nonterminal must exist on mysql")
 	require.True(t, mysqlIndexExists(t, db, "idx_jobs_tenant"), "idx_jobs_tenant must exist on mysql")
 	requireMySQLCascadeFKs(t, db)
 	requireMySQLUniqueKeyCollations(t, db)
@@ -396,6 +414,22 @@ func requireMySQLDeadLetteredAtPrecision(t *testing.T, db *gorm.DB, want int) {
 		  AND COLUMN_NAME = 'dead_lettered_at'
 	`).Scan(&precision).Error)
 	require.Equal(t, want, precision, "dead_lettered_at must be datetime(%d)", want)
+}
+
+func requireMySQLGeneratedVarchar36Column(t *testing.T, db *gorm.DB, columnName string) {
+	t.Helper()
+	var count int
+	require.NoError(t, db.Raw(`
+		SELECT COUNT(*)
+		FROM information_schema.COLUMNS
+		WHERE TABLE_SCHEMA = DATABASE()
+		  AND TABLE_NAME = 'jobs'
+		  AND COLUMN_NAME = ?
+		  AND DATA_TYPE = 'varchar'
+		  AND CHARACTER_MAXIMUM_LENGTH = 36
+		  AND GENERATION_EXPRESSION <> ''
+	`, columnName).Scan(&count).Error)
+	require.Equal(t, 1, count, "%s generated varchar(36) column must exist", columnName)
 }
 
 func postgresIndexDef(t *testing.T, db *gorm.DB, indexName string) string {

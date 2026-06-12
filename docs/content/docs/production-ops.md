@@ -335,8 +335,19 @@ still must be idempotent. See [Dead-Letter Queue]({{< relref
 
 ## Retention And GC
 
-Retention is disabled by default. Without retention, completed, failed,
-cancelled, and consumed-signal rows accumulate forever. Configure it on workers:
+Retention is enabled by default on workers with generous windows: completed
+jobs are deleted after 30 days, failed and cancelled jobs after 90 days, and
+consumed signals after 7 days. Disable it only if you manage retention
+externally or must keep terminal rows indefinitely:
+
+```go
+w := jobs.NewWorker(q,
+	jobs.RetentionDisabled(),
+)
+```
+
+Tune the windows explicitly when your operational policy needs different
+retention:
 
 ```go
 w := jobs.NewWorker(q,
@@ -350,7 +361,7 @@ w := jobs.NewWorker(q,
 )
 ```
 
-`jobs.DefaultRetention()` is an explicit opt-in preset: completed jobs 7 days,
+`jobs.DefaultRetention()` remains a conservative preset: completed jobs 7 days,
 terminal failed/cancelled jobs 30 days, consumed signals 7 days.
 
 Set `RetentionFailedAfter` long enough for operators to inspect and requeue DLQ

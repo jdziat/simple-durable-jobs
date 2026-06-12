@@ -717,17 +717,23 @@ func RateLimitKey(fn func(*Job) string) RateLimitOption {
 	return worker.RateLimitKey(fn)
 }
 
-// WithRetention enables optional automatic garbage collection of terminal jobs.
+// WithRetention configures automatic garbage collection of terminal jobs.
 func WithRetention(opts ...RetentionOption) WorkerOption {
 	return worker.WithRetention(opts...)
 }
 
-// DefaultRetention is an explicit opt-in conservative retention preset (NOT a
-// silent default): completed jobs 7 days, terminal failed/cancelled jobs 30
-// days, consumed signals 7 days. Tune individual windows by composing the
-// Retention* options under WithRetention instead.
+// DefaultRetention is a conservative retention preset: completed jobs 7 days,
+// terminal failed/cancelled jobs 30 days, consumed signals 7 days. Tune
+// individual windows by composing the Retention* options under WithRetention
+// instead.
 func DefaultRetention() WorkerOption {
 	return worker.DefaultRetention()
+}
+
+// RetentionDisabled fully disables automatic deletion of terminal jobs and
+// consumed signals.
+func RetentionDisabled() WorkerOption {
+	return worker.RetentionDisabled()
 }
 
 // RetentionCompletedAfter deletes completed jobs older than d. A non-positive

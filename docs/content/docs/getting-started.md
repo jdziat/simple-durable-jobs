@@ -213,6 +213,10 @@ worker := queue.NewWorker(
 )
 ```
 
+Workers also run retention GC by default: completed jobs are kept for 30 days,
+failed and cancelled jobs for 90 days, and consumed signals for 7 days. Use
+`jobs.RetentionDisabled()` only when you manage retention outside the worker.
+
 {{< callout type="info" >}}
 When `Concurrency()` is used inside `WorkerQueue()`, it applies only to that queue. Each queue independently tracks how many jobs it has running and only dequeues more when below its limit.
 {{< /callout >}}

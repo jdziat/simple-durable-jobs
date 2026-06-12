@@ -145,6 +145,60 @@ func TestWorkerRetentionUnsupportedStorageLogsOnceAndRuns(t *testing.T) {
 	assert.Equal(t, 1, strings.Count(buf.String(), "storage backend does not support retention GC"))
 }
 
+func TestWorkerRetentionDefaultOnPrunesSafeWindows(t *testing.T) {
+	db, store := newWorkerRetentionStore(t)
+	ctx := context.Background()
+	oldCompleted := time.Now().Add(-(31 * 24 * time.Hour)).UTC()
+	oldFailed := time.Now().Add(-(91 * 24 * time.Hour)).UTC()
+	oldSignal := time.Now().Add(-(8 * 24 * time.Hour)).UTC()
+	recentCompleted := time.Now().Add(-(29 * 24 * time.Hour)).UTC()
+	recentFailed := time.Now().Add(-(89 * 24 * time.Hour)).UTC()
+	recentSignal := time.Now().Add(-(6 * 24 * time.Hour)).UTC()
+
+	seedWorkerRetentionJob(t, db, "default-completed-old", core.StatusCompleted, oldCompleted)
+	seedWorkerRetentionJob(t, db, "default-completed-new", core.StatusCompleted, recentCompleted)
+	seedWorkerRetentionJob(t, db, "default-failed-old", core.StatusFailed, oldFailed)
+	seedWorkerRetentionJob(t, db, "default-failed-new", core.StatusFailed, recentFailed)
+	seedWorkerRetentionJob(t, db, "default-cancelled-old", core.StatusCancelled, oldFailed)
+	seedWorkerRetentionSignal(t, db, "default-signal-old", "default-completed-new", "ctx", &oldSignal)
+	seedWorkerRetentionSignal(t, db, "default-signal-new", "default-completed-new", "ctx", &recentSignal)
+
+	q := queue.New(store)
+	w := NewWorker(q,
+		WorkerQueue("retention-empty", Concurrency(1)),
+		WithOwnershipAuditInterval(0),
+	)
+	require.Equal(t, defaultRetentionCompletedAfter, w.config.Retention.CompletedAfter)
+	require.Equal(t, defaultRetentionFailedAfter, w.config.Retention.FailedAfter)
+	require.Equal(t, defaultRetentionConsumedSignalsAfter, w.config.Retention.ConsumedSignalsAfter)
+	w.config.Retention.Interval = 10 * time.Millisecond
+	w.config.Retention.BatchSize = 1
+
+	runCtx, cancel := context.WithCancel(ctx)
+	done := make(chan error, 1)
+	go func() { done <- w.Start(runCtx) }()
+	require.Eventually(t, func() bool {
+		return !workerRetentionExists(t, db, "default-completed-old") &&
+			!workerRetentionExists(t, db, "default-failed-old") &&
+			!workerRetentionExists(t, db, "default-cancelled-old") &&
+			!workerRetentionSignalExists(t, db, "default-signal-old")
+	}, 5*time.Second, 50*time.Millisecond)
+
+	assert.True(t, workerRetentionExists(t, db, "default-completed-new"))
+	assert.True(t, workerRetentionExists(t, db, "default-failed-new"))
+	assert.True(t, workerRetentionSignalExists(t, db, "default-signal-new"))
+
+	cancel()
+	require.Eventually(t, func() bool {
+		select {
+		case err := <-done:
+			return assert.ErrorIs(t, err, context.Canceled)
+		default:
+			return false
+		}
+	}, 5*time.Second, 50*time.Millisecond)
+}
+
 type lockedLogBuffer struct {
 	mu  sync.Mutex
 	buf bytes.Buffer
@@ -162,10 +216,10 @@ func (b *lockedLogBuffer) String() string {
 	return b.buf.String()
 }
 
-func TestStart_WarnsWhenRetentionUnconfigured(t *testing.T) {
+func TestStart_WarnsWhenRetentionDisabled(t *testing.T) {
 	var buf bytes.Buffer
 	q := queue.New(&mockStorage{})
-	w := NewWorker(q, WithOwnershipAuditInterval(0))
+	w := NewWorker(q, RetentionDisabled(), WithOwnershipAuditInterval(0))
 	w.logger = slog.New(slog.NewTextHandler(&buf, nil))
 
 	require.False(t, w.config.Retention.enabled())
@@ -175,25 +229,28 @@ func TestStart_WarnsWhenRetentionUnconfigured(t *testing.T) {
 	w.warnIfRetentionUnconfigured()
 
 	out := buf.String()
-	assert.Contains(t, out, "retention is not configured")
-	assert.Equal(t, 1, strings.Count(out, "retention is not configured"))
+	assert.Contains(t, out, "retention is disabled")
+	assert.Equal(t, 1, strings.Count(out, "retention is disabled"))
 }
 
-func TestStart_NoWarnWhenRetentionConfigured(t *testing.T) {
+func TestStart_LogsActiveRetentionWindowsOnce(t *testing.T) {
 	var buf bytes.Buffer
 	q := queue.New(&mockStorage{})
-	w := NewWorker(q,
-		WithRetention(RetentionCompletedAfter(time.Hour)),
-		WithOwnershipAuditInterval(0),
-	)
+	w := NewWorker(q, WithOwnershipAuditInterval(0))
 	w.logger = slog.New(slog.NewTextHandler(&buf, nil))
 
 	require.True(t, w.config.Retention.enabled())
 
-	// The Start gate takes the retention branch (not the warn branch) when
-	// enabled; exercising the warn path directly here would be a misuse, so we
-	// assert the gate predicate and that no warn was emitted.
-	assert.NotContains(t, buf.String(), "retention is not configured")
+	w.logRetentionConfigured()
+	w.logRetentionConfigured()
+
+	out := buf.String()
+	assert.Contains(t, out, "retention GC enabled")
+	assert.Contains(t, out, "completed_after=720h0m0s")
+	assert.Contains(t, out, "failed_after=2160h0m0s")
+	assert.Contains(t, out, "consumed_signals_after=168h0m0s")
+	assert.Contains(t, out, "disable with jobs.RetentionDisabled()")
+	assert.Equal(t, 1, strings.Count(out, "retention GC enabled"))
 }
 
 func TestDefaultRetention_EnablesConservativeWindows(t *testing.T) {
@@ -205,6 +262,34 @@ func TestDefaultRetention_EnablesConservativeWindows(t *testing.T) {
 	assert.Equal(t, 7*24*time.Hour, cfg.CompletedAfter)
 	assert.Equal(t, 30*24*time.Hour, cfg.FailedAfter)
 	assert.Equal(t, 7*24*time.Hour, cfg.ConsumedSignalsAfter)
+}
+
+func TestRetentionDisabledTurnsSweepOff(t *testing.T) {
+	q := queue.New(&mockStorage{})
+	w := NewWorker(q, RetentionDisabled(), WithOwnershipAuditInterval(0))
+
+	assert.True(t, w.config.Retention.Disabled)
+	assert.False(t, w.config.Retention.enabled())
+	assert.Zero(t, w.config.Retention.CompletedAfter)
+	assert.Zero(t, w.config.Retention.FailedAfter)
+	assert.Zero(t, w.config.Retention.ConsumedSignalsAfter)
+}
+
+func TestWithRetentionOverridesDefaultWindows(t *testing.T) {
+	q := queue.New(&mockStorage{})
+	w := NewWorker(q,
+		WithRetention(
+			RetentionCompletedAfter(2*time.Hour),
+			RetentionFailedAfter(3*time.Hour),
+			RetentionConsumedSignalsAfter(4*time.Hour),
+		),
+		WithOwnershipAuditInterval(0),
+	)
+
+	assert.True(t, w.config.Retention.enabled())
+	assert.Equal(t, 2*time.Hour, w.config.Retention.CompletedAfter)
+	assert.Equal(t, 3*time.Hour, w.config.Retention.FailedAfter)
+	assert.Equal(t, 4*time.Hour, w.config.Retention.ConsumedSignalsAfter)
 }
 
 func TestRetentionDeleteCheckpointsOnComplete_SetsFlag(t *testing.T) {

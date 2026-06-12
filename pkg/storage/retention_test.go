@@ -156,6 +156,22 @@ func TestDeleteTerminalJobsOlderThan_WorkflowGuardAndFanOutCleanup(t *testing.T)
 	assertRetentionFanOutMissing(t, s, "ret-fanout")
 }
 
+func TestDeleteTerminalJobsOlderThan_RootChildGuardBlocksDeletion(t *testing.T) {
+	s := newTestStorage(t)
+	ctx := context.Background()
+	old := time.Now().Add(-2 * time.Hour).UTC()
+	rootID := "ret-root-live-child"
+
+	seedRetentionJob(t, s, rootID, core.StatusCompleted, old)
+	seedRetentionWorkflowJob(t, s, "ret-root-only-live-child", core.StatusRunning, old, nil, &rootID, nil)
+
+	deleted, err := s.DeleteTerminalJobsOlderThan(ctx, core.StatusCompleted, time.Hour, 100)
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), deleted)
+	assertRetentionExists(t, s, rootID)
+	assertRetentionExists(t, s, "ret-root-only-live-child")
+}
+
 func TestDeleteTerminalJobsOlderThan_S04RegressionNoFanOutLeakOrStrandedLiveDescendants(t *testing.T) {
 	s := newTestStorage(t)
 	ctx := context.Background()

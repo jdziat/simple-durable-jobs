@@ -220,6 +220,11 @@ var schemaMigrations = []schemaMigration{
 		Name:    "deadletter_precision_align",
 		Up:      migrateDeadLetterPrecisionAlign,
 	},
+	{
+		Version: 19,
+		Name:    "retention_workflow_indexes",
+		Up:      migrateRetentionWorkflowIndexes,
+	},
 }
 
 // applyPendingMigrations runs every migration whose version is absent from the
@@ -755,6 +760,58 @@ func migrateDeadLetterPrecisionAlign(ctx context.Context, db *gorm.DB, dialect s
 		return fmt.Errorf("modify dead_lettered_at precision: %w", err)
 	}
 	return nil
+}
+
+func migrateRetentionWorkflowIndexes(ctx context.Context, db *gorm.DB, dialect string) error {
+	switch dialect {
+	case dialectMySQL:
+		m := db.Migrator()
+		if !m.HasColumn(&core.Job{}, "pending_parent_ref") {
+			if err := db.WithContext(ctx).Exec(
+				"ALTER TABLE jobs ADD COLUMN pending_parent_ref varchar(36) " +
+					"GENERATED ALWAYS AS (CASE WHEN status NOT IN ('completed','failed','cancelled') " +
+					"THEN parent_job_id END) STORED",
+			).Error; err != nil && !isBenignDDLError(err) {
+				return fmt.Errorf("add pending_parent_ref column: %w", err)
+			}
+		}
+		if !m.HasColumn(&core.Job{}, "pending_root_ref") {
+			if err := db.WithContext(ctx).Exec(
+				"ALTER TABLE jobs ADD COLUMN pending_root_ref varchar(36) " +
+					"GENERATED ALWAYS AS (CASE WHEN status NOT IN ('completed','failed','cancelled') " +
+					"THEN root_job_id END) STORED",
+			).Error; err != nil && !isBenignDDLError(err) {
+				return fmt.Errorf("add pending_root_ref column: %w", err)
+			}
+		}
+		if !m.HasIndex(&core.Job{}, "idx_jobs_parent_nonterminal") {
+			if err := db.WithContext(ctx).Exec(
+				"CREATE INDEX idx_jobs_parent_nonterminal ON jobs (pending_parent_ref)",
+			).Error; err != nil && !isBenignDDLError(err) {
+				return fmt.Errorf("create idx_jobs_parent_nonterminal: %w", err)
+			}
+		}
+		if !m.HasIndex(&core.Job{}, "idx_jobs_root_nonterminal") {
+			if err := db.WithContext(ctx).Exec(
+				"CREATE INDEX idx_jobs_root_nonterminal ON jobs (pending_root_ref)",
+			).Error; err != nil && !isBenignDDLError(err) {
+				return fmt.Errorf("create idx_jobs_root_nonterminal: %w", err)
+			}
+		}
+		return nil
+	default:
+		if err := db.WithContext(ctx).Exec(
+			"CREATE INDEX IF NOT EXISTS idx_jobs_parent_nonterminal ON jobs (parent_job_id) WHERE status NOT IN ('completed','failed','cancelled')",
+		).Error; err != nil {
+			return fmt.Errorf("create idx_jobs_parent_nonterminal: %w", err)
+		}
+		if err := db.WithContext(ctx).Exec(
+			"CREATE INDEX IF NOT EXISTS idx_jobs_root_nonterminal ON jobs (root_job_id) WHERE status NOT IN ('completed','failed','cancelled')",
+		).Error; err != nil {
+			return fmt.Errorf("create idx_jobs_root_nonterminal: %w", err)
+		}
+		return nil
+	}
 }
 
 func migrateIntegrityForeignKeys(ctx context.Context, db *gorm.DB, dialect string) error {
