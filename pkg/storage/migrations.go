@@ -235,6 +235,11 @@ var schemaMigrations = []schemaMigration{
 		Name:    "indexing_qc1",
 		Up:      migrateIndexingQC1,
 	},
+	{
+		Version: 22,
+		Name:    "check_constraints",
+		Up:      migrateCheckConstraints,
+	},
 }
 
 // applyPendingMigrations runs every migration whose version is absent from the
@@ -284,7 +289,8 @@ func isBenignDDLError(err error) bool {
 	return strings.Contains(m, "Error 1061") || strings.Contains(m, "Duplicate key name") || // index already exists
 		strings.Contains(m, "Error 1060") || strings.Contains(m, "Duplicate column name") || // column already exists
 		strings.Contains(m, "Error 1091") || strings.Contains(m, "check that column/key exists") || // dropping a missing index
-		strings.Contains(m, "Error 1826") || strings.Contains(m, "Duplicate foreign key constraint name") // FK already exists
+		strings.Contains(m, "Error 1826") || strings.Contains(m, "Duplicate foreign key constraint name") || // FK already exists
+		strings.Contains(m, "Error 3822") || strings.Contains(m, "Duplicate check constraint name") // CHECK already exists
 }
 
 // migrateReworkDequeueIndex replaces the original idx_jobs_dequeue, whose column
@@ -965,6 +971,108 @@ func migrateIndexingQC1(ctx context.Context, db *gorm.DB, dialect string) error 
 				return fmt.Errorf("create %s: %w", spec.name, err)
 			}
 		}
+		return nil
+	}
+}
+
+// migrateCheckConstraints is migration-only: no gorm check tags, so AutoMigrate
+// never creates a dialect-mismatched constraint or flaps these on startup.
+// Postgres adds each CHECK as NOT VALID and then validates it; MySQL applies
+// utf8mb4_0900_as_cs COLLATE on string-enum operands so enum checks are
+// case-sensitive (R05x). SQLite is a no-op because ALTER TABLE ADD CHECK is not
+// supported there.
+func migrateCheckConstraints(ctx context.Context, db *gorm.DB, dialect string) error {
+	type checkConstraint struct {
+		model     any
+		table     string
+		name      string
+		pgExpr    string
+		mysqlExpr string
+	}
+
+	const jobStatuses = "'pending','running','completed','failed','retrying','waiting','cancelled','paused'"
+	const fanOutStrategies = "'fail_fast','collect_all','threshold'"
+	const fanOutStatuses = "'pending','completed','failed'"
+
+	constraints := []checkConstraint{
+		{
+			model:     &core.Job{},
+			table:     "jobs",
+			name:      "chk_jobs_status",
+			pgExpr:    "status IN (" + jobStatuses + ")",
+			mysqlExpr: "status COLLATE utf8mb4_0900_as_cs IN (" + jobStatuses + ")",
+		},
+		{
+			model:     &core.Job{},
+			table:     "jobs",
+			name:      "chk_jobs_attempt_nonneg",
+			pgExpr:    "attempt >= 0",
+			mysqlExpr: "attempt >= 0",
+		},
+		{
+			model:     &core.Job{},
+			table:     "jobs",
+			name:      "chk_jobs_max_retries_nonneg",
+			pgExpr:    "max_retries >= 0",
+			mysqlExpr: "max_retries >= 0",
+		},
+		{
+			model:     &core.FanOut{},
+			table:     "fan_outs",
+			name:      "chk_fan_outs_strategy",
+			pgExpr:    "strategy IN (" + fanOutStrategies + ")",
+			mysqlExpr: "strategy COLLATE utf8mb4_0900_as_cs IN (" + fanOutStrategies + ")",
+		},
+		{
+			model:     &core.FanOut{},
+			table:     "fan_outs",
+			name:      "chk_fan_outs_status",
+			pgExpr:    "status IN (" + fanOutStatuses + ")",
+			mysqlExpr: "status COLLATE utf8mb4_0900_as_cs IN (" + fanOutStatuses + ")",
+		},
+		{
+			model:     &core.FanOut{},
+			table:     "fan_outs",
+			name:      "chk_fan_outs_counts_nonneg",
+			pgExpr:    "total_count >= 0 AND completed_count >= 0 AND failed_count >= 0 AND cancelled_count >= 0",
+			mysqlExpr: "total_count >= 0 AND completed_count >= 0 AND failed_count >= 0 AND cancelled_count >= 0",
+		},
+	}
+
+	m := db.Migrator()
+	switch dialect {
+	case dialectPostgres:
+		for _, constraint := range constraints {
+			if m.HasConstraint(constraint.model, constraint.name) {
+				continue
+			}
+			if err := db.WithContext(ctx).Exec(
+				fmt.Sprintf("ALTER TABLE %s ADD CONSTRAINT %s CHECK (%s) NOT VALID", constraint.table, constraint.name, constraint.pgExpr),
+			).Error; err != nil {
+				return fmt.Errorf("add %s: %w", constraint.name, err)
+			}
+			if err := db.WithContext(ctx).Exec(
+				fmt.Sprintf("ALTER TABLE %s VALIDATE CONSTRAINT %s", constraint.table, constraint.name),
+			).Error; err != nil {
+				return fmt.Errorf("validate %s: %w", constraint.name, err)
+			}
+		}
+		return nil
+	case dialectMySQL:
+		for _, constraint := range constraints {
+			if m.HasConstraint(constraint.model, constraint.name) {
+				continue
+			}
+			if err := db.WithContext(ctx).Exec(
+				fmt.Sprintf("ALTER TABLE %s ADD CONSTRAINT %s CHECK (%s)", constraint.table, constraint.name, constraint.mysqlExpr),
+			).Error; err != nil && !isBenignDDLError(err) {
+				return fmt.Errorf("add %s: %w", constraint.name, err)
+			}
+		}
+		return nil
+	default:
+		// CHECK enforcement is on the production engines (Postgres/MySQL);
+		// SQLite dev tables rely on the Go enum types.
 		return nil
 	}
 }

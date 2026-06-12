@@ -29,6 +29,8 @@ func TestIsBenignDDLError(t *testing.T) {
 		{"check that column/key exists", true},
 		{"Error 1826 (HY000): Duplicate foreign key constraint name 'fk_checkpoints_job'", true},
 		{"Duplicate foreign key constraint name 'fk'", true},
+		{"Error 3822 (HY000): Duplicate check constraint name 'chk_jobs_status'", true},
+		{"Duplicate check constraint name 'chk'", true},
 		{"Error 1146: Table doesn't exist", false},
 		{"some unrelated error", false},
 		{"", false},
@@ -88,7 +90,7 @@ func TestRunMigrations_ConcurrentSafe(t *testing.T) {
 
 	var versions []int
 	require.NoError(t, s.db.Model(&core.SchemaMigration{}).Order("version").Pluck("version", &versions).Error)
-	assert.Equal(t, []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}, versions, "every migration recorded exactly once")
+	assert.Equal(t, []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22}, versions, "every migration recorded exactly once")
 	assert.False(t, s.db.Migrator().HasIndex(&core.Job{}, "idx_jobs_dequeue"), "redundant dequeue index absent after v12")
 
 	// Pathological single-connection pool must not deadlock (lock + work share

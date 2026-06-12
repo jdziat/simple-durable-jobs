@@ -114,6 +114,8 @@ func TestPostgresSchemaAssertions(t *testing.T) {
 	requirePostgresCascadeFKs(t, db)
 	requirePostgresDispatcherColumnsNotNull(t, db)
 	requirePostgresFanOutThresholdDouble(t, db)
+	requirePostgresCheckConstraints(t, db)
+	requirePostgresCheckConstraintsEnforced(t, db)
 
 	// Regression (P5): a bare AutoMigrate must NOT drift the NOT NULL dispatcher
 	// columns or the double-precision threshold back (the core.Job/FanOut tags
@@ -224,6 +226,8 @@ func TestMySQLSchemaAssertions(t *testing.T) {
 	requireMySQLCascadeFKs(t, db)
 	requireMySQLUniqueKeyCollations(t, db)
 	requireMySQLDispatcherColumnsNotNull(t, db)
+	requireMySQLCheckConstraints(t, db)
+	requireMySQLCheckConstraintsEnforced(t, db)
 
 	// Regression (P5): a bare AutoMigrate must NOT drift the NOT NULL dispatcher
 	// columns back to nullable. Before the core.Job `not null` tags, AutoMigrate
@@ -401,6 +405,57 @@ func requirePostgresFanOutThresholdDouble(t *testing.T, db *gorm.DB) {
 	require.Equal(t, "double precision", dataType, "postgres fan_outs.threshold must be double precision")
 }
 
+func requirePostgresCheckConstraints(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	for _, constraintName := range checkConstraintNames() {
+		var count int
+		require.NoError(t, db.Raw(`
+			SELECT COUNT(*)
+			FROM pg_constraint
+			WHERE contype = 'c'
+			  AND conname = ?
+			  AND conrelid IN ('jobs'::regclass, 'fan_outs'::regclass)
+		`, constraintName).Scan(&count).Error)
+		require.Equal(t, 1, count, "%s CHECK constraint must exist on postgres", constraintName)
+	}
+}
+
+func requirePostgresCheckConstraintsEnforced(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	tx := db.Begin()
+	require.NoError(t, tx.Error)
+	defer func() {
+		require.NoError(t, tx.Rollback().Error)
+	}()
+
+	require.NoError(t, tx.Exec(`
+		INSERT INTO jobs (id, type, status, queue, priority, attempt, max_retries, timeout, determinism)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, "check-pg-parent", "schema.check", "pending", "default", 0, 0, 3, 0, 0).Error)
+
+	requireExecRejectedWithSavepoint(t, tx, "pg_bad_job_status", `
+		INSERT INTO jobs (id, type, status, queue, priority, attempt, max_retries, timeout, determinism)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, "check-pg-bad-status", "schema.check", "BOGUS", "default", 0, 0, 3, 0, 0)
+	requireExecRejectedWithSavepoint(t, tx, "pg_bad_job_attempt", `
+		INSERT INTO jobs (id, type, status, queue, priority, attempt, max_retries, timeout, determinism)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, "check-pg-bad-attempt", "schema.check", "pending", "default", 0, -1, 3, 0, 0)
+	requireExecRejectedWithSavepoint(t, tx, "pg_bad_fanout_strategy", `
+		INSERT INTO fan_outs (id, parent_job_id, total_count, strategy)
+		VALUES (?, ?, ?, ?)
+	`, "check-pg-bad-strategy", "check-pg-parent", 1, "nope")
+	requireExecRejectedWithSavepoint(t, tx, "pg_bad_fanout_count", `
+		INSERT INTO fan_outs (id, parent_job_id, total_count, completed_count)
+		VALUES (?, ?, ?, ?)
+	`, "check-pg-bad-count", "check-pg-parent", 1, -1)
+
+	require.NoError(t, tx.Exec(`
+		INSERT INTO fan_outs (id, parent_job_id, total_count, completed_count, failed_count, cancelled_count, strategy, status)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+	`, "check-pg-good-fanout", "check-pg-parent", 1, 0, 0, 0, "fail_fast", "pending").Error)
+}
+
 type postgresColumnType struct {
 	DataType          string `gorm:"column:data_type"`
 	DateTimePrecision int    `gorm:"column:datetime_precision"`
@@ -461,6 +516,61 @@ func requireMySQLDeadLetteredAtPrecision(t *testing.T, db *gorm.DB, want int) {
 	require.Equal(t, want, precision, "dead_lettered_at must be datetime(%d)", want)
 }
 
+func requireMySQLCheckConstraints(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	for _, constraintName := range checkConstraintNames() {
+		var count int
+		require.NoError(t, db.Raw(`
+			SELECT COUNT(*)
+			FROM information_schema.TABLE_CONSTRAINTS
+			WHERE CONSTRAINT_SCHEMA = DATABASE()
+			  AND CONSTRAINT_TYPE = 'CHECK'
+			  AND CONSTRAINT_NAME = ?
+		`, constraintName).Scan(&count).Error)
+		require.Equal(t, 1, count, "%s CHECK constraint must exist on mysql", constraintName)
+	}
+}
+
+func requireMySQLCheckConstraintsEnforced(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	tx := db.Begin()
+	require.NoError(t, tx.Error)
+	defer func() {
+		require.NoError(t, tx.Rollback().Error)
+	}()
+
+	require.NoError(t, tx.Exec(`
+		INSERT INTO jobs (id, type, status, queue, priority, attempt, max_retries, timeout, determinism)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, "check-mysql-parent", "schema.check", "pending", "default", 0, 0, 3, 0, 0).Error)
+
+	requireExecRejectedWithSavepoint(t, tx, "mysql_bad_job_case", `
+		INSERT INTO jobs (id, type, status, queue, priority, attempt, max_retries, timeout, determinism)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, "check-mysql-bad-case", "schema.check", "PENDING", "default", 0, 0, 3, 0, 0)
+	requireExecRejectedWithSavepoint(t, tx, "mysql_bad_job_status", `
+		INSERT INTO jobs (id, type, status, queue, priority, attempt, max_retries, timeout, determinism)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, "check-mysql-bad-status", "schema.check", "BOGUS", "default", 0, 0, 3, 0, 0)
+	requireExecRejectedWithSavepoint(t, tx, "mysql_bad_job_attempt", `
+		INSERT INTO jobs (id, type, status, queue, priority, attempt, max_retries, timeout, determinism)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, "check-mysql-bad-attempt", "schema.check", "pending", "default", 0, -1, 3, 0, 0)
+	requireExecRejectedWithSavepoint(t, tx, "mysql_bad_fanout_strategy", `
+		INSERT INTO fan_outs (id, parent_job_id, total_count, strategy)
+		VALUES (?, ?, ?, ?)
+	`, "check-mysql-bad-strategy", "check-mysql-parent", 1, "nope")
+	requireExecRejectedWithSavepoint(t, tx, "mysql_bad_fanout_count", `
+		INSERT INTO fan_outs (id, parent_job_id, total_count, completed_count)
+		VALUES (?, ?, ?, ?)
+	`, "check-mysql-bad-count", "check-mysql-parent", 1, -1)
+
+	require.NoError(t, tx.Exec(`
+		INSERT INTO fan_outs (id, parent_job_id, total_count, completed_count, failed_count, cancelled_count, strategy, status)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+	`, "check-mysql-good-fanout", "check-mysql-parent", 1, 0, 0, 0, "fail_fast", "pending").Error)
+}
+
 func requireMySQLGeneratedVarchar36Column(t *testing.T, db *gorm.DB, columnName string) {
 	t.Helper()
 	var count int
@@ -475,6 +585,25 @@ func requireMySQLGeneratedVarchar36Column(t *testing.T, db *gorm.DB, columnName 
 		  AND GENERATION_EXPRESSION <> ''
 	`, columnName).Scan(&count).Error)
 	require.Equal(t, 1, count, "%s generated varchar(36) column must exist", columnName)
+}
+
+func checkConstraintNames() []string {
+	return []string{
+		"chk_jobs_status",
+		"chk_jobs_attempt_nonneg",
+		"chk_jobs_max_retries_nonneg",
+		"chk_fan_outs_strategy",
+		"chk_fan_outs_status",
+		"chk_fan_outs_counts_nonneg",
+	}
+}
+
+func requireExecRejectedWithSavepoint(t *testing.T, tx *gorm.DB, savepointName, stmt string, args ...any) {
+	t.Helper()
+	require.NoError(t, tx.Exec("SAVEPOINT "+savepointName).Error)
+	require.Error(t, tx.Exec(stmt, args...).Error)
+	require.NoError(t, tx.Exec("ROLLBACK TO SAVEPOINT "+savepointName).Error)
+	require.NoError(t, tx.Exec("RELEASE SAVEPOINT "+savepointName).Error)
 }
 
 func postgresIndexDef(t *testing.T, db *gorm.DB, indexName string) string {
