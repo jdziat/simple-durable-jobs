@@ -32,7 +32,7 @@ type Job struct {
 	// Metadata stores queryable string tags for this job.
 	Metadata       map[string]string `gorm:"serializer:json;column:metadata"`
 	Priority       int               `gorm:"default:0;not null"`
-	Status         JobStatus         `gorm:"index;size:20;default:'pending';not null"`
+	Status         JobStatus         `gorm:"size:20;default:'pending';not null"`
 	PreviousStatus JobStatus         `gorm:"size:20"` // Status before pause, for restoration
 	Attempt        int               `gorm:"default:0;not null"`
 	MaxRetries     int               `gorm:"default:3;not null"`

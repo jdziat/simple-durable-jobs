@@ -57,6 +57,7 @@ type Worker struct {
 	retentionUnconfiguredLogged    atomic.Bool
 	retentionConfiguredLogged      atomic.Bool
 	uniqueLockStorageMissingLogged atomic.Bool
+	slotSweepStorageMissingLogged  atomic.Bool
 
 	// futureSleepSuppressions memoizes (jobID -> run_at) for sleeping jobs the
 	// signal-resume backstop has already inspected, capping checkpoint lookups
@@ -127,6 +128,10 @@ type retentionStorage interface {
 
 type uniqueLockSweepStorage interface {
 	DeleteExpiredUniqueLocks(ctx context.Context, limit int) (int64, error)
+}
+
+type concurrencySlotSweepStorage interface {
+	DeleteExpiredConcurrencySlots(ctx context.Context, cutoff time.Time) (int64, error)
 }
 
 // consumedSignalRetentionStorage is implemented by backends that can prune
@@ -369,6 +374,8 @@ func (w *Worker) Start(ctx context.Context) error {
 	if w.config.UniqueLockSweep.enabled() {
 		w.goTracked(func() { w.runUniqueLockSweep(ctx) })
 	}
+
+	w.goTracked(func() { w.runConcurrencySlotSweep(ctx) })
 
 	if w.config.Retention.enabled() {
 		w.logRetentionConfigured()
@@ -803,6 +810,35 @@ func (w *Worker) deleteExpiredUniqueLocks(ctx context.Context, storage uniqueLoc
 		if deleted < int64(batchSize) {
 			return
 		}
+	}
+}
+
+func (w *Worker) runConcurrencySlotSweep(ctx context.Context) {
+	storage, ok := w.queue.Storage().(concurrencySlotSweepStorage)
+	if !ok {
+		if w.slotSweepStorageMissingLogged.CompareAndSwap(false, true) {
+			w.logger.Warn("storage backend does not support concurrency slot GC; expired concurrency-cap slot sweep disabled")
+		}
+		return
+	}
+
+	ticker := time.NewTicker(defaultUniqueLockSweepInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			w.deleteExpiredConcurrencySlots(ctx, storage)
+		}
+	}
+}
+
+func (w *Worker) deleteExpiredConcurrencySlots(ctx context.Context, storage concurrencySlotSweepStorage) {
+	_, err := storage.DeleteExpiredConcurrencySlots(ctx, time.Now().UTC())
+	if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+		w.logger.Warn("concurrency slot GC pass failed", "error", err)
 	}
 }
 

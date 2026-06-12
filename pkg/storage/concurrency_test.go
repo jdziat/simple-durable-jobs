@@ -104,3 +104,46 @@ func TestConcurrencySlotConcurrentLastSlotRace(t *testing.T) {
 	}
 	assert.Equal(t, 1, winners, "exactly one racer should acquire the final slot")
 }
+
+func TestDeleteExpiredConcurrencySlotsPreservesLiveAndSentinel(t *testing.T) {
+	s := newTestStorage(t)
+	ctx := context.Background()
+	slot := uniqueSlotName(t)
+	now := time.Now().UTC()
+
+	require.NoError(t, s.db.WithContext(ctx).Create(&core.ConcurrencySlot{
+		SlotName:  slot,
+		JobID:     "",
+		WorkerID:  "",
+		ExpiresAt: time.Unix(0, 0).UTC(),
+	}).Error)
+	require.NoError(t, s.db.WithContext(ctx).Create(&core.ConcurrencySlot{
+		SlotName:  slot,
+		JobID:     "expired-job",
+		WorkerID:  "worker-1",
+		ExpiresAt: now.Add(-time.Hour),
+	}).Error)
+	require.NoError(t, s.db.WithContext(ctx).Create(&core.ConcurrencySlot{
+		SlotName:  slot,
+		JobID:     "live-job",
+		WorkerID:  "worker-1",
+		ExpiresAt: now.Add(time.Hour),
+	}).Error)
+
+	deleted, err := s.DeleteExpiredConcurrencySlots(ctx, now)
+	require.NoError(t, err)
+	// DeleteExpiredConcurrencySlots is a global GC sweep; on a shared external
+	// test DB it may also reap other tests' expired slots, so assert it removed
+	// at least our expired row. The slot-scoped remaining check below is the
+	// precise correctness assertion (sentinel + live row preserved).
+	assert.GreaterOrEqual(t, deleted, int64(1))
+
+	var remaining []core.ConcurrencySlot
+	require.NoError(t, s.db.WithContext(ctx).
+		Where("slot_name = ?", slot).
+		Order("job_id ASC").
+		Find(&remaining).Error)
+	require.Len(t, remaining, 2)
+	assert.Equal(t, "", remaining[0].JobID, "sentinel row must not be deleted")
+	assert.Equal(t, "live-job", remaining[1].JobID, "live held slot must not be deleted")
+}

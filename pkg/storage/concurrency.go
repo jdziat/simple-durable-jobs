@@ -111,3 +111,13 @@ func (s *GormStorage) ReleaseConcurrencySlot(ctx context.Context, slotName, jobI
 		Where("slot_name = ? AND job_id = ?", slotName, jobID).
 		Delete(&core.ConcurrencySlot{}).Error
 }
+
+// DeleteExpiredConcurrencySlots deletes expired held slots while preserving the
+// permanent per-slot sentinel row (job_id=”) used to serialize admission.
+func (s *GormStorage) DeleteExpiredConcurrencySlots(ctx context.Context, cutoff time.Time) (int64, error) {
+	result := s.db.WithContext(ctx).
+		Where("expires_at < ?", cutoff).
+		Where("job_id <> ?", "").
+		Delete(&core.ConcurrencySlot{})
+	return result.RowsAffected, result.Error
+}

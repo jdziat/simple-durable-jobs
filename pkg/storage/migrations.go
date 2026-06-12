@@ -225,6 +225,11 @@ var schemaMigrations = []schemaMigration{
 		Name:    "retention_workflow_indexes",
 		Up:      migrateRetentionWorkflowIndexes,
 	},
+	{
+		Version: 20,
+		Name:    "scale_finish_indexes",
+		Up:      migrateScaleFinishIndexes,
+	},
 }
 
 // applyPendingMigrations runs every migration whose version is absent from the
@@ -809,6 +814,54 @@ func migrateRetentionWorkflowIndexes(ctx context.Context, db *gorm.DB, dialect s
 			"CREATE INDEX IF NOT EXISTS idx_jobs_root_nonterminal ON jobs (root_job_id) WHERE status NOT IN ('completed','failed','cancelled')",
 		).Error; err != nil {
 			return fmt.Errorf("create idx_jobs_root_nonterminal: %w", err)
+		}
+		return nil
+	}
+}
+
+func migrateScaleFinishIndexes(ctx context.Context, db *gorm.DB, dialect string) error {
+	switch dialect {
+	case dialectMySQL:
+		m := db.Migrator()
+		if m.HasIndex(&core.Job{}, "idx_jobs_status") {
+			if err := m.DropIndex(&core.Job{}, "idx_jobs_status"); err != nil && !isBenignDDLError(err) {
+				return fmt.Errorf("drop idx_jobs_status: %w", err)
+			}
+		}
+		if !m.HasIndex(&core.Signal{}, "idx_signals_consumed_at") {
+			if err := db.WithContext(ctx).Exec(
+				"CREATE INDEX idx_signals_consumed_at ON signals (consumed_at, id)",
+			).Error; err != nil && !isBenignDDLError(err) {
+				return fmt.Errorf("create idx_signals_consumed_at: %w", err)
+			}
+		}
+		if m.HasIndex(&core.Job{}, "idx_jobs_retention_terminal") {
+			if err := m.DropIndex(&core.Job{}, "idx_jobs_retention_terminal"); err != nil && !isBenignDDLError(err) {
+				return fmt.Errorf("drop idx_jobs_retention_terminal: %w", err)
+			}
+		}
+		if err := db.WithContext(ctx).Exec(
+			"CREATE INDEX idx_jobs_retention_terminal ON jobs (status, completed_at, id)",
+		).Error; err != nil && !isBenignDDLError(err) {
+			return fmt.Errorf("create idx_jobs_retention_terminal: %w", err)
+		}
+		return nil
+	default:
+		if err := db.WithContext(ctx).Exec("DROP INDEX IF EXISTS idx_jobs_status").Error; err != nil {
+			return fmt.Errorf("drop idx_jobs_status: %w", err)
+		}
+		if err := db.WithContext(ctx).Exec(
+			"CREATE INDEX IF NOT EXISTS idx_signals_consumed_at ON signals (consumed_at, id) WHERE consumed_at IS NOT NULL",
+		).Error; err != nil {
+			return fmt.Errorf("create idx_signals_consumed_at: %w", err)
+		}
+		if err := db.WithContext(ctx).Exec("DROP INDEX IF EXISTS idx_jobs_retention_terminal").Error; err != nil {
+			return fmt.Errorf("drop idx_jobs_retention_terminal: %w", err)
+		}
+		if err := db.WithContext(ctx).Exec(
+			"CREATE INDEX IF NOT EXISTS idx_jobs_retention_terminal ON jobs (status, completed_at, id) WHERE status IN ('completed','failed','cancelled') AND completed_at IS NOT NULL",
+		).Error; err != nil {
+			return fmt.Errorf("create idx_jobs_retention_terminal: %w", err)
 		}
 		return nil
 	}

@@ -57,12 +57,14 @@ func TestPostgresSchemaAssertions(t *testing.T) {
 		"idx_jobs_active_unique":      "WHERE",
 		"idx_jobs_dequeue_eligible":   "WHERE",
 		"idx_jobs_retention_terminal": "WHERE",
+		"idx_signals_consumed_at":     "consumed_at IS NOT NULL",
 		"idx_jobs_stale_lock":         "COALESCE",
 	}
 	for indexName, mustContain := range defs {
 		indexDef := postgresIndexDef(t, db, indexName)
 		require.Contains(t, strings.ToUpper(indexDef), strings.ToUpper(mustContain), "%s definition:\n%s", indexName, indexDef)
 	}
+	require.Contains(t, strings.ToLower(postgresIndexDef(t, db, "idx_jobs_retention_terminal")), "id", "idx_jobs_retention_terminal must include id")
 	require.Contains(t, postgresIndexDef(t, db, "idx_jobs_stale_lock"), "WHERE", "idx_jobs_stale_lock must stay partial")
 	require.Contains(t, strings.ToUpper(postgresIndexDef(t, db, "idx_jobs_dequeue_eligible")), "COALESCE")
 	parentNonterminalDef := strings.ToLower(postgresIndexDef(t, db, "idx_jobs_parent_nonterminal"))
@@ -92,6 +94,7 @@ func TestPostgresSchemaAssertions(t *testing.T) {
 		"idx_jobs_dequeue",
 		"idx_jobs_unique_key",
 		"idx_jobs_dequeue_order",
+		"idx_jobs_status",
 	} {
 		require.False(t, postgresIndexExists(t, db, indexName), "%s must not exist after migration", indexName)
 	}
@@ -166,11 +169,15 @@ func TestMySQLSchemaAssertions(t *testing.T) {
 		"idx_jobs_locked_until",
 		"idx_jobs_dequeue",
 		"idx_jobs_dequeue_order",
+		"idx_jobs_status",
 	} {
 		require.False(t, mysqlIndexExists(t, db, indexName), "%s must not exist after migration", indexName)
 	}
 	require.True(t, mysqlIndexExists(t, db, "idx_jobs_unique_key"), "idx_jobs_unique_key must remain on mysql")
 	require.True(t, mysqlIndexExists(t, db, "idx_jobs_dequeue_eligible"), "idx_jobs_dequeue_eligible must exist on mysql")
+	require.True(t, mysqlIndexExists(t, db, "idx_jobs_retention_terminal"), "idx_jobs_retention_terminal must exist on mysql")
+	require.Equal(t, []string{"status", "completed_at", "id"}, mysqlIndexColumns(t, db, "jobs", "idx_jobs_retention_terminal"))
+	require.True(t, mysqlTableIndexExists(t, db, "signals", "idx_signals_consumed_at"), "idx_signals_consumed_at must exist on mysql")
 	requireMySQLGeneratedVarchar36Column(t, db, "pending_parent_ref")
 	requireMySQLGeneratedVarchar36Column(t, db, "pending_root_ref")
 	require.True(t, mysqlIndexExists(t, db, "idx_jobs_parent_nonterminal"), "idx_jobs_parent_nonterminal must exist on mysql")
@@ -453,15 +460,35 @@ func postgresIndexExists(t *testing.T, db *gorm.DB, indexName string) bool {
 
 func mysqlIndexExists(t *testing.T, db *gorm.DB, indexName string) bool {
 	t.Helper()
+	return mysqlTableIndexExists(t, db, "jobs", indexName)
+}
+
+func mysqlTableIndexExists(t *testing.T, db *gorm.DB, tableName, indexName string) bool {
+	t.Helper()
 	var count int
 	require.NoError(t, db.Raw(`
 		SELECT COUNT(*)
 		FROM information_schema.STATISTICS
 		WHERE TABLE_SCHEMA = DATABASE()
-		  AND TABLE_NAME = 'jobs'
+		  AND TABLE_NAME = ?
 		  AND INDEX_NAME = ?
-	`, indexName).Scan(&count).Error)
+	`, tableName, indexName).Scan(&count).Error)
 	return count > 0
+}
+
+func mysqlIndexColumns(t *testing.T, db *gorm.DB, tableName, indexName string) []string {
+	t.Helper()
+	var columns []string
+	require.NoError(t, db.Raw(`
+		SELECT COLUMN_NAME
+		FROM information_schema.STATISTICS
+		WHERE TABLE_SCHEMA = DATABASE()
+		  AND TABLE_NAME = ?
+		  AND INDEX_NAME = ?
+		ORDER BY SEQ_IN_INDEX
+	`, tableName, indexName).Scan(&columns).Error)
+	require.NotEmpty(t, columns, "%s must exist on %s", indexName, tableName)
+	return columns
 }
 
 func buildSchemaDequeuePlanQuery(s *GormStorage, queues []string, limit int) *gorm.DB {
