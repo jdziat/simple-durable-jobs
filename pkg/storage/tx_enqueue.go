@@ -5,7 +5,6 @@ import (
 	"errors"
 	"time"
 
-	"github.com/google/uuid"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 
@@ -109,7 +108,7 @@ func (s *GormStorage) EnqueueBatchTx(ctx context.Context, tx *gorm.DB, jobs []*c
 
 func fillEnqueueDefaults(job *core.Job) {
 	if job.ID == "" {
-		job.ID = uuid.New().String()
+		job.ID = core.NewID()
 	}
 	if job.Status == "" {
 		job.Status = core.StatusPending

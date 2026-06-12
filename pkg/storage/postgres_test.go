@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -149,6 +150,7 @@ func TestCancelSubJobs_PostgreSQL_ConcurrentCompletionKeepsFanOutCountsConsisten
 	s := newTestStorage(t)
 
 	const subQueue = "cancel-race-q"
+	seedTestJob(t, ctx, s, "parent", core.StatusWaiting)
 	fanOut := &core.FanOut{ID: "fo-cancel-race", ParentJobID: "parent", TotalCount: 3}
 	require.NoError(t, s.CreateFanOut(ctx, fanOut))
 
@@ -251,6 +253,114 @@ func TestCancelSubJobs_PostgreSQL_ConcurrentCompletionKeepsFanOutCountsConsisten
 		require.NotNil(t, racingRow)
 		assert.Equal(t, core.StatusCompleted, racingRow.Status)
 	}
+}
+
+func TestCompleteWithResult_PostgreSQL_ConcurrentTerminalCountsPostCommit(t *testing.T) {
+	skipIfNotPostgres(t)
+
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	fo := createP2BFanOut(t, ctx, s, core.FanOutPending)
+	sub1 := createRunningP2BJob(t, ctx, s, &fo.ID, "worker-1")
+	sub2 := createRunningP2BJob(t, ctx, s, &fo.ID, "worker-2")
+
+	type hookKey struct{}
+	type barrier struct {
+		mu      sync.Mutex
+		count   int
+		ready   chan struct{}
+		proceed chan struct{}
+		once    sync.Once
+	}
+	wait := func(b *barrier) {
+		b.mu.Lock()
+		b.count++
+		if b.count == 2 {
+			b.once.Do(func() { close(b.ready) })
+		}
+		b.mu.Unlock()
+		<-b.proceed
+	}
+	hook := struct {
+		update barrier
+		count  barrier
+	}{
+		update: barrier{ready: make(chan struct{}), proceed: make(chan struct{})},
+		count:  barrier{ready: make(chan struct{}), proceed: make(chan struct{})},
+	}
+
+	updateCallback := "terminal_count_post_commit_update"
+	require.NoError(t, s.DB().Callback().Update().After("gorm:update").Register(updateCallback, func(tx *gorm.DB) {
+		h, ok := tx.Statement.Context.Value(hookKey{}).(*struct {
+			update barrier
+			count  barrier
+		})
+		if !ok || tx.Statement.Table != "jobs" {
+			return
+		}
+		wait(&h.update)
+	}))
+	queryCallback := "terminal_count_post_commit_count"
+	require.NoError(t, s.DB().Callback().Query().After("gorm:query").Register(queryCallback, func(tx *gorm.DB) {
+		h, ok := tx.Statement.Context.Value(hookKey{}).(*struct {
+			update barrier
+			count  barrier
+		})
+		if !ok || tx.Statement.Table != "jobs" || !strings.Contains(tx.Statement.SQL.String(), "COUNT(*)") {
+			return
+		}
+		wait(&h.count)
+	}))
+	t.Cleanup(func() {
+		_ = s.DB().Callback().Update().Remove(updateCallback)
+		_ = s.DB().Callback().Query().Remove(queryCallback)
+	})
+
+	start := make(chan struct{})
+	results := make(chan *core.FanOut, 2)
+	errs := make(chan error, 2)
+	for _, tc := range []struct {
+		jobID    string
+		workerID string
+		result   []byte
+	}{
+		{jobID: sub1.ID, workerID: "worker-1", result: []byte(`{"i":1}`)},
+		{jobID: sub2.ID, workerID: "worker-2", result: []byte(`{"i":2}`)},
+	} {
+		go func() {
+			<-start
+			fo, err := s.CompleteWithResult(context.WithValue(ctx, hookKey{}, &hook), tc.jobID, tc.workerID, tc.result)
+			results <- fo
+			errs <- err
+		}()
+	}
+
+	close(start)
+	select {
+	case <-hook.update.ready:
+	case <-time.After(2 * time.Second):
+		t.Fatal("terminal job updates did not reach the concurrency barrier")
+	}
+	close(hook.update.proceed)
+
+	select {
+	case <-hook.count.ready:
+	case <-time.After(2 * time.Second):
+		t.Fatal("fan-out count queries did not reach the concurrency barrier")
+	}
+	close(hook.count.proceed)
+
+	for range 2 {
+		require.NoError(t, <-errs)
+		require.NotNil(t, <-results)
+	}
+
+	final, err := s.GetFanOut(ctx, fo.ID)
+	require.NoError(t, err)
+	require.NotNil(t, final)
+	assert.Equal(t, core.FanOutCompleted, final.Status)
+	assert.Equal(t, 2, final.CompletedCount)
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

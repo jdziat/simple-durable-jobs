@@ -178,7 +178,7 @@ w := jobs.NewWorker(q,
 
 When `GormStorage` supports `DequeueBatchPerQueue(ctx, workerID, budgets)`, the
 worker computes a per-queue claim budget from each queue's remaining capacity.
-The storage scan still follows the global `priority DESC, created_at ASC` order;
+The storage scan still follows the global `priority DESC, COALESCE(run_at, created_at) ASC` (eligibility-time) order;
 rows from a queue that has already hit its budget are skipped with the same
 skip-list mechanism used for paused rows. This keeps cross-queue global priority
 while preventing a hot queue from over-claiming and then releasing surplus rows.
@@ -190,22 +190,60 @@ under unexpected dequeue pressure.
 
 ## Dequeue Index
 
-Migration v9 (`dequeue_order_index`) adds `idx_jobs_dequeue_order` for
-multi-queue priority scans.
+The dequeue hot path claims the highest-priority *eligible* job — pending, with
+its scheduled time reached — using `FOR UPDATE SKIP LOCKED`, ordered by
+`priority DESC` then eligibility time. A single index, `idx_jobs_dequeue_eligible`,
+serves both ready and delayed/scheduled jobs by folding `run_at` into the
+eligibility key (`COALESCE(run_at, created_at)`):
 
-The index is order-first:
+- **PostgreSQL / SQLite** — partial index on
+  `(priority DESC, COALESCE(run_at, created_at), queue) WHERE status = 'pending'`.
+  Terminal rows are excluded from the index entirely.
+- **MySQL** — `(status, priority DESC, dq_eligible_at, queue)`, where
+  `dq_eligible_at` is a `STORED` generated column
+  `IF(status = 'pending', COALESCE(run_at, created_at), NULL)`. MySQL has no
+  partial indexes, so `status` leads the index as an equality (and the generated
+  column is `NULL` for non-pending rows). Leading with the `status` equality
+  followed by the `ORDER BY` keys lets the planner serve the dequeue **without a
+  filesort**.
 
-- MySQL: `(status, priority DESC, created_at ASC, queue)`
-- PostgreSQL and SQLite: partial index on `(priority DESC, created_at ASC, queue)
-  WHERE status = 'pending'`
+This replaces the earlier `idx_jobs_dequeue` / `idx_jobs_dequeue_order` indexes,
+which were dropped: they could not serve delayed jobs, and on MySQL a
+range-leading variant forced a full pending-scan with `Using filesort`. The
+multi-backend CI suite EXPLAINs the real dequeue query on PostgreSQL and MySQL
+and fails the build on a `Sort` / `Using filesort` plan or the wrong index, so a
+future column-order regression cannot ship.
 
-The existing `idx_jobs_dequeue` remains for queue-filtered scans. The new index
-lets planners walk pending jobs in global priority order and filter queues from
-the index, which avoids sort-heavy plans on the `ORDER BY priority DESC,
-created_at ASC LIMIT ...` dequeue hot path. The dequeue EXPLAIN tests document
-the reason: MySQL moved from a full scan with `Using filesort` to
-`idx_jobs_dequeue_order` with `Using index condition`; PostgreSQL moved to an
-`Index Scan using idx_jobs_dequeue_order` without a Sort node.
+## Schema Migrations At Scale
+
+`sdj migrate` — and the automatic `Migrate` on worker startup — is idempotent and
+applies every versioned migration under a fleet-wide advisory lock. On a fresh or
+small database every migration is effectively instant. A few migrations applied to
+an **already-large** `jobs` table take locks proportional to table size; on large
+installs apply these out-of-band (during a maintenance window, outside the fleet
+lock) before rolling out the upgrade:
+
+- **New index builds.** Versioned index migrations use plain `CREATE INDEX`, which
+  on PostgreSQL takes a `SHARE` lock that blocks writes for the build duration. If
+  you add an index migration against a large `jobs` table, build it first with
+  `CREATE INDEX CONCURRENTLY` out-of-band — it cannot run inside the transactional
+  migration runner — then deploy.
+- **MySQL collation migration (v15).** v15 pins `unique_key` /
+  `active_unique_key` to `utf8mb4_0900_as_cs` (case- and accent-sensitive dedup,
+  for cross-engine parity). On MySQL this is a table-copy `ALTER`: instant on a
+  fresh table, but minutes under the fleet lock at millions of rows. On large
+  installs run it during a maintenance window or via an online-DDL tool
+  (`pt-online-schema-change` / `gh-ost`) before upgrading.
+- **MySQL foreign keys (v14).** v14 adds `ON DELETE CASCADE` foreign keys from
+  `checkpoints` / `signals` / `fan_outs` to `jobs(id)`. Two MySQL-specific
+  consequences: (1) a child-row `INSERT` takes a shared lock on its parent `jobs`
+  row, so a checkpoint or signal write can briefly contend with a concurrent
+  status transition of the same job under heavy load; (2) `TRUNCATE jobs` now
+  fails (`Cannot truncate a table referenced in a foreign key constraint`) —
+  truncate the child tables first, or `SET FOREIGN_KEY_CHECKS = 0` for a full
+  reset. PostgreSQL's FK locks are `FOR KEY SHARE` and do not block the status
+  update; SQLite uses application-level cascade (its DSN runs with
+  `foreign_keys=OFF`).
 
 ## Metrics And Alerts
 
@@ -326,7 +364,8 @@ This page covers these operational surfaces:
 
 | Surface | Section |
 |---|---|
-| `idx_jobs_dequeue_order` / migration v9 `dequeue_order_index` | [Dequeue Index](#dequeue-index) |
+| `idx_jobs_dequeue_eligible` (ready + delayed dequeue) | [Dequeue Index](#dequeue-index) |
+| `CREATE INDEX CONCURRENTLY` / v15 collation / v14 FK out-of-band | [Schema Migrations At Scale](#schema-migrations-at-scale) |
 | `jobs.queue.depth`, `jobs.queue.backlog.oldest_age`, `jobs.dead_letter.depth`, `jobs.queue.saturation` | [Metrics And Alerts](#metrics-and-alerts) |
 | `storage.Healther`, `GormStorage.Ping(ctx)` | [Health Probes](#health-probes) |
 | Work-conserving drain loop | [Throughput Tuning](#throughput-tuning) |

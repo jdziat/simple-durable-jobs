@@ -8,7 +8,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 	"gorm.io/gorm/logger"
@@ -175,6 +174,24 @@ func (s *GormStorage) Migrate(ctx context.Context) error {
 	// AutoMigrate does check-then-create, which is not concurrency-safe on its
 	// own — two workers can both try to CREATE the same table/index).
 	return s.withMigrationLock(ctx, func(db *gorm.DB) error {
+		if s.dialect() == dialectMySQL {
+			if err := requireMySQLUTCSession(ctx, db); err != nil {
+				return err
+			}
+		}
+
+		// The core.Job dispatcher columns carry `not null` tags so AutoMigrate
+		// keeps them NOT NULL and never drifts them back to nullable (a drift
+		// would force a table-copy MODIFY on every MySQL startup). AutoMigrate
+		// runs before the versioned migrations, so backfill any pre-existing
+		// NULLs (only reachable via raw SQL — the Go model never writes them)
+		// FIRST, otherwise AutoMigrate's SET NOT NULL would fail on a populated
+		// table. Idempotent + cheap: after the first migrate the columns are
+		// NOT NULL, so the predicate is constraint-excluded.
+		if err := backfillDispatcherNulls(ctx, db, s.dialect()); err != nil {
+			return err
+		}
+
 		if err := db.AutoMigrate(
 			&core.Job{},
 			&core.Checkpoint{},
@@ -207,6 +224,45 @@ func (s *GormStorage) Migrate(ctx context.Context) error {
 
 		return s.applyPendingMigrations(ctx, db)
 	})
+}
+
+// backfillDispatcherNulls fills any pre-existing NULL dispatcher columns with
+// their defaults BEFORE AutoMigrate applies the `not null` tags, so AutoMigrate's
+// SET NOT NULL cannot fail on a populated table. Such NULLs are only reachable via
+// raw SQL (the Go model never writes them). PG/MySQL only; on a fresh DB the jobs
+// table does not exist yet (AutoMigrate creates it NOT NULL from the tags), so
+// skip. Idempotent + cheap: once the columns are NOT NULL the predicate is
+// constraint-excluded (no scan).
+func backfillDispatcherNulls(ctx context.Context, db *gorm.DB, dialect string) error {
+	if dialect != dialectPostgres && dialect != dialectMySQL {
+		return nil
+	}
+	if !db.Migrator().HasTable(&core.Job{}) {
+		return nil
+	}
+	return db.WithContext(ctx).Exec(`
+		UPDATE jobs
+		SET status = COALESCE(status, 'pending'),
+		    queue = COALESCE(queue, 'default'),
+		    priority = COALESCE(priority, 0),
+		    attempt = COALESCE(attempt, 0),
+		    max_retries = COALESCE(max_retries, 3)
+		WHERE status IS NULL OR queue IS NULL OR priority IS NULL
+		   OR attempt IS NULL OR max_retries IS NULL
+	`).Error
+}
+
+func requireMySQLUTCSession(ctx context.Context, db *gorm.DB) error {
+	var offsetSeconds int64
+	if err := db.WithContext(ctx).Raw(
+		"SELECT TIMESTAMPDIFF(SECOND, UTC_TIMESTAMP(6), NOW(6))",
+	).Scan(&offsetSeconds).Error; err != nil {
+		return fmt.Errorf("storage: check MySQL session clock: %w", err)
+	}
+	if offsetSeconds != 0 {
+		return fmt.Errorf("storage: MySQL session clock is not UTC; NOW(6) drives DB-clock lock/lease writes; set time_zone='+00:00' or loc=UTC in the DSN")
+	}
+	return nil
 }
 
 // Enqueue adds a job to the queue.
@@ -410,6 +466,7 @@ func (s *GormStorage) Dequeue(ctx context.Context, queues []string, workerID str
 	// add a predicate that assumes the two reads are equal.
 	nowExpr := s.nowExpr()
 	lockUntilExpr := s.offsetExpr(s.lockDuration)
+	eligExpr := s.dequeueEligibleExpr()
 	silentDB := s.db.Session(&gorm.Session{Logger: s.db.Logger.LogMode(logger.Silent)})
 	err = silentDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		// FOR UPDATE SKIP LOCKED ensures:
@@ -419,9 +476,9 @@ func (s *GormStorage) Dequeue(ctx context.Context, queues []string, workerID str
 		result := tx.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).
 			Where("queue IN ?", activeQueues).
 			Where("status = ?", core.StatusPending).
-			Where("(run_at IS NULL OR run_at <= ?)", nowExpr).
+			Where(eligExpr+" <= ?", nowExpr).
 			Where("(locked_until IS NULL OR locked_until < ?)", nowExpr).
-			Order("priority DESC, created_at ASC").
+			Order("priority DESC, " + eligExpr + " ASC").
 			First(&job)
 
 		if result.Error != nil {
@@ -475,15 +532,16 @@ func (s *GormStorage) Dequeue(ctx context.Context, queues []string, workerID str
 // This is NOT safe for multiple concurrent workers - use PostgreSQL for production.
 func (s *GormStorage) dequeueSQLite(ctx context.Context, queues []string, workerID string, now time.Time, lockUntil time.Time) (*core.Job, error) {
 	var job core.Job
+	eligExpr := s.dequeueEligibleExpr()
 
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		// Find a candidate job
 		result := tx.
 			Where("queue IN ?", queues).
 			Where("status = ?", core.StatusPending).
-			Where("(run_at IS NULL OR run_at <= ?)", now).
+			Where(eligExpr+" <= ?", now).
 			Where("(locked_until IS NULL OR locked_until < ?)", now).
-			Order("priority DESC, created_at ASC").
+			Order("priority DESC, " + eligExpr + " ASC").
 			First(&job)
 
 		if result.Error != nil {
@@ -698,28 +756,11 @@ func deadLetterReasonExpr(lastError string) clause.Expr {
 	)
 }
 
-// fanOutCounterStmt returns the constant UPDATE statement that increments the
-// named fan-out counter, or ok=false for any unrecognized column. This is an
-// allow-list: the only valid columns are the two terminal counters, and each
-// maps to a fixed string literal so no caller value is ever interpolated into
-// SQL. The placeholders bind (updated_at, fan_out_id, status).
-func fanOutCounterStmt(col string) (stmt string, ok bool) {
-	switch col {
-	case "completed_count":
-		return "UPDATE fan_outs SET completed_count = completed_count + 1, updated_at = ? WHERE id = ? AND status = ?", true
-	case "failed_count":
-		return "UPDATE fan_outs SET failed_count = failed_count + 1, updated_at = ? WHERE id = ? AND status = ?", true
-	default:
-		return "", false
-	}
-}
-
 // accountTerminalWithFanOut performs the ownership-guarded terminal job UPDATE
-// described by jobUpdates and, when the job is a sub-job of a still-pending
-// fan-out, atomically increments fanOutCounterCol in the same transaction
-// (liveness-guarded on status='pending'). Returns the fan-out row when the job
-// has a fan-out, or nil. Increments nothing and returns core.ErrJobNotOwned if the
-// worker no longer owns the running job.
+// described by jobUpdates and, when the job is a sub-job, resolves the fan-out
+// from live child-job terminal counts after that transaction commits. Returns
+// the fan-out row when the job has a fan-out, or nil. Returns core.ErrJobNotOwned
+// if the worker no longer owns the running job.
 //
 // When deleteCheckpoints is true (success path with the opt-in enabled), this
 // job's checkpoints are deleted in the SAME transaction, after the ownership
@@ -730,13 +771,12 @@ func fanOutCounterStmt(col string) (stmt string, ok bool) {
 //
 // Note: this builds a per-attempt copy of jobUpdates because the transaction
 // body may be retried after serialization failures.
-func (s *GormStorage) accountTerminalWithFanOut(ctx context.Context, jobID, workerID string, jobUpdates map[string]any, fanOutCounterCol string, deleteCheckpoints bool) (*core.FanOut, error) {
+func (s *GormStorage) accountTerminalWithFanOut(ctx context.Context, jobID, workerID string, jobUpdates map[string]any, _ string, deleteCheckpoints bool) (*core.FanOut, error) {
 	var fanOut core.FanOut
-	var hasFanOut bool
+	var fanOutID string
 
 	err := s.withSerializationRetry(ctx, func() error {
-		fanOut = core.FanOut{}
-		hasFanOut = false
+		fanOutID = ""
 
 		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 			now := time.Now()
@@ -779,58 +819,54 @@ func (s *GormStorage) accountTerminalWithFanOut(ctx context.Context, jobID, work
 			if job.FanOutID == nil || *job.FanOutID == "" {
 				return nil
 			}
-
-			// Map the caller's intent to a constant SQL statement via an
-			// allow-list. The column name is never interpolated from a
-			// variable — even though callers only pass hardcoded constants
-			// today, building the statement with fmt.Sprintf made the call
-			// site one careless edit away from SQL injection. The switch
-			// makes that impossible and is checked at compile time.
-			counterSQL, ok := fanOutCounterStmt(fanOutCounterCol)
-			if !ok {
-				return fmt.Errorf("storage: invalid fan-out counter column %q", fanOutCounterCol)
-			}
-			if err := tx.Exec(
-				counterSQL,
-				now, *job.FanOutID, core.FanOutPending,
-			).Error; err != nil {
-				return err
-			}
-			if err := tx.First(&fanOut, "id = ?", *job.FanOutID).Error; err != nil {
-				return err
-			}
-			hasFanOut = true
-
-			// Advance the fan-out status IN THE SAME TRANSACTION as the
-			// counter increment. The increment UPDATE above row-locks the
-			// fan_outs row (PG/MySQL) or serializes the whole write tx
-			// (SQLite), so this re-read reflects the post-increment counts
-			// (read-your-writes), and exactly one transaction — the one whose
-			// increment makes the counts terminal — observes done==true. The
-			// status UPDATE is pending-guarded, so it is a no-op if the status
-			// was somehow already advanced. Committing the increment and the
-			// status advance together means the DB can never be observed as
-			// status='pending' with terminal counts on this path: a crash
-			// before the commit loses the increment (the sub-job re-runs under
-			// at-least-once semantics); a crash after leaves a terminal status
-			// the existing GetWaitingJobsToResume query can rescue.
-			if done, termStatus := fanOut.TerminalStatus(); done {
-				res := tx.Model(&core.FanOut{}).
-					Where("id = ? AND status = ?", *job.FanOutID, core.FanOutPending).
-					Updates(map[string]any{"status": termStatus, "updated_at": now})
-				if res.Error != nil {
-					return res.Error
-				}
-				fanOut.Status = termStatus
-			}
+			fanOutID = *job.FanOutID
 			return nil
 		})
 	})
 	if err != nil {
 		return nil, err
 	}
-	if !hasFanOut {
+	if fanOutID == "" {
 		return nil, nil
+	}
+
+	err = s.withSerializationRetry(ctx, func() error {
+		fanOut = core.FanOut{}
+		db := s.db.WithContext(ctx)
+		if err := db.First(&fanOut, "id = ?", fanOutID).Error; err != nil {
+			return err
+		}
+		completed, failed, cancelled, err := liveFanOutCounts(db, fanOutID)
+		if err != nil {
+			return err
+		}
+		overlayFanOutCounts(&fanOut, completed, failed, cancelled)
+
+		// Count after the child terminal transaction commits so the snapshot can
+		// see concurrently-committed siblings. The pending-guarded update remains
+		// the exactly-once serializer; non-terminal children perform no fan_outs
+		// write at all.
+		if done, termStatus := fanOut.TerminalStatus(); done {
+			res := db.Model(&core.FanOut{}).
+				Where("id = ? AND status = ?", fanOutID, core.FanOutPending).
+				Updates(map[string]any{
+					"status":          termStatus,
+					"completed_count": completed,
+					"failed_count":    failed,
+					"cancelled_count": cancelled,
+					"updated_at":      time.Now(),
+				})
+			if res.Error != nil {
+				return res.Error
+			}
+			if res.RowsAffected == 1 {
+				fanOut.Status = termStatus
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	return &fanOut, nil
 }
@@ -840,7 +876,7 @@ func (s *GormStorage) accountTerminalWithFanOut(ctx context.Context, jobID, work
 // the latest result and error fields are updated in place (upsert).
 func (s *GormStorage) SaveCheckpoint(ctx context.Context, cp *core.Checkpoint) error {
 	if cp.ID == "" {
-		cp.ID = uuid.New().String()
+		cp.ID = core.NewID()
 	}
 	row, err := s.encodedCheckpointForSave(cp)
 	if err != nil {
@@ -914,9 +950,9 @@ func (s *GormStorage) GetDueJobs(ctx context.Context, queues []string, limit int
 	err = s.db.WithContext(ctx).
 		Where("queue IN ?", activeQueues).
 		Where("status = ?", core.StatusPending).
-		Where("(run_at IS NULL OR run_at <= ?)", nowVal).
+		Where(s.dequeueEligibleExpr()+" <= ?", nowVal).
 		Where("(locked_until IS NULL OR locked_until < ?)", nowVal).
-		Order("priority DESC, created_at ASC").
+		Order("priority DESC, " + s.dequeueEligibleExpr() + " ASC").
 		Limit(limit).
 		Find(&jobList).Error
 
@@ -1201,9 +1237,99 @@ func (s *GormStorage) GetJobsByStatus(ctx context.Context, status core.JobStatus
 // CreateFanOut creates a new fan-out record.
 func (s *GormStorage) CreateFanOut(ctx context.Context, fanOut *core.FanOut) error {
 	if fanOut.ID == "" {
-		fanOut.ID = uuid.New().String()
+		fanOut.ID = core.NewID()
 	}
 	return s.db.WithContext(ctx).Create(fanOut).Error
+}
+
+func liveFanOutCounts(db *gorm.DB, fanOutID string) (completed, failed, cancelled int, err error) {
+	type countRow struct {
+		Status string
+		Count  int64
+	}
+	var rows []countRow
+	err = db.Model(&core.Job{}).
+		Select("status, COUNT(*) AS count").
+		Where("fan_out_id = ? AND status IN ?", fanOutID, []core.JobStatus{core.StatusCompleted, core.StatusFailed, core.StatusCancelled}).
+		Group("status").
+		Find(&rows).Error
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	for _, row := range rows {
+		switch core.JobStatus(row.Status) {
+		case core.StatusCompleted:
+			completed += int(row.Count)
+		case core.StatusFailed:
+			failed += int(row.Count)
+		case core.StatusCancelled:
+			cancelled += int(row.Count)
+		}
+	}
+	return completed, failed, cancelled, nil
+}
+
+func overlayFanOutCounts(fanOut *core.FanOut, completed, failed, cancelled int) {
+	fanOut.CompletedCount = completed
+	fanOut.FailedCount = failed
+	fanOut.CancelledCount = cancelled
+}
+
+func overlayLiveFanOutCounts(db *gorm.DB, fanOut *core.FanOut) error {
+	completed, failed, cancelled, err := liveFanOutCounts(db, fanOut.ID)
+	if err != nil {
+		return err
+	}
+	overlayFanOutCounts(fanOut, completed, failed, cancelled)
+	return nil
+}
+
+func overlayLiveFanOutCountsBatch(db *gorm.DB, fanOuts []*core.FanOut) error {
+	if len(fanOuts) == 0 {
+		return nil
+	}
+	ids := make([]string, 0, len(fanOuts))
+	byID := make(map[string]*core.FanOut, len(fanOuts))
+	for _, fanOut := range fanOuts {
+		if fanOut == nil {
+			continue
+		}
+		ids = append(ids, fanOut.ID)
+		byID[fanOut.ID] = fanOut
+		overlayFanOutCounts(fanOut, 0, 0, 0)
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+
+	type countRow struct {
+		FanOutID string
+		Status   string
+		Count    int64
+	}
+	var rows []countRow
+	if err := db.Model(&core.Job{}).
+		Select("fan_out_id, status, COUNT(*) AS count").
+		Where("fan_out_id IN ? AND status IN ?", ids, []core.JobStatus{core.StatusCompleted, core.StatusFailed, core.StatusCancelled}).
+		Group("fan_out_id, status").
+		Find(&rows).Error; err != nil {
+		return err
+	}
+	for _, row := range rows {
+		fanOut := byID[row.FanOutID]
+		if fanOut == nil {
+			continue
+		}
+		switch core.JobStatus(row.Status) {
+		case core.StatusCompleted:
+			fanOut.CompletedCount += int(row.Count)
+		case core.StatusFailed:
+			fanOut.FailedCount += int(row.Count)
+		case core.StatusCancelled:
+			fanOut.CancelledCount += int(row.Count)
+		}
+	}
+	return nil
 }
 
 // GetFanOut retrieves a fan-out by ID.
@@ -1213,64 +1339,37 @@ func (s *GormStorage) GetFanOut(ctx context.Context, fanOutID string) (*core.Fan
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil, nil
 	}
-	return &fanOut, err
+	if err != nil {
+		return nil, err
+	}
+	if err := overlayLiveFanOutCounts(s.db.WithContext(ctx), &fanOut); err != nil {
+		return nil, err
+	}
+	return &fanOut, nil
 }
 
-// IncrementFanOutCompleted atomically increments the completed count.
+// IncrementFanOutCompleted returns the fan-out with live completed count.
 func (s *GormStorage) IncrementFanOutCompleted(ctx context.Context, fanOutID string) (*core.FanOut, error) {
-	var fanOut core.FanOut
-	err := s.withSerializationRetry(ctx, func() error {
-		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-			if err := tx.Exec(
-				"UPDATE fan_outs SET completed_count = completed_count + 1, updated_at = ? WHERE id = ?",
-				time.Now(), fanOutID,
-			).Error; err != nil {
-				return err
-			}
-			return tx.First(&fanOut, "id = ?", fanOutID).Error
-		})
-	})
-	if err != nil {
-		return nil, err
-	}
-	return &fanOut, nil
+	return s.getFanOutWithLiveCounts(ctx, fanOutID)
 }
 
-// IncrementFanOutFailed atomically increments the failed count.
+// IncrementFanOutFailed returns the fan-out with live failed count.
 func (s *GormStorage) IncrementFanOutFailed(ctx context.Context, fanOutID string) (*core.FanOut, error) {
-	var fanOut core.FanOut
-	err := s.withSerializationRetry(ctx, func() error {
-		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-			if err := tx.Exec(
-				"UPDATE fan_outs SET failed_count = failed_count + 1, updated_at = ? WHERE id = ?",
-				time.Now(), fanOutID,
-			).Error; err != nil {
-				return err
-			}
-			return tx.First(&fanOut, "id = ?", fanOutID).Error
-		})
-	})
-	if err != nil {
-		return nil, err
-	}
-	return &fanOut, nil
+	return s.getFanOutWithLiveCounts(ctx, fanOutID)
 }
 
-// IncrementFanOutCancelled atomically increments the cancelled count.
+// IncrementFanOutCancelled returns the fan-out with live cancelled count.
 func (s *GormStorage) IncrementFanOutCancelled(ctx context.Context, fanOutID string) (*core.FanOut, error) {
+	return s.getFanOutWithLiveCounts(ctx, fanOutID)
+}
+
+func (s *GormStorage) getFanOutWithLiveCounts(ctx context.Context, fanOutID string) (*core.FanOut, error) {
 	var fanOut core.FanOut
-	err := s.withSerializationRetry(ctx, func() error {
-		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-			if err := tx.Exec(
-				"UPDATE fan_outs SET cancelled_count = cancelled_count + 1, updated_at = ? WHERE id = ?",
-				time.Now(), fanOutID,
-			).Error; err != nil {
-				return err
-			}
-			return tx.First(&fanOut, "id = ?", fanOutID).Error
-		})
-	})
-	if err != nil {
+	db := s.db.WithContext(ctx)
+	if err := db.First(&fanOut, "id = ?", fanOutID).Error; err != nil {
+		return nil, err
+	}
+	if err := overlayLiveFanOutCounts(db, &fanOut); err != nil {
 		return nil, err
 	}
 	return &fanOut, nil
@@ -1281,15 +1380,30 @@ func (s *GormStorage) IncrementFanOutCancelled(ctx context.Context, fanOutID str
 // by another worker, or (false, error) on database error.
 // This prevents race conditions where multiple workers try to complete the same fan-out.
 func (s *GormStorage) UpdateFanOutStatus(ctx context.Context, fanOutID string, status core.FanOutStatus) (bool, error) {
-	result := s.db.WithContext(ctx).
-		Model(&core.FanOut{}).
-		Where("id = ? AND status = ?", fanOutID, core.FanOutPending).
-		Update("status", status)
-	if result.Error != nil {
-		return false, result.Error
-	}
-	// RowsAffected == 0 means another worker already completed this fan-out
-	return result.RowsAffected > 0, nil
+	var updated bool
+	err := s.withSerializationRetry(ctx, func() error {
+		completed, failed, cancelled, err := liveFanOutCounts(s.db.WithContext(ctx), fanOutID)
+		if err != nil {
+			return err
+		}
+		result := s.db.WithContext(ctx).
+			Model(&core.FanOut{}).
+			Where("id = ? AND status = ?", fanOutID, core.FanOutPending).
+			Updates(map[string]any{
+				"status":          status,
+				"completed_count": completed,
+				"failed_count":    failed,
+				"cancelled_count": cancelled,
+				"updated_at":      time.Now(),
+			})
+		if result.Error != nil {
+			return result.Error
+		}
+		// RowsAffected == 0 means another worker already completed this fan-out.
+		updated = result.RowsAffected > 0
+		return nil
+	})
+	return updated, err
 }
 
 // GetFanOutsByParent retrieves all fan-outs for a parent job.
@@ -1299,7 +1413,13 @@ func (s *GormStorage) GetFanOutsByParent(ctx context.Context, parentJobID string
 		Where("parent_job_id = ?", parentJobID).
 		Order("created_at ASC").
 		Find(&fanOuts).Error
-	return fanOuts, err
+	if err != nil {
+		return nil, err
+	}
+	if err := overlayLiveFanOutCountsBatch(s.db.WithContext(ctx), fanOuts); err != nil {
+		return nil, err
+	}
+	return fanOuts, nil
 }
 
 // --- Sub-job operations ---
@@ -1372,11 +1492,9 @@ func (s *GormStorage) GetSubJobResults(ctx context.Context, fanOutID string) ([]
 	return jobs, nil
 }
 
-// CancelSubJobs cancels pending/running sub-jobs for a fan-out.
-// Updates the fan-out's cancelled_count to reflect the number of cancelled
-// jobs and returns the IDs of the cancelled sub-jobs so the caller can
-// cancel any local in-flight handlers — see core.Storage.CancelSubJobs
-// for the rationale.
+// CancelSubJobs cancels pending/running sub-jobs for a fan-out and returns their
+// IDs so the caller can cancel any local in-flight handlers — see
+// core.Storage.CancelSubJobs for the rationale.
 func (s *GormStorage) CancelSubJobs(ctx context.Context, fanOutID string) ([]string, error) {
 	var cancelled []string
 	err := s.withSerializationRetry(ctx, func() error {
@@ -1410,15 +1528,7 @@ func (s *GormStorage) CancelSubJobs(ctx context.Context, fanOutID string) ([]str
 			if result.Error != nil {
 				return result.Error
 			}
-			if result.RowsAffected == 0 {
-				return nil
-			}
-
-			// Update the fan-out's cancelled count to match.
-			return tx.Exec(
-				"UPDATE fan_outs SET cancelled_count = cancelled_count + ?, updated_at = ? WHERE id = ?",
-				result.RowsAffected, now, fanOutID,
-			).Error
+			return nil
 		})
 	})
 	if err != nil {
@@ -1427,7 +1537,7 @@ func (s *GormStorage) CancelSubJobs(ctx context.Context, fanOutID string) ([]str
 	return cancelled, nil
 }
 
-// CancelSubJob cancels a single sub-job and updates its fan-out's cancelled count.
+// CancelSubJob cancels a single sub-job and returns its fan-out with live counts.
 // Returns the updated FanOut record so the caller can check for completion.
 // Returns (nil, nil) if the job has no fan-out ID (not a sub-job).
 func (s *GormStorage) CancelSubJob(ctx context.Context, jobID string) (*core.FanOut, error) {
@@ -1472,17 +1582,14 @@ func (s *GormStorage) CancelSubJob(ctx context.Context, jobID string) (*core.Fan
 				return nil
 			}
 
-			// Increment cancelled count on the fan-out
-			if err := tx.Exec(
-				"UPDATE fan_outs SET cancelled_count = cancelled_count + 1, updated_at = ? WHERE id = ?",
-				now, *job.FanOutID,
-			).Error; err != nil {
-				return err
-			}
-
 			if err := tx.First(&fanOut, "id = ?", *job.FanOutID).Error; err != nil {
 				return err
 			}
+			completed, failed, cancelledCount, err := liveFanOutCounts(tx, *job.FanOutID)
+			if err != nil {
+				return err
+			}
+			overlayFanOutCounts(&fanOut, completed, failed, cancelledCount)
 			hasFanOut = true
 			return nil
 		})
@@ -1654,17 +1761,22 @@ func (s *GormStorage) Requeue(ctx context.Context, jobID string) (bool, error) {
 
 // deleteFanOutSubtree deletes the entire fan-out tree rooted at rootJobID: every
 // fan-out it spawned directly or transitively, all of those sub-jobs, and their
-// checkpoints. The root job row itself is NOT touched. Used by Requeue so
+// checkpoints/signals. The root job row itself is NOT touched. Used by Requeue so
 // replaying a parent re-dispatches a fresh tree instead of orphaning the old one
 // at any depth (a sub-job may itself be a fan-out parent).
 //
-// It descends level by level, deleting each level before expanding the next.
-// parent_job_id/fan_out_id are plain columns (no FK), so a child fan-out is
-// still findable by its (now-deleted) parent sub-job's id; and because each
-// level's rows are deleted as it is visited, even cyclically corrupt data cannot
-// loop (the depth cap is just extra insurance). IN-lists stay bounded to one
-// level's width rather than the whole tree.
+// Two phases. Phase 1 is a read-only level-by-level descent that collects every
+// fan-out id and sub-job id in the tree WITHOUT deleting anything, so the
+// parent_job_id/fan_out_id chains stay intact for the whole walk. Phase 2 then
+// deletes the collected rows. This ordering is required because migration v14
+// added fk_fanouts_parent (fan_outs.parent_job_id -> jobs.id ON DELETE CASCADE):
+// deleting a level's sub-jobs cascade-removes the NEXT level's fan_outs rows, so
+// a delete-as-you-descend walk would lose the frontier and orphan grandchildren
+// (there is no FK on jobs.fan_out_id, so the cascade stops at fan_outs and the
+// grandchild sub-jobs would be stranded). The depth cap bounds cyclically corrupt
+// data; IN-lists stay bounded to one level's width during the walk.
 func (s *GormStorage) deleteFanOutSubtree(tx *gorm.DB, rootJobID string) error {
+	var allFanOutIDs, allSubJobIDs []string
 	frontier := []string{rootJobID}
 	for depth := 0; len(frontier) > 0 && depth < maxFanOutTreeDepth; depth++ {
 		var fanOutIDs []string
@@ -1674,7 +1786,7 @@ func (s *GormStorage) deleteFanOutSubtree(tx *gorm.DB, rootJobID string) error {
 			return err
 		}
 		if len(fanOutIDs) == 0 {
-			return nil // reached the leaves
+			break // reached the leaves
 		}
 
 		var subJobIDs []string
@@ -1684,22 +1796,34 @@ func (s *GormStorage) deleteFanOutSubtree(tx *gorm.DB, rootJobID string) error {
 			return err
 		}
 
-		if len(subJobIDs) > 0 {
-			if err := tx.Where("job_id IN ?", subJobIDs).Delete(&core.Checkpoint{}).Error; err != nil {
-				return err
-			}
-			if err := tx.Where("id IN ?", subJobIDs).Delete(&core.Job{}).Error; err != nil {
-				return err
-			}
-		}
-		if err := tx.Where("id IN ?", fanOutIDs).Delete(&core.FanOut{}).Error; err != nil {
+		allFanOutIDs = append(allFanOutIDs, fanOutIDs...)
+		allSubJobIDs = append(allSubJobIDs, subJobIDs...)
+
+		// Descend into the sub-jobs just collected; their child fan-outs are
+		// still present (nothing deleted yet) and findable by parent_job_id.
+		frontier = subJobIDs
+	}
+
+	if len(allSubJobIDs) > 0 {
+		// Delete dependents explicitly so the behavior holds on SQLite too (no FK
+		// there). On PG/MySQL deleting the sub-jobs also cascade-removes their
+		// checkpoints/signals/fan_outs, making these deletes idempotent.
+		if err := tx.Where("job_id IN ?", allSubJobIDs).Delete(&core.Checkpoint{}).Error; err != nil {
 			return err
 		}
-
-		// Sub-jobs just deleted may themselves have spawned fan-outs; expand
-		// into them next. Their child fan-out rows are still present and remain
-		// findable by parent_job_id (a plain column).
-		frontier = subJobIDs
+		if err := tx.Where("job_id IN ?", allSubJobIDs).Delete(&core.Signal{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("id IN ?", allSubJobIDs).Delete(&core.Job{}).Error; err != nil {
+			return err
+		}
+	}
+	if len(allFanOutIDs) > 0 {
+		// Root-level fan_outs (parent_job_id = the untouched root) are not reached
+		// by the sub-job cascade, so delete the collected fan_outs explicitly.
+		if err := tx.Where("id IN ?", allFanOutIDs).Delete(&core.FanOut{}).Error; err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -1771,15 +1895,13 @@ func (s *GormStorage) GetStalledFanOutParents(ctx context.Context, olderThan tim
 }
 
 // GetCompletablePendingFanOuts finds fan-outs that are still status='pending'
-// but whose persisted counts already satisfy a terminal condition while their
-// parent job sits in StatusWaiting — the exact post-crash state left when a
-// worker died between the counter-increment commit and the (pre-P2) separate
-// status-advance transaction, plus any legacy/non-atomic increment path.
+// but whose live child-job terminal counts already satisfy a terminal-condition
+// superset while their parent job sits in StatusWaiting.
 //
-// The arithmetic predicate (completed+failed+cancelled >= total) OR failed>0
-// OR cancelled>0 is a portable SUPERSET of every FanOut.TerminalStatus()
-// terminal condition (collect_all/threshold resolve at accounted>=total; the
-// default fail_fast and threshold early-fail resolve at failed>0/cancelled>0).
+// The child-count predicate (terminal>=total) OR failed>0 OR cancelled>0 is a
+// portable SUPERSET of every FanOut.TerminalStatus() terminal condition
+// (collect_all/threshold resolve at accounted>=total; the default fail_fast and
+// threshold early-fail resolve at failed>0/cancelled>0).
 // The final terminal decision is made in Go by the caller via TerminalStatus(),
 // so a non-terminal row that slips through is a harmless no-op. Restricting to
 // parent status='waiting' avoids touching fan-outs whose parent is still
@@ -1793,17 +1915,35 @@ func (s *GormStorage) GetCompletablePendingFanOuts(ctx context.Context, olderTha
 	err := s.db.WithContext(ctx).Raw(`
 		SELECT f.* FROM fan_outs f
 		INNER JOIN jobs j ON j.id = f.parent_job_id
+		LEFT JOIN (
+			SELECT fan_out_id,
+				COUNT(*) AS terminal_count,
+				SUM(CASE WHEN status = ? THEN 1 ELSE 0 END) AS failed_count,
+				SUM(CASE WHEN status = ? THEN 1 ELSE 0 END) AS cancelled_count
+			FROM jobs
+			WHERE fan_out_id IS NOT NULL
+			AND status IN (?, ?, ?)
+			GROUP BY fan_out_id
+		) counts ON counts.fan_out_id = f.id
 		WHERE f.status = ?
 		AND j.status = ?
 		AND f.created_at < ?
 		AND (
-			f.completed_count + f.failed_count + f.cancelled_count >= f.total_count
-			OR f.failed_count > 0
-			OR f.cancelled_count > 0
+			COALESCE(counts.terminal_count, 0) >= f.total_count
+			OR COALESCE(counts.failed_count, 0) > 0
+			OR COALESCE(counts.cancelled_count, 0) > 0
 		)
 		LIMIT ?
-	`, core.FanOutPending, core.StatusWaiting, olderThan, maxResumeBatch).Scan(&fanOuts).Error
+	`,
+		core.StatusFailed,
+		core.StatusCancelled,
+		core.StatusCompleted, core.StatusFailed, core.StatusCancelled,
+		core.FanOutPending, core.StatusWaiting, olderThan, maxResumeBatch,
+	).Scan(&fanOuts).Error
 	if err != nil {
+		return nil, err
+	}
+	if err := overlayLiveFanOutCountsBatch(s.db.WithContext(ctx), fanOuts); err != nil {
 		return nil, err
 	}
 	return fanOuts, nil

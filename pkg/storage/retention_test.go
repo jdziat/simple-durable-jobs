@@ -117,6 +117,85 @@ func TestDeleteTerminalJobsOlderThan_ConcurrentPasses(t *testing.T) {
 	assert.Equal(t, int64(0), remaining)
 }
 
+func TestDeleteTerminalJobsOlderThan_WorkflowGuardAndFanOutCleanup(t *testing.T) {
+	s := newTestStorage(t)
+	ctx := context.Background()
+	old := time.Now().Add(-2 * time.Hour).UTC()
+	recent := time.Now().Add(-10 * time.Minute).UTC()
+	rootID := "ret-root"
+
+	seedRetentionJob(t, s, rootID, core.StatusWaiting, old)
+	seedRetentionWorkflowJob(t, s, "ret-sub-parent", core.StatusCompleted, old, &rootID, &rootID, nil)
+	require.NoError(t, s.CreateFanOut(ctx, &core.FanOut{
+		ID:          "ret-fanout",
+		ParentJobID: "ret-sub-parent",
+		TotalCount:  1,
+		Status:      core.FanOutPending,
+	}))
+	fanOutID := "ret-fanout"
+	seedRetentionWorkflowJob(t, s, "ret-live-child", core.StatusRunning, old, ptrString("ret-sub-parent"), &rootID, &fanOutID)
+
+	deleted, err := s.DeleteTerminalJobsOlderThan(ctx, core.StatusCompleted, time.Hour, 100)
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), deleted)
+	assertRetentionExists(t, s, "ret-sub-parent")
+	assertRetentionFanOutExists(t, s, "ret-fanout")
+
+	require.NoError(t, s.db.Model(&core.Job{}).
+		Where("id = ?", "ret-live-child").
+		Updates(map[string]any{"status": core.StatusCompleted, "completed_at": recent}).Error)
+	require.NoError(t, s.db.Model(&core.FanOut{}).
+		Where("id = ?", "ret-fanout").
+		Update("status", core.FanOutCompleted).Error)
+
+	deleted, err = s.DeleteTerminalJobsOlderThan(ctx, core.StatusCompleted, time.Hour, 100)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), deleted)
+	assertRetentionMissing(t, s, "ret-sub-parent")
+	assertRetentionExists(t, s, "ret-live-child")
+	assertRetentionFanOutMissing(t, s, "ret-fanout")
+}
+
+func TestDeleteTerminalJobsOlderThan_S04RegressionNoFanOutLeakOrStrandedLiveDescendants(t *testing.T) {
+	s := newTestStorage(t)
+	ctx := context.Background()
+	old := time.Now().Add(-2 * time.Hour).UTC()
+	rootID := "s04-root"
+
+	seedRetentionJob(t, s, rootID, core.StatusCompleted, old)
+	seedRetentionWorkflowJob(t, s, "s04-sub-parent", core.StatusCompleted, old, &rootID, &rootID, nil)
+	require.NoError(t, s.CreateFanOut(ctx, &core.FanOut{
+		ID:          "s04-fanout",
+		ParentJobID: "s04-sub-parent",
+		TotalCount:  2,
+		Status:      core.FanOutPending,
+	}))
+	fanOutID := "s04-fanout"
+	seedRetentionWorkflowJob(t, s, "s04-grand-0", core.StatusRunning, old, ptrString("s04-sub-parent"), &rootID, &fanOutID)
+	seedRetentionWorkflowJob(t, s, "s04-grand-1", core.StatusPending, old, ptrString("s04-sub-parent"), &rootID, &fanOutID)
+
+	deleted, err := s.DeleteTerminalJobsOlderThan(ctx, core.StatusCompleted, time.Hour, 100)
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), deleted)
+	assertRetentionExists(t, s, rootID)
+	assertRetentionExists(t, s, "s04-sub-parent")
+	assertRetentionExists(t, s, "s04-grand-0")
+	assertRetentionExists(t, s, "s04-grand-1")
+
+	var leakedFanOuts int64
+	require.NoError(t, s.db.Model(&core.FanOut{}).
+		Where("NOT EXISTS (SELECT 1 FROM jobs j WHERE j.id = fan_outs.parent_job_id)").
+		Count(&leakedFanOuts).Error)
+	assert.Equal(t, int64(0), leakedFanOuts, "retention must not orphan fan_outs")
+
+	var strandedLiveDescendants int64
+	require.NoError(t, s.db.Model(&core.Job{}).
+		Where("status NOT IN ?", []core.JobStatus{core.StatusCompleted, core.StatusFailed, core.StatusCancelled}).
+		Where("(parent_job_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM jobs p WHERE p.id = jobs.parent_job_id)) OR (root_job_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM jobs r WHERE r.id = jobs.root_job_id))").
+		Count(&strandedLiveDescendants).Error)
+	assert.Equal(t, int64(0), strandedLiveDescendants, "retention must not strand live descendants")
+}
+
 func TestDeleteConsumedSignalsOlderThan_PrunesOnlyConsumedOlderThanWindow(t *testing.T) {
 	s := newTestStorage(t)
 	ctx := context.Background()
@@ -172,8 +251,26 @@ func seedRetentionJob(t *testing.T, s *GormStorage, id string, status core.JobSt
 	}).Error)
 }
 
+func seedRetentionWorkflowJob(t *testing.T, s *GormStorage, id string, status core.JobStatus, completedAt time.Time, parentID, rootID, fanOutID *string) {
+	t.Helper()
+	job := &core.Job{
+		ID:          id,
+		Type:        "retention.workflow",
+		Queue:       "default",
+		Status:      status,
+		ParentJobID: parentID,
+		RootJobID:   rootID,
+		FanOutID:    fanOutID,
+	}
+	if status == core.StatusCompleted || status == core.StatusFailed || status == core.StatusCancelled {
+		job.CompletedAt = &completedAt
+	}
+	require.NoError(t, s.db.Create(job).Error)
+}
+
 func seedRetentionSignal(t *testing.T, s *GormStorage, id, jobID, name string, consumedAt *time.Time) {
 	t.Helper()
+	seedTestJob(t, context.Background(), s, jobID, core.StatusCompleted)
 	require.NoError(t, s.db.Create(&core.Signal{
 		ID:         id,
 		JobID:      jobID,
@@ -181,6 +278,10 @@ func seedRetentionSignal(t *testing.T, s *GormStorage, id, jobID, name string, c
 		Payload:    []byte(`"payload"`),
 		ConsumedAt: consumedAt,
 	}).Error)
+}
+
+func ptrString(v string) *string {
+	return &v
 }
 
 func assertRetentionExists(t *testing.T, s *GormStorage, id string) {
@@ -197,11 +298,25 @@ func assertRetentionSignalExists(t *testing.T, s *GormStorage, id string) {
 	assert.Equal(t, int64(1), count, "signal should exist: %s", id)
 }
 
+func assertRetentionFanOutExists(t *testing.T, s *GormStorage, id string) {
+	t.Helper()
+	var count int64
+	require.NoError(t, s.db.Model(&core.FanOut{}).Where("id = ?", id).Count(&count).Error)
+	assert.Equal(t, int64(1), count, "fan-out should exist: %s", id)
+}
+
 func assertRetentionSignalMissing(t *testing.T, s *GormStorage, id string) {
 	t.Helper()
 	var count int64
 	require.NoError(t, s.db.Model(&core.Signal{}).Where("id = ?", id).Count(&count).Error)
 	assert.Equal(t, int64(0), count, "signal should be deleted: %s", id)
+}
+
+func assertRetentionFanOutMissing(t *testing.T, s *GormStorage, id string) {
+	t.Helper()
+	var count int64
+	require.NoError(t, s.db.Model(&core.FanOut{}).Where("id = ?", id).Count(&count).Error)
+	assert.Equal(t, int64(0), count, "fan-out should be deleted: %s", id)
 }
 
 func assertRetentionMissing(t *testing.T, s *GormStorage, id string) {

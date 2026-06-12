@@ -16,6 +16,8 @@ func TestGormStorage_SaveCheckpointTx_CommitAndRollbackVisibility(t *testing.T) 
 	s := newTxEnqueueTestStorage(t)
 
 	t.Run("commit", func(t *testing.T) {
+		seedTestJob(t, ctx, s, "job-tx-commit", core.StatusRunning)
+		seedTestJob(t, ctx, s, "job-plain-commit", core.StatusRunning)
 		resultBytes, err := json.Marshal(map[string]string{"status": "done"})
 		require.NoError(t, err)
 		cp := &core.Checkpoint{
@@ -60,6 +62,7 @@ func TestGormStorage_SaveCheckpointTx_CommitAndRollbackVisibility(t *testing.T) 
 	})
 
 	t.Run("rollback", func(t *testing.T) {
+		seedTestJob(t, ctx, s, "job-tx-rollback", core.StatusRunning)
 		cp := &core.Checkpoint{
 			JobID:     "job-tx-rollback",
 			CallIndex: -1,

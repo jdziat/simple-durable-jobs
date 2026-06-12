@@ -180,6 +180,46 @@ var schemaMigrations = []schemaMigration{
 		Name:    "unique_locks",
 		Up:      migrateUniqueLocks,
 	},
+	{
+		Version: 11,
+		Name:    "fix_dead_letter_index",
+		Up:      migrateFixDeadLetterIndex,
+	},
+	{
+		Version: 12,
+		Name:    "drop_redundant_job_indexes",
+		Up:      migrateDropRedundantJobIndexes,
+	},
+	{
+		Version: 13,
+		Name:    "dequeue_eligibility_index",
+		Up:      migrateDequeueEligibilityIndex,
+	},
+	{
+		Version: 14,
+		Name:    "integrity_foreign_keys",
+		Up:      migrateIntegrityForeignKeys,
+	},
+	{
+		Version: 15,
+		Name:    "dialect_correctness",
+		Up:      migrateDialectCorrectness,
+	},
+	{
+		Version: 16,
+		Name:    "dlq_metadata_index",
+		Up:      migrateDLQMetadataIndex,
+	},
+	{
+		Version: 17,
+		Name:    "mysql_dequeue_index_order",
+		Up:      migrateMySQLDequeueIndexOrder,
+	},
+	{
+		Version: 18,
+		Name:    "deadletter_precision_align",
+		Up:      migrateDeadLetterPrecisionAlign,
+	},
 }
 
 // applyPendingMigrations runs every migration whose version is absent from the
@@ -228,7 +268,8 @@ func isBenignDDLError(err error) bool {
 	m := err.Error()
 	return strings.Contains(m, "Error 1061") || strings.Contains(m, "Duplicate key name") || // index already exists
 		strings.Contains(m, "Error 1060") || strings.Contains(m, "Duplicate column name") || // column already exists
-		strings.Contains(m, "Error 1091") || strings.Contains(m, "check that column/key exists") // dropping a missing index
+		strings.Contains(m, "Error 1091") || strings.Contains(m, "check that column/key exists") || // dropping a missing index
+		strings.Contains(m, "Error 1826") || strings.Contains(m, "Duplicate foreign key constraint name") // FK already exists
 }
 
 // migrateReworkDequeueIndex replaces the original idx_jobs_dequeue, whose column
@@ -533,4 +574,421 @@ func migrateUniqueLocks(ctx context.Context, db *gorm.DB, dialect string) error 
 			"CREATE INDEX IF NOT EXISTS idx_unique_locks_expires_at ON unique_locks (expires_at)",
 		).Error
 	}
+}
+
+func migrateFixDeadLetterIndex(ctx context.Context, db *gorm.DB, dialect string) error {
+	switch dialect {
+	case dialectMySQL:
+		var precision sql.NullInt64
+		if err := db.WithContext(ctx).Raw(`
+			SELECT DATETIME_PRECISION
+			FROM information_schema.COLUMNS
+			WHERE TABLE_SCHEMA = DATABASE()
+			  AND TABLE_NAME = 'jobs'
+			  AND COLUMN_NAME = 'dead_lettered_at'
+		`).Scan(&precision).Error; err != nil {
+			return fmt.Errorf("read dead_lettered_at precision: %w", err)
+		}
+		if precision.Valid && precision.Int64 == 6 {
+			return nil
+		}
+		if err := db.WithContext(ctx).Exec(
+			"ALTER TABLE jobs MODIFY COLUMN dead_lettered_at DATETIME(6) NULL",
+		).Error; err != nil && !isBenignDDLError(err) {
+			return fmt.Errorf("modify dead_lettered_at precision: %w", err)
+		}
+		return nil
+	case dialectPostgres:
+		if err := db.WithContext(ctx).Exec("ALTER TABLE jobs ALTER COLUMN dead_lettered_at TYPE timestamp with time zone").Error; err != nil {
+			return fmt.Errorf("normalize dead_lettered_at type: %w", err)
+		}
+		if err := db.WithContext(ctx).Exec("DROP INDEX IF EXISTS idx_jobs_dead_lettered_at").Error; err != nil {
+			return fmt.Errorf("drop idx_jobs_dead_lettered_at: %w", err)
+		}
+		return db.WithContext(ctx).Exec(
+			"CREATE INDEX IF NOT EXISTS idx_jobs_dead_lettered_at ON jobs (dead_lettered_at) WHERE dead_lettered_at IS NOT NULL",
+		).Error
+	default:
+		if err := db.WithContext(ctx).Exec("DROP INDEX IF EXISTS idx_jobs_dead_lettered_at").Error; err != nil {
+			return fmt.Errorf("drop idx_jobs_dead_lettered_at: %w", err)
+		}
+		return db.WithContext(ctx).Exec(
+			"CREATE INDEX IF NOT EXISTS idx_jobs_dead_lettered_at ON jobs (dead_lettered_at) WHERE dead_lettered_at IS NOT NULL",
+		).Error
+	}
+}
+
+func migrateDropRedundantJobIndexes(ctx context.Context, db *gorm.DB, dialect string) error {
+	switch dialect {
+	case dialectMySQL:
+		m := db.Migrator()
+		for _, indexName := range []string{
+			"idx_jobs_priority",
+			"idx_jobs_queue",
+			"idx_jobs_locked_until",
+			"idx_jobs_dequeue",
+		} {
+			if m.HasIndex(&core.Job{}, indexName) {
+				if err := m.DropIndex(&core.Job{}, indexName); err != nil && !isBenignDDLError(err) {
+					return fmt.Errorf("drop %s: %w", indexName, err)
+				}
+			}
+		}
+		if !m.HasIndex(&core.Job{}, "idx_jobs_unique_key") {
+			if err := db.WithContext(ctx).Exec(
+				"CREATE INDEX idx_jobs_unique_key ON jobs (unique_key)",
+			).Error; err != nil && !isBenignDDLError(err) {
+				return fmt.Errorf("create idx_jobs_unique_key: %w", err)
+			}
+		}
+		return nil
+	default:
+		for _, indexName := range []string{
+			"idx_jobs_priority",
+			"idx_jobs_queue",
+			"idx_jobs_locked_until",
+			"idx_jobs_dequeue",
+			"idx_jobs_unique_key",
+		} {
+			if err := db.WithContext(ctx).Exec("DROP INDEX IF EXISTS " + indexName).Error; err != nil {
+				return fmt.Errorf("drop %s: %w", indexName, err)
+			}
+		}
+		return nil
+	}
+}
+
+func migrateDequeueEligibilityIndex(ctx context.Context, db *gorm.DB, dialect string) error {
+	switch dialect {
+	case dialectMySQL:
+		m := db.Migrator()
+		if !m.HasColumn(&core.Job{}, "dq_eligible_at") {
+			if err := db.WithContext(ctx).Exec(
+				"ALTER TABLE jobs ADD COLUMN dq_eligible_at datetime(6) " +
+					"GENERATED ALWAYS AS (IF(status = 'pending', COALESCE(run_at, created_at), NULL)) STORED",
+			).Error; err != nil && !isBenignDDLError(err) {
+				return fmt.Errorf("add dq_eligible_at column: %w", err)
+			}
+		}
+		if !m.HasIndex(&core.Job{}, "idx_jobs_dequeue_eligible") {
+			if err := db.WithContext(ctx).Exec(
+				"CREATE INDEX idx_jobs_dequeue_eligible ON jobs (dq_eligible_at, priority, queue)",
+			).Error; err != nil && !isBenignDDLError(err) {
+				return fmt.Errorf("create idx_jobs_dequeue_eligible: %w", err)
+			}
+		}
+		if m.HasIndex(&core.Job{}, "idx_jobs_dequeue_order") {
+			if err := m.DropIndex(&core.Job{}, "idx_jobs_dequeue_order"); err != nil && !isBenignDDLError(err) {
+				return fmt.Errorf("drop idx_jobs_dequeue_order: %w", err)
+			}
+		}
+		return nil
+	default:
+		if err := db.WithContext(ctx).Exec(
+			"CREATE INDEX IF NOT EXISTS idx_jobs_dequeue_eligible ON jobs (priority DESC, (COALESCE(run_at, created_at)), queue) WHERE status = 'pending'",
+		).Error; err != nil {
+			return fmt.Errorf("create idx_jobs_dequeue_eligible: %w", err)
+		}
+		if err := db.WithContext(ctx).Exec("DROP INDEX IF EXISTS idx_jobs_dequeue_order").Error; err != nil {
+			return fmt.Errorf("drop idx_jobs_dequeue_order: %w", err)
+		}
+		return nil
+	}
+}
+
+func migrateMySQLDequeueIndexOrder(ctx context.Context, db *gorm.DB, dialect string) error {
+	if dialect != dialectMySQL {
+		return nil
+	}
+
+	var leadingColumn sql.NullString
+	if err := db.WithContext(ctx).Raw(`
+		SELECT COLUMN_NAME
+		FROM information_schema.STATISTICS
+		WHERE TABLE_SCHEMA = DATABASE()
+		  AND TABLE_NAME = 'jobs'
+		  AND INDEX_NAME = 'idx_jobs_dequeue_eligible'
+		  AND SEQ_IN_INDEX = 1
+	`).Scan(&leadingColumn).Error; err != nil {
+		return fmt.Errorf("read idx_jobs_dequeue_eligible leading column: %w", err)
+	}
+	if leadingColumn.Valid && strings.EqualFold(leadingColumn.String, "status") {
+		return nil
+	}
+
+	m := db.Migrator()
+	if m.HasIndex(&core.Job{}, "idx_jobs_dequeue_eligible") {
+		if err := m.DropIndex(&core.Job{}, "idx_jobs_dequeue_eligible"); err != nil && !isBenignDDLError(err) {
+			return fmt.Errorf("drop idx_jobs_dequeue_eligible: %w", err)
+		}
+	}
+	if err := db.WithContext(ctx).Exec(
+		"CREATE INDEX idx_jobs_dequeue_eligible ON jobs (status, priority DESC, dq_eligible_at, queue)",
+	).Error; err != nil && !isBenignDDLError(err) {
+		return fmt.Errorf("create idx_jobs_dequeue_eligible: %w", err)
+	}
+	return nil
+}
+
+func migrateDeadLetterPrecisionAlign(ctx context.Context, db *gorm.DB, dialect string) error {
+	if dialect != dialectMySQL {
+		return nil
+	}
+
+	var precision sql.NullInt64
+	if err := db.WithContext(ctx).Raw(`
+		SELECT DATETIME_PRECISION
+		FROM information_schema.COLUMNS
+		WHERE TABLE_SCHEMA = DATABASE()
+		  AND TABLE_NAME = 'jobs'
+		  AND COLUMN_NAME = 'dead_lettered_at'
+	`).Scan(&precision).Error; err != nil {
+		return fmt.Errorf("read dead_lettered_at precision: %w", err)
+	}
+	if precision.Valid && precision.Int64 == 3 {
+		return nil
+	}
+
+	if err := db.WithContext(ctx).Exec(
+		"ALTER TABLE jobs MODIFY dead_lettered_at datetime(3) NULL",
+	).Error; err != nil && !isBenignDDLError(err) {
+		return fmt.Errorf("modify dead_lettered_at precision: %w", err)
+	}
+	return nil
+}
+
+func migrateIntegrityForeignKeys(ctx context.Context, db *gorm.DB, dialect string) error {
+	switch dialect {
+	case dialectPostgres, dialectMySQL:
+		// Continue below.
+	default:
+		// SQLite test/prod DSNs have foreign_keys=OFF, and adding a FK to an
+		// existing SQLite table requires a full table rebuild. SQLite integrity
+		// rests on the app-level workflow-aware retention instead.
+		return nil
+	}
+
+	for _, stmt := range []string{
+		"DELETE FROM checkpoints WHERE NOT EXISTS (SELECT 1 FROM jobs j WHERE j.id = checkpoints.job_id)",
+		"DELETE FROM signals WHERE NOT EXISTS (SELECT 1 FROM jobs j WHERE j.id = signals.job_id)",
+		"DELETE FROM fan_outs WHERE NOT EXISTS (SELECT 1 FROM jobs j WHERE j.id = fan_outs.parent_job_id)",
+	} {
+		if err := db.WithContext(ctx).Exec(stmt).Error; err != nil {
+			return fmt.Errorf("pre-clean integrity orphans: %w", err)
+		}
+	}
+
+	type foreignKey struct {
+		model any
+		table string
+		name  string
+		col   string
+	}
+	const jobsRef = "REFERENCES jobs(id) ON DELETE CASCADE"
+	keys := []foreignKey{
+		{model: &core.Checkpoint{}, table: "checkpoints", name: "fk_checkpoints_job", col: "job_id"},
+		{model: &core.Signal{}, table: "signals", name: "fk_signals_job", col: "job_id"},
+		{model: &core.FanOut{}, table: "fan_outs", name: "fk_fanouts_parent", col: "parent_job_id"},
+	}
+
+	// S16: these VALIDATE / FK-add statements run under the fleet migration
+	// lock. On huge populated installs operators should run them out-of-band.
+	m := db.Migrator()
+	for _, key := range keys {
+		if m.HasConstraint(key.model, key.name) {
+			continue
+		}
+		switch dialect {
+		case dialectPostgres:
+			if err := db.WithContext(ctx).Exec(
+				fmt.Sprintf("ALTER TABLE %s ADD CONSTRAINT %s FOREIGN KEY (%s) %s NOT VALID", key.table, key.name, key.col, jobsRef),
+			).Error; err != nil {
+				return fmt.Errorf("add %s: %w", key.name, err)
+			}
+			if err := db.WithContext(ctx).Exec(
+				fmt.Sprintf("ALTER TABLE %s VALIDATE CONSTRAINT %s", key.table, key.name),
+			).Error; err != nil {
+				return fmt.Errorf("validate %s: %w", key.name, err)
+			}
+		case dialectMySQL:
+			if err := db.WithContext(ctx).Exec(
+				fmt.Sprintf("ALTER TABLE %s ADD CONSTRAINT %s FOREIGN KEY (%s) %s", key.table, key.name, key.col, jobsRef),
+			).Error; err != nil && !isBenignDDLError(err) {
+				return fmt.Errorf("add %s: %w", key.name, err)
+			}
+		}
+	}
+	return nil
+}
+
+func migrateDialectCorrectness(ctx context.Context, db *gorm.DB, dialect string) error {
+	switch dialect {
+	case dialectMySQL:
+		return migrateMySQLDialectCorrectness(ctx, db)
+	case dialectPostgres:
+		return migratePostgresDialectCorrectness(ctx, db)
+	default:
+		return nil
+	}
+}
+
+func migrateDLQMetadataIndex(ctx context.Context, db *gorm.DB, dialect string) error {
+	switch dialect {
+	case dialectPostgres:
+		if err := db.WithContext(ctx).Exec(
+			"CREATE INDEX IF NOT EXISTS idx_jobs_metadata_gin ON jobs USING GIN ((NULLIF(metadata, '')::jsonb) jsonb_path_ops)",
+		).Error; err != nil {
+			return fmt.Errorf("create idx_jobs_metadata_gin: %w", err)
+		}
+		if err := db.WithContext(ctx).Exec(
+			"CREATE INDEX IF NOT EXISTS idx_jobs_tenant ON jobs (tenant)",
+		).Error; err != nil {
+			return fmt.Errorf("create idx_jobs_tenant: %w", err)
+		}
+		return nil
+	case dialectMySQL:
+		m := db.Migrator()
+		if !m.HasIndex(&core.Job{}, "idx_jobs_tenant") {
+			if err := db.WithContext(ctx).Exec(
+				"CREATE INDEX idx_jobs_tenant ON jobs (tenant)",
+			).Error; err != nil && !isBenignDDLError(err) {
+				return fmt.Errorf("create idx_jobs_tenant: %w", err)
+			}
+		}
+		return nil
+	default:
+		if err := db.WithContext(ctx).Exec(
+			"CREATE INDEX IF NOT EXISTS idx_jobs_tenant ON jobs (tenant)",
+		).Error; err != nil {
+			return fmt.Errorf("create idx_jobs_tenant: %w", err)
+		}
+		return nil
+	}
+}
+
+func migrateMySQLDialectCorrectness(ctx context.Context, db *gorm.DB) error {
+	const collation = "utf8mb4_0900_as_cs"
+
+	uniqueKeyCollation, err := mysqlColumnCollation(ctx, db, "unique_key")
+	if err != nil {
+		return fmt.Errorf("read unique_key collation: %w", err)
+	}
+	if uniqueKeyCollation != collation {
+		if err := db.WithContext(ctx).Exec(
+			"ALTER TABLE jobs MODIFY unique_key VARCHAR(255) COLLATE utf8mb4_0900_as_cs",
+		).Error; err != nil {
+			return fmt.Errorf("modify unique_key collation: %w", err)
+		}
+	}
+
+	activeUniqueKeyCollation, err := mysqlColumnCollation(ctx, db, "active_unique_key")
+	if err != nil {
+		return fmt.Errorf("read active_unique_key collation: %w", err)
+	}
+	if activeUniqueKeyCollation != collation {
+		if err := db.WithContext(ctx).Exec(
+			"ALTER TABLE jobs MODIFY active_unique_key VARCHAR(255) COLLATE utf8mb4_0900_as_cs " +
+				"GENERATED ALWAYS AS (CASE WHEN status IN ('pending','running') AND unique_key <> '' " +
+				"THEN unique_key ELSE NULL END) STORED",
+		).Error; err != nil {
+			return fmt.Errorf("modify active_unique_key collation: %w", err)
+		}
+	}
+
+	dispatcherNotNull, err := mysqlDispatcherColumnsNotNull(ctx, db)
+	if err != nil {
+		return fmt.Errorf("read dispatcher column nullability: %w", err)
+	}
+	if !dispatcherNotNull {
+		if err := db.WithContext(ctx).Exec(
+			"ALTER TABLE jobs " +
+				"MODIFY status VARCHAR(20) NOT NULL DEFAULT 'pending', " +
+				"MODIFY queue VARCHAR(255) NOT NULL DEFAULT 'default', " +
+				"MODIFY priority BIGINT NOT NULL DEFAULT 0, " +
+				"MODIFY attempt BIGINT NOT NULL DEFAULT 0, " +
+				"MODIFY max_retries BIGINT NOT NULL DEFAULT 3",
+		).Error; err != nil {
+			return fmt.Errorf("modify dispatcher columns not null: %w", err)
+		}
+	}
+
+	return nil
+}
+
+func mysqlColumnCollation(ctx context.Context, db *gorm.DB, columnName string) (string, error) {
+	var collation sql.NullString
+	if err := db.WithContext(ctx).Raw(`
+		SELECT COLLATION_NAME
+		FROM information_schema.COLUMNS
+		WHERE TABLE_SCHEMA = DATABASE()
+		  AND TABLE_NAME = 'jobs'
+		  AND COLUMN_NAME = ?
+	`, columnName).Scan(&collation).Error; err != nil {
+		return "", err
+	}
+	if !collation.Valid {
+		return "", nil
+	}
+	return collation.String, nil
+}
+
+func mysqlDispatcherColumnsNotNull(ctx context.Context, db *gorm.DB) (bool, error) {
+	var count int
+	if err := db.WithContext(ctx).Raw(`
+		SELECT COUNT(*)
+		FROM information_schema.COLUMNS
+		WHERE TABLE_SCHEMA = DATABASE()
+		  AND TABLE_NAME = 'jobs'
+		  AND COLUMN_NAME IN ('status', 'queue', 'priority', 'attempt', 'max_retries')
+		  AND IS_NULLABLE = 'NO'
+	`).Scan(&count).Error; err != nil {
+		return false, err
+	}
+	return count == 5, nil
+}
+
+func migratePostgresDialectCorrectness(ctx context.Context, db *gorm.DB) error {
+	if err := db.WithContext(ctx).Exec(`
+		UPDATE jobs
+		SET status = COALESCE(status, 'pending'),
+		    queue = COALESCE(queue, 'default'),
+		    priority = COALESCE(priority, 0),
+		    attempt = COALESCE(attempt, 0),
+		    max_retries = COALESCE(max_retries, 3)
+		WHERE status IS NULL
+		   OR queue IS NULL
+		   OR priority IS NULL
+		   OR attempt IS NULL
+		   OR max_retries IS NULL
+	`).Error; err != nil {
+		return fmt.Errorf("backfill dispatcher column nulls: %w", err)
+	}
+	if err := db.WithContext(ctx).Exec(
+		"ALTER TABLE jobs " +
+			"ALTER COLUMN status SET NOT NULL, " +
+			"ALTER COLUMN queue SET NOT NULL, " +
+			"ALTER COLUMN priority SET NOT NULL, " +
+			"ALTER COLUMN attempt SET NOT NULL, " +
+			"ALTER COLUMN max_retries SET NOT NULL",
+	).Error; err != nil {
+		return fmt.Errorf("set dispatcher columns not null: %w", err)
+	}
+
+	var thresholdType string
+	if err := db.WithContext(ctx).Raw(`
+		SELECT data_type
+		FROM information_schema.COLUMNS
+		WHERE table_schema = CURRENT_SCHEMA()
+		  AND table_name = 'fan_outs'
+		  AND column_name = 'threshold'
+	`).Scan(&thresholdType).Error; err != nil {
+		return fmt.Errorf("read fan_outs.threshold type: %w", err)
+	}
+	if thresholdType == "double precision" {
+		return nil
+	}
+	if err := db.WithContext(ctx).Exec("ALTER TABLE fan_outs ALTER COLUMN threshold TYPE double precision").Error; err != nil {
+		return fmt.Errorf("alter fan_outs.threshold type: %w", err)
+	}
+	return nil
 }

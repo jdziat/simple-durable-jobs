@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/google/uuid"
 	"gorm.io/gorm"
 
 	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
@@ -91,7 +90,7 @@ func GetVersion(ctx context.Context, changeID string, minSupported, maxSupported
 	}
 
 	cp = &core.Checkpoint{
-		ID:        uuid.New().String(),
+		ID:        core.NewID(),
 		JobID:     jc.Job.ID,
 		CallIndex: -1,
 		CallType:  key.Type,
@@ -123,7 +122,7 @@ func SavePhaseCheckpoint(ctx context.Context, phaseName string, result any) erro
 	}
 
 	cp := &core.Checkpoint{
-		ID:        uuid.New().String(),
+		ID:        core.NewID(),
 		JobID:     jc.Job.ID,
 		CallIndex: -1, // Use -1 to indicate phase checkpoint (not a Call index)
 		CallType:  phaseName,
@@ -154,7 +153,7 @@ func SavePhaseCheckpointTx(ctx context.Context, tx *gorm.DB, phaseName string, r
 	}
 
 	cp := &core.Checkpoint{
-		ID:        uuid.New().String(),
+		ID:        core.NewID(),
 		JobID:     jc.Job.ID,
 		CallIndex: -1, // Use -1 to indicate phase checkpoint (not a Call index)
 		CallType:  phaseName,

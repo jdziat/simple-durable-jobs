@@ -12,8 +12,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/google/uuid"
-
 	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
 	intctx "github.com/jdziat/simple-durable-jobs/v2/pkg/internal/context"
 	"github.com/jdziat/simple-durable-jobs/v2/pkg/internal/handler"
@@ -191,7 +189,7 @@ func NewWorker(q *queue.Queue, opts ...WorkerOption) *Worker {
 	config := WorkerConfig{
 		Queues:           nil, // Will be set to default if no queue options provided
 		PollInterval:     100 * time.Millisecond,
-		WorkerID:         uuid.New().String(),
+		WorkerID:         core.NewID(),
 		DrainTimeout:     30 * time.Second,
 		DequeueBatchSize: 10,
 	}

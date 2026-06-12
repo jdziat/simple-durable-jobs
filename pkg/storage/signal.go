@@ -5,7 +5,6 @@ import (
 	"errors"
 	"time"
 
-	"github.com/google/uuid"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 
@@ -20,7 +19,7 @@ func (s *GormStorage) SendSignal(ctx context.Context, jobID, name string, payloa
 		return err
 	}
 	return s.db.WithContext(ctx).Create(&core.Signal{
-		ID:      uuid.New().String(),
+		ID:      core.NewID(),
 		JobID:   jobID,
 		Name:    name,
 		Payload: encoded,

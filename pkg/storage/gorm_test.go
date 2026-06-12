@@ -40,6 +40,18 @@ func newTestJob(queue, jobType string) *core.Job {
 	}
 }
 
+func seedTestJob(t *testing.T, ctx context.Context, s *GormStorage, id string, status core.JobStatus) {
+	t.Helper()
+	require.NoError(t, s.db.WithContext(ctx).
+		Where("id = ?", id).
+		FirstOrCreate(&core.Job{
+			ID:     id,
+			Type:   "fixture.job",
+			Queue:  "default",
+			Status: status,
+		}).Error)
+}
+
 // newConcurrentTestStorage returns a storage whose underlying DB can be
 // accessed from multiple goroutines at once. Plain openTestDB on SQLite
 // uses ":memory:" which gives each pooled connection its own isolated
@@ -115,7 +127,7 @@ func TestNewGormStorage_NilDB(t *testing.T) {
 	assert.False(t, s.IsSQLite(), "nil db should not claim SQLite")
 }
 
-func TestMigrate_DequeueIndexExists(t *testing.T) {
+func TestMigrate_DequeueOrderIndexExists(t *testing.T) {
 	ctx := context.Background()
 	db := openTestDB(t)
 	s := NewGormStorage(db)
@@ -123,27 +135,34 @@ func TestMigrate_DequeueIndexExists(t *testing.T) {
 	require.NoError(t, s.Migrate(ctx))
 	require.NoError(t, s.Migrate(ctx), "migrate should be idempotent")
 
-	var indexName string
-	switch {
-	case s.IsSQLite():
-		require.NoError(t, s.DB().Raw(
-			"SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?",
-			"idx_jobs_dequeue",
-		).Scan(&indexName).Error)
-	case strings.EqualFold(s.DB().Name(), "postgres"):
-		require.NoError(t, s.DB().Raw(
-			"SELECT indexname FROM pg_indexes WHERE tablename = ? AND indexname = ?",
-			"jobs", "idx_jobs_dequeue",
-		).Scan(&indexName).Error)
-	case strings.EqualFold(s.DB().Name(), "mysql"):
-		require.NoError(t, s.DB().Raw(
-			"SELECT index_name FROM information_schema.statistics WHERE table_schema = DATABASE() AND table_name = ? AND index_name = ? LIMIT 1",
-			"jobs", "idx_jobs_dequeue",
-		).Scan(&indexName).Error)
-	default:
-		t.Fatalf("unsupported test dialect %q", s.DB().Name())
+	findIndex := func(want string) string {
+		t.Helper()
+		var indexName string
+		switch {
+		case s.IsSQLite():
+			require.NoError(t, s.DB().Raw(
+				"SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?",
+				want,
+			).Scan(&indexName).Error)
+		case strings.EqualFold(s.DB().Name(), "postgres"):
+			require.NoError(t, s.DB().Raw(
+				"SELECT indexname FROM pg_indexes WHERE tablename = ? AND indexname = ?",
+				"jobs", want,
+			).Scan(&indexName).Error)
+		case strings.EqualFold(s.DB().Name(), "mysql"):
+			require.NoError(t, s.DB().Raw(
+				"SELECT index_name FROM information_schema.statistics WHERE table_schema = DATABASE() AND table_name = ? AND index_name = ? LIMIT 1",
+				"jobs", want,
+			).Scan(&indexName).Error)
+		default:
+			t.Fatalf("unsupported test dialect %q", s.DB().Name())
+		}
+		return indexName
 	}
-	assert.Equal(t, "idx_jobs_dequeue", indexName)
+
+	assert.Empty(t, findIndex("idx_jobs_dequeue"))
+	assert.Empty(t, findIndex("idx_jobs_dequeue_order"))
+	assert.Equal(t, "idx_jobs_dequeue_eligible", findIndex("idx_jobs_dequeue_eligible"))
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1480,15 +1499,33 @@ func createRunningP2BJob(t *testing.T, ctx context.Context, s *GormStorage, fanO
 
 func createP2BFanOut(t *testing.T, ctx context.Context, s *GormStorage, status core.FanOutStatus) *core.FanOut {
 	t.Helper()
+	parentID := p2bID(t, "parent")
+	seedTestJob(t, ctx, s, parentID, core.StatusWaiting)
 	fo := &core.FanOut{
 		ID:          p2bID(t, "fo"),
-		ParentJobID: p2bID(t, "parent"),
+		ParentJobID: parentID,
 		TotalCount:  2,
 		Strategy:    core.StrategyCollectAll,
 		Status:      status,
 	}
 	require.NoError(t, s.CreateFanOut(ctx, fo))
 	return fo
+}
+
+func seedFanOutChild(t *testing.T, ctx context.Context, s *GormStorage, fanOutID string, status core.JobStatus) *core.Job {
+	t.Helper()
+	job := &core.Job{
+		Type:     "fanout.child",
+		Queue:    "default",
+		Status:   status,
+		FanOutID: &fanOutID,
+	}
+	if status == core.StatusCompleted || status == core.StatusFailed || status == core.StatusCancelled {
+		now := time.Now()
+		job.CompletedAt = &now
+	}
+	require.NoError(t, s.Enqueue(ctx, job))
+	return job
 }
 
 func TestCompleteWithResult_AtomicIncrementOnce(t *testing.T) {
@@ -1606,7 +1643,7 @@ func TestCompleteWithResult_LivenessGuard_NoCountOnTerminalFanOut(t *testing.T) 
 	require.NoError(t, err)
 	require.NotNil(t, updated)
 	assert.Equal(t, core.FanOutFailed, updated.Status)
-	assert.Equal(t, 0, updated.CompletedCount)
+	assert.Equal(t, 1, updated.CompletedCount)
 
 	row, err := s.GetJob(ctx, job.ID)
 	require.NoError(t, err)
@@ -1616,7 +1653,11 @@ func TestCompleteWithResult_LivenessGuard_NoCountOnTerminalFanOut(t *testing.T) 
 	after, err := s.GetFanOut(ctx, fo.ID)
 	require.NoError(t, err)
 	require.NotNil(t, after)
-	assert.Equal(t, 0, after.CompletedCount)
+	assert.Equal(t, 1, after.CompletedCount)
+
+	var persisted core.FanOut
+	require.NoError(t, s.DB().First(&persisted, "id = ?", fo.ID).Error)
+	assert.Equal(t, 0, persisted.CompletedCount)
 }
 
 func TestFailTerminalWithResult_AtomicIncrementOnce(t *testing.T) {
@@ -1699,7 +1740,7 @@ func TestFailTerminalWithResult_LivenessGuard_NoCountOnTerminalFanOut(t *testing
 	require.NoError(t, err)
 	require.NotNil(t, updated)
 	assert.Equal(t, core.FanOutFailed, updated.Status)
-	assert.Equal(t, 0, updated.FailedCount)
+	assert.Equal(t, 1, updated.FailedCount)
 
 	row, err := s.GetJob(ctx, job.ID)
 	require.NoError(t, err)
@@ -1709,7 +1750,11 @@ func TestFailTerminalWithResult_LivenessGuard_NoCountOnTerminalFanOut(t *testing
 	after, err := s.GetFanOut(ctx, fo.ID)
 	require.NoError(t, err)
 	require.NotNil(t, after)
-	assert.Equal(t, 0, after.FailedCount)
+	assert.Equal(t, 1, after.FailedCount)
+
+	var persisted core.FanOut
+	require.NoError(t, s.DB().First(&persisted, "id = ?", fo.ID).Error)
+	assert.Equal(t, 0, persisted.FailedCount)
 }
 
 func TestCreateFanOut_PreservesExistingID(t *testing.T) {
@@ -1738,11 +1783,13 @@ func TestIncrementFanOutCompleted(t *testing.T) {
 	fanOut := &core.FanOut{ParentJobID: parent.ID, TotalCount: 3}
 	require.NoError(t, s.CreateFanOut(ctx, fanOut))
 
+	seedFanOutChild(t, ctx, s, fanOut.ID, core.StatusCompleted)
 	updated, err := s.IncrementFanOutCompleted(ctx, fanOut.ID)
 	require.NoError(t, err)
 	require.NotNil(t, updated)
 	assert.Equal(t, 1, updated.CompletedCount)
 
+	seedFanOutChild(t, ctx, s, fanOut.ID, core.StatusCompleted)
 	updated, err = s.IncrementFanOutCompleted(ctx, fanOut.ID)
 	require.NoError(t, err)
 	assert.Equal(t, 2, updated.CompletedCount)
@@ -1758,6 +1805,7 @@ func TestIncrementFanOutFailed(t *testing.T) {
 	fanOut := &core.FanOut{ParentJobID: parent.ID, TotalCount: 3}
 	require.NoError(t, s.CreateFanOut(ctx, fanOut))
 
+	seedFanOutChild(t, ctx, s, fanOut.ID, core.StatusFailed)
 	updated, err := s.IncrementFanOutFailed(ctx, fanOut.ID)
 	require.NoError(t, err)
 	require.NotNil(t, updated)
@@ -1774,6 +1822,7 @@ func TestIncrementFanOutCancelled(t *testing.T) {
 	fanOut := &core.FanOut{ParentJobID: parent.ID, TotalCount: 3}
 	require.NoError(t, s.CreateFanOut(ctx, fanOut))
 
+	seedFanOutChild(t, ctx, s, fanOut.ID, core.StatusCancelled)
 	updated, err := s.IncrementFanOutCancelled(ctx, fanOut.ID)
 	require.NoError(t, err)
 	require.NotNil(t, updated)
@@ -2118,6 +2167,23 @@ func TestEnqueueUnique_DifferentKeysCreateDifferentJobs(t *testing.T) {
 	require.NoError(t, s.EnqueueUnique(ctx, job1, "key:a"))
 	require.NoError(t, s.EnqueueUnique(ctx, job2, "key:b"))
 	assert.NotEqual(t, job1.ID, job2.ID)
+}
+
+func TestEnqueueUnique_CaseDifferingKeysCreateDifferentJobs(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	upper := &core.Job{Type: "case.dedup", Queue: "default"}
+	lower := &core.Job{Type: "case.dedup", Queue: "default"}
+	require.NoError(t, s.EnqueueUnique(ctx, upper, "MyKey"))
+	require.NoError(t, s.EnqueueUnique(ctx, lower, "mykey"))
+	assert.NotEqual(t, upper.ID, lower.ID)
+
+	var count int64
+	require.NoError(t, s.DB().Model(&core.Job{}).
+		Where("unique_key IN ?", []string{"MyKey", "mykey"}).
+		Count(&count).Error)
+	assert.EqualValues(t, 2, count, "case-differing unique keys must be distinct")
 }
 
 func TestEnqueueUnique_Concurrent_NoDuplicates(t *testing.T) {
@@ -2700,10 +2766,13 @@ func TestGetStalledFanOutParents_LimitsBatch(t *testing.T) {
 // ──────────────────────────────────────────────────────────────────────────────
 
 // TestCompleteWithResult_AdvancesFanOutStatusInSameTx proves the fan-out status
-// transitions to 'completed' inside the same transaction as the terminal
-// counter increment — no separate worker-layer UpdateFanOutStatus call is made
-// anywhere in this test, so a status of 'completed' after the final sub-job can
-// only come from the in-tx advance.
+// transitions to 'completed' synchronously from CompleteWithResult itself —
+// after P7, via accountTerminalWithFanOut's post-commit child-job COUNT and
+// pending-guarded resolve (no longer a per-child counter increment; the resolve
+// is a second transaction after the child's terminal write commits). No separate
+// worker-layer UpdateFanOutStatus call is made anywhere in this test, so a
+// 'completed' status after the final sub-job can only come from
+// CompleteWithResult's own resolution.
 func TestCompleteWithResult_AdvancesFanOutStatusInSameTx(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStorage(t)
@@ -2744,9 +2813,11 @@ func TestFailTerminalWithResult_AdvancesFanOutStatusInSameTx(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStorage(t)
 
+	parentID := p2bID(t, "parent")
+	seedTestJob(t, ctx, s, parentID, core.StatusWaiting)
 	fo := &core.FanOut{
 		ID:          p2bID(t, "fo"),
-		ParentJobID: p2bID(t, "parent"),
+		ParentJobID: parentID,
 		TotalCount:  3,
 		Strategy:    core.StrategyFailFast,
 		Status:      core.FanOutPending,
@@ -2783,14 +2854,15 @@ func TestGetCompletablePendingFanOuts(t *testing.T) {
 	strandedParent := &core.Job{Type: "wf.stranded", Queue: "default", Status: core.StatusWaiting}
 	require.NoError(t, s.Enqueue(ctx, strandedParent))
 	stranded := &core.FanOut{
-		ParentJobID:    strandedParent.ID,
-		TotalCount:     2,
-		CompletedCount: 2,
-		Strategy:       core.StrategyCollectAll,
-		Status:         core.FanOutPending,
-		CreatedAt:      old,
+		ParentJobID: strandedParent.ID,
+		TotalCount:  2,
+		Strategy:    core.StrategyCollectAll,
+		Status:      core.FanOutPending,
+		CreatedAt:   old,
 	}
 	require.NoError(t, s.CreateFanOut(ctx, stranded))
+	seedFanOutChild(t, ctx, s, stranded.ID, core.StatusCompleted)
+	seedFanOutChild(t, ctx, s, stranded.ID, core.StatusCompleted)
 
 	// (b) fail_fast pending with failed_count==1, waiting parent, old → returned.
 	failParent := &core.Job{Type: "wf.fail", Queue: "default", Status: core.StatusWaiting}
@@ -2798,59 +2870,61 @@ func TestGetCompletablePendingFanOuts(t *testing.T) {
 	failFan := &core.FanOut{
 		ParentJobID: failParent.ID,
 		TotalCount:  3,
-		FailedCount: 1,
 		Strategy:    core.StrategyFailFast,
 		Status:      core.FanOutPending,
 		CreatedAt:   old,
 	}
 	require.NoError(t, s.CreateFanOut(ctx, failFan))
+	seedFanOutChild(t, ctx, s, failFan.ID, core.StatusFailed)
 
 	// (c) genuinely in-flight pending (counts < total, no failures) → excluded.
 	inflightParent := &core.Job{Type: "wf.inflight", Queue: "default", Status: core.StatusWaiting}
 	require.NoError(t, s.Enqueue(ctx, inflightParent))
 	require.NoError(t, s.CreateFanOut(ctx, &core.FanOut{
-		ParentJobID:    inflightParent.ID,
-		TotalCount:     3,
-		CompletedCount: 1,
-		Strategy:       core.StrategyCollectAll,
-		Status:         core.FanOutPending,
-		CreatedAt:      old,
+		ParentJobID: inflightParent.ID,
+		TotalCount:  3,
+		Strategy:    core.StrategyCollectAll,
+		Status:      core.FanOutPending,
+		CreatedAt:   old,
 	}))
 
 	// (d) pending with terminal counts but parent status='running' → excluded.
 	runningParent := &core.Job{Type: "wf.running", Queue: "default", Status: core.StatusRunning}
 	require.NoError(t, s.Enqueue(ctx, runningParent))
-	require.NoError(t, s.CreateFanOut(ctx, &core.FanOut{
-		ParentJobID:    runningParent.ID,
-		TotalCount:     2,
-		CompletedCount: 2,
-		Strategy:       core.StrategyCollectAll,
-		Status:         core.FanOutPending,
-		CreatedAt:      old,
-	}))
+	runningFan := &core.FanOut{
+		ParentJobID: runningParent.ID,
+		TotalCount:  2,
+		Strategy:    core.StrategyCollectAll,
+		Status:      core.FanOutPending,
+		CreatedAt:   old,
+	}
+	require.NoError(t, s.CreateFanOut(ctx, runningFan))
+	seedFanOutChild(t, ctx, s, runningFan.ID, core.StatusCompleted)
+	seedFanOutChild(t, ctx, s, runningFan.ID, core.StatusCompleted)
 
 	// (e) pending terminal but created_at recent (after cutoff) → excluded.
 	recentParent := &core.Job{Type: "wf.recent", Queue: "default", Status: core.StatusWaiting}
 	require.NoError(t, s.Enqueue(ctx, recentParent))
-	require.NoError(t, s.CreateFanOut(ctx, &core.FanOut{
-		ParentJobID:    recentParent.ID,
-		TotalCount:     2,
-		CompletedCount: 2,
-		Strategy:       core.StrategyCollectAll,
-		Status:         core.FanOutPending,
-		CreatedAt:      recent,
-	}))
+	recentFan := &core.FanOut{
+		ParentJobID: recentParent.ID,
+		TotalCount:  2,
+		Strategy:    core.StrategyCollectAll,
+		Status:      core.FanOutPending,
+		CreatedAt:   recent,
+	}
+	require.NoError(t, s.CreateFanOut(ctx, recentFan))
+	seedFanOutChild(t, ctx, s, recentFan.ID, core.StatusCompleted)
+	seedFanOutChild(t, ctx, s, recentFan.ID, core.StatusCompleted)
 
 	// (f) already-terminal status='completed' → excluded.
 	doneParent := &core.Job{Type: "wf.done", Queue: "default", Status: core.StatusWaiting}
 	require.NoError(t, s.Enqueue(ctx, doneParent))
 	require.NoError(t, s.CreateFanOut(ctx, &core.FanOut{
-		ParentJobID:    doneParent.ID,
-		TotalCount:     2,
-		CompletedCount: 2,
-		Strategy:       core.StrategyCollectAll,
-		Status:         core.FanOutCompleted,
-		CreatedAt:      old,
+		ParentJobID: doneParent.ID,
+		TotalCount:  2,
+		Strategy:    core.StrategyCollectAll,
+		Status:      core.FanOutCompleted,
+		CreatedAt:   old,
 	}))
 
 	got, err := s.GetCompletablePendingFanOuts(ctx, cutoff)
@@ -2880,14 +2954,16 @@ func TestGetCompletablePendingFanOuts_LimitsBatch(t *testing.T) {
 	for i := 0; i < maxResumeBatch+25; i++ {
 		parent := &core.Job{Type: "wf.stranded", Queue: "default", Status: core.StatusWaiting}
 		require.NoError(t, s.Enqueue(ctx, parent))
-		require.NoError(t, s.CreateFanOut(ctx, &core.FanOut{
-			ParentJobID:    parent.ID,
-			TotalCount:     2,
-			CompletedCount: 2,
-			Strategy:       core.StrategyCollectAll,
-			Status:         core.FanOutPending,
-			CreatedAt:      old,
-		}))
+		fanOut := &core.FanOut{
+			ParentJobID: parent.ID,
+			TotalCount:  2,
+			Strategy:    core.StrategyCollectAll,
+			Status:      core.FanOutPending,
+			CreatedAt:   old,
+		}
+		require.NoError(t, s.CreateFanOut(ctx, fanOut))
+		seedFanOutChild(t, ctx, s, fanOut.ID, core.StatusCompleted)
+		seedFanOutChild(t, ctx, s, fanOut.ID, core.StatusCompleted)
 	}
 
 	got, err := s.GetCompletablePendingFanOuts(ctx, cutoff)
@@ -3277,6 +3353,7 @@ func TestMarkWaiting_Success(t *testing.T) {
 func TestCancelSubJob_CancelsPendingSubJob(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStorage(t)
+	seedTestJob(t, ctx, s, "parent-1", core.StatusWaiting)
 
 	// Create a fan-out.
 	fo := &core.FanOut{
@@ -3316,6 +3393,7 @@ func TestCancelSubJob_CancelsPendingSubJob(t *testing.T) {
 func TestCancelSubJobs_CancelsMultiplePending(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStorage(t)
+	seedTestJob(t, ctx, s, "parent-1", core.StatusWaiting)
 
 	fo := &core.FanOut{
 		ID:          "fo-multi",
@@ -3355,6 +3433,7 @@ func TestCancelSubJobs_CancelsMultiplePending(t *testing.T) {
 func TestIncrementFanOutCancelled_ReturnsUpdatedFanOut(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStorage(t)
+	seedTestJob(t, ctx, s, "p1", core.StatusWaiting)
 
 	fo := &core.FanOut{
 		ID:          "fo-inc-cancel",
@@ -3365,10 +3444,12 @@ func TestIncrementFanOutCancelled_ReturnsUpdatedFanOut(t *testing.T) {
 	}
 	require.NoError(t, s.CreateFanOut(ctx, fo))
 
+	seedFanOutChild(t, ctx, s, "fo-inc-cancel", core.StatusCancelled)
 	result, err := s.IncrementFanOutCancelled(ctx, "fo-inc-cancel")
 	require.NoError(t, err)
 	assert.Equal(t, 1, result.CancelledCount)
 
+	seedFanOutChild(t, ctx, s, "fo-inc-cancel", core.StatusCancelled)
 	result2, err := s.IncrementFanOutCancelled(ctx, "fo-inc-cancel")
 	require.NoError(t, err)
 	assert.Equal(t, 2, result2.CancelledCount)
@@ -3381,6 +3462,7 @@ func TestIncrementFanOutCancelled_ReturnsUpdatedFanOut(t *testing.T) {
 func TestUpdateFanOutStatus_CompleteThenFail(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStorage(t)
+	seedTestJob(t, ctx, s, "p1", core.StatusWaiting)
 
 	fo := &core.FanOut{
 		ID:          "fo-status",

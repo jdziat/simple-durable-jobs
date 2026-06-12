@@ -152,12 +152,7 @@ func (s *GormStorage) SearchJobs(ctx context.Context, filter core.JobFilter) ([]
 	if filter.Tenant != "" {
 		q = q.Where("tenant = ?", filter.Tenant)
 	}
-	if filter.MetaContains != nil {
-		for key, value := range *filter.MetaContains {
-			pattern := `%` + escapeLikePattern(metadataPairFragment(key, value)) + `%`
-			q = q.Where(metadataTextExpression(s)+" LIKE ? ESCAPE ?", pattern, `\`)
-		}
-	}
+	q = applyMetaContains(s, q, filter.MetaContains)
 	if filter.Search != "" {
 		searchTerm := filter.Search
 		if len(searchTerm) > maxUISearchLength {
@@ -192,6 +187,27 @@ func (s *GormStorage) SearchJobs(ctx context.Context, filter core.JobFilter) ([]
 		return nil, 0, err
 	}
 	return jobs, total, nil
+}
+
+func applyMetaContains(s *GormStorage, q *gorm.DB, m *core.MetadataMap) *gorm.DB {
+	if m == nil || len(*m) == 0 {
+		return q
+	}
+	switch s.dialect() {
+	case dialectPostgres:
+		jsonBytes, err := json.Marshal(*m)
+		if err != nil {
+			_ = q.AddError(fmt.Errorf("marshal metadata contains: %w", err))
+			return q
+		}
+		return q.Where("(NULLIF(metadata, '')::jsonb) @> ?::jsonb", string(jsonBytes))
+	default:
+		for key, value := range *m {
+			pattern := `%` + escapeLikePattern(metadataPairFragment(key, value)) + `%`
+			q = q.Where(metadataTextExpression(s)+" LIKE ? ESCAPE ?", pattern, `\`)
+		}
+		return q
+	}
 }
 
 func metadataTextExpression(s *GormStorage) string {
@@ -372,7 +388,13 @@ func (s *GormStorage) GetFanOutsByParents(ctx context.Context, parentJobIDs []st
 		Where("parent_job_id IN ?", parentJobIDs).
 		Order("parent_job_id ASC, created_at ASC").
 		Find(&fanOuts).Error
-	return fanOuts, err
+	if err != nil {
+		return nil, err
+	}
+	if err := overlayLiveFanOutCountsBatch(s.db.WithContext(ctx), fanOuts); err != nil {
+		return nil, err
+	}
+	return fanOuts, nil
 }
 
 // GetSubJobsByFanOuts retrieves sub-jobs for multiple fan-outs in one query.

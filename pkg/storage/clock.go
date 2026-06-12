@@ -61,6 +61,13 @@ func (s *GormStorage) nowExpr() clause.Expr {
 	return gorm.Expr("NOW()")
 }
 
+func (s *GormStorage) dequeueEligibleExpr() string {
+	if s.dialect() == dialectMySQL {
+		return "dq_eligible_at"
+	}
+	return "COALESCE(run_at, created_at)"
+}
+
 // offsetExpr returns a SQL expression for (DB now + d). A negative d yields a
 // time in the past. Only valid when useDBClock is true.
 func (s *GormStorage) offsetExpr(d time.Duration) clause.Expr {

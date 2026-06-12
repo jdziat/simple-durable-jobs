@@ -16,7 +16,7 @@ import (
 func TestDequeueBatch_CorrectnessAndPausedQueues(t *testing.T) {
 	s := newTestStorage(t)
 	ctx := context.Background()
-	base := time.Now().Add(-time.Hour).UTC()
+	base := time.Now().Add(-time.Hour) // local repr, matching autoCreateTime; see P3 (COALESCE eligibility is tz-lexical on sqlite)
 
 	seed := []struct {
 		id       string
@@ -86,7 +86,7 @@ func TestDequeueBatch_CorrectnessAndPausedQueues(t *testing.T) {
 func TestDequeueBatchPerQueue_SkipsQueuesAtBudgetWithoutOverClaiming(t *testing.T) {
 	s := newTestStorage(t)
 	ctx := context.Background()
-	base := time.Now().Add(-time.Hour).UTC()
+	base := time.Now().Add(-time.Hour) // local repr, matching autoCreateTime; see P3 (COALESCE eligibility is tz-lexical on sqlite)
 
 	seed := []struct {
 		id       string

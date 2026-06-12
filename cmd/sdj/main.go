@@ -14,8 +14,9 @@ import (
 	"text/tabwriter"
 	"time"
 
+	mysqlcfg "github.com/go-sql-driver/mysql"
 	jobs "github.com/jdziat/simple-durable-jobs/v2"
-	"gorm.io/driver/mysql"
+	gormmysql "gorm.io/driver/mysql"
 	"gorm.io/driver/postgres"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
@@ -192,7 +193,7 @@ func (a app) runMigrate(ctx context.Context, globals globalOptions, args []strin
 Usage:
   sdj --driver sqlite --dsn ./jobs.db migrate
   sdj --driver postgres --dsn postgres://user:pass@localhost/db migrate
-  sdj --driver mysql --dsn 'user:pass@tcp(localhost:3306)/db?parseTime=true&loc=UTC' migrate
+  sdj --driver mysql --dsn 'user:pass@tcp(localhost:3306)/db?parseTime=true&loc=UTC&time_zone=%27%2B00%3A00%27' migrate
 `)
 	if code := a.parseSubcommand(fs, args); code != exitOK {
 		if code == exitHandled {
@@ -221,7 +222,7 @@ func (a app) runQueues(ctx context.Context, globals globalOptions, args []string
 Usage:
   sdj --driver sqlite --dsn ./jobs.db queues
   sdj --driver postgres --dsn postgres://user:pass@localhost/db queues
-  sdj --driver mysql --dsn 'user:pass@tcp(localhost:3306)/db?parseTime=true&loc=UTC' queues
+  sdj --driver mysql --dsn 'user:pass@tcp(localhost:3306)/db?parseTime=true&loc=UTC&time_zone=%27%2B00%3A00%27' queues
 `)
 	if code := a.parseSubcommand(fs, args); code != exitOK {
 		if code == exitHandled {
@@ -468,7 +469,7 @@ func (a app) runHealth(ctx context.Context, globals globalOptions, args []string
 Usage:
   sdj --driver sqlite --dsn ./jobs.db health
   sdj --driver postgres --dsn postgres://user:pass@localhost/db health
-  sdj --driver mysql --dsn 'user:pass@tcp(localhost:3306)/db?parseTime=true&loc=UTC' health
+  sdj --driver mysql --dsn 'user:pass@tcp(localhost:3306)/db?parseTime=true&loc=UTC&time_zone=%27%2B00%3A00%27' health
 `)
 	if code := a.parseSubcommand(fs, args); code != exitOK {
 		if code == exitHandled {
@@ -538,7 +539,16 @@ func openStore(opts globalOptions) (openedStore, error) {
 	case "postgres":
 		dialector = postgres.Open(opts.dsn)
 	case "mysql":
-		dialector = mysql.Open(opts.dsn)
+		cfg, err := mysqlcfg.ParseDSN(opts.dsn)
+		if err != nil {
+			return openedStore{}, fmt.Errorf("could not parse MySQL DSN; expected %s; %s", dsnHint(opts.driver), userError(err))
+		}
+		cfg.Loc = time.UTC
+		if cfg.Params == nil {
+			cfg.Params = make(map[string]string)
+		}
+		cfg.Params["time_zone"] = "'+00:00'"
+		dialector = gormmysql.Open(cfg.FormatDSN())
 	default:
 		return openedStore{}, fmt.Errorf("unknown --driver %q; valid drivers: sqlite, postgres, mysql", opts.driver)
 	}
@@ -578,9 +588,9 @@ func dsnHint(driver string) string {
 	case "postgres":
 		return "postgres://user:pass@host:5432/db"
 	case "mysql":
-		return "user:pass@tcp(host:3306)/db?parseTime=true"
+		return "user:pass@tcp(host:3306)/db?parseTime=true&loc=UTC&time_zone=%27%2B00%3A00%27"
 	default:
-		return "one of: sqlite file path like ./jobs.db; postgres postgres://user:pass@host:5432/db; mysql user:pass@tcp(host:3306)/db?parseTime=true"
+		return "one of: sqlite file path like ./jobs.db; postgres postgres://user:pass@host:5432/db; mysql user:pass@tcp(host:3306)/db?parseTime=true&loc=UTC&time_zone=%27%2B00%3A00%27"
 	}
 }
 

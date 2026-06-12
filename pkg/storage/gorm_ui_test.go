@@ -39,7 +39,7 @@ func TestMigrate_IdempotentRecordsAllMigrations(t *testing.T) {
 	var versions []int
 	require.NoError(t, store.db.Model(&core.SchemaMigration{}).Order("version").Pluck("version", &versions).Error)
 	assert.Equal(t, len(schemaMigrations), len(versions))
-	assert.Equal(t, 10, versions[len(versions)-1])
+	assert.Equal(t, schemaMigrations[len(schemaMigrations)-1].Version, versions[len(versions)-1])
 }
 
 func TestSearchJobs_EscapesLikeMetacharacters(t *testing.T) {
