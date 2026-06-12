@@ -32,14 +32,16 @@ type jobsService struct {
 	queue        *queue.Queue
 	statsStorage StatsStorage
 
-	activeStreams atomic.Int32
+	activeStreams     atomic.Int32
+	metadataRedaction bool
 }
 
 func newJobsService(storage core.Storage, q *queue.Queue, statsStorage StatsStorage) *jobsService {
 	return &jobsService{
-		storage:      storage,
-		queue:        q,
-		statsStorage: statsStorage,
+		storage:           storage,
+		queue:             q,
+		statsStorage:      statsStorage,
+		metadataRedaction: true,
 	}
 }
 
@@ -176,7 +178,7 @@ func (s *jobsService) ListJobs(ctx context.Context, req *connect.Request[jobsv1.
 
 	pbJobs := make([]*jobsv1.Job, len(jobs))
 	for i, j := range jobs {
-		pbJobs[i] = jobToProto(j)
+		pbJobs[i] = s.jobToProto(j)
 	}
 
 	return connect.NewResponse(&jobsv1.ListJobsResponse{
@@ -207,7 +209,7 @@ func (s *jobsService) GetJob(ctx context.Context, req *connect.Request[jobsv1.Ge
 	}
 
 	return connect.NewResponse(&jobsv1.GetJobResponse{
-		Job:         jobToProto(job),
+		Job:         s.jobToProto(job),
 		Checkpoints: pbCheckpoints,
 	}), nil
 }
@@ -223,7 +225,7 @@ func (s *jobsService) RetryJob(ctx context.Context, req *connect.Request[jobsv1.
 	}
 
 	return connect.NewResponse(&jobsv1.RetryJobResponse{
-		Job: jobToProto(job),
+		Job: s.jobToProto(job),
 	}), nil
 }
 
@@ -284,7 +286,7 @@ func (s *jobsService) PauseJob(ctx context.Context, req *connect.Request[jobsv1.
 	if job == nil {
 		return nil, connect.NewError(connect.CodeNotFound, nil)
 	}
-	return connect.NewResponse(&jobsv1.PauseJobResponse{Job: jobToProto(job)}), nil
+	return connect.NewResponse(&jobsv1.PauseJobResponse{Job: s.jobToProto(job)}), nil
 }
 
 // CancelJob cooperatively cancels a running job by aliasing aggressive pause.
@@ -302,7 +304,7 @@ func (s *jobsService) CancelJob(ctx context.Context, req *connect.Request[jobsv1
 	if job == nil {
 		return nil, connect.NewError(connect.CodeNotFound, nil)
 	}
-	return connect.NewResponse(&jobsv1.CancelJobResponse{Job: jobToProto(job)}), nil
+	return connect.NewResponse(&jobsv1.CancelJobResponse{Job: s.jobToProto(job)}), nil
 }
 
 // ResumeJob resumes a paused job.
@@ -320,7 +322,7 @@ func (s *jobsService) ResumeJob(ctx context.Context, req *connect.Request[jobsv1
 	if job == nil {
 		return nil, connect.NewError(connect.CodeNotFound, nil)
 	}
-	return connect.NewResponse(&jobsv1.ResumeJobResponse{Job: jobToProto(job)}), nil
+	return connect.NewResponse(&jobsv1.ResumeJobResponse{Job: s.jobToProto(job)}), nil
 }
 
 // PauseQueue pauses an entire queue.
@@ -452,7 +454,7 @@ func (s *jobsService) GetWorkflow(ctx context.Context, req *connect.Request[jobs
 	}
 
 	return connect.NewResponse(&jobsv1.GetWorkflowResponse{
-		Root:     jobToProto(root),
+		Root:     s.jobToProto(root),
 		FanOuts:  allFanOuts,
 		Children: allChildren,
 	}), nil
@@ -490,7 +492,7 @@ func (s *jobsService) ListWorkflows(ctx context.Context, req *connect.Request[jo
 	summaries := make([]*jobsv1.WorkflowSummary, 0, len(roots))
 	for _, root := range roots {
 		summary := &jobsv1.WorkflowSummary{
-			RootJob: jobToProto(root),
+			RootJob: s.jobToProto(root),
 		}
 		fanOuts := fanOutsByParent[root.ID]
 
@@ -716,7 +718,7 @@ func (s *jobsService) collectWorkflowTreeBatched(ctx context.Context, root *core
 						continue
 					}
 					visited[sj.ID] = struct{}{}
-					allChildren = append(allChildren, jobToProto(sj))
+					allChildren = append(allChildren, s.jobToProto(sj))
 					queue = append(queue, sj.ID)
 					if len(allChildren) >= maxWorkflowJobs {
 						break
@@ -763,7 +765,7 @@ func (s *jobsService) collectWorkflowTreeFallback(ctx context.Context, root *cor
 					continue
 				}
 				visited[sj.ID] = struct{}{}
-				allChildren = append(allChildren, jobToProto(sj))
+				allChildren = append(allChildren, s.jobToProto(sj))
 				queue = append(queue, sj.ID)
 				if len(allChildren) >= maxWorkflowJobs {
 					break
@@ -874,7 +876,22 @@ func redactBytes(b []byte) []byte {
 	return []byte(security.RedactSecrets(string(b)))
 }
 
+func redactString(s string) string {
+	if s == "" {
+		return s
+	}
+	return security.RedactSecrets(s)
+}
+
+func (s *jobsService) jobToProto(j *core.Job) *jobsv1.Job {
+	return jobToProtoWithMetadataRedaction(j, s.metadataRedaction)
+}
+
 func jobToProto(j *core.Job) *jobsv1.Job {
+	return jobToProtoWithMetadataRedaction(j, true)
+}
+
+func jobToProtoWithMetadataRedaction(j *core.Job, redactMetadata bool) *jobsv1.Job {
 	pb := &jobsv1.Job{
 		Id:          j.ID,
 		Type:        j.Type,
@@ -890,7 +907,7 @@ func jobToProto(j *core.Job) *jobsv1.Job {
 		Result:      redactBytes(j.Result),
 		Worker:      j.LockedBy,
 		Tenant:      j.Tenant,
-		Metadata:    metadataMapToProto(j.Metadata),
+		Metadata:    metadataMapToProto(j.Metadata, redactMetadata),
 	}
 	if j.StartedAt != nil {
 		pb.StartedAt = timestamppb.New(*j.StartedAt)
@@ -928,12 +945,15 @@ func metadataMapFromProto(metadata map[string]string) *core.MetadataMap {
 	return &out
 }
 
-func metadataMapToProto(metadata map[string]string) map[string]string {
+func metadataMapToProto(metadata map[string]string, redactValues bool) map[string]string {
 	if len(metadata) == 0 {
 		return nil
 	}
 	out := make(map[string]string, len(metadata))
 	for key, value := range metadata {
+		if redactValues {
+			value = redactString(value)
+		}
 		out[key] = value
 	}
 	return out

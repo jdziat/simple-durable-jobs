@@ -1,6 +1,7 @@
 package queue
 
 import (
+	"errors"
 	"time"
 
 	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
@@ -13,18 +14,19 @@ type Options struct {
 	// Tenant identifies the tenant that owns an enqueued job.
 	Tenant string
 	// Metadata stores queryable string tags for an enqueued job.
-	Metadata       *core.MetadataMap
-	Priority       int
-	MaxRetries     int
-	Delay          time.Duration
-	RunAt          *time.Time
-	UniqueKey      string
-	IdempotencyKey string
-	UniqueForTTL   time.Duration
-	UniqueLockTTL  time.Duration
-	Determinism    DeterminismMode
-	determinismSet bool
-	prioritySet    bool
+	Metadata        *core.MetadataMap
+	MaxMetadataSize int
+	Priority        int
+	MaxRetries      int
+	Delay           time.Duration
+	RunAt           *time.Time
+	UniqueKey       string
+	IdempotencyKey  string
+	UniqueForTTL    time.Duration
+	UniqueLockTTL   time.Duration
+	Determinism     DeterminismMode
+	determinismSet  bool
+	prioritySet     bool
 	// Timezone is reserved for future use and is currently ignored; schedules evaluate in UTC.
 	//
 	// Deprecated: never read; schedules evaluate in UTC. Will be removed in v3.
@@ -36,9 +38,10 @@ type Options struct {
 // NewOptions creates Options with defaults.
 func NewOptions() *Options {
 	return &Options{
-		Queue:      "default",
-		Priority:   0,
-		MaxRetries: DefaultJobRetries,
+		Queue:           "default",
+		MaxMetadataSize: DefaultMaxMetadataSize,
+		Priority:        0,
+		MaxRetries:      DefaultJobRetries,
 	}
 }
 
@@ -93,6 +96,14 @@ func WithMeta(key, value string) Option {
 			o.Metadata = &metadata
 		}
 		(*o.Metadata)[key] = value
+	})
+}
+
+// WithMaxMetadataSize sets the maximum marshaled metadata size in bytes.
+// A value <= 0 disables the limit (unlimited); the default is DefaultMaxMetadataSize.
+func WithMaxMetadataSize(n int) Option {
+	return optionFunc(func(o *Options) {
+		o.MaxMetadataSize = n
 	})
 }
 
@@ -205,8 +216,11 @@ func Determinism(mode DeterminismMode) Option {
 
 // Default values.
 var (
-	DefaultJobRetries  = 2
-	DefaultCallRetries = 3
+	DefaultJobRetries      = 2
+	DefaultCallRetries     = 3
+	DefaultMaxMetadataSize = 64 << 10
+
+	ErrJobMetadataTooLarge = errors.New("jobs: job metadata exceeds size limit")
 )
 
 func cloneMetadata(m map[string]string) map[string]string {

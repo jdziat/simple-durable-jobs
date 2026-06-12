@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -686,6 +687,42 @@ func TestHandler_AuthorizerPreservesConnectErrorCode(t *testing.T) {
 	assert.False(t, called)
 }
 
+func TestHandler_WatchEventsDeniedWithoutAuthAndAuthorizerAction(t *testing.T) {
+	store := &mockStorage{}
+	q := queue.New(store)
+	server := httptest.NewServer(Handler(store, WithQueue(q)))
+	defer server.Close()
+
+	client := jobsv1connect.NewJobsServiceClient(server.Client(), server.URL)
+	stream, err := client.WatchEvents(context.Background(), connect.NewRequest(&jobsv1.WatchEventsRequest{}))
+	require.NoError(t, err)
+	assert.False(t, stream.Receive())
+	err = stream.Err()
+	require.Error(t, err)
+	assert.Equal(t, connect.CodePermissionDenied, connect.CodeOf(err))
+
+	var actions []Action
+	authorizer := authorizerFunc(func(_ context.Context, action Action) error {
+		actions = append(actions, action)
+		return errors.New("watch denied")
+	})
+	server = httptest.NewServer(Handler(store, WithQueue(q), WithAuthorizer(authorizer)))
+	defer server.Close()
+
+	client = jobsv1connect.NewJobsServiceClient(server.Client(), server.URL)
+	stream, err = client.WatchEvents(context.Background(), connect.NewRequest(&jobsv1.WatchEventsRequest{}))
+	require.NoError(t, err)
+	assert.False(t, stream.Receive())
+	err = stream.Err()
+	require.Error(t, err)
+	assert.Equal(t, connect.CodePermissionDenied, connect.CodeOf(err))
+	assert.Equal(t, []Action{ActionWatchEvents}, actions)
+}
+
+func TestActionForProcedure_UnknownProcedureDefaultsToReadAction(t *testing.T) {
+	assert.Equal(t, ActionViewJobs, actionForProcedure("/jobs.v1.JobsService/FutureReadRPC"))
+}
+
 func TestHandler_ReadOnlyRPCDeniedWithoutAuth(t *testing.T) {
 	called := false
 	store := &mockUIStorage{
@@ -703,6 +740,119 @@ func TestHandler_ReadOnlyRPCDeniedWithoutAuth(t *testing.T) {
 	require.Error(t, err)
 	assert.Equal(t, connect.CodePermissionDenied, connect.CodeOf(err))
 	assert.False(t, called)
+}
+
+func TestHandler_MutatingRPCOriginAllowDeny(t *testing.T) {
+	t.Run("no origin allowed", func(t *testing.T) {
+		called := false
+		store := &mockUIStorage{
+			retryJobFn: func(_ context.Context, _ string) (*core.Job, error) {
+				called = true
+				return sampleJob("j1", "default", "work", core.StatusPending), nil
+			},
+		}
+		server := httptest.NewServer(Handler(store, WithInsecureAllowUnauthenticated()))
+		defer server.Close()
+
+		client := jobsv1connect.NewJobsServiceClient(server.Client(), server.URL)
+		_, err := client.RetryJob(context.Background(), connect.NewRequest(&jobsv1.RetryJobRequest{Id: "j1"}))
+		require.NoError(t, err)
+		assert.True(t, called)
+	})
+
+	t.Run("mismatched origin denied", func(t *testing.T) {
+		called := false
+		store := &mockUIStorage{
+			retryJobFn: func(_ context.Context, _ string) (*core.Job, error) {
+				called = true
+				return sampleJob("j1", "default", "work", core.StatusPending), nil
+			},
+		}
+		server := httptest.NewServer(Handler(store, WithInsecureAllowUnauthenticated()))
+		defer server.Close()
+
+		client := jobsv1connect.NewJobsServiceClient(server.Client(), server.URL)
+		req := connect.NewRequest(&jobsv1.RetryJobRequest{Id: "j1"})
+		req.Header().Set("Origin", "https://evil.example")
+		req.Header().Set("X-Forwarded-Host", mustURL(t, server.URL).Host)
+		_, err := client.RetryJob(context.Background(), req)
+		require.Error(t, err)
+		assert.Equal(t, connect.CodePermissionDenied, connect.CodeOf(err))
+		assert.Contains(t, err.Error(), "origin not allowed")
+		assert.False(t, called)
+	})
+
+	t.Run("same origin allowed", func(t *testing.T) {
+		called := false
+		store := &mockUIStorage{
+			retryJobFn: func(_ context.Context, _ string) (*core.Job, error) {
+				called = true
+				return sampleJob("j1", "default", "work", core.StatusPending), nil
+			},
+		}
+		server := httptest.NewServer(Handler(store, WithInsecureAllowUnauthenticated()))
+		defer server.Close()
+
+		origin := mustURL(t, server.URL)
+		client := jobsv1connect.NewJobsServiceClient(server.Client(), server.URL)
+		req := connect.NewRequest(&jobsv1.RetryJobRequest{Id: "j1"})
+		req.Header().Set("Origin", origin.Scheme+"://"+origin.Host)
+		_, err := client.RetryJob(context.Background(), req)
+		require.NoError(t, err)
+		assert.True(t, called)
+	})
+
+	// Regression: a forged X-Forwarded-Host matching the attacker Origin must NOT
+	// be trusted as same-origin (the same-origin check uses the real Host only).
+	t.Run("forged x-forwarded-host denied", func(t *testing.T) {
+		called := false
+		store := &mockUIStorage{
+			retryJobFn: func(_ context.Context, _ string) (*core.Job, error) {
+				called = true
+				return sampleJob("j1", "default", "work", core.StatusPending), nil
+			},
+		}
+		server := httptest.NewServer(Handler(store, WithInsecureAllowUnauthenticated()))
+		defer server.Close()
+
+		client := jobsv1connect.NewJobsServiceClient(server.Client(), server.URL)
+		req := connect.NewRequest(&jobsv1.RetryJobRequest{Id: "j1"})
+		req.Header().Set("Origin", "https://evil.example")
+		req.Header().Set("X-Forwarded-Host", "evil.example")
+		_, err := client.RetryJob(context.Background(), req)
+		require.Error(t, err)
+		assert.Equal(t, connect.CodePermissionDenied, connect.CodeOf(err))
+		assert.False(t, called)
+	})
+
+	t.Run("allowed origin option allowed", func(t *testing.T) {
+		called := false
+		store := &mockUIStorage{
+			retryJobFn: func(_ context.Context, _ string) (*core.Job, error) {
+				called = true
+				return sampleJob("j1", "default", "work", core.StatusPending), nil
+			},
+		}
+		server := httptest.NewServer(Handler(store,
+			WithInsecureAllowUnauthenticated(),
+			WithAllowedOrigins("https://ops.example"),
+		))
+		defer server.Close()
+
+		client := jobsv1connect.NewJobsServiceClient(server.Client(), server.URL)
+		req := connect.NewRequest(&jobsv1.RetryJobRequest{Id: "j1"})
+		req.Header().Set("Origin", "https://ops.example")
+		_, err := client.RetryJob(context.Background(), req)
+		require.NoError(t, err)
+		assert.True(t, called)
+	})
+}
+
+func mustURL(t *testing.T, raw string) *url.URL {
+	t.Helper()
+	parsed, err := url.Parse(raw)
+	require.NoError(t, err)
+	return parsed
 }
 
 // ---------------------------------------------------------------------------
@@ -1877,6 +2027,80 @@ func TestJobToProto_RedactsPayloadsWithoutTruncating(t *testing.T) {
 	assert.Greater(t, len(pb.Result), 5000)
 	assert.NotContains(t, pb.LastError, "abcdefghijklmnopqrstuvwxyz012345")
 	assert.Contains(t, pb.LastError, "bearer [REDACTED]")
+}
+
+func TestJobToProto_RedactsMetadataValues(t *testing.T) {
+	secret := "sk_live_1234567890abcdef"
+	job := sampleJob("j1", "default", "work", core.StatusCompleted)
+	job.Metadata = map[string]string{
+		"token": "token=" + secret,
+		"team":  "payments",
+	}
+
+	pb := jobToProto(job)
+
+	require.NotNil(t, pb.Metadata)
+	assert.NotContains(t, pb.Metadata["token"], secret)
+	assert.Contains(t, pb.Metadata["token"], "[REDACTED]")
+	assert.Equal(t, "payments", pb.Metadata["team"])
+}
+
+func TestService_MetadataRedactionOptOut(t *testing.T) {
+	secret := "sk_live_1234567890abcdef"
+	job := sampleJob("j1", "default", "work", core.StatusCompleted)
+	job.Metadata = map[string]string{"token": "token=" + secret}
+	store := &mockStorage{
+		getJobFn: func(_ context.Context, _ string) (*core.Job, error) {
+			return job, nil
+		},
+	}
+	svc := newServiceWithBaseStorage(store)
+	svc.metadataRedaction = false
+
+	resp, err := svc.GetJob(context.Background(), connect.NewRequest(&jobsv1.GetJobRequest{Id: "j1"}))
+	require.NoError(t, err)
+	require.NotNil(t, resp.Msg.Job.Metadata)
+	assert.Contains(t, resp.Msg.Job.Metadata["token"], secret)
+}
+
+func TestHandler_MetadataRedactionOptOut(t *testing.T) {
+	secret := "sk_live_1234567890abcdef"
+	job := sampleJob("j1", "default", "work", core.StatusCompleted)
+	job.Metadata = map[string]string{"token": "token=" + secret}
+	store := &mockStorage{
+		getJobFn: func(_ context.Context, _ string) (*core.Job, error) {
+			return job, nil
+		},
+	}
+	server := httptest.NewServer(Handler(store,
+		WithInsecureAllowUnauthenticated(),
+		WithMetadataRedaction(false),
+	))
+	defer server.Close()
+
+	client := jobsv1connect.NewJobsServiceClient(server.Client(), server.URL)
+	resp, err := client.GetJob(context.Background(), connect.NewRequest(&jobsv1.GetJobRequest{Id: "j1"}))
+	require.NoError(t, err)
+	require.NotNil(t, resp.Msg.Job.Metadata)
+	assert.Contains(t, resp.Msg.Job.Metadata["token"], secret)
+}
+
+func TestListJobs_RedactsMetadataValues(t *testing.T) {
+	secret := "ghp_1234567890abcdefghij"
+	job := sampleJob("j1", "default", "work", core.StatusPending)
+	job.Metadata = map[string]string{"token": "token=" + secret}
+	store := &mockUIStorage{
+		searchJobsFn: func(_ context.Context, _ JobFilter) ([]*core.Job, int64, error) {
+			return []*core.Job{job}, 1, nil
+		},
+	}
+	svc := newServiceWithUIStorage(store)
+
+	resp, err := svc.ListJobs(context.Background(), connect.NewRequest(&jobsv1.ListJobsRequest{}))
+	require.NoError(t, err)
+	require.Len(t, resp.Msg.Jobs, 1)
+	assert.NotContains(t, resp.Msg.Jobs[0].Metadata["token"], secret)
+	assert.Contains(t, resp.Msg.Jobs[0].Metadata["token"], "[REDACTED]")
 }
 
 // ---------------------------------------------------------------------------

@@ -162,6 +162,27 @@ reads and writes, matching the dashboard's unified explicit opt-in.
 for authentication, logging, headers, and principal injection, but RPC access is
 controlled only by `ui.WithAuthorizer(...)` or the explicit insecure opt-in.
 
+## Origin Checks for Mutations
+
+Mutating dashboard RPCs also check the browser `Origin` header. Requests with
+no `Origin` header are allowed so CLI and server-to-server Connect clients keep
+working. Browser requests with an `Origin` must be same-origin with the request
+host or match an explicit allow-list:
+
+```go
+http.Handle("/jobs/", http.StripPrefix("/jobs", ui.Handler(
+	store,
+	ui.WithMiddleware(authMiddleware),
+	ui.WithAuthorizer(DashboardAuthorizer{}),
+	ui.WithAllowedOrigins("https://ops.example.com"),
+)))
+```
+
+The embedded SPA is served from the same origin as the API, so it does not need
+this option. Cross-origin dashboard deployments do. If your authentication uses
+cookies or any automatically attached browser credential, keep this Origin check
+enabled and list only trusted dashboard origins.
+
 ## Programmatic Reuse
 
 The authorizer is only wired into the dashboard's Connect RPC interceptor.

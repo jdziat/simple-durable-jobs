@@ -311,6 +311,15 @@ func (q *Queue) buildJob(name string, args any, options *Options) (*core.Job, er
 	if len(argsBytes) > security.MaxJobArgsSize {
 		return nil, core.ErrJobArgsTooLarge
 	}
+	if options.Metadata != nil && options.MaxMetadataSize > 0 {
+		metadataBytes, err := json.Marshal(options.Metadata)
+		if err != nil {
+			return nil, fmt.Errorf("jobs: failed to marshal metadata: %w", err)
+		}
+		if len(metadataBytes) > options.MaxMetadataSize {
+			return nil, ErrJobMetadataTooLarge
+		}
+	}
 
 	// Clamp retries to maximum
 	maxRetries := security.ClampRetries(options.MaxRetries)

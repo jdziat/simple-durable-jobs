@@ -2,6 +2,7 @@ package queue
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -371,6 +372,31 @@ func TestQueue_Enqueue_WithTenantAndMetadata(t *testing.T) {
 		"plan":   "pro",
 		"region": "us",
 	}, job.Metadata)
+}
+
+func TestQueue_Enqueue_MetadataSizeLimit(t *testing.T) {
+	assert.Equal(t, 64<<10, DefaultMaxMetadataSize)
+
+	store := newMockStorage()
+	q := New(store)
+	q.Register("test-job", func(ctx context.Context, args string) error {
+		return nil
+	})
+
+	underValue := strings.Repeat("a", 64)
+	jobID, err := q.Enqueue(context.Background(), "test-job", "hello",
+		WithMetadata(map[string]string{"payload": underValue}),
+		WithMaxMetadataSize(128),
+	)
+	require.NoError(t, err)
+	assert.NotEmpty(t, jobID)
+
+	_, err = q.Enqueue(context.Background(), "test-job", "hello",
+		WithMetadata(map[string]string{"payload": strings.Repeat("b", 200)}),
+		WithMaxMetadataSize(128),
+	)
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, ErrJobMetadataTooLarge))
 }
 
 func TestQueue_Enqueue_TenantTooLongReturnsError(t *testing.T) {

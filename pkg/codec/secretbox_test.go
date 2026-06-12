@@ -21,6 +21,17 @@ func TestSecretboxDecodeLegacyPlaintext(t *testing.T) {
 	assert.Equal(t, plaintext, decoded)
 }
 
+func TestSecretboxStrictRejectsLegacyPlaintext(t *testing.T) {
+	var key [32]byte
+	key[0] = 1
+	c, err := NewSecretboxStrict(key)
+	require.NoError(t, err)
+
+	_, err = c.Decode([]byte(`{"legacy":true}`))
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, ErrSecretboxLegacyPlaintext))
+}
+
 func TestSecretboxRoundTrip(t *testing.T) {
 	var key [32]byte
 	key[0] = 1
@@ -32,6 +43,21 @@ func TestSecretboxRoundTrip(t *testing.T) {
 	require.NoError(t, err)
 	require.NotEqual(t, plaintext, stored)
 	require.True(t, bytes.HasPrefix(stored, magic))
+
+	decoded, err := c.Decode(stored)
+	require.NoError(t, err)
+	assert.Equal(t, plaintext, decoded)
+}
+
+func TestSecretboxStrictRoundTrip(t *testing.T) {
+	var key [32]byte
+	key[0] = 1
+	c, err := NewSecretboxStrict(key)
+	require.NoError(t, err)
+
+	plaintext := []byte(`{"secret":"value"}`)
+	stored, err := c.Encode(plaintext)
+	require.NoError(t, err)
 
 	decoded, err := c.Decode(stored)
 	require.NoError(t, err)

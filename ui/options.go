@@ -25,6 +25,8 @@ type config struct {
 	statsRetention               time.Duration
 	insecureAllowUnauthenticated bool
 	authorizer                   Authorizer
+	allowedOrigins               map[string]struct{}
+	metadataRedaction            bool
 }
 
 // WithMiddleware wraps the handler with middleware (auth, logging, etc.).
@@ -71,6 +73,28 @@ func WithInsecureAllowUnauthenticatedWrites() Option {
 func WithAuthorizer(a Authorizer) Option {
 	return optionFunc(func(c *config) {
 		c.authorizer = a
+	})
+}
+
+// WithAllowedOrigins permits browser mutating RPCs from the given origins in
+// addition to same-origin requests. Values must be full origins such as
+// "https://ops.example.com".
+func WithAllowedOrigins(origins ...string) Option {
+	return optionFunc(func(c *config) {
+		if c.allowedOrigins == nil {
+			c.allowedOrigins = make(map[string]struct{}, len(origins))
+		}
+		for _, origin := range origins {
+			c.allowedOrigins[origin] = struct{}{}
+		}
+	})
+}
+
+// WithMetadataRedaction controls best-effort secret redaction for job metadata
+// values returned by the dashboard. Metadata redaction is enabled by default.
+func WithMetadataRedaction(enabled bool) Option {
+	return optionFunc(func(c *config) {
+		c.metadataRedaction = enabled
 	})
 }
 

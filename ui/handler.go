@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 
@@ -34,7 +35,8 @@ var (
 //	mux.Handle("/jobs/", http.StripPrefix("/jobs", ui.Handler(storage)))
 func Handler(storage core.Storage, opts ...Option) http.Handler {
 	cfg := &config{
-		ctx: context.Background(),
+		ctx:               context.Background(),
+		metadataRedaction: true,
 	}
 	for _, opt := range opts {
 		opt.apply(cfg)
@@ -66,6 +68,7 @@ func Handler(storage core.Storage, opts ...Option) http.Handler {
 
 	// Create the jobs service
 	svc := newJobsService(storage, cfg.queue, statsStorage)
+	svc.metadataRedaction = cfg.metadataRedaction
 
 	// Register Connect-RPC handler
 	path, handler := jobsv1connect.NewJobsServiceHandler(
@@ -73,6 +76,7 @@ func Handler(storage core.Storage, opts ...Option) http.Handler {
 		connect.WithInterceptors(authInterceptor(
 			cfg.insecureAllowUnauthenticated,
 			cfg.authorizer,
+			cfg.allowedOrigins,
 		)),
 	)
 	mux.Handle(path, handler)
@@ -100,8 +104,18 @@ func Handler(storage core.Storage, opts ...Option) http.Handler {
 		})
 	}
 
+	withHostHeader := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Always overwrite the header-map Host from the server-authoritative
+		// r.Host so the same-origin check cannot be fooled by a client-injected
+		// Host header (browsers can't set Host; a non-browser client could).
+		if r.Host != "" {
+			r.Header.Set("Host", r.Host)
+		}
+		mux.ServeHTTP(w, r)
+	})
+
 	// Wrap with H2C for HTTP/2 over cleartext (needed for Connect streaming)
-	h2cHandler := h2c.NewHandler(mux, &http2.Server{})
+	h2cHandler := h2c.NewHandler(withHostHeader, &http2.Server{})
 
 	// Apply middleware if configured
 	if cfg.middleware != nil {
@@ -152,17 +166,24 @@ const authRequiredMessage = "jobs UI requires an Authorizer (ui.WithAuthorizer) 
 type dashboardAuthInterceptor struct {
 	insecureAllowUnauthenticated bool
 	authorizer                   Authorizer
+	allowedOrigins               map[string]struct{}
 }
 
-func authInterceptor(insecureAllowUnauthenticated bool, authorizer Authorizer) connect.Interceptor {
+func authInterceptor(insecureAllowUnauthenticated bool, authorizer Authorizer, allowedOrigins map[string]struct{}) connect.Interceptor {
 	return dashboardAuthInterceptor{
 		insecureAllowUnauthenticated: insecureAllowUnauthenticated,
 		authorizer:                   authorizer,
+		allowedOrigins:               allowedOrigins,
 	}
 }
 
 func (i dashboardAuthInterceptor) WrapUnary(next connect.UnaryFunc) connect.UnaryFunc {
 	return connect.UnaryFunc(func(ctx context.Context, req connect.AnyRequest) (connect.AnyResponse, error) {
+		if _, mutates := mutatingProcedures[req.Spec().Procedure]; mutates {
+			if err := i.authorizeOrigin(req); err != nil {
+				return nil, err
+			}
+		}
 		if err := i.authorize(ctx, req.Spec().Procedure); err != nil {
 			return nil, err
 		}
@@ -199,6 +220,28 @@ func (i dashboardAuthInterceptor) authorize(ctx context.Context, procedure strin
 		return nil
 	}
 	return connect.NewError(connect.CodePermissionDenied, errors.New(authRequiredMessage))
+}
+
+func (i dashboardAuthInterceptor) authorizeOrigin(req connect.AnyRequest) error {
+	origin := req.Header().Get("Origin")
+	if origin == "" {
+		return nil
+	}
+	if _, ok := i.allowedOrigins[origin]; ok {
+		return nil
+	}
+	// Same-origin check compares the browser Origin against the server's real
+	// Host (copied into the Host header by withHostHeader). Client-supplied
+	// X-Forwarded-Host is deliberately NOT trusted — it is forgeable by any
+	// caller and would defeat the check. Cross-origin operators use
+	// WithAllowedOrigins.
+	originURL, err := url.Parse(origin)
+	if err == nil && originURL.Host != "" {
+		if host := req.Header().Get("Host"); host != "" && strings.EqualFold(originURL.Host, host) {
+			return nil
+		}
+	}
+	return connect.NewError(connect.CodePermissionDenied, errors.New("origin not allowed; configure ui.WithAllowedOrigins"))
 }
 
 func actionForProcedure(procedure string) Action {
