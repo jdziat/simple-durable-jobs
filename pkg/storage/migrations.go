@@ -240,6 +240,11 @@ var schemaMigrations = []schemaMigration{
 		Name:    "check_constraints",
 		Up:      migrateCheckConstraints,
 	},
+	{
+		Version: 23,
+		Name:    "metadata_integrity",
+		Up:      migrateMetadataIntegrity,
+	},
 }
 
 // applyPendingMigrations runs every migration whose version is absent from the
@@ -1073,6 +1078,37 @@ func migrateCheckConstraints(ctx context.Context, db *gorm.DB, dialect string) e
 	default:
 		// CHECK enforcement is on the production engines (Postgres/MySQL);
 		// SQLite dev tables rely on the Go enum types.
+		return nil
+	}
+}
+
+// migrateMetadataIntegrity is migration-only: no gorm check tag, so
+// AutoMigrate never creates or flaps it. The OR guard accepts NULL, empty
+// string, and valid JSON, and rejects only non-empty invalid JSON, which the
+// json serializer never produces.
+func migrateMetadataIntegrity(ctx context.Context, db *gorm.DB, dialect string) error {
+	switch dialect {
+	case dialectMySQL:
+		const (
+			name = "chk_jobs_metadata_json"
+			expr = "metadata IS NULL OR metadata = '' OR JSON_VALID(metadata)"
+		)
+		m := db.Migrator()
+		if m.HasConstraint(&core.Job{}, name) {
+			return nil
+		}
+		if err := db.WithContext(ctx).Exec(
+			fmt.Sprintf("ALTER TABLE %s ADD CONSTRAINT %s CHECK (%s)", "jobs", name, expr),
+		).Error; err != nil && !isBenignDDLError(err) {
+			return fmt.Errorf("add %s: %w", name, err)
+		}
+		return nil
+	case dialectPostgres:
+		// PG already validates metadata via the idx_jobs_metadata_gin expression
+		// index ((NULLIF(metadata,'')::jsonb)), so a CHECK would be redundant.
+		return nil
+	default:
+		// SQLite is dev-only and ALTER TABLE ADD CHECK is unsupported there.
 		return nil
 	}
 }

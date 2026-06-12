@@ -228,6 +228,7 @@ func TestMySQLSchemaAssertions(t *testing.T) {
 	requireMySQLDispatcherColumnsNotNull(t, db)
 	requireMySQLCheckConstraints(t, db)
 	requireMySQLCheckConstraintsEnforced(t, db)
+	requireMySQLMetadataIntegrity(t, db)
 
 	// Regression (P5): a bare AutoMigrate must NOT drift the NOT NULL dispatcher
 	// columns back to nullable. Before the core.Job `not null` tags, AutoMigrate
@@ -569,6 +570,67 @@ func requireMySQLCheckConstraintsEnforced(t *testing.T, db *gorm.DB) {
 		INSERT INTO fan_outs (id, parent_job_id, total_count, completed_count, failed_count, cancelled_count, strategy, status)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 	`, "check-mysql-good-fanout", "check-mysql-parent", 1, 0, 0, 0, "fail_fast", "pending").Error)
+}
+
+func requireMySQLMetadataIntegrity(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	var count int
+	require.NoError(t, db.Raw(`
+		SELECT COUNT(*)
+		FROM information_schema.TABLE_CONSTRAINTS
+		WHERE CONSTRAINT_SCHEMA = DATABASE()
+		  AND CONSTRAINT_TYPE = 'CHECK'
+		  AND CONSTRAINT_NAME = 'chk_jobs_metadata_json'
+	`).Scan(&count).Error)
+	require.Equal(t, 1, count, "chk_jobs_metadata_json CHECK constraint must exist on mysql")
+
+	tx := db.Begin()
+	require.NoError(t, tx.Error)
+	defer func() {
+		require.NoError(t, tx.Rollback().Error)
+	}()
+
+	now := time.Now().UTC()
+	requireExecRejectedWithSavepoint(t, tx, "mysql_bad_metadata_json", `
+		INSERT INTO jobs (id, type, queue, status, priority, attempt, max_retries, timeout, determinism, created_at, metadata)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, "metadata-bad-json", "schema.metadata", "default", "pending", 0, 0, 3, 0, 0, now, "not-valid-json")
+
+	require.NoError(t, tx.Exec(`
+		INSERT INTO jobs (id, type, queue, status, priority, attempt, max_retries, timeout, determinism, created_at, metadata)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, "metadata-empty", "schema.metadata", "default", "pending", 0, 0, 3, 0, 0, now, "").Error)
+	require.NoError(t, tx.Exec(`
+		INSERT INTO jobs (id, type, queue, status, priority, attempt, max_retries, timeout, determinism, created_at, metadata)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, "metadata-null", "schema.metadata", "default", "pending", 0, 0, 3, 0, 0, now, nil).Error)
+	require.NoError(t, tx.Exec(`
+		INSERT INTO jobs (id, type, queue, status, priority, attempt, max_retries, timeout, determinism, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, "metadata-omitted", "schema.metadata", "default", "pending", 0, 0, 3, 0, 0, now).Error)
+	require.NoError(t, tx.Exec(`
+		INSERT INTO jobs (id, type, queue, status, priority, attempt, max_retries, timeout, determinism, created_at, metadata)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, "metadata-json-contains-prod", "schema.metadata", "default", "pending", 0, 0, 3, 0, 0, now, `{"env":"prod"}`).Error)
+	require.NoError(t, tx.Exec(`
+		INSERT INTO jobs (id, type, queue, status, priority, attempt, max_retries, timeout, determinism, created_at, metadata)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, "metadata-json-near-value", "schema.metadata", "default", "pending", 0, 0, 3, 0, 0, now, `{"env":"prod-test"}`).Error)
+	require.NoError(t, tx.Exec(`
+		INSERT INTO jobs (id, type, queue, status, priority, attempt, max_retries, timeout, determinism, created_at, metadata)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, "metadata-json-near-key", "schema.metadata", "default", "pending", 0, 0, 3, 0, 0, now, `{"team":"prod"}`).Error)
+
+	var matches []string
+	require.NoError(t, tx.Raw(`
+		SELECT id
+		FROM jobs
+		WHERE metadata IS NOT NULL
+		  AND metadata <> ''
+		  AND JSON_CONTAINS(metadata, CAST(? AS JSON))
+		ORDER BY id
+	`, `{"env":"prod"}`).Scan(&matches).Error)
+	require.Equal(t, []string{"metadata-json-contains-prod"}, matches, "JSON_CONTAINS must exclude substring-only metadata near-matches")
 }
 
 func requireMySQLGeneratedVarchar36Column(t *testing.T, db *gorm.DB, columnName string) {
