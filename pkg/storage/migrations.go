@@ -230,6 +230,11 @@ var schemaMigrations = []schemaMigration{
 		Name:    "scale_finish_indexes",
 		Up:      migrateScaleFinishIndexes,
 	},
+	{
+		Version: 21,
+		Name:    "indexing_qc1",
+		Up:      migrateIndexingQC1,
+	},
 }
 
 // applyPendingMigrations runs every migration whose version is absent from the
@@ -862,6 +867,103 @@ func migrateScaleFinishIndexes(ctx context.Context, db *gorm.DB, dialect string)
 			"CREATE INDEX IF NOT EXISTS idx_jobs_retention_terminal ON jobs (status, completed_at, id) WHERE status IN ('completed','failed','cancelled') AND completed_at IS NOT NULL",
 		).Error; err != nil {
 			return fmt.Errorf("create idx_jobs_retention_terminal: %w", err)
+		}
+		return nil
+	}
+}
+
+func migrateIndexingQC1(ctx context.Context, db *gorm.DB, dialect string) error {
+	// Keep idx_concurrency_slots_expires_at: DeleteExpiredConcurrencySlots is a
+	// global expires_at sweep, and idx_concurrency_slots_live leads slot_name.
+	switch dialect {
+	case dialectMySQL:
+		m := db.Migrator()
+		for _, indexName := range []string{
+			"idx_jobs_run_at",
+			"idx_jobs_fan_out_id",
+		} {
+			if m.HasIndex(&core.Job{}, indexName) {
+				if err := m.DropIndex(&core.Job{}, indexName); err != nil && !isBenignDDLError(err) {
+					return fmt.Errorf("drop %s: %w", indexName, err)
+				}
+			}
+		}
+		if m.HasIndex(&core.RateLimitWindow{}, "idx_rate_limit_windows_lookup") {
+			if err := m.DropIndex(&core.RateLimitWindow{}, "idx_rate_limit_windows_lookup"); err != nil && !isBenignDDLError(err) {
+				return fmt.Errorf("drop idx_rate_limit_windows_lookup: %w", err)
+			}
+		}
+		for _, spec := range []struct {
+			name string
+			sql  string
+		}{
+			{
+				name: "idx_jobs_status_created",
+				sql:  "CREATE INDEX idx_jobs_status_created ON jobs (status, created_at DESC)",
+			},
+			{
+				name: "idx_jobs_queue_created",
+				sql:  "CREATE INDEX idx_jobs_queue_created ON jobs (queue, created_at DESC)",
+			},
+			{
+				name: "idx_jobs_fan_out_status",
+				sql:  "CREATE INDEX idx_jobs_fan_out_status ON jobs (fan_out_id, status)",
+			},
+		} {
+			if !m.HasIndex(&core.Job{}, spec.name) {
+				if err := db.WithContext(ctx).Exec(spec.sql).Error; err != nil && !isBenignDDLError(err) {
+					return fmt.Errorf("create %s: %w", spec.name, err)
+				}
+			}
+		}
+		// R19 parity: MySQL's v8 idx_jobs_stale_lock is a plain composite
+		// (status, last_heartbeat_at, started_at, locked_until), so the reaper's
+		// ORDER BY COALESCE(last_heartbeat_at, started_at, locked_until) cannot
+		// ride it and filesorts the whole running set every tick. Rebuild it as
+		// an expression index (status, (COALESCE(...))) so MySQL gets the same
+		// index-ordered range scan PG/SQLite get from their functional/partial
+		// idx_jobs_stale_lock. Functional key parts need MySQL 8.0.13+.
+		if m.HasIndex(&core.Job{}, "idx_jobs_stale_lock") {
+			if err := m.DropIndex(&core.Job{}, "idx_jobs_stale_lock"); err != nil && !isBenignDDLError(err) {
+				return fmt.Errorf("drop idx_jobs_stale_lock: %w", err)
+			}
+		}
+		if err := db.WithContext(ctx).Exec(
+			"CREATE INDEX idx_jobs_stale_lock ON jobs (status, ((COALESCE(last_heartbeat_at, started_at, locked_until))))",
+		).Error; err != nil && !isBenignDDLError(err) {
+			return fmt.Errorf("create idx_jobs_stale_lock expression index: %w", err)
+		}
+		return nil
+	default:
+		for _, indexName := range []string{
+			"idx_jobs_run_at",
+			"idx_jobs_fan_out_id",
+			"idx_rate_limit_windows_lookup",
+		} {
+			if err := db.WithContext(ctx).Exec("DROP INDEX IF EXISTS " + indexName).Error; err != nil {
+				return fmt.Errorf("drop %s: %w", indexName, err)
+			}
+		}
+		for _, spec := range []struct {
+			name string
+			sql  string
+		}{
+			{
+				name: "idx_jobs_status_created",
+				sql:  "CREATE INDEX IF NOT EXISTS idx_jobs_status_created ON jobs (status, created_at DESC)",
+			},
+			{
+				name: "idx_jobs_queue_created",
+				sql:  "CREATE INDEX IF NOT EXISTS idx_jobs_queue_created ON jobs (queue, created_at DESC)",
+			},
+			{
+				name: "idx_jobs_fan_out_status",
+				sql:  "CREATE INDEX IF NOT EXISTS idx_jobs_fan_out_status ON jobs (fan_out_id, status)",
+			},
+		} {
+			if err := db.WithContext(ctx).Exec(spec.sql).Error; err != nil {
+				return fmt.Errorf("create %s: %w", spec.name, err)
+			}
 		}
 		return nil
 	}

@@ -1180,12 +1180,12 @@ func (s *GormStorage) ReleaseStaleLocks(ctx context.Context, staleDuration time.
 	err := s.withSerializationRetry(ctx, func() error {
 		released = nil
 		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-			// Unordered LIMIT: the reaper is idempotent and self-draining (a
-			// stale lock stays running+expired until released), so a per-tick
-			// cap bounds the IN-list update without needing a stable sort.
+			// ORDER BY matches idx_jobs_stale_lock's freshness expression, so
+			// the planner can use it while the per-tick cap bounds the update.
 			if err := tx.Model(&core.Job{}).
 				Where("status = ?", core.StatusRunning).
 				Where("COALESCE(last_heartbeat_at, started_at, locked_until) < ?", cutoff).
+				Order("COALESCE(last_heartbeat_at, started_at, locked_until) ASC").
 				Limit(maxResumeBatch).
 				Pluck("id", &released).Error; err != nil {
 				return err

@@ -86,6 +86,17 @@ func TestPostgresSchemaAssertions(t *testing.T) {
 	require.Contains(t, strings.ToUpper(metadataIndexDef), "NULLIF(METADATA", "idx_jobs_metadata_gin definition:\n%s", metadataIndexDef)
 	require.Contains(t, metadataIndexDef, "jsonb_path_ops", "idx_jobs_metadata_gin definition:\n%s", metadataIndexDef)
 	require.True(t, postgresIndexExists(t, db, "idx_jobs_tenant"), "idx_jobs_tenant must exist")
+	statusCreatedDef := strings.ToLower(postgresIndexDef(t, db, "idx_jobs_status_created"))
+	require.Contains(t, statusCreatedDef, "status", "idx_jobs_status_created definition:\n%s", statusCreatedDef)
+	require.Contains(t, statusCreatedDef, "created_at", "idx_jobs_status_created definition:\n%s", statusCreatedDef)
+	queueCreatedDef := strings.ToLower(postgresIndexDef(t, db, "idx_jobs_queue_created"))
+	require.Contains(t, queueCreatedDef, "queue", "idx_jobs_queue_created definition:\n%s", queueCreatedDef)
+	require.Contains(t, queueCreatedDef, "created_at", "idx_jobs_queue_created definition:\n%s", queueCreatedDef)
+	fanOutStatusDef := strings.ToLower(postgresIndexDef(t, db, "idx_jobs_fan_out_status"))
+	require.Contains(t, fanOutStatusDef, "fan_out_id", "idx_jobs_fan_out_status definition:\n%s", fanOutStatusDef)
+	require.Contains(t, fanOutStatusDef, "status", "idx_jobs_fan_out_status definition:\n%s", fanOutStatusDef)
+	require.True(t, postgresIndexExists(t, db, "idx_concurrency_slots_expires_at"), "idx_concurrency_slots_expires_at must exist")
+	require.False(t, postgresIndexExists(t, db, "idx_rate_limit_windows_lookup"), "idx_rate_limit_windows_lookup must not exist after migration")
 
 	for _, indexName := range []string{
 		"idx_jobs_priority",
@@ -95,6 +106,8 @@ func TestPostgresSchemaAssertions(t *testing.T) {
 		"idx_jobs_unique_key",
 		"idx_jobs_dequeue_order",
 		"idx_jobs_status",
+		"idx_jobs_run_at",
+		"idx_jobs_fan_out_id",
 	} {
 		require.False(t, postgresIndexExists(t, db, indexName), "%s must not exist after migration", indexName)
 	}
@@ -170,6 +183,8 @@ func TestMySQLSchemaAssertions(t *testing.T) {
 		"idx_jobs_dequeue",
 		"idx_jobs_dequeue_order",
 		"idx_jobs_status",
+		"idx_jobs_run_at",
+		"idx_jobs_fan_out_id",
 	} {
 		require.False(t, mysqlIndexExists(t, db, indexName), "%s must not exist after migration", indexName)
 	}
@@ -177,7 +192,30 @@ func TestMySQLSchemaAssertions(t *testing.T) {
 	require.True(t, mysqlIndexExists(t, db, "idx_jobs_dequeue_eligible"), "idx_jobs_dequeue_eligible must exist on mysql")
 	require.True(t, mysqlIndexExists(t, db, "idx_jobs_retention_terminal"), "idx_jobs_retention_terminal must exist on mysql")
 	require.Equal(t, []string{"status", "completed_at", "id"}, mysqlIndexColumns(t, db, "jobs", "idx_jobs_retention_terminal"))
+	require.True(t, mysqlIndexExists(t, db, "idx_jobs_status_created"), "idx_jobs_status_created must exist on mysql")
+	require.Equal(t, []string{"status", "created_at"}, mysqlIndexColumns(t, db, "jobs", "idx_jobs_status_created"))
+	require.True(t, mysqlIndexExists(t, db, "idx_jobs_queue_created"), "idx_jobs_queue_created must exist on mysql")
+	require.Equal(t, []string{"queue", "created_at"}, mysqlIndexColumns(t, db, "jobs", "idx_jobs_queue_created"))
+	require.True(t, mysqlIndexExists(t, db, "idx_jobs_fan_out_status"), "idx_jobs_fan_out_status must exist on mysql")
+	require.Equal(t, []string{"fan_out_id", "status"}, mysqlIndexColumns(t, db, "jobs", "idx_jobs_fan_out_status"))
+	// idx_jobs_stale_lock must be an EXPRESSION index on MySQL (status +
+	// functional COALESCE key part) so the reaper's ORDER BY COALESCE(...) rides
+	// the index instead of filesorting — parity with the PG/SQLite partial
+	// functional index (R19).
+	require.True(t, mysqlIndexExists(t, db, "idx_jobs_stale_lock"), "idx_jobs_stale_lock must exist on mysql")
+	var staleLockExprParts int
+	require.NoError(t, db.Raw(`
+		SELECT COUNT(*)
+		FROM information_schema.STATISTICS
+		WHERE TABLE_SCHEMA = DATABASE()
+		  AND TABLE_NAME = 'jobs'
+		  AND INDEX_NAME = 'idx_jobs_stale_lock'
+		  AND EXPRESSION IS NOT NULL
+	`).Scan(&staleLockExprParts).Error)
+	require.GreaterOrEqual(t, staleLockExprParts, 1, "idx_jobs_stale_lock must be a COALESCE expression index so the reaper ORDER BY rides it (no filesort)")
 	require.True(t, mysqlTableIndexExists(t, db, "signals", "idx_signals_consumed_at"), "idx_signals_consumed_at must exist on mysql")
+	require.True(t, mysqlTableIndexExists(t, db, "concurrency_slots", "idx_concurrency_slots_expires_at"), "idx_concurrency_slots_expires_at must exist on mysql")
+	require.False(t, mysqlTableIndexExists(t, db, "rate_limit_windows", "idx_rate_limit_windows_lookup"), "idx_rate_limit_windows_lookup must not exist after migration")
 	requireMySQLGeneratedVarchar36Column(t, db, "pending_parent_ref")
 	requireMySQLGeneratedVarchar36Column(t, db, "pending_root_ref")
 	require.True(t, mysqlIndexExists(t, db, "idx_jobs_parent_nonterminal"), "idx_jobs_parent_nonterminal must exist on mysql")

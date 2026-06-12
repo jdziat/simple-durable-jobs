@@ -32,7 +32,7 @@ type Job struct {
 	// Metadata stores queryable string tags for this job.
 	Metadata       map[string]string `gorm:"serializer:json;column:metadata"`
 	Priority       int               `gorm:"default:0;not null"`
-	Status         JobStatus         `gorm:"size:20;default:'pending';not null"`
+	Status         JobStatus         `gorm:"size:20;default:'pending';not null;index:idx_jobs_fan_out_status,priority:2"`
 	PreviousStatus JobStatus         `gorm:"size:20"` // Status before pause, for restoration
 	Attempt        int               `gorm:"default:0;not null"`
 	MaxRetries     int               `gorm:"default:3;not null"`
@@ -43,8 +43,8 @@ type Job struct {
 	Determinism      int    `gorm:"not null;default:0"`
 	LastError        string `gorm:"type:text"`
 	DeadLetteredAt   *time.Time
-	DeadLetterReason string     `gorm:"type:text"`
-	RunAt            *time.Time `gorm:"index"`
+	DeadLetterReason string `gorm:"type:text"`
+	RunAt            *time.Time
 	StartedAt        *time.Time
 	CompletedAt      *time.Time
 	CreatedAt        time.Time `gorm:"autoCreateTime"`
@@ -59,8 +59,8 @@ type Job struct {
 	RootJobID   *string `gorm:"index;size:36"` // Top-level workflow job
 
 	// Fan-out tracking
-	FanOutID    *string `gorm:"index;size:36"` // Groups sibling sub-jobs
-	FanOutIndex int     `gorm:"default:0"`     // Position in fan-out batch
+	FanOutID    *string `gorm:"index:idx_jobs_fan_out_status,priority:1;size:36"` // Groups sibling sub-jobs
+	FanOutIndex int     `gorm:"default:0"`                                        // Position in fan-out batch
 
 	// Result storage for parent retrieval
 	Result []byte `gorm:"type:bytes"` // Serialized return value
