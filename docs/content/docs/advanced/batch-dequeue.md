@@ -34,7 +34,7 @@ When one worker serves several queues with different concurrency caps,
 `DequeueBatchPerQueue` prevents a hot queue from consuming the whole batch. The
 worker computes `maxConcurrency - running` for each available queue and passes
 that budget map to storage. `GormStorage` still uses one global
-`priority DESC, created_at ASC` scan, then skip-lists rows whose queue already
+`priority DESC, COALESCE(run_at, created_at) ASC` scan, then skip-lists rows whose queue already
 hit its budget. This preserves cross-queue global priority while avoiding the
 surplus claim/release churn that older batch dequeue could cause.
 
@@ -49,7 +49,7 @@ DequeueBatch(ctx context.Context, queues []string, workerID string, limit int) (
 DequeueBatchPerQueue(ctx context.Context, workerID string, budgets map[string]int) ([]*core.Job, error)
 ```
 
-It preserves the same predicates and ordering as single-row `Dequeue`: active queue filter, `pending` status, due `run_at`, expired or empty lock, and `priority DESC, created_at ASC`.
+It preserves the same predicates and ordering as single-row `Dequeue`: active queue filter, `pending` status, due `run_at` (folded into the eligibility key `COALESCE(run_at, created_at)`), expired or empty lock, and `priority DESC, COALESCE(run_at, created_at) ASC`.
 
 ## Backend locking
 

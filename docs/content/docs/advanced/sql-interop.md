@@ -128,7 +128,7 @@ Example parameters:
 | `4` | `mailers` |
 | `5` | `0` |
 | `6` | `3` |
-| `7` | `NULL` or a `datetime(6)` |
+| `7` | `NULL` (run immediately), or a future timestamp to delay the job (e.g. `2026-01-01 12:00:00`) |
 
 ## Rules
 
