@@ -15,6 +15,7 @@ import (
 	"gorm.io/driver/mysql"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 	"gorm.io/gorm/logger"
 )
 
@@ -162,6 +163,83 @@ func TestMySQLSchemaAssertions(t *testing.T) {
 	require.NoError(t, db.AutoMigrate(&core.Job{}))
 	requireMySQLDispatcherColumnsNotNull(t, db)
 	requireMySQLUniqueKeyCollations(t, db)
+}
+
+func TestPostgresDequeuePlanUsesEligibleIndex(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL not set")
+	}
+	schemaName := uniqueSchemaAssertionsName("dequeue_plan")
+
+	adminDB, err := gorm.Open(postgres.Open(dsn), &gorm.Config{
+		Logger: logger.Default.LogMode(logger.Silent),
+	})
+	require.NoError(t, err, "open postgres test db")
+	closeDBOnCleanup(t, adminDB)
+	require.NoError(t, adminDB.Exec("CREATE SCHEMA "+quotePostgresIdent(schemaName)).Error)
+	t.Cleanup(func() {
+		require.NoError(t, adminDB.Exec("DROP SCHEMA IF EXISTS "+quotePostgresIdent(schemaName)+" CASCADE").Error)
+	})
+
+	db, err := gorm.Open(postgres.Open(postgresDSNWithSearchPath(t, dsn, schemaName)), &gorm.Config{
+		Logger: logger.Default.LogMode(logger.Silent),
+	})
+	require.NoError(t, err, "open isolated postgres schema")
+	closeDBOnCleanup(t, db)
+
+	ctx := context.Background()
+	s := NewGormStorage(db)
+	require.NoError(t, s.Migrate(ctx))
+	seedDequeuePlanJobs(t, ctx, db)
+	analyzeExplainJobs(t, db)
+
+	query := buildSchemaDequeuePlanQuery(s, []string{"default"}, 10)
+	var plan string
+	require.NoError(t, db.Raw("EXPLAIN (FORMAT JSON) "+query.Statement.SQL.String(), query.Statement.Vars...).Scan(&plan).Error)
+	t.Logf("postgres dequeue EXPLAIN JSON:\n%s", plan)
+	require.Contains(t, plan, `"Index Name": "idx_jobs_dequeue_eligible"`)
+	require.NotContains(t, plan, `"Node Type": "Sort"`)
+}
+
+func TestMySQLDequeuePlanUsesEligibleIndexWithoutFilesort(t *testing.T) {
+	dsn := os.Getenv("TEST_MYSQL_URL")
+	if dsn == "" {
+		t.Skip("TEST_MYSQL_URL not set")
+	}
+	databaseName := uniqueSchemaAssertionsName("dequeue_plan")
+
+	adminDB, err := gorm.Open(mysql.Open(dsn), &gorm.Config{
+		Logger: logger.Default.LogMode(logger.Silent),
+	})
+	require.NoError(t, err, "open mysql test db")
+	closeDBOnCleanup(t, adminDB)
+	require.NoError(t, adminDB.Exec("CREATE DATABASE "+quoteMySQLIdent(databaseName)).Error)
+	t.Cleanup(func() {
+		require.NoError(t, adminDB.Exec("DROP DATABASE IF EXISTS "+quoteMySQLIdent(databaseName)).Error)
+	})
+
+	db, err := gorm.Open(mysql.Open(mysqlDSNWithDatabase(t, dsn, databaseName)), &gorm.Config{
+		Logger: logger.Default.LogMode(logger.Silent),
+	})
+	require.NoError(t, err, "open isolated mysql database")
+	closeDBOnCleanup(t, db)
+
+	ctx := context.Background()
+	s := NewGormStorage(db)
+	require.NoError(t, s.Migrate(ctx))
+	seedDequeuePlanJobs(t, ctx, db)
+	analyzeExplainJobs(t, db)
+
+	query := buildSchemaDequeuePlanQuery(s, []string{"default"}, 10)
+	var plan string
+	require.NoError(t, db.Raw("EXPLAIN FORMAT=JSON "+query.Statement.SQL.String(), query.Statement.Vars...).Scan(&plan).Error)
+	t.Logf("mysql dequeue EXPLAIN JSON:\n%s", plan)
+	require.Contains(t, plan, `"key": "idx_jobs_dequeue_eligible"`)
+	// EXPLAIN FORMAT=JSON always emits the "using_filesort" field; assert it is
+	// false (no filesort), not merely that the substring "filesort" is absent —
+	// the field name itself contains "filesort" even when its value is false.
+	require.NotContains(t, plan, `"using_filesort": true`)
 }
 
 func TestMySQLMigrateRequiresUTCSession(t *testing.T) {
@@ -325,6 +403,49 @@ func mysqlIndexExists(t *testing.T, db *gorm.DB, indexName string) bool {
 		  AND INDEX_NAME = ?
 	`, indexName).Scan(&count).Error)
 	return count > 0
+}
+
+func buildSchemaDequeuePlanQuery(s *GormStorage, queues []string, limit int) *gorm.DB {
+	var candidates []*core.Job
+	eligExpr := s.dequeueEligibleExpr()
+	return s.db.Session(&gorm.Session{DryRun: true}).
+		Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).
+		Where("queue IN ?", queues).
+		Where("status = ?", core.StatusPending).
+		Where(eligExpr+" <= ?", s.nowExpr()).
+		Where("(locked_until IS NULL OR locked_until < ?)", s.nowExpr()).
+		Order("priority DESC, " + eligExpr + " ASC").
+		Limit(limit).
+		Find(&candidates)
+}
+
+func seedDequeuePlanJobs(t *testing.T, ctx context.Context, db *gorm.DB) {
+	t.Helper()
+
+	now := time.Now().UTC()
+	queues := []string{"default", "critical", "bulk"}
+	// Seed a large backlog so the cost gap between the correct composite-index
+	// plan and the idx_jobs_status full-scan+filesort is decisive (not within the
+	// optimizer's ~1% noise margin). At a small seed the planner can flip under
+	// buffer-pool contention and make the plan-aware guard flaky; at this scale
+	// the ~LIMIT-bounded index lookup dwarfs sorting thousands of pending rows.
+	const seedCount = 30000
+	jobs := make([]*core.Job, 0, seedCount)
+	for i := 0; i < seedCount; i++ {
+		createdAt := now.Add(-time.Duration(seedCount-i) * time.Second)
+		jobs = append(jobs, &core.Job{
+			ID:         fmt.Sprintf("dequeue-plan-%04d", i),
+			Type:       "explain.dequeue",
+			Args:       []byte(`{}`),
+			Queue:      queues[i%len(queues)],
+			Priority:   i % 31,
+			Status:     core.StatusPending,
+			MaxRetries: 3,
+			CreatedAt:  createdAt,
+			UpdatedAt:  createdAt,
+		})
+	}
+	require.NoError(t, db.WithContext(ctx).CreateInBatches(jobs, 250).Error)
 }
 
 func postgresDSNWithSearchPath(t *testing.T, dsn, schemaName string) string {

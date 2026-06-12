@@ -210,6 +210,11 @@ var schemaMigrations = []schemaMigration{
 		Name:    "dlq_metadata_index",
 		Up:      migrateDLQMetadataIndex,
 	},
+	{
+		Version: 17,
+		Name:    "mysql_dequeue_index_order",
+		Up:      migrateMySQLDequeueIndexOrder,
+	},
 }
 
 // applyPendingMigrations runs every migration whose version is absent from the
@@ -684,6 +689,40 @@ func migrateDequeueEligibilityIndex(ctx context.Context, db *gorm.DB, dialect st
 		}
 		return nil
 	}
+}
+
+func migrateMySQLDequeueIndexOrder(ctx context.Context, db *gorm.DB, dialect string) error {
+	if dialect != dialectMySQL {
+		return nil
+	}
+
+	var leadingColumn sql.NullString
+	if err := db.WithContext(ctx).Raw(`
+		SELECT COLUMN_NAME
+		FROM information_schema.STATISTICS
+		WHERE TABLE_SCHEMA = DATABASE()
+		  AND TABLE_NAME = 'jobs'
+		  AND INDEX_NAME = 'idx_jobs_dequeue_eligible'
+		  AND SEQ_IN_INDEX = 1
+	`).Scan(&leadingColumn).Error; err != nil {
+		return fmt.Errorf("read idx_jobs_dequeue_eligible leading column: %w", err)
+	}
+	if leadingColumn.Valid && strings.EqualFold(leadingColumn.String, "status") {
+		return nil
+	}
+
+	m := db.Migrator()
+	if m.HasIndex(&core.Job{}, "idx_jobs_dequeue_eligible") {
+		if err := m.DropIndex(&core.Job{}, "idx_jobs_dequeue_eligible"); err != nil && !isBenignDDLError(err) {
+			return fmt.Errorf("drop idx_jobs_dequeue_eligible: %w", err)
+		}
+	}
+	if err := db.WithContext(ctx).Exec(
+		"CREATE INDEX idx_jobs_dequeue_eligible ON jobs (status, priority DESC, dq_eligible_at, queue)",
+	).Error; err != nil && !isBenignDDLError(err) {
+		return fmt.Errorf("create idx_jobs_dequeue_eligible: %w", err)
+	}
+	return nil
 }
 
 func migrateIntegrityForeignKeys(ctx context.Context, db *gorm.DB, dialect string) error {
