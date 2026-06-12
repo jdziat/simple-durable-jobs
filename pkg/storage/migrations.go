@@ -215,6 +215,11 @@ var schemaMigrations = []schemaMigration{
 		Name:    "mysql_dequeue_index_order",
 		Up:      migrateMySQLDequeueIndexOrder,
 	},
+	{
+		Version: 18,
+		Name:    "deadletter_precision_align",
+		Up:      migrateDeadLetterPrecisionAlign,
+	},
 }
 
 // applyPendingMigrations runs every migration whose version is absent from the
@@ -721,6 +726,33 @@ func migrateMySQLDequeueIndexOrder(ctx context.Context, db *gorm.DB, dialect str
 		"CREATE INDEX idx_jobs_dequeue_eligible ON jobs (status, priority DESC, dq_eligible_at, queue)",
 	).Error; err != nil && !isBenignDDLError(err) {
 		return fmt.Errorf("create idx_jobs_dequeue_eligible: %w", err)
+	}
+	return nil
+}
+
+func migrateDeadLetterPrecisionAlign(ctx context.Context, db *gorm.DB, dialect string) error {
+	if dialect != dialectMySQL {
+		return nil
+	}
+
+	var precision sql.NullInt64
+	if err := db.WithContext(ctx).Raw(`
+		SELECT DATETIME_PRECISION
+		FROM information_schema.COLUMNS
+		WHERE TABLE_SCHEMA = DATABASE()
+		  AND TABLE_NAME = 'jobs'
+		  AND COLUMN_NAME = 'dead_lettered_at'
+	`).Scan(&precision).Error; err != nil {
+		return fmt.Errorf("read dead_lettered_at precision: %w", err)
+	}
+	if precision.Valid && precision.Int64 == 3 {
+		return nil
+	}
+
+	if err := db.WithContext(ctx).Exec(
+		"ALTER TABLE jobs MODIFY dead_lettered_at datetime(3) NULL",
+	).Error; err != nil && !isBenignDDLError(err) {
+		return fmt.Errorf("modify dead_lettered_at precision: %w", err)
 	}
 	return nil
 }

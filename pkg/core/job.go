@@ -40,9 +40,9 @@ type Job struct {
 	// Determinism is the replay strictness mode
 	// (0=ExplicitCheckpoints,1=Strict,2=BestEffort).
 	// BestEffort relaxes the Call replay type-mismatch guard.
-	Determinism      int        `gorm:"not null;default:0"`
-	LastError        string     `gorm:"type:text"`
-	DeadLetteredAt   *time.Time `gorm:"precision:6"`
+	Determinism      int    `gorm:"not null;default:0"`
+	LastError        string `gorm:"type:text"`
+	DeadLetteredAt   *time.Time
 	DeadLetterReason string     `gorm:"type:text"`
 	RunAt            *time.Time `gorm:"index"`
 	StartedAt        *time.Time

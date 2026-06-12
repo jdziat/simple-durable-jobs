@@ -45,6 +45,12 @@ func TestPostgresSchemaAssertions(t *testing.T) {
 	ctx := context.Background()
 	s := NewGormStorage(db)
 	require.NoError(t, s.Migrate(ctx))
+	beforeDeadLetterType := requirePostgresDeadLetteredAtType(t, db)
+	require.Equal(t, postgresColumnType{DataType: "timestamp with time zone", DateTimePrecision: 6}, beforeDeadLetterType)
+
+	require.NoError(t, s.Migrate(ctx), "second Migrate must not alter jobs.dead_lettered_at")
+	afterDeadLetterType := requirePostgresDeadLetteredAtType(t, db)
+	require.Equal(t, beforeDeadLetterType, afterDeadLetterType, "second Migrate must leave dead_lettered_at type byte-identical")
 
 	defs := map[string]string{
 		"idx_jobs_dead_lettered_at":   "dead_lettered_at IS NOT NULL",
@@ -113,10 +119,10 @@ func TestMySQLSchemaAssertions(t *testing.T) {
 	ctx := context.Background()
 	s := NewGormStorage(db)
 	require.NoError(t, s.Migrate(ctx))
-	requireMySQLDeadLetteredAtPrecision(t, db, 6)
+	requireMySQLDeadLetteredAtPrecision(t, db, 3)
 
 	require.NoError(t, s.Migrate(ctx), "second Migrate must not let AutoMigrate revert dead_lettered_at precision")
-	requireMySQLDeadLetteredAtPrecision(t, db, 6)
+	requireMySQLDeadLetteredAtPrecision(t, db, 3)
 
 	var activeUniqueKeyCount int
 	require.NoError(t, db.Raw(`
@@ -332,6 +338,25 @@ func requirePostgresFanOutThresholdDouble(t *testing.T, db *gorm.DB) {
 	require.Equal(t, "double precision", dataType, "postgres fan_outs.threshold must be double precision")
 }
 
+type postgresColumnType struct {
+	DataType          string `gorm:"column:data_type"`
+	DateTimePrecision int    `gorm:"column:datetime_precision"`
+}
+
+func requirePostgresDeadLetteredAtType(t *testing.T, db *gorm.DB) postgresColumnType {
+	t.Helper()
+	var columnType postgresColumnType
+	require.NoError(t, db.Raw(`
+		SELECT data_type, datetime_precision
+		FROM information_schema.COLUMNS
+		WHERE table_schema = CURRENT_SCHEMA()
+		  AND table_name = 'jobs'
+		  AND column_name = 'dead_lettered_at'
+	`).Scan(&columnType).Error)
+	require.NotEmpty(t, columnType.DataType, "postgres jobs.dead_lettered_at must exist")
+	return columnType
+}
+
 func requireMySQLUniqueKeyCollations(t *testing.T, db *gorm.DB) {
 	t.Helper()
 	var count int
@@ -490,4 +515,71 @@ func quotePostgresIdent(ident string) string {
 
 func quoteMySQLIdent(ident string) string {
 	return "`" + strings.ReplaceAll(ident, "`", "``") + "`"
+}
+
+// stmtCaptureLogger records every SQL statement GORM executes so a test can
+// assert what a 2nd Migrate() actually *issues*, not just the resulting schema.
+// This catches a re-issued no-op ALTER (e.g. timestamptz(6)->timestamptz(6))
+// that a structural before/after type check cannot see but that still takes an
+// AccessExclusiveLock — the P1b dead_lettered_at flap class.
+type stmtCaptureLogger struct {
+	logger.Interface
+	stmts []string
+}
+
+// LogMode must return the wrapper (GORM uses the returned logger), otherwise the
+// embedded logger would be used and Trace would not be captured.
+func (c *stmtCaptureLogger) LogMode(level logger.LogLevel) logger.Interface {
+	c.Interface = c.Interface.LogMode(level)
+	return c
+}
+
+func (c *stmtCaptureLogger) Trace(ctx context.Context, begin time.Time, fc func() (string, int64), err error) {
+	sql, _ := fc()
+	c.stmts = append(c.stmts, sql)
+}
+
+// TestPostgresDeadLetteredAtMigrateNoFlap is the statement-level P1b regression
+// guard: the structural before/after type assertion in TestPostgresSchemaAssertions
+// would still pass if the precision:6 tag were reintroduced (the re-issued
+// ALTER COLUMN dead_lettered_at TYPE timestamptz(6) leaves the resulting type
+// byte-identical), so it cannot catch the actual AccessExclusiveLock flap. This
+// captures GORM's statements on a steady-state 2nd Migrate and asserts none
+// ALTER dead_lettered_at. Scoped to the column so the pre-existing (S18-adjacent)
+// fan_outs.threshold SET DEFAULT churn is ignored.
+func TestPostgresDeadLetteredAtMigrateNoFlap(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL not set")
+	}
+	schemaName := uniqueSchemaAssertionsName("deadletter_flap")
+
+	adminDB, err := gorm.Open(postgres.Open(dsn), &gorm.Config{
+		Logger: logger.Default.LogMode(logger.Silent),
+	})
+	require.NoError(t, err, "open postgres test db")
+	closeDBOnCleanup(t, adminDB)
+	require.NoError(t, adminDB.Exec("CREATE SCHEMA "+quotePostgresIdent(schemaName)).Error)
+	t.Cleanup(func() {
+		require.NoError(t, adminDB.Exec("DROP SCHEMA IF EXISTS "+quotePostgresIdent(schemaName)+" CASCADE").Error)
+	})
+
+	capture := &stmtCaptureLogger{Interface: logger.Default.LogMode(logger.Silent)}
+	db, err := gorm.Open(postgres.Open(postgresDSNWithSearchPath(t, dsn, schemaName)), &gorm.Config{
+		Logger: capture,
+	})
+	require.NoError(t, err, "open isolated postgres schema")
+	closeDBOnCleanup(t, db)
+
+	ctx := context.Background()
+	s := NewGormStorage(db)
+	require.NoError(t, s.Migrate(ctx)) // build the schema
+	capture.stmts = nil                // capture only the steady-state 2nd Migrate
+	require.NoError(t, s.Migrate(ctx))
+
+	for _, stmt := range capture.stmts {
+		lower := strings.ToLower(stmt)
+		require.Falsef(t, strings.Contains(lower, "alter") && strings.Contains(lower, "dead_lettered_at"),
+			"a steady-state 2nd Migrate must not ALTER dead_lettered_at (precision flap reintroduced?): %s", stmt)
+	}
 }
