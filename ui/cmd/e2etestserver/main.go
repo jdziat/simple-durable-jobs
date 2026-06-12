@@ -64,7 +64,7 @@ func main() {
 	ctx, cancel := context.WithCancel(seedCtx)
 	defer cancel()
 
-	handler := ui.Handler(store, ui.WithQueue(q), ui.WithContext(ctx), ui.WithInsecureAllowUnauthenticatedWrites())
+	handler := ui.Handler(store, ui.WithQueue(q), ui.WithContext(ctx), ui.WithInsecureAllowUnauthenticated())
 
 	ln, err := net.Listen("tcp", "127.0.0.1:"+*port)
 	if err != nil {

@@ -19,12 +19,12 @@ type optionFunc func(*config)
 func (f optionFunc) apply(c *config) { f(c) }
 
 type config struct {
-	ctx                                context.Context
-	middleware                         func(http.Handler) http.Handler
-	queue                              *queue.Queue
-	statsRetention                     time.Duration
-	insecureAllowUnauthenticatedWrites bool
-	authorizer                         Authorizer
+	ctx                          context.Context
+	middleware                   func(http.Handler) http.Handler
+	queue                        *queue.Queue
+	statsRetention               time.Duration
+	insecureAllowUnauthenticated bool
+	authorizer                   Authorizer
 }
 
 // WithMiddleware wraps the handler with middleware (auth, logging, etc.).
@@ -50,15 +50,24 @@ func WithStatsRetention(d time.Duration) Option {
 	})
 }
 
-// WithInsecureAllowUnauthenticatedWrites permits mutating RPCs without auth middleware.
-// This is intended for local development and tests only.
-func WithInsecureAllowUnauthenticatedWrites() Option {
+// WithInsecureAllowUnauthenticated permits all dashboard RPCs without an authorizer.
+// This is intended for local development and trusted networks only.
+func WithInsecureAllowUnauthenticated() Option {
 	return optionFunc(func(c *config) {
-		c.insecureAllowUnauthenticatedWrites = true
+		c.insecureAllowUnauthenticated = true
 	})
 }
 
-// WithAuthorizer configures per-action authorization for mutating dashboard RPCs.
+// WithInsecureAllowUnauthenticatedWrites permits all dashboard RPCs without an
+// authorizer. This is intended for local development and trusted networks only.
+//
+// Deprecated: use [WithInsecureAllowUnauthenticated], which makes explicit that
+// the unauthenticated surface includes reads (job payloads), not only writes.
+func WithInsecureAllowUnauthenticatedWrites() Option {
+	return WithInsecureAllowUnauthenticated()
+}
+
+// WithAuthorizer configures per-action authorization for dashboard RPCs.
 func WithAuthorizer(a Authorizer) Option {
 	return optionFunc(func(c *config) {
 		c.authorizer = a

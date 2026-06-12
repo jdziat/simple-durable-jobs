@@ -321,10 +321,13 @@ ctx, cancel := context.WithCancel(context.Background())
 defer cancel()
 
 mux.Handle("/jobs/", http.StripPrefix("/jobs", ui.Handler(storage,
-    ui.WithQueue(queue),      // Enable event streaming
-    ui.WithContext(ctx),      // Lifecycle context for graceful shutdown
+    ui.WithQueue(queue),                         // Enable event streaming
+    ui.WithContext(ctx),                         // Lifecycle context for graceful shutdown
+    ui.WithInsecureAllowUnauthenticated(),       // Local/trusted networks only
 )))
 ```
+
+The dashboard is secure by default; use `ui.WithInsecureAllowUnauthenticated()` only for local development or trusted networks, and use an `ui.Authorizer` for production.
 
 The dashboard shows real-time queue stats, historical charts, live event streaming, and job management controls.
 

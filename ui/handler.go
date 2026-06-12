@@ -39,6 +39,9 @@ func Handler(storage core.Storage, opts ...Option) http.Handler {
 	for _, opt := range opts {
 		opt.apply(cfg)
 	}
+	if cfg.authorizer == nil && cfg.insecureAllowUnauthenticated {
+		slog.Default().Warn("jobs UI running WITHOUT authentication — all job payloads are exposed; use only on a local/trusted network")
+	}
 
 	// Set up stats storage if we have a GORM-backed storage
 	var statsStorage StatsStorage
@@ -67,8 +70,8 @@ func Handler(storage core.Storage, opts ...Option) http.Handler {
 	// Register Connect-RPC handler
 	path, handler := jobsv1connect.NewJobsServiceHandler(
 		svc,
-		connect.WithInterceptors(writeAuthInterceptor(
-			cfg.middleware != nil || cfg.insecureAllowUnauthenticatedWrites,
+		connect.WithInterceptors(authInterceptor(
+			cfg.insecureAllowUnauthenticated,
 			cfg.authorizer,
 		)),
 	)
@@ -132,29 +135,82 @@ var mutatingProcedures = map[string]Action{
 	jobsv1connect.JobsServicePurgeQueueProcedure:     ActionPurgeQueue,
 }
 
-func writeAuthInterceptor(allowWrites bool, authorizer Authorizer) connect.Interceptor {
-	return connect.UnaryInterceptorFunc(func(next connect.UnaryFunc) connect.UnaryFunc {
-		return connect.UnaryFunc(func(ctx context.Context, req connect.AnyRequest) (connect.AnyResponse, error) {
-			action, mutates := mutatingProcedures[req.Spec().Procedure]
-			if !mutates {
-				return next(ctx, req)
-			}
-			if authorizer != nil {
-				if err := authorizer.Authorize(ctx, action); err != nil {
-					var connectErr *connect.Error
-					if errors.As(err, &connectErr) {
-						return nil, connectErr
-					}
-					return nil, connect.NewError(connect.CodePermissionDenied, err)
-				}
-				return next(ctx, req)
-			}
-			if !allowWrites {
-				return nil, connect.NewError(connect.CodePermissionDenied, errors.New("jobs UI write RPCs require auth middleware or explicit insecure opt-in"))
-			}
-			return next(ctx, req)
-		})
+var readProcedures = map[string]Action{
+	jobsv1connect.JobsServiceGetStatsProcedure:          ActionViewStats,
+	jobsv1connect.JobsServiceGetStatsHistoryProcedure:   ActionViewStats,
+	jobsv1connect.JobsServiceListJobsProcedure:          ActionViewJobs,
+	jobsv1connect.JobsServiceGetJobProcedure:            ActionViewJob,
+	jobsv1connect.JobsServiceListQueuesProcedure:        ActionViewStats,
+	jobsv1connect.JobsServiceListScheduledJobsProcedure: ActionViewJobs,
+	jobsv1connect.JobsServiceGetWorkflowProcedure:       ActionViewJob,
+	jobsv1connect.JobsServiceListWorkflowsProcedure:     ActionViewJobs,
+	jobsv1connect.JobsServiceWatchEventsProcedure:       ActionWatchEvents,
+}
+
+const authRequiredMessage = "jobs UI requires an Authorizer (ui.WithAuthorizer) or an explicit ui.WithInsecureAllowUnauthenticated() for local/trusted-network use"
+
+type dashboardAuthInterceptor struct {
+	insecureAllowUnauthenticated bool
+	authorizer                   Authorizer
+}
+
+func authInterceptor(insecureAllowUnauthenticated bool, authorizer Authorizer) connect.Interceptor {
+	return dashboardAuthInterceptor{
+		insecureAllowUnauthenticated: insecureAllowUnauthenticated,
+		authorizer:                   authorizer,
+	}
+}
+
+func (i dashboardAuthInterceptor) WrapUnary(next connect.UnaryFunc) connect.UnaryFunc {
+	return connect.UnaryFunc(func(ctx context.Context, req connect.AnyRequest) (connect.AnyResponse, error) {
+		if err := i.authorize(ctx, req.Spec().Procedure); err != nil {
+			return nil, err
+		}
+		return next(ctx, req)
 	})
+}
+
+func (i dashboardAuthInterceptor) WrapStreamingClient(next connect.StreamingClientFunc) connect.StreamingClientFunc {
+	return next
+}
+
+func (i dashboardAuthInterceptor) WrapStreamingHandler(next connect.StreamingHandlerFunc) connect.StreamingHandlerFunc {
+	return connect.StreamingHandlerFunc(func(ctx context.Context, conn connect.StreamingHandlerConn) error {
+		if err := i.authorize(ctx, conn.Spec().Procedure); err != nil {
+			return err
+		}
+		return next(ctx, conn)
+	})
+}
+
+func (i dashboardAuthInterceptor) authorize(ctx context.Context, procedure string) error {
+	action := actionForProcedure(procedure)
+	if i.authorizer != nil {
+		if err := i.authorizer.Authorize(ctx, action); err != nil {
+			var connectErr *connect.Error
+			if errors.As(err, &connectErr) {
+				return connectErr
+			}
+			return connect.NewError(connect.CodePermissionDenied, err)
+		}
+		return nil
+	}
+	if i.insecureAllowUnauthenticated {
+		return nil
+	}
+	return connect.NewError(connect.CodePermissionDenied, errors.New(authRequiredMessage))
+}
+
+func actionForProcedure(procedure string) Action {
+	if action, mutates := mutatingProcedures[procedure]; mutates {
+		return action
+	}
+	if action, ok := readProcedures[procedure]; ok {
+		return action
+	}
+	// Any read procedure not explicitly mapped is still authorized (fail-closed),
+	// just under the coarse ActionViewJobs — never treated as public.
+	return ActionViewJobs
 }
 
 const placeholderHTML = `<!DOCTYPE html>
