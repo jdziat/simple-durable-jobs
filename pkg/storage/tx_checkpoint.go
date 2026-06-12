@@ -3,7 +3,6 @@ package storage
 import (
 	"context"
 
-	"github.com/google/uuid"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 
@@ -23,7 +22,7 @@ var _ TxCheckpointer = (*GormStorage)(nil)
 // handle.
 func (s *GormStorage) SaveCheckpointTx(ctx context.Context, tx *gorm.DB, cp *core.Checkpoint) error {
 	if cp.ID == "" {
-		cp.ID = uuid.New().String()
+		cp.ID = core.NewID()
 	}
 	row, err := s.encodedCheckpointForSave(cp)
 	if err != nil {

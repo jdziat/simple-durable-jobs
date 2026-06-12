@@ -8,7 +8,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 	"gorm.io/gorm/logger"
@@ -877,7 +876,7 @@ func (s *GormStorage) accountTerminalWithFanOut(ctx context.Context, jobID, work
 // the latest result and error fields are updated in place (upsert).
 func (s *GormStorage) SaveCheckpoint(ctx context.Context, cp *core.Checkpoint) error {
 	if cp.ID == "" {
-		cp.ID = uuid.New().String()
+		cp.ID = core.NewID()
 	}
 	row, err := s.encodedCheckpointForSave(cp)
 	if err != nil {
@@ -1238,7 +1237,7 @@ func (s *GormStorage) GetJobsByStatus(ctx context.Context, status core.JobStatus
 // CreateFanOut creates a new fan-out record.
 func (s *GormStorage) CreateFanOut(ctx context.Context, fanOut *core.FanOut) error {
 	if fanOut.ID == "" {
-		fanOut.ID = uuid.New().String()
+		fanOut.ID = core.NewID()
 	}
 	return s.db.WithContext(ctx).Create(fanOut).Error
 }

@@ -17,8 +17,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
-
 	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
 	intctx "github.com/jdziat/simple-durable-jobs/v2/pkg/internal/context"
 	"github.com/jdziat/simple-durable-jobs/v2/pkg/security"
@@ -113,7 +111,7 @@ func nextCheckpoint(cs *intctx.CallState, ctype string) (idx int, cp *core.Check
 
 func writeCheckpoint(ctx context.Context, jc *intctx.JobContext, idx int, ctype string, result []byte) error {
 	cp := &core.Checkpoint{
-		ID:        uuid.New().String(),
+		ID:        core.NewID(),
 		JobID:     jc.Job.ID,
 		CallIndex: idx,
 		CallType:  ctype,
@@ -163,7 +161,7 @@ func WaitForSignal[T any](ctx context.Context, name string) (T, error) {
 	// outcomes.
 	sig, err := ss.ConsumeSignalTx(ctx, jc.Job.ID, name, func(s *core.Signal) (*core.Checkpoint, error) {
 		return &core.Checkpoint{
-			ID:        uuid.New().String(),
+			ID:        core.NewID(),
 			JobID:     jc.Job.ID,
 			CallIndex: idx,
 			CallType:  ctype,
@@ -288,7 +286,7 @@ func WaitForSignalTimeout[T any](ctx context.Context, name string, d time.Durati
 			return nil, fmt.Errorf("signal: marshal checkpoint: %w", e)
 		}
 		return &core.Checkpoint{
-			ID:        uuid.New().String(),
+			ID:        core.NewID(),
 			JobID:     jc.Job.ID,
 			CallIndex: idx,
 			CallType:  ctype,
@@ -491,7 +489,7 @@ func DrainSignals[T any](ctx context.Context, name string) ([]T, error) {
 			return nil, fmt.Errorf("signal: marshal drain checkpoint: %w", e)
 		}
 		return &core.Checkpoint{
-			ID:        uuid.New().String(),
+			ID:        core.NewID(),
 			JobID:     jc.Job.ID,
 			CallIndex: idx,
 			CallType:  ctype,

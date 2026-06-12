@@ -6,8 +6,6 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/google/uuid"
-
 	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
 	intctx "github.com/jdziat/simple-durable-jobs/v2/pkg/internal/context"
 	"github.com/jdziat/simple-durable-jobs/v2/pkg/security"
@@ -95,7 +93,7 @@ func FanOut[T any](ctx context.Context, subJobs []SubJob, opts ...Option) ([]Res
 	}
 
 	// First execution: create fan-out and sub-jobs
-	fanOutID = uuid.New().String()
+	fanOutID = core.NewID()
 	jobs, err := buildSubJobs(subJobs, cfg, jc, fanOutID)
 	if err != nil {
 		return nil, err
@@ -125,7 +123,7 @@ func FanOut[T any](ctx context.Context, subJobs []SubJob, opts ...Option) ([]Res
 		CallIndex: callIndex,
 	})
 	cp := &core.Checkpoint{
-		ID:        uuid.New().String(),
+		ID:        core.NewID(),
 		JobID:     jc.Job.ID,
 		CallIndex: callIndex,
 		CallType:  "fanout",
@@ -213,7 +211,7 @@ func buildSubJobs(subJobs []SubJob, cfg *config, jc *intctx.JobContext, fanOutID
 
 		// Fan-out children inherit the parent's tenant and metadata so tenant
 		// scope and queryable context flow consistently through the workflow.
-		jobID := uuid.New().String()
+		jobID := core.NewID()
 		jobs[i] = &core.Job{
 			ID:          jobID,
 			Type:        sj.Type,

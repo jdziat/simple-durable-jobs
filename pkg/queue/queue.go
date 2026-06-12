@@ -13,7 +13,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/google/uuid"
 	"gorm.io/gorm"
 
 	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
@@ -323,7 +322,7 @@ func (q *Queue) buildJob(name string, args any, options *Options) (*core.Job, er
 	}
 
 	job := &core.Job{
-		ID:          uuid.New().String(),
+		ID:          core.NewID(),
 		Type:        name,
 		Args:        argsBytes,
 		Queue:       options.Queue,

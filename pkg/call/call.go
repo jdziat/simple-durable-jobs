@@ -6,8 +6,6 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/google/uuid"
-
 	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
 	intctx "github.com/jdziat/simple-durable-jobs/v2/pkg/internal/context"
 	"github.com/jdziat/simple-durable-jobs/v2/pkg/internal/handler"
@@ -132,7 +130,7 @@ func CallWithCheckpointCtx[T any](execCtx, checkpointCtx context.Context, name s
 	// the write succeeds even if execCtx's deadline fired just after the handler
 	// returned.
 	cp := &core.Checkpoint{
-		ID:        uuid.New().String(),
+		ID:        core.NewID(),
 		JobID:     jc.Job.ID,
 		CallIndex: callIndex,
 		CallType:  name,
