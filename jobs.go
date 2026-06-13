@@ -1129,9 +1129,11 @@ func newDeadLetterFilter(opts ...DeadLetterOption) DeadLetterFilter {
 // Signal delivers a named signal carrying payload to a job (workflow). Signal
 // names starting with "_" are reserved for library-internal primitives such as
 // durable timers and are rejected with ErrSignalNameReserved. The signal is
-// buffered durably, so it is not lost if sent before the handler waits for it;
-// and if the target job is currently waiting on a signal, this resumes it
-// promptly (a recovery poll is the backstop). Delivery is FIFO per (job, name).
+// buffered durably, so it is not lost if sent before the handler waits for it.
+// Once Signal returns nil, the signal is durably delivered in FIFO order per
+// (job, name). If the target job is currently waiting on a signal, Signal wakes
+// it immediately when possible; otherwise the resume poll wakes it. A failed
+// immediate wake after delivery is not returned as an error.
 //
 // The handler receives signals with WaitForSignal / WaitForSignalTimeout /
 // CheckSignal / DrainSignals. Returns ErrJobNotFound if the job does not exist,
@@ -1193,9 +1195,8 @@ func Signal(ctx context.Context, q *Queue, jobID, name string, payload any) erro
 		if r, ok := q.Storage().(signalResumer); ok {
 			resumed, err := r.ResumeSignalWaitingJob(ctx, jobID)
 			if err != nil {
-				return fmt.Errorf("jobs: signal sent but resume failed (poll will recover): %w", err)
-			}
-			if resumed {
+				slog.Default().Warn("signal delivered but immediate resume failed; the resume poll will wake the job", "job_id", jobID, "name", name, "error", err)
+			} else if resumed {
 				q.Emit(&core.JobResumedBySignal{JobID: jobID, SignalName: name, Timestamp: time.Now()})
 			}
 		}

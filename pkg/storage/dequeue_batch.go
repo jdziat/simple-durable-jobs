@@ -85,7 +85,7 @@ func activeQueuesExcludingPaused(queues, pausedQueues []string) []string {
 
 func (s *GormStorage) dequeueBatchLocked(ctx context.Context, queues []string, workerID string, limit int, perQueueBudgets map[string]int) ([]*core.Job, error) {
 	nowExpr := s.nowExpr()
-	lockUntilExpr := s.offsetExpr(s.lockDuration)
+	lockUntilExpr := s.offsetExpr(time.Duration(s.lockDuration.Load()))
 	silentDB := s.db.Session(&gorm.Session{Logger: s.db.Logger.LogMode(logger.Silent)})
 
 	claimedIDs := make([]string, 0, limit)
@@ -253,7 +253,7 @@ func sleepDequeueBatchRetry(ctx context.Context, d time.Duration) error {
 
 func (s *GormStorage) dequeueBatchSQLite(ctx context.Context, queues []string, workerID string, limit int, perQueueBudgets map[string]int) ([]*core.Job, error) {
 	now := time.Now()
-	lockUntil := now.Add(s.lockDuration)
+	lockUntil := now.Add(time.Duration(s.lockDuration.Load()))
 
 	var jobs []*core.Job
 	err := s.withSerializationRetry(ctx, func() error {

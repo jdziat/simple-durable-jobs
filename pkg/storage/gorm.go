@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"gorm.io/gorm"
@@ -35,7 +36,7 @@ type GormStorageOption func(*GormStorage)
 // dequeued or extended by a heartbeat. The default is 45 minutes.
 func WithStorageLockDuration(d time.Duration) GormStorageOption {
 	return func(s *GormStorage) {
-		s.lockDuration = d
+		s.lockDuration.Store(int64(d))
 	}
 }
 
@@ -68,7 +69,7 @@ var _ core.Storage = (*GormStorage)(nil)
 type GormStorage struct {
 	db              *gorm.DB
 	isSQLite        bool
-	lockDuration    time.Duration
+	lockDuration    atomic.Int64
 	codec           core.PayloadCodec
 	skipDefaultPool bool
 
@@ -80,7 +81,7 @@ type GormStorage struct {
 	// RetentionDeleteCheckpointsOnComplete option (wired through
 	// SetDeleteCheckpointsOnComplete) to bound the checkpoints table. Never
 	// affects the failure path — retry replay reads checkpoints.
-	deleteCheckpointsOnComplete bool
+	deleteCheckpointsOnComplete atomic.Bool
 }
 
 // NewGormStorage creates a new GORM-backed storage. For file-based SQLite under
@@ -114,7 +115,8 @@ func NewGormStorage(db *gorm.DB, opts ...GormStorageOption) *GormStorage {
 		dialector := db.Name()
 		isSQLite = strings.Contains(strings.ToLower(dialector), "sqlite")
 	}
-	s := &GormStorage{db: db, isSQLite: isSQLite, lockDuration: defaultLockDuration, codec: core.IdentityCodec}
+	s := &GormStorage{db: db, isSQLite: isSQLite, codec: core.IdentityCodec}
+	s.lockDuration.Store(int64(defaultLockDuration))
 	if s.isSQLite {
 		// NOTE: a one-shot PRAGMA only affects the single pooled connection it
 		// runs on; connections the pool opens later default to busy_timeout=0.
@@ -133,19 +135,24 @@ func NewGormStorage(db *gorm.DB, opts ...GormStorageOption) *GormStorage {
 	return s
 }
 
-// SetLockDuration updates the lock duration after construction.
+// SetLockDuration updates storage-wide lock state; last setter wins, so use
+// separate GormStorage instances for divergent per-worker config.
 // This is used by the worker when WithLockDuration is passed as a worker option.
 func (s *GormStorage) SetLockDuration(d time.Duration) {
-	s.lockDuration = d
+	s.lockDuration.Store(int64(d))
 }
 
-// SetDeleteCheckpointsOnComplete toggles transactional checkpoint GC on the
+// SetDeleteCheckpointsOnComplete toggles storage-wide checkpoint GC state; last
+// setter wins, so use separate GormStorage instances for divergent per-worker
+// config.
+//
+// It applies checkpoint GC on the
 // success terminal write. The worker calls it when the opt-in
 // RetentionDeleteCheckpointsOnComplete option is set. Default (unset) preserves
 // completed-job checkpoints so the dashboard can still show their phase results.
 // It never affects the failure path; retry replay always keeps checkpoints.
 func (s *GormStorage) SetDeleteCheckpointsOnComplete(enabled bool) {
-	s.deleteCheckpointsOnComplete = enabled
+	s.deleteCheckpointsOnComplete.Store(enabled)
 }
 
 // IsSQLite returns true if the storage is using SQLite.
@@ -432,7 +439,8 @@ func (s *GormStorage) EnqueueUnique(ctx context.Context, job *core.Job, uniqueKe
 func (s *GormStorage) Dequeue(ctx context.Context, queues []string, workerID string) (*core.Job, error) {
 	var job core.Job
 	now := time.Now()
-	lockUntil := now.Add(s.lockDuration)
+	lockDuration := time.Duration(s.lockDuration.Load())
+	lockUntil := now.Add(lockDuration)
 
 	// Get paused queues
 	pausedQueues, err := s.GetPausedQueues(ctx)
@@ -479,7 +487,7 @@ func (s *GormStorage) Dequeue(ctx context.Context, queues []string, workerID str
 	// check — it can never make a just-taken lock look already expired. Do not
 	// add a predicate that assumes the two reads are equal.
 	nowExpr := s.nowExpr()
-	lockUntilExpr := s.offsetExpr(s.lockDuration)
+	lockUntilExpr := s.offsetExpr(lockDuration)
 	silentDB := s.db.Session(&gorm.Session{Logger: s.db.Logger.LogMode(logger.Silent)})
 	err = silentDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		// FOR UPDATE SKIP LOCKED ensures:
@@ -632,7 +640,7 @@ func (s *GormStorage) Complete(ctx context.Context, jobID string, workerID strin
 		if result.RowsAffected == 0 {
 			return core.ErrJobNotOwned
 		}
-		if s.deleteCheckpointsOnComplete {
+		if s.deleteCheckpointsOnComplete.Load() {
 			if err := tx.Where("job_id = ?", jobID).Delete(&core.Checkpoint{}).Error; err != nil {
 				return err
 			}
@@ -658,7 +666,7 @@ func (s *GormStorage) CompleteWithResult(ctx context.Context, jobID, workerID st
 	}
 	// Success path: GC this job's checkpoints in the same tx ONLY when the
 	// opt-in is enabled (default off keeps them for the dashboard).
-	return s.accountTerminalWithFanOut(ctx, jobID, workerID, updates, "completed_count", s.deleteCheckpointsOnComplete)
+	return s.accountTerminalWithFanOut(ctx, jobID, workerID, updates, "completed_count", s.deleteCheckpointsOnComplete.Load())
 }
 
 // Fail marks a job as failed, optionally scheduling a retry.
@@ -1055,11 +1063,13 @@ func (s *GormStorage) Heartbeat(ctx context.Context, jobID string, workerID stri
 	if s.useDBClock() {
 		// Extend the lock on the DB clock so it stays comparable with the
 		// reaper's stale cutoff regardless of this worker's wall clock.
-		updates["locked_until"] = s.offsetExpr(s.lockDuration)
+		lockDuration := time.Duration(s.lockDuration.Load())
+		updates["locked_until"] = s.offsetExpr(lockDuration)
 		updates["last_heartbeat_at"] = s.nowExpr()
 	} else {
 		now := time.Now()
-		updates["locked_until"] = now.Add(s.lockDuration)
+		lockDuration := time.Duration(s.lockDuration.Load())
+		updates["locked_until"] = now.Add(lockDuration)
 		updates["last_heartbeat_at"] = now
 	}
 	result := s.db.WithContext(ctx).
