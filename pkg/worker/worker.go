@@ -1237,73 +1237,33 @@ func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 		w.handleError(ctx, jobCtx, job, err)
 		cancelHeartbeat()
 	} else {
-		if completer, ok := w.queue.Storage().(completeWithResultStorage); ok {
-			fo, completeErr := w.completeWithResult(ctx, completer, job.ID, resultBytes)
+		completer, ok := w.queue.Storage().(completeWithResultStorage)
+		if !ok {
+			w.logger.Error("storage does not implement CompleteWithResult; cannot complete job", "job_id", job.ID)
 			cancelHeartbeat()
-			if errors.Is(completeErr, core.ErrJobNotOwned) {
-				w.logger.Warn("job no longer owned at completion; skipping completion handling",
-					"job_id", job.ID)
-				return
-			}
-			if completeErr != nil {
-				w.logger.Error("failed to complete job after retries", "job_id", job.ID, "error", completeErr)
-				w.releaseAfterTerminalWriteError(ctx, job.ID, "completion")
-				return
-			}
-
-			w.queue.CallCompleteHooks(jobCtx, job)
-			w.queue.Emit(&core.JobCompleted{Job: job, Duration: time.Since(startTime), Timestamp: time.Now()})
-			if err := w.checkFanOutCompletion(ctx, fo); err != nil {
-				w.logger.Error("failed to handle sub-job completion", "job_id", job.ID, "error", err)
-			}
+			w.releaseAfterTerminalWriteError(ctx, job.ID, "completion")
 			return
 		}
-
-		// Legacy storage path: keep the original split result/complete/fan-out
-		// writes for storages that do not implement CompleteWithResult.
+		fo, completeErr := w.completeWithResult(ctx, completer, job.ID, resultBytes)
 		cancelHeartbeat()
-		if resultBytes != nil {
-			if saveErr := w.queue.Storage().SaveJobResult(ctx, job.ID, w.config.WorkerID, resultBytes); saveErr != nil {
-				w.logger.Error("failed to persist job result", "job_id", job.ID, "error", saveErr)
-				// fall through — completion still proceeds
-			}
-		}
-		completeErr := w.completeWithRetry(ctx, job.ID)
 		if errors.Is(completeErr, core.ErrJobNotOwned) {
-			// The job was reclaimed, cancelled, or already completed by
-			// another path while this handler was running. The worker that
-			// now owns it is responsible for fan-out accounting; doing it
-			// here would double-count the fan-out and race the new owner.
 			w.logger.Warn("job no longer owned at completion; skipping completion handling",
 				"job_id", job.ID)
 			return
 		}
 		if completeErr != nil {
 			w.logger.Error("failed to complete job after retries", "job_id", job.ID, "error", completeErr)
-			// Still handle sub-job completion — the work is done even if
-			// we couldn't mark it in the DB. Without this, the fan-out
-			// counter never increments and the parent stays in 'waiting'.
-		} else {
-			w.queue.CallCompleteHooks(jobCtx, job)
-			// Emit completion event
-			w.queue.Emit(&core.JobCompleted{Job: job, Duration: time.Since(startTime), Timestamp: time.Now()})
+			w.releaseAfterTerminalWriteError(ctx, job.ID, "completion")
+			return
 		}
 
-		// Handle sub-job completion (resume parent if needed) — always run
-		// regardless of whether Complete() succeeded, to prevent orphaned
-		// parent jobs stuck in 'waiting' with all sub-jobs actually done.
-		// (The lost-ownership case returned above.)
-		if err := w.handleSubJobCompletion(ctx, job, completeErr == nil); err != nil {
+		w.queue.CallCompleteHooks(jobCtx, job)
+		w.queue.Emit(&core.JobCompleted{Job: job, Duration: time.Since(startTime), Timestamp: time.Now()})
+		if err := w.checkFanOutCompletion(ctx, fo); err != nil {
 			w.logger.Error("failed to handle sub-job completion", "job_id", job.ID, "error", err)
 		}
+		return
 	}
-}
-
-// completeWithRetry marks a job complete with retry on transient failures.
-func (w *Worker) completeWithRetry(ctx context.Context, jobID string) error {
-	return retryWithBackoff(ctx, *w.config.StorageRetry, func() error {
-		return w.queue.Storage().Complete(ctx, jobID, w.config.WorkerID)
-	})
 }
 
 func (w *Worker) completeWithResult(ctx context.Context, storage completeWithResultStorage, jobID string, result []byte) (*core.FanOut, error) {

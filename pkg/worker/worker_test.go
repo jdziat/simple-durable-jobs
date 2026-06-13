@@ -104,6 +104,18 @@ func (m *mockStorage) Complete(ctx context.Context, jobID string, workerID strin
 	return nil
 }
 
+func (m *mockStorage) CompleteWithResult(ctx context.Context, jobID, workerID string, result []byte) (*core.FanOut, error) {
+	if result != nil {
+		if err := m.SaveJobResult(ctx, jobID, workerID, result); err != nil {
+			return nil, err
+		}
+	}
+	if err := m.Complete(ctx, jobID, workerID); err != nil {
+		return nil, err
+	}
+	return nil, nil
+}
+
 func (m *mockStorage) Fail(ctx context.Context, jobID string, workerID string, errMsg string, retryAt *time.Time) error {
 	if m.failFunc != nil {
 		return m.failFunc(ctx, jobID, workerID, errMsg, retryAt)
@@ -4073,11 +4085,25 @@ func TestWorker_CheckFanOutCompletion_FailFastAllDone(t *testing.T) {
 // Handler result persistence tests
 // ---------------------------------------------------------------------------
 
-// trackingStorage wraps a real storage and records SaveJobResult calls.
+// trackingStorage wraps a real storage and records completion results.
 type trackingStorage struct {
 	core.Storage
 	mu           sync.Mutex
 	savedResults map[string][]byte
+}
+
+func (s *trackingStorage) CompleteWithResult(ctx context.Context, jobID, workerID string, result []byte) (*core.FanOut, error) {
+	fo, err := s.Storage.(completeWithResultStorage).CompleteWithResult(ctx, jobID, workerID, result)
+	if err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	if s.savedResults == nil {
+		s.savedResults = map[string][]byte{}
+	}
+	s.savedResults[jobID] = result
+	s.mu.Unlock()
+	return fo, nil
 }
 
 func (s *trackingStorage) SaveJobResult(ctx context.Context, jobID string, workerID string, result []byte) error {

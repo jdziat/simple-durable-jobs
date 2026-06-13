@@ -45,6 +45,10 @@ func (s *GormStorage) PeekSignal(ctx context.Context, jobID, name string) (*core
 	return &sig, nil
 }
 
+func (s *GormStorage) pendingSignalsLocked(tx *gorm.DB, jobID, name string) *gorm.DB {
+	return s.lockForUpdate(tx.Where("job_id = ? AND name = ? AND consumed_at IS NULL", jobID, name).Order("created_at ASC"), true)
+}
+
 // ConsumeSignal atomically takes the oldest pending signal of name for the job
 // (marking it consumed), or returns nil if none are pending. Concurrent
 // consumers receive disjoint signals (FOR UPDATE SKIP LOCKED on Postgres/MySQL;
@@ -54,9 +58,7 @@ func (s *GormStorage) ConsumeSignal(ctx context.Context, jobID, name string) (*c
 	err := s.withSerializationRetry(ctx, func() error {
 		out = nil
 		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-			q := tx.Where("job_id = ? AND name = ? AND consumed_at IS NULL", jobID, name).
-				Order("created_at ASC")
-			q = s.lockForUpdate(q, true)
+			q := s.pendingSignalsLocked(tx, jobID, name)
 			var sig core.Signal
 			err := q.First(&sig).Error
 			if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -96,9 +98,7 @@ func (s *GormStorage) DrainSignals(ctx context.Context, jobID, name string) ([]*
 	err := s.withSerializationRetry(ctx, func() error {
 		out = nil
 		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-			q := tx.Where("job_id = ? AND name = ? AND consumed_at IS NULL", jobID, name).
-				Order("created_at ASC")
-			q = s.lockForUpdate(q, true)
+			q := s.pendingSignalsLocked(tx, jobID, name)
 			var sigs []*core.Signal
 			if err := q.Find(&sigs).Error; err != nil {
 				return err
@@ -153,9 +153,7 @@ func (s *GormStorage) ConsumeSignalTx(ctx context.Context, jobID, name string, b
 	err := s.withSerializationRetry(ctx, func() error {
 		out = nil
 		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-			q := tx.Where("job_id = ? AND name = ? AND consumed_at IS NULL", jobID, name).
-				Order("created_at ASC")
-			q = s.lockForUpdate(q, true)
+			q := s.pendingSignalsLocked(tx, jobID, name)
 			var sig core.Signal
 			err := q.First(&sig).Error
 			if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -209,9 +207,7 @@ func (s *GormStorage) DrainSignalsTx(ctx context.Context, jobID, name string, bu
 	err := s.withSerializationRetry(ctx, func() error {
 		out = nil
 		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-			q := tx.Where("job_id = ? AND name = ? AND consumed_at IS NULL", jobID, name).
-				Order("created_at ASC")
-			q = s.lockForUpdate(q, true)
+			q := s.pendingSignalsLocked(tx, jobID, name)
 			var sigs []*core.Signal
 			if err := q.Find(&sigs).Error; err != nil {
 				return err
