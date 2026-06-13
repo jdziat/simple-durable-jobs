@@ -141,7 +141,7 @@ caller-supplied key to `jobs.IdempotencyKey(key, ttl)`, or use
 work. `jobs.Unique(key)` is narrower: it only prevents another pending or
 running job with the same key.
 
-There is no workflow checkpointing equivalent in Asynq. If your Asynq task currently chains follow-up tasks manually, consider a Simple Durable Jobs workflow handler with `jobs.Call[T]` checkpoints or `jobs.FanOut[T]`.
+As of 2026-06-13, there is no first-party workflow checkpointing equivalent in Asynq. If your Asynq task currently chains follow-up tasks manually, consider a Simple Durable Jobs workflow handler with `jobs.Call[T]` checkpoints or `jobs.FanOut[T]`.
 
 Asynq's Redis task groups and some queue inspection behaviors do not have direct equivalents. Use queue names, unique keys, typed arguments, dashboard filtering, and application-owned tables for domain-level grouping.
 

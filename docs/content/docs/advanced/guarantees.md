@@ -7,6 +7,20 @@ This page is the honest contract: what Simple Durable Jobs guarantees, what it
 asks of you in return, and how to configure it for production. Read it before
 you put revenue-critical work on the queue.
 
+> **No warranty — use at your own risk.** Simple Durable Jobs is free,
+> open-source software provided "AS IS", without warranty of any kind, as set
+> out in the [LICENSE](https://github.com/jdziat/simple-durable-jobs/blob/main/LICENSE).
+> The properties described on this page are the library's *design contract*,
+> exercised by the automated test suite described below — they are not a
+> guarantee of fitness for any particular purpose and create no warranty. You
+> are responsible for validating the library against your own requirements.
+>
+> **Not for high-risk use.** This software is general-purpose infrastructure and
+> is **not designed or tested for safety-critical or high-risk uses** — including
+> medical, life-support, aviation, automotive, nuclear, emergency-response, or
+> financial-settlement systems — where failure could lead to death, injury, or
+> severe financial or environmental harm. Do not use it for such purposes.
+
 ## Execution semantics: at-least-once
 
 Handlers run **at least once**. A job is leased with a time-bounded lock; if the
@@ -34,28 +48,36 @@ making *effects* idempotent, not by the queue pretending a crash never happened.
 
 What the library does guarantee:
 
+These properties are the library's design contract, verified by the test suite
+described below; they are provided on the AS-IS basis in the LICENSE and are not
+a warranty of fitness for any particular use.
+
 - **Durability** — an enqueued job is committed to the database before
   `Enqueue` returns; it survives process and machine restarts.
-- **No lost jobs** — a leased job is either completed, failed (terminally),
-  retried, or returned to the queue by the stale-lock reaper. It never silently
-  disappears.
-- **Single active owner** — at any instant at most one worker holds a job's
-  lock. Lock timing is anchored to the **database clock** on Postgres/MySQL, so
-  clock skew between workers cannot cause a live lock to be reclaimed early.
+- **No lost jobs** — the library is designed so that a leased job is either
+  completed, failed (terminally), retried, or returned to the queue by the
+  stale-lock reaper, and the chaos suite asserts that jobs do not silently
+  disappear.
+- **Single active owner** — the library is designed so that at any instant at
+  most one worker holds a job's lock. Lock timing is anchored to the **database
+  clock** on Postgres/MySQL, and the chaos suite asserts that worker clock skew
+  does not cause a live lock to be reclaimed early.
 - **Checkpointed workflows** — completed `Call()` steps are not re-executed on
   replay (subject to the at-least-once window above), and fan-in counters are
   updated atomically with the sub-job's terminal transition. The fan-out's
-  *status* advance commits in that same terminal transaction, so a terminal
-  fan-out is never observable as `status=pending` with terminal counts. If a
-  worker crashes between the final sub-job's terminal write and resuming the
-  waiting parent, a recovery sweep (`GetCompletablePendingFanOuts`, gated by
+  *status* advance commits in that same terminal transaction; the library is
+  designed so that a terminal fan-out is not observable as `status=pending` with
+  terminal counts, and the chaos suite asserts that invariant. If a worker
+  crashes between the final sub-job's terminal write and resuming the waiting
+  parent, a recovery sweep (`GetCompletablePendingFanOuts`, gated by
   `WithFanOutRecoveryStaleAge`, default 2m) heals any parent stranded in
   `waiting`.
 - **Atomic signal consumption** — consuming a signal
   (`WaitForSignal`/`WaitForSignalTimeout`/`DrainSignals`) persists the consume
-  and its replay checkpoint in a single transaction, so a crash mid-wait cannot
-  wedge a waiting job or drop a drained signal: the transaction either rolls
-  back cleanly (nothing consumed) or commits both.
+  and its replay checkpoint in a single transaction; the library is designed so
+  that a crash mid-wait does not wedge a waiting job or drop a drained signal,
+  and the chaos suite asserts that the transaction either rolls back cleanly
+  (nothing consumed) or commits both.
 
 ## Backend support tiers
 
@@ -90,8 +112,9 @@ is almost certainly wrong for short jobs. The relevant knobs:
   been pushed out.
   `StaleLockAge` also governs the heartbeat interval: it is clamped to
   `StaleLockAge/3` (with a 200ms floor), so a live worker refreshes its
-  last-contact timestamp several times within the stale window and an active job
-  is never falsely reclaimed.
+  last-contact timestamp several times within the stale window. The reaper is
+  designed so that an active job is not falsely reclaimed, and the chaos suite
+  asserts that behavior.
 - `WithStaleLockInterval(d)` — how often the reaper runs (default 5m).
 
 For sub-minute jobs, something like `WithLockDuration(2*time.Minute)`,

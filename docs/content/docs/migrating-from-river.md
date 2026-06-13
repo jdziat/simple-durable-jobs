@@ -121,7 +121,7 @@ return tx.Commit().Error
 
 Both systems are at-least-once. Keep handlers idempotent, put side effects behind natural idempotency keys, and expect retries after worker crashes.
 
-River-specific PostgreSQL features and APIs do not carry over. If your current design depends on River's exact job states, queue internals, LISTEN/NOTIFY wakeups, or Pro features, map those deliberately instead of expecting a drop-in replacement.
+River-specific PostgreSQL features and APIs may not carry over as of 2026-06-13. If your current design depends on River's exact job states, queue internals, LISTEN/NOTIFY wakeups, or Pro features, map those deliberately against River's current documentation instead of expecting a drop-in replacement.
 
 You do not have to leave PostgreSQL. Simple Durable Jobs supports PostgreSQL through GORM and is happiest in production on PostgreSQL or MySQL. SQLite is useful for local development and single-process tests.
 

@@ -12,16 +12,23 @@ River, Temporal, and Asynq are all good systems when their design center matches
 
 For performance, see this project's [benchmarks](../benchmarks/). We do not publish cross-vendor performance numbers because those require identical workloads, tuning, hardware, and operating assumptions.
 
+> Competitor descriptions below reflect our understanding of each project's
+> public documentation **as of 2026-06-13** and describe features, not quality.
+> Third-party products change; verify any comparison against each project's
+> current documentation before relying on it. River, Temporal, and Asynq are
+> trademarks of their respective owners and are referenced here for
+> identification only; this project is not affiliated with or endorsed by them.
+
 ## Feature Comparison
 
 | Area | Simple Durable Jobs | River | Temporal | Asynq |
 | --- | --- | --- | --- | --- |
 | Backends | SQLite, PostgreSQL, MySQL through GORM | PostgreSQL | Temporal Server backed by its supported persistence layer | Redis |
 | Embedded vs separate service | Embedded Go library; workers run in your process | Embedded Go library; workers run in your process | Separate server or cluster plus worker processes | Embedded Go library plus Redis |
-| Durable workflows/checkpoints | Checkpointed `Call[T]`, fan-out/fan-in, signals, timers | Job queue in OSS; paid Pro tier adds workflow-oriented features such as workflows and sequences | Full deterministic workflow replay with durable history | Task processing; no workflow checkpointing model |
-| Signals | Durable job signals for Go workflows | Not an OSS queue primitive | First-class workflow signals | No workflow signal primitive |
+| Durable workflows/checkpoints | Checkpointed `Call[T]`, fan-out/fan-in, signals, timers | Job queue in OSS; paid Pro tier adds workflow-oriented features such as workflows and sequences (as of 2026-06-13) | Full deterministic workflow replay with durable history | Task processing; no first-party workflow checkpointing model as of 2026-06-13 |
+| Signals | Durable job signals for Go workflows | No first-party OSS queue signal primitive as of 2026-06-13 | First-class workflow signals | No first-party workflow signal primitive as of 2026-06-13 |
 | Timers | Durable `Sleep`, `SleepUntil`, delay, and schedules | Scheduled and delayed jobs | First-class durable timers in workflow history | Delayed and scheduled tasks |
-| Transactional enqueue | `EnqueueTx` and `EnqueueBatchTx` with caller-owned GORM transactions | Transactional insert into PostgreSQL is a core fit | Client API call to Temporal service; not a row inserted in your app DB transaction | Redis enqueue; not in your SQL transaction |
+| Transactional enqueue | `EnqueueTx` and `EnqueueBatchTx` with caller-owned GORM transactions | Transactional insert into PostgreSQL is a core fit | Client API call to Temporal service; not a row inserted in your app DB transaction as of 2026-06-13 | Redis enqueue; not in your SQL transaction |
 | Batch ops | Batch enqueue and optional batch dequeue | Batch insertion support | Workflow and activity APIs; not a queue batch API in the same shape | Task groups and task enqueue patterns; no SQL batch enqueue |
 | Rate limiting/concurrency caps | Per-worker queue throttles plus storage-backed fleet and per-key caps | Queue and worker tuning focused on PostgreSQL-backed throughput | Worker concurrency, task queue controls, and server-side scaling model | Queue-level concurrency and rate limiting patterns backed by Redis |
 | DLQ | Failed/cancelled terminal jobs with dead-letter metadata and requeue | Failed job handling and retry controls | Failure history, retries, and workflow recovery through Temporal APIs | Retry/archive inspection through Redis-backed task states and UI |
@@ -65,3 +72,5 @@ Simple Durable Jobs deliberately does not have:
 - Schema-level multi-tenancy. All tenants share the same jobs tables unless you run separate databases.
 - Deterministic replay queries like Temporal workflows provide. `Call[T]` checkpoints results, but the workflow model is not Temporal's event-history replay engine.
 - A separate hosted control plane. The dashboard is embedded in your application.
+
+River, Temporal, Asynq, PostgreSQL, MySQL, Redis, and other names are trademarks of their respective owners; used here for identification only. This project is not affiliated with or endorsed by them.
