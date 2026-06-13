@@ -256,6 +256,11 @@ var schemaMigrations = []schemaMigration{
 		Name:    "drop_redundant_signal_index",
 		Up:      migrateDropRedundantSignalIndex,
 	},
+	{
+		Version: 25,
+		Name:    "signal_fifo_index_drop_root_index_mysql_precision_collation",
+		Up:      migrateV25PostMergeSchema,
+	},
 }
 
 // applyPendingMigrations runs every migration whose version is absent from the
@@ -1138,6 +1143,119 @@ func migrateDropRedundantSignalIndex(ctx context.Context, db *gorm.DB, dialect s
 	}
 }
 
+func migrateV25PostMergeSchema(ctx context.Context, db *gorm.DB, dialect string) error {
+	switch dialect {
+	case dialectMySQL:
+		m := db.Migrator()
+		// X1: rebuild idx_signals_pending to (job_id, name, consumed_at,
+		// created_at) so ConsumeSignal's ORDER BY created_at is index-served.
+		// MySQL refuses a direct DROP because the index backs the signals.job_id
+		// foreign key (fk_signals_job, Error 1553), so create the 4-column
+		// replacement first (it also leads with job_id and satisfies the FK),
+		// drop the old, then rename into place. Skipped when the index already
+		// includes created_at (fresh DBs where AutoMigrate built the 4-column
+		// form from the model tag).
+		hasCreatedAt, err := mysqlIndexHasColumn(ctx, db, "signals", "idx_signals_pending", "created_at")
+		if err != nil {
+			return fmt.Errorf("inspect idx_signals_pending: %w", err)
+		}
+		if !hasCreatedAt {
+			if m.HasIndex(&core.Signal{}, "idx_signals_pending_rebuild") {
+				if err := m.DropIndex(&core.Signal{}, "idx_signals_pending_rebuild"); err != nil && !isBenignDDLError(err) {
+					return fmt.Errorf("drop idx_signals_pending_rebuild: %w", err)
+				}
+			}
+			if err := db.WithContext(ctx).Exec(
+				"CREATE INDEX idx_signals_pending_rebuild ON signals (job_id, name, consumed_at, created_at)",
+			).Error; err != nil && !isBenignDDLError(err) {
+				return fmt.Errorf("create idx_signals_pending_rebuild: %w", err)
+			}
+			if err := db.WithContext(ctx).Exec(
+				"DROP INDEX idx_signals_pending ON signals",
+			).Error; err != nil && !isBenignDDLError(err) {
+				return fmt.Errorf("drop idx_signals_pending: %w", err)
+			}
+			if err := db.WithContext(ctx).Exec(
+				"ALTER TABLE signals RENAME INDEX idx_signals_pending_rebuild TO idx_signals_pending",
+			).Error; err != nil && !isBenignDDLError(err) {
+				return fmt.Errorf("rename idx_signals_pending_rebuild: %w", err)
+			}
+		}
+
+		if m.HasIndex(&core.Job{}, "idx_jobs_root_job_id") {
+			if err := m.DropIndex(&core.Job{}, "idx_jobs_root_job_id"); err != nil && !isBenignDDLError(err) {
+				return fmt.Errorf("drop idx_jobs_root_job_id: %w", err)
+			}
+		}
+
+		if m.HasColumn(&core.Job{}, "dq_eligible_at") {
+			if err := db.WithContext(ctx).Exec(
+				"ALTER TABLE jobs MODIFY dq_eligible_at datetime(3) " +
+					"GENERATED ALWAYS AS (IF(status = 'pending', COALESCE(run_at, created_at), NULL)) STORED",
+			).Error; err != nil && !isBenignDDLError(err) {
+				return fmt.Errorf("modify dq_eligible_at precision: %w", err)
+			}
+		}
+
+		// MySQL's default utf8mb4_0900_ai_ci collation is case-insensitive.
+		// Pin queue and tenant to as_cs so queue/tenant identifiers are
+		// case-sensitive, matching Postgres semantics.
+		// BEHAVIOR CHANGE: on MySQL, queue/tenant 'Default' and 'default' become
+		// DISTINCT (they were silently merged under ai_ci). See production-ops.md.
+		const collation = "utf8mb4_0900_as_cs"
+		queueCollation, err := mysqlColumnCollation(ctx, db, "queue")
+		if err != nil {
+			return fmt.Errorf("read queue collation: %w", err)
+		}
+		if queueCollation != collation {
+			if err := db.WithContext(ctx).Exec(
+				"ALTER TABLE jobs MODIFY queue varchar(255) COLLATE utf8mb4_0900_as_cs NOT NULL DEFAULT 'default'",
+			).Error; err != nil && !isBenignDDLError(err) {
+				return fmt.Errorf("modify queue collation: %w", err)
+			}
+		}
+		tenantCollation, err := mysqlColumnCollation(ctx, db, "tenant")
+		if err != nil {
+			return fmt.Errorf("read tenant collation: %w", err)
+		}
+		if tenantCollation != collation {
+			if err := db.WithContext(ctx).Exec(
+				"ALTER TABLE jobs MODIFY tenant varchar(255) COLLATE utf8mb4_0900_as_cs NULL",
+			).Error; err != nil && !isBenignDDLError(err) {
+				return fmt.Errorf("modify tenant collation: %w", err)
+			}
+		}
+		return nil
+	default:
+		// X1 (Postgres/SQLite): a PARTIAL index keyed (job_id, name, created_at)
+		// WHERE consumed_at IS NULL. Unlike MySQL — which serves the FIFO consume
+		// from the 4-column composite via an IS-NULL ref — Postgres will NOT use a
+		// middle `consumed_at IS NULL` qual to provide created_at order, so the
+		// full composite still top-N-sorts (measured ~4ms over 20k pending). The
+		// partial index makes job_id+name an equality prefix with created_at next,
+		// so the consume is a no-sort index scan that stops at the first row
+		// (measured 0.09ms). Every pending-signal query filters consumed_at IS
+		// NULL (Peek/Consume/Drain/count/resume-EXISTS), so coverage is unchanged;
+		// the consumed-row GC rides idx_signals_consumed_at. Postgres needs no
+		// index to back the signals.job_id FK. SQLite also supports partial
+		// indexes. (Fresh DBs: AutoMigrate first builds the 4-column form from the
+		// model tag; this replaces it with the partial one. AutoMigrate matches by
+		// name only, so it does not flap afterward.)
+		if err := db.WithContext(ctx).Exec("DROP INDEX IF EXISTS idx_signals_pending").Error; err != nil {
+			return fmt.Errorf("drop idx_signals_pending: %w", err)
+		}
+		if err := db.WithContext(ctx).Exec(
+			"CREATE INDEX IF NOT EXISTS idx_signals_pending ON signals (job_id, name, created_at) WHERE consumed_at IS NULL",
+		).Error; err != nil {
+			return fmt.Errorf("create idx_signals_pending: %w", err)
+		}
+		if err := db.WithContext(ctx).Exec("DROP INDEX IF EXISTS idx_jobs_root_job_id").Error; err != nil {
+			return fmt.Errorf("drop idx_jobs_root_job_id: %w", err)
+		}
+		return nil
+	}
+}
+
 func migrateIntegrityForeignKeys(ctx context.Context, db *gorm.DB, dialect string) error {
 	switch dialect {
 	case dialectPostgres, dialectMySQL:
@@ -1294,6 +1412,24 @@ func migrateMySQLDialectCorrectness(ctx context.Context, db *gorm.DB) error {
 	}
 
 	return nil
+}
+
+// mysqlIndexHasColumn reports whether the named index on the given table
+// includes column as one of its key parts (used to detect whether a rebuild
+// has already happened, so the migration is safe on fresh DBs).
+func mysqlIndexHasColumn(ctx context.Context, db *gorm.DB, table, index, column string) (bool, error) {
+	var n int64
+	if err := db.WithContext(ctx).Raw(`
+		SELECT COUNT(*)
+		FROM information_schema.STATISTICS
+		WHERE TABLE_SCHEMA = DATABASE()
+		  AND TABLE_NAME = ?
+		  AND INDEX_NAME = ?
+		  AND COLUMN_NAME = ?
+	`, table, index, column).Scan(&n).Error; err != nil {
+		return false, err
+	}
+	return n > 0, nil
 }
 
 func mysqlColumnCollation(ctx context.Context, db *gorm.DB, columnName string) (string, error) {

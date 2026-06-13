@@ -60,7 +60,7 @@ type Job struct {
 
 	// Parent-child relationship
 	ParentJobID *string `gorm:"index;size:36"`
-	RootJobID   *string `gorm:"index;size:36"` // Top-level workflow job
+	RootJobID   *string `gorm:"size:36"` // Top-level workflow job
 
 	// Fan-out tracking
 	FanOutID    *string `gorm:"index:idx_jobs_fan_out_status,priority:1;size:36"` // Groups sibling sub-jobs

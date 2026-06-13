@@ -20,5 +20,5 @@ type Signal struct {
 	// composite index (job_id, name, consumed_at) supports the
 	// oldest-pending-of-(job,name) lookup and the has-pending-signal poll.
 	ConsumedAt *time.Time `gorm:"index:idx_signals_pending,priority:3"`
-	CreatedAt  time.Time  `gorm:"autoCreateTime"`
+	CreatedAt  time.Time  `gorm:"autoCreateTime;index:idx_signals_pending,priority:4"`
 }
