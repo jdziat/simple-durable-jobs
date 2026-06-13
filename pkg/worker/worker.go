@@ -348,6 +348,7 @@ func (w *Worker) Start(ctx context.Context) error {
 	if err := w.validateConfiguredStorageCapabilities(); err != nil {
 		return err
 	}
+	w.logStorageCapabilities()
 
 	totalConcurrency := 0
 	for _, c := range w.config.Queues {

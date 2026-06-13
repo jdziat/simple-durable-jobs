@@ -1053,6 +1053,7 @@ func Requeue(ctx context.Context, q *Queue, jobID string) (bool, error) {
 	type requeuer interface {
 		Requeue(ctx context.Context, jobID string) (bool, error)
 	}
+	var _ requeuer = (*storage.GormStorage)(nil)
 	r, ok := q.Storage().(requeuer)
 	if !ok {
 		return false, fmt.Errorf("jobs: storage backend does not support Requeue")
@@ -1066,6 +1067,7 @@ func ListDeadLettered(ctx context.Context, q *Queue, opts ...DeadLetterOption) (
 	type deadLetterLister interface {
 		ListDeadLettered(ctx context.Context, filter core.DeadLetterFilter) ([]*core.Job, error)
 	}
+	var _ deadLetterLister = (*storage.GormStorage)(nil)
 	l, ok := q.Storage().(deadLetterLister)
 	if !ok {
 		return nil, fmt.Errorf("jobs: storage backend does not support dead-letter triage")
@@ -1079,6 +1081,7 @@ func CountDeadLettered(ctx context.Context, q *Queue, opts ...DeadLetterOption) 
 	type deadLetterCounter interface {
 		CountDeadLettered(ctx context.Context, filter core.DeadLetterFilter) (int64, error)
 	}
+	var _ deadLetterCounter = (*storage.GormStorage)(nil)
 	c, ok := q.Storage().(deadLetterCounter)
 	if !ok {
 		return 0, fmt.Errorf("jobs: storage backend does not support dead-letter triage")
@@ -1147,6 +1150,7 @@ func Signal(ctx context.Context, q *Queue, jobID, name string, payload any) erro
 	type signalSender interface {
 		SendSignal(ctx context.Context, jobID, name string, payload []byte) error
 	}
+	var _ signalSender = (*storage.GormStorage)(nil)
 	sender, ok := q.Storage().(signalSender)
 	if !ok {
 		return core.ErrStorageNoSignals
@@ -1185,6 +1189,7 @@ func Signal(ctx context.Context, q *Queue, jobID, name string, payload any) erro
 		type signalResumer interface {
 			ResumeSignalWaitingJob(ctx context.Context, jobID string) (bool, error)
 		}
+		var _ signalResumer = (*storage.GormStorage)(nil)
 		if r, ok := q.Storage().(signalResumer); ok {
 			resumed, err := r.ResumeSignalWaitingJob(ctx, jobID)
 			if err != nil {
