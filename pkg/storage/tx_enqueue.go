@@ -30,6 +30,12 @@ var _ TxEnqueuer = (*GormStorage)(nil)
 var _ TxUniqueLockEnqueuer = (*GormStorage)(nil)
 
 // EnqueueTx adds a job using the caller-supplied transaction handle.
+//
+// Under MySQL, callers MUST wrap the owning transaction in
+// serialization-failure retry. The in-transaction unique-key FOR UPDATE dedup
+// can gap-lock deadlock under contention (surfaced as error 1213). Prefer
+// GormStorage.WithSerializationRetry around the full begin -> EnqueueTx ->
+// commit transaction.
 func (s *GormStorage) EnqueueTx(ctx context.Context, tx *gorm.DB, job *core.Job) error {
 	fillEnqueueDefaults(job)
 	row, err := s.encodedJobForCreate(job)
@@ -51,6 +57,12 @@ func (s *GormStorage) EnqueueTx(ctx context.Context, tx *gorm.DB, job *core.Job)
 }
 
 // EnqueueUniqueTx adds a unique job using the caller-supplied transaction handle.
+//
+// Under MySQL, callers MUST wrap the owning transaction in
+// serialization-failure retry. The in-transaction unique-key FOR UPDATE dedup
+// can gap-lock deadlock under contention (surfaced as error 1213). Prefer
+// GormStorage.WithSerializationRetry around the full begin -> EnqueueUniqueTx
+// -> commit transaction.
 func (s *GormStorage) EnqueueUniqueTx(ctx context.Context, tx *gorm.DB, job *core.Job, uniqueKey string) error {
 	fillEnqueueDefaults(job)
 	job.UniqueKey = uniqueKey
@@ -94,6 +106,12 @@ func (s *GormStorage) EnqueueWithUniqueLockTx(ctx context.Context, tx *gorm.DB, 
 }
 
 // EnqueueBatchTx inserts multiple jobs using the caller-supplied transaction handle.
+//
+// Under MySQL, callers MUST wrap the owning transaction in
+// serialization-failure retry. The in-transaction unique-key FOR UPDATE dedup
+// can gap-lock deadlock under contention (surfaced as error 1213). Prefer
+// GormStorage.WithSerializationRetry around the full begin -> EnqueueBatchTx
+// -> commit transaction.
 func (s *GormStorage) EnqueueBatchTx(ctx context.Context, tx *gorm.DB, jobs []*core.Job) error {
 	if len(jobs) == 0 {
 		return nil

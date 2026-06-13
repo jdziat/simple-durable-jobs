@@ -189,6 +189,57 @@ func TestResumeSignalWaitingJob(t *testing.T) {
 	assert.Equal(t, core.StatusPaused, p.Status, "paused job stays paused")
 }
 
+func TestMarkWaitingWithDeadline_RunningOwnedJobSucceeds(t *testing.T) {
+	s := newTestStorage(t)
+	ctx := context.Background()
+
+	job := newTestJob("default", "signal.wait")
+	require.NoError(t, s.Enqueue(ctx, job))
+	got, err := s.Dequeue(ctx, []string{"default"}, "w1")
+	require.NoError(t, err)
+	require.NotNil(t, got)
+
+	require.NoError(t, s.MarkWaitingWithDeadline(ctx, got.ID, "w1", time.Minute))
+
+	after, err := s.GetJob(ctx, got.ID)
+	require.NoError(t, err)
+	require.NotNil(t, after)
+	assert.Equal(t, core.StatusWaiting, after.Status)
+	assert.Empty(t, after.LockedBy)
+	assert.Nil(t, after.LockedUntil)
+	require.NotNil(t, after.RunAt)
+	assert.True(t, after.RunAt.After(time.Now()), "deadline should be in the future")
+}
+
+func TestMarkWaitingWithDeadline_NonRunningOwnedJobReturnsErrJobNotOwned(t *testing.T) {
+	s := newTestStorage(t)
+	ctx := context.Background()
+
+	job := newTestJob("default", "signal.wait")
+	require.NoError(t, s.Enqueue(ctx, job))
+	got, err := s.Dequeue(ctx, []string{"default"}, "w1")
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	require.NotNil(t, got.LockedUntil)
+
+	require.NoError(t, s.db.WithContext(ctx).
+		Model(&core.Job{}).
+		Where("id = ?", got.ID).
+		Update("status", core.StatusCompleted).Error)
+
+	err = s.MarkWaitingWithDeadline(ctx, got.ID, "w1", time.Minute)
+	require.ErrorIs(t, err, core.ErrJobNotOwned)
+
+	after, err := s.GetJob(ctx, got.ID)
+	require.NoError(t, err)
+	require.NotNil(t, after)
+	assert.Equal(t, core.StatusCompleted, after.Status)
+	assert.Equal(t, "w1", after.LockedBy)
+	require.NotNil(t, after.LockedUntil)
+	assert.WithinDuration(t, *got.LockedUntil, *after.LockedUntil, time.Millisecond)
+	assert.Nil(t, after.RunAt)
+}
+
 func TestGetPendingSignalName(t *testing.T) {
 	s := newTestStorage(t)
 	ctx := context.Background()

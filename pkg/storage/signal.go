@@ -327,7 +327,7 @@ func (s *GormStorage) MarkWaitingWithDeadline(ctx context.Context, jobID, worker
 	}
 	result := s.db.WithContext(ctx).
 		Model(&core.Job{}).
-		Where("id = ? AND locked_by = ?", jobID, workerID).
+		Where("id = ? AND locked_by = ? AND status = ?", jobID, workerID, core.StatusRunning).
 		Updates(map[string]any{
 			"status":       core.StatusWaiting,
 			"locked_by":    "",

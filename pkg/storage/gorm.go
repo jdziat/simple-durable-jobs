@@ -325,6 +325,14 @@ func (s *GormStorage) withSerializationRetry(ctx context.Context, fn func() erro
 	return fmt.Errorf("transaction failed after %d retries: %w", maxAttempts, lastErr)
 }
 
+// WithSerializationRetry retries fn on transient serialization/deadlock
+// failures with jittered backoff. Use it to wrap caller-owned outbox
+// transactions on MySQL, for example begin -> EnqueueBatchTx -> commit, so the
+// whole transaction is retried when gap-lock deadlocks surface.
+func (s *GormStorage) WithSerializationRetry(ctx context.Context, fn func() error) error {
+	return s.withSerializationRetry(ctx, fn)
+}
+
 // isSerializationFailure reports whether err is a transient
 // serialization/deadlock failure that can be resolved by retrying the
 // enclosing transaction. String matching is used deliberately to avoid
@@ -1601,7 +1609,7 @@ func (s *GormStorage) CancelSubJob(ctx context.Context, jobID string) (*core.Fan
 func (s *GormStorage) MarkWaiting(ctx context.Context, jobID string, workerID string) error {
 	result := s.db.WithContext(ctx).
 		Model(&core.Job{}).
-		Where("id = ? AND locked_by = ?", jobID, workerID).
+		Where("id = ? AND locked_by = ? AND status = ?", jobID, workerID, core.StatusRunning).
 		Updates(map[string]any{
 			"status":       core.StatusWaiting,
 			"locked_by":    "",

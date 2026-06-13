@@ -3344,6 +3344,36 @@ func TestMarkWaiting_Success(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, core.StatusWaiting, after.Status)
 	assert.Empty(t, after.LockedBy)
+	assert.Nil(t, after.LockedUntil)
+}
+
+func TestMarkWaiting_NonRunningOwnedJobReturnsErrJobNotOwned(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	job := newTestJob("default", "workflow")
+	require.NoError(t, s.Enqueue(ctx, job))
+
+	got, err := s.Dequeue(ctx, []string{"default"}, "w1")
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	require.NotNil(t, got.LockedUntil)
+
+	require.NoError(t, s.db.WithContext(ctx).
+		Model(&core.Job{}).
+		Where("id = ?", got.ID).
+		Update("status", core.StatusCompleted).Error)
+
+	err = s.MarkWaiting(ctx, got.ID, "w1")
+	require.ErrorIs(t, err, core.ErrJobNotOwned)
+
+	after, err := s.GetJob(ctx, got.ID)
+	require.NoError(t, err)
+	require.NotNil(t, after)
+	assert.Equal(t, core.StatusCompleted, after.Status)
+	assert.Equal(t, "w1", after.LockedBy)
+	require.NotNil(t, after.LockedUntil)
+	assert.WithinDuration(t, *got.LockedUntil, *after.LockedUntil, time.Millisecond)
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -4442,4 +4472,36 @@ func TestIsSerializationFailure_RetryableErrors(t *testing.T) {
 			t.Errorf("expected %q to NOT be treated as a serialization failure", msg)
 		}
 	}
+}
+
+func TestWithSerializationRetry_RetriesSerializationFailureThenSucceeds(t *testing.T) {
+	ctx := context.Background()
+	s := &GormStorage{}
+	attempts := 0
+
+	err := s.WithSerializationRetry(ctx, func() error {
+		attempts++
+		if attempts < 3 {
+			return errors.New("Error 1213: Deadlock found when trying to get lock")
+		}
+		return nil
+	})
+
+	require.NoError(t, err)
+	assert.Equal(t, 3, attempts)
+}
+
+func TestWithSerializationRetry_NonSerializationErrorReturnsImmediately(t *testing.T) {
+	ctx := context.Background()
+	s := &GormStorage{}
+	attempts := 0
+	boom := errors.New("boom")
+
+	err := s.WithSerializationRetry(ctx, func() error {
+		attempts++
+		return boom
+	})
+
+	require.ErrorIs(t, err, boom)
+	assert.Equal(t, 1, attempts)
 }
