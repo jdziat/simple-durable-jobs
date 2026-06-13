@@ -3953,6 +3953,38 @@ func TestWorker_CompleteFanOut_ParentNotInWaitingStatus(t *testing.T) {
 	assert.NoError(t, err)
 }
 
+func TestWorker_CompleteFanOut_ParentResumeRetryStopsOnContextCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var attempts atomic.Int32
+	mock := &mockStorage{
+		updateFanOutStatusFunc: func(_ context.Context, _ string, _ core.FanOutStatus) (bool, error) {
+			return true, nil
+		},
+		resumeJobFunc: func(_ context.Context, _ string) (bool, error) {
+			attempts.Add(1)
+			cancel()
+			return false, nil
+		},
+	}
+	q := queue.New(mock)
+	w := NewWorker(q, WithStorageRetry(RetryConfig{MaxAttempts: 1}))
+
+	fo := &core.FanOut{
+		ID:          "fo-cancel",
+		ParentJobID: "parent-cancel",
+	}
+
+	start := time.Now()
+	err := w.completeFanOut(ctx, fo, core.FanOutCompleted)
+	elapsed := time.Since(start)
+
+	require.NoError(t, err)
+	assert.Equal(t, int32(1), attempts.Load())
+	assert.Less(t, elapsed, 100*time.Millisecond, "ctx cancellation should abort retry backoff promptly")
+}
+
 // TestWorker_HandleSubJobCompletion_FullFlow_Succeeded wires a real fan-out
 // counter increment into handleSubJobCompletion to exercise the path where
 // IncrementFanOutCompleted returns a non-nil FanOut that triggers completion.

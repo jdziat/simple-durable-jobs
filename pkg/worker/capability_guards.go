@@ -15,6 +15,7 @@ var _ failTerminalWithResultStorage = (*storage.GormStorage)(nil)
 var _ batchDequeuer = (*storage.GormStorage)(nil)
 var _ perQueueDequeuer = (*storage.GormStorage)(nil)
 var _ concurrencySlotStorage = (*storage.GormStorage)(nil)
+var _ concurrencySlotRenewer = (*storage.GormStorage)(nil)
 var _ rateLimiterStorage = (*storage.GormStorage)(nil)
 var _ retentionStorage = (*storage.GormStorage)(nil)
 var _ uniqueLockSweepStorage = (*storage.GormStorage)(nil)
@@ -27,7 +28,7 @@ var _ recoveryLeaser = (*storage.GormStorage)(nil)
 
 func (w *Worker) logStorageCapabilities() {
 	s := w.queue.Storage()
-	inactive := make([]string, 0, 17)
+	inactive := make([]string, 0, 18)
 
 	if _, ok := s.(scheduledFireReader); !ok {
 		inactive = append(inactive, "durable-timers/scheduled-fire-read")
@@ -52,6 +53,9 @@ func (w *Worker) logStorageCapabilities() {
 	}
 	if _, ok := s.(concurrencySlotStorage); !ok {
 		inactive = append(inactive, "fleet-concurrency-caps")
+	}
+	if _, ok := s.(concurrencySlotRenewer); !ok {
+		inactive = append(inactive, "concurrency-slot-renew")
 	}
 	if _, ok := s.(rateLimiterStorage); !ok {
 		inactive = append(inactive, "rate-limits")

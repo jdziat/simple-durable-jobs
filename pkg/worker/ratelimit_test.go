@@ -68,9 +68,10 @@ func TestQueueRateLimitDoesNotConsumeUnconfiguredQueues(t *testing.T) {
 
 type rateMockStorage struct {
 	*releaseStateStorage
-	mu        sync.Mutex
-	remaining int
-	seenNames []string
+	mu            sync.Mutex
+	remaining     int
+	seenNames     []string
+	consumedNames []string
 }
 
 func newRateMockStorage(job *core.Job, denies int) *rateMockStorage {
@@ -91,6 +92,7 @@ func (s *rateMockStorage) TryConsumeRate(_ context.Context, limitName string, _ 
 		s.remaining--
 		return false, nil
 	}
+	s.consumedNames = append(s.consumedNames, limitName)
 	return true, nil
 }
 
@@ -164,7 +166,49 @@ func TestWorkerQueueRateLimitRefundsTokenAfterFleetDeny(t *testing.T) {
 	w.dispatchDequeuedJobs(context.Background(), jobsChan, []*core.Job{job2})
 	require.Len(t, jobsChan, 1, "refunded queue token should admit the next job immediately")
 	assert.Equal(t, "job-2", (<-jobsChan).ID)
+	// The first fleet check is denied and does not increment the fixed-window
+	// counter; only the successfully dispatched second job consumes a fleet unit.
+	assert.Equal(t, []string{"fleet"}, store.consumedNames)
 	assert.Equal(t, []string{"fleet", "fleet"}, store.seenNames)
+}
+
+func TestWorkerConcurrencySlotDenialDoesNotConsumeFleetRateLimit(t *testing.T) {
+	job1 := runningJob("job-1", "tenant-a")
+	job2 := runningJob("job-2", "tenant-b")
+	store := &capRateMockStorage{
+		capMockStorage: newCapMockStorage([]*core.Job{job1, job2}),
+	}
+	w := NewWorker(queue.New(store),
+		WorkerQueue("default", Concurrency(2)),
+		ConcurrencyCap("global", 1),
+		RateLimit("fleet", 100),
+		DisableRetry(),
+	)
+	w.config.WorkerID = "worker-1"
+
+	jobsChan := make(chan *core.Job, 2)
+	w.dispatchDequeuedJobs(context.Background(), jobsChan, []*core.Job{job1, job2})
+
+	require.Len(t, jobsChan, 1)
+	assert.Equal(t, "job-1", (<-jobsChan).ID)
+	assert.Equal(t, []string{"job-2"}, store.getReleasedJobIDs())
+	assert.Equal(t, []string{"fleet"}, store.seenNames, "fleet rate is the last gate, so slot-denied jobs are never checked")
+	assert.Equal(t, []string{"fleet"}, store.consumedNames, "only the dispatched job consumes a fleet unit")
+}
+
+type capRateMockStorage struct {
+	*capMockStorage
+	rateMu        sync.Mutex
+	seenNames     []string
+	consumedNames []string
+}
+
+func (s *capRateMockStorage) TryConsumeRate(_ context.Context, limitName string, _ float64, _ time.Duration, _ time.Time) (bool, error) {
+	s.rateMu.Lock()
+	defer s.rateMu.Unlock()
+	s.seenNames = append(s.seenNames, limitName)
+	s.consumedNames = append(s.consumedNames, limitName)
+	return true, nil
 }
 
 func TestWorkerRateLimitUnsupportedStorageIsNoop(t *testing.T) {

@@ -100,6 +100,40 @@ func (s *GormStorage) TryAcquireConcurrencySlot(ctx context.Context, slotName, j
 	return acquired, nil
 }
 
+// RenewConcurrencySlot extends an existing slot lease for jobID. It is
+// renew-only: a missing row returns false and is never re-created (so a slot
+// released while a heartbeat tick is in flight cannot be resurrected for a
+// finished job). Ownership is intentionally preserved — worker_id is not
+// reclaimed — since only the holder renews its own slot.
+func (s *GormStorage) RenewConcurrencySlot(ctx context.Context, slotName, jobID string, ttl time.Duration) (bool, error) {
+	var renewed bool
+	err := s.withSerializationRetry(ctx, func() error {
+		renewed = false
+		var expiresVal any
+		if s.useDBClock() {
+			expiresVal = s.offsetExpr(ttl)
+		} else {
+			expiresVal = time.Now().Add(ttl)
+		}
+		result := s.db.WithContext(ctx).
+			Model(&core.ConcurrencySlot{}).
+			Where("slot_name = ? AND job_id = ?", slotName, jobID).
+			Updates(map[string]any{
+				"worker_id":  gorm.Expr("worker_id"),
+				"expires_at": expiresVal,
+			})
+		if result.Error != nil {
+			return result.Error
+		}
+		renewed = result.RowsAffected == 1
+		return nil
+	})
+	if err != nil {
+		return false, err
+	}
+	return renewed, nil
+}
+
 // ReleaseConcurrencySlot releases a slot held for jobID. It is idempotent:
 // missing rows are already released.
 func (s *GormStorage) ReleaseConcurrencySlot(ctx context.Context, slotName, jobID string) error {

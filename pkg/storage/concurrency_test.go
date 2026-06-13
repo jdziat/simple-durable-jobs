@@ -55,6 +55,44 @@ func TestConcurrencySlotLimitReleaseAndExpiry(t *testing.T) {
 	assert.True(t, ok, "expired slots must not count against the cap")
 }
 
+func TestRenewConcurrencySlotRenewOnly(t *testing.T) {
+	s := newTestStorage(t)
+	ctx := context.Background()
+	slot := uniqueSlotName(t)
+
+	ok, err := s.TryAcquireConcurrencySlot(ctx, slot, "job-live", "worker-1", 1, time.Second)
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	var before core.ConcurrencySlot
+	require.NoError(t, s.db.WithContext(ctx).
+		Where("slot_name = ? AND job_id = ?", slot, "job-live").
+		First(&before).Error)
+
+	renewed, err := s.RenewConcurrencySlot(ctx, slot, "job-live", time.Hour)
+	require.NoError(t, err)
+	require.True(t, renewed)
+
+	var after core.ConcurrencySlot
+	require.NoError(t, s.db.WithContext(ctx).
+		Where("slot_name = ? AND job_id = ?", slot, "job-live").
+		First(&after).Error)
+	assert.True(t, after.ExpiresAt.After(before.ExpiresAt), "live slot renewal should advance expiry")
+	assert.Equal(t, before.WorkerID, after.WorkerID, "renew-only update preserves the current worker id")
+
+	require.NoError(t, s.ReleaseConcurrencySlot(ctx, slot, "job-live"))
+	renewed, err = s.RenewConcurrencySlot(ctx, slot, "job-live", time.Hour)
+	require.NoError(t, err)
+	assert.False(t, renewed, "released slots must not be resurrected by renewal")
+
+	var heldRows int64
+	require.NoError(t, s.db.WithContext(ctx).
+		Model(&core.ConcurrencySlot{}).
+		Where("slot_name = ? AND job_id = ?", slot, "job-live").
+		Count(&heldRows).Error)
+	assert.Equal(t, int64(0), heldRows)
+}
+
 func TestConcurrencySlotConcurrentLastSlotRace(t *testing.T) {
 	s := newConcurrentTestStorage(t)
 	ctx := context.Background()

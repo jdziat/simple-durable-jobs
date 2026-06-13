@@ -118,6 +118,10 @@ type concurrencySlotStorage interface {
 	ReleaseConcurrencySlot(ctx context.Context, slotName, jobID string) error
 }
 
+type concurrencySlotRenewer interface {
+	RenewConcurrencySlot(ctx context.Context, slotName, jobID string, ttl time.Duration) (bool, error)
+}
+
 type rateLimiterStorage interface {
 	TryConsumeRate(ctx context.Context, limitName string, perSecond float64, window time.Duration, now time.Time) (bool, error)
 }
@@ -619,12 +623,6 @@ func (w *Worker) dispatchDequeuedJobs(ctx context.Context, jobsChan chan<- *core
 			released++
 			continue
 		}
-		if ok := w.tryConsumeRateLimits(ctx, job); !ok {
-			w.refundQueueRateLimit(job.Queue)
-			w.releaseDequeuedJobOnShutdown(ctx, job)
-			released++
-			continue
-		}
 		if ok := w.tryAcquireConcurrencySlots(ctx, job); !ok {
 			w.refundQueueRateLimit(job.Queue)
 			w.releaseDequeuedJobOnShutdown(ctx, job)
@@ -632,6 +630,12 @@ func (w *Worker) dispatchDequeuedJobs(ctx context.Context, jobsChan chan<- *core
 			continue
 		}
 		if ctx.Err() != nil {
+			w.refundQueueRateLimit(job.Queue)
+			w.releaseDequeuedJobOnShutdown(ctx, job)
+			released++
+			continue
+		}
+		if ok := w.tryConsumeRateLimits(ctx, job); !ok {
 			w.refundQueueRateLimit(job.Queue)
 			w.releaseDequeuedJobOnShutdown(ctx, job)
 			released++
@@ -1082,13 +1086,13 @@ func (w *Worker) renewConcurrencySlots(ctx context.Context, jobID string) {
 	if len(slots) == 0 {
 		return
 	}
-	storage, ok := w.queue.Storage().(concurrencySlotStorage)
+	storage, ok := w.queue.Storage().(concurrencySlotRenewer)
 	if !ok {
 		return
 	}
 	ttl := w.concurrencySlotTTL()
 	for _, slot := range slots {
-		if _, err := storage.TryAcquireConcurrencySlot(ctx, slot, jobID, w.config.WorkerID, 1, ttl); err != nil {
+		if _, err := storage.RenewConcurrencySlot(ctx, slot, jobID, ttl); err != nil {
 			w.logger.Warn("failed to renew concurrency slot", "job_id", jobID, "slot", slot, "error", err)
 		}
 	}
@@ -1693,7 +1697,17 @@ func (w *Worker) completeFanOut(ctx context.Context, fo *core.FanOut, status cor
 			w.logger.Debug("parent job not yet in resumable status, retrying",
 				"parent_job_id", fo.ParentJobID,
 				"attempt", attempt+1)
-			time.Sleep(time.Duration(100*(1<<attempt)) * time.Millisecond) // 100ms, 200ms, 400ms, 800ms
+			delay := time.Duration(100*(1<<attempt)) * time.Millisecond // 100ms, 200ms, 400ms, 800ms
+			select {
+			case <-ctx.Done():
+				// Abort the inline retry promptly on shutdown/cancellation (do
+				// not park the processLoop). The fan-out status was already
+				// CAS-advanced upstream; a parent left in 'waiting' is healed by
+				// the GetStalledFanOutParents backstop poll, so returning nil
+				// here is safe — it is not a completion failure.
+				return nil
+			case <-time.After(delay):
+			}
 		}
 	}
 	if !resumed {
