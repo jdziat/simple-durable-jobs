@@ -123,6 +123,9 @@ type WorkerConfig struct {
 	WorkerID        string
 	EnableScheduler bool
 	currentQueue    string // internal: scopes Concurrency to this queue
+	// set by a top-level Concurrency() option; applied to the auto-created
+	// default queue when no WorkerQueue is configured.
+	topLevelConcurrency *int
 
 	// ConcurrencyCaps are optional DB-backed caps enforced across the fleet when
 	// the storage backend implements the worker's optional concurrency slot
@@ -228,6 +231,10 @@ type WorkerConfig struct {
 
 // Concurrency sets the concurrency for a queue.
 // Values are clamped to [1, MaxConcurrency].
+//
+// Used at the top level (e.g. NewWorker(q, Concurrency(50))) it sets the
+// concurrency of the implicit "default" queue created when no WorkerQueue is
+// configured. Inside WorkerQueue(name, Concurrency(n)) it scopes to that queue.
 func Concurrency(n int) WorkerOption {
 	return workerOptionFunc(func(c *WorkerConfig) {
 		clamped := security.ClampConcurrency(n)
@@ -237,6 +244,8 @@ func Concurrency(n int) WorkerOption {
 			for k := range c.Queues {
 				c.Queues[k] = clamped
 			}
+			v := clamped
+			c.topLevelConcurrency = &v
 		}
 	})
 }

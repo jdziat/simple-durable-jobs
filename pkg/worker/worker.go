@@ -206,7 +206,11 @@ func NewWorker(q *queue.Queue, opts ...WorkerOption) *Worker {
 
 	// If no queues configured, use default
 	if config.Queues == nil {
-		config.Queues = map[string]int{"default": 10}
+		n := 10
+		if config.topLevelConcurrency != nil {
+			n = *config.topLevelConcurrency
+		}
+		config.Queues = map[string]int{"default": n}
 	}
 
 	// Set default retry configs if not specified
@@ -341,6 +345,10 @@ func (w *Worker) Start(ctx context.Context) error {
 	w.started.Store(true)
 	defer w.started.Store(false)
 
+	if err := w.validateConfiguredStorageCapabilities(); err != nil {
+		return err
+	}
+
 	totalConcurrency := 0
 	for _, c := range w.config.Queues {
 		totalConcurrency += c
@@ -413,6 +421,21 @@ func (w *Worker) Start(ctx context.Context) error {
 			w.drainDequeuedJobs(ctx, jobsChan, totalConcurrency)
 		}
 	}
+}
+
+func (w *Worker) validateConfiguredStorageCapabilities() error {
+	storage := w.queue.Storage()
+	if count := len(w.config.ConcurrencyCaps); count > 0 {
+		if _, ok := storage.(concurrencySlotStorage); !ok {
+			return fmt.Errorf("worker has %d ConcurrencyCap(s) configured but storage %T does not support DB-backed concurrency slots; the cap would be silently ignored", count, storage)
+		}
+	}
+	if count := len(w.config.RateLimits); count > 0 {
+		if _, ok := storage.(rateLimiterStorage); !ok {
+			return fmt.Errorf("worker has %d RateLimit(s) configured but storage %T does not support DB-backed rate limiting; the rate limit would be silently ignored", count, storage)
+		}
+	}
+	return nil
 }
 
 func (w *Worker) drainDequeuedJobs(ctx context.Context, jobsChan chan<- *core.Job, totalConcurrency int) {
