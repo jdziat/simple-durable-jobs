@@ -67,6 +67,9 @@ type (
 	// Job represents a unit of work to be processed.
 	Job = core.Job
 
+	// UUID is the public job/fan-out/signal/checkpoint identifier type.
+	UUID = core.UUID
+
 	// Checkpoint stores the result of a durable Call() for replay.
 	Checkpoint = core.Checkpoint
 
@@ -353,6 +356,14 @@ var (
 
 	IdentityCodec = core.IdentityCodec
 )
+
+const NilUUID = core.NilUUID
+
+func NewID() UUID { return core.NewID() }
+
+func ParseUUID(s string) (UUID, error) { return core.ParseUUID(s) }
+
+func MustUUID(s string) UUID { return core.MustUUID(s) }
 
 // NopCodec is an alias for IdentityCodec.
 //
@@ -939,8 +950,8 @@ func JobFromContext(ctx context.Context) *Job {
 	return jobctx.JobFromContext(ctx)
 }
 
-// JobIDFromContext returns the current job ID from context, or empty string if not in a job handler.
-func JobIDFromContext(ctx context.Context) string {
+// JobIDFromContext returns the current job ID from context, or empty UUID if not in a job handler.
+func JobIDFromContext(ctx context.Context) UUID {
 	return jobctx.JobIDFromContext(ctx)
 }
 
@@ -1049,9 +1060,9 @@ func IsWaitingError(err error) bool {
 // requeuable (failed/cancelled) state. Returns ErrCannotRequeueSubJob for a
 // fan-out sub-job (requeue its parent instead), or an error if the storage
 // backend does not support requeueing.
-func Requeue(ctx context.Context, q *Queue, jobID string) (bool, error) {
+func Requeue(ctx context.Context, q *Queue, jobID UUID) (bool, error) {
 	type requeuer interface {
-		Requeue(ctx context.Context, jobID string) (bool, error)
+		Requeue(ctx context.Context, jobID core.UUID) (bool, error)
 	}
 	var _ requeuer = (*storage.GormStorage)(nil)
 	r, ok := q.Storage().(requeuer)
@@ -1139,7 +1150,7 @@ func newDeadLetterFilter(opts ...DeadLetterOption) DeadLetterFilter {
 // CheckSignal / DrainSignals. Returns ErrJobNotFound if the job does not exist,
 // ErrStorageNoSignals if the backend lacks signal support,
 // ErrSignalNameReserved, or ErrSignalNameTooLong.
-func Signal(ctx context.Context, q *Queue, jobID, name string, payload any) error {
+func Signal(ctx context.Context, q *Queue, jobID UUID, name string, payload any) error {
 	if name == "" {
 		return fmt.Errorf("jobs: signal name must not be empty")
 	}
@@ -1150,7 +1161,7 @@ func Signal(ctx context.Context, q *Queue, jobID, name string, payload any) erro
 		return core.ErrSignalNameTooLong
 	}
 	type signalSender interface {
-		SendSignal(ctx context.Context, jobID, name string, payload []byte) error
+		SendSignal(ctx context.Context, jobID core.UUID, name string, payload []byte) error
 	}
 	var _ signalSender = (*storage.GormStorage)(nil)
 	sender, ok := q.Storage().(signalSender)
@@ -1189,7 +1200,7 @@ func Signal(ctx context.Context, q *Queue, jobID, name string, payload any) erro
 			return nil
 		}
 		type signalResumer interface {
-			ResumeSignalWaitingJob(ctx context.Context, jobID string) (bool, error)
+			ResumeSignalWaitingJob(ctx context.Context, jobID core.UUID) (bool, error)
 		}
 		var _ signalResumer = (*storage.GormStorage)(nil)
 		if r, ok := q.Storage().(signalResumer); ok {
@@ -1268,7 +1279,7 @@ func DrainSignals[T any](ctx context.Context, name string) ([]T, error) {
 //   - An error wrapping ErrJobCancelled if the job was cancelled.
 //   - ErrNoResult if the job completed but has no persisted result value.
 //   - An error wrapping the JSON decode failure if Result cannot be unmarshaled into T.
-func LoadResult[T any](ctx context.Context, q *Queue, jobID string) (T, error) {
+func LoadResult[T any](ctx context.Context, q *Queue, jobID UUID) (T, error) {
 	var zero T
 	job, err := q.Storage().GetJob(ctx, jobID)
 	if err != nil {

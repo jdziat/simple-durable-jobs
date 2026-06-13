@@ -119,27 +119,31 @@ func TestRequeue_FanOutHandling(t *testing.T) {
 	// Parent → fo-1 → {sub-0, sub-1}; sub-0 is itself a nested fan-out parent
 	// → fo-2 → {grand-0, grand-1}. Requeuing the parent must clear the WHOLE
 	// subtree, including the grandchildren and their checkpoints.
+	parentID := core.NewID()
+	foID := core.NewID()
+	subIDs := []core.UUID{core.NewID(), core.NewID()}
+	fo2 := core.NewID()
+	grandIDs := []core.UUID{core.NewID(), core.NewID()}
+	otherID := core.NewID()
 	require.NoError(t, s.db.WithContext(ctx).Create(&core.Job{
-		ID: "parent", Type: "wf", Queue: "default", Status: core.StatusFailed,
+		ID: parentID, Type: "wf", Queue: "default", Status: core.StatusFailed,
 	}).Error)
 	require.NoError(t, s.CreateFanOut(ctx, &core.FanOut{
-		ID: "fo-1", ParentJobID: "parent", TotalCount: 2, CompletedCount: 1, FailedCount: 1,
+		ID: foID, ParentJobID: parentID, TotalCount: 2, CompletedCount: 1, FailedCount: 1,
 	}))
-	foID := "fo-1"
 	for i, st := range []core.JobStatus{core.StatusCompleted, core.StatusFailed} {
 		require.NoError(t, s.db.WithContext(ctx).Create(&core.Job{
-			ID: fmt.Sprintf("sub-%d", i), Type: "wf.sub", Queue: "default",
+			ID: subIDs[i], Type: "wf.sub", Queue: "default",
 			Status: st, FanOutID: &foID, FanOutIndex: i,
 		}).Error)
 	}
 	// Nested level under sub-0.
 	require.NoError(t, s.CreateFanOut(ctx, &core.FanOut{
-		ID: "fo-2", ParentJobID: "sub-0", TotalCount: 2, CompletedCount: 2,
+		ID: fo2, ParentJobID: subIDs[0], TotalCount: 2, CompletedCount: 2,
 	}))
-	fo2 := "fo-2"
 	// grand-0 failed (so the sub-job-rejection path is reachable), grand-1 done.
 	for i, st := range []core.JobStatus{core.StatusFailed, core.StatusCompleted} {
-		gid := fmt.Sprintf("grand-%d", i)
+		gid := grandIDs[i]
 		require.NoError(t, s.db.WithContext(ctx).Create(&core.Job{
 			ID: gid, Type: "wf.grand", Queue: "default",
 			Status: st, FanOutID: &fo2, FanOutIndex: i,
@@ -151,47 +155,47 @@ func TestRequeue_FanOutHandling(t *testing.T) {
 
 	// An unrelated parent that must be left untouched.
 	require.NoError(t, s.db.WithContext(ctx).Create(&core.Job{
-		ID: "other", Type: "wf", Queue: "default", Status: core.StatusFailed,
+		ID: otherID, Type: "wf", Queue: "default", Status: core.StatusFailed,
 	}).Error)
-	require.NoError(t, s.CreateFanOut(ctx, &core.FanOut{ID: "fo-other", ParentJobID: "other", TotalCount: 1}))
+	require.NoError(t, s.CreateFanOut(ctx, &core.FanOut{ID: core.NewID(), ParentJobID: otherID, TotalCount: 1}))
 
 	// A sub-job cannot be requeued directly.
-	_, err := s.Requeue(ctx, "sub-1")
+	_, err := s.Requeue(ctx, subIDs[1])
 	require.ErrorIs(t, err, core.ErrCannotRequeueSubJob)
-	_, err = s.Requeue(ctx, "grand-0")
+	_, err = s.Requeue(ctx, grandIDs[0])
 	require.ErrorIs(t, err, core.ErrCannotRequeueSubJob)
 
 	// Requeuing the parent resets it and clears the whole fan-out subtree.
-	requeued, err := s.Requeue(ctx, "parent")
+	requeued, err := s.Requeue(ctx, parentID)
 	require.NoError(t, err)
 	assert.True(t, requeued)
 
-	parent, err := s.GetJob(ctx, "parent")
+	parent, err := s.GetJob(ctx, parentID)
 	require.NoError(t, err)
 	assert.Equal(t, core.StatusPending, parent.Status)
 
-	fos, err := s.GetFanOutsByParent(ctx, "parent")
+	fos, err := s.GetFanOutsByParent(ctx, parentID)
 	require.NoError(t, err)
 	assert.Empty(t, fos, "level-1 fan-out records cleared")
-	subs, err := s.GetSubJobs(ctx, "fo-1")
+	subs, err := s.GetSubJobs(ctx, foID)
 	require.NoError(t, err)
 	assert.Empty(t, subs, "level-1 sub-jobs cleared")
 
 	// Nested level cleared too.
-	nestedFOs, err := s.GetFanOutsByParent(ctx, "sub-0")
+	nestedFOs, err := s.GetFanOutsByParent(ctx, subIDs[0])
 	require.NoError(t, err)
 	assert.Empty(t, nestedFOs, "nested fan-out records cleared")
-	grands, err := s.GetSubJobs(ctx, "fo-2")
+	grands, err := s.GetSubJobs(ctx, fo2)
 	require.NoError(t, err)
 	assert.Empty(t, grands, "grandchild sub-jobs cleared")
 	for i := 0; i < 2; i++ {
-		gcps, err := s.GetCheckpoints(ctx, fmt.Sprintf("grand-%d", i))
+		gcps, err := s.GetCheckpoints(ctx, grandIDs[i])
 		require.NoError(t, err)
 		assert.Empty(t, gcps, "grandchild checkpoints cleared")
 	}
 
 	// The unrelated parent is untouched.
-	otherFOs, err := s.GetFanOutsByParent(ctx, "other")
+	otherFOs, err := s.GetFanOutsByParent(ctx, otherID)
 	require.NoError(t, err)
 	assert.Len(t, otherFOs, 1, "unrelated parent's fan-out must be left intact")
 }
@@ -203,30 +207,31 @@ func TestRequeue_ClearsCheckpoints(t *testing.T) {
 	s := newTestStorage(t)
 	ctx := context.Background()
 
+	jobID := core.NewID()
 	require.NoError(t, s.db.WithContext(ctx).Create(&core.Job{
-		ID: "rq-1", Type: "wf", Queue: "default", Status: core.StatusFailed, Attempt: 3, LastError: "boom",
+		ID: jobID, Type: "wf", Queue: "default", Status: core.StatusFailed, Attempt: 3, LastError: "boom",
 	}).Error)
 	for i := 0; i < 3; i++ {
 		require.NoError(t, s.SaveCheckpoint(ctx, &core.Checkpoint{
-			JobID: "rq-1", CallIndex: i, CallType: fmt.Sprintf("step-%d", i), Result: []byte(`"ok"`),
+			JobID: jobID, CallIndex: i, CallType: fmt.Sprintf("step-%d", i), Result: []byte(`"ok"`),
 		}))
 	}
 
-	requeued, err := s.Requeue(ctx, "rq-1")
+	requeued, err := s.Requeue(ctx, jobID)
 	require.NoError(t, err)
 	assert.True(t, requeued)
 
-	got, err := s.GetJob(ctx, "rq-1")
+	got, err := s.GetJob(ctx, jobID)
 	require.NoError(t, err)
 	assert.Equal(t, core.StatusPending, got.Status)
 	assert.Equal(t, 0, got.Attempt)
 
-	cps, err := s.GetCheckpoints(ctx, "rq-1")
+	cps, err := s.GetCheckpoints(ctx, jobID)
 	require.NoError(t, err)
 	assert.Empty(t, cps, "Requeue should clear checkpoints for a fresh replay")
 
 	// A non-terminal / missing job is not requeued.
-	missing, err := s.Requeue(ctx, "does-not-exist")
+	missing, err := s.Requeue(ctx, core.NewID())
 	require.NoError(t, err)
 	assert.False(t, missing)
 }
@@ -327,13 +332,13 @@ func TestSeedScheduledFire_InsertIfAbsent(t *testing.T) {
 func TestSaveCheckpoint_PersistsErrorCause(t *testing.T) {
 	s := newTestStorage(t)
 	ctx := context.Background()
-	seedTestJob(t, ctx, s, "job-1", core.StatusRunning)
+	seedTestJob(t, ctx, s, testUUID("job-1"), core.StatusRunning)
 
 	orig := core.NoRetry(assertErr("payment declined"))
 	message, cause, kind, delay := core.CheckpointErrorFields(orig)
 
 	cp := &core.Checkpoint{
-		JobID:           "job-1",
+		JobID:           testUUID("job-1"),
 		CallIndex:       0,
 		CallType:        "charge",
 		Error:           message,
@@ -343,7 +348,7 @@ func TestSaveCheckpoint_PersistsErrorCause(t *testing.T) {
 	}
 	require.NoError(t, s.SaveCheckpoint(ctx, cp))
 
-	loaded, err := s.GetCheckpoints(ctx, "job-1")
+	loaded, err := s.GetCheckpoints(ctx, testUUID("job-1"))
 	require.NoError(t, err)
 	require.Len(t, loaded, 1)
 	assert.Equal(t, "payment declined", loaded[0].ErrorCause)

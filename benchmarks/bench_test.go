@@ -145,7 +145,7 @@ func BenchmarkDispatchLatency(b *testing.B) {
 	ctx := context.Background()
 	latencies := make([]int64, 0, b.N)
 	started := make(chan *jobs.JobStarted, 1)
-	completed := make(chan string, 1)
+	completed := make(chan jobs.UUID, 1)
 
 	env.queue.Register("bench.latency", func(context.Context, noopArgs) error { return nil })
 	env.queue.OnJobStart(func(_ context.Context, job *jobs.Job) {
@@ -316,7 +316,7 @@ func waitDone(b *testing.B, done <-chan struct{}, timeout time.Duration) {
 	}
 }
 
-func waitJobStarted(b *testing.B, started <-chan *jobs.JobStarted, jobID string, timeout time.Duration) time.Time {
+func waitJobStarted(b *testing.B, started <-chan *jobs.JobStarted, jobID jobs.UUID, timeout time.Duration) time.Time {
 	b.Helper()
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
@@ -332,7 +332,7 @@ func waitJobStarted(b *testing.B, started <-chan *jobs.JobStarted, jobID string,
 	}
 }
 
-func waitJobCompleted(b *testing.B, completed <-chan string, jobID string, timeout time.Duration) {
+func waitJobCompleted(b *testing.B, completed <-chan jobs.UUID, jobID jobs.UUID, timeout time.Duration) {
 	b.Helper()
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()

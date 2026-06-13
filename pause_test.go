@@ -110,7 +110,7 @@ func TestGetPausedJobs_ReturnsPausedJobIDs(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, paused, 2)
 
-	ids := make([]string, 0, len(paused))
+	ids := make([]jobs.UUID, 0, len(paused))
 	for _, j := range paused {
 		ids = append(ids, j.ID)
 	}

@@ -32,7 +32,7 @@ func SubJobOf[A any, R any](def *Def[A, R], args A, opts ...queue.Option) fanout
 }
 
 // Signal delivers a named signal carrying payload to a job.
-func Signal(ctx context.Context, q *queue.Queue, jobID, name string, payload any) error {
+func Signal(ctx context.Context, q *queue.Queue, jobID core.UUID, name string, payload any) error {
 	if name == "" {
 		return fmt.Errorf("jobs: signal name must not be empty")
 	}
@@ -43,7 +43,7 @@ func Signal(ctx context.Context, q *queue.Queue, jobID, name string, payload any
 		return core.ErrSignalNameTooLong
 	}
 	type signalSender interface {
-		SendSignal(ctx context.Context, jobID, name string, payload []byte) error
+		SendSignal(ctx context.Context, jobID core.UUID, name string, payload []byte) error
 	}
 	sender, ok := q.Storage().(signalSender)
 	if !ok {
@@ -76,7 +76,7 @@ func Signal(ctx context.Context, q *queue.Queue, jobID, name string, payload any
 			return nil
 		}
 		type signalResumer interface {
-			ResumeSignalWaitingJob(ctx context.Context, jobID string) (bool, error)
+			ResumeSignalWaitingJob(ctx context.Context, jobID core.UUID) (bool, error)
 		}
 		if r, ok := q.Storage().(signalResumer); ok {
 			resumed, err := r.ResumeSignalWaitingJob(ctx, jobID)

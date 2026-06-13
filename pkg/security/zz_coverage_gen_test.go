@@ -63,9 +63,9 @@ func TestIsLikelyOpaqueToken_DigitUpperLowerMix(t *testing.T) {
 func TestIsLikelyOpaqueToken_NotEnoughVariety(t *testing.T) {
 	// Non-hex letters only (g-z), no digit, no symbol, single case.
 	// hexOnly is false (g-z), hasTokenSymbol false, and not (digit&&upper&&lower).
-	assert.False(t, isLikelyOpaqueToken("zzzzzzzzzzzzzzzzzzzz"))  // all lower non-hex
-	assert.False(t, isLikelyOpaqueToken("ZZZZZZZZZZZZZZZZZZZZ"))  // all upper non-hex
-	assert.False(t, isLikelyOpaqueToken("gggggggggggggggggggg"))  // lower g
+	assert.False(t, isLikelyOpaqueToken("zzzzzzzzzzzzzzzzzzzz")) // all lower non-hex
+	assert.False(t, isLikelyOpaqueToken("ZZZZZZZZZZZZZZZZZZZZ")) // all upper non-hex
+	assert.False(t, isLikelyOpaqueToken("gggggggggggggggggggg")) // lower g
 	// Digit + lower non-hex but no upper -> fails the digit&&upper&&lower clause.
 	assert.False(t, isLikelyOpaqueToken("g1g2g3g4g5g6g7g8g9g0"))
 	// Digit + upper non-hex but no lower.
@@ -78,7 +78,7 @@ func TestIsLikelyOpaqueToken_DefaultBranchUnknownRune(t *testing.T) {
 	assert.False(t, isLikelyOpaqueToken("aaaaaaaaaa aaaaaaaaaa")) // space at index 10
 	assert.False(t, isLikelyOpaqueToken("aaaaaaaaaa-aaaaaaaaaa")) // hyphen
 	assert.False(t, isLikelyOpaqueToken("aaaaaaaaaa.aaaaaaaaaa")) // dot
-	assert.False(t, isLikelyOpaqueToken("aaaaaaaaaaéaaaaaaaaa")) // non-ASCII rune (é)
+	assert.False(t, isLikelyOpaqueToken("aaaaaaaaaaéaaaaaaaaa"))  // non-ASCII rune (é)
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

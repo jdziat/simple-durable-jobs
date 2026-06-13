@@ -33,34 +33,34 @@ type mockStorage struct {
 	mu sync.Mutex
 
 	releaseCount           int64         // number of ReleaseStaleLocks calls
-	releasedIDs            []string      // IDs returned by ReleaseStaleLocks
+	releasedIDs            []core.UUID   // IDs returned by ReleaseStaleLocks
 	releaseErr             error         // error returned by ReleaseStaleLocks
 	releaseDelay           time.Duration // optional artificial delay per call
-	releaseFunc            func(ctx context.Context, age time.Duration) ([]string, error)
-	releasedJobIDs         []string // IDs passed to Release
-	releaseJobFunc         func(ctx context.Context, jobID string, workerID string) error
+	releaseFunc            func(ctx context.Context, age time.Duration) ([]core.UUID, error)
+	releasedJobIDs         []core.UUID // IDs passed to Release
+	releaseJobFunc         func(ctx context.Context, jobID core.UUID, workerID string) error
 	dequeueFunc            func(ctx context.Context, queues []string, workerID string) (*core.Job, error)
-	completeFunc           func(ctx context.Context, jobID string, workerID string) error
-	failFunc               func(ctx context.Context, jobID string, workerID string, errMsg string, retryAt *time.Time) error
-	heartbeatFunc          func(ctx context.Context, jobID string, workerID string) error
-	checkpointFunc         func(ctx context.Context, jobID string) ([]core.Checkpoint, error)
+	completeFunc           func(ctx context.Context, jobID core.UUID, workerID string) error
+	failFunc               func(ctx context.Context, jobID core.UUID, workerID string, errMsg string, retryAt *time.Time) error
+	heartbeatFunc          func(ctx context.Context, jobID core.UUID, workerID string) error
+	checkpointFunc         func(ctx context.Context, jobID core.UUID) ([]core.Checkpoint, error)
 	saveCheckpointFunc     func(ctx context.Context, cp *core.Checkpoint) error
 	waitingJobsFunc        func(ctx context.Context) ([]*core.Job, error)
 	stalledJobsFunc        func(ctx context.Context, olderThan time.Time) ([]*core.Job, error)
-	signalWaitingAfterFunc func(ctx context.Context, afterJobID string, limit int) ([]*core.Job, error)
+	signalWaitingAfterFunc func(ctx context.Context, afterJobID core.UUID, limit int) ([]*core.Job, error)
 	signalWaitingFunc      func(ctx context.Context) ([]*core.Job, error)
-	resumeSignalFunc       func(ctx context.Context, jobID string) (bool, error)
+	resumeSignalFunc       func(ctx context.Context, jobID core.UUID) (bool, error)
 	claimFireFunc          func(ctx context.Context, name string, fireTime time.Time) (bool, error)
 	fireTimeFunc           func(ctx context.Context, name string) (time.Time, bool, error)
 	fireTimes              map[string]time.Time
 
 	// fan-out control hooks
-	incrementCompletedFunc func(ctx context.Context, fanOutID string) (*core.FanOut, error)
-	incrementFailedFunc    func(ctx context.Context, fanOutID string) (*core.FanOut, error)
-	updateFanOutStatusFunc func(ctx context.Context, fanOutID string, status core.FanOutStatus) (bool, error)
-	resumeJobFunc          func(ctx context.Context, jobID string) (bool, error)
-	cancelSubJobsFunc      func(ctx context.Context, fanOutID string) ([]string, error)
-	findOrphanedFunc       func(jobIDs []string) ([]string, error)
+	incrementCompletedFunc func(ctx context.Context, fanOutID core.UUID) (*core.FanOut, error)
+	incrementFailedFunc    func(ctx context.Context, fanOutID core.UUID) (*core.FanOut, error)
+	updateFanOutStatusFunc func(ctx context.Context, fanOutID core.UUID, status core.FanOutStatus) (bool, error)
+	resumeJobFunc          func(ctx context.Context, jobID core.UUID) (bool, error)
+	cancelSubJobsFunc      func(ctx context.Context, fanOutID core.UUID) ([]core.UUID, error)
+	findOrphanedFunc       func(jobIDs []core.UUID) ([]core.UUID, error)
 	completablePendingFunc func(ctx context.Context, olderThan time.Time) ([]*core.FanOut, error)
 
 	// enqueue tracking
@@ -97,14 +97,14 @@ func (m *mockStorage) Dequeue(ctx context.Context, queues []string, workerID str
 	return nil, nil
 }
 
-func (m *mockStorage) Complete(ctx context.Context, jobID string, workerID string) error {
+func (m *mockStorage) Complete(ctx context.Context, jobID core.UUID, workerID string) error {
 	if m.completeFunc != nil {
 		return m.completeFunc(ctx, jobID, workerID)
 	}
 	return nil
 }
 
-func (m *mockStorage) CompleteWithResult(ctx context.Context, jobID, workerID string, result []byte) (*core.FanOut, error) {
+func (m *mockStorage) CompleteWithResult(ctx context.Context, jobID core.UUID, workerID string, result []byte) (*core.FanOut, error) {
 	if result != nil {
 		if err := m.SaveJobResult(ctx, jobID, workerID, result); err != nil {
 			return nil, err
@@ -116,7 +116,7 @@ func (m *mockStorage) CompleteWithResult(ctx context.Context, jobID, workerID st
 	return nil, nil
 }
 
-func (m *mockStorage) Fail(ctx context.Context, jobID string, workerID string, errMsg string, retryAt *time.Time) error {
+func (m *mockStorage) Fail(ctx context.Context, jobID core.UUID, workerID string, errMsg string, retryAt *time.Time) error {
 	if m.failFunc != nil {
 		return m.failFunc(ctx, jobID, workerID, errMsg, retryAt)
 	}
@@ -143,14 +143,14 @@ func (m *mockStorage) SaveCheckpoint(ctx context.Context, cp *core.Checkpoint) e
 	return nil
 }
 
-func (m *mockStorage) GetCheckpoints(ctx context.Context, jobID string) ([]core.Checkpoint, error) {
+func (m *mockStorage) GetCheckpoints(ctx context.Context, jobID core.UUID) ([]core.Checkpoint, error) {
 	if m.checkpointFunc != nil {
 		return m.checkpointFunc(ctx, jobID)
 	}
 	return nil, nil
 }
 
-func (m *mockStorage) DeleteCheckpoints(_ context.Context, _ string) error { return nil }
+func (m *mockStorage) DeleteCheckpoints(_ context.Context, _ core.UUID) error { return nil }
 
 func (m *mockStorage) GetDueJobs(_ context.Context, _ []string, _ int) ([]*core.Job, error) {
 	return nil, nil
@@ -171,14 +171,14 @@ func (m *mockStorage) GetScheduledFireTime(ctx context.Context, name string) (ti
 	return t, ok, nil
 }
 
-func (m *mockStorage) Heartbeat(ctx context.Context, jobID string, workerID string) error {
+func (m *mockStorage) Heartbeat(ctx context.Context, jobID core.UUID, workerID string) error {
 	if m.heartbeatFunc != nil {
 		return m.heartbeatFunc(ctx, jobID, workerID)
 	}
 	return nil
 }
 
-func (m *mockStorage) Release(ctx context.Context, jobID string, workerID string) error {
+func (m *mockStorage) Release(ctx context.Context, jobID core.UUID, workerID string) error {
 	m.mu.Lock()
 	m.releasedJobIDs = append(m.releasedJobIDs, jobID)
 	m.mu.Unlock()
@@ -188,7 +188,7 @@ func (m *mockStorage) Release(ctx context.Context, jobID string, workerID string
 	return nil
 }
 
-func (m *mockStorage) ReleaseStaleLocks(ctx context.Context, age time.Duration) ([]string, error) {
+func (m *mockStorage) ReleaseStaleLocks(ctx context.Context, age time.Duration) ([]core.UUID, error) {
 	if m.releaseDelay > 0 {
 		time.Sleep(m.releaseDelay)
 	}
@@ -201,14 +201,14 @@ func (m *mockStorage) ReleaseStaleLocks(ctx context.Context, age time.Duration) 
 	return m.releasedIDs, m.releaseErr
 }
 
-func (m *mockStorage) FindOrphanedJobs(_ context.Context, jobIDs []string, _ string) ([]string, error) {
+func (m *mockStorage) FindOrphanedJobs(_ context.Context, jobIDs []core.UUID, _ string) ([]core.UUID, error) {
 	if m.findOrphanedFunc != nil {
 		return m.findOrphanedFunc(jobIDs)
 	}
 	return nil, nil
 }
 
-func (m *mockStorage) GetJob(_ context.Context, _ string) (*core.Job, error) { return nil, nil }
+func (m *mockStorage) GetJob(_ context.Context, _ core.UUID) (*core.Job, error) { return nil, nil }
 
 func (m *mockStorage) GetJobsByStatus(_ context.Context, _ core.JobStatus, _ int) ([]*core.Job, error) {
 	return nil, nil
@@ -216,63 +216,63 @@ func (m *mockStorage) GetJobsByStatus(_ context.Context, _ core.JobStatus, _ int
 
 func (m *mockStorage) CreateFanOut(_ context.Context, _ *core.FanOut) error { return nil }
 
-func (m *mockStorage) GetFanOut(_ context.Context, _ string) (*core.FanOut, error) {
+func (m *mockStorage) GetFanOut(_ context.Context, _ core.UUID) (*core.FanOut, error) {
 	return nil, nil
 }
 
-func (m *mockStorage) IncrementFanOutCompleted(ctx context.Context, fanOutID string) (*core.FanOut, error) {
+func (m *mockStorage) IncrementFanOutCompleted(ctx context.Context, fanOutID core.UUID) (*core.FanOut, error) {
 	if m.incrementCompletedFunc != nil {
 		return m.incrementCompletedFunc(ctx, fanOutID)
 	}
 	return nil, nil
 }
 
-func (m *mockStorage) IncrementFanOutFailed(ctx context.Context, fanOutID string) (*core.FanOut, error) {
+func (m *mockStorage) IncrementFanOutFailed(ctx context.Context, fanOutID core.UUID) (*core.FanOut, error) {
 	if m.incrementFailedFunc != nil {
 		return m.incrementFailedFunc(ctx, fanOutID)
 	}
 	return nil, nil
 }
 
-func (m *mockStorage) IncrementFanOutCancelled(_ context.Context, _ string) (*core.FanOut, error) {
+func (m *mockStorage) IncrementFanOutCancelled(_ context.Context, _ core.UUID) (*core.FanOut, error) {
 	return nil, nil
 }
 
-func (m *mockStorage) UpdateFanOutStatus(ctx context.Context, fanOutID string, status core.FanOutStatus) (bool, error) {
+func (m *mockStorage) UpdateFanOutStatus(ctx context.Context, fanOutID core.UUID, status core.FanOutStatus) (bool, error) {
 	if m.updateFanOutStatusFunc != nil {
 		return m.updateFanOutStatusFunc(ctx, fanOutID, status)
 	}
 	return false, nil
 }
 
-func (m *mockStorage) GetFanOutsByParent(_ context.Context, _ string) ([]*core.FanOut, error) {
+func (m *mockStorage) GetFanOutsByParent(_ context.Context, _ core.UUID) ([]*core.FanOut, error) {
 	return nil, nil
 }
 
 func (m *mockStorage) EnqueueBatch(_ context.Context, _ []*core.Job) error { return nil }
 
-func (m *mockStorage) GetSubJobs(_ context.Context, _ string) ([]*core.Job, error) {
+func (m *mockStorage) GetSubJobs(_ context.Context, _ core.UUID) ([]*core.Job, error) {
 	return nil, nil
 }
 
-func (m *mockStorage) GetSubJobResults(_ context.Context, _ string) ([]*core.Job, error) {
+func (m *mockStorage) GetSubJobResults(_ context.Context, _ core.UUID) ([]*core.Job, error) {
 	return nil, nil
 }
 
-func (m *mockStorage) CancelSubJobs(ctx context.Context, fanOutID string) ([]string, error) {
+func (m *mockStorage) CancelSubJobs(ctx context.Context, fanOutID core.UUID) ([]core.UUID, error) {
 	if m.cancelSubJobsFunc != nil {
 		return m.cancelSubJobsFunc(ctx, fanOutID)
 	}
 	return nil, nil
 }
 
-func (m *mockStorage) CancelSubJob(_ context.Context, _ string) (*core.FanOut, error) {
+func (m *mockStorage) CancelSubJob(_ context.Context, _ core.UUID) (*core.FanOut, error) {
 	return nil, nil
 }
 
-func (m *mockStorage) MarkWaiting(_ context.Context, _ string, _ string) error { return nil }
+func (m *mockStorage) MarkWaiting(_ context.Context, _ core.UUID, _ string) error { return nil }
 
-func (m *mockStorage) ResumeJob(ctx context.Context, jobID string) (bool, error) {
+func (m *mockStorage) ResumeJob(ctx context.Context, jobID core.UUID) (bool, error) {
 	if m.resumeJobFunc != nil {
 		return m.resumeJobFunc(ctx, jobID)
 	}
@@ -307,39 +307,39 @@ func (m *mockStorage) GetSignalWaitingJobsToResume(ctx context.Context) ([]*core
 	return nil, nil
 }
 
-func (m *mockStorage) GetSignalWaitingJobsToResumeAfter(ctx context.Context, afterJobID string, limit int) ([]*core.Job, error) {
+func (m *mockStorage) GetSignalWaitingJobsToResumeAfter(ctx context.Context, afterJobID core.UUID, limit int) ([]*core.Job, error) {
 	if m.signalWaitingAfterFunc != nil {
 		return m.signalWaitingAfterFunc(ctx, afterJobID, limit)
 	}
 	return nil, nil
 }
 
-func (m *mockStorage) ResumeSignalWaitingJob(ctx context.Context, jobID string) (bool, error) {
+func (m *mockStorage) ResumeSignalWaitingJob(ctx context.Context, jobID core.UUID) (bool, error) {
 	if m.resumeSignalFunc != nil {
 		return m.resumeSignalFunc(ctx, jobID)
 	}
 	return false, nil
 }
 
-func (m *mockStorage) SaveJobResult(_ context.Context, jobID string, _ string, result []byte) error {
+func (m *mockStorage) SaveJobResult(_ context.Context, jobID core.UUID, _ string, result []byte) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.savedResults == nil {
 		m.savedResults = map[string][]byte{}
 	}
-	m.savedResults[jobID] = result
+	m.savedResults[string(jobID)] = result
 	return nil
 }
 
-func (m *mockStorage) PauseJob(_ context.Context, _ string) error   { return nil }
-func (m *mockStorage) UnpauseJob(_ context.Context, _ string) error { return nil }
+func (m *mockStorage) PauseJob(_ context.Context, _ core.UUID) error   { return nil }
+func (m *mockStorage) UnpauseJob(_ context.Context, _ core.UUID) error { return nil }
 func (m *mockStorage) GetPausedJobs(_ context.Context, _ string) ([]*core.Job, error) {
 	return nil, nil
 }
-func (m *mockStorage) IsJobPaused(_ context.Context, _ string) (bool, error) { return false, nil }
-func (m *mockStorage) PauseQueue(_ context.Context, _ string) error          { return nil }
-func (m *mockStorage) UnpauseQueue(_ context.Context, _ string) error        { return nil }
-func (m *mockStorage) GetPausedQueues(_ context.Context) ([]string, error)   { return nil, nil }
+func (m *mockStorage) IsJobPaused(_ context.Context, _ core.UUID) (bool, error) { return false, nil }
+func (m *mockStorage) PauseQueue(_ context.Context, _ string) error             { return nil }
+func (m *mockStorage) UnpauseQueue(_ context.Context, _ string) error           { return nil }
+func (m *mockStorage) GetPausedQueues(_ context.Context) ([]string, error)      { return nil, nil }
 func (m *mockStorage) IsQueuePaused(_ context.Context, _ string) (bool, error) {
 	return false, nil
 }
@@ -355,26 +355,26 @@ func (m *mockStorage) getReleaseCount() int64 {
 	return m.releaseCount
 }
 
-func (m *mockStorage) getReleasedJobIDs() []string {
+func (m *mockStorage) getReleasedJobIDs() []core.UUID {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return append([]string(nil), m.releasedJobIDs...)
+	return append([]core.UUID(nil), m.releasedJobIDs...)
 }
 
 type atomicMockStorage struct {
 	*mockStorage
-	completeWithResultFunc     func(ctx context.Context, jobID, workerID string, result []byte) (*core.FanOut, error)
-	failTerminalWithResultFunc func(ctx context.Context, jobID, workerID, errMsg string) (*core.FanOut, error)
+	completeWithResultFunc     func(ctx context.Context, jobID core.UUID, workerID string, result []byte) (*core.FanOut, error)
+	failTerminalWithResultFunc func(ctx context.Context, jobID core.UUID, workerID string, errMsg string) (*core.FanOut, error)
 }
 
-func (m *atomicMockStorage) CompleteWithResult(ctx context.Context, jobID, workerID string, result []byte) (*core.FanOut, error) {
+func (m *atomicMockStorage) CompleteWithResult(ctx context.Context, jobID core.UUID, workerID string, result []byte) (*core.FanOut, error) {
 	if m.completeWithResultFunc != nil {
 		return m.completeWithResultFunc(ctx, jobID, workerID, result)
 	}
 	return nil, nil
 }
 
-func (m *atomicMockStorage) FailTerminalWithResult(ctx context.Context, jobID, workerID, errMsg string) (*core.FanOut, error) {
+func (m *atomicMockStorage) FailTerminalWithResult(ctx context.Context, jobID core.UUID, workerID string, errMsg string) (*core.FanOut, error) {
 	if m.failTerminalWithResultFunc != nil {
 		return m.failTerminalWithResultFunc(ctx, jobID, workerID, errMsg)
 	}
@@ -1028,7 +1028,7 @@ func TestWorker_StartWaitsForStaleLockReaperToFinish(t *testing.T) {
 	var enterOnce sync.Once
 
 	mock := &mockStorage{}
-	mock.releaseFunc = func(_ context.Context, _ time.Duration) ([]string, error) {
+	mock.releaseFunc = func(_ context.Context, _ time.Duration) ([]core.UUID, error) {
 		enterOnce.Do(func() { close(reaperEntered) })
 		<-releaseReaper
 		return nil, nil
@@ -1077,7 +1077,7 @@ func TestWorker_StartWaitsForStaleLockReaperToFinish(t *testing.T) {
 // fires the OnJobReclaimed hook. This is the leading-indicator observability
 // the un-alertable slog-only reaper lacked.
 func TestWorker_StaleLockReaper_EmitsJobReclaimed(t *testing.T) {
-	mock := &mockStorage{releasedIDs: []string{"job-1", "job-2"}}
+	mock := &mockStorage{releasedIDs: []core.UUID{core.UUID("job-1"), core.UUID("job-2")}}
 	q := queue.New(mock)
 
 	// Subscribe BEFORE Start so no emitted event is missed.
@@ -1085,7 +1085,7 @@ func TestWorker_StaleLockReaper_EmitsJobReclaimed(t *testing.T) {
 	defer q.Unsubscribe(ch)
 
 	var hookCount atomic.Int32
-	q.OnJobReclaimed(func(_ context.Context, _, reason string) {
+	q.OnJobReclaimed(func(_ context.Context, _ core.UUID, reason string) {
 		if reason == core.ReclaimReasonStaleLock {
 			hookCount.Add(1)
 		}
@@ -1110,7 +1110,7 @@ loop:
 				sawReclaim = true
 				gotReason = rc.Reason
 				gotWorkerID = rc.WorkerID
-				gotJobID = rc.JobID
+				gotJobID = string(rc.JobID)
 				break loop
 			}
 		case <-deadline:
@@ -1134,8 +1134,8 @@ loop:
 // hookable core.JobReclaimed event (Reason=ownership_audit).
 func TestWorker_OwnershipAudit_EmitsJobReclaimed(t *testing.T) {
 	mock := &mockStorage{}
-	mock.findOrphanedFunc = func(_ []string) ([]string, error) {
-		return []string{"job-9"}, nil
+	mock.findOrphanedFunc = func(_ []core.UUID) ([]core.UUID, error) {
+		return []core.UUID{core.UUID("job-9")}, nil
 	}
 	q := queue.New(mock)
 
@@ -1177,7 +1177,7 @@ loop:
 
 	require.NotNil(t, rc, "expected a JobReclaimed event from the ownership audit")
 	assert.Equal(t, core.ReclaimReasonOwnershipAudit, rc.Reason)
-	assert.Equal(t, "job-9", rc.JobID)
+	assert.Equal(t, core.UUID("job-9"), rc.JobID)
 	assert.Equal(t, w.config.WorkerID, rc.WorkerID)
 }
 
@@ -1437,14 +1437,14 @@ func TestWorker_TrackUntrackMultipleJobs(t *testing.T) {
 
 	const n = 5
 	for i := range n {
-		w.trackQueueJob(string(rune('a'+i)), "default")
+		w.trackQueueJob(core.UUID(string(rune('a'+i))), "default")
 	}
 
 	counter := w.queueRunning["default"]
 	assert.Equal(t, int32(n), counter.Load())
 
 	for i := range n {
-		w.untrackQueueJob(string(rune('a' + i)))
+		w.untrackQueueJob(core.UUID(string(rune('a' + i))))
 	}
 	assert.Equal(t, int32(0), counter.Load())
 }
@@ -1606,7 +1606,7 @@ func TestWorker_CalculateBackoff_OverflowSafeForMaxRetryRange(t *testing.T) {
 func TestWorker_FailWithRetry_ClampsPastRetryAtToNow(t *testing.T) {
 	var captured *time.Time
 	mock := &mockStorage{
-		failFunc: func(_ context.Context, _ string, _ string, _ string, retryAt *time.Time) error {
+		failFunc: func(_ context.Context, _ core.UUID, _ string, _ string, retryAt *time.Time) error {
 			require.NotNil(t, retryAt)
 			copy := *retryAt
 			captured = &copy
@@ -1706,7 +1706,7 @@ func TestWorker_StaleLockReaper_ErrorPathContinues(t *testing.T) {
 
 func TestWorker_StaleLockReaper_LogsWhenJobsReleased(t *testing.T) {
 	mock := &mockStorage{
-		releasedIDs: []string{"job-a", "job-b", "job-c"}, // pretend 3 jobs were released
+		releasedIDs: []core.UUID{core.UUID("job-a"), core.UUID("job-b"), core.UUID("job-c")}, // pretend 3 jobs were released
 		releaseErr:  nil,
 	}
 	q := queue.New(mock)
@@ -2198,7 +2198,7 @@ func TestWorker_ShutdownReleasesDequeuedJobInsteadOfDropping(t *testing.T) {
 	err := w.Start(ctx)
 	require.ErrorIs(t, err, context.Canceled)
 
-	assert.Equal(t, []string{job.ID}, mock.getReleasedJobIDs())
+	assert.Equal(t, []core.UUID{job.ID}, mock.getReleasedJobIDs())
 	assert.Equal(t, int32(0), w.queueRunning["default"].Load())
 	w.queueJobIDMu.Lock()
 	_, tracked := w.queueJobID[job.ID]
@@ -2345,10 +2345,10 @@ func TestWorker_ExecuteHandler_PanicsWithError(t *testing.T) {
 
 func TestWorker_ExecuteHandler_GetCheckpointsError(t *testing.T) {
 	mock := &mockStorage{
-		checkpointFunc: func(_ context.Context, _ string) ([]core.Checkpoint, error) {
+		checkpointFunc: func(_ context.Context, _ core.UUID) ([]core.Checkpoint, error) {
 			return nil, errors.New("checkpoint load error")
 		},
-		failFunc: func(_ context.Context, _ string, _ string, _ string, _ *time.Time) error {
+		failFunc: func(_ context.Context, _ core.UUID, _ string, _ string, _ *time.Time) error {
 			return nil
 		},
 	}
@@ -2363,7 +2363,7 @@ func TestWorker_ExecuteHandler_GetCheckpointsError(t *testing.T) {
 	})
 
 	// Inject a job directly into the mock dequeue so we control what is processed.
-	jobID := "test-job-1"
+	jobID := core.UUID("test-job-1")
 	mock.dequeueFunc = func(ctx context.Context, queues []string, workerID string) (*core.Job, error) {
 		mock.dequeueFunc = nil // only return once
 		return &core.Job{
@@ -2406,7 +2406,7 @@ func TestExecuteHandler_CheckpointWriteSurvivesJobCancellation(t *testing.T) {
 		capturedCP  *core.Checkpoint
 	)
 	mock := &mockStorage{
-		checkpointFunc: func(_ context.Context, _ string) ([]core.Checkpoint, error) {
+		checkpointFunc: func(_ context.Context, _ core.UUID) ([]core.Checkpoint, error) {
 			return nil, nil
 		},
 		saveCheckpointFunc: func(ctx context.Context, cp *core.Checkpoint) error {
@@ -2466,7 +2466,7 @@ func TestExecuteHandler_CheckpointWriteSurvivesJobCancellation_CallPath(t *testi
 		capturedCP  *core.Checkpoint
 	)
 	mock := &mockStorage{
-		checkpointFunc: func(_ context.Context, _ string) ([]core.Checkpoint, error) {
+		checkpointFunc: func(_ context.Context, _ core.UUID) ([]core.Checkpoint, error) {
 			return nil, nil
 		},
 		saveCheckpointFunc: func(ctx context.Context, cp *core.Checkpoint) error {
@@ -2544,7 +2544,7 @@ func TestWorker_PollWaitingJobs_ExitsOnContextCancel(t *testing.T) {
 
 func TestWorker_PollWaitingJobs_ResumesStalledFanOutParent(t *testing.T) {
 	stalledParent := &core.Job{ID: "stalled-parent", Status: core.StatusWaiting}
-	resumed := make(chan string, 1)
+	resumed := make(chan core.UUID, 1)
 	var sawCutoff atomic.Bool
 
 	mock := &mockStorage{
@@ -2554,7 +2554,7 @@ func TestWorker_PollWaitingJobs_ResumesStalledFanOutParent(t *testing.T) {
 			}
 			return []*core.Job{stalledParent}, nil
 		},
-		resumeJobFunc: func(_ context.Context, jobID string) (bool, error) {
+		resumeJobFunc: func(_ context.Context, jobID core.UUID) (bool, error) {
 			resumed <- jobID
 			return true, nil
 		},
@@ -2569,7 +2569,7 @@ func TestWorker_PollWaitingJobs_ResumesStalledFanOutParent(t *testing.T) {
 
 	select {
 	case jobID := <-resumed:
-		assert.Equal(t, "stalled-parent", jobID)
+		assert.Equal(t, core.UUID("stalled-parent"), jobID)
 	case <-time.After(time.Second):
 		t.Fatal("ResumeJob was not called for stalled fan-out parent")
 	}
@@ -2585,25 +2585,25 @@ func TestWorker_PollWaitingJobs_ResumesStalledFanOutParent(t *testing.T) {
 func TestPollWaitingJobsOnce_RescuesStrandedTerminalFanOut(t *testing.T) {
 	stranded := &core.FanOut{
 		ID:             "fo-stranded",
-		ParentJobID:    "parent-stranded",
+		ParentJobID:    core.UUID("parent-stranded"),
 		TotalCount:     2,
 		CompletedCount: 2,
 		Strategy:       core.StrategyCollectAll,
 		Status:         core.FanOutPending,
 	}
 	statusUpdated := make(chan core.FanOutStatus, 1)
-	resumed := make(chan string, 1)
+	resumed := make(chan core.UUID, 1)
 
 	mock := &mockStorage{
 		completablePendingFunc: func(_ context.Context, _ time.Time) ([]*core.FanOut, error) {
 			return []*core.FanOut{stranded}, nil
 		},
-		updateFanOutStatusFunc: func(_ context.Context, fanOutID string, status core.FanOutStatus) (bool, error) {
+		updateFanOutStatusFunc: func(_ context.Context, fanOutID core.UUID, status core.FanOutStatus) (bool, error) {
 			assert.Equal(t, stranded.ID, fanOutID)
 			statusUpdated <- status
 			return true, nil
 		},
-		resumeJobFunc: func(_ context.Context, jobID string) (bool, error) {
+		resumeJobFunc: func(_ context.Context, jobID core.UUID) (bool, error) {
 			resumed <- jobID
 			return true, nil
 		},
@@ -2636,12 +2636,12 @@ func TestPollWaitingJobsOnce_RescuesStrandedTerminalFanOut(t *testing.T) {
 // because its own terminal transaction already advanced the status. completeFanOut
 // must still fall through to the idempotent ResumeJob.
 func TestCompleteFanOut_ResumesWhenStatusAlreadyTerminal(t *testing.T) {
-	resumed := make(chan string, 1)
+	resumed := make(chan core.UUID, 1)
 	mock := &mockStorage{
-		updateFanOutStatusFunc: func(_ context.Context, _ string, _ core.FanOutStatus) (bool, error) {
+		updateFanOutStatusFunc: func(_ context.Context, _ core.UUID, _ core.FanOutStatus) (bool, error) {
 			return false, nil // status already advanced in-tx
 		},
-		resumeJobFunc: func(_ context.Context, jobID string) (bool, error) {
+		resumeJobFunc: func(_ context.Context, jobID core.UUID) (bool, error) {
 			resumed <- jobID
 			return true, nil
 		},
@@ -2651,7 +2651,7 @@ func TestCompleteFanOut_ResumesWhenStatusAlreadyTerminal(t *testing.T) {
 
 	fo := &core.FanOut{
 		ID:             "fo-already-terminal",
-		ParentJobID:    "parent-already-terminal",
+		ParentJobID:    core.UUID("parent-already-terminal"),
 		TotalCount:     2,
 		CompletedCount: 2,
 		Strategy:       core.StrategyCollectAll,
@@ -2688,12 +2688,12 @@ func TestWorker_PollSignalWaitingJobs_PagesPastMemoizedFutureSleeps(t *testing.T
 	}
 
 	var sleepCheckpointReads atomic.Int32
-	resumed := make(chan string, 4)
+	resumed := make(chan core.UUID, 4)
 	mock := &mockStorage{
-		signalWaitingAfterFunc: func(_ context.Context, afterJobID string, limit int) ([]*core.Job, error) {
+		signalWaitingAfterFunc: func(_ context.Context, afterJobID core.UUID, limit int) ([]*core.Job, error) {
 			var out []*core.Job
 			for _, job := range jobs {
-				if job.ID <= afterJobID {
+				if string(job.ID) <= string(afterJobID) {
 					continue
 				}
 				out = append(out, job)
@@ -2703,8 +2703,8 @@ func TestWorker_PollSignalWaitingJobs_PagesPastMemoizedFutureSleeps(t *testing.T
 			}
 			return out, nil
 		},
-		checkpointFunc: func(_ context.Context, jobID string) ([]core.Checkpoint, error) {
-			if strings.HasPrefix(jobID, "a-sleep-") {
+		checkpointFunc: func(_ context.Context, jobID core.UUID) ([]core.Checkpoint, error) {
+			if strings.HasPrefix(string(jobID), "a-sleep-") {
 				sleepCheckpointReads.Add(1)
 				return []core.Checkpoint{{
 					JobID: jobID, CallIndex: 0, CallType: signal.SleepCheckpointType, Result: sleepState,
@@ -2712,7 +2712,7 @@ func TestWorker_PollSignalWaitingJobs_PagesPastMemoizedFutureSleeps(t *testing.T
 			}
 			return nil, nil
 		},
-		resumeSignalFunc: func(_ context.Context, jobID string) (bool, error) {
+		resumeSignalFunc: func(_ context.Context, jobID core.UUID) (bool, error) {
 			resumed <- jobID
 			return true, nil
 		},
@@ -2724,7 +2724,7 @@ func TestWorker_PollSignalWaitingJobs_PagesPastMemoizedFutureSleeps(t *testing.T
 
 	select {
 	case jobID := <-resumed:
-		assert.Equal(t, "z-legit-signal", jobID)
+		assert.Equal(t, core.UUID("z-legit-signal"), jobID)
 	case <-time.After(time.Second):
 		t.Fatal("signal backstop did not page past future durable timers")
 	}
@@ -2756,7 +2756,7 @@ func TestWorker_HandleSubJobCompletion_WithFanOutID_StorageReturnsNil(t *testing
 	q := queue.New(mock)
 	w := NewWorker(q)
 
-	fanOutID := "fo-123"
+	fanOutID := core.UUID("fo-123")
 	job := &core.Job{ID: "j1", Type: "noop", Queue: "default", FanOutID: &fanOutID}
 
 	// Default mock IncrementFanOutCompleted returns (nil, nil).
@@ -2775,7 +2775,7 @@ func TestWorker_HandleSubJobCompletion_WithFanOutID_IncrementFailed(t *testing.T
 	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
 	defer cancel()
 
-	fanOutID := "fo-456"
+	fanOutID := core.UUID("fo-456")
 	job := &core.Job{ID: "j1", Type: "noop", Queue: "default", FanOutID: &fanOutID}
 	err := w.handleSubJobCompletion(ctx, job, true)
 	// Mock returns (nil, nil), so retryWithBackoff returns nil.
@@ -2783,19 +2783,19 @@ func TestWorker_HandleSubJobCompletion_WithFanOutID_IncrementFailed(t *testing.T
 }
 
 func TestWorker_NoHandlerSubJobAccountsToFanOut(t *testing.T) {
-	fanOutID := "fo-no-handler"
+	fanOutID := core.UUID("fo-no-handler")
 	var failedIncrements atomic.Int32
 	mock := &mockStorage{
-		failFunc: func(_ context.Context, _ string, _ string, _ string, retryAt *time.Time) error {
+		failFunc: func(_ context.Context, _ core.UUID, _ string, _ string, retryAt *time.Time) error {
 			require.Nil(t, retryAt)
 			return nil
 		},
-		incrementFailedFunc: func(_ context.Context, gotFanOutID string) (*core.FanOut, error) {
+		incrementFailedFunc: func(_ context.Context, gotFanOutID core.UUID) (*core.FanOut, error) {
 			failedIncrements.Add(1)
 			assert.Equal(t, fanOutID, gotFanOutID)
 			return &core.FanOut{
 				ID:          gotFanOutID,
-				ParentJobID: "parent",
+				ParentJobID: core.UUID("parent"),
 				TotalCount:  2,
 				FailedCount: 1,
 				Strategy:    core.StrategyCollectAll,
@@ -2818,9 +2818,9 @@ func TestWorker_NoHandlerSubJobAccountsToFanOut(t *testing.T) {
 }
 
 func TestWorker_ReleaseAfterTerminalWriteError_UsesDetachedContext(t *testing.T) {
-	released := make(chan string, 1)
+	released := make(chan core.UUID, 1)
 	mock := &mockStorage{
-		releaseJobFunc: func(ctx context.Context, jobID string, _ string) error {
+		releaseJobFunc: func(ctx context.Context, jobID core.UUID, _ string) error {
 			require.NoError(t, ctx.Err(), "release context must survive caller cancellation")
 			released <- jobID
 			return nil
@@ -2836,38 +2836,38 @@ func TestWorker_ReleaseAfterTerminalWriteError_UsesDetachedContext(t *testing.T)
 
 	select {
 	case jobID := <-released:
-		assert.Equal(t, "terminal-release-job", jobID)
+		assert.Equal(t, core.UUID("terminal-release-job"), jobID)
 	case <-time.After(time.Second):
 		t.Fatal("Release was not called after terminal write error")
 	}
-	assert.Equal(t, []string{"terminal-release-job"}, mock.getReleasedJobIDs())
+	assert.Equal(t, []core.UUID{core.UUID("terminal-release-job")}, mock.getReleasedJobIDs())
 }
 
 func TestWorker_TransientCompleteError_ReleasesForRerun(t *testing.T) {
-	fanOutID := "fo-transient-complete"
+	fanOutID := core.UUID("fo-transient-complete")
 	transientErr := errors.New("complete unavailable")
 	var completeCalls atomic.Int32
 	var legacyCompleted atomic.Int32
 	var legacyFailed atomic.Int32
 
 	base := &mockStorage{
-		incrementCompletedFunc: func(context.Context, string) (*core.FanOut, error) {
+		incrementCompletedFunc: func(context.Context, core.UUID) (*core.FanOut, error) {
 			legacyCompleted.Add(1)
 			return nil, nil
 		},
-		incrementFailedFunc: func(context.Context, string) (*core.FanOut, error) {
+		incrementFailedFunc: func(context.Context, core.UUID) (*core.FanOut, error) {
 			legacyFailed.Add(1)
 			return nil, nil
 		},
 	}
 	store := &atomicMockStorage{mockStorage: base}
-	store.completeWithResultFunc = func(_ context.Context, _ string, _ string, _ []byte) (*core.FanOut, error) {
+	store.completeWithResultFunc = func(_ context.Context, _ core.UUID, _ string, _ []byte) (*core.FanOut, error) {
 		if completeCalls.Add(1) == 1 {
 			return nil, transientErr
 		}
 		return &core.FanOut{
 			ID:             fanOutID,
-			ParentJobID:    "parent",
+			ParentJobID:    core.UUID("parent"),
 			TotalCount:     2,
 			CompletedCount: 1,
 			Strategy:       core.StrategyCollectAll,
@@ -2881,40 +2881,40 @@ func TestWorker_TransientCompleteError_ReleasesForRerun(t *testing.T) {
 	job := &core.Job{ID: "sub-transient", Type: "atomic-success", Queue: "default", FanOutID: &fanOutID}
 	w.processJob(context.Background(), job)
 
-	assert.Equal(t, []string{job.ID}, store.getReleasedJobIDs())
+	assert.Equal(t, []core.UUID{job.ID}, store.getReleasedJobIDs())
 	assert.Equal(t, int32(0), legacyCompleted.Load())
 	assert.Equal(t, int32(0), legacyFailed.Load(), "transient complete must not be counted as a failed sub-job")
 	assert.Equal(t, int32(1), completeCalls.Load())
 
 	w.processJob(context.Background(), job)
 
-	assert.Equal(t, []string{job.ID}, store.getReleasedJobIDs(), "successful rerun should not release again")
+	assert.Equal(t, []core.UUID{job.ID}, store.getReleasedJobIDs(), "successful rerun should not release again")
 	assert.Equal(t, int32(2), completeCalls.Load())
 	assert.Equal(t, int32(0), legacyCompleted.Load())
 	assert.Equal(t, int32(0), legacyFailed.Load())
 }
 
 func TestWorker_CompleteWithResult_Success_IncrementsAndResumes(t *testing.T) {
-	fanOutID := "fo-atomic-success"
-	parentID := "parent-atomic-success"
+	fanOutID := core.UUID("fo-atomic-success")
+	parentID := core.UUID("parent-atomic-success")
 	resultSeen := make(chan []byte, 1)
-	resumed := make(chan string, 1)
+	resumed := make(chan core.UUID, 1)
 	statusUpdated := make(chan core.FanOutStatus, 1)
 
 	base := &mockStorage{
-		updateFanOutStatusFunc: func(_ context.Context, gotFanOutID string, status core.FanOutStatus) (bool, error) {
+		updateFanOutStatusFunc: func(_ context.Context, gotFanOutID core.UUID, status core.FanOutStatus) (bool, error) {
 			assert.Equal(t, fanOutID, gotFanOutID)
 			statusUpdated <- status
 			return true, nil
 		},
-		resumeJobFunc: func(_ context.Context, jobID string) (bool, error) {
+		resumeJobFunc: func(_ context.Context, jobID core.UUID) (bool, error) {
 			resumed <- jobID
 			return true, nil
 		},
 	}
 	store := &atomicMockStorage{mockStorage: base}
-	store.completeWithResultFunc = func(_ context.Context, jobID, workerID string, result []byte) (*core.FanOut, error) {
-		assert.Equal(t, "sub-atomic-success", jobID)
+	store.completeWithResultFunc = func(_ context.Context, jobID core.UUID, workerID string, result []byte) (*core.FanOut, error) {
+		assert.Equal(t, core.UUID("sub-atomic-success"), jobID)
 		assert.NotEmpty(t, workerID)
 		resultSeen <- append([]byte(nil), result...)
 		return &core.FanOut{
@@ -2977,7 +2977,7 @@ func TestWorker_HeartbeatHeldUntilAfterComplete(t *testing.T) {
 	var heartbeatOnce sync.Once
 
 	base := &mockStorage{
-		heartbeatFunc: func(context.Context, string, string) error {
+		heartbeatFunc: func(context.Context, core.UUID, string) error {
 			if entered.Load() {
 				heartbeatOnce.Do(func() { close(heartbeatDuringComplete) })
 			}
@@ -2985,7 +2985,7 @@ func TestWorker_HeartbeatHeldUntilAfterComplete(t *testing.T) {
 		},
 	}
 	store := &atomicMockStorage{mockStorage: base}
-	store.completeWithResultFunc = func(context.Context, string, string, []byte) (*core.FanOut, error) {
+	store.completeWithResultFunc = func(context.Context, core.UUID, string, []byte) (*core.FanOut, error) {
 		entered.Store(true)
 		completeOnce.Do(func() { close(completeEntered) })
 		select {
@@ -3026,31 +3026,31 @@ func TestWorker_HeartbeatHeldUntilAfterComplete(t *testing.T) {
 }
 
 func TestWorker_FailTerminalWithResult_Atomicity(t *testing.T) {
-	fanOutID := "fo-terminal-fail"
-	parentID := "parent-terminal-fail"
+	fanOutID := core.UUID("fo-terminal-fail")
+	parentID := core.UUID("parent-terminal-fail")
 	var legacyFailed atomic.Int32
 	failCalled := make(chan string, 1)
 	statusUpdated := make(chan core.FanOutStatus, 1)
-	resumed := make(chan string, 1)
+	resumed := make(chan core.UUID, 1)
 
 	base := &mockStorage{
-		incrementFailedFunc: func(context.Context, string) (*core.FanOut, error) {
+		incrementFailedFunc: func(context.Context, core.UUID) (*core.FanOut, error) {
 			legacyFailed.Add(1)
 			return nil, nil
 		},
-		updateFanOutStatusFunc: func(_ context.Context, gotFanOutID string, status core.FanOutStatus) (bool, error) {
+		updateFanOutStatusFunc: func(_ context.Context, gotFanOutID core.UUID, status core.FanOutStatus) (bool, error) {
 			assert.Equal(t, fanOutID, gotFanOutID)
 			statusUpdated <- status
 			return true, nil
 		},
-		resumeJobFunc: func(_ context.Context, jobID string) (bool, error) {
+		resumeJobFunc: func(_ context.Context, jobID core.UUID) (bool, error) {
 			resumed <- jobID
 			return true, nil
 		},
 	}
 	store := &atomicMockStorage{mockStorage: base}
-	store.failTerminalWithResultFunc = func(_ context.Context, jobID, workerID, errMsg string) (*core.FanOut, error) {
-		assert.Equal(t, "sub-terminal-fail", jobID)
+	store.failTerminalWithResultFunc = func(_ context.Context, jobID core.UUID, workerID string, errMsg string) (*core.FanOut, error) {
+		assert.Equal(t, core.UUID("sub-terminal-fail"), jobID)
 		assert.NotEmpty(t, workerID)
 		failCalled <- errMsg
 		return &core.FanOut{
@@ -3176,7 +3176,7 @@ func TestWorker_HandleError_RetryAfterExhausted(t *testing.T) {
 	mock := &mockStorage{}
 
 	failCalled := make(chan struct{}, 1)
-	mock.failFunc = func(_ context.Context, _ string, _ string, _ string, _ *time.Time) error {
+	mock.failFunc = func(_ context.Context, _ core.UUID, _ string, _ string, _ *time.Time) error {
 		select {
 		case failCalled <- struct{}{}:
 		default:
@@ -3582,15 +3582,15 @@ func TestScheduler_ManyMissedBoundariesFireOnce(t *testing.T) {
 // where completed+failed+cancelled == total, causing completeFanOut to be called.
 // Uses the StrategyCollectAll strategy so status becomes FanOutCompleted.
 func TestWorker_CheckFanOutCompletion_AllDoneCompletesParent(t *testing.T) {
-	parentResumed := make(chan string, 1)
+	parentResumed := make(chan core.UUID, 1)
 	fanOutUpdated := make(chan core.FanOutStatus, 1)
 
 	mock := &mockStorage{
-		updateFanOutStatusFunc: func(_ context.Context, id string, status core.FanOutStatus) (bool, error) {
+		updateFanOutStatusFunc: func(_ context.Context, id core.UUID, status core.FanOutStatus) (bool, error) {
 			fanOutUpdated <- status
 			return true, nil // claim the update
 		},
-		resumeJobFunc: func(_ context.Context, jobID string) (bool, error) {
+		resumeJobFunc: func(_ context.Context, jobID core.UUID) (bool, error) {
 			parentResumed <- jobID
 			return true, nil
 		},
@@ -3600,7 +3600,7 @@ func TestWorker_CheckFanOutCompletion_AllDoneCompletesParent(t *testing.T) {
 
 	fo := &core.FanOut{
 		ID:             "fo-1",
-		ParentJobID:    "parent-job-1",
+		ParentJobID:    core.UUID("parent-job-1"),
 		TotalCount:     2,
 		CompletedCount: 2,
 		FailedCount:    0,
@@ -3620,7 +3620,7 @@ func TestWorker_CheckFanOutCompletion_AllDoneCompletesParent(t *testing.T) {
 
 	select {
 	case jobID := <-parentResumed:
-		assert.Equal(t, "parent-job-1", jobID)
+		assert.Equal(t, core.UUID("parent-job-1"), jobID)
 	case <-time.After(time.Second):
 		t.Fatal("ResumeJob was not called for parent")
 	}
@@ -3635,7 +3635,7 @@ func TestWorker_CheckFanOutCompletion_NotDoneYetReturnsNil(t *testing.T) {
 
 	fo := &core.FanOut{
 		ID:             "fo-2",
-		ParentJobID:    "parent-job-2",
+		ParentJobID:    core.UUID("parent-job-2"),
 		TotalCount:     5,
 		CompletedCount: 2,
 		FailedCount:    0,
@@ -3653,11 +3653,11 @@ func TestWorker_CheckFanOutCompletion_FailFastTriggersEarly(t *testing.T) {
 	fanOutUpdated := make(chan core.FanOutStatus, 1)
 
 	mock := &mockStorage{
-		updateFanOutStatusFunc: func(_ context.Context, _ string, status core.FanOutStatus) (bool, error) {
+		updateFanOutStatusFunc: func(_ context.Context, _ core.UUID, status core.FanOutStatus) (bool, error) {
 			fanOutUpdated <- status
 			return true, nil
 		},
-		resumeJobFunc: func(_ context.Context, _ string) (bool, error) {
+		resumeJobFunc: func(_ context.Context, _ core.UUID) (bool, error) {
 			return true, nil
 		},
 	}
@@ -3667,7 +3667,7 @@ func TestWorker_CheckFanOutCompletion_FailFastTriggersEarly(t *testing.T) {
 	// 3 of 5 sub-jobs done, but 1 failed — fail-fast should trigger immediately.
 	fo := &core.FanOut{
 		ID:             "fo-3",
-		ParentJobID:    "parent-job-3",
+		ParentJobID:    core.UUID("parent-job-3"),
 		TotalCount:     5,
 		CompletedCount: 2,
 		FailedCount:    1,
@@ -3692,11 +3692,11 @@ func TestWorker_CheckFanOutCompletion_ThresholdDoomed(t *testing.T) {
 	fanOutUpdated := make(chan core.FanOutStatus, 1)
 
 	mock := &mockStorage{
-		updateFanOutStatusFunc: func(_ context.Context, _ string, status core.FanOutStatus) (bool, error) {
+		updateFanOutStatusFunc: func(_ context.Context, _ core.UUID, status core.FanOutStatus) (bool, error) {
 			fanOutUpdated <- status
 			return true, nil
 		},
-		resumeJobFunc: func(_ context.Context, _ string) (bool, error) {
+		resumeJobFunc: func(_ context.Context, _ core.UUID) (bool, error) {
 			return true, nil
 		},
 	}
@@ -3707,7 +3707,7 @@ func TestWorker_CheckFanOutCompletion_ThresholdDoomed(t *testing.T) {
 	// 3 in flight, the best possible result is 7 successes, below the required 8.
 	fo := &core.FanOut{
 		ID:             "fo-4",
-		ParentJobID:    "parent-job-4",
+		ParentJobID:    core.UUID("parent-job-4"),
 		TotalCount:     10,
 		CompletedCount: 4,
 		FailedCount:    3,
@@ -3734,11 +3734,11 @@ func TestWorker_CheckFanOutCompletion_AllCancelledNoCompletions(t *testing.T) {
 	fanOutUpdated := make(chan core.FanOutStatus, 1)
 
 	mock := &mockStorage{
-		updateFanOutStatusFunc: func(_ context.Context, _ string, status core.FanOutStatus) (bool, error) {
+		updateFanOutStatusFunc: func(_ context.Context, _ core.UUID, status core.FanOutStatus) (bool, error) {
 			fanOutUpdated <- status
 			return true, nil
 		},
-		resumeJobFunc: func(_ context.Context, _ string) (bool, error) {
+		resumeJobFunc: func(_ context.Context, _ core.UUID) (bool, error) {
 			return true, nil
 		},
 	}
@@ -3747,7 +3747,7 @@ func TestWorker_CheckFanOutCompletion_AllCancelledNoCompletions(t *testing.T) {
 
 	fo := &core.FanOut{
 		ID:             "fo-5",
-		ParentJobID:    "parent-job-5",
+		ParentJobID:    core.UUID("parent-job-5"),
 		TotalCount:     3,
 		CompletedCount: 0,
 		FailedCount:    0,
@@ -3773,11 +3773,11 @@ func TestWorker_CheckFanOutCompletion_ThresholdAllDoneBelowThreshold(t *testing.
 	fanOutUpdated := make(chan core.FanOutStatus, 1)
 
 	mock := &mockStorage{
-		updateFanOutStatusFunc: func(_ context.Context, _ string, status core.FanOutStatus) (bool, error) {
+		updateFanOutStatusFunc: func(_ context.Context, _ core.UUID, status core.FanOutStatus) (bool, error) {
 			fanOutUpdated <- status
 			return true, nil
 		},
-		resumeJobFunc: func(_ context.Context, _ string) (bool, error) {
+		resumeJobFunc: func(_ context.Context, _ core.UUID) (bool, error) {
 			return true, nil
 		},
 	}
@@ -3787,7 +3787,7 @@ func TestWorker_CheckFanOutCompletion_ThresholdAllDoneBelowThreshold(t *testing.
 	// All 4 sub-jobs done: 1 completed, 3 failed. successRate = 0.25 < threshold 0.8.
 	fo := &core.FanOut{
 		ID:             "fo-6",
-		ParentJobID:    "parent-job-6",
+		ParentJobID:    core.UUID("parent-job-6"),
 		TotalCount:     4,
 		CompletedCount: 1,
 		FailedCount:    3,
@@ -3813,11 +3813,11 @@ func TestWorker_CheckFanOutCompletion_ThresholdAllDoneAboveThreshold(t *testing.
 	fanOutUpdated := make(chan core.FanOutStatus, 1)
 
 	mock := &mockStorage{
-		updateFanOutStatusFunc: func(_ context.Context, _ string, status core.FanOutStatus) (bool, error) {
+		updateFanOutStatusFunc: func(_ context.Context, _ core.UUID, status core.FanOutStatus) (bool, error) {
 			fanOutUpdated <- status
 			return true, nil
 		},
-		resumeJobFunc: func(_ context.Context, _ string) (bool, error) {
+		resumeJobFunc: func(_ context.Context, _ core.UUID) (bool, error) {
 			return true, nil
 		},
 	}
@@ -3827,7 +3827,7 @@ func TestWorker_CheckFanOutCompletion_ThresholdAllDoneAboveThreshold(t *testing.
 	// All 4 sub-jobs done: 4 completed, 0 failed. successRate = 1.0 >= threshold 0.8.
 	fo := &core.FanOut{
 		ID:             "fo-7",
-		ParentJobID:    "parent-job-7",
+		ParentJobID:    core.UUID("parent-job-7"),
 		TotalCount:     4,
 		CompletedCount: 4,
 		FailedCount:    0,
@@ -3853,11 +3853,11 @@ func TestWorker_CheckFanOutCompletion_ThresholdAllCancelledNoActive(t *testing.T
 	fanOutUpdated := make(chan core.FanOutStatus, 1)
 
 	mock := &mockStorage{
-		updateFanOutStatusFunc: func(_ context.Context, _ string, status core.FanOutStatus) (bool, error) {
+		updateFanOutStatusFunc: func(_ context.Context, _ core.UUID, status core.FanOutStatus) (bool, error) {
 			fanOutUpdated <- status
 			return true, nil
 		},
-		resumeJobFunc: func(_ context.Context, _ string) (bool, error) {
+		resumeJobFunc: func(_ context.Context, _ core.UUID) (bool, error) {
 			return true, nil
 		},
 	}
@@ -3867,7 +3867,7 @@ func TestWorker_CheckFanOutCompletion_ThresholdAllCancelledNoActive(t *testing.T
 	// Threshold strategy with all cancelled — activeTotal == 0, falls to failed.
 	fo := &core.FanOut{
 		ID:             "fo-8",
-		ParentJobID:    "parent-job-8",
+		ParentJobID:    core.UUID("parent-job-8"),
 		TotalCount:     3,
 		CompletedCount: 0,
 		FailedCount:    0,
@@ -3897,10 +3897,10 @@ func TestWorker_CompleteFanOut_AlreadyCompletedByAnotherWorker(t *testing.T) {
 	resumeCalled := false
 
 	mock := &mockStorage{
-		updateFanOutStatusFunc: func(_ context.Context, _ string, _ core.FanOutStatus) (bool, error) {
+		updateFanOutStatusFunc: func(_ context.Context, _ core.UUID, _ core.FanOutStatus) (bool, error) {
 			return false, nil // status already advanced (in-tx, or by another worker)
 		},
-		resumeJobFunc: func(_ context.Context, _ string) (bool, error) {
+		resumeJobFunc: func(_ context.Context, _ core.UUID) (bool, error) {
 			resumeCalled = true
 			return true, nil
 		},
@@ -3910,7 +3910,7 @@ func TestWorker_CompleteFanOut_AlreadyCompletedByAnotherWorker(t *testing.T) {
 
 	fo := &core.FanOut{
 		ID:          "fo-9",
-		ParentJobID: "parent-job-9",
+		ParentJobID: core.UUID("parent-job-9"),
 	}
 
 	err := w.completeFanOut(context.Background(), fo, core.FanOutCompleted)
@@ -3921,18 +3921,18 @@ func TestWorker_CompleteFanOut_AlreadyCompletedByAnotherWorker(t *testing.T) {
 // TestWorker_CompleteFanOut_CancelOnFailCancelsSubJobs exercises the
 // CancelOnFail=true + FanOutFailed branch inside completeFanOut.
 func TestWorker_CompleteFanOut_CancelOnFailCancelsSubJobs(t *testing.T) {
-	cancelSubJobsCalled := make(chan string, 1)
+	cancelSubJobsCalled := make(chan core.UUID, 1)
 
 	mock := &mockStorage{
-		updateFanOutStatusFunc: func(_ context.Context, _ string, _ core.FanOutStatus) (bool, error) {
+		updateFanOutStatusFunc: func(_ context.Context, _ core.UUID, _ core.FanOutStatus) (bool, error) {
 			return true, nil
 		},
-		resumeJobFunc: func(_ context.Context, _ string) (bool, error) {
+		resumeJobFunc: func(_ context.Context, _ core.UUID) (bool, error) {
 			return true, nil
 		},
-		cancelSubJobsFunc: func(_ context.Context, fanOutID string) ([]string, error) {
+		cancelSubJobsFunc: func(_ context.Context, fanOutID core.UUID) ([]core.UUID, error) {
 			cancelSubJobsCalled <- fanOutID
-			return []string{"sub-1", "sub-2"}, nil
+			return []core.UUID{core.UUID("sub-1"), core.UUID("sub-2")}, nil
 		},
 	}
 	q := queue.New(mock)
@@ -3940,7 +3940,7 @@ func TestWorker_CompleteFanOut_CancelOnFailCancelsSubJobs(t *testing.T) {
 
 	fo := &core.FanOut{
 		ID:           "fo-10",
-		ParentJobID:  "parent-job-10",
+		ParentJobID:  core.UUID("parent-job-10"),
 		CancelOnFail: true,
 	}
 
@@ -3949,7 +3949,7 @@ func TestWorker_CompleteFanOut_CancelOnFailCancelsSubJobs(t *testing.T) {
 
 	select {
 	case id := <-cancelSubJobsCalled:
-		assert.Equal(t, "fo-10", id)
+		assert.Equal(t, core.UUID("fo-10"), id)
 	case <-time.After(time.Second):
 		t.Fatal("CancelSubJobs was not called with CancelOnFail=true")
 	}
@@ -3959,10 +3959,10 @@ func TestWorker_CompleteFanOut_CancelOnFailCancelsSubJobs(t *testing.T) {
 // path when ResumeJob returns (false, nil) — parent was not waiting.
 func TestWorker_CompleteFanOut_ParentNotInWaitingStatus(t *testing.T) {
 	mock := &mockStorage{
-		updateFanOutStatusFunc: func(_ context.Context, _ string, _ core.FanOutStatus) (bool, error) {
+		updateFanOutStatusFunc: func(_ context.Context, _ core.UUID, _ core.FanOutStatus) (bool, error) {
 			return true, nil
 		},
-		resumeJobFunc: func(_ context.Context, _ string) (bool, error) {
+		resumeJobFunc: func(_ context.Context, _ core.UUID) (bool, error) {
 			return false, nil // parent not in waiting status
 		},
 	}
@@ -3971,7 +3971,7 @@ func TestWorker_CompleteFanOut_ParentNotInWaitingStatus(t *testing.T) {
 
 	fo := &core.FanOut{
 		ID:          "fo-11",
-		ParentJobID: "parent-job-11",
+		ParentJobID: core.UUID("parent-job-11"),
 	}
 
 	// Should log a warning but return nil (not an error).
@@ -3985,10 +3985,10 @@ func TestWorker_CompleteFanOut_ParentResumeRetryStopsOnContextCancel(t *testing.
 
 	var attempts atomic.Int32
 	mock := &mockStorage{
-		updateFanOutStatusFunc: func(_ context.Context, _ string, _ core.FanOutStatus) (bool, error) {
+		updateFanOutStatusFunc: func(_ context.Context, _ core.UUID, _ core.FanOutStatus) (bool, error) {
 			return true, nil
 		},
-		resumeJobFunc: func(_ context.Context, _ string) (bool, error) {
+		resumeJobFunc: func(_ context.Context, _ core.UUID) (bool, error) {
 			attempts.Add(1)
 			cancel()
 			return false, nil
@@ -3999,7 +3999,7 @@ func TestWorker_CompleteFanOut_ParentResumeRetryStopsOnContextCancel(t *testing.
 
 	fo := &core.FanOut{
 		ID:          "fo-cancel",
-		ParentJobID: "parent-cancel",
+		ParentJobID: core.UUID("parent-cancel"),
 	}
 
 	start := time.Now()
@@ -4017,10 +4017,10 @@ func TestWorker_CompleteFanOut_ParentResumeRetryStopsOnContextCancel(t *testing.
 func TestWorker_HandleSubJobCompletion_FullFlow_Succeeded(t *testing.T) {
 	parentResumed := make(chan struct{}, 1)
 
-	fanOutID := "fo-full-1"
+	fanOutID := core.UUID("fo-full-1")
 	fo := &core.FanOut{
 		ID:             fanOutID,
-		ParentJobID:    "parent-full-1",
+		ParentJobID:    core.UUID("parent-full-1"),
 		TotalCount:     1,
 		CompletedCount: 1, // this increment makes it complete
 		FailedCount:    0,
@@ -4029,13 +4029,13 @@ func TestWorker_HandleSubJobCompletion_FullFlow_Succeeded(t *testing.T) {
 	}
 
 	mock := &mockStorage{
-		incrementCompletedFunc: func(_ context.Context, _ string) (*core.FanOut, error) {
+		incrementCompletedFunc: func(_ context.Context, _ core.UUID) (*core.FanOut, error) {
 			return fo, nil
 		},
-		updateFanOutStatusFunc: func(_ context.Context, _ string, _ core.FanOutStatus) (bool, error) {
+		updateFanOutStatusFunc: func(_ context.Context, _ core.UUID, _ core.FanOutStatus) (bool, error) {
 			return true, nil
 		},
-		resumeJobFunc: func(_ context.Context, _ string) (bool, error) {
+		resumeJobFunc: func(_ context.Context, _ core.UUID) (bool, error) {
 			parentResumed <- struct{}{}
 			return true, nil
 		},
@@ -4061,10 +4061,10 @@ func TestWorker_HandleSubJobCompletion_FullFlow_Succeeded(t *testing.T) {
 func TestWorker_HandleSubJobCompletion_FullFlow_Failed(t *testing.T) {
 	parentResumed := make(chan struct{}, 1)
 
-	fanOutID := "fo-full-2"
+	fanOutID := core.UUID("fo-full-2")
 	fo := &core.FanOut{
 		ID:             fanOutID,
-		ParentJobID:    "parent-full-2",
+		ParentJobID:    core.UUID("parent-full-2"),
 		TotalCount:     1,
 		CompletedCount: 0,
 		FailedCount:    1,
@@ -4073,13 +4073,13 @@ func TestWorker_HandleSubJobCompletion_FullFlow_Failed(t *testing.T) {
 	}
 
 	mock := &mockStorage{
-		incrementFailedFunc: func(_ context.Context, _ string) (*core.FanOut, error) {
+		incrementFailedFunc: func(_ context.Context, _ core.UUID) (*core.FanOut, error) {
 			return fo, nil
 		},
-		updateFanOutStatusFunc: func(_ context.Context, _ string, _ core.FanOutStatus) (bool, error) {
+		updateFanOutStatusFunc: func(_ context.Context, _ core.UUID, _ core.FanOutStatus) (bool, error) {
 			return true, nil
 		},
-		resumeJobFunc: func(_ context.Context, _ string) (bool, error) {
+		resumeJobFunc: func(_ context.Context, _ core.UUID) (bool, error) {
 			parentResumed <- struct{}{}
 			return true, nil
 		},
@@ -4106,11 +4106,11 @@ func TestWorker_CheckFanOutCompletion_FailFastAllDone(t *testing.T) {
 	fanOutUpdated := make(chan core.FanOutStatus, 1)
 
 	mock := &mockStorage{
-		updateFanOutStatusFunc: func(_ context.Context, _ string, status core.FanOutStatus) (bool, error) {
+		updateFanOutStatusFunc: func(_ context.Context, _ core.UUID, status core.FanOutStatus) (bool, error) {
 			fanOutUpdated <- status
 			return true, nil
 		},
-		resumeJobFunc: func(_ context.Context, _ string) (bool, error) {
+		resumeJobFunc: func(_ context.Context, _ core.UUID) (bool, error) {
 			return true, nil
 		},
 	}
@@ -4120,7 +4120,7 @@ func TestWorker_CheckFanOutCompletion_FailFastAllDone(t *testing.T) {
 	// All done, 1 succeeded and 1 failed; FailFast → FanOutFailed.
 	fo := &core.FanOut{
 		ID:             "fo-ff-done",
-		ParentJobID:    "parent-ff-done",
+		ParentJobID:    core.UUID("parent-ff-done"),
 		TotalCount:     2,
 		CompletedCount: 1,
 		FailedCount:    1,
@@ -4150,7 +4150,7 @@ type trackingStorage struct {
 	savedResults map[string][]byte
 }
 
-func (s *trackingStorage) CompleteWithResult(ctx context.Context, jobID, workerID string, result []byte) (*core.FanOut, error) {
+func (s *trackingStorage) CompleteWithResult(ctx context.Context, jobID core.UUID, workerID string, result []byte) (*core.FanOut, error) {
 	fo, err := s.Storage.(completeWithResultStorage).CompleteWithResult(ctx, jobID, workerID, result)
 	if err != nil {
 		return nil, err
@@ -4159,17 +4159,17 @@ func (s *trackingStorage) CompleteWithResult(ctx context.Context, jobID, workerI
 	if s.savedResults == nil {
 		s.savedResults = map[string][]byte{}
 	}
-	s.savedResults[jobID] = result
+	s.savedResults[string(jobID)] = result
 	s.mu.Unlock()
 	return fo, nil
 }
 
-func (s *trackingStorage) SaveJobResult(ctx context.Context, jobID string, workerID string, result []byte) error {
+func (s *trackingStorage) SaveJobResult(ctx context.Context, jobID core.UUID, workerID string, result []byte) error {
 	s.mu.Lock()
 	if s.savedResults == nil {
 		s.savedResults = map[string][]byte{}
 	}
-	s.savedResults[jobID] = result
+	s.savedResults[string(jobID)] = result
 	s.mu.Unlock()
 	// Also delegate to the real storage so the job lifecycle isn't broken.
 	return s.Storage.SaveJobResult(ctx, jobID, workerID, result)
@@ -4208,7 +4208,7 @@ func TestWorker_PersistsHandlerResult(t *testing.T) {
 	require.Eventually(t, func() bool {
 		store.mu.Lock()
 		defer store.mu.Unlock()
-		_, ok := store.savedResults[jobID]
+		_, ok := store.savedResults[string(jobID)]
 		return ok
 	}, 5*time.Second, 10*time.Millisecond, "handler result must be persisted via SaveJobResult")
 	cancel()
@@ -4219,7 +4219,7 @@ func TestWorker_PersistsHandlerResult(t *testing.T) {
 	}
 
 	store.mu.Lock()
-	got := store.savedResults[jobID]
+	got := store.savedResults[string(jobID)]
 	store.mu.Unlock()
 	var decoded map[string]any
 	require.NoError(t, json.Unmarshal(got, &decoded))
@@ -4241,7 +4241,7 @@ func TestWorker_PersistsHandlerResult(t *testing.T) {
 func TestRunHeartbeat_AbandonsOrphanedJob(t *testing.T) {
 	mock := &mockStorage{}
 	var heartbeatCalls atomic.Int32
-	mock.heartbeatFunc = func(_ context.Context, _ string, _ string) error {
+	mock.heartbeatFunc = func(_ context.Context, _ core.UUID, _ string) error {
 		heartbeatCalls.Add(1)
 		return core.ErrJobNotOwned
 	}
@@ -4298,7 +4298,7 @@ func TestRunHeartbeat_TransientErrorDoesNotAbandon(t *testing.T) {
 	mock := &mockStorage{}
 	var heartbeatCalls atomic.Int32
 	transientErr := errors.New("db unreachable")
-	mock.heartbeatFunc = func(_ context.Context, _ string, _ string) error {
+	mock.heartbeatFunc = func(_ context.Context, _ core.UUID, _ string) error {
 		heartbeatCalls.Add(1)
 		return transientErr
 	}
@@ -4340,7 +4340,7 @@ func TestRunHeartbeat_TransientErrorDoesNotAbandon(t *testing.T) {
 func TestRunHeartbeat_SuccessResetsCounter(t *testing.T) {
 	mock := &mockStorage{}
 	var calls atomic.Int32
-	mock.heartbeatFunc = func(_ context.Context, _ string, _ string) error {
+	mock.heartbeatFunc = func(_ context.Context, _ core.UUID, _ string) error {
 		n := calls.Add(1)
 		// Return ErrJobNotOwned for the first 2 calls, then succeed, then
 		// orphan again. The counter should reset after the success, so
@@ -4397,13 +4397,13 @@ func TestRunHeartbeat_SuccessResetsCounter(t *testing.T) {
 // heartbeats to notice they'd been reclaimed.
 func TestCompleteFanOut_CancelsLocalSubJobHandlers(t *testing.T) {
 	mock := &mockStorage{}
-	mock.cancelSubJobsFunc = func(_ context.Context, fanOutID string) ([]string, error) {
-		return []string{"sub-a", "sub-b", "sub-c"}, nil
+	mock.cancelSubJobsFunc = func(_ context.Context, fanOutID core.UUID) ([]core.UUID, error) {
+		return []core.UUID{core.UUID("sub-a"), core.UUID("sub-b"), core.UUID("sub-c")}, nil
 	}
-	mock.updateFanOutStatusFunc = func(_ context.Context, _ string, _ core.FanOutStatus) (bool, error) {
+	mock.updateFanOutStatusFunc = func(_ context.Context, _ core.UUID, _ core.FanOutStatus) (bool, error) {
 		return true, nil
 	}
-	mock.resumeJobFunc = func(_ context.Context, _ string) (bool, error) {
+	mock.resumeJobFunc = func(_ context.Context, _ core.UUID) (bool, error) {
 		return true, nil
 	}
 
@@ -4415,7 +4415,7 @@ func TestCompleteFanOut_CancelsLocalSubJobHandlers(t *testing.T) {
 	for _, id := range []string{"sub-a", "sub-b"} {
 		id := id
 		w.runningJobsMu.Lock()
-		w.runningJobs[id] = func() { cancelCalls[id]++ }
+		w.runningJobs[core.UUID(id)] = func() { cancelCalls[string(id)]++ }
 		w.runningJobsMu.Unlock()
 	}
 	// sub-c is intentionally NOT in this worker's runningJobs — it's
@@ -4424,7 +4424,7 @@ func TestCompleteFanOut_CancelsLocalSubJobHandlers(t *testing.T) {
 
 	fo := &core.FanOut{
 		ID:           "fo-test",
-		ParentJobID:  "parent-1",
+		ParentJobID:  core.UUID("parent-1"),
 		CancelOnFail: true,
 	}
 
@@ -4444,7 +4444,7 @@ func TestCompleteFanOut_CancelsLocalSubJobHandlers(t *testing.T) {
 // abandons (which can be 6+ minutes).
 func TestReapStaleLocks_CancelsLocalHandlersOfReleasedJobs(t *testing.T) {
 	mock := &mockStorage{}
-	mock.releasedIDs = []string{"orphan-1", "orphan-2"}
+	mock.releasedIDs = []core.UUID{core.UUID("orphan-1"), core.UUID("orphan-2")}
 
 	q := queue.New(mock)
 	w := NewWorker(q, DisableRetry())
@@ -4486,11 +4486,11 @@ func TestReapStaleLocks_CancelsLocalHandlersOfReleasedJobs(t *testing.T) {
 // one's context is cancelled.
 func TestOwnershipAudit_CancelsOrphanedLocalHandlers(t *testing.T) {
 	mock := &mockStorage{}
-	mock.findOrphanedFunc = func(jobIDs []string) ([]string, error) {
+	mock.findOrphanedFunc = func(jobIDs []core.UUID) ([]core.UUID, error) {
 		// "job-mine" is still ours; "job-stolen" is orphaned.
 		for _, id := range jobIDs {
 			if id == "job-stolen" {
-				return []string{"job-stolen"}, nil
+				return []core.UUID{core.UUID("job-stolen")}, nil
 			}
 		}
 		return nil, nil
@@ -4582,7 +4582,7 @@ func TestOwnershipAudit_DoesNotCancelSelfSuspendedJob(t *testing.T) {
 func TestOwnershipAudit_NoOpWhenNoOrphans(t *testing.T) {
 	mock := &mockStorage{}
 	var auditCalls atomic.Int32
-	mock.findOrphanedFunc = func(_ []string) ([]string, error) {
+	mock.findOrphanedFunc = func(_ []core.UUID) ([]core.UUID, error) {
 		auditCalls.Add(1)
 		return nil, nil
 	}
@@ -4615,7 +4615,7 @@ func TestOwnershipAudit_NoOpWhenNoOrphans(t *testing.T) {
 func TestOwnershipAudit_SkipsQueryWhenNoRunningJobs(t *testing.T) {
 	mock := &mockStorage{}
 	var queries atomic.Int32
-	mock.findOrphanedFunc = func(_ []string) ([]string, error) {
+	mock.findOrphanedFunc = func(_ []core.UUID) ([]core.UUID, error) {
 		queries.Add(1)
 		return nil, nil
 	}
@@ -4726,11 +4726,11 @@ func TestFanOutRecoveryStaleAge_Configuration(t *testing.T) {
 // exact corruption this branch's cancellation work aims to end.
 func TestHandleError_NotOwnedSkipsFanOutAccounting(t *testing.T) {
 	mock := &mockStorage{}
-	mock.failFunc = func(_ context.Context, _, _, _ string, _ *time.Time) error {
+	mock.failFunc = func(_ context.Context, _ core.UUID, _, _ string, _ *time.Time) error {
 		return core.ErrJobNotOwned
 	}
 	var incrementCalled atomic.Int32
-	mock.incrementFailedFunc = func(_ context.Context, _ string) (*core.FanOut, error) {
+	mock.incrementFailedFunc = func(_ context.Context, _ core.UUID) (*core.FanOut, error) {
 		incrementCalled.Add(1)
 		return nil, nil
 	}
@@ -4738,7 +4738,7 @@ func TestHandleError_NotOwnedSkipsFanOutAccounting(t *testing.T) {
 	q := queue.New(mock)
 	w := NewWorker(q, DisableRetry())
 
-	fanOutID := "fo-1"
+	fanOutID := core.UUID("fo-1")
 	// Attempt >= MaxRetries → terminal path (the one that does fan-out accounting).
 	job := &core.Job{ID: "sub-1", FanOutID: &fanOutID, Attempt: 5, MaxRetries: 3}
 
@@ -4754,11 +4754,11 @@ func TestHandleError_NotOwnedSkipsFanOutAccounting(t *testing.T) {
 // against the fan-out so the parent isn't left stuck in 'waiting'.
 func TestHandleError_OwnedStillAccountsFanOut(t *testing.T) {
 	mock := &mockStorage{}
-	mock.failFunc = func(_ context.Context, _, _, _ string, _ *time.Time) error {
+	mock.failFunc = func(_ context.Context, _ core.UUID, _, _ string, _ *time.Time) error {
 		return nil // owned: Fail succeeds
 	}
 	var incrementCalled atomic.Int32
-	mock.incrementFailedFunc = func(_ context.Context, _ string) (*core.FanOut, error) {
+	mock.incrementFailedFunc = func(_ context.Context, _ core.UUID) (*core.FanOut, error) {
 		incrementCalled.Add(1)
 		// Return a fan-out that is NOT yet complete so checkFanOutCompletion
 		// is a no-op and we don't pull in the completeFanOut machinery.
@@ -4768,7 +4768,7 @@ func TestHandleError_OwnedStillAccountsFanOut(t *testing.T) {
 	q := queue.New(mock)
 	w := NewWorker(q, DisableRetry())
 
-	fanOutID := "fo-1"
+	fanOutID := core.UUID("fo-1")
 	job := &core.Job{ID: "sub-1", FanOutID: &fanOutID, Attempt: 5, MaxRetries: 3}
 
 	ctx := context.Background()

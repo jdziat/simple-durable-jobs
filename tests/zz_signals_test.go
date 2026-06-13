@@ -18,15 +18,15 @@ type resultBox struct {
 }
 
 func newResultBox() *resultBox { return &resultBox{m: map[string]string{}} }
-func (b *resultBox) set(id, v string) {
+func (b *resultBox) set(id jobs.UUID, v string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.m[id] = v
+	b.m[string(id)] = v
 }
-func (b *resultBox) get(id string) (string, bool) {
+func (b *resultBox) get(id jobs.UUID) (string, bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	v, ok := b.m[id]
+	v, ok := b.m[string(id)]
 	return v, ok
 }
 
@@ -147,7 +147,7 @@ func TestSignals_PollBackstopResumes(t *testing.T) {
 
 	// Deliver via storage only — no ResumeJob — so the poll must recover it.
 	sender, ok := store.(interface {
-		SendSignal(context.Context, string, string, []byte) error
+		SendSignal(context.Context, jobs.UUID, string, []byte) error
 	})
 	require.True(t, ok, "storage must support signals")
 	require.NoError(t, sender.SendSignal(ctx, id, "ctx", []byte(`"via-poll"`)))
@@ -267,7 +267,7 @@ func TestSignals_EmitsResumedBySignalOnPollBackstop(t *testing.T) {
 
 	events := q.Events()
 	sender, ok := store.(interface {
-		SendSignal(context.Context, string, string, []byte) error
+		SendSignal(context.Context, jobs.UUID, string, []byte) error
 	})
 	require.True(t, ok, "storage must support signals")
 	require.NoError(t, sender.SendSignal(ctx, id, "ctx", []byte(`"via-poll"`)))
@@ -305,12 +305,12 @@ func TestSignals_PeekThenDrain(t *testing.T) {
 			return err
 		}
 		mu.Lock()
-		c := seen[id]
+		c := seen[string(id)]
 		if peeked {
 			c.peeked = 1
 		}
 		c.drained = len(all)
-		seen[id] = c
+		seen[string(id)] = c
 		mu.Unlock()
 		return nil
 	})
@@ -327,11 +327,11 @@ func TestSignals_PeekThenDrain(t *testing.T) {
 	require.Eventually(t, func() bool {
 		mu.Lock()
 		defer mu.Unlock()
-		c, ok := seen[id]
+		c, ok := seen[string(id)]
 		return ok && c.drained == 3
 	}, 10*time.Second, 50*time.Millisecond, "drain should return all three buffered signals")
 
 	mu.Lock()
 	defer mu.Unlock()
-	assert.Equal(t, 1, seen[id].peeked, "CheckSignal observed a pending signal without consuming it")
+	assert.Equal(t, 1, seen[string(id)].peeked, "CheckSignal observed a pending signal without consuming it")
 }

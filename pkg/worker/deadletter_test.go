@@ -104,7 +104,7 @@ func TestWorkerDeadLetter_RetryingJobNotDeadLetteredYet(t *testing.T) {
 
 	retried := make(chan string, 1)
 	q.OnRetry(func(_ context.Context, job *core.Job, _ int, _ error) {
-		retried <- job.ID
+		retried <- string(job.ID)
 	})
 
 	jobID, err := q.Enqueue(context.Background(), "dlq.retry-first", struct{}{}, queue.Retries(2))
@@ -117,7 +117,7 @@ func TestWorkerDeadLetter_RetryingJobNotDeadLetteredYet(t *testing.T) {
 
 	select {
 	case gotID := <-retried:
-		assert.Equal(t, jobID, gotID)
+		assert.Equal(t, string(jobID), gotID)
 	case <-time.After(4 * time.Second):
 		t.Fatal("retryable job did not call retry hook")
 	}

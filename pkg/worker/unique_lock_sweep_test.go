@@ -66,12 +66,12 @@ func TestWorkerUniqueLockSweepDeletesExpiredLocks(t *testing.T) {
 
 	require.NoError(t, db.Create(&core.UniqueLock{
 		ScopeHash: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-		JobID:     "expired",
+		JobID:     workerTestUUID("expired"),
 		ExpiresAt: now.Add(-time.Hour),
 	}).Error)
 	require.NoError(t, db.Create(&core.UniqueLock{
 		ScopeHash: "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
-		JobID:     "live",
+		JobID:     workerTestUUID("live"),
 		ExpiresAt: now.Add(time.Hour),
 	}).Error)
 

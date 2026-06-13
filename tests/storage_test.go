@@ -71,14 +71,14 @@ func TestGormStorage_Enqueue_PreserveID(t *testing.T) {
 	ctx := context.Background()
 
 	job := &jobs.Job{
-		ID:   "custom-id-123",
+		ID:   integrationTestUUID("custom-id-123"),
 		Type: "test-job",
 	}
 
 	err := store.Enqueue(ctx, job)
 	require.NoError(t, err)
 
-	assert.Equal(t, "custom-id-123", job.ID)
+	assert.Equal(t, integrationTestUUID("custom-id-123"), job.ID)
 }
 
 func TestGormStorage_Dequeue(t *testing.T) {
@@ -513,7 +513,7 @@ func TestGormStorage_GetJob_NotFound(t *testing.T) {
 	store := setupStorageTest(t)
 	ctx := context.Background()
 
-	job, err := store.GetJob(ctx, "non-existent-id")
+	job, err := store.GetJob(ctx, integrationTestUUID("non-existent-id"))
 	require.NoError(t, err)
 	assert.Nil(t, job)
 }

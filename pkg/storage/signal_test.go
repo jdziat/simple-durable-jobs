@@ -3,20 +3,27 @@ package storage
 import (
 	"context"
 	"errors"
+	"sort"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/jdziat/simple-durable-jobs/v3/pkg/core"
 )
 
+func signalUUID(v string) core.UUID {
+	return core.UUID(uuid.NewSHA1(uuid.NameSpaceOID, []byte("signal:"+v)).String())
+}
+
 func sendTestSignal(t *testing.T, ctx context.Context, s *GormStorage, jobID, name string, payload []byte) {
 	t.Helper()
-	seedTestJob(t, ctx, s, jobID, core.StatusWaiting)
-	require.NoError(t, s.SendSignal(ctx, jobID, name, payload))
+	id := signalUUID(jobID)
+	seedTestJob(t, ctx, s, id, core.StatusWaiting)
+	require.NoError(t, s.SendSignal(ctx, id, name, payload))
 }
 
 func TestSendConsumeSignal_FIFO(t *testing.T) {
@@ -27,22 +34,22 @@ func TestSendConsumeSignal_FIFO(t *testing.T) {
 	sendTestSignal(t, ctx, s, "j1", "ctx", []byte(`"b"`))
 	sendTestSignal(t, ctx, s, "j1", "other", []byte(`"x"`))
 
-	got1, err := s.ConsumeSignal(ctx, "j1", "ctx")
+	got1, err := s.ConsumeSignal(ctx, signalUUID("j1"), "ctx")
 	require.NoError(t, err)
 	require.NotNil(t, got1)
 	assert.Equal(t, `"a"`, string(got1.Payload), "FIFO: oldest first")
 
-	got2, err := s.ConsumeSignal(ctx, "j1", "ctx")
+	got2, err := s.ConsumeSignal(ctx, signalUUID("j1"), "ctx")
 	require.NoError(t, err)
 	require.NotNil(t, got2)
 	assert.Equal(t, `"b"`, string(got2.Payload))
 
-	none, err := s.ConsumeSignal(ctx, "j1", "ctx")
+	none, err := s.ConsumeSignal(ctx, signalUUID("j1"), "ctx")
 	require.NoError(t, err)
 	assert.Nil(t, none, "no more pending of this name")
 
 	// The other name is untouched.
-	other, err := s.ConsumeSignal(ctx, "j1", "other")
+	other, err := s.ConsumeSignal(ctx, signalUUID("j1"), "other")
 	require.NoError(t, err)
 	require.NotNil(t, other)
 	assert.Equal(t, `"x"`, string(other.Payload))
@@ -53,17 +60,17 @@ func TestPeekSignal_DoesNotConsume(t *testing.T) {
 	ctx := context.Background()
 	sendTestSignal(t, ctx, s, "j1", "ctx", []byte(`"v"`))
 
-	p1, err := s.PeekSignal(ctx, "j1", "ctx")
+	p1, err := s.PeekSignal(ctx, signalUUID("j1"), "ctx")
 	require.NoError(t, err)
 	require.NotNil(t, p1)
-	p2, err := s.PeekSignal(ctx, "j1", "ctx")
+	p2, err := s.PeekSignal(ctx, signalUUID("j1"), "ctx")
 	require.NoError(t, err)
 	require.NotNil(t, p2, "peek leaves the signal pending")
 
-	c, err := s.ConsumeSignal(ctx, "j1", "ctx")
+	c, err := s.ConsumeSignal(ctx, signalUUID("j1"), "ctx")
 	require.NoError(t, err)
 	require.NotNil(t, c)
-	after, err := s.PeekSignal(ctx, "j1", "ctx")
+	after, err := s.PeekSignal(ctx, signalUUID("j1"), "ctx")
 	require.NoError(t, err)
 	assert.Nil(t, after, "consumed signal no longer pending")
 }
@@ -76,18 +83,18 @@ func TestDrainSignals(t *testing.T) {
 	}
 	sendTestSignal(t, ctx, s, "j1", "other", []byte(`"x"`))
 
-	drained, err := s.DrainSignals(ctx, "j1", "ctx")
+	drained, err := s.DrainSignals(ctx, signalUUID("j1"), "ctx")
 	require.NoError(t, err)
 	require.Len(t, drained, 3)
 	assert.Equal(t, `"a"`, string(drained[0].Payload))
 	assert.Equal(t, `"c"`, string(drained[2].Payload))
 
-	again, err := s.DrainSignals(ctx, "j1", "ctx")
+	again, err := s.DrainSignals(ctx, signalUUID("j1"), "ctx")
 	require.NoError(t, err)
 	assert.Empty(t, again, "all consumed")
 
 	// Unrelated name still there.
-	o, err := s.PeekSignal(ctx, "j1", "other")
+	o, err := s.PeekSignal(ctx, signalUUID("j1"), "other")
 	require.NoError(t, err)
 	assert.NotNil(t, o)
 }
@@ -98,7 +105,7 @@ func TestGetSignalWaitingJobsToResume(t *testing.T) {
 
 	mkJob := func(id string, status core.JobStatus, runAt *time.Time) {
 		require.NoError(t, s.db.WithContext(ctx).Create(&core.Job{
-			ID: id, Type: "wf", Queue: "default", Status: status, RunAt: runAt,
+			ID: signalUUID(id), Type: "wf", Queue: "default", Status: status, RunAt: runAt,
 		}).Error)
 	}
 	past := time.Now().Add(-time.Minute)
@@ -118,21 +125,21 @@ func TestGetSignalWaitingJobsToResume(t *testing.T) {
 	mkJob("fanout-parent", core.StatusWaiting, nil)
 	sendTestSignal(t, ctx, s, "fanout-parent", "ctx", []byte(`1`))
 	require.NoError(t, s.db.WithContext(ctx).Create(&core.FanOut{
-		ID: "fo1", ParentJobID: "fanout-parent", Status: core.FanOutPending, TotalCount: 1,
+		ID: signalUUID("fo1"), ParentJobID: signalUUID("fanout-parent"), Status: core.FanOutPending, TotalCount: 1,
 	}).Error)
 
 	jobs, err := s.GetSignalWaitingJobsToResume(ctx)
 	require.NoError(t, err)
-	ids := map[string]bool{}
+	ids := map[core.UUID]bool{}
 	for _, j := range jobs {
 		ids[j.ID] = true
 	}
-	assert.True(t, ids["has-signal"], "waiting job with a pending signal must resume")
-	assert.True(t, ids["timed-out"], "waiting job past its deadline must resume")
-	assert.False(t, ids["still-waiting"], "future deadline, no signal → not yet")
-	assert.False(t, ids["plain-waiting"], "no signal, no deadline → not")
-	assert.False(t, ids["running-signal"], "only waiting jobs are resumed")
-	assert.False(t, ids["fanout-parent"], "a parent waiting on a pending fan-out must not be signal-resumed")
+	assert.True(t, ids[signalUUID("has-signal")], "waiting job with a pending signal must resume")
+	assert.True(t, ids[signalUUID("timed-out")], "waiting job past its deadline must resume")
+	assert.False(t, ids[signalUUID("still-waiting")], "future deadline, no signal -> not yet")
+	assert.False(t, ids[signalUUID("plain-waiting")], "no signal, no deadline -> not")
+	assert.False(t, ids[signalUUID("running-signal")], "only waiting jobs are resumed")
+	assert.False(t, ids[signalUUID("fanout-parent")], "a parent waiting on a pending fan-out must not be signal-resumed")
 }
 
 func TestGetSignalWaitingJobsToResumeAfter_KeysetPagesInIDOrder(t *testing.T) {
@@ -141,22 +148,24 @@ func TestGetSignalWaitingJobsToResumeAfter_KeysetPagesInIDOrder(t *testing.T) {
 
 	for _, id := range []string{"a", "b", "c", "d"} {
 		require.NoError(t, s.db.WithContext(ctx).Create(&core.Job{
-			ID: id, Type: "wf", Queue: "default", Status: core.StatusWaiting,
+			ID: signalUUID(id), Type: "wf", Queue: "default", Status: core.StatusWaiting,
 		}).Error)
 		sendTestSignal(t, ctx, s, id, "ctx", []byte(`1`))
 	}
+	expected := []core.UUID{signalUUID("a"), signalUUID("b"), signalUUID("c"), signalUUID("d")}
+	sort.Slice(expected, func(i, j int) bool { return expected[i] < expected[j] })
 
-	first, err := s.GetSignalWaitingJobsToResumeAfter(ctx, "", 2)
+	first, err := s.GetSignalWaitingJobsToResumeAfter(ctx, core.NilUUID, 2)
 	require.NoError(t, err)
 	require.Len(t, first, 2)
-	assert.Equal(t, "a", first[0].ID)
-	assert.Equal(t, "b", first[1].ID)
+	assert.Equal(t, expected[0], first[0].ID)
+	assert.Equal(t, expected[1], first[1].ID)
 
 	second, err := s.GetSignalWaitingJobsToResumeAfter(ctx, first[1].ID, 2)
 	require.NoError(t, err)
 	require.Len(t, second, 2)
-	assert.Equal(t, "c", second[0].ID)
-	assert.Equal(t, "d", second[1].ID)
+	assert.Equal(t, expected[2], second[0].ID)
+	assert.Equal(t, expected[3], second[1].ID)
 }
 
 func TestResumeSignalWaitingJob(t *testing.T) {
@@ -166,26 +175,26 @@ func TestResumeSignalWaitingJob(t *testing.T) {
 
 	// A waiting job with a future run_at (a WaitForSignalTimeout wake deadline).
 	require.NoError(t, s.db.WithContext(ctx).Create(&core.Job{
-		ID: "w", Type: "x", Queue: "default", Status: core.StatusWaiting, RunAt: &future,
+		ID: signalUUID("w"), Type: "x", Queue: "default", Status: core.StatusWaiting, RunAt: &future,
 	}).Error)
 	// A paused job — a signal must NOT un-pause it.
 	require.NoError(t, s.db.WithContext(ctx).Create(&core.Job{
-		ID: "p", Type: "x", Queue: "default", Status: core.StatusPaused,
+		ID: signalUUID("p"), Type: "x", Queue: "default", Status: core.StatusPaused,
 	}).Error)
 
-	ok, err := s.ResumeSignalWaitingJob(ctx, "w")
+	ok, err := s.ResumeSignalWaitingJob(ctx, signalUUID("w"))
 	require.NoError(t, err)
 	require.True(t, ok)
 	var w core.Job
-	require.NoError(t, s.db.WithContext(ctx).First(&w, "id = ?", "w").Error)
+	require.NoError(t, s.db.WithContext(ctx).First(&w, "id = ?", signalUUID("w")).Error)
 	assert.Equal(t, core.StatusPending, w.Status)
 	assert.Nil(t, w.RunAt, "signal resume must clear the timeout wake deadline")
 
-	ok2, err := s.ResumeSignalWaitingJob(ctx, "p")
+	ok2, err := s.ResumeSignalWaitingJob(ctx, signalUUID("p"))
 	require.NoError(t, err)
 	assert.False(t, ok2, "a paused job is not signal-resumable")
 	var p core.Job
-	require.NoError(t, s.db.WithContext(ctx).First(&p, "id = ?", "p").Error)
+	require.NoError(t, s.db.WithContext(ctx).First(&p, "id = ?", signalUUID("p")).Error)
 	assert.Equal(t, core.StatusPaused, p.Status, "paused job stays paused")
 }
 
@@ -245,15 +254,15 @@ func TestGetPendingSignalName(t *testing.T) {
 	ctx := context.Background()
 	sendTestSignal(t, ctx, s, "j1", "first", []byte(`1`))
 	sendTestSignal(t, ctx, s, "j1", "second", []byte(`2`))
-	_, err := s.ConsumeSignal(ctx, "j1", "first")
+	_, err := s.ConsumeSignal(ctx, signalUUID("j1"), "first")
 	require.NoError(t, err)
 
-	name, ok, err := s.GetPendingSignalName(ctx, "j1")
+	name, ok, err := s.GetPendingSignalName(ctx, signalUUID("j1"))
 	require.NoError(t, err)
 	require.True(t, ok)
 	assert.Equal(t, "second", name)
 
-	name, ok, err = s.GetPendingSignalName(ctx, "missing")
+	name, ok, err = s.GetPendingSignalName(ctx, signalUUID("missing"))
 	require.NoError(t, err)
 	assert.False(t, ok)
 	assert.Empty(t, name)
@@ -266,21 +275,21 @@ func TestResumeJob_PreservesRunAt(t *testing.T) {
 	// A delayed job paused before its run_at; the general ResumeJob must NOT strip
 	// its schedule (only the signal-specific resume clears run_at).
 	require.NoError(t, s.db.WithContext(ctx).Create(&core.Job{
-		ID: "d", Type: "x", Queue: "default", Status: core.StatusPaused, RunAt: &future,
+		ID: signalUUID("d"), Type: "x", Queue: "default", Status: core.StatusPaused, RunAt: &future,
 	}).Error)
 
-	ok, err := s.ResumeJob(ctx, "d")
+	ok, err := s.ResumeJob(ctx, signalUUID("d"))
 	require.NoError(t, err)
 	require.True(t, ok)
 	var d core.Job
-	require.NoError(t, s.db.WithContext(ctx).First(&d, "id = ?", "d").Error)
+	require.NoError(t, s.db.WithContext(ctx).First(&d, "id = ?", signalUUID("d")).Error)
 	assert.Equal(t, core.StatusPending, d.Status)
 	require.NotNil(t, d.RunAt, "ResumeJob must preserve a delayed job's schedule")
 }
 
 // validCheckpoint builds a well-formed call-index checkpoint for a consumed
 // signal, mirroring what pkg/signal's WaitForSignal closure produces.
-func validCheckpoint(jobID string, sig *core.Signal) *core.Checkpoint {
+func validCheckpoint(jobID core.UUID, sig *core.Signal) *core.Checkpoint {
 	return &core.Checkpoint{
 		JobID:     jobID,
 		CallIndex: 0,
@@ -294,19 +303,19 @@ func TestConsumeSignalTx_AtomicConsumeAndCheckpoint(t *testing.T) {
 	ctx := context.Background()
 	sendTestSignal(t, ctx, s, "j1", "ctx", []byte(`"hi"`))
 
-	sig, err := s.ConsumeSignalTx(ctx, "j1", "ctx", func(sig *core.Signal) (*core.Checkpoint, error) {
-		return validCheckpoint("j1", sig), nil
+	sig, err := s.ConsumeSignalTx(ctx, signalUUID("j1"), "ctx", func(sig *core.Signal) (*core.Checkpoint, error) {
+		return validCheckpoint(signalUUID("j1"), sig), nil
 	})
 	require.NoError(t, err)
 	require.NotNil(t, sig)
 	assert.Equal(t, `"hi"`, string(sig.Payload))
 
 	// The signal is consumed atomically with the checkpoint write.
-	peek, err := s.PeekSignal(ctx, "j1", "ctx")
+	peek, err := s.PeekSignal(ctx, signalUUID("j1"), "ctx")
 	require.NoError(t, err)
 	assert.Nil(t, peek, "signal consumed")
 
-	cps, err := s.GetCheckpoints(ctx, "j1")
+	cps, err := s.GetCheckpoints(ctx, signalUUID("j1"))
 	require.NoError(t, err)
 	require.Len(t, cps, 1, "the call-index checkpoint was persisted in the same tx")
 	assert.Equal(t, 0, cps[0].CallIndex)
@@ -323,17 +332,17 @@ func TestConsumeSignalTx_RollbackLeavesSignalAndNoCheckpoint(t *testing.T) {
 	// back. This is the crash/replay regression proof at the tx layer — the old
 	// two-tx design (consume commits, then checkpoint) cannot satisfy it. Runs on
 	// SQLite AND Postgres AND MySQL (the PG/MySQL FOR UPDATE SKIP LOCKED path).
-	_, err := s.ConsumeSignalTx(ctx, "j1", "ctx", func(*core.Signal) (*core.Checkpoint, error) {
+	_, err := s.ConsumeSignalTx(ctx, signalUUID("j1"), "ctx", func(*core.Signal) (*core.Checkpoint, error) {
 		return nil, errors.New("boom")
 	})
 	require.Error(t, err)
 
-	peek, err := s.PeekSignal(ctx, "j1", "ctx")
+	peek, err := s.PeekSignal(ctx, signalUUID("j1"), "ctx")
 	require.NoError(t, err)
 	require.NotNil(t, peek, "consume rolled back: signal still pending (consumed_at NULL)")
 	assert.Equal(t, `"hi"`, string(peek.Payload))
 
-	cps, err := s.GetCheckpoints(ctx, "j1")
+	cps, err := s.GetCheckpoints(ctx, signalUUID("j1"))
 	require.NoError(t, err)
 	assert.Empty(t, cps, "no checkpoint recorded when the tx rolled back")
 }
@@ -342,14 +351,14 @@ func TestConsumeSignalTx_NoPendingDoesNothing(t *testing.T) {
 	s := newTestStorage(t)
 	ctx := context.Background()
 
-	sig, err := s.ConsumeSignalTx(ctx, "j1", "ctx", func(*core.Signal) (*core.Checkpoint, error) {
+	sig, err := s.ConsumeSignalTx(ctx, signalUUID("j1"), "ctx", func(*core.Signal) (*core.Checkpoint, error) {
 		t.Fatal("buildCheckpoint must not be called when no signal is pending")
 		return nil, nil
 	})
 	require.NoError(t, err)
 	assert.Nil(t, sig, "no signal → nil, nil")
 
-	cps, err := s.GetCheckpoints(ctx, "j1")
+	cps, err := s.GetCheckpoints(ctx, signalUUID("j1"))
 	require.NoError(t, err)
 	assert.Empty(t, cps, "no checkpoint when nothing was consumed")
 }
@@ -357,7 +366,7 @@ func TestConsumeSignalTx_NoPendingDoesNothing(t *testing.T) {
 func TestDrainSignalsTx_AlwaysCheckpointsAndRollsBack(t *testing.T) {
 	drainCheckpoint := func(sigs []*core.Signal) *core.Checkpoint {
 		return &core.Checkpoint{
-			JobID:     "j1",
+			JobID:     signalUUID("j1"),
 			CallIndex: 0,
 			CallType:  "signaldrain:ctx",
 			Result:    []byte("[]"),
@@ -367,9 +376,9 @@ func TestDrainSignalsTx_AlwaysCheckpointsAndRollsBack(t *testing.T) {
 	t.Run("empty still checkpoints", func(t *testing.T) {
 		s := newTestStorage(t)
 		ctx := context.Background()
-		seedTestJob(t, ctx, s, "j1", core.StatusWaiting)
+		seedTestJob(t, ctx, s, signalUUID("j1"), core.StatusWaiting)
 		var called bool
-		sigs, err := s.DrainSignalsTx(ctx, "j1", "ctx", func(sigs []*core.Signal) (*core.Checkpoint, error) {
+		sigs, err := s.DrainSignalsTx(ctx, signalUUID("j1"), "ctx", func(sigs []*core.Signal) (*core.Checkpoint, error) {
 			called = true
 			assert.Empty(t, sigs, "empty batch")
 			return drainCheckpoint(sigs), nil
@@ -377,7 +386,7 @@ func TestDrainSignalsTx_AlwaysCheckpointsAndRollsBack(t *testing.T) {
 		require.NoError(t, err)
 		assert.Empty(t, sigs)
 		assert.True(t, called, "buildCheckpoint always invoked, even when empty")
-		cps, err := s.GetCheckpoints(ctx, "j1")
+		cps, err := s.GetCheckpoints(ctx, signalUUID("j1"))
 		require.NoError(t, err)
 		require.Len(t, cps, 1, "empty drain still records a checkpoint for deterministic replay")
 	})
@@ -388,15 +397,15 @@ func TestDrainSignalsTx_AlwaysCheckpointsAndRollsBack(t *testing.T) {
 		for _, p := range [][]byte{[]byte(`"a"`), []byte(`"b"`), []byte(`"c"`)} {
 			sendTestSignal(t, ctx, s, "j1", "ctx", p)
 		}
-		sigs, err := s.DrainSignalsTx(ctx, "j1", "ctx", func(sigs []*core.Signal) (*core.Checkpoint, error) {
+		sigs, err := s.DrainSignalsTx(ctx, signalUUID("j1"), "ctx", func(sigs []*core.Signal) (*core.Checkpoint, error) {
 			return drainCheckpoint(sigs), nil
 		})
 		require.NoError(t, err)
 		require.Len(t, sigs, 3)
-		peek, err := s.PeekSignal(ctx, "j1", "ctx")
+		peek, err := s.PeekSignal(ctx, signalUUID("j1"), "ctx")
 		require.NoError(t, err)
 		assert.Nil(t, peek, "all consumed")
-		cps, err := s.GetCheckpoints(ctx, "j1")
+		cps, err := s.GetCheckpoints(ctx, signalUUID("j1"))
 		require.NoError(t, err)
 		require.Len(t, cps, 1)
 	})
@@ -407,11 +416,11 @@ func TestDrainSignalsTx_AlwaysCheckpointsAndRollsBack(t *testing.T) {
 		for _, p := range [][]byte{[]byte(`"a"`), []byte(`"b"`), []byte(`"c"`)} {
 			sendTestSignal(t, ctx, s, "j1", "ctx", p)
 		}
-		_, err := s.DrainSignalsTx(ctx, "j1", "ctx", func([]*core.Signal) (*core.Checkpoint, error) {
+		_, err := s.DrainSignalsTx(ctx, signalUUID("j1"), "ctx", func([]*core.Signal) (*core.Checkpoint, error) {
 			return nil, errors.New("boom")
 		})
 		require.Error(t, err)
-		drained, err := s.DrainSignals(ctx, "j1", "ctx")
+		drained, err := s.DrainSignals(ctx, signalUUID("j1"), "ctx")
 		require.NoError(t, err)
 		assert.Len(t, drained, 3, "nothing consumed: all three still pending")
 		// Note: this DrainSignals consumed them; assert no checkpoint from the
@@ -430,14 +439,14 @@ func TestConsumeSignal_ConcurrentDisjoint(t *testing.T) {
 		sendTestSignal(t, ctx, s, "j1", "ctx", []byte(`1`))
 	}
 	var mu sync.Mutex
-	seen := map[string]int{}
+	seen := map[core.UUID]int{}
 	var wg sync.WaitGroup
 	for w := 0; w < 4; w++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for {
-				sig, err := s.ConsumeSignal(ctx, "j1", "ctx")
+				sig, err := s.ConsumeSignal(ctx, signalUUID("j1"), "ctx")
 				if err != nil || sig == nil {
 					return
 				}

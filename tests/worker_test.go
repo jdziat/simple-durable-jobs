@@ -396,8 +396,9 @@ func TestWorker_UnknownHandler(t *testing.T) {
 	defer cancel()
 
 	// Manually insert a job with unknown type
+	jobID := integrationTestUUID("test-unknown-job")
 	job := &jobs.Job{
-		ID:     "test-unknown-job",
+		ID:     jobID,
 		Type:   "unknown-job",
 		Queue:  "default",
 		Status: jobs.StatusPending,
@@ -411,7 +412,7 @@ func TestWorker_UnknownHandler(t *testing.T) {
 	// Poll for failure
 	var updatedJob *jobs.Job
 	for i := 0; i < 50; i++ {
-		updatedJob, _ = store.GetJob(context.Background(), "test-unknown-job")
+		updatedJob, _ = store.GetJob(context.Background(), jobID)
 		if updatedJob != nil && updatedJob.Status == jobs.StatusFailed {
 			break
 		}

@@ -13,7 +13,7 @@ func TestNewIDReturnsUUIDv7String(t *testing.T) {
 
 	assert.Len(t, id, 36)
 
-	parsed, err := uuid.Parse(id)
+	parsed, err := uuid.Parse(string(id))
 	require.NoError(t, err)
 	assert.Equal(t, uuid.Version(7), parsed.Version())
 }
@@ -27,7 +27,7 @@ func TestNewIDLexicallyIncreases(t *testing.T) {
 
 func TestNewIDUnique(t *testing.T) {
 	const n = 1000
-	seen := make(map[string]struct{}, n)
+	seen := make(map[UUID]struct{}, n)
 
 	for range n {
 		id := NewID()

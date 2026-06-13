@@ -88,27 +88,27 @@ func (s *GormStorage) dequeueBatchLocked(ctx context.Context, queues []string, w
 	lockUntilExpr := s.offsetExpr(time.Duration(s.lockDuration.Load()))
 	silentDB := s.db.Session(&gorm.Session{Logger: s.db.Logger.LogMode(logger.Silent)})
 
-	claimedIDs := make([]string, 0, limit)
+	claimedIDs := make([]core.UUID, 0, limit)
 	claimedPerQueue := make(map[string]int, len(perQueueBudgets))
 	emptyRetries := 0
 	for len(claimedIDs) < limit {
-		var batchIDs []string
+		var batchIDs []core.UUID
 		batchQueueCounts := make(map[string]int, len(perQueueBudgets))
 		err := s.withSerializationRetry(ctx, func() error {
 			batchIDs = nil
 			batchQueueCounts = make(map[string]int, len(perQueueBudgets))
 			return silentDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 				remaining := limit - len(claimedIDs)
-				batchIDs = make([]string, 0, remaining)
+				batchIDs = make([]core.UUID, 0, remaining)
 				txClaimedPerQueue := make(map[string]int, len(claimedPerQueue)+len(perQueueBudgets))
 				for queueName, count := range claimedPerQueue {
 					txClaimedPerQueue[queueName] = count
 				}
-				claimedInTx := make(map[string]struct{}, remaining)
+				claimedInTx := make(map[core.UUID]struct{}, remaining)
 				for _, id := range claimedIDs {
 					claimedInTx[id] = struct{}{}
 				}
-				skippedIDs := make([]string, 0)
+				skippedIDs := make([]core.UUID, 0)
 
 				for len(batchIDs) < remaining {
 					var candidates []*core.Job
@@ -118,7 +118,7 @@ func (s *GormStorage) dequeueBatchLocked(ctx context.Context, queues []string, w
 						query = query.Where("id NOT IN ?", skippedIDs)
 					}
 					if len(claimedInTx) > 0 {
-						ids := make([]string, 0, len(claimedInTx))
+						ids := make([]core.UUID, 0, len(claimedInTx))
 						for id := range claimedInTx {
 							ids = append(ids, id)
 						}
@@ -134,7 +134,7 @@ func (s *GormStorage) dequeueBatchLocked(ctx context.Context, queues []string, w
 						break
 					}
 
-					claimIDs := make([]string, 0, len(candidates))
+					claimIDs := make([]core.UUID, 0, len(candidates))
 					claimQueues := make(map[string]int, len(candidates))
 					for _, job := range candidates {
 						var queueState core.QueueState
@@ -258,14 +258,14 @@ func (s *GormStorage) dequeueBatchSQLite(ctx context.Context, queues []string, w
 	var jobs []*core.Job
 	err := s.withSerializationRetry(ctx, func() error {
 		jobs = nil
-		claimedIDs := make(map[string]struct{}, limit)
+		claimedIDs := make(map[core.UUID]struct{}, limit)
 		claimedPerQueue := make(map[string]int, len(perQueueBudgets))
 		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 			for len(jobs) < limit {
 				var job core.Job
 				query := s.claimableCandidates(tx, queues, now)
 				if len(claimedIDs) > 0 {
-					ids := make([]string, 0, len(claimedIDs))
+					ids := make([]core.UUID, 0, len(claimedIDs))
 					for id := range claimedIDs {
 						ids = append(ids, id)
 					}

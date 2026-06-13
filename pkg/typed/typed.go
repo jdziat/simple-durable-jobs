@@ -99,7 +99,7 @@ func (d *Def[A, R]) Name() string {
 // Arguments are passed unchanged to queue.Queue.Enqueue, preserving the same
 // JSON marshaling, size checks, middleware, and payload codec behavior as the
 // untyped API.
-func (d *Def[A, R]) Enqueue(ctx context.Context, args A, opts ...queue.Option) (string, error) {
+func (d *Def[A, R]) Enqueue(ctx context.Context, args A, opts ...queue.Option) (core.UUID, error) {
 	return d.q.Enqueue(ctx, d.name, args, opts...)
 }
 
@@ -107,7 +107,7 @@ func (d *Def[A, R]) Enqueue(ctx context.Context, args A, opts ...queue.Option) (
 //
 // Arguments are passed unchanged to queue.Queue.EnqueueRemote, preserving the
 // same wire format as untyped remote enqueue while checking A at compile time.
-func (d *Def[A, R]) EnqueueRemote(ctx context.Context, args A, opts ...queue.Option) (string, error) {
+func (d *Def[A, R]) EnqueueRemote(ctx context.Context, args A, opts ...queue.Option) (core.UUID, error) {
 	return d.q.EnqueueRemote(ctx, d.name, args, opts...)
 }
 
@@ -115,7 +115,7 @@ func (d *Def[A, R]) EnqueueRemote(ctx context.Context, args A, opts ...queue.Opt
 //
 // Arguments are passed unchanged to queue.Queue.EnqueueTx. The caller remains
 // responsible for committing or rolling back tx.
-func (d *Def[A, R]) EnqueueTx(ctx context.Context, tx *gorm.DB, args A, opts ...queue.Option) (string, error) {
+func (d *Def[A, R]) EnqueueTx(ctx context.Context, tx *gorm.DB, args A, opts ...queue.Option) (core.UUID, error) {
 	return d.q.EnqueueTx(ctx, tx, d.name, args, opts...)
 }
 
@@ -135,7 +135,7 @@ func (d *Def[A, R]) Call(ctx context.Context, args A) (R, error) {
 // ErrJobNotCompleted for non-terminal jobs, ErrJobFailed for failed jobs,
 // ErrJobCancelled for cancelled jobs, ErrNoResult for completed jobs without a
 // result, and ErrJobNotFound when the ID does not exist.
-func (d *Def[A, R]) Load(ctx context.Context, jobID string) (R, error) {
+func (d *Def[A, R]) Load(ctx context.Context, jobID core.UUID) (R, error) {
 	var zero R
 	job, err := d.q.Storage().GetJob(ctx, jobID)
 	if err != nil {

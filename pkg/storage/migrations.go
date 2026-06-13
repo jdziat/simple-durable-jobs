@@ -805,7 +805,7 @@ func migrateRetentionWorkflowIndexes(ctx context.Context, db *gorm.DB, dialect s
 		m := db.Migrator()
 		if !m.HasColumn(&core.Job{}, "pending_parent_ref") {
 			if err := db.WithContext(ctx).Exec(
-				"ALTER TABLE jobs ADD COLUMN pending_parent_ref varchar(36) " +
+				"ALTER TABLE jobs ADD COLUMN pending_parent_ref binary(16) " +
 					"GENERATED ALWAYS AS (CASE WHEN status NOT IN ('completed','failed','cancelled') " +
 					"THEN parent_job_id END) STORED",
 			).Error; err != nil && !isBenignDDLError(err) {
@@ -814,7 +814,7 @@ func migrateRetentionWorkflowIndexes(ctx context.Context, db *gorm.DB, dialect s
 		}
 		if !m.HasColumn(&core.Job{}, "pending_root_ref") {
 			if err := db.WithContext(ctx).Exec(
-				"ALTER TABLE jobs ADD COLUMN pending_root_ref varchar(36) " +
+				"ALTER TABLE jobs ADD COLUMN pending_root_ref binary(16) " +
 					"GENERATED ALWAYS AS (CASE WHEN status NOT IN ('completed','failed','cancelled') " +
 					"THEN root_job_id END) STORED",
 			).Error; err != nil && !isBenignDDLError(err) {

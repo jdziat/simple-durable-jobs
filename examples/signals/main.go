@@ -134,7 +134,7 @@ func main() {
 	fmt.Println("Signals example complete: approval workflow finished successfully")
 }
 
-func waitForStatus(ctx context.Context, storage jobs.Storage, jobID string, want jobs.JobStatus, timeout time.Duration) error {
+func waitForStatus(ctx context.Context, storage jobs.Storage, jobID jobs.UUID, want jobs.JobStatus, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		job, err := storage.GetJob(ctx, jobID)

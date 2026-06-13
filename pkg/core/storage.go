@@ -18,35 +18,35 @@ type Storage interface {
 	// Job lifecycle
 	Enqueue(ctx context.Context, job *Job) error
 	Dequeue(ctx context.Context, queues []string, workerID string) (*Job, error)
-	Complete(ctx context.Context, jobID string, workerID string) error
-	Fail(ctx context.Context, jobID string, workerID string, errMsg string, retryAt *time.Time) error
+	Complete(ctx context.Context, jobID UUID, workerID string) error
+	Fail(ctx context.Context, jobID UUID, workerID string, errMsg string, retryAt *time.Time) error
 
 	// Uniqueness
 	EnqueueUnique(ctx context.Context, job *Job, uniqueKey string) error
 
 	// Checkpointing
 	SaveCheckpoint(ctx context.Context, cp *Checkpoint) error
-	GetCheckpoints(ctx context.Context, jobID string) ([]Checkpoint, error)
-	DeleteCheckpoints(ctx context.Context, jobID string) error
+	GetCheckpoints(ctx context.Context, jobID UUID) ([]Checkpoint, error)
+	DeleteCheckpoints(ctx context.Context, jobID UUID) error
 
 	// Scheduling
 	GetDueJobs(ctx context.Context, queues []string, limit int) ([]*Job, error)
 	ClaimScheduledFire(ctx context.Context, name string, fireTime time.Time) (bool, error)
 
 	// Locking
-	Heartbeat(ctx context.Context, jobID string, workerID string) error
+	Heartbeat(ctx context.Context, jobID UUID, workerID string) error
 	// Release returns an owned, still-running job to status=pending, clears
 	// locked_by/locked_until/started_at, so a dequeued-but-undelivered job
 	// (e.g. dropped at shutdown) is immediately re-runnable instead of
 	// waiting for the stale-lock reaper.
-	Release(ctx context.Context, jobID, workerID string) error
+	Release(ctx context.Context, jobID UUID, workerID string) error
 	// ReleaseStaleLocks releases locks on jobs whose heartbeat is older than
 	// staleDuration and returns the IDs of the jobs that were reclaimed. The
 	// caller can use those IDs to cancel in-flight handler contexts on the
 	// local worker — without this, an orphaned handler keeps running until
 	// its own heartbeat sees ErrJobNotOwned and times out (a slow path
 	// added in the heartbeat-abandon fix).
-	ReleaseStaleLocks(ctx context.Context, staleDuration time.Duration) (releasedJobIDs []string, err error)
+	ReleaseStaleLocks(ctx context.Context, staleDuration time.Duration) (releasedJobIDs []UUID, err error)
 	// FindOrphanedJobs returns the subset of jobIDs that this worker thinks
 	// it owns but the database disagrees with — either because the lock
 	// changed hands (locked_by != workerID), the lock was released
@@ -69,25 +69,25 @@ type Storage interface {
 	// running handler should stop. Periodic FindOrphanedJobs polling
 	// closes that gap with bounded query cost (one row per running job
 	// per audit tick).
-	FindOrphanedJobs(ctx context.Context, jobIDs []string, workerID string) ([]string, error)
+	FindOrphanedJobs(ctx context.Context, jobIDs []UUID, workerID string) ([]UUID, error)
 
 	// Queries
-	GetJob(ctx context.Context, jobID string) (*Job, error)
+	GetJob(ctx context.Context, jobID UUID) (*Job, error)
 	GetJobsByStatus(ctx context.Context, status JobStatus, limit int) ([]*Job, error)
 
 	// Fan-out operations
 	CreateFanOut(ctx context.Context, fanOut *FanOut) error
-	GetFanOut(ctx context.Context, fanOutID string) (*FanOut, error)
-	IncrementFanOutCompleted(ctx context.Context, fanOutID string) (*FanOut, error)
-	IncrementFanOutFailed(ctx context.Context, fanOutID string) (*FanOut, error)
-	IncrementFanOutCancelled(ctx context.Context, fanOutID string) (*FanOut, error)
-	UpdateFanOutStatus(ctx context.Context, fanOutID string, status FanOutStatus) (bool, error)
-	GetFanOutsByParent(ctx context.Context, parentJobID string) ([]*FanOut, error)
+	GetFanOut(ctx context.Context, fanOutID UUID) (*FanOut, error)
+	IncrementFanOutCompleted(ctx context.Context, fanOutID UUID) (*FanOut, error)
+	IncrementFanOutFailed(ctx context.Context, fanOutID UUID) (*FanOut, error)
+	IncrementFanOutCancelled(ctx context.Context, fanOutID UUID) (*FanOut, error)
+	UpdateFanOutStatus(ctx context.Context, fanOutID UUID, status FanOutStatus) (bool, error)
+	GetFanOutsByParent(ctx context.Context, parentJobID UUID) ([]*FanOut, error)
 
 	// Sub-job operations
 	EnqueueBatch(ctx context.Context, jobs []*Job) error
-	GetSubJobs(ctx context.Context, fanOutID string) ([]*Job, error)
-	GetSubJobResults(ctx context.Context, fanOutID string) ([]*Job, error)
+	GetSubJobs(ctx context.Context, fanOutID UUID) ([]*Job, error)
+	GetSubJobResults(ctx context.Context, fanOutID UUID) ([]*Job, error)
 	// CancelSubJobs marks all pending/running sub-jobs for a fan-out as
 	// cancelled and returns the IDs of the jobs that were cancelled. The
 	// caller is expected to invoke worker.CancelJob (or the cross-worker
@@ -95,26 +95,26 @@ type Storage interface {
 	// cancelled, not just the DB row. Without this, an in-flight sub-job
 	// continues executing even after its fan-out has been marked failed —
 	// observed in production on 2026-05-19.
-	CancelSubJobs(ctx context.Context, fanOutID string) (cancelledJobIDs []string, err error)
-	CancelSubJob(ctx context.Context, jobID string) (*FanOut, error)
+	CancelSubJobs(ctx context.Context, fanOutID UUID) (cancelledJobIDs []UUID, err error)
+	CancelSubJob(ctx context.Context, jobID UUID) (*FanOut, error)
 
 	// Waiting job operations
 	//
 	// MarkWaiting moves a running job into StatusWaiting (e.g. while it
 	// waits for fan-out sub-jobs).
-	MarkWaiting(ctx context.Context, jobID string, workerID string) error
-	ResumeJob(ctx context.Context, jobID string) (bool, error)
+	MarkWaiting(ctx context.Context, jobID UUID, workerID string) error
+	ResumeJob(ctx context.Context, jobID UUID) (bool, error)
 	GetWaitingJobsToResume(ctx context.Context) ([]*Job, error)
 	GetStalledFanOutParents(ctx context.Context, olderThan time.Time) ([]*Job, error)
 
 	// Result storage
-	SaveJobResult(ctx context.Context, jobID string, workerID string, result []byte) error
+	SaveJobResult(ctx context.Context, jobID UUID, workerID string, result []byte) error
 
 	// Job pause operations
-	PauseJob(ctx context.Context, jobID string) error
-	UnpauseJob(ctx context.Context, jobID string) error
+	PauseJob(ctx context.Context, jobID UUID) error
+	UnpauseJob(ctx context.Context, jobID UUID) error
 	GetPausedJobs(ctx context.Context, queue string) ([]*Job, error)
-	IsJobPaused(ctx context.Context, jobID string) (bool, error)
+	IsJobPaused(ctx context.Context, jobID UUID) (bool, error)
 
 	// Queue pause operations
 	PauseQueue(ctx context.Context, queue string) error

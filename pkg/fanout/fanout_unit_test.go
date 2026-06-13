@@ -40,11 +40,11 @@ func newMinimalStorage() *minimalStorage {
 
 func (s *minimalStorage) Migrate(ctx context.Context) error { return nil }
 func (s *minimalStorage) Enqueue(ctx context.Context, job *core.Job) error {
-	s.jobs[job.ID] = job
+	s.jobs[string(job.ID)] = job
 	return nil
 }
 func (s *minimalStorage) EnqueueUnique(ctx context.Context, job *core.Job, key string) error {
-	s.jobs[job.ID] = job
+	s.jobs[string(job.ID)] = job
 	return nil
 }
 func (s *minimalStorage) EnqueueBatch(ctx context.Context, jobs []*core.Job) error {
@@ -64,34 +64,38 @@ func (s *minimalStorage) EnqueueBatch(ctx context.Context, jobs []*core.Job) err
 				continue
 			}
 		}
-		s.jobs[j.ID] = j
+		s.jobs[string(j.ID)] = j
 	}
 	return nil
 }
 func (s *minimalStorage) Dequeue(ctx context.Context, queues []string, workerID string) (*core.Job, error) {
 	return nil, nil
 }
-func (s *minimalStorage) Complete(ctx context.Context, jobID, workerID string) error { return nil }
-func (s *minimalStorage) Release(ctx context.Context, jobID, workerID string) error  { return nil }
-func (s *minimalStorage) Fail(ctx context.Context, jobID, workerID, errMsg string, retryAt *time.Time) error {
+func (s *minimalStorage) Complete(ctx context.Context, jobID core.UUID, workerID string) error {
 	return nil
 }
-func (s *minimalStorage) GetJob(ctx context.Context, jobID string) (*core.Job, error) {
-	return s.jobs[jobID], nil
+func (s *minimalStorage) Release(ctx context.Context, jobID core.UUID, workerID string) error {
+	return nil
 }
-func (s *minimalStorage) GetCheckpoints(ctx context.Context, jobID string) ([]core.Checkpoint, error) {
+func (s *minimalStorage) Fail(ctx context.Context, jobID core.UUID, workerID string, errMsg string, retryAt *time.Time) error {
+	return nil
+}
+func (s *minimalStorage) GetJob(ctx context.Context, jobID core.UUID) (*core.Job, error) {
+	return s.jobs[string(jobID)], nil
+}
+func (s *minimalStorage) GetCheckpoints(ctx context.Context, jobID core.UUID) ([]core.Checkpoint, error) {
 	var out []core.Checkpoint
-	for _, cp := range s.checkpoints[jobID] {
+	for _, cp := range s.checkpoints[string(jobID)] {
 		out = append(out, *cp)
 	}
 	return out, nil
 }
 func (s *minimalStorage) SaveCheckpoint(ctx context.Context, cp *core.Checkpoint) error {
-	s.checkpoints[cp.JobID] = append(s.checkpoints[cp.JobID], cp)
+	s.checkpoints[string(cp.JobID)] = append(s.checkpoints[string(cp.JobID)], cp)
 	return nil
 }
-func (s *minimalStorage) DeleteCheckpoints(ctx context.Context, jobID string) error {
-	delete(s.checkpoints, jobID)
+func (s *minimalStorage) DeleteCheckpoints(ctx context.Context, jobID core.UUID) error {
+	delete(s.checkpoints, string(jobID))
 	return nil
 }
 func (s *minimalStorage) GetDueJobs(ctx context.Context, queues []string, limit int) ([]*core.Job, error) {
@@ -100,55 +104,57 @@ func (s *minimalStorage) GetDueJobs(ctx context.Context, queues []string, limit 
 func (s *minimalStorage) ClaimScheduledFire(ctx context.Context, name string, fireTime time.Time) (bool, error) {
 	return true, nil
 }
-func (s *minimalStorage) Heartbeat(ctx context.Context, jobID, workerID string) error { return nil }
-func (s *minimalStorage) ReleaseStaleLocks(ctx context.Context, d time.Duration) ([]string, error) {
+func (s *minimalStorage) Heartbeat(ctx context.Context, jobID core.UUID, workerID string) error {
+	return nil
+}
+func (s *minimalStorage) ReleaseStaleLocks(ctx context.Context, d time.Duration) ([]core.UUID, error) {
 	return nil, nil
 }
-func (s *minimalStorage) FindOrphanedJobs(ctx context.Context, jobIDs []string, workerID string) ([]string, error) {
+func (s *minimalStorage) FindOrphanedJobs(ctx context.Context, jobIDs []core.UUID, workerID string) ([]core.UUID, error) {
 	return nil, nil
 }
 func (s *minimalStorage) GetJobsByStatus(ctx context.Context, status core.JobStatus, limit int) ([]*core.Job, error) {
 	return nil, nil
 }
 func (s *minimalStorage) CreateFanOut(ctx context.Context, fo *core.FanOut) error {
-	s.fanOuts[fo.ID] = fo
+	s.fanOuts[string(fo.ID)] = fo
 	return nil
 }
-func (s *minimalStorage) GetFanOut(ctx context.Context, fanOutID string) (*core.FanOut, error) {
-	return s.fanOuts[fanOutID], nil
+func (s *minimalStorage) GetFanOut(ctx context.Context, fanOutID core.UUID) (*core.FanOut, error) {
+	return s.fanOuts[string(fanOutID)], nil
 }
-func (s *minimalStorage) IncrementFanOutCompleted(ctx context.Context, fanOutID string) (*core.FanOut, error) {
-	if fo, ok := s.fanOuts[fanOutID]; ok {
+func (s *minimalStorage) IncrementFanOutCompleted(ctx context.Context, fanOutID core.UUID) (*core.FanOut, error) {
+	if fo, ok := s.fanOuts[string(fanOutID)]; ok {
 		fo.CompletedCount++
 		return fo, nil
 	}
 	return nil, nil
 }
-func (s *minimalStorage) IncrementFanOutFailed(ctx context.Context, fanOutID string) (*core.FanOut, error) {
-	if fo, ok := s.fanOuts[fanOutID]; ok {
+func (s *minimalStorage) IncrementFanOutFailed(ctx context.Context, fanOutID core.UUID) (*core.FanOut, error) {
+	if fo, ok := s.fanOuts[string(fanOutID)]; ok {
 		fo.FailedCount++
 		return fo, nil
 	}
 	return nil, nil
 }
-func (s *minimalStorage) IncrementFanOutCancelled(ctx context.Context, fanOutID string) (*core.FanOut, error) {
-	if fo, ok := s.fanOuts[fanOutID]; ok {
+func (s *minimalStorage) IncrementFanOutCancelled(ctx context.Context, fanOutID core.UUID) (*core.FanOut, error) {
+	if fo, ok := s.fanOuts[string(fanOutID)]; ok {
 		fo.CancelledCount++
 		return fo, nil
 	}
 	return nil, nil
 }
-func (s *minimalStorage) UpdateFanOutStatus(ctx context.Context, fanOutID string, status core.FanOutStatus) (bool, error) {
-	if fo, ok := s.fanOuts[fanOutID]; ok {
+func (s *minimalStorage) UpdateFanOutStatus(ctx context.Context, fanOutID core.UUID, status core.FanOutStatus) (bool, error) {
+	if fo, ok := s.fanOuts[string(fanOutID)]; ok {
 		fo.Status = status
 		return true, nil
 	}
 	return false, nil
 }
-func (s *minimalStorage) GetFanOutsByParent(ctx context.Context, parentJobID string) ([]*core.FanOut, error) {
+func (s *minimalStorage) GetFanOutsByParent(ctx context.Context, parentJobID core.UUID) ([]*core.FanOut, error) {
 	return nil, nil
 }
-func (s *minimalStorage) GetSubJobs(ctx context.Context, fanOutID string) ([]*core.Job, error) {
+func (s *minimalStorage) GetSubJobs(ctx context.Context, fanOutID core.UUID) ([]*core.Job, error) {
 	var out []*core.Job
 	for _, j := range s.jobs {
 		if j.FanOutID != nil && *j.FanOutID == fanOutID {
@@ -157,7 +163,7 @@ func (s *minimalStorage) GetSubJobs(ctx context.Context, fanOutID string) ([]*co
 	}
 	return out, nil
 }
-func (s *minimalStorage) GetSubJobResults(ctx context.Context, fanOutID string) ([]*core.Job, error) {
+func (s *minimalStorage) GetSubJobResults(ctx context.Context, fanOutID core.UUID) ([]*core.Job, error) {
 	var out []*core.Job
 	for _, j := range s.jobs {
 		if j.FanOutID != nil && *j.FanOutID == fanOutID &&
@@ -167,18 +173,18 @@ func (s *minimalStorage) GetSubJobResults(ctx context.Context, fanOutID string) 
 	}
 	return out, nil
 }
-func (s *minimalStorage) CancelSubJobs(ctx context.Context, fanOutID string) ([]string, error) {
+func (s *minimalStorage) CancelSubJobs(ctx context.Context, fanOutID core.UUID) ([]core.UUID, error) {
 	return nil, nil
 }
-func (s *minimalStorage) CancelSubJob(ctx context.Context, jobID string) (*core.FanOut, error) {
+func (s *minimalStorage) CancelSubJob(ctx context.Context, jobID core.UUID) (*core.FanOut, error) {
 	return nil, nil
 }
-func (s *minimalStorage) MarkWaiting(ctx context.Context, jobID, workerID string) error {
-	s.suspended[jobID] = true
+func (s *minimalStorage) MarkWaiting(ctx context.Context, jobID core.UUID, workerID string) error {
+	s.suspended[string(jobID)] = true
 	return nil
 }
-func (s *minimalStorage) ResumeJob(ctx context.Context, jobID string) (bool, error) {
-	delete(s.suspended, jobID)
+func (s *minimalStorage) ResumeJob(ctx context.Context, jobID core.UUID) (bool, error) {
+	delete(s.suspended, string(jobID))
 	return true, nil
 }
 func (s *minimalStorage) GetWaitingJobsToResume(ctx context.Context) ([]*core.Job, error) {
@@ -187,12 +193,12 @@ func (s *minimalStorage) GetWaitingJobsToResume(ctx context.Context) ([]*core.Jo
 func (s *minimalStorage) GetStalledFanOutParents(ctx context.Context, olderThan time.Time) ([]*core.Job, error) {
 	return nil, nil
 }
-func (s *minimalStorage) SaveJobResult(ctx context.Context, jobID, workerID string, result []byte) error {
+func (s *minimalStorage) SaveJobResult(ctx context.Context, jobID core.UUID, workerID string, result []byte) error {
 	return nil
 }
-func (s *minimalStorage) PauseJob(ctx context.Context, jobID string) error   { return nil }
-func (s *minimalStorage) UnpauseJob(ctx context.Context, jobID string) error { return nil }
-func (s *minimalStorage) IsJobPaused(ctx context.Context, jobID string) (bool, error) {
+func (s *minimalStorage) PauseJob(ctx context.Context, jobID core.UUID) error   { return nil }
+func (s *minimalStorage) UnpauseJob(ctx context.Context, jobID core.UUID) error { return nil }
+func (s *minimalStorage) IsJobPaused(ctx context.Context, jobID core.UUID) (bool, error) {
 	return false, nil
 }
 func (s *minimalStorage) GetPausedJobs(ctx context.Context, queue string) ([]*core.Job, error) {
@@ -212,12 +218,12 @@ func (s *minimalStorage) RefreshQueueStates(ctx context.Context) (map[string]boo
 // Helpers for building job execution contexts
 // ---------------------------------------------------------------------------
 
-func makeJobCtx(store *minimalStorage, parentJobID, queue string) *intctx.JobContext {
+func makeJobCtx(store *minimalStorage, parentJobID core.UUID, queue string) *intctx.JobContext {
 	job := &core.Job{
 		ID:    parentJobID,
 		Queue: queue,
 	}
-	store.jobs[parentJobID] = job
+	store.jobs[string(parentJobID)] = job
 
 	return &intctx.JobContext{
 		Job:      job,
@@ -239,7 +245,7 @@ func buildCtx(jc *intctx.JobContext, checkpoints []core.Checkpoint) context.Cont
 	return ctx
 }
 
-func countSubJobs(store *minimalStorage, fanOutID string) int {
+func countSubJobs(store *minimalStorage, fanOutID core.UUID) int {
 	count := 0
 	for _, j := range store.jobs {
 		if j.FanOutID != nil && *j.FanOutID == fanOutID {
@@ -461,11 +467,11 @@ func TestFanOut_SubJobPriorityOverrideHonorsExplicitZero(t *testing.T) {
 
 func TestFanOut_ResumeWithCompletedFanOut_ReturnsResults(t *testing.T) {
 	store := newMinimalStorage()
-	parentID := "parent-resume"
+	parentID := core.UUID("parent-resume")
 	jc := makeJobCtx(store, parentID, "default")
 
 	// Simulate first execution: save a checkpoint and create a FanOut.
-	fanOutID := "fo-complete"
+	fanOutID := core.NewID()
 	cpData, _ := json.Marshal(core.FanOutCheckpoint{FanOutID: fanOutID, CallIndex: 0})
 	existingCP := core.Checkpoint{
 		ID:        "cp-1",
@@ -478,7 +484,7 @@ func TestFanOut_ResumeWithCompletedFanOut_ReturnsResults(t *testing.T) {
 	// Pre-populate: completed FanOut + sub-job results.
 	resultBytes, _ := json.Marshal("done")
 	foIndex := 0
-	store.fanOuts[fanOutID] = &core.FanOut{
+	store.fanOuts[string(fanOutID)] = &core.FanOut{
 		ID:             fanOutID,
 		ParentJobID:    parentID,
 		TotalCount:     1,
@@ -504,10 +510,10 @@ func TestFanOut_ResumeWithCompletedFanOut_ReturnsResults(t *testing.T) {
 
 func TestFanOut_ResumeWithPendingFanOut_SuspendsAgain(t *testing.T) {
 	store := newMinimalStorage()
-	parentID := "parent-still-waiting"
+	parentID := core.UUID("parent-still-waiting")
 	jc := makeJobCtx(store, parentID, "default")
 
-	fanOutID := "fo-pending"
+	fanOutID := core.NewID()
 	cpData, _ := json.Marshal(core.FanOutCheckpoint{FanOutID: fanOutID, CallIndex: 0})
 	existingCP := core.Checkpoint{
 		ID:        "cp-2",
@@ -518,7 +524,7 @@ func TestFanOut_ResumeWithPendingFanOut_SuspendsAgain(t *testing.T) {
 	}
 
 	// FanOut still pending (sub-jobs not done yet).
-	store.fanOuts[fanOutID] = &core.FanOut{
+	store.fanOuts[string(fanOutID)] = &core.FanOut{
 		ID:          fanOutID,
 		ParentJobID: parentID,
 		TotalCount:  2,
@@ -531,12 +537,12 @@ func TestFanOut_ResumeWithPendingFanOut_SuspendsAgain(t *testing.T) {
 	require.Error(t, err)
 	assert.True(t, IsWaitingError(err))
 	// Parent should be marked waiting again.
-	assert.True(t, store.suspended[parentID])
+	assert.True(t, store.suspended[string(parentID)])
 }
 
 func TestFanOut_ResumeWithPendingFanOut_ReEnqueuesMissingSubJobs(t *testing.T) {
 	store := newMinimalStorage()
-	parentID := "parent-recover-zero-subjobs"
+	parentID := core.UUID("parent-recover-zero-subjobs")
 	jc := makeJobCtx(store, parentID, "default")
 	ctx := buildCtx(jc, nil)
 
@@ -549,7 +555,7 @@ func TestFanOut_ResumeWithPendingFanOut_ReEnqueuesMissingSubJobs(t *testing.T) {
 	_, err := FanOut[string](ctx, subs)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "failed to enqueue sub-jobs")
-	assert.False(t, store.suspended[parentID], "enqueue failure should resume the parent")
+	assert.False(t, store.suspended[string(parentID)], "enqueue failure should resume the parent")
 	assert.Equal(t, 1, len(store.jobs), "only the parent job should exist before replay")
 
 	cps, err := store.GetCheckpoints(context.Background(), parentID)
@@ -565,7 +571,7 @@ func TestFanOut_ResumeWithPendingFanOut_ReEnqueuesMissingSubJobs(t *testing.T) {
 	_, err = FanOut[string](replayCtx, subs)
 	require.Error(t, err)
 	assert.True(t, IsWaitingError(err))
-	assert.True(t, store.suspended[parentID])
+	assert.True(t, store.suspended[string(parentID)])
 	assert.Equal(t, 2, countSubJobs(store, fanOutCP.FanOutID))
 }
 
@@ -589,7 +595,7 @@ func TestFanOut_InvalidSubJobQueue_ReturnsError(t *testing.T) {
 
 func TestCollectResults_NoJobContext_ReturnsError(t *testing.T) {
 	ctx := context.Background()
-	_, err := CollectResults[int](ctx, "fo-1")
+	_, err := CollectResults[int](ctx, core.NewID())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "must be used within a job handler")
 }
@@ -606,14 +612,14 @@ func TestCollectResults_FanOutNotFound_ReturnsError(t *testing.T) {
 
 func TestCollectResults_CompletedFanOut_ReturnsValues(t *testing.T) {
 	store := newMinimalStorage()
-	parentID := "parent-collect"
+	parentID := core.UUID("parent-collect")
 	jc := makeJobCtx(store, parentID, "default")
 	ctx := buildCtx(jc, nil)
 
-	fanOutID := "fo-collect"
+	fanOutID := core.NewID()
 	resultBytes, _ := json.Marshal(99)
 	foIndex := 0
-	store.fanOuts[fanOutID] = &core.FanOut{
+	store.fanOuts[string(fanOutID)] = &core.FanOut{
 		ID:             fanOutID,
 		ParentJobID:    parentID,
 		TotalCount:     1,
@@ -636,13 +642,13 @@ func TestCollectResults_CompletedFanOut_ReturnsValues(t *testing.T) {
 
 func TestCollectResults_CancelledSubJobAtNonZeroIndex_ReturnsCancelledErr(t *testing.T) {
 	store := newMinimalStorage()
-	parentID := "parent-cancelled-sub"
+	parentID := core.UUID("parent-cancelled-sub")
 	jc := makeJobCtx(store, parentID, "default")
 	ctx := buildCtx(jc, nil)
 
-	fanOutID := "fo-cancelled-sub"
+	fanOutID := core.NewID()
 	successBytes, _ := json.Marshal("ok")
-	store.fanOuts[fanOutID] = &core.FanOut{
+	store.fanOuts[string(fanOutID)] = &core.FanOut{
 		ID:             fanOutID,
 		ParentJobID:    parentID,
 		TotalCount:     3,
@@ -678,13 +684,13 @@ func TestCollectResults_CancelledSubJobAtNonZeroIndex_ReturnsCancelledErr(t *tes
 
 func TestCollectResults_FailedFanOut_ReturnsErrorWithResults(t *testing.T) {
 	store := newMinimalStorage()
-	parentID := "parent-failed-fo"
+	parentID := core.UUID("parent-failed-fo")
 	jc := makeJobCtx(store, parentID, "default")
 	ctx := buildCtx(jc, nil)
 
-	fanOutID := "fo-failed"
+	fanOutID := core.NewID()
 	foIndex := 0
-	store.fanOuts[fanOutID] = &core.FanOut{
+	store.fanOuts[string(fanOutID)] = &core.FanOut{
 		ID:          fanOutID,
 		ParentJobID: parentID,
 		TotalCount:  1,
@@ -715,13 +721,13 @@ func TestCollectResults_FailedFanOut_ReturnsErrorWithResults(t *testing.T) {
 
 func TestCollectResults_BadResultJSON_ReturnsDecodeError(t *testing.T) {
 	store := newMinimalStorage()
-	parentID := "parent-badjson"
+	parentID := core.UUID("parent-badjson")
 	jc := makeJobCtx(store, parentID, "default")
 	ctx := buildCtx(jc, nil)
 
-	fanOutID := "fo-badjson"
+	fanOutID := core.NewID()
 	foIndex := 0
-	store.fanOuts[fanOutID] = &core.FanOut{
+	store.fanOuts[string(fanOutID)] = &core.FanOut{
 		ID:          fanOutID,
 		ParentJobID: parentID,
 		TotalCount:  1,
@@ -745,7 +751,7 @@ func TestCollectResults_BadResultJSON_ReturnsDecodeError(t *testing.T) {
 
 func TestFanOut_ResumeWithBadCheckpointJSON_ReturnsError(t *testing.T) {
 	store := newMinimalStorage()
-	parentID := "parent-badcp"
+	parentID := core.UUID("parent-badcp")
 	jc := makeJobCtx(store, parentID, "default")
 
 	badCP := core.Checkpoint{
@@ -783,9 +789,9 @@ func TestFanOut_AssignsIdempotencyKeyToSubJobs(t *testing.T) {
 
 	// There should be exactly one FanOut record; pull its ID.
 	require.Len(t, store.fanOuts, 1)
-	var fanOutID string
+	var fanOutID core.UUID
 	for id := range store.fanOuts {
-		fanOutID = id
+		fanOutID = core.UUID(id)
 	}
 
 	// Every sub-job's UniqueKey must be fanout-<id>-<index>, with each

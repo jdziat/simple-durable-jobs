@@ -19,21 +19,21 @@ func TestDequeueBatch_CorrectnessAndPausedQueues(t *testing.T) {
 	base := time.Now().Add(-time.Hour) // local repr, matching autoCreateTime; see P3 (COALESCE eligibility is tz-lexical on sqlite)
 
 	seed := []struct {
-		id       string
+		id       core.UUID
 		queue    string
 		priority int
 		created  time.Time
 	}{
-		{"job-01", "critical", 10, base.Add(0 * time.Second)},
-		{"job-02", "default", 10, base.Add(1 * time.Second)},
-		{"job-03", "critical", 9, base.Add(2 * time.Second)},
-		{"job-04", "default", 8, base.Add(3 * time.Second)},
-		{"job-05", "critical", 8, base.Add(4 * time.Second)},
-		{"job-06", "default", 5, base.Add(5 * time.Second)},
-		{"job-07", "critical", 4, base.Add(6 * time.Second)},
-		{"job-08", "default", 3, base.Add(7 * time.Second)},
-		{"job-09", "critical", 2, base.Add(8 * time.Second)},
-		{"job-10", "default", 1, base.Add(9 * time.Second)},
+		{core.NewID(), "critical", 10, base.Add(0 * time.Second)},
+		{core.NewID(), "default", 10, base.Add(1 * time.Second)},
+		{core.NewID(), "critical", 9, base.Add(2 * time.Second)},
+		{core.NewID(), "default", 8, base.Add(3 * time.Second)},
+		{core.NewID(), "critical", 8, base.Add(4 * time.Second)},
+		{core.NewID(), "default", 5, base.Add(5 * time.Second)},
+		{core.NewID(), "critical", 4, base.Add(6 * time.Second)},
+		{core.NewID(), "default", 3, base.Add(7 * time.Second)},
+		{core.NewID(), "critical", 2, base.Add(8 * time.Second)},
+		{core.NewID(), "default", 1, base.Add(9 * time.Second)},
 	}
 	for _, item := range seed {
 		require.NoError(t, s.db.WithContext(ctx).Create(&core.Job{
@@ -45,13 +45,20 @@ func TestDequeueBatch_CorrectnessAndPausedQueues(t *testing.T) {
 			CreatedAt: item.created,
 		}).Error)
 	}
-	require.NoError(t, s.Enqueue(ctx, &core.Job{ID: "paused-01", Type: "work", Queue: "paused", Priority: 100}))
+	pausedID := core.NewID()
+	require.NoError(t, s.Enqueue(ctx, &core.Job{ID: pausedID, Type: "work", Queue: "paused", Priority: 100}))
 	require.NoError(t, s.PauseQueue(ctx, "paused"))
 
 	got, err := s.DequeueBatch(ctx, []string{"default", "critical", "paused"}, "w1", 5)
 	require.NoError(t, err)
 	require.Len(t, got, 5)
-	assert.Equal(t, []string{"job-01", "job-02", "job-03", "job-04", "job-05"}, jobIDs(got))
+	assert.Equal(t, []string{
+		string(seed[0].id),
+		string(seed[1].id),
+		string(seed[2].id),
+		string(seed[3].id),
+		string(seed[4].id),
+	}, jobIDs(got))
 
 	for _, job := range got {
 		assert.Equal(t, core.StatusRunning, job.Status)
@@ -70,13 +77,19 @@ func TestDequeueBatch_CorrectnessAndPausedQueues(t *testing.T) {
 	got, err = s.DequeueBatch(ctx, []string{"default", "critical", "paused"}, "w1", 5)
 	require.NoError(t, err)
 	require.Len(t, got, 5)
-	assert.Equal(t, []string{"job-06", "job-07", "job-08", "job-09", "job-10"}, jobIDs(got))
+	assert.Equal(t, []string{
+		string(seed[5].id),
+		string(seed[6].id),
+		string(seed[7].id),
+		string(seed[8].id),
+		string(seed[9].id),
+	}, jobIDs(got))
 
 	got, err = s.DequeueBatch(ctx, []string{"default", "critical", "paused"}, "w1", 5)
 	require.NoError(t, err)
 	assert.Empty(t, got)
 
-	paused, err := s.GetJob(ctx, "paused-01")
+	paused, err := s.GetJob(ctx, pausedID)
 	require.NoError(t, err)
 	require.NotNil(t, paused)
 	assert.Equal(t, core.StatusPending, paused.Status)
@@ -89,16 +102,16 @@ func TestDequeueBatchPerQueue_SkipsQueuesAtBudgetWithoutOverClaiming(t *testing.
 	base := time.Now().Add(-time.Hour) // local repr, matching autoCreateTime; see P3 (COALESCE eligibility is tz-lexical on sqlite)
 
 	seed := []struct {
-		id       string
+		id       core.UUID
 		queue    string
 		priority int
 		created  time.Time
 	}{
-		{"hot-01", "hot", 100, base.Add(0 * time.Second)},
-		{"hot-02", "hot", 99, base.Add(1 * time.Second)},
-		{"hot-03", "hot", 98, base.Add(2 * time.Second)},
-		{"idle-01", "idle", 90, base.Add(3 * time.Second)},
-		{"idle-02", "idle", 89, base.Add(4 * time.Second)},
+		{core.NewID(), "hot", 100, base.Add(0 * time.Second)},
+		{core.NewID(), "hot", 99, base.Add(1 * time.Second)},
+		{core.NewID(), "hot", 98, base.Add(2 * time.Second)},
+		{core.NewID(), "idle", 90, base.Add(3 * time.Second)},
+		{core.NewID(), "idle", 89, base.Add(4 * time.Second)},
 	}
 	for _, item := range seed {
 		require.NoError(t, s.db.WithContext(ctx).Create(&core.Job{
@@ -114,9 +127,9 @@ func TestDequeueBatchPerQueue_SkipsQueuesAtBudgetWithoutOverClaiming(t *testing.
 	got, err := s.DequeueBatchPerQueue(ctx, "w1", map[string]int{"hot": 1, "idle": 2})
 	require.NoError(t, err)
 	require.Len(t, got, 3)
-	assert.Equal(t, []string{"hot-01", "idle-01", "idle-02"}, jobIDs(got))
+	assert.Equal(t, []string{string(seed[0].id), string(seed[3].id), string(seed[4].id)}, jobIDs(got))
 
-	for _, id := range []string{"hot-02", "hot-03"} {
+	for _, id := range []core.UUID{seed[1].id, seed[2].id} {
 		stored, err := s.GetJob(ctx, id)
 		require.NoError(t, err)
 		require.NotNil(t, stored)
@@ -124,7 +137,7 @@ func TestDequeueBatchPerQueue_SkipsQueuesAtBudgetWithoutOverClaiming(t *testing.
 		assert.Empty(t, stored.LockedBy)
 		assert.Equal(t, 0, stored.Attempt)
 	}
-	for _, id := range []string{"hot-01", "idle-01", "idle-02"} {
+	for _, id := range []core.UUID{seed[0].id, seed[3].id, seed[4].id} {
 		stored, err := s.GetJob(ctx, id)
 		require.NoError(t, err)
 		require.NotNil(t, stored)
@@ -143,7 +156,7 @@ func TestDequeueBatch_ConcurrentCallersDoNotDoubleDispatch(t *testing.T) {
 
 	for i := 0; i < totalJobs; i++ {
 		require.NoError(t, s.Enqueue(ctx, &core.Job{
-			ID:       fmt.Sprintf("job-%02d", i),
+			ID:       core.NewID(),
 			Type:     "work",
 			Queue:    "work",
 			Priority: totalJobs - i,
@@ -152,7 +165,7 @@ func TestDequeueBatch_ConcurrentCallersDoNotDoubleDispatch(t *testing.T) {
 
 	var wg sync.WaitGroup
 	start := make(chan struct{})
-	results := make(chan string, totalJobs)
+	results := make(chan core.UUID, totalJobs)
 	errs := make(chan error, callers)
 	for i := 0; i < callers; i++ {
 		wg.Add(1)
@@ -177,7 +190,7 @@ func TestDequeueBatch_ConcurrentCallersDoNotDoubleDispatch(t *testing.T) {
 	for err := range errs {
 		require.NoError(t, err)
 	}
-	seen := map[string]bool{}
+	seen := map[core.UUID]bool{}
 	for id := range results {
 		require.False(t, seen[id], "job %s returned more than once", id)
 		seen[id] = true
@@ -202,7 +215,7 @@ func TestDequeueBatch_LimitClampAndEmptyLimit(t *testing.T) {
 func jobIDs(jobs []*core.Job) []string {
 	ids := make([]string, 0, len(jobs))
 	for _, job := range jobs {
-		ids = append(ids, job.ID)
+		ids = append(ids, string(job.ID))
 	}
 	return ids
 }

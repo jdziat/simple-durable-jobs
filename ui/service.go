@@ -190,7 +190,11 @@ func (s *jobsService) ListJobs(ctx context.Context, req *connect.Request[jobsv1.
 
 // GetJob returns a single job with its checkpoints.
 func (s *jobsService) GetJob(ctx context.Context, req *connect.Request[jobsv1.GetJobRequest]) (*connect.Response[jobsv1.GetJobResponse], error) {
-	job, err := s.storage.GetJob(ctx, req.Msg.Id)
+	id, err := core.ParseUUID(req.Msg.Id)
+	if err != nil {
+		return nil, connect.NewError(connect.CodeInvalidArgument, err)
+	}
+	job, err := s.storage.GetJob(ctx, id)
 	if err != nil {
 		return nil, connect.NewError(connect.CodeInternal, err)
 	}
@@ -276,10 +280,14 @@ func (s *jobsService) PauseJob(ctx context.Context, req *connect.Request[jobsv1.
 	if s.queue == nil {
 		return nil, connect.NewError(connect.CodeUnimplemented, nil)
 	}
-	if err := s.queue.PauseJob(ctx, req.Msg.Id); err != nil {
+	id, err := core.ParseUUID(req.Msg.Id)
+	if err != nil {
+		return nil, connect.NewError(connect.CodeInvalidArgument, err)
+	}
+	if err := s.queue.PauseJob(ctx, id); err != nil {
 		return nil, connect.NewError(connect.CodeInternal, err)
 	}
-	job, err := s.storage.GetJob(ctx, req.Msg.Id)
+	job, err := s.storage.GetJob(ctx, id)
 	if err != nil {
 		return nil, connect.NewError(connect.CodeInternal, err)
 	}
@@ -294,10 +302,14 @@ func (s *jobsService) CancelJob(ctx context.Context, req *connect.Request[jobsv1
 	if s.queue == nil {
 		return nil, connect.NewError(connect.CodeUnimplemented, nil)
 	}
-	if err := s.queue.CancelJob(ctx, req.Msg.Id); err != nil {
+	id, err := core.ParseUUID(req.Msg.Id)
+	if err != nil {
+		return nil, connect.NewError(connect.CodeInvalidArgument, err)
+	}
+	if err := s.queue.CancelJob(ctx, id); err != nil {
 		return nil, connect.NewError(connect.CodeInternal, err)
 	}
-	job, err := s.storage.GetJob(ctx, req.Msg.Id)
+	job, err := s.storage.GetJob(ctx, id)
 	if err != nil {
 		return nil, connect.NewError(connect.CodeInternal, err)
 	}
@@ -312,10 +324,14 @@ func (s *jobsService) ResumeJob(ctx context.Context, req *connect.Request[jobsv1
 	if s.queue == nil {
 		return nil, connect.NewError(connect.CodeUnimplemented, nil)
 	}
-	if err := s.queue.ResumeJob(ctx, req.Msg.Id); err != nil {
+	id, err := core.ParseUUID(req.Msg.Id)
+	if err != nil {
+		return nil, connect.NewError(connect.CodeInvalidArgument, err)
+	}
+	if err := s.queue.ResumeJob(ctx, id); err != nil {
 		return nil, connect.NewError(connect.CodeInternal, err)
 	}
-	job, err := s.storage.GetJob(ctx, req.Msg.Id)
+	job, err := s.storage.GetJob(ctx, id)
 	if err != nil {
 		return nil, connect.NewError(connect.CodeInternal, err)
 	}
@@ -425,7 +441,11 @@ func (s *jobsService) ListScheduledJobs(ctx context.Context, req *connect.Reques
 // fan-outs and children via BFS, returning everything flattened.
 func (s *jobsService) GetWorkflow(ctx context.Context, req *connect.Request[jobsv1.GetWorkflowRequest]) (*connect.Response[jobsv1.GetWorkflowResponse], error) {
 	// Load the requested job.
-	job, err := s.storage.GetJob(ctx, req.Msg.JobId)
+	id, err := core.ParseUUID(req.Msg.JobId)
+	if err != nil {
+		return nil, connect.NewError(connect.CodeInvalidArgument, err)
+	}
+	job, err := s.storage.GetJob(ctx, id)
 	if err != nil {
 		return nil, connect.NewError(connect.CodeInternal, err)
 	}
@@ -683,8 +703,8 @@ func (s *jobsService) collectWorkflowTreeBatched(ctx context.Context, root *core
 	var allFanOuts []*jobsv1.FanOut
 	var allChildren []*jobsv1.Job
 
-	queue := []string{root.ID}
-	visited := make(map[string]struct{}, maxWorkflowJobs)
+	queue := []core.UUID{root.ID}
+	visited := make(map[core.UUID]struct{}, maxWorkflowJobs)
 	visited[root.ID] = struct{}{}
 
 	for len(queue) > 0 && len(allChildren) < maxWorkflowJobs {
@@ -697,7 +717,7 @@ func (s *jobsService) collectWorkflowTreeBatched(ctx context.Context, root *core
 		}
 		fanOutsByParent := groupFanOutsByParent(fanOuts)
 
-		fanOutIDs := make([]string, 0, len(fanOuts))
+		fanOutIDs := make([]core.UUID, 0, len(fanOuts))
 		for _, parentID := range currentParents {
 			for _, fo := range fanOutsByParent[parentID] {
 				fanOutIDs = append(fanOutIDs, fo.ID)
@@ -741,8 +761,8 @@ func (s *jobsService) collectWorkflowTreeFallback(ctx context.Context, root *cor
 	var allFanOuts []*jobsv1.FanOut
 	var allChildren []*jobsv1.Job
 
-	queue := []string{root.ID}
-	visited := make(map[string]struct{}, maxWorkflowJobs)
+	queue := []core.UUID{root.ID}
+	visited := make(map[core.UUID]struct{}, maxWorkflowJobs)
 	visited[root.ID] = struct{}{}
 
 	for len(queue) > 0 && len(allChildren) < maxWorkflowJobs {
@@ -777,14 +797,14 @@ func (s *jobsService) collectWorkflowTreeFallback(ctx context.Context, root *cor
 	return allFanOuts, allChildren, nil
 }
 
-func (s *jobsService) getFanOutsForParents(ctx context.Context, roots []*core.Job) (map[string][]*core.FanOut, error) {
-	parentIDs := make([]string, 0, len(roots))
+func (s *jobsService) getFanOutsForParents(ctx context.Context, roots []*core.Job) (map[core.UUID][]*core.FanOut, error) {
+	parentIDs := make([]core.UUID, 0, len(roots))
 	for _, root := range roots {
 		parentIDs = append(parentIDs, root.ID)
 	}
 
 	if batch, ok := s.storage.(interface {
-		GetFanOutsByParents(context.Context, []string) ([]*core.FanOut, error)
+		GetFanOutsByParents(context.Context, []core.UUID) ([]*core.FanOut, error)
 	}); ok {
 		fanOuts, err := batch.GetFanOutsByParents(ctx, parentIDs)
 		if err != nil {
@@ -793,7 +813,7 @@ func (s *jobsService) getFanOutsForParents(ctx context.Context, roots []*core.Jo
 		return groupFanOutsByParent(fanOuts), nil
 	}
 
-	fanOutsByParent := make(map[string][]*core.FanOut, len(parentIDs))
+	fanOutsByParent := make(map[core.UUID][]*core.FanOut, len(parentIDs))
 	for _, parentID := range parentIDs {
 		fanOuts, err := s.storage.GetFanOutsByParent(ctx, parentID)
 		if err != nil {
@@ -804,16 +824,16 @@ func (s *jobsService) getFanOutsForParents(ctx context.Context, roots []*core.Jo
 	return fanOutsByParent, nil
 }
 
-func groupFanOutsByParent(fanOuts []*core.FanOut) map[string][]*core.FanOut {
-	grouped := make(map[string][]*core.FanOut)
+func groupFanOutsByParent(fanOuts []*core.FanOut) map[core.UUID][]*core.FanOut {
+	grouped := make(map[core.UUID][]*core.FanOut)
 	for _, fo := range fanOuts {
 		grouped[fo.ParentJobID] = append(grouped[fo.ParentJobID], fo)
 	}
 	return grouped
 }
 
-func groupSubJobsByFanOut(jobs []*core.Job) map[string][]*core.Job {
-	grouped := make(map[string][]*core.Job)
+func groupSubJobsByFanOut(jobs []*core.Job) map[core.UUID][]*core.Job {
+	grouped := make(map[core.UUID][]*core.Job)
 	for _, job := range jobs {
 		if job.FanOutID == nil {
 			continue
@@ -824,8 +844,12 @@ func groupSubJobsByFanOut(jobs []*core.Job) map[string][]*core.Job {
 }
 
 func (s *jobsService) retryJob(ctx context.Context, id string) (*core.Job, error) {
+	jobID, err := core.ParseUUID(id)
+	if err != nil {
+		return nil, connect.NewError(connect.CodeInvalidArgument, err)
+	}
 	if ui, ok := s.storage.(UIStorage); ok {
-		return ui.RetryJob(ctx, id)
+		return ui.RetryJob(ctx, jobID)
 	}
 
 	// Fallback: not supported without UIStorage
@@ -833,8 +857,12 @@ func (s *jobsService) retryJob(ctx context.Context, id string) (*core.Job, error
 }
 
 func (s *jobsService) deleteJob(ctx context.Context, id string) error {
+	jobID, err := core.ParseUUID(id)
+	if err != nil {
+		return connect.NewError(connect.CodeInvalidArgument, err)
+	}
 	if ui, ok := s.storage.(UIStorage); ok {
-		return ui.DeleteJob(ctx, id)
+		return ui.DeleteJob(ctx, jobID)
 	}
 	return connect.NewError(connect.CodeUnimplemented, nil)
 }
@@ -893,7 +921,7 @@ func jobToProto(j *core.Job) *jobsv1.Job {
 
 func jobToProtoWithMetadataRedaction(j *core.Job, redactMetadata bool) *jobsv1.Job {
 	pb := &jobsv1.Job{
-		Id:          j.ID,
+		Id:          string(j.ID),
 		Type:        j.Type,
 		Queue:       j.Queue,
 		Status:      string(j.Status),
@@ -919,13 +947,16 @@ func jobToProtoWithMetadataRedaction(j *core.Job, redactMetadata bool) *jobsv1.J
 		pb.RunAt = timestamppb.New(*j.RunAt)
 	}
 	if j.ParentJobID != nil {
-		pb.ParentJobId = j.ParentJobID
+		parentJobID := string(*j.ParentJobID)
+		pb.ParentJobId = &parentJobID
 	}
 	if j.RootJobID != nil {
-		pb.RootJobId = j.RootJobID
+		rootJobID := string(*j.RootJobID)
+		pb.RootJobId = &rootJobID
 	}
 	if j.FanOutID != nil {
-		pb.FanOutId = j.FanOutID
+		fanOutID := string(*j.FanOutID)
+		pb.FanOutId = &fanOutID
 	}
 	if j.DeadLetteredAt != nil {
 		pb.DeadLetteredAt = timestamppb.New(*j.DeadLetteredAt)
@@ -961,8 +992,8 @@ func metadataMapToProto(metadata map[string]string, redactValues bool) map[strin
 
 func fanOutToProto(f *core.FanOut) *jobsv1.FanOut {
 	pb := &jobsv1.FanOut{
-		Id:             f.ID,
-		ParentJobId:    f.ParentJobID,
+		Id:             string(f.ID),
+		ParentJobId:    string(f.ParentJobID),
 		TotalCount:     int32(f.TotalCount),
 		CompletedCount: int32(f.CompletedCount),
 		FailedCount:    int32(f.FailedCount),
@@ -982,8 +1013,8 @@ func fanOutToProto(f *core.FanOut) *jobsv1.FanOut {
 
 func checkpointToProto(cp *core.Checkpoint) *jobsv1.Checkpoint {
 	pb := &jobsv1.Checkpoint{
-		Id:        cp.ID,
-		JobId:     cp.JobID,
+		Id:        string(cp.ID),
+		JobId:     string(cp.JobID),
 		CallIndex: int32(cp.CallIndex),
 		CallType:  cp.CallType,
 		Result:    redactBytes(cp.Result),
@@ -1057,7 +1088,7 @@ func coreEventToProto(e core.Event) *jobsv1.Event {
 	case *core.JobReclaimed:
 		return &jobsv1.Event{
 			Type:      "job.reclaimed",
-			JobId:     ev.JobID,
+			JobId:     string(ev.JobID),
 			WorkerId:  ev.WorkerID,
 			Reason:    ev.Reason,
 			Timestamp: timestamppb.New(ev.Timestamp),
@@ -1089,8 +1120,8 @@ type UIStorage interface {
 	core.Storage
 	GetQueueStats(ctx context.Context) ([]*jobsv1.QueueStats, error)
 	SearchJobs(ctx context.Context, filter core.JobFilter) ([]*core.Job, int64, error)
-	RetryJob(ctx context.Context, jobID string) (*core.Job, error)
-	DeleteJob(ctx context.Context, jobID string) error
+	RetryJob(ctx context.Context, jobID core.UUID) (*core.Job, error)
+	DeleteJob(ctx context.Context, jobID core.UUID) error
 	PurgeJobs(ctx context.Context, queue string, status core.JobStatus) (int64, error)
 	// GetWorkflowRoots returns root jobs (ParentJobID == nil) that are workflow
 	// parents. status filters by job status when non-empty. limit and offset
@@ -1099,8 +1130,8 @@ type UIStorage interface {
 }
 
 type workflowBatchStorage interface {
-	GetFanOutsByParents(ctx context.Context, parentJobIDs []string) ([]*core.FanOut, error)
-	GetSubJobsByFanOuts(ctx context.Context, fanOutIDs []string) ([]*core.Job, error)
+	GetFanOutsByParents(ctx context.Context, parentJobIDs []core.UUID) ([]*core.FanOut, error)
+	GetSubJobsByFanOuts(ctx context.Context, fanOutIDs []core.UUID) ([]*core.Job, error)
 }
 
 type queueDepthStatsStorage interface {

@@ -27,7 +27,7 @@ type MetadataMap map[string]string
 
 // Job represents a unit of work to be processed.
 type Job struct {
-	ID    string `gorm:"primaryKey;size:36"`
+	ID    UUID   `gorm:"primaryKey"`
 	Type  string `gorm:"index;size:255;not null"`
 	Args  []byte `gorm:"type:bytes"`
 	Queue string `gorm:"size:255;default:'default';not null"`
@@ -59,12 +59,12 @@ type Job struct {
 	UniqueKey        string     `gorm:"size:255"` // For job deduplication
 
 	// Parent-child relationship
-	ParentJobID *string `gorm:"index;size:36"`
-	RootJobID   *string `gorm:"size:36"` // Top-level workflow job
+	ParentJobID *UUID `gorm:"index"`
+	RootJobID   *UUID // Top-level workflow job
 
 	// Fan-out tracking
-	FanOutID    *string `gorm:"index:idx_jobs_fan_out_status,priority:1;size:36"` // Groups sibling sub-jobs
-	FanOutIndex int     `gorm:"default:0"`                                        // Position in fan-out batch
+	FanOutID    *UUID `gorm:"index:idx_jobs_fan_out_status,priority:1"` // Groups sibling sub-jobs
+	FanOutIndex int   `gorm:"default:0"`                                // Position in fan-out batch
 
 	// Result storage for parent retrieval
 	Result []byte `gorm:"type:bytes"` // Serialized return value
@@ -75,8 +75,8 @@ type Job struct {
 
 // Checkpoint stores the result of a durable Call() for replay.
 type Checkpoint struct {
-	ID        string `gorm:"primaryKey;size:36"`
-	JobID     string `gorm:"index;uniqueIndex:idx_checkpoints_job_call,priority:1;size:36;not null"`
+	ID        UUID   `gorm:"primaryKey"`
+	JobID     UUID   `gorm:"index;uniqueIndex:idx_checkpoints_job_call,priority:1;not null"`
 	CallIndex int    `gorm:"uniqueIndex:idx_checkpoints_job_call,priority:2;not null"`
 	CallType  string `gorm:"uniqueIndex:idx_checkpoints_job_call,priority:3;size:255;not null"`
 	Result    []byte `gorm:"type:bytes"`
@@ -94,6 +94,6 @@ type Checkpoint struct {
 
 // FanOutCheckpoint stores fan-out state for job replay.
 type FanOutCheckpoint struct {
-	FanOutID  string `json:"fan_out_id"`
+	FanOutID  UUID   `json:"fan_out_id"`
 	CallIndex int    `json:"call_index"`
 }

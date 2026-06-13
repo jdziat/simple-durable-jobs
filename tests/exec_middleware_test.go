@@ -33,7 +33,7 @@ func startExecWorker(t *testing.T, q *jobs.Queue) {
 	})
 }
 
-func waitForExecJob(t *testing.T, store jobs.Storage, jobID string, want jobs.JobStatus) *jobs.Job {
+func waitForExecJob(t *testing.T, store jobs.Storage, jobID jobs.UUID, want jobs.JobStatus) *jobs.Job {
 	t.Helper()
 	var got *jobs.Job
 	require.Eventually(t, func() bool {

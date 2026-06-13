@@ -2,7 +2,6 @@ package storage
 
 import (
 	"context"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -48,9 +47,9 @@ func TestSearchJobs_EscapesLikeMetacharacters(t *testing.T) {
 	now := time.Now()
 
 	jobs := []*core.Job{
-		{ID: "literal-percent-%", Type: "work", Queue: "default", Status: core.StatusPending, Args: []byte(`{"value":"literal percent %"}`), CreatedAt: now},
-		{ID: "literal-underscore-_", Type: "work", Queue: "default", Status: core.StatusPending, Args: []byte(`{"value":"literal underscore _"}`), CreatedAt: now.Add(time.Second)},
-		{ID: "plain", Type: "work", Queue: "default", Status: core.StatusPending, Args: []byte(`{"value":"plain"}`), CreatedAt: now.Add(2 * time.Second)},
+		{ID: testUUID("literal-percent-%"), Type: "work", Queue: "default", Status: core.StatusPending, Args: []byte(`{"value":"literal percent %"}`), CreatedAt: now},
+		{ID: testUUID("literal-underscore-_"), Type: "work", Queue: "default", Status: core.StatusPending, Args: []byte(`{"value":"literal underscore _"}`), CreatedAt: now.Add(time.Second)},
+		{ID: testUUID("plain"), Type: "work", Queue: "default", Status: core.StatusPending, Args: []byte(`{"value":"plain"}`), CreatedAt: now.Add(2 * time.Second)},
 	}
 	for _, job := range jobs {
 		require.NoError(t, store.Enqueue(ctx, job))
@@ -60,13 +59,13 @@ func TestSearchJobs_EscapesLikeMetacharacters(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, int64(1), percentTotal)
 	require.Len(t, percentMatches, 1)
-	assert.Equal(t, "literal-percent-%", percentMatches[0].ID)
+	assert.Equal(t, testUUID("literal-percent-%"), percentMatches[0].ID)
 
 	underscoreMatches, underscoreTotal, err := store.SearchJobs(ctx, core.JobFilter{Search: "_", Limit: 10})
 	require.NoError(t, err)
 	assert.Equal(t, int64(1), underscoreTotal)
 	require.Len(t, underscoreMatches, 1)
-	assert.Equal(t, "literal-underscore-_", underscoreMatches[0].ID)
+	assert.Equal(t, testUUID("literal-underscore-_"), underscoreMatches[0].ID)
 }
 
 func TestSearchJobs_FiltersTenantAndMetadata(t *testing.T) {
@@ -76,7 +75,7 @@ func TestSearchJobs_FiltersTenantAndMetadata(t *testing.T) {
 
 	jobs := []*core.Job{
 		{
-			ID:        "tenant-a-match",
+			ID:        testUUID("tenant-a-match"),
 			Type:      "work",
 			Queue:     "default",
 			Status:    core.StatusPending,
@@ -86,7 +85,7 @@ func TestSearchJobs_FiltersTenantAndMetadata(t *testing.T) {
 			CreatedAt: now,
 		},
 		{
-			ID:        "tenant-a-dev",
+			ID:        testUUID("tenant-a-dev"),
 			Type:      "work",
 			Queue:     "default",
 			Status:    core.StatusPending,
@@ -96,7 +95,7 @@ func TestSearchJobs_FiltersTenantAndMetadata(t *testing.T) {
 			CreatedAt: now.Add(time.Second),
 		},
 		{
-			ID:        "tenant-b-prod",
+			ID:        testUUID("tenant-b-prod"),
 			Type:      "work",
 			Queue:     "default",
 			Status:    core.StatusPending,
@@ -113,7 +112,7 @@ func TestSearchJobs_FiltersTenantAndMetadata(t *testing.T) {
 	tenantMatches, tenantTotal, err := store.SearchJobs(ctx, core.JobFilter{Tenant: "tenant-a", Limit: 10})
 	require.NoError(t, err)
 	assert.Equal(t, int64(2), tenantTotal)
-	assert.ElementsMatch(t, []string{"tenant-a-match", "tenant-a-dev"}, jobIDs(tenantMatches))
+	assert.ElementsMatch(t, []string{string(testUUID("tenant-a-match")), string(testUUID("tenant-a-dev"))}, jobIDs(tenantMatches))
 
 	metaMatches, metaTotal, err := store.SearchJobs(ctx, core.JobFilter{
 		MetaContains: &core.MetadataMap{"env": "prod", "region": "us"},
@@ -122,7 +121,7 @@ func TestSearchJobs_FiltersTenantAndMetadata(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, int64(1), metaTotal)
 	require.Len(t, metaMatches, 1)
-	assert.Equal(t, "tenant-a-match", metaMatches[0].ID)
+	assert.Equal(t, testUUID("tenant-a-match"), metaMatches[0].ID)
 
 	combinedMatches, combinedTotal, err := store.SearchJobs(ctx, core.JobFilter{
 		Tenant:       "tenant-b",
@@ -132,7 +131,7 @@ func TestSearchJobs_FiltersTenantAndMetadata(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, int64(1), combinedTotal)
 	require.Len(t, combinedMatches, 1)
-	assert.Equal(t, "tenant-b-prod", combinedMatches[0].ID)
+	assert.Equal(t, testUUID("tenant-b-prod"), combinedMatches[0].ID)
 }
 
 func TestCountActiveWorkers_CountsDistinctRunningLockHolders(t *testing.T) {
@@ -146,11 +145,11 @@ func TestCountActiveWorkers_CountsDistinctRunningLockHolders(t *testing.T) {
 	now := time.Now()
 	lockedUntil := now.Add(time.Minute)
 	jobs := []*core.Job{
-		{ID: "running-worker-1-a", Type: "work", Queue: "default", Status: core.StatusRunning, LockedBy: "worker-1", LockedUntil: &lockedUntil, CreatedAt: now},
-		{ID: "running-worker-1-b", Type: "work", Queue: "default", Status: core.StatusRunning, LockedBy: "worker-1", LockedUntil: &lockedUntil, CreatedAt: now},
-		{ID: "running-worker-2", Type: "work", Queue: "emails", Status: core.StatusRunning, LockedBy: "worker-2", LockedUntil: &lockedUntil, CreatedAt: now},
-		{ID: "running-empty-worker", Type: "work", Queue: "default", Status: core.StatusRunning, LockedBy: "", LockedUntil: &lockedUntil, CreatedAt: now},
-		{ID: "pending-worker-3", Type: "work", Queue: "default", Status: core.StatusPending, LockedBy: "worker-3", LockedUntil: &lockedUntil, CreatedAt: now},
+		{ID: testUUID("running-worker-1-a"), Type: "work", Queue: "default", Status: core.StatusRunning, LockedBy: "worker-1", LockedUntil: &lockedUntil, CreatedAt: now},
+		{ID: testUUID("running-worker-1-b"), Type: "work", Queue: "default", Status: core.StatusRunning, LockedBy: "worker-1", LockedUntil: &lockedUntil, CreatedAt: now},
+		{ID: testUUID("running-worker-2"), Type: "work", Queue: "emails", Status: core.StatusRunning, LockedBy: "worker-2", LockedUntil: &lockedUntil, CreatedAt: now},
+		{ID: testUUID("running-empty-worker"), Type: "work", Queue: "default", Status: core.StatusRunning, LockedBy: "", LockedUntil: &lockedUntil, CreatedAt: now},
+		{ID: testUUID("pending-worker-3"), Type: "work", Queue: "default", Status: core.StatusPending, LockedBy: "worker-3", LockedUntil: &lockedUntil, CreatedAt: now},
 	}
 	for _, job := range jobs {
 		require.NoError(t, store.Enqueue(ctx, job))
@@ -170,11 +169,11 @@ func TestGetQueueDepthStats_OldestPendingAt(t *testing.T) {
 	oldestEmails := now.Add(-2 * time.Hour)
 
 	jobs := []*core.Job{
-		{ID: "default-oldest", Type: "work", Queue: "default", Status: core.StatusPending, Args: []byte(`{}`), CreatedAt: oldestDefault},
-		{ID: "default-newer", Type: "work", Queue: "default", Status: core.StatusPending, Args: []byte(`{}`), CreatedAt: newerDefault},
-		{ID: "default-running", Type: "work", Queue: "default", Status: core.StatusRunning, Args: []byte(`{}`), CreatedAt: now.Add(-4 * time.Hour)},
-		{ID: "emails-oldest", Type: "work", Queue: "emails", Status: core.StatusPending, Args: []byte(`{}`), CreatedAt: oldestEmails},
-		{ID: "completed-only", Type: "work", Queue: "archive", Status: core.StatusCompleted, Args: []byte(`{}`), CreatedAt: now.Add(-5 * time.Hour)},
+		{ID: testUUID("default-oldest"), Type: "work", Queue: "default", Status: core.StatusPending, Args: []byte(`{}`), CreatedAt: oldestDefault},
+		{ID: testUUID("default-newer"), Type: "work", Queue: "default", Status: core.StatusPending, Args: []byte(`{}`), CreatedAt: newerDefault},
+		{ID: testUUID("default-running"), Type: "work", Queue: "default", Status: core.StatusRunning, Args: []byte(`{}`), CreatedAt: now.Add(-4 * time.Hour)},
+		{ID: testUUID("emails-oldest"), Type: "work", Queue: "emails", Status: core.StatusPending, Args: []byte(`{}`), CreatedAt: oldestEmails},
+		{ID: testUUID("completed-only"), Type: "work", Queue: "archive", Status: core.StatusCompleted, Args: []byte(`{}`), CreatedAt: now.Add(-5 * time.Hour)},
 	}
 	for _, job := range jobs {
 		require.NoError(t, store.Enqueue(ctx, job))
@@ -238,11 +237,10 @@ func TestSearchJobs_OverlongSearchIsBounded(t *testing.T) {
 
 	bounded := strings.Repeat("a", maxUISearchLength)
 	require.NoError(t, store.Enqueue(ctx, &core.Job{
-		ID:        "bounded-" + bounded,
 		Type:      "work",
 		Queue:     "default",
 		Status:    core.StatusPending,
-		Args:      []byte(`{}`),
+		Args:      []byte(`{"search":"` + bounded + `"}`),
 		CreatedAt: time.Now(),
 	}))
 
@@ -250,14 +248,14 @@ func TestSearchJobs_OverlongSearchIsBounded(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, int64(1), total)
 	require.Len(t, matches, 1)
-	assert.Equal(t, "bounded-"+bounded, matches[0].ID)
+	assert.Contains(t, string(matches[0].Args), bounded)
 }
 
 func TestPurgeJobs_DeletesCheckpoints(t *testing.T) {
 	ctx := context.Background()
 	store := newUITestStorage(t)
 	job := &core.Job{
-		ID:        "failed-with-checkpoint",
+		ID:        core.NewID(),
 		Type:      "work",
 		Queue:     "q",
 		Status:    core.StatusFailed,
@@ -266,7 +264,7 @@ func TestPurgeJobs_DeletesCheckpoints(t *testing.T) {
 	}
 	require.NoError(t, store.Enqueue(ctx, job))
 	require.NoError(t, store.SaveCheckpoint(ctx, &core.Checkpoint{
-		ID:        "checkpoint-1",
+		ID:        core.NewID(),
 		JobID:     job.ID,
 		CallIndex: 0,
 		CallType:  "test",
@@ -289,7 +287,7 @@ func TestSearchJobs_ClampsOffsetAndLimit(t *testing.T) {
 	now := time.Now()
 	for i := 0; i < maxUIQueryLimit+25; i++ {
 		require.NoError(t, store.Enqueue(ctx, &core.Job{
-			ID:        "job-" + strconv.Itoa(i),
+			ID:        core.NewID(),
 			Type:      "work",
 			Queue:     "default",
 			Status:    core.StatusPending,
@@ -304,7 +302,7 @@ func TestSearchJobs_ClampsOffsetAndLimit(t *testing.T) {
 	assert.Len(t, jobs, maxUIQueryLimit)
 
 	for i := 0; i < maxUIQueryLimit+25; i++ {
-		rootID := "root-" + strconv.Itoa(i)
+		rootID := core.NewID()
 		require.NoError(t, store.Enqueue(ctx, &core.Job{
 			ID:        rootID,
 			Type:      "workflow",
@@ -314,7 +312,7 @@ func TestSearchJobs_ClampsOffsetAndLimit(t *testing.T) {
 			CreatedAt: now.Add(time.Duration(i) * time.Second),
 		}))
 		require.NoError(t, store.Enqueue(ctx, &core.Job{
-			ID:          "child-" + strconv.Itoa(i),
+			ID:          core.NewID(),
 			Type:        "step",
 			Queue:       "default",
 			Status:      core.StatusPending,

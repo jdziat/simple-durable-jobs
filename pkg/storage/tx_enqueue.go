@@ -23,7 +23,7 @@ type TxEnqueuer interface {
 // TxUniqueLockEnqueuer is the optional storage capability for atomic windowed
 // enqueue deduplication inside a caller-owned GORM transaction.
 type TxUniqueLockEnqueuer interface {
-	EnqueueWithUniqueLockTx(ctx context.Context, tx *gorm.DB, job *core.Job, scopeHash string, ttl time.Duration) (string, error)
+	EnqueueWithUniqueLockTx(ctx context.Context, tx *gorm.DB, job *core.Job, scopeHash string, ttl time.Duration) (core.UUID, error)
 }
 
 var _ TxEnqueuer = (*GormStorage)(nil)
@@ -97,9 +97,9 @@ func (s *GormStorage) EnqueueUniqueTx(ctx context.Context, tx *gorm.DB, job *cor
 
 // EnqueueWithUniqueLockTx adds a job under a time-bounded unique lock using
 // the caller-supplied transaction handle.
-func (s *GormStorage) EnqueueWithUniqueLockTx(ctx context.Context, tx *gorm.DB, job *core.Job, scopeHash string, ttl time.Duration) (string, error) {
+func (s *GormStorage) EnqueueWithUniqueLockTx(ctx context.Context, tx *gorm.DB, job *core.Job, scopeHash string, ttl time.Duration) (core.UUID, error) {
 	if scopeHash == "" || ttl <= 0 {
-		return "", core.ErrStorageNoUniqueLocks
+		return core.NilUUID, core.ErrStorageNoUniqueLocks
 	}
 	fillEnqueueDefaults(job)
 	return s.enqueueWithUniqueLockDB(ctx, tx.WithContext(ctx), job, scopeHash, ttl)

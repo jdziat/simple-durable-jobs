@@ -90,7 +90,7 @@ func TestDefaultBatchSizeDrainsRespectingQueueCap(t *testing.T) {
 	q.OnJobComplete(func(_ context.Context, job *core.Job) {
 		running.Add(-1)
 		mu.Lock()
-		completed[job.ID]++
+		completed[string(job.ID)]++
 		n := len(completed)
 		mu.Unlock()
 		if n == totalJobs {

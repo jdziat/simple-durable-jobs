@@ -354,7 +354,7 @@ func TestQueue_Enqueue_ConcurrentAccess(t *testing.T) {
 	// Enqueue concurrently
 	var wg atomic.Int32
 	wg.Store(10)
-	done := make(chan string, 10)
+	done := make(chan jobs.UUID, 10)
 
 	for i := 0; i < 10; i++ {
 		go func(n int) {
@@ -365,7 +365,7 @@ func TestQueue_Enqueue_ConcurrentAccess(t *testing.T) {
 	}
 
 	// Collect all job IDs
-	ids := make(map[string]bool)
+	ids := make(map[jobs.UUID]bool)
 	for i := 0; i < 10; i++ {
 		id := <-done
 		ids[id] = true

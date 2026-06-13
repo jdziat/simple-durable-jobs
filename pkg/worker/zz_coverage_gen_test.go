@@ -56,12 +56,12 @@ func TestGen_PollWaitingJobsOnce_ResumesWaitingJobsAndHandlesResumeError(t *test
 	waitingOK := &core.Job{ID: "wait-ok", Status: core.StatusWaiting}
 	waitingBad := &core.Job{ID: "wait-bad", Status: core.StatusWaiting}
 
-	var resumed []string
+	var resumed []core.UUID
 	mock := &mockStorage{
 		waitingJobsFunc: func(_ context.Context) ([]*core.Job, error) {
 			return []*core.Job{waitingOK, waitingBad}, nil
 		},
-		resumeJobFunc: func(_ context.Context, jobID string) (bool, error) {
+		resumeJobFunc: func(_ context.Context, jobID core.UUID) (bool, error) {
 			resumed = append(resumed, jobID)
 			if jobID == "wait-bad" {
 				return false, errors.New("resume failed")
@@ -78,7 +78,7 @@ func TestGen_PollWaitingJobsOnce_ResumesWaitingJobsAndHandlesResumeError(t *test
 
 	w.pollWaitingJobsOnce(context.Background())
 
-	require.ElementsMatch(t, []string{"wait-ok", "wait-bad"}, resumed)
+	require.ElementsMatch(t, []core.UUID{core.UUID("wait-ok"), core.UUID("wait-bad")}, resumed)
 }
 
 func TestGen_PollWaitingJobsOnce_GetStalledParentsError(t *testing.T) {
@@ -107,7 +107,7 @@ func TestGen_PollWaitingJobsOnce_ResumeStalledParentError(t *testing.T) {
 		stalledJobsFunc: func(_ context.Context, _ time.Time) ([]*core.Job, error) {
 			return []*core.Job{stalled}, nil
 		},
-		resumeJobFunc: func(_ context.Context, jobID string) (bool, error) {
+		resumeJobFunc: func(_ context.Context, jobID core.UUID) (bool, error) {
 			if jobID == "stalled-bad" {
 				attempted.Store(true)
 				return false, errors.New("resume failed")
@@ -129,7 +129,7 @@ func TestGen_PollWaitingJobsOnce_ResumeStalledParentError(t *testing.T) {
 func TestGen_RunOwnershipAudit_QueryError(t *testing.T) {
 	var queried atomic.Bool
 	mock := &mockStorage{
-		findOrphanedFunc: func(_ []string) ([]string, error) {
+		findOrphanedFunc: func(_ []core.UUID) ([]core.UUID, error) {
 			queried.Store(true)
 			return nil, errors.New("audit query boom")
 		},

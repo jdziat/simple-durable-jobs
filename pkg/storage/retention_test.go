@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -127,8 +128,8 @@ func TestDeleteTerminalJobsOlderThan_WorkflowGuardAndFanOutCleanup(t *testing.T)
 	seedRetentionJob(t, s, rootID, core.StatusWaiting, old)
 	seedRetentionWorkflowJob(t, s, "ret-sub-parent", core.StatusCompleted, old, &rootID, &rootID, nil)
 	require.NoError(t, s.CreateFanOut(ctx, &core.FanOut{
-		ID:          "ret-fanout",
-		ParentJobID: "ret-sub-parent",
+		ID:          retentionUUID("ret-fanout"),
+		ParentJobID: retentionUUID("ret-sub-parent"),
 		TotalCount:  1,
 		Status:      core.FanOutPending,
 	}))
@@ -142,10 +143,10 @@ func TestDeleteTerminalJobsOlderThan_WorkflowGuardAndFanOutCleanup(t *testing.T)
 	assertRetentionFanOutExists(t, s, "ret-fanout")
 
 	require.NoError(t, s.db.Model(&core.Job{}).
-		Where("id = ?", "ret-live-child").
+		Where("id = ?", retentionUUID("ret-live-child")).
 		Updates(map[string]any{"status": core.StatusCompleted, "completed_at": recent}).Error)
 	require.NoError(t, s.db.Model(&core.FanOut{}).
-		Where("id = ?", "ret-fanout").
+		Where("id = ?", retentionUUID("ret-fanout")).
 		Update("status", core.FanOutCompleted).Error)
 
 	deleted, err = s.DeleteTerminalJobsOlderThan(ctx, core.StatusCompleted, time.Hour, 100)
@@ -181,8 +182,8 @@ func TestDeleteTerminalJobsOlderThan_S04RegressionNoFanOutLeakOrStrandedLiveDesc
 	seedRetentionJob(t, s, rootID, core.StatusCompleted, old)
 	seedRetentionWorkflowJob(t, s, "s04-sub-parent", core.StatusCompleted, old, &rootID, &rootID, nil)
 	require.NoError(t, s.CreateFanOut(ctx, &core.FanOut{
-		ID:          "s04-fanout",
-		ParentJobID: "s04-sub-parent",
+		ID:          retentionUUID("s04-fanout"),
+		ParentJobID: retentionUUID("s04-sub-parent"),
 		TotalCount:  2,
 		Status:      core.FanOutPending,
 	}))
@@ -259,7 +260,7 @@ func TestDeleteConsumedSignalsOlderThan_BatchLimitZeroWindowAndBoundary(t *testi
 func seedRetentionJob(t *testing.T, s *GormStorage, id string, status core.JobStatus, completedAt time.Time) {
 	t.Helper()
 	require.NoError(t, s.db.Create(&core.Job{
-		ID:          id,
+		ID:          retentionUUID(id),
 		Type:        "retention.test",
 		Queue:       "default",
 		Status:      status,
@@ -270,13 +271,13 @@ func seedRetentionJob(t *testing.T, s *GormStorage, id string, status core.JobSt
 func seedRetentionWorkflowJob(t *testing.T, s *GormStorage, id string, status core.JobStatus, completedAt time.Time, parentID, rootID, fanOutID *string) {
 	t.Helper()
 	job := &core.Job{
-		ID:          id,
+		ID:          retentionUUID(id),
 		Type:        "retention.workflow",
 		Queue:       "default",
 		Status:      status,
-		ParentJobID: parentID,
-		RootJobID:   rootID,
-		FanOutID:    fanOutID,
+		ParentJobID: ptrRetentionUUID(parentID),
+		RootJobID:   ptrRetentionUUID(rootID),
+		FanOutID:    ptrRetentionUUID(fanOutID),
 	}
 	if status == core.StatusCompleted || status == core.StatusFailed || status == core.StatusCancelled {
 		job.CompletedAt = &completedAt
@@ -286,10 +287,10 @@ func seedRetentionWorkflowJob(t *testing.T, s *GormStorage, id string, status co
 
 func seedRetentionSignal(t *testing.T, s *GormStorage, id, jobID, name string, consumedAt *time.Time) {
 	t.Helper()
-	seedTestJob(t, context.Background(), s, jobID, core.StatusCompleted)
+	seedTestJob(t, context.Background(), s, retentionUUID(jobID), core.StatusCompleted)
 	require.NoError(t, s.db.Create(&core.Signal{
-		ID:         id,
-		JobID:      jobID,
+		ID:         retentionUUID(id),
+		JobID:      retentionUUID(jobID),
 		Name:       name,
 		Payload:    []byte(`"payload"`),
 		ConsumedAt: consumedAt,
@@ -300,44 +301,56 @@ func ptrString(v string) *string {
 	return &v
 }
 
+func retentionUUID(v string) core.UUID {
+	return core.UUID(uuid.NewSHA1(uuid.NameSpaceOID, []byte(v)).String())
+}
+
+func ptrRetentionUUID(v *string) *core.UUID {
+	if v == nil {
+		return nil
+	}
+	u := retentionUUID(*v)
+	return &u
+}
+
 func assertRetentionExists(t *testing.T, s *GormStorage, id string) {
 	t.Helper()
 	var count int64
-	require.NoError(t, s.db.Model(&core.Job{}).Where("id = ?", id).Count(&count).Error)
+	require.NoError(t, s.db.Model(&core.Job{}).Where("id = ?", retentionUUID(id)).Count(&count).Error)
 	assert.Equal(t, int64(1), count, "job should exist: %s", id)
 }
 
 func assertRetentionSignalExists(t *testing.T, s *GormStorage, id string) {
 	t.Helper()
 	var count int64
-	require.NoError(t, s.db.Model(&core.Signal{}).Where("id = ?", id).Count(&count).Error)
+	require.NoError(t, s.db.Model(&core.Signal{}).Where("id = ?", retentionUUID(id)).Count(&count).Error)
 	assert.Equal(t, int64(1), count, "signal should exist: %s", id)
 }
 
 func assertRetentionFanOutExists(t *testing.T, s *GormStorage, id string) {
 	t.Helper()
 	var count int64
-	require.NoError(t, s.db.Model(&core.FanOut{}).Where("id = ?", id).Count(&count).Error)
+	require.NoError(t, s.db.Model(&core.FanOut{}).Where("id = ?", retentionUUID(id)).Count(&count).Error)
 	assert.Equal(t, int64(1), count, "fan-out should exist: %s", id)
 }
 
 func assertRetentionSignalMissing(t *testing.T, s *GormStorage, id string) {
 	t.Helper()
 	var count int64
-	require.NoError(t, s.db.Model(&core.Signal{}).Where("id = ?", id).Count(&count).Error)
+	require.NoError(t, s.db.Model(&core.Signal{}).Where("id = ?", retentionUUID(id)).Count(&count).Error)
 	assert.Equal(t, int64(0), count, "signal should be deleted: %s", id)
 }
 
 func assertRetentionFanOutMissing(t *testing.T, s *GormStorage, id string) {
 	t.Helper()
 	var count int64
-	require.NoError(t, s.db.Model(&core.FanOut{}).Where("id = ?", id).Count(&count).Error)
+	require.NoError(t, s.db.Model(&core.FanOut{}).Where("id = ?", retentionUUID(id)).Count(&count).Error)
 	assert.Equal(t, int64(0), count, "fan-out should be deleted: %s", id)
 }
 
 func assertRetentionMissing(t *testing.T, s *GormStorage, id string) {
 	t.Helper()
 	var count int64
-	require.NoError(t, s.db.Model(&core.Job{}).Where("id = ?", id).Count(&count).Error)
+	require.NoError(t, s.db.Model(&core.Job{}).Where("id = ?", retentionUUID(id)).Count(&count).Error)
 	assert.Equal(t, int64(0), count, "job should be deleted: %s", id)
 }

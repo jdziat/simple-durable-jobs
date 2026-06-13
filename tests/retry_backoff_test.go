@@ -76,7 +76,7 @@ func TestRetryBackoff_PrecedenceRetryAfterAndNoRetry(t *testing.T) {
 	assert.Equal(t, 1, failed.Attempt)
 }
 
-func waitForRetryRunAt(t *testing.T, store jobs.Storage, jobID string, timeout time.Duration) *jobs.Job {
+func waitForRetryRunAt(t *testing.T, store jobs.Storage, jobID jobs.UUID, timeout time.Duration) *jobs.Job {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
@@ -91,7 +91,7 @@ func waitForRetryRunAt(t *testing.T, store jobs.Storage, jobID string, timeout t
 	return nil
 }
 
-func waitForStatus(t *testing.T, store jobs.Storage, jobID string, status jobs.JobStatus, timeout time.Duration) *jobs.Job {
+func waitForStatus(t *testing.T, store jobs.Storage, jobID jobs.UUID, status jobs.JobStatus, timeout time.Duration) *jobs.Job {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {

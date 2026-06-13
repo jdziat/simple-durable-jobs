@@ -78,7 +78,7 @@ func newRateMockStorage(job *core.Job, denies int) *rateMockStorage {
 	return &rateMockStorage{
 		releaseStateStorage: &releaseStateStorage{
 			mockStorage: &mockStorage{},
-			jobs:        map[string]*core.Job{job.ID: job},
+			jobs:        map[string]*core.Job{string(job.ID): job},
 		},
 		remaining: denies,
 	}
@@ -112,7 +112,7 @@ func TestWorkerRateLimitPerKeyAdmissionReleasesDeniedJob(t *testing.T) {
 	w.dispatchDequeuedJobs(context.Background(), jobsChan, []*core.Job{job})
 
 	assert.Empty(t, jobsChan)
-	assert.Equal(t, []string{"job-1"}, store.getReleasedJobIDs())
+	assert.Equal(t, []core.UUID{core.UUID("job-1")}, store.getReleasedJobIDs())
 	assert.Equal(t, core.StatusPending, job.Status)
 	assert.Equal(t, 0, job.Attempt)
 	assert.Equal(t, []string{"llm:tenant-a"}, store.seenNames)
@@ -124,7 +124,7 @@ func TestWorkerQueueRateLimitDenialDoesNotConsumeFleetRateLimit(t *testing.T) {
 	job2 := runningJob("job-2", "tenant-b")
 	job2.Queue = "x"
 	store := newRateMockStorage(job1, 0)
-	store.jobs[job2.ID] = job2
+	store.jobs[string(job2.ID)] = job2
 	w := NewWorker(queue.New(store),
 		WorkerQueue("x", Concurrency(2)),
 		RateLimit("fleet", 100),
@@ -137,8 +137,8 @@ func TestWorkerQueueRateLimitDenialDoesNotConsumeFleetRateLimit(t *testing.T) {
 	w.dispatchDequeuedJobs(context.Background(), jobsChan, []*core.Job{job1, job2})
 
 	require.Len(t, jobsChan, 1)
-	assert.Equal(t, "job-1", (<-jobsChan).ID)
-	assert.Equal(t, []string{"job-2"}, store.getReleasedJobIDs())
+	assert.Equal(t, core.UUID("job-1"), (<-jobsChan).ID)
+	assert.Equal(t, []core.UUID{core.UUID("job-2")}, store.getReleasedJobIDs())
 	assert.LessOrEqual(t, len(store.seenNames), 1)
 	assert.Equal(t, []string{"fleet"}, store.seenNames)
 }
@@ -149,7 +149,7 @@ func TestWorkerQueueRateLimitRefundsTokenAfterFleetDeny(t *testing.T) {
 	job2 := runningJob("job-2", "tenant-b")
 	job2.Queue = "x"
 	store := newRateMockStorage(job1, 1)
-	store.jobs[job2.ID] = job2
+	store.jobs[string(job2.ID)] = job2
 	w := NewWorker(queue.New(store),
 		WorkerQueue("x", Concurrency(1)),
 		RateLimit("fleet", 1),
@@ -161,11 +161,11 @@ func TestWorkerQueueRateLimitRefundsTokenAfterFleetDeny(t *testing.T) {
 	jobsChan := make(chan *core.Job, 1)
 	w.dispatchDequeuedJobs(context.Background(), jobsChan, []*core.Job{job1})
 	require.Empty(t, jobsChan)
-	assert.Equal(t, []string{"job-1"}, store.getReleasedJobIDs())
+	assert.Equal(t, []core.UUID{core.UUID("job-1")}, store.getReleasedJobIDs())
 
 	w.dispatchDequeuedJobs(context.Background(), jobsChan, []*core.Job{job2})
 	require.Len(t, jobsChan, 1, "refunded queue token should admit the next job immediately")
-	assert.Equal(t, "job-2", (<-jobsChan).ID)
+	assert.Equal(t, core.UUID("job-2"), (<-jobsChan).ID)
 	// The first fleet check is denied and does not increment the fixed-window
 	// counter; only the successfully dispatched second job consumes a fleet unit.
 	assert.Equal(t, []string{"fleet"}, store.consumedNames)
@@ -190,8 +190,8 @@ func TestWorkerConcurrencySlotDenialDoesNotConsumeFleetRateLimit(t *testing.T) {
 	w.dispatchDequeuedJobs(context.Background(), jobsChan, []*core.Job{job1, job2})
 
 	require.Len(t, jobsChan, 1)
-	assert.Equal(t, "job-1", (<-jobsChan).ID)
-	assert.Equal(t, []string{"job-2"}, store.getReleasedJobIDs())
+	assert.Equal(t, core.UUID("job-1"), (<-jobsChan).ID)
+	assert.Equal(t, []core.UUID{core.UUID("job-2")}, store.getReleasedJobIDs())
 	assert.Equal(t, []string{"fleet"}, store.seenNames, "fleet rate is the last gate, so slot-denied jobs are never checked")
 	assert.Equal(t, []string{"fleet"}, store.consumedNames, "only the dispatched job consumes a fleet unit")
 }
@@ -215,7 +215,7 @@ func TestWorkerRateLimitUnsupportedStorageIsNoop(t *testing.T) {
 	job := runningJob("job-1", "tenant-a")
 	store := &releaseStateStorage{
 		mockStorage: &mockStorage{},
-		jobs:        map[string]*core.Job{job.ID: job},
+		jobs:        map[string]*core.Job{string(job.ID): job},
 	}
 	w := NewWorker(queue.New(store),
 		WorkerQueue("default", Concurrency(1)),
@@ -228,7 +228,7 @@ func TestWorkerRateLimitUnsupportedStorageIsNoop(t *testing.T) {
 	w.dispatchDequeuedJobs(context.Background(), jobsChan, []*core.Job{job})
 
 	require.Len(t, jobsChan, 1)
-	assert.Equal(t, "job-1", (<-jobsChan).ID)
+	assert.Equal(t, core.UUID("job-1"), (<-jobsChan).ID)
 	assert.Empty(t, store.getReleasedJobIDs())
 }
 

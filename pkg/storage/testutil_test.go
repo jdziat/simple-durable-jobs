@@ -4,6 +4,8 @@ import (
 	"os"
 	"testing"
 
+	"github.com/google/uuid"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/core"
 	"github.com/stretchr/testify/require"
 	"gorm.io/driver/mysql"
 	"gorm.io/driver/postgres"
@@ -11,6 +13,10 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 )
+
+func testUUID(name string) core.UUID {
+	return core.UUID(uuid.NewSHA1(uuid.NameSpaceOID, []byte(name)).String())
+}
 
 // openTestDB opens a database for tests.
 // When TEST_DATABASE_URL is set it connects to PostgreSQL; otherwise it

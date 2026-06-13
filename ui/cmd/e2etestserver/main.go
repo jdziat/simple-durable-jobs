@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jdziat/simple-durable-jobs/v3/pkg/core"
 	"github.com/jdziat/simple-durable-jobs/v3/pkg/queue"
 	"github.com/jdziat/simple-durable-jobs/v3/pkg/schedule"
@@ -105,11 +106,11 @@ func seedE2EData(ctx context.Context, store *storage.GormStorage, db *gorm.DB) e
 
 	// Pending jobs (5 total: 3 in default, 2 in emails)
 	pendingJobs := []*core.Job{
-		{ID: "e2e-pending-001", Type: "SendEmail", Queue: "default", Tenant: "acme", Metadata: core.MetadataMap{"region": "us-east", "team": "payments"}, Status: core.StatusPending, Priority: 5, MaxRetries: 3, Args: mustJSON(map[string]any{"to": "user@example.com"}), CreatedAt: now.Add(-10 * time.Minute)},
-		{ID: "e2e-pending-002", Type: "GenerateReport", Queue: "default", Tenant: "globex", Metadata: core.MetadataMap{"region": "eu-west", "team": "analytics"}, Status: core.StatusPending, Priority: 3, MaxRetries: 3, Args: mustJSON(map[string]any{"report_id": 42}), CreatedAt: now.Add(-9 * time.Minute)},
-		{ID: "e2e-pending-003", Type: "ProcessOrder", Queue: "default", Status: core.StatusPending, Priority: 7, MaxRetries: 5, Args: mustJSON(map[string]any{"order_id": 1001}), CreatedAt: now.Add(-8 * time.Minute)},
-		{ID: "e2e-pending-004", Type: "SendEmail", Queue: "emails", Status: core.StatusPending, Priority: 5, MaxRetries: 3, Args: mustJSON(map[string]any{"to": "admin@example.com"}), CreatedAt: now.Add(-7 * time.Minute)},
-		{ID: "e2e-pending-005", Type: "SendNotification", Queue: "emails", Status: core.StatusPending, Priority: 1, MaxRetries: 3, Args: mustJSON(map[string]any{"channel": "slack"}), CreatedAt: now.Add(-6 * time.Minute)},
+		{ID: e2eID("e2e-pending-001"), Type: "SendEmail", Queue: "default", Tenant: "acme", Metadata: core.MetadataMap{"region": "us-east", "team": "payments"}, Status: core.StatusPending, Priority: 5, MaxRetries: 3, Args: mustJSON(map[string]any{"to": "user@example.com"}), CreatedAt: now.Add(-10 * time.Minute)},
+		{ID: e2eID("e2e-pending-002"), Type: "GenerateReport", Queue: "default", Tenant: "globex", Metadata: core.MetadataMap{"region": "eu-west", "team": "analytics"}, Status: core.StatusPending, Priority: 3, MaxRetries: 3, Args: mustJSON(map[string]any{"report_id": 42}), CreatedAt: now.Add(-9 * time.Minute)},
+		{ID: e2eID("e2e-pending-003"), Type: "ProcessOrder", Queue: "default", Status: core.StatusPending, Priority: 7, MaxRetries: 5, Args: mustJSON(map[string]any{"order_id": 1001}), CreatedAt: now.Add(-8 * time.Minute)},
+		{ID: e2eID("e2e-pending-004"), Type: "SendEmail", Queue: "emails", Status: core.StatusPending, Priority: 5, MaxRetries: 3, Args: mustJSON(map[string]any{"to": "admin@example.com"}), CreatedAt: now.Add(-7 * time.Minute)},
+		{ID: e2eID("e2e-pending-005"), Type: "SendNotification", Queue: "emails", Status: core.StatusPending, Priority: 1, MaxRetries: 3, Args: mustJSON(map[string]any{"channel": "slack"}), CreatedAt: now.Add(-6 * time.Minute)},
 	}
 
 	// Running jobs (3 total)
@@ -118,9 +119,9 @@ func seedE2EData(ctx context.Context, store *storage.GormStorage, db *gorm.DB) e
 	runningStart3 := now.Add(-2 * time.Minute)
 	lockedUntil := now.Add(5 * time.Minute)
 	runningJobs := []*core.Job{
-		{ID: "e2e-running-001", Type: "GenerateReport", Queue: "default", Status: core.StatusRunning, Priority: 5, Attempt: 1, MaxRetries: 3, Args: mustJSON(map[string]any{"report_id": 99}), CreatedAt: now.Add(-6 * time.Minute), StartedAt: &runningStart1, LockedBy: "worker-1", LockedUntil: &lockedUntil},
-		{ID: "e2e-running-002", Type: "ProcessOrder", Queue: "default", Status: core.StatusRunning, Priority: 8, Attempt: 1, MaxRetries: 3, Args: mustJSON(map[string]any{"order_id": 2002}), CreatedAt: now.Add(-4 * time.Minute), StartedAt: &runningStart2, LockedBy: "worker-2", LockedUntil: &lockedUntil},
-		{ID: "e2e-running-003", Type: "SendEmail", Queue: "emails", Status: core.StatusRunning, Priority: 5, Attempt: 1, MaxRetries: 3, Args: mustJSON(map[string]any{"to": "test@example.com"}), CreatedAt: now.Add(-3 * time.Minute), StartedAt: &runningStart3, LockedBy: "worker-1", LockedUntil: &lockedUntil},
+		{ID: e2eID("e2e-running-001"), Type: "GenerateReport", Queue: "default", Status: core.StatusRunning, Priority: 5, Attempt: 1, MaxRetries: 3, Args: mustJSON(map[string]any{"report_id": 99}), CreatedAt: now.Add(-6 * time.Minute), StartedAt: &runningStart1, LockedBy: "worker-1", LockedUntil: &lockedUntil},
+		{ID: e2eID("e2e-running-002"), Type: "ProcessOrder", Queue: "default", Status: core.StatusRunning, Priority: 8, Attempt: 1, MaxRetries: 3, Args: mustJSON(map[string]any{"order_id": 2002}), CreatedAt: now.Add(-4 * time.Minute), StartedAt: &runningStart2, LockedBy: "worker-2", LockedUntil: &lockedUntil},
+		{ID: e2eID("e2e-running-003"), Type: "SendEmail", Queue: "emails", Status: core.StatusRunning, Priority: 5, Attempt: 1, MaxRetries: 3, Args: mustJSON(map[string]any{"to": "test@example.com"}), CreatedAt: now.Add(-3 * time.Minute), StartedAt: &runningStart3, LockedBy: "worker-1", LockedUntil: &lockedUntil},
 	}
 
 	// Completed jobs (10 total)
@@ -138,7 +139,7 @@ func seedE2EData(ctx context.Context, store *storage.GormStorage, db *gorm.DB) e
 			jobType = "GenerateReport"
 		}
 		completedJobs[i] = &core.Job{
-			ID:          fmt.Sprintf("e2e-completed-%03d", i+1),
+			ID:          e2eID(fmt.Sprintf("e2e-completed-%03d", i+1)),
 			Type:        jobType,
 			Queue:       queueName,
 			Status:      core.StatusCompleted,
@@ -182,7 +183,7 @@ func seedE2EData(ctx context.Context, store *storage.GormStorage, db *gorm.DB) e
 			deadLetterReason = "max retries exhausted: " + failedErrors[i]
 		}
 		failedJobs[i] = &core.Job{
-			ID:               fmt.Sprintf("e2e-failed-%03d", i+1),
+			ID:               e2eID(fmt.Sprintf("e2e-failed-%03d", i+1)),
 			Type:             "SendEmail",
 			Queue:            "default",
 			Status:           core.StatusFailed,
@@ -243,30 +244,30 @@ func seedE2EData(ctx context.Context, store *storage.GormStorage, db *gorm.DB) e
 
 	// Paused jobs (2 total)
 	pausedJobs := []*core.Job{
-		{ID: "e2e-paused-001", Type: "SendEmail", Queue: "default", Status: core.StatusPaused, Priority: 5, MaxRetries: 3, Args: mustJSON(map[string]any{"to": "paused@example.com"}), CreatedAt: now.Add(-15 * time.Minute)},
-		{ID: "e2e-paused-002", Type: "GenerateReport", Queue: "emails", Status: core.StatusPaused, Priority: 3, MaxRetries: 3, Args: mustJSON(map[string]any{"report_id": 77}), CreatedAt: now.Add(-14 * time.Minute)},
+		{ID: e2eID("e2e-paused-001"), Type: "SendEmail", Queue: "default", Status: core.StatusPaused, Priority: 5, MaxRetries: 3, Args: mustJSON(map[string]any{"to": "paused@example.com"}), CreatedAt: now.Add(-15 * time.Minute)},
+		{ID: e2eID("e2e-paused-002"), Type: "GenerateReport", Queue: "emails", Status: core.StatusPaused, Priority: 3, MaxRetries: 3, Args: mustJSON(map[string]any{"report_id": 77}), CreatedAt: now.Add(-14 * time.Minute)},
 	}
 
 	// Cancelled job (1 total)
 	cancelledStart := now.Add(-20 * time.Minute)
 	cancelledComplete := cancelledStart.Add(10 * time.Second)
 	cancelledJobs := []*core.Job{
-		{ID: "e2e-cancelled-001", Type: "ProcessOrder", Queue: "default", Status: core.StatusCancelled, Priority: 5, Attempt: 1, MaxRetries: 3, Args: mustJSON(map[string]any{"order_id": 9999}), LastError: "cancelled by user", CreatedAt: now.Add(-25 * time.Minute), StartedAt: &cancelledStart, CompletedAt: &cancelledComplete},
+		{ID: e2eID("e2e-cancelled-001"), Type: "ProcessOrder", Queue: "default", Status: core.StatusCancelled, Priority: 5, Attempt: 1, MaxRetries: 3, Args: mustJSON(map[string]any{"order_id": 9999}), LastError: "cancelled by user", CreatedAt: now.Add(-25 * time.Minute), StartedAt: &cancelledStart, CompletedAt: &cancelledComplete},
 	}
 
 	// Workflow: parent + 3 children + FanOut
 	wfCreated := now.Add(-2 * time.Hour)
 	wfStarted := wfCreated.Add(5 * time.Second)
-	fanOutID := "e2e-fanout-001"
+	fanOutID := e2eID("e2e-fanout-001")
 	workflowJobs := []*core.Job{
-		{ID: "e2e-workflow-root", Type: "BatchProcess", Queue: "default", Status: core.StatusRunning, Priority: 5, Attempt: 1, MaxRetries: 1, Args: mustJSON(map[string]any{"batch_size": 3}), CreatedAt: wfCreated, StartedAt: &wfStarted, LockedBy: "worker-1", LockedUntil: &lockedUntil},
+		{ID: e2eID("e2e-workflow-root"), Type: "BatchProcess", Queue: "default", Status: core.StatusRunning, Priority: 5, Attempt: 1, MaxRetries: 1, Args: mustJSON(map[string]any{"batch_size": 3}), CreatedAt: wfCreated, StartedAt: &wfStarted, LockedBy: "worker-1", LockedUntil: &lockedUntil},
 	}
-	rootID := "e2e-workflow-root"
+	rootID := e2eID("e2e-workflow-root")
 	childStatuses := []core.JobStatus{core.StatusCompleted, core.StatusRunning, core.StatusPending}
 	for i := 0; i < 3; i++ {
 		childCreated := wfCreated.Add(time.Duration(i+1) * 10 * time.Second)
 		child := &core.Job{
-			ID:          fmt.Sprintf("e2e-workflow-child-%03d", i+1),
+			ID:          e2eID(fmt.Sprintf("e2e-workflow-child-%03d", i+1)),
 			Type:        "ProcessItem",
 			Queue:       "default",
 			Status:      childStatuses[i],
@@ -334,8 +335,8 @@ func seedE2EData(ctx context.Context, store *storage.GormStorage, db *gorm.DB) e
 	for i := 0; i < 2; i++ {
 		for j := 0; j < 2; j++ {
 			cp := &core.Checkpoint{
-				ID:        fmt.Sprintf("e2e-checkpoint-%03d-%03d", i+1, j+1),
-				JobID:     fmt.Sprintf("e2e-completed-%03d", i+1),
+				ID:        e2eID(fmt.Sprintf("e2e-checkpoint-%03d-%03d", i+1, j+1)),
+				JobID:     e2eID(fmt.Sprintf("e2e-completed-%03d", i+1)),
 				CallIndex: j,
 				CallType:  "http.Get",
 				Result:    mustJSON(map[string]any{"status": 200, "body": "OK"}),
@@ -464,4 +465,11 @@ func mustJSON(v any) []byte {
 
 func ptrTime(t time.Time) *time.Time {
 	return &t
+}
+
+// e2eID maps a stable human-readable fixture name to a deterministic UUID so the
+// seeded IDs are valid core.UUID values (v3 binary PK) yet reproducible across
+// runs. The e2e suite's seed-data.ts is re-keyed to these UUIDs separately.
+func e2eID(name string) core.UUID {
+	return core.UUID(uuid.NewSHA1(uuid.NameSpaceURL, []byte("sdj-e2e/"+name)).String())
 }

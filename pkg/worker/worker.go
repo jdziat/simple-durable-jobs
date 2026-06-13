@@ -35,18 +35,18 @@ type Worker struct {
 	pauseMode atomic.Value // stores core.PauseMode
 
 	// Running job cancellation (for aggressive pause)
-	runningJobs   map[string]context.CancelFunc
+	runningJobs   map[core.UUID]context.CancelFunc
 	runningJobsMu sync.Mutex
 
 	// Per-queue concurrency tracking
 	queueRunning map[string]*atomic.Int32 // queue name -> active count
-	queueJobID   map[string]string        // job ID -> queue name (for decrement on completion)
+	queueJobID   map[core.UUID]string     // job ID -> queue name (for decrement on completion)
 	queueJobIDMu sync.Mutex
 
 	// DB-backed concurrency slots acquired for dequeued jobs. Only populated
 	// when the storage backend implements concurrencySlotStorage.
 	slotJobIDMu sync.Mutex
-	slotJobID   map[string][]string
+	slotJobID   map[core.UUID][]string
 
 	// Per-worker queue rate-limit buckets. Only populated for queues configured
 	// with WithQueueRateLimit.
@@ -66,7 +66,7 @@ type Worker struct {
 	// out-of-band (e.g. cancelled mid-sleep) holds its ~tens-of-bytes entry
 	// until the original deadline expires.
 	futureSleepMu           sync.Mutex
-	futureSleepSuppressions map[string]int64
+	futureSleepSuppressions map[core.UUID]int64
 
 	// heartbeatInterval is the tick rate for runHeartbeat. Defaults to
 	// 2 minutes; tests override with a sub-second value. Not exposed via
@@ -89,7 +89,7 @@ type scheduledFireSeeder interface {
 }
 
 type completeWithResultStorage interface {
-	CompleteWithResult(ctx context.Context, jobID, workerID string, result []byte) (*core.FanOut, error)
+	CompleteWithResult(ctx context.Context, jobID core.UUID, workerID string, result []byte) (*core.FanOut, error)
 }
 
 // completablePendingFanOutStorage is implemented by backends that can find
@@ -102,7 +102,7 @@ type completablePendingFanOutStorage interface {
 }
 
 type failTerminalWithResultStorage interface {
-	FailTerminalWithResult(ctx context.Context, jobID, workerID, errMsg string) (*core.FanOut, error)
+	FailTerminalWithResult(ctx context.Context, jobID core.UUID, workerID, errMsg string) (*core.FanOut, error)
 }
 
 type batchDequeuer interface {
@@ -114,12 +114,12 @@ type perQueueDequeuer interface {
 }
 
 type concurrencySlotStorage interface {
-	TryAcquireConcurrencySlot(ctx context.Context, slotName, jobID, workerID string, limit int, ttl time.Duration) (bool, error)
-	ReleaseConcurrencySlot(ctx context.Context, slotName, jobID string) error
+	TryAcquireConcurrencySlot(ctx context.Context, slotName string, jobID core.UUID, workerID string, limit int, ttl time.Duration) (bool, error)
+	ReleaseConcurrencySlot(ctx context.Context, slotName string, jobID core.UUID) error
 }
 
 type concurrencySlotRenewer interface {
-	RenewConcurrencySlot(ctx context.Context, slotName, jobID string, ttl time.Duration) (bool, error)
+	RenewConcurrencySlot(ctx context.Context, slotName string, jobID core.UUID, ttl time.Duration) (bool, error)
 }
 
 type rateLimiterStorage interface {
@@ -153,18 +153,18 @@ type signalResumeStorage interface {
 	// ResumeSignalWaitingJob resumes a waiting (never paused) job and clears its
 	// timeout wake deadline. Distinct from ResumeJob so the signal backstop can't
 	// un-pause an operator-paused job or strip a delayed job's schedule.
-	ResumeSignalWaitingJob(ctx context.Context, jobID string) (bool, error)
+	ResumeSignalWaitingJob(ctx context.Context, jobID core.UUID) (bool, error)
 }
 
 type signalResumePager interface {
-	GetSignalWaitingJobsToResumeAfter(ctx context.Context, afterJobID string, limit int) ([]*core.Job, error)
+	GetSignalWaitingJobsToResumeAfter(ctx context.Context, afterJobID core.UUID, limit int) ([]*core.Job, error)
 }
 
 // pendingSignalNameReader lets the resume backstop distinguish a genuine
 // signal wake (unconsumed signal present) from a durable-timer deadline wake,
 // and best-effort name the signal for the JobResumedBySignal event. Optional.
 type pendingSignalNameReader interface {
-	GetPendingSignalName(ctx context.Context, jobID string) (name string, ok bool, err error)
+	GetPendingSignalName(ctx context.Context, jobID core.UUID) (name string, ok bool, err error)
 }
 
 // recoveryLeaser is implemented by storage backends that can elect a single
@@ -199,7 +199,7 @@ func NewWorker(q *queue.Queue, opts ...WorkerOption) *Worker {
 	config := WorkerConfig{
 		Queues:           nil, // Will be set to default if no queue options provided
 		PollInterval:     100 * time.Millisecond,
-		WorkerID:         core.NewID(),
+		WorkerID:         string(core.NewID()),
 		DrainTimeout:     30 * time.Second,
 		DequeueBatchSize: 10,
 	}
@@ -329,12 +329,12 @@ func NewWorker(q *queue.Queue, opts ...WorkerOption) *Worker {
 		queue:                   q,
 		config:                  config,
 		logger:                  slog.Default(),
-		runningJobs:             make(map[string]context.CancelFunc),
+		runningJobs:             make(map[core.UUID]context.CancelFunc),
 		queueRunning:            queueRunning,
-		queueJobID:              make(map[string]string),
-		slotJobID:               make(map[string][]string),
+		queueJobID:              make(map[core.UUID]string),
+		slotJobID:               make(map[core.UUID][]string),
 		queueRateBuckets:        queueRateBuckets,
-		futureSleepSuppressions: make(map[string]int64),
+		futureSleepSuppressions: make(map[core.UUID]int64),
 		heartbeatInterval:       hbInterval,
 	}
 }
@@ -914,7 +914,7 @@ func (w *Worker) refundQueueRateLimit(queueName string) {
 }
 
 // trackQueueJob increments the running counter for a queue and records the job→queue mapping.
-func (w *Worker) trackQueueJob(jobID, queueName string) {
+func (w *Worker) trackQueueJob(jobID core.UUID, queueName string) {
 	if counter, ok := w.queueRunning[queueName]; ok {
 		counter.Add(1)
 	}
@@ -923,7 +923,7 @@ func (w *Worker) trackQueueJob(jobID, queueName string) {
 	w.queueJobIDMu.Unlock()
 }
 
-func (w *Worker) tryTrackQueueJob(jobID, queueName string) bool {
+func (w *Worker) tryTrackQueueJob(jobID core.UUID, queueName string) bool {
 	counter, ok := w.queueRunning[queueName]
 	if !ok {
 		w.trackQueueJob(jobID, queueName)
@@ -949,7 +949,7 @@ func (w *Worker) tryTrackQueueJob(jobID, queueName string) bool {
 }
 
 // untrackQueueJob decrements the running counter for a job's queue.
-func (w *Worker) untrackQueueJob(jobID string) {
+func (w *Worker) untrackQueueJob(jobID core.UUID) {
 	w.queueJobIDMu.Lock()
 	queueName, ok := w.queueJobID[jobID]
 	if ok {
@@ -1053,7 +1053,7 @@ func (w *Worker) tryAcquireConcurrencySlots(ctx context.Context, job *core.Job) 
 	return true
 }
 
-func (w *Worker) releaseConcurrencySlots(ctx context.Context, jobID string) {
+func (w *Worker) releaseConcurrencySlots(ctx context.Context, jobID core.UUID) {
 	w.slotJobIDMu.Lock()
 	slots := w.slotJobID[jobID]
 	delete(w.slotJobID, jobID)
@@ -1061,7 +1061,7 @@ func (w *Worker) releaseConcurrencySlots(ctx context.Context, jobID string) {
 	w.releaseSlotNames(ctx, jobID, slots)
 }
 
-func (w *Worker) releaseSlotNames(ctx context.Context, jobID string, slots []string) {
+func (w *Worker) releaseSlotNames(ctx context.Context, jobID core.UUID, slots []string) {
 	if len(slots) == 0 {
 		return
 	}
@@ -1079,7 +1079,7 @@ func (w *Worker) releaseSlotNames(ctx context.Context, jobID string, slots []str
 	}
 }
 
-func (w *Worker) renewConcurrencySlots(ctx context.Context, jobID string) {
+func (w *Worker) renewConcurrencySlots(ctx context.Context, jobID core.UUID) {
 	w.slotJobIDMu.Lock()
 	slots := append([]string(nil), w.slotJobID[jobID]...)
 	w.slotJobIDMu.Unlock()
@@ -1294,7 +1294,7 @@ func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 	}
 }
 
-func (w *Worker) completeWithResult(ctx context.Context, storage completeWithResultStorage, jobID string, result []byte) (*core.FanOut, error) {
+func (w *Worker) completeWithResult(ctx context.Context, storage completeWithResultStorage, jobID core.UUID, result []byte) (*core.FanOut, error) {
 	var fo *core.FanOut
 	err := retryWithBackoff(ctx, *w.config.StorageRetry, func() error {
 		var completeErr error
@@ -1304,7 +1304,7 @@ func (w *Worker) completeWithResult(ctx context.Context, storage completeWithRes
 	return fo, err
 }
 
-func (w *Worker) failTerminalWithResult(ctx context.Context, storage failTerminalWithResultStorage, jobID string, errMsg string) (*core.FanOut, error) {
+func (w *Worker) failTerminalWithResult(ctx context.Context, storage failTerminalWithResultStorage, jobID core.UUID, errMsg string) (*core.FanOut, error) {
 	var fo *core.FanOut
 	err := retryWithBackoff(ctx, *w.config.StorageRetry, func() error {
 		var failErr error
@@ -1314,7 +1314,7 @@ func (w *Worker) failTerminalWithResult(ctx context.Context, storage failTermina
 	return fo, err
 }
 
-func (w *Worker) releaseAfterTerminalWriteError(ctx context.Context, jobID string, action string) {
+func (w *Worker) releaseAfterTerminalWriteError(ctx context.Context, jobID core.UUID, action string) {
 	releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
 
@@ -1574,7 +1574,7 @@ func (w *Worker) handleError(ctx context.Context, jobCtx context.Context, job *c
 // failWithRetry marks a job as failed with retry on transient storage failures.
 // It returns the final storage error so callers can detect a lost-ownership
 // outcome (core.ErrJobNotOwned) and skip downstream side effects.
-func (w *Worker) failWithRetry(ctx context.Context, jobID string, errMsg string, retryAt *time.Time) error {
+func (w *Worker) failWithRetry(ctx context.Context, jobID core.UUID, errMsg string, retryAt *time.Time) error {
 	if retryAt != nil {
 		now := time.Now()
 		if !retryAt.After(now) {
@@ -2064,7 +2064,7 @@ func (w *Worker) pollSignalWaitingJobs(ctx context.Context, sr signalResumeStora
 	}
 	pager, paged := w.queue.Storage().(signalResumePager)
 	signalNames, canReadSignalNames := w.queue.Storage().(pendingSignalNameReader)
-	afterJobID := ""
+	afterJobID := core.NilUUID
 
 	for {
 		var sigWaiting []*core.Job
@@ -2157,7 +2157,7 @@ func (w *Worker) memoizeFutureSleep(job *core.Job) {
 	w.futureSleepMu.Unlock()
 }
 
-func (w *Worker) clearFutureSleepMemo(jobID string) {
+func (w *Worker) clearFutureSleepMemo(jobID core.UUID) {
 	w.futureSleepMu.Lock()
 	delete(w.futureSleepSuppressions, jobID)
 	w.futureSleepMu.Unlock()
@@ -2179,7 +2179,7 @@ func (w *Worker) pruneExpiredFutureSleepMemos(now time.Time) {
 // emit may be dropped on full subscriber buffers and the hook list is copied
 // under RLock before invocation, matching every other Call*Hooks. A duplicate
 // emit is harmless (it only nudges a monotonic counter).
-func (w *Worker) emitReclaimed(ctx context.Context, jobID, reason string) {
+func (w *Worker) emitReclaimed(ctx context.Context, jobID core.UUID, reason string) {
 	w.queue.Emit(&core.JobReclaimed{
 		JobID:     jobID,
 		WorkerID:  w.config.WorkerID,
@@ -2270,7 +2270,7 @@ func (w *Worker) runOwnershipAudit(ctx context.Context) {
 			// Snapshot the IDs we think we own. Holding the mutex during
 			// the DB call would block dequeue/complete; copy and release.
 			w.runningJobsMu.Lock()
-			ids := make([]string, 0, len(w.runningJobs))
+			ids := make([]core.UUID, 0, len(w.runningJobs))
 			for id := range w.runningJobs {
 				ids = append(ids, id)
 			}
@@ -2333,7 +2333,7 @@ func (w *Worker) Pause(mode core.PauseMode) {
 
 // CancelJob cancels a specific running job's context.
 // Returns true if the job was found and cancelled.
-func (w *Worker) CancelJob(jobID string) bool {
+func (w *Worker) CancelJob(jobID core.UUID) bool {
 	w.runningJobsMu.Lock()
 	cancel, ok := w.runningJobs[jobID]
 	w.runningJobsMu.Unlock()

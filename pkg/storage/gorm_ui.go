@@ -153,14 +153,7 @@ func (s *GormStorage) SearchJobs(ctx context.Context, filter core.JobFilter) ([]
 		q = q.Where("tenant = ?", filter.Tenant)
 	}
 	q = applyMetaContains(s, q, filter.MetaContains)
-	if filter.Search != "" {
-		searchTerm := filter.Search
-		if len(searchTerm) > maxUISearchLength {
-			searchTerm = searchTerm[:maxUISearchLength]
-		}
-		search := "%" + escapeLikePattern(searchTerm) + "%"
-		q = q.Where("id LIKE ? ESCAPE ? OR "+argsTextExpression(s)+" LIKE ? ESCAPE ?", search, `\`, search, `\`)
-	}
+	q = applyJobSearch(s, q, filter.Search)
 	if !filter.Since.IsZero() {
 		q = q.Where("created_at >= ?", filter.Since)
 	}
@@ -233,6 +226,26 @@ func metadataTextExpression(s *GormStorage) string {
 	}
 }
 
+// applyJobSearch applies the dashboard/dead-letter search term to a jobs query.
+// Job IDs are stored as binary uuid columns (v3), so a substring LIKE against id
+// no longer works on Postgres/MySQL and is meaningless for random UUIDv7s.
+// Instead an exact id match is added when the term parses as a UUID, alongside a
+// substring search over the args text (which still supports free-text lookups).
+func applyJobSearch(s *GormStorage, q *gorm.DB, rawSearch string) *gorm.DB {
+	if rawSearch == "" {
+		return q
+	}
+	searchTerm := rawSearch
+	if len(searchTerm) > maxUISearchLength {
+		searchTerm = searchTerm[:maxUISearchLength]
+	}
+	argsLike := "%" + escapeLikePattern(searchTerm) + "%"
+	if id, err := core.ParseUUID(strings.TrimSpace(searchTerm)); err == nil && id != core.NilUUID {
+		return q.Where("id = ? OR "+argsTextExpression(s)+" LIKE ? ESCAPE ?", id, argsLike, `\`)
+	}
+	return q.Where(argsTextExpression(s)+" LIKE ? ESCAPE ?", argsLike, `\`)
+}
+
 func argsTextExpression(s *GormStorage) string {
 	switch s.dialect() {
 	case dialectPostgres:
@@ -278,7 +291,7 @@ func escapeLikePattern(s string) string {
 }
 
 // RetryJob resets a failed or cancelled job back to pending for re-execution.
-func (s *GormStorage) RetryJob(ctx context.Context, jobID string) (*core.Job, error) {
+func (s *GormStorage) RetryJob(ctx context.Context, jobID core.UUID) (*core.Job, error) {
 	var job core.Job
 	err := s.db.WithContext(ctx).First(&job, "id = ?", jobID).Error
 	if err != nil {
@@ -323,7 +336,7 @@ func (s *GormStorage) RetryJob(ctx context.Context, jobID string) (*core.Job, er
 }
 
 // DeleteJob permanently removes a job from the database.
-func (s *GormStorage) DeleteJob(ctx context.Context, jobID string) error {
+func (s *GormStorage) DeleteJob(ctx context.Context, jobID core.UUID) error {
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		// Delete checkpoints and any buffered signals first
 		if err := tx.Where("job_id = ?", jobID).Delete(&core.Checkpoint{}).Error; err != nil {
@@ -392,7 +405,7 @@ func (s *GormStorage) GetWorkflowRoots(ctx context.Context, status string, limit
 }
 
 // GetFanOutsByParents retrieves fan-outs for multiple parent jobs in one query.
-func (s *GormStorage) GetFanOutsByParents(ctx context.Context, parentJobIDs []string) ([]*core.FanOut, error) {
+func (s *GormStorage) GetFanOutsByParents(ctx context.Context, parentJobIDs []core.UUID) ([]*core.FanOut, error) {
 	if len(parentJobIDs) == 0 {
 		return nil, nil
 	}
@@ -412,7 +425,7 @@ func (s *GormStorage) GetFanOutsByParents(ctx context.Context, parentJobIDs []st
 }
 
 // GetSubJobsByFanOuts retrieves sub-jobs for multiple fan-outs in one query.
-func (s *GormStorage) GetSubJobsByFanOuts(ctx context.Context, fanOutIDs []string) ([]*core.Job, error) {
+func (s *GormStorage) GetSubJobsByFanOuts(ctx context.Context, fanOutIDs []core.UUID) ([]*core.Job, error) {
 	if len(fanOutIDs) == 0 {
 		return nil, nil
 	}

@@ -11,8 +11,8 @@ import "time"
 // until ConsumedAt is set; CheckSignal peeks without consuming, WaitForSignal
 // and DrainSignals consume.
 type Signal struct {
-	ID    string `gorm:"primaryKey;size:36"`
-	JobID string `gorm:"index:idx_signals_pending,priority:1;size:36;not null"`
+	ID    UUID   `gorm:"primaryKey"`
+	JobID UUID   `gorm:"index:idx_signals_pending,priority:1;not null"`
 	Name  string `gorm:"index:idx_signals_pending,priority:2;size:255;not null"`
 	// Payload is the JSON-encoded signal value.
 	Payload []byte `gorm:"type:bytes"`

@@ -215,8 +215,8 @@ func retryHook(inst *instruments) func(context.Context, *core.Job, int, error) {
 	}
 }
 
-func reclaimHook(inst *instruments) func(context.Context, string, string) {
-	return func(ctx context.Context, _ string, reason string) {
+func reclaimHook(inst *instruments) func(context.Context, core.UUID, string) {
+	return func(ctx context.Context, _ core.UUID, reason string) {
 		inst.reclaimed.Add(ctx, 1, metric.WithAttributes(attribute.String(attrReason, reason)))
 	}
 }

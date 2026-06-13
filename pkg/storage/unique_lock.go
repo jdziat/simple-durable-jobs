@@ -16,15 +16,15 @@ var _ core.UniqueLockSweeper = (*GormStorage)(nil)
 // EnqueueWithUniqueLock atomically enqueues job under a time-bounded unique
 // lock. When a live lock already exists, it returns that original job ID and
 // does not insert job.
-func (s *GormStorage) EnqueueWithUniqueLock(ctx context.Context, job *core.Job, scopeHash string, ttl time.Duration) (string, error) {
+func (s *GormStorage) EnqueueWithUniqueLock(ctx context.Context, job *core.Job, scopeHash string, ttl time.Duration) (core.UUID, error) {
 	if scopeHash == "" || ttl <= 0 {
-		return "", core.ErrStorageNoUniqueLocks
+		return core.NilUUID, core.ErrStorageNoUniqueLocks
 	}
 	fillEnqueueDefaults(job)
 
-	var jobID string
+	var jobID core.UUID
 	err := s.withSerializationRetry(ctx, func() error {
-		jobID = ""
+		jobID = core.NilUUID
 		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 			id, err := s.enqueueWithUniqueLockDB(ctx, tx, job, scopeHash, ttl)
 			if err != nil {
@@ -35,15 +35,15 @@ func (s *GormStorage) EnqueueWithUniqueLock(ctx context.Context, job *core.Job, 
 		})
 	})
 	if err != nil {
-		return "", err
+		return core.NilUUID, err
 	}
 	return jobID, nil
 }
 
-func (s *GormStorage) enqueueWithUniqueLockDB(ctx context.Context, db *gorm.DB, job *core.Job, scopeHash string, ttl time.Duration) (string, error) {
+func (s *GormStorage) enqueueWithUniqueLockDB(ctx context.Context, db *gorm.DB, job *core.Job, scopeHash string, ttl time.Duration) (core.UUID, error) {
 	acquired, existingID, err := s.tryAcquireUniqueLock(ctx, db, scopeHash, job.ID, ttl)
 	if err != nil {
-		return "", err
+		return core.NilUUID, err
 	}
 	if !acquired {
 		return existingID, nil
@@ -51,15 +51,15 @@ func (s *GormStorage) enqueueWithUniqueLockDB(ctx context.Context, db *gorm.DB, 
 
 	row, err := s.encodedJobForCreate(job)
 	if err != nil {
-		return "", err
+		return core.NilUUID, err
 	}
 	if err := db.WithContext(ctx).Create(row).Error; err != nil {
-		return "", err
+		return core.NilUUID, err
 	}
 	return job.ID, nil
 }
 
-func (s *GormStorage) tryAcquireUniqueLock(ctx context.Context, db *gorm.DB, scopeHash, jobID string, ttl time.Duration) (bool, string, error) {
+func (s *GormStorage) tryAcquireUniqueLock(ctx context.Context, db *gorm.DB, scopeHash string, jobID core.UUID, ttl time.Duration) (bool, core.UUID, error) {
 	var nowVal, expiresVal any
 	if s.useDBClock() {
 		nowVal = s.nowExpr()
@@ -103,28 +103,28 @@ func (s *GormStorage) tryAcquireUniqueLock(ctx context.Context, db *gorm.DB, sco
 		`, scopeHash, jobID, expiresVal, nowVal, nowVal)
 	}
 	if result.Error != nil {
-		return false, "", result.Error
+		return false, core.NilUUID, result.Error
 	}
 	if result.RowsAffected > 0 {
 		if s.dialect() == dialectMySQL {
 			var lock core.UniqueLock
 			if err := db.WithContext(ctx).First(&lock, "scope_hash = ?", scopeHash).Error; err != nil {
-				return false, "", err
+				return false, core.NilUUID, err
 			}
 			if lock.JobID != jobID {
 				return false, lock.JobID, nil
 			}
 		}
-		return true, "", nil
+		return true, core.NilUUID, nil
 	}
 
 	var lock core.UniqueLock
 	err := db.WithContext(ctx).First(&lock, "scope_hash = ?", scopeHash).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
-		return false, "", gorm.ErrRecordNotFound
+		return false, core.NilUUID, gorm.ErrRecordNotFound
 	}
 	if err != nil {
-		return false, "", err
+		return false, core.NilUUID, err
 	}
 	return false, lock.JobID, nil
 }

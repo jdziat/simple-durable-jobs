@@ -17,11 +17,11 @@ type capabilityMockStorage struct {
 	*mockStorage
 }
 
-func (s *capabilityMockStorage) TryAcquireConcurrencySlot(context.Context, string, string, string, int, time.Duration) (bool, error) {
+func (s *capabilityMockStorage) TryAcquireConcurrencySlot(context.Context, string, core.UUID, string, int, time.Duration) (bool, error) {
 	return true, nil
 }
 
-func (s *capabilityMockStorage) ReleaseConcurrencySlot(context.Context, string, string) error {
+func (s *capabilityMockStorage) ReleaseConcurrencySlot(context.Context, string, core.UUID) error {
 	return nil
 }
 

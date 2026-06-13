@@ -34,11 +34,11 @@ func JobFromContext(ctx context.Context) *core.Job {
 	return jc.Job
 }
 
-// JobIDFromContext returns the current job ID from context, or empty string if not in a job handler.
-func JobIDFromContext(ctx context.Context) string {
+// JobIDFromContext returns the current job ID from context, or empty UUID if not in a job handler.
+func JobIDFromContext(ctx context.Context) core.UUID {
 	job := JobFromContext(ctx)
 	if job == nil {
-		return ""
+		return core.NilUUID
 	}
 	return job.ID
 }

@@ -316,7 +316,7 @@ func sqliteDSN(path string) string {
 	return fmt.Sprintf("%s?_journal_mode=WAL&_busy_timeout=5000&_txlock=immediate", path)
 }
 
-func runWorkerUntilStatus(t *testing.T, q *queue.Queue, store core.Storage, jobID string, want core.JobStatus) {
+func runWorkerUntilStatus(t *testing.T, q *queue.Queue, store core.Storage, jobID core.UUID, want core.JobStatus) {
 	t.Helper()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

@@ -39,7 +39,7 @@ func (s *GormStorage) DeleteTerminalJobsOlderThan(ctx context.Context, status co
 	err := s.withSerializationRetry(ctx, func() error {
 		deleted = 0
 		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-			var ids []string
+			var ids []core.UUID
 			query := tx.Model(&core.Job{}).
 				Where("status = ?", status).
 				Where("completed_at IS NOT NULL").

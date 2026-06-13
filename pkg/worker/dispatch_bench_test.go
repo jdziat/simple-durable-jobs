@@ -23,7 +23,7 @@ func newDeterministicDequeueStorage(n int) *deterministicDequeueStorage {
 	jobs := make([]*core.Job, 0, n)
 	for i := 0; i < n; i++ {
 		jobs = append(jobs, &core.Job{
-			ID:     fmt.Sprintf("job-%04d", i),
+			ID:     core.UUID(fmt.Sprintf("job-%04d", i)),
 			Type:   "work",
 			Queue:  "default",
 			Args:   []byte(`{}`),

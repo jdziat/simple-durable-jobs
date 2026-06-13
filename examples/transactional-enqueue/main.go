@@ -108,20 +108,20 @@ func main() {
 	fmt.Println("Transactional enqueue example complete: only the committed job ran")
 }
 
-func createOrderAndJob(ctx context.Context, db *gorm.DB, queue *jobs.Queue, order Order, commit bool) (string, error) {
+func createOrderAndJob(ctx context.Context, db *gorm.DB, queue *jobs.Queue, order Order, commit bool) (jobs.UUID, error) {
 	tx := db.Begin()
 	if tx.Error != nil {
-		return "", tx.Error
+		return jobs.NilUUID, tx.Error
 	}
 	defer tx.Rollback()
 
 	if err := tx.WithContext(ctx).Create(&order).Error; err != nil {
-		return "", err
+		return jobs.NilUUID, err
 	}
 
 	jobID, err := queue.EnqueueTx(ctx, tx, "fulfill-order", FulfillOrderArgs{OrderID: order.ID}, jobs.Unique("order:"+order.ID))
 	if err != nil {
-		return "", err
+		return jobs.NilUUID, err
 	}
 
 	if !commit {
@@ -142,7 +142,7 @@ func printCounts(ctx context.Context, db *gorm.DB, label string) {
 	fmt.Printf("%s: orders=%d jobs=%d\n", label, orderCount, jobCount)
 }
 
-func waitForStatus(ctx context.Context, storage jobs.Storage, jobID string, want jobs.JobStatus, timeout time.Duration) error {
+func waitForStatus(ctx context.Context, storage jobs.Storage, jobID jobs.UUID, want jobs.JobStatus, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		job, err := storage.GetJob(ctx, jobID)

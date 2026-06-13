@@ -516,8 +516,9 @@ func TestIntegration_StaleLockCleanup(t *testing.T) {
 
 	// Create a job that appears to be locked by a dead worker
 	staleLockTime := time.Now().Add(-10 * time.Minute)
+	staleID := jobs.NewID()
 	job := &jobs.Job{
-		ID:          "stale-job",
+		ID:          staleID,
 		Type:        "stale-lock-task",
 		Args:        []byte(`{}`),
 		Queue:       "default",
@@ -532,10 +533,10 @@ func TestIntegration_StaleLockCleanup(t *testing.T) {
 	released, err := store.ReleaseStaleLocks(ctx, 5*time.Minute)
 	require.NoError(t, err)
 	assert.Len(t, released, 1, "Should release 1 stale lock")
-	assert.Equal(t, "stale-job", released[0])
+	assert.Equal(t, staleID, released[0])
 
 	// Verify job is now pending
-	updatedJob, err := store.GetJob(ctx, "stale-job")
+	updatedJob, err := store.GetJob(ctx, staleID)
 	require.NoError(t, err)
 	assert.Equal(t, jobs.StatusPending, updatedJob.Status)
 	assert.Empty(t, updatedJob.LockedBy)

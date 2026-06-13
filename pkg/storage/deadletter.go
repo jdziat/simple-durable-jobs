@@ -56,14 +56,7 @@ func (s *GormStorage) deadLetterQuery(ctx context.Context, filter core.DeadLette
 		q = q.Where("tenant = ?", filter.Tenant)
 	}
 	q = applyMetaContains(s, q, filter.MetaContains)
-	if filter.Search != "" {
-		searchTerm := filter.Search
-		if len(searchTerm) > maxUISearchLength {
-			searchTerm = searchTerm[:maxUISearchLength]
-		}
-		search := "%" + escapeLikePattern(searchTerm) + "%"
-		q = q.Where("id LIKE ? ESCAPE ? OR "+argsTextExpression(s)+" LIKE ? ESCAPE ?", search, `\`, search, `\`)
-	}
+	q = applyJobSearch(s, q, filter.Search)
 	return q
 }
 

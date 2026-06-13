@@ -70,7 +70,7 @@ func TestCall_ReturnsCheckpointedResult(t *testing.T) {
 		return n * 2, nil
 	})
 
-	jobID := "test-job"
+	jobID := integrationTestUUID("test-job")
 
 	queue.Register("parent", func(ctx context.Context, _ struct{}) error {
 		result, err := jobs.Call[int](ctx, "nested", 5)
@@ -92,7 +92,7 @@ func TestCall_ReturnsCheckpointedResult(t *testing.T) {
 
 	// Simulate pre-existing checkpoint
 	checkpoint := &jobs.Checkpoint{
-		ID:        "cp-1",
+		ID:        integrationTestUUID("cp-1"),
 		JobID:     jobID,
 		CallIndex: 0,
 		CallType:  "nested",
@@ -388,7 +388,7 @@ func TestCall_CheckpointedErrorReturned(t *testing.T) {
 		return "", errors.New("original error")
 	})
 
-	jobID := "test-error-job"
+	jobID := integrationTestUUID("test-error-job")
 
 	var capturedErr error
 	queue.Register("parent-error", func(ctx context.Context, _ struct{}) error {
@@ -410,7 +410,7 @@ func TestCall_CheckpointedErrorReturned(t *testing.T) {
 
 	// Simulate pre-existing checkpoint with error
 	checkpoint := &jobs.Checkpoint{
-		ID:        "cp-err",
+		ID:        integrationTestUUID("cp-err"),
 		JobID:     jobID,
 		CallIndex: 0,
 		CallType:  "failing",

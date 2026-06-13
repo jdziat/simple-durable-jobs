@@ -18,7 +18,7 @@ func TestQueueDeadLetterCounts(t *testing.T) {
 	seedTerminalFailure(t, store, "alpha-1", "alpha")
 	seedTerminalFailure(t, store, "alpha-2", "alpha")
 	seedTerminalFailure(t, store, "beta-1", "beta")
-	require.NoError(t, store.Enqueue(ctx, &core.Job{ID: "failed-without-dlq", Type: "work", Queue: "alpha", Status: core.StatusFailed}))
+	require.NoError(t, store.Enqueue(ctx, &core.Job{ID: testUUID("failed-without-dlq"), Type: "work", Queue: "alpha", Status: core.StatusFailed}))
 
 	counts, err := store.QueueDeadLetterCounts(ctx)
 	require.NoError(t, err)
@@ -37,11 +37,11 @@ func TestQueueOldestPendingAt(t *testing.T) {
 	alphaNewer := now.Add(-time.Hour)
 	betaOldest := now.Add(-2 * time.Hour)
 
-	require.NoError(t, store.Enqueue(ctx, &core.Job{ID: "alpha-oldest", Type: "work", Queue: "alpha", CreatedAt: alphaOldest}))
-	require.NoError(t, store.Enqueue(ctx, &core.Job{ID: "alpha-newer", Type: "work", Queue: "alpha", CreatedAt: alphaNewer}))
-	require.NoError(t, store.Enqueue(ctx, &core.Job{ID: "beta-oldest", Type: "work", Queue: "beta", CreatedAt: betaOldest}))
-	require.NoError(t, store.Enqueue(ctx, &core.Job{ID: "alpha-running", Type: "work", Queue: "alpha", Status: core.StatusRunning, CreatedAt: now.Add(-4 * time.Hour)}))
-	require.NoError(t, store.Enqueue(ctx, &core.Job{ID: "archive-completed", Type: "work", Queue: "archive", Status: core.StatusCompleted, CreatedAt: now.Add(-5 * time.Hour)}))
+	require.NoError(t, store.Enqueue(ctx, &core.Job{ID: testUUID("alpha-oldest"), Type: "work", Queue: "alpha", CreatedAt: alphaOldest}))
+	require.NoError(t, store.Enqueue(ctx, &core.Job{ID: testUUID("alpha-newer"), Type: "work", Queue: "alpha", CreatedAt: alphaNewer}))
+	require.NoError(t, store.Enqueue(ctx, &core.Job{ID: testUUID("beta-oldest"), Type: "work", Queue: "beta", CreatedAt: betaOldest}))
+	require.NoError(t, store.Enqueue(ctx, &core.Job{ID: testUUID("alpha-running"), Type: "work", Queue: "alpha", Status: core.StatusRunning, CreatedAt: now.Add(-4 * time.Hour)}))
+	require.NoError(t, store.Enqueue(ctx, &core.Job{ID: testUUID("archive-completed"), Type: "work", Queue: "archive", Status: core.StatusCompleted, CreatedAt: now.Add(-5 * time.Hour)}))
 
 	oldestByQueue, err := store.QueueOldestPendingAt(ctx)
 	require.NoError(t, err)
@@ -55,7 +55,7 @@ func TestQueueOldestPendingAt(t *testing.T) {
 func seedTerminalFailure(t *testing.T, store *GormStorage, id, queueName string) {
 	t.Helper()
 	ctx := context.Background()
-	require.NoError(t, store.Enqueue(ctx, &core.Job{ID: id, Type: "work", Queue: queueName, MaxRetries: 1}))
+	require.NoError(t, store.Enqueue(ctx, &core.Job{ID: core.NewID(), Type: "work", Queue: queueName, MaxRetries: 1}))
 	job, err := store.Dequeue(ctx, []string{queueName}, "worker-1")
 	require.NoError(t, err)
 	require.NotNil(t, job)

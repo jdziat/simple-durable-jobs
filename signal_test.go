@@ -23,12 +23,12 @@ type signalTestStorage struct {
 	resumeErr error
 }
 
-func (s *signalTestStorage) SendSignal(ctx context.Context, jobID, name string, payload []byte) error {
+func (s *signalTestStorage) SendSignal(ctx context.Context, jobID core.UUID, name string, payload []byte) error {
 	s.sendCount.Add(1)
 	return s.GormStorage.SendSignal(ctx, jobID, name, payload)
 }
 
-func (s *signalTestStorage) ResumeSignalWaitingJob(ctx context.Context, jobID string) (bool, error) {
+func (s *signalTestStorage) ResumeSignalWaitingJob(ctx context.Context, jobID core.UUID) (bool, error) {
 	if s.resumeErr != nil {
 		return false, s.resumeErr
 	}
@@ -59,7 +59,7 @@ func seedWaitingSignalJob(t *testing.T, ctx context.Context, store *signalTestSt
 	return job
 }
 
-func waitForJobResumedBySignal(t *testing.T, events <-chan core.Event, jobID, name string) {
+func waitForJobResumedBySignal(t *testing.T, events <-chan core.Event, jobID core.UUID, name string) {
 	t.Helper()
 	deadline := time.After(time.Second)
 	for {

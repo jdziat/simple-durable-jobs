@@ -30,14 +30,14 @@ func TestWorker_StrictDeterminism_FailsOnDroppedCall(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			mock := &mockStorage{
-				checkpointFunc: func(_ context.Context, _ string) ([]core.Checkpoint, error) {
+				checkpointFunc: func(_ context.Context, _ core.UUID) ([]core.Checkpoint, error) {
 					// Two Call checkpoints recorded by a prior run.
 					return []core.Checkpoint{
 						{JobID: "j1", CallIndex: 0, CallType: "step-a", Result: []byte(`"ok"`)},
 						{JobID: "j1", CallIndex: 1, CallType: "step-b", Result: []byte(`"ok"`)},
 					}, nil
 				},
-				failFunc: func(_ context.Context, _, _, _ string, _ *time.Time) error { return nil },
+				failFunc: func(_ context.Context, _ core.UUID, _, _ string, _ *time.Time) error { return nil },
 			}
 			q := queue.New(mock)
 
@@ -143,10 +143,10 @@ func runStrictDeterminismJob(t *testing.T, checkpoints []core.Checkpoint, handle
 	t.Helper()
 
 	mock := &mockStorage{
-		checkpointFunc: func(_ context.Context, _ string) ([]core.Checkpoint, error) {
+		checkpointFunc: func(_ context.Context, _ core.UUID) ([]core.Checkpoint, error) {
 			return checkpoints, nil
 		},
-		failFunc: func(_ context.Context, _, _, _ string, _ *time.Time) error { return nil },
+		failFunc: func(_ context.Context, _ core.UUID, _, _ string, _ *time.Time) error { return nil },
 	}
 	q := queue.New(mock)
 

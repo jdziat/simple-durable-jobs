@@ -3,7 +3,6 @@ package storage
 import (
 	"context"
 	"database/sql"
-	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -312,7 +311,7 @@ func seedDequeueExplainJobs(t *testing.T, ctx context.Context, db *gorm.DB) {
 			status = core.StatusPending
 		}
 		job := &core.Job{
-			ID:         fmt.Sprintf("explain-%04d", i),
+			ID:         core.NewID(),
 			Type:       "explain.dequeue",
 			Args:       []byte(`{}`),
 			Queue:      queues[i%len(queues)],
@@ -332,7 +331,7 @@ func seedDequeueExplainJobs(t *testing.T, ctx context.Context, db *gorm.DB) {
 	for i := 0; i < 2000; i++ {
 		createdAt := now.Add(-time.Duration(2000-i) * time.Second)
 		jobs = append(jobs, &core.Job{
-			ID:         fmt.Sprintf("explain-future-%04d", i),
+			ID:         core.NewID(),
 			Type:       "explain.dequeue",
 			Args:       []byte(`{}`),
 			Queue:      queues[i%len(queues)],
@@ -360,7 +359,7 @@ func seedDeadLetterMetaExplainJobs(t *testing.T, ctx context.Context, db *gorm.D
 			region = "us"
 		}
 		jobs = append(jobs, &core.Job{
-			ID:               fmt.Sprintf("dlqmeta-%04d", i),
+			ID:               core.NewID(),
 			Type:             "explain.dlqmeta",
 			Args:             []byte(`{}`),
 			Queue:            "default",

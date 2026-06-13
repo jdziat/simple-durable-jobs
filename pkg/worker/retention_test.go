@@ -320,7 +320,7 @@ func TestRetentionDeleteCheckpointsOnComplete_WiredToStorage(t *testing.T) {
 		// NewWorker is where the wiring happens.
 		_ = NewWorker(q, opts...)
 
-		job := &core.Job{ID: "wired-" + t.Name(), Type: "gc", Queue: "default", Status: core.StatusPending}
+		job := &core.Job{ID: workerTestUUID("wired-" + t.Name()), Type: "gc", Queue: "default", Status: core.StatusPending}
 		require.NoError(t, store.Enqueue(ctx, job))
 		got, err := store.Dequeue(ctx, []string{"default"}, "worker-1")
 		require.NoError(t, err)
@@ -376,7 +376,7 @@ func newWorkerRetentionStore(t *testing.T) (*gorm.DB, *storage.GormStorage) {
 func seedWorkerRetentionJob(t *testing.T, db *gorm.DB, id string, status core.JobStatus, completedAt time.Time) {
 	t.Helper()
 	require.NoError(t, db.Create(&core.Job{
-		ID:          id,
+		ID:          workerTestUUID(id),
 		Type:        "retention.worker",
 		Queue:       "default",
 		Status:      status,
@@ -387,8 +387,8 @@ func seedWorkerRetentionJob(t *testing.T, db *gorm.DB, id string, status core.Jo
 func seedWorkerRetentionSignal(t *testing.T, db *gorm.DB, id, jobID, name string, consumedAt *time.Time) {
 	t.Helper()
 	require.NoError(t, db.Create(&core.Signal{
-		ID:         id,
-		JobID:      jobID,
+		ID:         workerTestUUID(id),
+		JobID:      workerTestUUID(jobID),
 		Name:       name,
 		Payload:    []byte(`"payload"`),
 		ConsumedAt: consumedAt,
@@ -398,13 +398,13 @@ func seedWorkerRetentionSignal(t *testing.T, db *gorm.DB, id, jobID, name string
 func workerRetentionExists(t *testing.T, db *gorm.DB, id string) bool {
 	t.Helper()
 	var count int64
-	require.NoError(t, db.Model(&core.Job{}).Where("id = ?", id).Count(&count).Error)
+	require.NoError(t, db.Model(&core.Job{}).Where("id = ?", workerTestUUID(id)).Count(&count).Error)
 	return count == 1
 }
 
 func workerRetentionSignalExists(t *testing.T, db *gorm.DB, id string) bool {
 	t.Helper()
 	var count int64
-	require.NoError(t, db.Model(&core.Signal{}).Where("id = ?", id).Count(&count).Error)
+	require.NoError(t, db.Model(&core.Signal{}).Where("id = ?", workerTestUUID(id)).Count(&count).Error)
 	return count == 1
 }

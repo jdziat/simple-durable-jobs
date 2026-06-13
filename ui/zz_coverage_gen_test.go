@@ -62,7 +62,7 @@ func TestWatchEvents_StreamsAndFilters(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	job := &core.Job{ID: "watch-1", Queue: "emails", Type: "send"}
+	job := &core.Job{ID: uiTestUUID("watch-1"), Queue: "emails", Type: "send"}
 
 	// The server subscribes asynchronously only after the streaming request
 	// reaches the handler, and over HTTP/1.1 the client's WatchEvents call blocks
@@ -128,7 +128,7 @@ func TestWatchEvents_FilterRejectsAndQueueEventBranch(t *testing.T) {
 				return
 			case <-ticker.C:
 				// Rejected: job on a different queue.
-				q.Emit(&core.JobCompleted{Job: &core.Job{ID: "x", Queue: "other", Type: "t"}, Timestamp: time.Now()})
+				q.Emit(&core.JobCompleted{Job: &core.Job{ID: uiTestUUID("x"), Queue: "other", Type: "t"}, Timestamp: time.Now()})
 				// Rejected: queue event with no Job field on a non-matching queue.
 				q.Emit(&core.QueuePaused{Queue: "other", Timestamp: time.Now()})
 				// Accepted: queue event with no Job field on the matching queue,
@@ -159,28 +159,28 @@ func TestWatchEvents_FilterRejectsAndQueueEventBranch(t *testing.T) {
 
 func TestPauseJob_GetJobError(t *testing.T) {
 	store := &mockStorage{
-		getJobFn: func(_ context.Context, _ string) (*core.Job, error) {
+		getJobFn: func(_ context.Context, _ core.UUID) (*core.Job, error) {
 			return nil, errors.New("get job boom")
 		},
 	}
 	q := queue.New(store)
 	svc := newJobsService(store, q, nil)
 
-	_, err := svc.PauseJob(context.Background(), connect.NewRequest(&jobsv1.PauseJobRequest{Id: "j1"}))
+	_, err := svc.PauseJob(context.Background(), connect.NewRequest(&jobsv1.PauseJobRequest{Id: uiTestID("j1")}))
 	require.Error(t, err)
 	assert.Equal(t, connect.CodeInternal, connect.CodeOf(err))
 }
 
 func TestResumeJob_GetJobError(t *testing.T) {
 	store := &mockStorage{
-		getJobFn: func(_ context.Context, _ string) (*core.Job, error) {
+		getJobFn: func(_ context.Context, _ core.UUID) (*core.Job, error) {
 			return nil, errors.New("get job boom")
 		},
 	}
 	q := queue.New(store)
 	svc := newJobsService(store, q, nil)
 
-	_, err := svc.ResumeJob(context.Background(), connect.NewRequest(&jobsv1.ResumeJobRequest{Id: "j1"}))
+	_, err := svc.ResumeJob(context.Background(), connect.NewRequest(&jobsv1.ResumeJobRequest{Id: uiTestID("j1")}))
 	require.Error(t, err)
 	assert.Equal(t, connect.CodeInternal, connect.CodeOf(err))
 }
@@ -216,10 +216,10 @@ func TestStatsCollector_SnapshotCountsRunning(t *testing.T) {
 
 	store := q.Storage()
 	require.NoError(t, store.Enqueue(ctx, &core.Job{
-		ID: "run-1", Queue: "run-queue", Type: "work", Status: core.StatusRunning,
+		ID: uiTestUUID("run-1"), Queue: "run-queue", Type: "work", Status: core.StatusRunning,
 	}))
 	require.NoError(t, store.Enqueue(ctx, &core.Job{
-		ID: "pend-1", Queue: "run-queue", Type: "work", Status: core.StatusPending,
+		ID: uiTestUUID("pend-1"), Queue: "run-queue", Type: "work", Status: core.StatusPending,
 	}))
 
 	collector.snapshot(ctx)
@@ -253,7 +253,7 @@ func TestStatsCollector_SnapshotDepthError(t *testing.T) {
 	q := queue.New(store)
 	ctx := context.Background()
 	require.NoError(t, store.Enqueue(ctx, &core.Job{
-		ID: "p-1", Queue: "errq", Type: "work", Status: core.StatusPending,
+		ID: uiTestUUID("p-1"), Queue: "errq", Type: "work", Status: core.StatusPending,
 	}))
 
 	logr := slog.New(slog.NewTextHandler(io.Discard, nil))

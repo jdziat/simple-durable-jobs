@@ -351,7 +351,7 @@ func TestSavePhaseCheckpoint(t *testing.T) {
 	})
 }
 
-func newTestVersionContext(jobID string, checkpoints []core.Checkpoint, save func(context.Context, *core.Checkpoint) error) context.Context {
+func newTestVersionContext(jobID core.UUID, checkpoints []core.Checkpoint, save func(context.Context, *core.Checkpoint) error) context.Context {
 	if save == nil {
 		save = func(context.Context, *core.Checkpoint) error { return nil }
 	}

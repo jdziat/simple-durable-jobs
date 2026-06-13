@@ -21,7 +21,7 @@ func TestJob_HasRequiredFields(t *testing.T) {
 		CreatedAt:  time.Now(),
 	}
 
-	assert.Equal(t, "test-123", job.ID)
+	assert.Equal(t, jobs.UUID("test-123"), job.ID)
 	assert.Equal(t, "send-email", job.Type)
 	assert.Equal(t, jobs.StatusPending, job.Status)
 }
@@ -35,7 +35,7 @@ func TestCheckpoint_HasRequiredFields(t *testing.T) {
 		Result:    []byte(`{"receipt":"abc"}`),
 	}
 
-	assert.Equal(t, "cp-123", cp.ID)
-	assert.Equal(t, "job-456", cp.JobID)
+	assert.Equal(t, jobs.UUID("cp-123"), cp.ID)
+	assert.Equal(t, jobs.UUID("job-456"), cp.JobID)
 	assert.Equal(t, 0, cp.CallIndex)
 }

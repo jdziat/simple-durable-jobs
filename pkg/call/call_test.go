@@ -1141,7 +1141,7 @@ func (s *testCheckpointStore) SaveCheckpoint(ctx context.Context, cp *core.Check
 	return nil
 }
 
-func (s *testCheckpointStore) GetCheckpoints(ctx context.Context, jobID string) ([]core.Checkpoint, error) {
+func (s *testCheckpointStore) GetCheckpoints(ctx context.Context, jobID core.UUID) ([]core.Checkpoint, error) {
 	var checkpoints []core.Checkpoint
 	for _, cp := range s.checkpoints {
 		if cp.JobID == jobID {

@@ -13,7 +13,7 @@ import (
 // TryAcquireConcurrencySlot attempts to acquire or renew one leased slot for
 // slotName on behalf of jobID. It is an optional storage capability used by the
 // worker through type assertion; core.Storage is intentionally unchanged.
-func (s *GormStorage) TryAcquireConcurrencySlot(ctx context.Context, slotName, jobID, workerID string, limit int, ttl time.Duration) (bool, error) {
+func (s *GormStorage) TryAcquireConcurrencySlot(ctx context.Context, slotName string, jobID core.UUID, workerID string, limit int, ttl time.Duration) (bool, error) {
 	if limit <= 0 {
 		return false, nil
 	}
@@ -38,13 +38,13 @@ func (s *GormStorage) TryAcquireConcurrencySlot(ctx context.Context, slotName, j
 			// concrete row to lock before it counts and inserts.
 			if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&core.ConcurrencySlot{
 				SlotName:  slotName,
-				JobID:     "",
+				JobID:     core.NilUUID,
 				WorkerID:  "",
 				ExpiresAt: time.Unix(0, 0).UTC(),
 			}).Error; err != nil {
 				return err
 			}
-			sentinel := tx.Where("slot_name = ? AND job_id = ?", slotName, "")
+			sentinel := tx.Where("slot_name = ? AND job_id = ?", slotName, core.NilUUID)
 			sentinel = s.lockForUpdate(sentinel, false)
 			var guard core.ConcurrencySlot
 			if err := sentinel.First(&guard).Error; err != nil {
@@ -69,7 +69,7 @@ func (s *GormStorage) TryAcquireConcurrencySlot(ctx context.Context, slotName, j
 
 			live := tx.Model(&core.ConcurrencySlot{}).
 				Where("slot_name = ? AND expires_at >= ?", slotName, nowVal).
-				Where("job_id <> ?", "")
+				Where("job_id <> ?", core.NilUUID)
 			live = s.lockForUpdate(live, true)
 			var liveSlots []core.ConcurrencySlot
 			if err := live.Find(&liveSlots).Error; err != nil {
@@ -105,7 +105,7 @@ func (s *GormStorage) TryAcquireConcurrencySlot(ctx context.Context, slotName, j
 // released while a heartbeat tick is in flight cannot be resurrected for a
 // finished job). Ownership is intentionally preserved — worker_id is not
 // reclaimed — since only the holder renews its own slot.
-func (s *GormStorage) RenewConcurrencySlot(ctx context.Context, slotName, jobID string, ttl time.Duration) (bool, error) {
+func (s *GormStorage) RenewConcurrencySlot(ctx context.Context, slotName string, jobID core.UUID, ttl time.Duration) (bool, error) {
 	var renewed bool
 	err := s.withSerializationRetry(ctx, func() error {
 		renewed = false
@@ -136,18 +136,18 @@ func (s *GormStorage) RenewConcurrencySlot(ctx context.Context, slotName, jobID 
 
 // ReleaseConcurrencySlot releases a slot held for jobID. It is idempotent:
 // missing rows are already released.
-func (s *GormStorage) ReleaseConcurrencySlot(ctx context.Context, slotName, jobID string) error {
+func (s *GormStorage) ReleaseConcurrencySlot(ctx context.Context, slotName string, jobID core.UUID) error {
 	return s.db.WithContext(ctx).
 		Where("slot_name = ? AND job_id = ?", slotName, jobID).
 		Delete(&core.ConcurrencySlot{}).Error
 }
 
 // DeleteExpiredConcurrencySlots deletes expired held slots while preserving the
-// permanent per-slot sentinel row (job_id=”) used to serialize admission.
+// permanent per-slot sentinel row (job_id="") used to serialize admission.
 func (s *GormStorage) DeleteExpiredConcurrencySlots(ctx context.Context, cutoff time.Time) (int64, error) {
 	result := s.db.WithContext(ctx).
 		Where("expires_at < ?", cutoff).
-		Where("job_id <> ?", "").
+		Where("job_id <> ?", core.NilUUID).
 		Delete(&core.ConcurrencySlot{})
 	return result.RowsAffected, result.Error
 }

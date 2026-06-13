@@ -12,8 +12,8 @@ import (
 
 // SendSignal persists a named signal for a job. It is buffered: a signal sent
 // before the handler waits for it is not lost.
-func (s *GormStorage) SendSignal(ctx context.Context, jobID, name string, payload []byte) error {
-	encoded, err := s.encodePayload("signal payload", jobID+"/"+name, payload)
+func (s *GormStorage) SendSignal(ctx context.Context, jobID core.UUID, name string, payload []byte) error {
+	encoded, err := s.encodePayload("signal payload", string(jobID)+"/"+name, payload)
 	if err != nil {
 		return err
 	}
@@ -27,7 +27,7 @@ func (s *GormStorage) SendSignal(ctx context.Context, jobID, name string, payloa
 
 // PeekSignal returns the oldest pending (unconsumed) signal of name for the job
 // WITHOUT consuming it, or nil if none. Used by CheckSignal.
-func (s *GormStorage) PeekSignal(ctx context.Context, jobID, name string) (*core.Signal, error) {
+func (s *GormStorage) PeekSignal(ctx context.Context, jobID core.UUID, name string) (*core.Signal, error) {
 	var sig core.Signal
 	err := s.db.WithContext(ctx).
 		Where("job_id = ? AND name = ? AND consumed_at IS NULL", jobID, name).
@@ -45,7 +45,7 @@ func (s *GormStorage) PeekSignal(ctx context.Context, jobID, name string) (*core
 	return &sig, nil
 }
 
-func (s *GormStorage) pendingSignalsLocked(tx *gorm.DB, jobID, name string) *gorm.DB {
+func (s *GormStorage) pendingSignalsLocked(tx *gorm.DB, jobID core.UUID, name string) *gorm.DB {
 	return s.lockForUpdate(tx.Where("job_id = ? AND name = ? AND consumed_at IS NULL", jobID, name).Order("created_at ASC"), true)
 }
 
@@ -53,7 +53,7 @@ func (s *GormStorage) pendingSignalsLocked(tx *gorm.DB, jobID, name string) *gor
 // (marking it consumed), or returns nil if none are pending. Concurrent
 // consumers receive disjoint signals (FOR UPDATE SKIP LOCKED on Postgres/MySQL;
 // SQLite's serialized writer provides equivalent protection).
-func (s *GormStorage) ConsumeSignal(ctx context.Context, jobID, name string) (*core.Signal, error) {
+func (s *GormStorage) ConsumeSignal(ctx context.Context, jobID core.UUID, name string) (*core.Signal, error) {
 	var out *core.Signal
 	err := s.withSerializationRetry(ctx, func() error {
 		out = nil
@@ -93,7 +93,7 @@ func (s *GormStorage) ConsumeSignal(ctx context.Context, jobID, name string) (*c
 
 // DrainSignals atomically consumes ALL currently-pending signals of name for the
 // job, in arrival (FIFO) order, returning them. Empty slice if none.
-func (s *GormStorage) DrainSignals(ctx context.Context, jobID, name string) ([]*core.Signal, error) {
+func (s *GormStorage) DrainSignals(ctx context.Context, jobID core.UUID, name string) ([]*core.Signal, error) {
 	var out []*core.Signal
 	err := s.withSerializationRetry(ctx, func() error {
 		out = nil
@@ -107,7 +107,7 @@ func (s *GormStorage) DrainSignals(ctx context.Context, jobID, name string) ([]*
 				return nil
 			}
 			now := time.Now()
-			ids := make([]string, len(sigs))
+			ids := make([]core.UUID, len(sigs))
 			for i, sg := range sigs {
 				ids[i] = sg.ID
 				sg.ConsumedAt = &now
@@ -148,7 +148,7 @@ func (s *GormStorage) DrainSignals(ctx context.Context, jobID, name string) ([]*
 // Postgres/MySQL; SQLite's serialized writer provides equivalent protection).
 // withSerializationRetry wraps the whole consume+checkpoint so a 40001/1213
 // retry re-runs both atomically.
-func (s *GormStorage) ConsumeSignalTx(ctx context.Context, jobID, name string, buildCheckpoint func(sig *core.Signal) (*core.Checkpoint, error)) (*core.Signal, error) {
+func (s *GormStorage) ConsumeSignalTx(ctx context.Context, jobID core.UUID, name string, buildCheckpoint func(sig *core.Signal) (*core.Checkpoint, error)) (*core.Signal, error) {
 	var out *core.Signal
 	err := s.withSerializationRetry(ctx, func() error {
 		out = nil
@@ -202,7 +202,7 @@ func (s *GormStorage) ConsumeSignalTx(ctx context.Context, jobID, name string, b
 // because DrainSignals must record an empty-result checkpoint so replay of an
 // empty drain is deterministic. The consume-all and the checkpoint commit or
 // roll back together.
-func (s *GormStorage) DrainSignalsTx(ctx context.Context, jobID, name string, buildCheckpoint func(sigs []*core.Signal) (*core.Checkpoint, error)) ([]*core.Signal, error) {
+func (s *GormStorage) DrainSignalsTx(ctx context.Context, jobID core.UUID, name string, buildCheckpoint func(sigs []*core.Signal) (*core.Checkpoint, error)) ([]*core.Signal, error) {
 	var out []*core.Signal
 	err := s.withSerializationRetry(ctx, func() error {
 		out = nil
@@ -214,7 +214,7 @@ func (s *GormStorage) DrainSignalsTx(ctx context.Context, jobID, name string, bu
 			}
 			if len(sigs) > 0 {
 				now := time.Now()
-				ids := make([]string, len(sigs))
+				ids := make([]core.UUID, len(sigs))
 				for i, sg := range sigs {
 					ids[i] = sg.ID
 					sg.ConsumedAt = &now
@@ -250,7 +250,7 @@ func (s *GormStorage) DrainSignalsTx(ctx context.Context, jobID, name string, bu
 // GetPendingSignalName returns the oldest pending signal name for jobID. It is
 // an optional capability used by the worker to distinguish signal-driven wakes
 // from expired durable-timer wakes before emitting JobResumedBySignal.
-func (s *GormStorage) GetPendingSignalName(ctx context.Context, jobID string) (string, bool, error) {
+func (s *GormStorage) GetPendingSignalName(ctx context.Context, jobID core.UUID) (string, bool, error) {
 	var sig core.Signal
 	err := s.db.WithContext(ctx).
 		Select("name").
@@ -284,7 +284,7 @@ func (s *GormStorage) DeleteConsumedSignalsOlderThan(ctx context.Context, age ti
 	err := s.withSerializationRetry(ctx, func() error {
 		deleted = 0
 		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-			var ids []string
+			var ids []core.UUID
 			query := tx.Model(&core.Signal{}).
 				Where("consumed_at IS NOT NULL").
 				Where("consumed_at < ?", cutoff).
@@ -318,7 +318,7 @@ func (s *GormStorage) DeleteConsumedSignalsOlderThan(ctx context.Context, age ti
 // another worker), so anchoring both to the single DB clock removes the wall-clock
 // skew that would otherwise make the timeout fire early or late. SQLite is
 // single-clock, so it uses the caller's time.
-func (s *GormStorage) MarkWaitingWithDeadline(ctx context.Context, jobID, workerID string, d time.Duration) error {
+func (s *GormStorage) MarkWaitingWithDeadline(ctx context.Context, jobID core.UUID, workerID string, d time.Duration) error {
 	var runAt any
 	if s.useDBClock() {
 		runAt = s.offsetExpr(d)
@@ -354,13 +354,13 @@ func (s *GormStorage) MarkWaitingWithDeadline(ctx context.Context, jobID, worker
 // deciding to wait and MarkWaiting committing would otherwise leave the job
 // waiting forever with the event-driven resume already missed.
 func (s *GormStorage) GetSignalWaitingJobsToResume(ctx context.Context) ([]*core.Job, error) {
-	return s.GetSignalWaitingJobsToResumeAfter(ctx, "", maxResumeBatch)
+	return s.GetSignalWaitingJobsToResumeAfter(ctx, core.NilUUID, maxResumeBatch)
 }
 
 // GetSignalWaitingJobsToResumeAfter is the ordered, keyset-paged form of
 // GetSignalWaitingJobsToResume. The worker uses it to scan past durable timers
 // that have buffered user signals but should not be resumed before run_at.
-func (s *GormStorage) GetSignalWaitingJobsToResumeAfter(ctx context.Context, afterJobID string, limit int) ([]*core.Job, error) {
+func (s *GormStorage) GetSignalWaitingJobsToResumeAfter(ctx context.Context, afterJobID core.UUID, limit int) ([]*core.Job, error) {
 	if limit <= 0 {
 		limit = maxResumeBatch
 	}

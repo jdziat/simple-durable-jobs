@@ -13,7 +13,7 @@ import (
 
 // saveCheckpoints writes n distinct checkpoints for a job. Call indexes are
 // unique so the (job_id, call_index, call_type) upsert never collapses them.
-func saveCheckpoints(t *testing.T, ctx context.Context, s *GormStorage, jobID string, n int) {
+func saveCheckpoints(t *testing.T, ctx context.Context, s *GormStorage, jobID core.UUID, n int) {
 	t.Helper()
 	for i := 0; i < n; i++ {
 		require.NoError(t, s.SaveCheckpoint(ctx, &core.Checkpoint{
@@ -25,7 +25,7 @@ func saveCheckpoints(t *testing.T, ctx context.Context, s *GormStorage, jobID st
 	}
 }
 
-func checkpointCount(t *testing.T, ctx context.Context, s *GormStorage, jobID string) int {
+func checkpointCount(t *testing.T, ctx context.Context, s *GormStorage, jobID core.UUID) int {
 	t.Helper()
 	cps, err := s.GetCheckpoints(ctx, jobID)
 	require.NoError(t, err)

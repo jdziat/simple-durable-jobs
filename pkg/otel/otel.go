@@ -113,7 +113,7 @@ func enqueueMiddleware(tracer trace.Tracer, prop propagation.TextMapPropagator) 
 			return err
 		}
 
-		span.SetAttributes(attribute.String("job.id", job.ID))
+		span.SetAttributes(attribute.String("job.id", string(job.ID)))
 		return nil
 	}
 }
@@ -190,7 +190,7 @@ func jobAttributes(job *core.Job) []attribute.KeyValue {
 		attribute.Int("job.attempt", job.Attempt),
 	}
 	if job.ID != "" {
-		attrs = append(attrs, attribute.String("job.id", job.ID))
+		attrs = append(attrs, attribute.String("job.id", string(job.ID)))
 	}
 	return attrs
 }

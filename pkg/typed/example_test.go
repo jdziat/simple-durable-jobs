@@ -274,7 +274,7 @@ func newExampleDurableQueue() (*queue.Queue, core.Storage, func()) {
 	return queue.New(store), store, cleanup
 }
 
-func runExampleWorkerUntilStatus(q *queue.Queue, store core.Storage, jobID string, want core.JobStatus) {
+func runExampleWorkerUntilStatus(q *queue.Queue, store core.Storage, jobID core.UUID, want core.JobStatus) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
