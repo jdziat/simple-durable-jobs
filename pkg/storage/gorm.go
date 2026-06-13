@@ -812,6 +812,18 @@ func (s *GormStorage) accountTerminalWithFanOut(ctx context.Context, jobID, work
 				}
 			}
 
+			// Release any fleet concurrency slots this job holds, atomically with
+			// the terminal write. The worker also releases them best-effort after
+			// processJob returns, but a crash in the window between this commit and
+			// that deferred release would otherwise orphan a live slot for a
+			// finished job until its TTL (~45m), silently shrinking the cap. Doing
+			// it in the terminal tx makes slot release crash-safe. Keyed by job_id
+			// so it covers every configured cap; the permanent per-slot-name
+			// sentinel (job_id = '') is never matched.
+			if err := tx.Where("job_id = ?", jobID).Delete(&core.ConcurrencySlot{}).Error; err != nil {
+				return err
+			}
+
 			var job core.Job
 			if err := tx.Select("fan_out_id").First(&job, "id = ?", jobID).Error; err != nil {
 				return err
@@ -1525,6 +1537,13 @@ func (s *GormStorage) CancelSubJobs(ctx context.Context, fanOutID string) ([]str
 				})
 			if result.Error != nil {
 				return result.Error
+			}
+
+			// Release any fleet concurrency slots held by the cancelled sub-jobs,
+			// atomically with the cancel write, so a worker that dies before its
+			// deferred release cannot orphan a live slot for a now-terminal job.
+			if err := tx.Where("job_id IN ?", cancelled).Delete(&core.ConcurrencySlot{}).Error; err != nil {
+				return err
 			}
 			return nil
 		})
