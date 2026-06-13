@@ -1186,19 +1186,27 @@ func (s *GormStorage) ReleaseStaleLocks(ctx context.Context, staleDuration time.
 		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 			// ORDER BY matches idx_jobs_stale_lock's freshness expression, so
 			// the planner can use it while the per-tick cap bounds the update.
-			if err := tx.Model(&core.Job{}).
+			q := tx.Model(&core.Job{}).
 				Where("status = ?", core.StatusRunning).
 				Where("COALESCE(last_heartbeat_at, started_at, locked_until) < ?", cutoff).
 				Order("COALESCE(last_heartbeat_at, started_at, locked_until) ASC").
-				Limit(maxResumeBatch).
-				Pluck("id", &released).Error; err != nil {
+				Limit(maxResumeBatch)
+			q = s.lockForUpdate(q, true)
+			if err := q.Pluck("id", &released).Error; err != nil {
 				return err
 			}
 			if len(released) == 0 {
 				return nil
 			}
+			// Defense-in-depth: the FOR UPDATE SKIP LOCKED above already froze the
+			// plucked set, so these rows cannot change under us — but re-asserting
+			// the staleness predicate keeps the UPDATE self-guarding (it can never
+			// revert a row that is no longer running/stale even if a future change
+			// drops the row lock).
 			return tx.Model(&core.Job{}).
 				Where("id IN ?", released).
+				Where("status = ?", core.StatusRunning).
+				Where("COALESCE(last_heartbeat_at, started_at, locked_until) < ?", cutoff).
 				Updates(map[string]any{
 					"status":       core.StatusPending,
 					"locked_by":    "",
@@ -1929,33 +1937,31 @@ func (s *GormStorage) GetStalledFanOutParents(ctx context.Context, olderThan tim
 // matches GetStalledFanOutParents: recovery is idempotent and self-draining.
 func (s *GormStorage) GetCompletablePendingFanOuts(ctx context.Context, olderThan time.Time) ([]*core.FanOut, error) {
 	var fanOuts []*core.FanOut
+	// The terminal-child counts are computed by correlated subqueries scoped to
+	// each candidate fan-out (f.id), AFTER the outer WHERE has narrowed to the
+	// small pending+waiting+old working set. This makes the child scan O(children
+	// of the few candidate fan-outs) — an index lookup on (fan_out_id, status) per
+	// candidate — instead of aggregating terminal children of every fan-out ever.
+	// Correlated scalar subqueries are portable across SQLite/PostgreSQL/MySQL.
+	// Equivalence with the prior derived-table form: terminal_count>=total_count
+	// OR failed_count>0 OR cancelled_count>0  ⟺  count(completed|failed|cancelled)
+	// >= total_count OR count(failed|cancelled) > 0.
 	err := s.db.WithContext(ctx).Raw(`
 		SELECT f.* FROM fan_outs f
 		INNER JOIN jobs j ON j.id = f.parent_job_id
-		LEFT JOIN (
-			SELECT fan_out_id,
-				COUNT(*) AS terminal_count,
-				SUM(CASE WHEN status = ? THEN 1 ELSE 0 END) AS failed_count,
-				SUM(CASE WHEN status = ? THEN 1 ELSE 0 END) AS cancelled_count
-			FROM jobs
-			WHERE fan_out_id IS NOT NULL
-			AND status IN (?, ?, ?)
-			GROUP BY fan_out_id
-		) counts ON counts.fan_out_id = f.id
 		WHERE f.status = ?
 		AND j.status = ?
 		AND f.created_at < ?
 		AND (
-			COALESCE(counts.terminal_count, 0) >= f.total_count
-			OR COALESCE(counts.failed_count, 0) > 0
-			OR COALESCE(counts.cancelled_count, 0) > 0
+			(SELECT COUNT(*) FROM jobs c WHERE c.fan_out_id = f.id AND c.status IN (?, ?, ?)) >= f.total_count
+			OR (SELECT COUNT(*) FROM jobs c WHERE c.fan_out_id = f.id AND c.status IN (?, ?)) > 0
 		)
 		LIMIT ?
 	`,
-		core.StatusFailed,
-		core.StatusCancelled,
+		core.FanOutPending, core.StatusWaiting, olderThan,
 		core.StatusCompleted, core.StatusFailed, core.StatusCancelled,
-		core.FanOutPending, core.StatusWaiting, olderThan, maxResumeBatch,
+		core.StatusFailed, core.StatusCancelled,
+		maxResumeBatch,
 	).Scan(&fanOuts).Error
 	if err != nil {
 		return nil, err

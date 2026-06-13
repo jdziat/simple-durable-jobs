@@ -876,6 +876,34 @@ func TestReleaseStaleLocks_ReclaimsByLastContactNotStackedLease(t *testing.T) {
 	assert.Empty(t, row.LockedBy)
 }
 
+func TestReleaseStaleLocks_DoesNotReclaimRecentlyHeartbeatedJob(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	require.NoError(t, s.Enqueue(ctx, newTestJob("default", "task.run")))
+
+	got, err := s.Dequeue(ctx, []string{"default"}, "worker-1")
+	require.NoError(t, err)
+	require.NotNil(t, got)
+
+	past := time.Now().Add(-2 * time.Hour)
+	require.NoError(t, s.db.Model(&core.Job{}).
+		Where("id = ?", got.ID).
+		Updates(map[string]any{"started_at": past, "locked_until": past}).Error)
+	require.NoError(t, s.Heartbeat(ctx, got.ID, "worker-1"))
+
+	released, err := s.ReleaseStaleLocks(ctx, time.Hour)
+	require.NoError(t, err)
+	assert.Empty(t, released, "recent heartbeat must keep the running job live")
+
+	row, err := s.GetJob(ctx, got.ID)
+	require.NoError(t, err)
+	require.NotNil(t, row)
+	assert.Equal(t, core.StatusRunning, row.Status)
+	assert.Equal(t, "worker-1", row.LockedBy)
+	require.NotNil(t, row.LastHeartbeatAt)
+}
+
 // TestReleaseStaleLocks_NullHeartbeatFallsBackToStartedAt covers the COALESCE
 // middle term: a job dequeued but never heartbeated (last_heartbeat_at NULL)
 // must be reclaimed once started_at falls past the cutoff, even with a fresh
@@ -2941,6 +2969,50 @@ func TestGetCompletablePendingFanOuts(t *testing.T) {
 	assert.False(t, gotParents[runningParent.ID], "running-parent fan-out must be excluded")
 	assert.False(t, gotParents[recentParent.ID], "recent fan-out must be excluded")
 	assert.False(t, gotParents[doneParent.ID], "already-terminal fan-out must be excluded")
+}
+
+func TestGetCompletablePendingFanOuts_IgnoresUnrelatedCompletedFanOutChildren(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	old := time.Now().Add(-10 * time.Minute)
+	cutoff := time.Now().Add(-2 * time.Minute)
+
+	pendingParent := &core.Job{Type: "wf.pending-strand", Queue: "default", Status: core.StatusWaiting}
+	require.NoError(t, s.Enqueue(ctx, pendingParent))
+	pendingFanOut := &core.FanOut{
+		ParentJobID: pendingParent.ID,
+		TotalCount:  2,
+		Strategy:    core.StrategyCollectAll,
+		Status:      core.FanOutPending,
+		CreatedAt:   old,
+	}
+	require.NoError(t, s.CreateFanOut(ctx, pendingFanOut))
+	seedFanOutChild(t, ctx, s, pendingFanOut.ID, core.StatusCompleted)
+	seedFanOutChild(t, ctx, s, pendingFanOut.ID, core.StatusCompleted)
+
+	completedParent := &core.Job{Type: "wf.completed-unrelated", Queue: "default", Status: core.StatusWaiting}
+	require.NoError(t, s.Enqueue(ctx, completedParent))
+	completedFanOut := &core.FanOut{
+		ParentJobID: completedParent.ID,
+		TotalCount:  3,
+		Strategy:    core.StrategyCollectAll,
+		Status:      core.FanOutCompleted,
+		CreatedAt:   old,
+	}
+	require.NoError(t, s.CreateFanOut(ctx, completedFanOut))
+	seedFanOutChild(t, ctx, s, completedFanOut.ID, core.StatusCompleted)
+	seedFanOutChild(t, ctx, s, completedFanOut.ID, core.StatusFailed)
+	seedFanOutChild(t, ctx, s, completedFanOut.ID, core.StatusCancelled)
+
+	got, err := s.GetCompletablePendingFanOuts(ctx, cutoff)
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	assert.Equal(t, pendingFanOut.ID, got[0].ID)
+	assert.Equal(t, pendingParent.ID, got[0].ParentJobID)
+	assert.Equal(t, 2, got[0].CompletedCount)
+	assert.Equal(t, 0, got[0].FailedCount)
+	assert.Equal(t, 0, got[0].CancelledCount)
 }
 
 // TestGetCompletablePendingFanOuts_LimitsBatch mirrors the stalled-parent batch

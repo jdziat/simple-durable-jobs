@@ -2817,6 +2817,32 @@ func TestWorker_NoHandlerSubJobAccountsToFanOut(t *testing.T) {
 	assert.Equal(t, int32(1), failedIncrements.Load())
 }
 
+func TestWorker_ReleaseAfterTerminalWriteError_UsesDetachedContext(t *testing.T) {
+	released := make(chan string, 1)
+	mock := &mockStorage{
+		releaseJobFunc: func(ctx context.Context, jobID string, _ string) error {
+			require.NoError(t, ctx.Err(), "release context must survive caller cancellation")
+			released <- jobID
+			return nil
+		},
+	}
+	q := queue.New(mock)
+	w := NewWorker(q, DisableRetry())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	w.releaseAfterTerminalWriteError(ctx, "terminal-release-job", "completion")
+
+	select {
+	case jobID := <-released:
+		assert.Equal(t, "terminal-release-job", jobID)
+	case <-time.After(time.Second):
+		t.Fatal("Release was not called after terminal write error")
+	}
+	assert.Equal(t, []string{"terminal-release-job"}, mock.getReleasedJobIDs())
+}
+
 func TestWorker_TransientCompleteError_ReleasesForRerun(t *testing.T) {
 	fanOutID := "fo-transient-complete"
 	transientErr := errors.New("complete unavailable")
