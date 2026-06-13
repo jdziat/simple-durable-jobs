@@ -23,6 +23,8 @@ description: "A Go library for durable job queues with checkpointed workflows, f
 {{< /hextra/hero-subtitle >}}
 </div>
 
+<p class="sdj-quietlink">Review the <a href="docs/advanced/guarantees/">Guarantees &amp; Production Readiness</a> page for the AS-IS warranty disclaimer, high-risk-use exclusion, execution semantics, and production tuning contract.</p>
+
 <div class="sdj-hero-buttons">
 {{< hextra/hero-button text="Get Started" link="docs/getting-started/" >}}
 {{< hextra/hero-button text="Migrate to v2" link="docs/migration-v1-to-v2/" style="background:transparent;border:1px solid var(--sdj-accent);color:var(--sdj-accent)" >}}
@@ -118,7 +120,7 @@ func main() {
   {{< hextra/feature-card
     icon="bell"
     title="Durable Signals"
-    subtitle="Send, wait, check, and drain durable signals to coordinate jobs with each other and with the outside world — buffered, FIFO, and exactly-once."
+    subtitle="Send, wait, check, and drain durable signals to coordinate jobs with each other and with the outside world — buffered, FIFO, and consumed exactly-once. (Handlers themselves are at-least-once; keep side effects idempotent.)"
   >}}
   {{< hextra/feature-card
     icon="exclamation-circle"
@@ -138,7 +140,7 @@ func main() {
   {{< hextra/feature-card
     icon="lock-closed"
     title="Payload Encryption"
-    subtitle="Plug in a codec to transparently encrypt job arguments, results, checkpoints, and error text (last_error / dead-letter reason) at rest, with key rotation, at the storage boundary."
+    subtitle="Plug in a codec to transparently encrypt job arguments, results, checkpoints, and error text (last_error / dead-letter reason) at rest, with key rotation, at the storage boundary. (opt-in; encrypts the listed fields at the application/storage boundary — it is not whole-database encryption and is not a compliance attestation.)"
   >}}
 {{< /hextra/feature-grid >}}
 

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"gorm.io/gorm"
@@ -35,7 +36,7 @@ type GormStorageOption func(*GormStorage)
 // dequeued or extended by a heartbeat. The default is 45 minutes.
 func WithStorageLockDuration(d time.Duration) GormStorageOption {
 	return func(s *GormStorage) {
-		s.lockDuration = d
+		s.lockDuration.Store(int64(d))
 	}
 }
 
@@ -68,7 +69,7 @@ var _ core.Storage = (*GormStorage)(nil)
 type GormStorage struct {
 	db              *gorm.DB
 	isSQLite        bool
-	lockDuration    time.Duration
+	lockDuration    atomic.Int64
 	codec           core.PayloadCodec
 	skipDefaultPool bool
 
@@ -80,7 +81,7 @@ type GormStorage struct {
 	// RetentionDeleteCheckpointsOnComplete option (wired through
 	// SetDeleteCheckpointsOnComplete) to bound the checkpoints table. Never
 	// affects the failure path — retry replay reads checkpoints.
-	deleteCheckpointsOnComplete bool
+	deleteCheckpointsOnComplete atomic.Bool
 }
 
 // NewGormStorage creates a new GORM-backed storage. For file-based SQLite under
@@ -114,7 +115,8 @@ func NewGormStorage(db *gorm.DB, opts ...GormStorageOption) *GormStorage {
 		dialector := db.Name()
 		isSQLite = strings.Contains(strings.ToLower(dialector), "sqlite")
 	}
-	s := &GormStorage{db: db, isSQLite: isSQLite, lockDuration: defaultLockDuration, codec: core.IdentityCodec}
+	s := &GormStorage{db: db, isSQLite: isSQLite, codec: core.IdentityCodec}
+	s.lockDuration.Store(int64(defaultLockDuration))
 	if s.isSQLite {
 		// NOTE: a one-shot PRAGMA only affects the single pooled connection it
 		// runs on; connections the pool opens later default to busy_timeout=0.
@@ -133,19 +135,24 @@ func NewGormStorage(db *gorm.DB, opts ...GormStorageOption) *GormStorage {
 	return s
 }
 
-// SetLockDuration updates the lock duration after construction.
+// SetLockDuration updates storage-wide lock state; last setter wins, so use
+// separate GormStorage instances for divergent per-worker config.
 // This is used by the worker when WithLockDuration is passed as a worker option.
 func (s *GormStorage) SetLockDuration(d time.Duration) {
-	s.lockDuration = d
+	s.lockDuration.Store(int64(d))
 }
 
-// SetDeleteCheckpointsOnComplete toggles transactional checkpoint GC on the
+// SetDeleteCheckpointsOnComplete toggles storage-wide checkpoint GC state; last
+// setter wins, so use separate GormStorage instances for divergent per-worker
+// config.
+//
+// It applies checkpoint GC on the
 // success terminal write. The worker calls it when the opt-in
 // RetentionDeleteCheckpointsOnComplete option is set. Default (unset) preserves
 // completed-job checkpoints so the dashboard can still show their phase results.
 // It never affects the failure path; retry replay always keeps checkpoints.
 func (s *GormStorage) SetDeleteCheckpointsOnComplete(enabled bool) {
-	s.deleteCheckpointsOnComplete = enabled
+	s.deleteCheckpointsOnComplete.Store(enabled)
 }
 
 // IsSQLite returns true if the storage is using SQLite.
@@ -432,7 +439,8 @@ func (s *GormStorage) EnqueueUnique(ctx context.Context, job *core.Job, uniqueKe
 func (s *GormStorage) Dequeue(ctx context.Context, queues []string, workerID string) (*core.Job, error) {
 	var job core.Job
 	now := time.Now()
-	lockUntil := now.Add(s.lockDuration)
+	lockDuration := time.Duration(s.lockDuration.Load())
+	lockUntil := now.Add(lockDuration)
 
 	// Get paused queues
 	pausedQueues, err := s.GetPausedQueues(ctx)
@@ -479,7 +487,7 @@ func (s *GormStorage) Dequeue(ctx context.Context, queues []string, workerID str
 	// check — it can never make a just-taken lock look already expired. Do not
 	// add a predicate that assumes the two reads are equal.
 	nowExpr := s.nowExpr()
-	lockUntilExpr := s.offsetExpr(s.lockDuration)
+	lockUntilExpr := s.offsetExpr(lockDuration)
 	silentDB := s.db.Session(&gorm.Session{Logger: s.db.Logger.LogMode(logger.Silent)})
 	err = silentDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		// FOR UPDATE SKIP LOCKED ensures:
@@ -632,7 +640,7 @@ func (s *GormStorage) Complete(ctx context.Context, jobID string, workerID strin
 		if result.RowsAffected == 0 {
 			return core.ErrJobNotOwned
 		}
-		if s.deleteCheckpointsOnComplete {
+		if s.deleteCheckpointsOnComplete.Load() {
 			if err := tx.Where("job_id = ?", jobID).Delete(&core.Checkpoint{}).Error; err != nil {
 				return err
 			}
@@ -658,7 +666,7 @@ func (s *GormStorage) CompleteWithResult(ctx context.Context, jobID, workerID st
 	}
 	// Success path: GC this job's checkpoints in the same tx ONLY when the
 	// opt-in is enabled (default off keeps them for the dashboard).
-	return s.accountTerminalWithFanOut(ctx, jobID, workerID, updates, "completed_count", s.deleteCheckpointsOnComplete)
+	return s.accountTerminalWithFanOut(ctx, jobID, workerID, updates, "completed_count", s.deleteCheckpointsOnComplete.Load())
 }
 
 // Fail marks a job as failed, optionally scheduling a retry.
@@ -1055,11 +1063,13 @@ func (s *GormStorage) Heartbeat(ctx context.Context, jobID string, workerID stri
 	if s.useDBClock() {
 		// Extend the lock on the DB clock so it stays comparable with the
 		// reaper's stale cutoff regardless of this worker's wall clock.
-		updates["locked_until"] = s.offsetExpr(s.lockDuration)
+		lockDuration := time.Duration(s.lockDuration.Load())
+		updates["locked_until"] = s.offsetExpr(lockDuration)
 		updates["last_heartbeat_at"] = s.nowExpr()
 	} else {
 		now := time.Now()
-		updates["locked_until"] = now.Add(s.lockDuration)
+		lockDuration := time.Duration(s.lockDuration.Load())
+		updates["locked_until"] = now.Add(lockDuration)
 		updates["last_heartbeat_at"] = now
 	}
 	result := s.db.WithContext(ctx).
@@ -1186,19 +1196,27 @@ func (s *GormStorage) ReleaseStaleLocks(ctx context.Context, staleDuration time.
 		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 			// ORDER BY matches idx_jobs_stale_lock's freshness expression, so
 			// the planner can use it while the per-tick cap bounds the update.
-			if err := tx.Model(&core.Job{}).
+			q := tx.Model(&core.Job{}).
 				Where("status = ?", core.StatusRunning).
 				Where("COALESCE(last_heartbeat_at, started_at, locked_until) < ?", cutoff).
 				Order("COALESCE(last_heartbeat_at, started_at, locked_until) ASC").
-				Limit(maxResumeBatch).
-				Pluck("id", &released).Error; err != nil {
+				Limit(maxResumeBatch)
+			q = s.lockForUpdate(q, true)
+			if err := q.Pluck("id", &released).Error; err != nil {
 				return err
 			}
 			if len(released) == 0 {
 				return nil
 			}
+			// Defense-in-depth: the FOR UPDATE SKIP LOCKED above already froze the
+			// plucked set, so these rows cannot change under us — but re-asserting
+			// the staleness predicate keeps the UPDATE self-guarding (it can never
+			// revert a row that is no longer running/stale even if a future change
+			// drops the row lock).
 			return tx.Model(&core.Job{}).
 				Where("id IN ?", released).
+				Where("status = ?", core.StatusRunning).
+				Where("COALESCE(last_heartbeat_at, started_at, locked_until) < ?", cutoff).
 				Updates(map[string]any{
 					"status":       core.StatusPending,
 					"locked_by":    "",
@@ -1929,33 +1947,31 @@ func (s *GormStorage) GetStalledFanOutParents(ctx context.Context, olderThan tim
 // matches GetStalledFanOutParents: recovery is idempotent and self-draining.
 func (s *GormStorage) GetCompletablePendingFanOuts(ctx context.Context, olderThan time.Time) ([]*core.FanOut, error) {
 	var fanOuts []*core.FanOut
+	// The terminal-child counts are computed by correlated subqueries scoped to
+	// each candidate fan-out (f.id), AFTER the outer WHERE has narrowed to the
+	// small pending+waiting+old working set. This makes the child scan O(children
+	// of the few candidate fan-outs) — an index lookup on (fan_out_id, status) per
+	// candidate — instead of aggregating terminal children of every fan-out ever.
+	// Correlated scalar subqueries are portable across SQLite/PostgreSQL/MySQL.
+	// Equivalence with the prior derived-table form: terminal_count>=total_count
+	// OR failed_count>0 OR cancelled_count>0  ⟺  count(completed|failed|cancelled)
+	// >= total_count OR count(failed|cancelled) > 0.
 	err := s.db.WithContext(ctx).Raw(`
 		SELECT f.* FROM fan_outs f
 		INNER JOIN jobs j ON j.id = f.parent_job_id
-		LEFT JOIN (
-			SELECT fan_out_id,
-				COUNT(*) AS terminal_count,
-				SUM(CASE WHEN status = ? THEN 1 ELSE 0 END) AS failed_count,
-				SUM(CASE WHEN status = ? THEN 1 ELSE 0 END) AS cancelled_count
-			FROM jobs
-			WHERE fan_out_id IS NOT NULL
-			AND status IN (?, ?, ?)
-			GROUP BY fan_out_id
-		) counts ON counts.fan_out_id = f.id
 		WHERE f.status = ?
 		AND j.status = ?
 		AND f.created_at < ?
 		AND (
-			COALESCE(counts.terminal_count, 0) >= f.total_count
-			OR COALESCE(counts.failed_count, 0) > 0
-			OR COALESCE(counts.cancelled_count, 0) > 0
+			(SELECT COUNT(*) FROM jobs c WHERE c.fan_out_id = f.id AND c.status IN (?, ?, ?)) >= f.total_count
+			OR (SELECT COUNT(*) FROM jobs c WHERE c.fan_out_id = f.id AND c.status IN (?, ?)) > 0
 		)
 		LIMIT ?
 	`,
-		core.StatusFailed,
-		core.StatusCancelled,
+		core.FanOutPending, core.StatusWaiting, olderThan,
 		core.StatusCompleted, core.StatusFailed, core.StatusCancelled,
-		core.FanOutPending, core.StatusWaiting, olderThan, maxResumeBatch,
+		core.StatusFailed, core.StatusCancelled,
+		maxResumeBatch,
 	).Scan(&fanOuts).Error
 	if err != nil {
 		return nil, err

@@ -642,7 +642,7 @@ mux.Handle("/jobs/", http.StripPrefix("/jobs", ui.Handler(storage,
 log.Fatal(http.ListenAndServe(":8080", mux))
 ```
 
-The dashboard is secure by default; use `ui.WithInsecureAllowUnauthenticated()` only for local development or trusted networks, and use an `ui.Authorizer` for production.
+The dashboard fails closed by default: without `ui.WithAuthorizer(...)` or `ui.WithInsecureAllowUnauthenticated()`, all dashboard RPCs (reads and mutations) return `PermissionDenied`. This is an authorization gate only — it does not provide transport encryption, CSRF protection, or audit logging; operate the dashboard behind your own TLS and network controls.
 
 ---
 

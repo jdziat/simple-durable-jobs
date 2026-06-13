@@ -1315,7 +1315,10 @@ func (w *Worker) failTerminalWithResult(ctx context.Context, storage failTermina
 }
 
 func (w *Worker) releaseAfterTerminalWriteError(ctx context.Context, jobID string, action string) {
-	if err := w.queue.Storage().Release(ctx, jobID, w.config.WorkerID); err != nil && !errors.Is(err, core.ErrJobNotOwned) {
+	releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+
+	if err := w.queue.Storage().Release(releaseCtx, jobID, w.config.WorkerID); err != nil && !errors.Is(err, core.ErrJobNotOwned) {
 		w.logger.Warn("failed to release job after transient terminal write error",
 			"job_id", jobID,
 			"action", action,

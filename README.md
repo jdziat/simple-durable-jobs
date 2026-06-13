@@ -35,10 +35,11 @@ existing database."
 
 Execution is **at-least-once**: handlers and `Call()` steps re-run from their
 last checkpoint after a crash, so **handlers must be idempotent**. Jobs are
-durable and never silently lost, and a job has a single active owner — lock
-timing is anchored to the database clock, so worker clock skew can't reclaim a
-live lock. See **[Guarantees & Production Readiness](https://jdziat.github.io/simple-durable-jobs/docs/advanced/guarantees/)**
-for the full contract, backend support tiers, and crash-recovery tuning.
+durable and designed not to be silently lost, and a job has a single active
+owner — lock timing is anchored to the database clock, so worker clock skew
+can't reclaim a live lock. See **[Guarantees & Production Readiness](https://jdziat.github.io/simple-durable-jobs/docs/advanced/guarantees/)**
+for the AS-IS warranty disclaimer, high-risk-use exclusion, full contract,
+backend support tiers, and crash-recovery tuning.
 
 ## Documentation
 
@@ -77,7 +78,7 @@ for the full contract, backend support tiers, and crash-recovery tuning.
 - **Dead-Letter Queue** - Explicit dead-letter metadata with list/count/requeue triage
 - **Retention / GC** - Automatic pruning of terminal jobs by per-status age window and consumed signals by opt-in age window; opt-in transactional checkpoint GC (`RetentionDeleteCheckpointsOnComplete`) bounds checkpoint growth, and a worker started with no retention configured logs a one-time WARN
 - **Execution Middleware** - Interceptors that wrap handler execution
-- **Payload Codec** - Pluggable encryption-at-rest for job arguments, results, checkpoints, and error text (`last_error` and the dead-letter reason suffix)
+- **Payload Codec** - Pluggable encryption-at-rest for job arguments, results, checkpoints, and error text (`last_error` and the dead-letter reason suffix) (opt-in; encrypts the listed fields at the application/storage boundary — it is not whole-database encryption and is not a compliance attestation.)
 - **Workflow Versioning** - GetVersion markers to evolve in-flight workflows safely across deploys
 - **Metrics** - Optional Prometheus / OpenTelemetry metrics exporter (queue depth, latency, throughput, failures)
 - **Observability** - Hooks, event streams, OpenTelemetry tracing, and an embedded web dashboard

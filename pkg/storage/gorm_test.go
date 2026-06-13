@@ -876,6 +876,34 @@ func TestReleaseStaleLocks_ReclaimsByLastContactNotStackedLease(t *testing.T) {
 	assert.Empty(t, row.LockedBy)
 }
 
+func TestReleaseStaleLocks_DoesNotReclaimRecentlyHeartbeatedJob(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	require.NoError(t, s.Enqueue(ctx, newTestJob("default", "task.run")))
+
+	got, err := s.Dequeue(ctx, []string{"default"}, "worker-1")
+	require.NoError(t, err)
+	require.NotNil(t, got)
+
+	past := time.Now().Add(-2 * time.Hour)
+	require.NoError(t, s.db.Model(&core.Job{}).
+		Where("id = ?", got.ID).
+		Updates(map[string]any{"started_at": past, "locked_until": past}).Error)
+	require.NoError(t, s.Heartbeat(ctx, got.ID, "worker-1"))
+
+	released, err := s.ReleaseStaleLocks(ctx, time.Hour)
+	require.NoError(t, err)
+	assert.Empty(t, released, "recent heartbeat must keep the running job live")
+
+	row, err := s.GetJob(ctx, got.ID)
+	require.NoError(t, err)
+	require.NotNil(t, row)
+	assert.Equal(t, core.StatusRunning, row.Status)
+	assert.Equal(t, "worker-1", row.LockedBy)
+	require.NotNil(t, row.LastHeartbeatAt)
+}
+
 // TestReleaseStaleLocks_NullHeartbeatFallsBackToStartedAt covers the COALESCE
 // middle term: a job dequeued but never heartbeated (last_heartbeat_at NULL)
 // must be reclaimed once started_at falls past the cutoff, even with a fresh
@@ -2943,6 +2971,50 @@ func TestGetCompletablePendingFanOuts(t *testing.T) {
 	assert.False(t, gotParents[doneParent.ID], "already-terminal fan-out must be excluded")
 }
 
+func TestGetCompletablePendingFanOuts_IgnoresUnrelatedCompletedFanOutChildren(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	old := time.Now().Add(-10 * time.Minute)
+	cutoff := time.Now().Add(-2 * time.Minute)
+
+	pendingParent := &core.Job{Type: "wf.pending-strand", Queue: "default", Status: core.StatusWaiting}
+	require.NoError(t, s.Enqueue(ctx, pendingParent))
+	pendingFanOut := &core.FanOut{
+		ParentJobID: pendingParent.ID,
+		TotalCount:  2,
+		Strategy:    core.StrategyCollectAll,
+		Status:      core.FanOutPending,
+		CreatedAt:   old,
+	}
+	require.NoError(t, s.CreateFanOut(ctx, pendingFanOut))
+	seedFanOutChild(t, ctx, s, pendingFanOut.ID, core.StatusCompleted)
+	seedFanOutChild(t, ctx, s, pendingFanOut.ID, core.StatusCompleted)
+
+	completedParent := &core.Job{Type: "wf.completed-unrelated", Queue: "default", Status: core.StatusWaiting}
+	require.NoError(t, s.Enqueue(ctx, completedParent))
+	completedFanOut := &core.FanOut{
+		ParentJobID: completedParent.ID,
+		TotalCount:  3,
+		Strategy:    core.StrategyCollectAll,
+		Status:      core.FanOutCompleted,
+		CreatedAt:   old,
+	}
+	require.NoError(t, s.CreateFanOut(ctx, completedFanOut))
+	seedFanOutChild(t, ctx, s, completedFanOut.ID, core.StatusCompleted)
+	seedFanOutChild(t, ctx, s, completedFanOut.ID, core.StatusFailed)
+	seedFanOutChild(t, ctx, s, completedFanOut.ID, core.StatusCancelled)
+
+	got, err := s.GetCompletablePendingFanOuts(ctx, cutoff)
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	assert.Equal(t, pendingFanOut.ID, got[0].ID)
+	assert.Equal(t, pendingParent.ID, got[0].ParentJobID)
+	assert.Equal(t, 2, got[0].CompletedCount)
+	assert.Equal(t, 0, got[0].FailedCount)
+	assert.Equal(t, 0, got[0].CancelledCount)
+}
+
 // TestGetCompletablePendingFanOuts_LimitsBatch mirrors the stalled-parent batch
 // cap: the backstop returns at most maxResumeBatch rows per tick.
 func TestGetCompletablePendingFanOuts_LimitsBatch(t *testing.T) {
@@ -4021,7 +4093,7 @@ func TestNewGormStorage_DefaultLockDuration(t *testing.T) {
 	require.NoError(t, err)
 
 	s := NewGormStorage(db)
-	assert.Equal(t, 45*time.Minute, s.lockDuration, "default lock duration should be 45 minutes")
+	assert.Equal(t, 45*time.Minute, time.Duration(s.lockDuration.Load()), "default lock duration should be 45 minutes")
 }
 
 func TestWithStorageLockDuration_SetsCustomDuration(t *testing.T) {
@@ -4031,7 +4103,7 @@ func TestWithStorageLockDuration_SetsCustomDuration(t *testing.T) {
 	require.NoError(t, err)
 
 	s := NewGormStorage(db, WithStorageLockDuration(2*time.Hour))
-	assert.Equal(t, 2*time.Hour, s.lockDuration)
+	assert.Equal(t, 2*time.Hour, time.Duration(s.lockDuration.Load()))
 }
 
 func TestSetLockDuration_OverridesValue(t *testing.T) {
@@ -4042,7 +4114,111 @@ func TestSetLockDuration_OverridesValue(t *testing.T) {
 
 	s := NewGormStorage(db)
 	s.SetLockDuration(90 * time.Minute)
-	assert.Equal(t, 90*time.Minute, s.lockDuration)
+	assert.Equal(t, 90*time.Minute, time.Duration(s.lockDuration.Load()))
+}
+
+func TestStorageWideSetters_ConcurrentWithHotPathReaders(t *testing.T) {
+	ctx := context.Background()
+	s := newConcurrentTestStorage(t)
+
+	s.SetLockDuration(3 * time.Minute)
+	heartbeatJob := newTestJob("default", "task.heartbeat")
+	require.NoError(t, s.Enqueue(ctx, heartbeatJob))
+	runningHeartbeatJob, err := s.Dequeue(ctx, []string{"default"}, "worker-heartbeat")
+	require.NoError(t, err)
+	require.NotNil(t, runningHeartbeatJob)
+
+	const completeJobs = 50
+	completeJobIDs := make([]string, 0, completeJobs)
+	for i := 0; i < completeJobs; i++ {
+		job := newTestJob("complete-race", "task.complete")
+		require.NoError(t, s.Enqueue(ctx, job))
+		running, err := s.Dequeue(ctx, []string{"complete-race"}, "worker-complete")
+		require.NoError(t, err)
+		require.NotNil(t, running)
+		require.NoError(t, s.SaveCheckpoint(ctx, &core.Checkpoint{
+			JobID:     running.ID,
+			CallIndex: 0,
+			CallType:  "step",
+		}))
+		completeJobIDs = append(completeJobIDs, running.ID)
+	}
+
+	stop := make(chan struct{})
+	var setters sync.WaitGroup
+	setters.Add(1)
+	go func() {
+		defer setters.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				s.SetLockDuration(2 * time.Minute)
+				s.SetDeleteCheckpointsOnComplete(true)
+				s.SetLockDuration(4 * time.Minute)
+				s.SetDeleteCheckpointsOnComplete(false)
+			}
+		}
+	}()
+
+	var readers sync.WaitGroup
+	readErrs := make(chan error, completeJobs+200)
+
+	readers.Add(1)
+	go func() {
+		defer readers.Done()
+		for i := 0; i < 200; i++ {
+			if err := s.Heartbeat(ctx, runningHeartbeatJob.ID, "worker-heartbeat"); err != nil {
+				readErrs <- err
+				return
+			}
+		}
+	}()
+
+	readers.Add(1)
+	go func() {
+		defer readers.Done()
+		for _, jobID := range completeJobIDs {
+			if err := s.Complete(ctx, jobID, "worker-complete"); err != nil {
+				readErrs <- err
+				return
+			}
+		}
+	}()
+
+	readers.Wait()
+	close(stop)
+	setters.Wait()
+	close(readErrs)
+	for err := range readErrs {
+		require.NoError(t, err)
+	}
+
+	s.SetLockDuration(7 * time.Minute)
+	s.SetDeleteCheckpointsOnComplete(true)
+
+	job := newTestJob("default", "task.configured")
+	require.NoError(t, s.Enqueue(ctx, job))
+	before := time.Now()
+	got, err := s.Dequeue(ctx, []string{"default"}, "worker-configured")
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	require.NotNil(t, got.LockedUntil)
+	assert.True(t, got.LockedUntil.After(before.Add(6*time.Minute)),
+		"LockedUntil %v should reflect the configured lock duration", got.LockedUntil)
+	assert.True(t, got.LockedUntil.Before(before.Add(8*time.Minute)),
+		"LockedUntil %v should reflect the configured lock duration", got.LockedUntil)
+
+	require.NoError(t, s.SaveCheckpoint(ctx, &core.Checkpoint{
+		JobID:     got.ID,
+		CallIndex: 0,
+		CallType:  "step",
+	}))
+	require.NoError(t, s.Complete(ctx, got.ID, "worker-configured"))
+	checkpoints, err := s.GetCheckpoints(ctx, got.ID)
+	require.NoError(t, err)
+	assert.Empty(t, checkpoints, "enabled checkpoint GC should take effect")
 }
 
 func TestDequeue_CustomLockDurationIsApplied(t *testing.T) {

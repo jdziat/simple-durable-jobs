@@ -98,6 +98,12 @@ func TestPostgresSchemaAssertions(t *testing.T) {
 	require.True(t, postgresIndexExists(t, db, "idx_concurrency_slots_expires_at"), "idx_concurrency_slots_expires_at must exist")
 	require.False(t, postgresIndexExists(t, db, "idx_rate_limit_windows_lookup"), "idx_rate_limit_windows_lookup must not exist after migration")
 	require.True(t, postgresIndexExists(t, db, "idx_signals_pending"), "idx_signals_pending must remain on postgres")
+	signalsPendingDef := strings.ToLower(postgresIndexDef(t, db, "idx_signals_pending"))
+	require.Contains(t, signalsPendingDef, "created_at", "idx_signals_pending must include created_at")
+	// X1: on Postgres it must be PARTIAL (WHERE consumed_at IS NULL) so the FIFO
+	// consume is a no-sort index scan; the full composite still top-N-sorts.
+	require.Contains(t, signalsPendingDef, "where", "idx_signals_pending must be partial on postgres:\n%s", signalsPendingDef)
+	require.Contains(t, signalsPendingDef, "consumed_at is null", "idx_signals_pending must be partial on consumed_at IS NULL:\n%s", signalsPendingDef)
 
 	for _, indexName := range []string{
 		"idx_jobs_priority",
@@ -109,6 +115,7 @@ func TestPostgresSchemaAssertions(t *testing.T) {
 		"idx_jobs_status",
 		"idx_jobs_run_at",
 		"idx_jobs_fan_out_id",
+		"idx_jobs_root_job_id",
 		"idx_signals_job_id",
 	} {
 		require.False(t, postgresIndexExists(t, db, indexName), "%s must not exist after migration", indexName)
@@ -154,9 +161,13 @@ func TestMySQLSchemaAssertions(t *testing.T) {
 	s := NewGormStorage(db)
 	require.NoError(t, s.Migrate(ctx))
 	requireMySQLDeadLetteredAtPrecision(t, db, 3)
+	requireMySQLDQEligibleAtType(t, db, "datetime(3)")
+	requireMySQLQueueTenantCollations(t, db)
 
 	require.NoError(t, s.Migrate(ctx), "second Migrate must not let AutoMigrate revert dead_lettered_at precision")
 	requireMySQLDeadLetteredAtPrecision(t, db, 3)
+	requireMySQLDQEligibleAtType(t, db, "datetime(3)")
+	requireMySQLQueueTenantCollations(t, db)
 
 	var activeUniqueKeyCount int
 	require.NoError(t, db.Raw(`
@@ -189,6 +200,7 @@ func TestMySQLSchemaAssertions(t *testing.T) {
 		"idx_jobs_status",
 		"idx_jobs_run_at",
 		"idx_jobs_fan_out_id",
+		"idx_jobs_root_job_id",
 	} {
 		require.False(t, mysqlIndexExists(t, db, indexName), "%s must not exist after migration", indexName)
 	}
@@ -220,6 +232,7 @@ func TestMySQLSchemaAssertions(t *testing.T) {
 	require.True(t, mysqlTableIndexExists(t, db, "signals", "idx_signals_consumed_at"), "idx_signals_consumed_at must exist on mysql")
 	require.False(t, mysqlTableIndexExists(t, db, "signals", "idx_signals_job_id"), "idx_signals_job_id must not exist after migration")
 	require.True(t, mysqlTableIndexExists(t, db, "signals", "idx_signals_pending"), "idx_signals_pending must remain on mysql")
+	require.Contains(t, mysqlIndexColumns(t, db, "signals", "idx_signals_pending"), "created_at", "idx_signals_pending must include created_at on mysql")
 	require.True(t, mysqlTableIndexExists(t, db, "concurrency_slots", "idx_concurrency_slots_expires_at"), "idx_concurrency_slots_expires_at must exist on mysql")
 	require.False(t, mysqlTableIndexExists(t, db, "rate_limit_windows", "idx_rate_limit_windows_lookup"), "idx_rate_limit_windows_lookup must not exist after migration")
 	requireMySQLGeneratedVarchar36Column(t, db, "pending_parent_ref")
@@ -241,6 +254,7 @@ func TestMySQLSchemaAssertions(t *testing.T) {
 	require.NoError(t, db.AutoMigrate(&core.Job{}))
 	requireMySQLDispatcherColumnsNotNull(t, db)
 	requireMySQLUniqueKeyCollations(t, db)
+	requireMySQLQueueTenantCollations(t, db)
 }
 
 func TestPostgresDequeuePlanUsesEligibleIndex(t *testing.T) {
@@ -519,6 +533,33 @@ func requireMySQLDeadLetteredAtPrecision(t *testing.T, db *gorm.DB, want int) {
 		  AND COLUMN_NAME = 'dead_lettered_at'
 	`).Scan(&precision).Error)
 	require.Equal(t, want, precision, "dead_lettered_at must be datetime(%d)", want)
+}
+
+func requireMySQLDQEligibleAtType(t *testing.T, db *gorm.DB, want string) {
+	t.Helper()
+	var columnType string
+	require.NoError(t, db.Raw(`
+		SELECT COLUMN_TYPE
+		FROM information_schema.COLUMNS
+		WHERE TABLE_SCHEMA = DATABASE()
+		  AND TABLE_NAME = 'jobs'
+		  AND COLUMN_NAME = 'dq_eligible_at'
+	`).Scan(&columnType).Error)
+	require.Equal(t, want, columnType, "dq_eligible_at column_type must be %s", want)
+}
+
+func requireMySQLQueueTenantCollations(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	var count int
+	require.NoError(t, db.Raw(`
+		SELECT COUNT(*)
+		FROM information_schema.COLUMNS
+		WHERE TABLE_SCHEMA = DATABASE()
+		  AND TABLE_NAME = 'jobs'
+		  AND COLUMN_NAME IN ('queue', 'tenant')
+		  AND COLLATION_NAME = 'utf8mb4_0900_as_cs'
+	`).Scan(&count).Error)
+	require.Equal(t, 2, count, "mysql queue and tenant columns must use utf8mb4_0900_as_cs")
 }
 
 func requireMySQLCheckConstraints(t *testing.T, db *gorm.DB) {

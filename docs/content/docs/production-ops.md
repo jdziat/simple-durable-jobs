@@ -234,6 +234,15 @@ lock) before rolling out the upgrade:
   fresh table, but minutes under the fleet lock at millions of rows. On large
   installs run it during a maintenance window or via an online-DDL tool
   (`pt-online-schema-change` / `gh-ost`) before upgrading.
+- **MySQL queue/tenant collation + signal index rebuild (v25).** v25 pins
+  `queue` and `tenant` to `utf8mb4_0900_as_cs`, so on MySQL these become
+  **case-sensitive** — `"Default"` and `"default"` are now *distinct* queues
+  (matching PostgreSQL, which was already case-sensitive). If a MySQL-only
+  deployment relied on case-insensitive queue/tenant matching, normalize your
+  queue/tenant names before upgrading. v25 also right-sizes `dq_eligible_at` to
+  `datetime(3)` and rebuilds `idx_signals_pending` to include `created_at` — all
+  table-copy/index `ALTER`s on MySQL, so the same maintenance-window guidance as
+  v15 applies on large installs.
 - **MySQL foreign keys (v14).** v14 adds `ON DELETE CASCADE` foreign keys from
   `checkpoints` / `signals` / `fan_outs` to `jobs(id)`. Two MySQL-specific
   consequences: (1) a child-row `INSERT` takes a shared lock on its parent `jobs`

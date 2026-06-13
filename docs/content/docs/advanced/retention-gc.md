@@ -147,10 +147,12 @@ replaceable at enqueue time, but the table will grow without a sweeper.
 
 ## Checkpoints
 
-Checkpoints are the per-call replay markers that make a job exactly-once. They
-are read only while a job is still being attempted (a pending/running dequeue
-replays from them); a successful job is terminal and never re-dequeued, so its
-checkpoints are dead weight after completion.
+Checkpoints are the per-call replay markers that let a job resume without
+re-running already-completed steps (the basis for exactly-once *effects* when
+your handlers are idempotent; execution itself is at-least-once). They are read
+only while a job is still being attempted (a pending/running dequeue replays
+from them); after a successful job reaches its terminal state, it is not
+designed to be re-dequeued, so its checkpoints are dead weight after completion.
 
 ### Bounding the checkpoints table
 
@@ -168,9 +170,10 @@ w := jobs.NewWorker(q,
 
 With this option, a successful job's checkpoints are deleted **in the same
 transaction** as its completion write. The delete commits or rolls back together
-with the status flip, so a crash can never leave a completed job with orphaned
-checkpoints, and a lost-ownership completion deletes nothing. The trade-off is
-that completed jobs then show an empty checkpoints panel in the dashboard.
+with the status flip; the library is designed so that a crash does not leave a
+completed job with orphaned checkpoints, and a lost-ownership completion deletes
+nothing. The trade-off is that completed jobs then show an empty checkpoints
+panel in the dashboard.
 
 This option requires no background sweep and works independently of the
 per-status windows — you can enable it with or without `WithRetention` windows.
@@ -180,10 +183,11 @@ per-status windows — you can enable it with or without `WithRetention` windows
 
 Checkpoint GC-on-complete only ever fires on **success**. Retryable failures
 move the job back to pending and the next attempt replays from its checkpoints,
-so deleting them there would break exactly-once replay. Terminally failed
-(dead-lettered) jobs also keep their checkpoints for debugging; they are removed
-only when a `RetentionFailedAfter` window deletes the terminal job row and its
-checkpoints together.
+so deleting them there would break replay from already-completed steps (the
+basis for exactly-once *effects* when handlers are idempotent; execution itself
+is at-least-once). Terminally failed (dead-lettered) jobs also keep their
+checkpoints for debugging; they are removed only when a `RetentionFailedAfter`
+window deletes the terminal job row and its checkpoints together.
 
 ## Storage support
 

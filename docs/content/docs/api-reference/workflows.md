@@ -106,7 +106,7 @@ Spawns sub-jobs in parallel and waits for all results. Must be called from withi
 
 Sub-jobs receive a deterministic `UniqueKey` of the form `fanout-<fanOutID>-<index>` so a crashed parent can replay without inserting duplicate children.
 
-If a worker crashes between completing the final sub-job and resuming the parent, the parent does not stall forever. A polling backstop scans for fan-outs left `pending` whose persisted counts already satisfy a terminal condition while the parent job still sits in `waiting`, and drives each one through the same completion path the live resume uses. The sweep only considers fan-outs older than `WithFanOutRecoveryStaleAge` (default 2 minutes), so a stranded parent is resumed within that window. Recovery reuses the live CAS/idempotent-resume path and can never double-resume. See [Guarantees]({{< relref "/docs/advanced/guarantees" >}}) for the underlying transactional invariant.
+If a worker crashes between completing the final sub-job and resuming the parent, the parent does not stall forever. A polling backstop scans for fan-outs left `pending` whose persisted counts already satisfy a terminal condition while the parent job still sits in `waiting`, and drives each one through the same completion path the live resume uses. The sweep only considers fan-outs older than `WithFanOutRecoveryStaleAge` (default 2 minutes), so a stranded parent is resumed within that window. Recovery reuses the live CAS/idempotent-resume path; the library is designed so that recovery does not double-resume, and the chaos suite asserts that behavior. See [Guarantees]({{< relref "/docs/advanced/guarantees" >}}) for the underlying transactional invariant.
 
 ```go
 results, err := jobs.FanOut[ProcessedItem](ctx, subJobs, jobs.FailFast())
