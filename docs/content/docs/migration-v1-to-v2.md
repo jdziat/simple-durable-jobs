@@ -20,7 +20,7 @@ on-disk schema, is unchanged. Migration is three find/replace steps.
 
 v1 and v2 are distinct module paths:
 `github.com/jdziat/simple-durable-jobs` and
-`github.com/jdziat/simple-durable-jobs/v2`. You can depend on both at once and
+`github.com/jdziat/simple-durable-jobs/v3`. You can depend on both at once and
 migrate package by package. The v1 line remains installable.
 
 ## Database Schema
@@ -33,7 +33,7 @@ safe: deploy v2 workers alongside v1, drain v1, then decommission v1.
 ## Step 1: Update the Import Path
 
 ```sh
-go get github.com/jdziat/simple-durable-jobs/v2@v2.0.0
+go get github.com/jdziat/simple-durable-jobs/v3@v2.0.0
 ```
 
 Rewrite imports across your code. The `/v2` suffix is the only module-path
@@ -42,7 +42,7 @@ change:
 ```sh
 # preview, then apply
 grep -rl 'github.com/jdziat/simple-durable-jobs' --include='*.go' . \
-  | xargs perl -pi -e 's|github\.com/jdziat/simple-durable-jobs(?!/v2)|github.com/jdziat/simple-durable-jobs/v2|g'
+  | xargs perl -pi -e 's|github\.com/jdziat/simple-durable-jobs(?!/v2)|github.com/jdziat/simple-durable-jobs/v3|g'
 goimports -w .   # or: gofmt -w .
 ```
 

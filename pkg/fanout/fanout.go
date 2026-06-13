@@ -6,9 +6,9 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
-	intctx "github.com/jdziat/simple-durable-jobs/v2/pkg/internal/context"
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/security"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/core"
+	intctx "github.com/jdziat/simple-durable-jobs/v3/pkg/internal/context"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/security"
 )
 
 // FanOut spawns sub-jobs in parallel and waits for all results.

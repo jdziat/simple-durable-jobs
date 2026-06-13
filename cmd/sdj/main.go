@@ -15,7 +15,7 @@ import (
 	"time"
 
 	mysqlcfg "github.com/go-sql-driver/mysql"
-	jobs "github.com/jdziat/simple-durable-jobs/v2"
+	jobs "github.com/jdziat/simple-durable-jobs/v3"
 	gormmysql "gorm.io/driver/mysql"
 	"gorm.io/driver/postgres"
 	"gorm.io/driver/sqlite"

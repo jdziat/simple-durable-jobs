@@ -20,9 +20,9 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/storage"
-	"github.com/jdziat/simple-durable-jobs/v2/ui"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/storage"
+	"github.com/jdziat/simple-durable-jobs/v3/ui"
 	"gorm.io/driver/postgres"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"

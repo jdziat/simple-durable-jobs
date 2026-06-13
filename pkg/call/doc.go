@@ -4,6 +4,6 @@
 // registered handlers. Results are automatically checkpointed, enabling
 // crash recovery and replay without re-executing completed calls.
 //
-// Most users should import the root package github.com/jdziat/simple-durable-jobs/v2
+// Most users should import the root package github.com/jdziat/simple-durable-jobs/v3
 // which re-exports the Call function.
 package call

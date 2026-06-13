@@ -35,7 +35,7 @@ import (
     "fmt"
     "time"
 
-    jobs "github.com/jdziat/simple-durable-jobs/v2"
+    jobs "github.com/jdziat/simple-durable-jobs/v3"
     "gorm.io/driver/sqlite"
     "gorm.io/gorm"
 )
@@ -80,7 +80,7 @@ Typed definitions keep the existing string-keyed routing model while giving Go
 producers compile-time checked arguments and results.
 
 ```go
-import typed "github.com/jdziat/simple-durable-jobs/v2/pkg/typed"
+import typed "github.com/jdziat/simple-durable-jobs/v3/pkg/typed"
 
 sendEmail := typed.Define(queue, "send-email", func(ctx context.Context, args EmailArgs) (EmailResult, error) {
     return EmailResult{MessageID: "msg_123"}, nil
@@ -112,7 +112,7 @@ import (
     "context"
     "fmt"
 
-    jobs "github.com/jdziat/simple-durable-jobs/v2"
+    jobs "github.com/jdziat/simple-durable-jobs/v3"
     "gorm.io/driver/sqlite"
     "gorm.io/gorm"
 )
@@ -201,7 +201,7 @@ import (
     "context"
     "fmt"
 
-    jobs "github.com/jdziat/simple-durable-jobs/v2"
+    jobs "github.com/jdziat/simple-durable-jobs/v3"
     "gorm.io/driver/sqlite"
     "gorm.io/gorm"
 )
@@ -320,7 +320,7 @@ import (
     "fmt"
     "time"
 
-    jobs "github.com/jdziat/simple-durable-jobs/v2"
+    jobs "github.com/jdziat/simple-durable-jobs/v3"
     "gorm.io/driver/sqlite"
     "gorm.io/gorm"
 )
@@ -376,7 +376,7 @@ import (
     "context"
     "fmt"
 
-    jobs "github.com/jdziat/simple-durable-jobs/v2"
+    jobs "github.com/jdziat/simple-durable-jobs/v3"
     "gorm.io/driver/sqlite"
     "gorm.io/gorm"
 )
@@ -421,7 +421,7 @@ import (
     "errors"
     "time"
 
-    jobs "github.com/jdziat/simple-durable-jobs/v2"
+    jobs "github.com/jdziat/simple-durable-jobs/v3"
     "gorm.io/driver/sqlite"
     "gorm.io/gorm"
 )
@@ -476,7 +476,7 @@ import (
     "context"
     "log"
 
-    jobs "github.com/jdziat/simple-durable-jobs/v2"
+    jobs "github.com/jdziat/simple-durable-jobs/v3"
     "gorm.io/driver/sqlite"
     "gorm.io/gorm"
 )
@@ -538,7 +538,7 @@ import (
     "flag"
     "fmt"
 
-    jobs "github.com/jdziat/simple-durable-jobs/v2"
+    jobs "github.com/jdziat/simple-durable-jobs/v3"
     "gorm.io/driver/postgres"
     "gorm.io/gorm"
 )
@@ -620,7 +620,7 @@ queue.ResumeJob(ctx, jobID)
 Mount a full-featured monitoring dashboard into any Go HTTP server.
 
 ```go
-import "github.com/jdziat/simple-durable-jobs/v2/ui"
+import "github.com/jdziat/simple-durable-jobs/v3/ui"
 
 ctx, cancel := context.WithCancel(context.Background())
 defer cancel()
@@ -769,7 +769,7 @@ queue.Register("agent-workflow", func(ctx context.Context, task AgentTask) error
 Optional Prometheus/OpenTelemetry metrics for queue depth, lifecycle counters, and duration histograms.
 
 ```go
-import jobsmetrics "github.com/jdziat/simple-durable-jobs/v2/pkg/metrics"
+import jobsmetrics "github.com/jdziat/simple-durable-jobs/v3/pkg/metrics"
 
 handler, meterProvider, err := jobsmetrics.NewPrometheusHandler()
 if err != nil {

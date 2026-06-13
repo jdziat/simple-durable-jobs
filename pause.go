@@ -3,9 +3,9 @@ package jobs
 import (
 	"context"
 
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/queue"
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/security"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/queue"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/security"
 )
 
 // PauseMode determines how pause operations behave.

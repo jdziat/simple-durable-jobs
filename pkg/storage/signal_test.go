@@ -10,7 +10,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/core"
 )
 
 func sendTestSignal(t *testing.T, ctx context.Context, s *GormStorage, jobID, name string, payload []byte) {

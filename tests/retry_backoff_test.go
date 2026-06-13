@@ -9,7 +9,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/jdziat/simple-durable-jobs/v2"
+	"github.com/jdziat/simple-durable-jobs/v3"
 )
 
 func TestRetryBackoff_PersistsConfiguredNextRunAcrossBackends(t *testing.T) {

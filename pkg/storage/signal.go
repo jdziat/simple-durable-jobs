@@ -7,7 +7,7 @@ import (
 
 	"gorm.io/gorm"
 
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/core"
 )
 
 // SendSignal persists a named signal for a job. It is buffered: a signal sent

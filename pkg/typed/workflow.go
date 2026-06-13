@@ -8,11 +8,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/fanout"
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/queue"
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/security"
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/signal"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/fanout"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/queue"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/security"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/signal"
 )
 
 // Result wraps a typed fan-out sub-job result with its index and error.

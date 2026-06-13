@@ -30,14 +30,14 @@ Enqueued metric job 6d389568
 Enqueued metric job 5d1583c5
 Enqueued metric job 9a4dcb97
 Queue depth before worker starts:
-jobs_queue_depth{otel_scope_name="github.com/jdziat/simple-durable-jobs/v2/pkg/metrics",otel_scope_schema_url="",otel_scope_version="",outcome="pending",queue="default"} 3
+jobs_queue_depth{otel_scope_name="github.com/jdziat/simple-durable-jobs/v3/pkg/metrics",otel_scope_schema_url="",otel_scope_version="",outcome="pending",queue="default"} 3
 Starting worker...
 [worker] Processing metric job 1
 [worker] Processing metric job 2
 [worker] Processing metric job 3
 Processed job metrics after worker completes:
-jobs_completed_total{job_type="metric-job",otel_scope_name="github.com/jdziat/simple-durable-jobs/v2/pkg/metrics",otel_scope_schema_url="",otel_scope_version="",outcome="completed",queue="default"} 3
-jobs_started_total{job_type="metric-job",otel_scope_name="github.com/jdziat/simple-durable-jobs/v2/pkg/metrics",otel_scope_schema_url="",otel_scope_version="",outcome="started",queue="default"} 3
+jobs_completed_total{job_type="metric-job",otel_scope_name="github.com/jdziat/simple-durable-jobs/v3/pkg/metrics",otel_scope_schema_url="",otel_scope_version="",outcome="completed",queue="default"} 3
+jobs_started_total{job_type="metric-job",otel_scope_name="github.com/jdziat/simple-durable-jobs/v3/pkg/metrics",otel_scope_schema_url="",otel_scope_version="",outcome="started",queue="default"} 3
 jobs_queue_depth: no pending series (queue drained)
 Histogram metrics also exist for jobs.wait.duration and jobs.run.duration.
 Metrics example complete: scraped real queue metrics

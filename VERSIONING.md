@@ -32,7 +32,7 @@ Removal happens only in the next major version.
 
 Shipped in `v2.0.0` (the deliberate major cut — see `MIGRATION-v2.md`):
 
-- Module import path moved to `github.com/jdziat/simple-durable-jobs/v2`.
+- Module import path moved to `github.com/jdziat/simple-durable-jobs/v3`.
 - `core.Storage.SuspendJob` → `MarkWaiting` and `SuspendJobWithDeadline` →
   `MarkWaitingWithDeadline` (the status they set is `waiting`).
 - Removed the deprecated `IsSuspendError` and `SuspendError` aliases

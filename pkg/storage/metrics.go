@@ -3,7 +3,7 @@ package storage
 import (
 	"context"
 
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/core"
 )
 
 // QueuePendingCounts returns per-queue pending job counts for optional metrics

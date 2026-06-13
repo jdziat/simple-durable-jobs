@@ -7,7 +7,7 @@ The `jobstest` package provides test fixtures and enqueue assertions for code
 that produces or consumes jobs. It is imported directly from the module root:
 
 ```go
-import "github.com/jdziat/simple-durable-jobs/v2/jobstest"
+import "github.com/jdziat/simple-durable-jobs/v3/jobstest"
 ```
 
 ## Queue fixture
@@ -24,7 +24,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/jdziat/simple-durable-jobs/v2/jobstest"
+	"github.com/jdziat/simple-durable-jobs/v3/jobstest"
 )
 
 type EmailArgs struct {

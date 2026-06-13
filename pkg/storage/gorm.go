@@ -13,8 +13,8 @@ import (
 	"gorm.io/gorm/clause"
 	"gorm.io/gorm/logger"
 
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/security"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/security"
 )
 
 const (

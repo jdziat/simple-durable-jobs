@@ -6,7 +6,7 @@ import (
 
 	"gorm.io/gorm"
 
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/core"
 )
 
 // DeleteTerminalJobsOlderThan deletes at most limit jobs in one terminal status

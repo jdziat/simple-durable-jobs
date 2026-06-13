@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/storage"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/storage"
 )
 
 var _ scheduledFireReader = (*storage.GormStorage)(nil)

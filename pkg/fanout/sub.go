@@ -1,7 +1,7 @@
 package fanout
 
 import (
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/queue"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/queue"
 )
 
 // Sub creates a sub-job definition. A queue.Timeout option bounds this

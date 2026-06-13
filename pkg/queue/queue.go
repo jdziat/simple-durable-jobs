@@ -15,11 +15,11 @@ import (
 
 	"gorm.io/gorm"
 
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/internal/handler"
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/schedule"
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/security"
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/storage"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/internal/handler"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/schedule"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/security"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/storage"
 )
 
 // EnqueueMiddleware wraps the enqueue operation.
@@ -758,7 +758,7 @@ var WorkerFactory func(q *Queue, opts ...any) core.Starter
 // Options should be worker.WorkerOption values.
 func (q *Queue) NewWorker(opts ...any) core.Starter {
 	if WorkerFactory == nil {
-		panic("jobs: WorkerFactory not initialized - import github.com/jdziat/simple-durable-jobs/v2 to initialize")
+		panic("jobs: WorkerFactory not initialized - import github.com/jdziat/simple-durable-jobs/v3 to initialize")
 	}
 	return WorkerFactory(q, opts...)
 }

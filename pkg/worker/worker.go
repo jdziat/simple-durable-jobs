@@ -12,14 +12,14 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
-	intctx "github.com/jdziat/simple-durable-jobs/v2/pkg/internal/context"
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/internal/handler"
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/queue"
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/schedule"
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/security"
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/signal"
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/storage"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/core"
+	intctx "github.com/jdziat/simple-durable-jobs/v3/pkg/internal/context"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/internal/handler"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/queue"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/schedule"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/security"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/signal"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/storage"
 )
 
 // Worker processes jobs from the queue.

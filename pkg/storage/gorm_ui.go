@@ -11,8 +11,8 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 	"gorm.io/gorm"
 
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
-	jobsv1 "github.com/jdziat/simple-durable-jobs/v2/ui/gen/jobs/v1"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/core"
+	jobsv1 "github.com/jdziat/simple-durable-jobs/v3/ui/gen/jobs/v1"
 )
 
 const (

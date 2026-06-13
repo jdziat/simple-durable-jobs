@@ -35,18 +35,18 @@ import (
 
 	"gorm.io/gorm"
 
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/call"
-	payloadcodec "github.com/jdziat/simple-durable-jobs/v2/pkg/codec"
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/fanout"
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/jobctx"
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/queue"
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/schedule"
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/security"
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/signal"
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/storage"
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/typed"
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/worker"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/call"
+	payloadcodec "github.com/jdziat/simple-durable-jobs/v3/pkg/codec"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/fanout"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/jobctx"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/queue"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/schedule"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/security"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/signal"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/storage"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/typed"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/worker"
 )
 
 func init() {
