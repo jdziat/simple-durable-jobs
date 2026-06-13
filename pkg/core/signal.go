@@ -12,7 +12,7 @@ import "time"
 // and DrainSignals consume.
 type Signal struct {
 	ID    string `gorm:"primaryKey;size:36"`
-	JobID string `gorm:"index;index:idx_signals_pending,priority:1;size:36;not null"`
+	JobID string `gorm:"index:idx_signals_pending,priority:1;size:36;not null"`
 	Name  string `gorm:"index:idx_signals_pending,priority:2;size:255;not null"`
 	// Payload is the JSON-encoded signal value.
 	Payload []byte `gorm:"type:bytes"`

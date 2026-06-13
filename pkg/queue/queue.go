@@ -156,13 +156,22 @@ func (q *Queue) CallDirect(ctx context.Context, name string, argsJSON []byte) er
 // Enqueue adds a job to the queue. The job type must have a registered handler.
 // A Timeout option bounds this job's handler execution and overrides the
 // handler's registration-time timeout for this job.
+//
+// args is validated against the registered handler's argument type: passing a
+// different concrete struct, or a payload that cannot decode into it, returns
+// ErrJobArgsMismatch at the call instead of failing far later at dispatch.
+// Producers that intentionally send a dynamic or differently-shaped payload
+// (no local handler) should use EnqueueRemote/EnqueueTx, which are unchecked.
 func (q *Queue) Enqueue(ctx context.Context, name string, args any, opts ...Option) (string, error) {
 	q.mu.RLock()
-	_, ok := q.handlers[name]
+	h, ok := q.handlers[name]
 	q.mu.RUnlock()
 
 	if !ok {
 		return "", fmt.Errorf("jobs: no handler registered for %q", name)
+	}
+	if err := h.ValidateArgs(name, args); err != nil {
+		return "", err
 	}
 
 	return q.enqueue(ctx, name, args, opts...)
@@ -310,6 +319,15 @@ func (q *Queue) buildJob(name string, args any, options *Options) (*core.Job, er
 	// Enforce size limit on arguments
 	if len(argsBytes) > security.MaxJobArgsSize {
 		return nil, core.ErrJobArgsTooLarge
+	}
+	if options.Metadata != nil && options.MaxMetadataSize > 0 {
+		metadataBytes, err := json.Marshal(options.Metadata)
+		if err != nil {
+			return nil, fmt.Errorf("jobs: failed to marshal metadata: %w", err)
+		}
+		if len(metadataBytes) > options.MaxMetadataSize {
+			return nil, ErrJobMetadataTooLarge
+		}
 	}
 
 	// Clamp retries to maximum

@@ -30,6 +30,12 @@ var _ TxEnqueuer = (*GormStorage)(nil)
 var _ TxUniqueLockEnqueuer = (*GormStorage)(nil)
 
 // EnqueueTx adds a job using the caller-supplied transaction handle.
+//
+// Under MySQL, callers MUST wrap the owning transaction in
+// serialization-failure retry. The in-transaction unique-key FOR UPDATE dedup
+// can gap-lock deadlock under contention (surfaced as error 1213). Prefer
+// GormStorage.WithSerializationRetry around the full begin -> EnqueueTx ->
+// commit transaction.
 func (s *GormStorage) EnqueueTx(ctx context.Context, tx *gorm.DB, job *core.Job) error {
 	fillEnqueueDefaults(job)
 	row, err := s.encodedJobForCreate(job)
@@ -51,6 +57,12 @@ func (s *GormStorage) EnqueueTx(ctx context.Context, tx *gorm.DB, job *core.Job)
 }
 
 // EnqueueUniqueTx adds a unique job using the caller-supplied transaction handle.
+//
+// Under MySQL, callers MUST wrap the owning transaction in
+// serialization-failure retry. The in-transaction unique-key FOR UPDATE dedup
+// can gap-lock deadlock under contention (surfaced as error 1213). Prefer
+// GormStorage.WithSerializationRetry around the full begin -> EnqueueUniqueTx
+// -> commit transaction.
 func (s *GormStorage) EnqueueUniqueTx(ctx context.Context, tx *gorm.DB, job *core.Job, uniqueKey string) error {
 	fillEnqueueDefaults(job)
 	job.UniqueKey = uniqueKey
@@ -58,9 +70,7 @@ func (s *GormStorage) EnqueueUniqueTx(ctx context.Context, tx *gorm.DB, job *cor
 
 	query := db.Where("unique_key = ?", uniqueKey).
 		Where("status IN ?", []core.JobStatus{core.StatusPending, core.StatusRunning})
-	if !s.isSQLite {
-		query = query.Clauses(clause.Locking{Strength: "UPDATE"})
-	}
+	query = s.lockForUpdate(query, false)
 
 	var existing core.Job
 	err := query.First(&existing).Error
@@ -96,6 +106,12 @@ func (s *GormStorage) EnqueueWithUniqueLockTx(ctx context.Context, tx *gorm.DB, 
 }
 
 // EnqueueBatchTx inserts multiple jobs using the caller-supplied transaction handle.
+//
+// Under MySQL, callers MUST wrap the owning transaction in
+// serialization-failure retry. The in-transaction unique-key FOR UPDATE dedup
+// can gap-lock deadlock under contention (surfaced as error 1213). Prefer
+// GormStorage.WithSerializationRetry around the full begin -> EnqueueBatchTx
+// -> commit transaction.
 func (s *GormStorage) EnqueueBatchTx(ctx context.Context, tx *gorm.DB, jobs []*core.Job) error {
 	if len(jobs) == 0 {
 		return nil
@@ -132,9 +148,7 @@ func (s *GormStorage) enqueueBatchWithDB(db *gorm.DB, jobs []*core.Job) error {
 			Select("unique_key").
 			Where("unique_key IN ? AND status IN ?", keys,
 				[]core.JobStatus{core.StatusPending, core.StatusRunning, core.StatusCompleted})
-		if !s.isSQLite {
-			query = query.Clauses(clause.Locking{Strength: "UPDATE"})
-		}
+		query = s.lockForUpdate(query, false)
 
 		var found []string
 		if err := query.Pluck("unique_key", &found).Error; err != nil {

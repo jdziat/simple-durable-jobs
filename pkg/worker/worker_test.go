@@ -104,6 +104,18 @@ func (m *mockStorage) Complete(ctx context.Context, jobID string, workerID strin
 	return nil
 }
 
+func (m *mockStorage) CompleteWithResult(ctx context.Context, jobID, workerID string, result []byte) (*core.FanOut, error) {
+	if result != nil {
+		if err := m.SaveJobResult(ctx, jobID, workerID, result); err != nil {
+			return nil, err
+		}
+	}
+	if err := m.Complete(ctx, jobID, workerID); err != nil {
+		return nil, err
+	}
+	return nil, nil
+}
+
 func (m *mockStorage) Fail(ctx context.Context, jobID string, workerID string, errMsg string, retryAt *time.Time) error {
 	if m.failFunc != nil {
 		return m.failFunc(ctx, jobID, workerID, errMsg, retryAt)
@@ -3941,6 +3953,38 @@ func TestWorker_CompleteFanOut_ParentNotInWaitingStatus(t *testing.T) {
 	assert.NoError(t, err)
 }
 
+func TestWorker_CompleteFanOut_ParentResumeRetryStopsOnContextCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var attempts atomic.Int32
+	mock := &mockStorage{
+		updateFanOutStatusFunc: func(_ context.Context, _ string, _ core.FanOutStatus) (bool, error) {
+			return true, nil
+		},
+		resumeJobFunc: func(_ context.Context, _ string) (bool, error) {
+			attempts.Add(1)
+			cancel()
+			return false, nil
+		},
+	}
+	q := queue.New(mock)
+	w := NewWorker(q, WithStorageRetry(RetryConfig{MaxAttempts: 1}))
+
+	fo := &core.FanOut{
+		ID:          "fo-cancel",
+		ParentJobID: "parent-cancel",
+	}
+
+	start := time.Now()
+	err := w.completeFanOut(ctx, fo, core.FanOutCompleted)
+	elapsed := time.Since(start)
+
+	require.NoError(t, err)
+	assert.Equal(t, int32(1), attempts.Load())
+	assert.Less(t, elapsed, 100*time.Millisecond, "ctx cancellation should abort retry backoff promptly")
+}
+
 // TestWorker_HandleSubJobCompletion_FullFlow_Succeeded wires a real fan-out
 // counter increment into handleSubJobCompletion to exercise the path where
 // IncrementFanOutCompleted returns a non-nil FanOut that triggers completion.
@@ -4073,11 +4117,25 @@ func TestWorker_CheckFanOutCompletion_FailFastAllDone(t *testing.T) {
 // Handler result persistence tests
 // ---------------------------------------------------------------------------
 
-// trackingStorage wraps a real storage and records SaveJobResult calls.
+// trackingStorage wraps a real storage and records completion results.
 type trackingStorage struct {
 	core.Storage
 	mu           sync.Mutex
 	savedResults map[string][]byte
+}
+
+func (s *trackingStorage) CompleteWithResult(ctx context.Context, jobID, workerID string, result []byte) (*core.FanOut, error) {
+	fo, err := s.Storage.(completeWithResultStorage).CompleteWithResult(ctx, jobID, workerID, result)
+	if err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	if s.savedResults == nil {
+		s.savedResults = map[string][]byte{}
+	}
+	s.savedResults[jobID] = result
+	s.mu.Unlock()
+	return fo, nil
 }
 
 func (s *trackingStorage) SaveJobResult(ctx context.Context, jobID string, workerID string, result []byte) error {

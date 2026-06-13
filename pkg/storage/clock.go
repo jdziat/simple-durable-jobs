@@ -6,6 +6,8 @@ import (
 
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
+
+	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
 )
 
 // Dialect names returned by GormStorage.dialect.
@@ -66,6 +68,31 @@ func (s *GormStorage) dequeueEligibleExpr() string {
 		return "dq_eligible_at"
 	}
 	return "COALESCE(run_at, created_at)"
+}
+
+// lockForUpdate applies a SELECT ... FOR UPDATE row lock, with SKIP LOCKED when
+// skipLocked is true. SQLite has no row locks, so it is a no-op there.
+func (s *GormStorage) lockForUpdate(q *gorm.DB, skipLocked bool) *gorm.DB {
+	if s.isSQLite {
+		return q
+	}
+	opts := ""
+	if skipLocked {
+		opts = "SKIP LOCKED"
+	}
+	return q.Clauses(clause.Locking{Strength: "UPDATE", Options: opts})
+}
+
+// claimableCandidates applies the shared dequeue candidate predicate and
+// ordering. Callers add locking, limits, exclusions, and read shape.
+func (s *GormStorage) claimableCandidates(q *gorm.DB, queues []string, now any) *gorm.DB {
+	eligExpr := s.dequeueEligibleExpr()
+	return q.
+		Where("queue IN ?", queues).
+		Where("status = ?", core.StatusPending).
+		Where(eligExpr+" <= ?", now).
+		Where("(locked_until IS NULL OR locked_until < ?)", now).
+		Order("priority DESC, " + eligExpr + " ASC")
 }
 
 // offsetExpr returns a SQL expression for (DB now + d). A negative d yields a

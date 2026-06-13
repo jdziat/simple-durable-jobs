@@ -26,6 +26,12 @@ const (
 )
 
 const (
+	defaultRetentionCompletedAfter       = 30 * 24 * time.Hour
+	defaultRetentionFailedAfter          = 90 * 24 * time.Hour
+	defaultRetentionConsumedSignalsAfter = 7 * 24 * time.Hour
+)
+
+const (
 	defaultUniqueLockSweepInterval = time.Hour
 	minUniqueLockSweepInterval     = 100 * time.Millisecond
 	defaultUniqueLockSweepBatch    = 1000
@@ -87,6 +93,7 @@ type RateLimitConfig struct {
 // RetentionConfig controls automatic deletion of old terminal jobs and consumed
 // signal rows. A zero window keeps that category forever.
 type RetentionConfig struct {
+	Disabled             bool
 	CompletedAfter       time.Duration
 	FailedAfter          time.Duration
 	ConsumedSignalsAfter time.Duration
@@ -106,7 +113,7 @@ type RetentionConfig struct {
 // checkpoint-on-complete GC is NOT a sweep (it happens inline on the completion
 // write), so it does not by itself start the retention goroutine.
 func (c RetentionConfig) enabled() bool {
-	return c.CompletedAfter > 0 || c.FailedAfter > 0 || c.ConsumedSignalsAfter > 0
+	return !c.Disabled && (c.CompletedAfter > 0 || c.FailedAfter > 0 || c.ConsumedSignalsAfter > 0)
 }
 
 // WorkerConfig holds worker configuration.
@@ -116,6 +123,9 @@ type WorkerConfig struct {
 	WorkerID        string
 	EnableScheduler bool
 	currentQueue    string // internal: scopes Concurrency to this queue
+	// set by a top-level Concurrency() option; applied to the auto-created
+	// default queue when no WorkerQueue is configured.
+	topLevelConcurrency *int
 
 	// ConcurrencyCaps are optional DB-backed caps enforced across the fleet when
 	// the storage backend implements the worker's optional concurrency slot
@@ -206,9 +216,12 @@ type WorkerConfig struct {
 	DequeueBatchSize int
 
 	// Retention configures optional automatic garbage collection for terminal
-	// jobs and consumed signals. It is disabled by default; zero windows keep
-	// rows forever.
+	// jobs and consumed signals. If unset, NewWorker applies generous safe
+	// defaults; use RetentionDisabled to opt out. Zero windows in an explicit
+	// WithRetention config keep those rows forever.
 	Retention RetentionConfig
+
+	retentionSet bool
 
 	// UniqueLockSweep configures automatic garbage collection for expired
 	// IdempotencyKey/UniqueFor locks. It is enabled by default and independent
@@ -218,6 +231,10 @@ type WorkerConfig struct {
 
 // Concurrency sets the concurrency for a queue.
 // Values are clamped to [1, MaxConcurrency].
+//
+// Used at the top level (e.g. NewWorker(q, Concurrency(50))) it sets the
+// concurrency of the implicit "default" queue created when no WorkerQueue is
+// configured. Inside WorkerQueue(name, Concurrency(n)) it scopes to that queue.
 func Concurrency(n int) WorkerOption {
 	return workerOptionFunc(func(c *WorkerConfig) {
 		clamped := security.ClampConcurrency(n)
@@ -227,6 +244,8 @@ func Concurrency(n int) WorkerOption {
 			for k := range c.Queues {
 				c.Queues[k] = clamped
 			}
+			v := clamped
+			c.topLevelConcurrency = &v
 		}
 	})
 }
@@ -288,8 +307,8 @@ func RateLimit(name string, perSecond float64, opts ...RateLimitOption) WorkerOp
 	})
 }
 
-// DefaultRetention is an EXPLICIT opt-in conservative retention preset — it is
-// NOT a silent default. It enables automatic GC of terminal job rows and
+// DefaultRetention is an explicit conservative retention preset. It enables
+// automatic GC of terminal job rows and
 // consumed signals with conservative windows (completed jobs 7 days, terminal
 // failed/cancelled jobs 30 days, consumed signals 7 days). Tune individual
 // windows by composing the Retention* options under WithRetention instead.
@@ -306,12 +325,13 @@ func DefaultRetention() WorkerOption {
 	)
 }
 
-// WithRetention enables optional automatic garbage collection when at least one
-// retention window is positive. With no positive windows it is a no-op and
-// starts no retention goroutine.
+// WithRetention configures automatic garbage collection. Calling it explicitly
+// overrides the stock retention defaults; with no positive windows it starts no
+// retention goroutine.
 func WithRetention(opts ...RetentionOption) WorkerOption {
 	return workerOptionFunc(func(c *WorkerConfig) {
 		cfg := c.Retention
+		cfg.Disabled = false
 		for _, opt := range opts {
 			opt(&cfg)
 		}
@@ -327,6 +347,17 @@ func WithRetention(opts ...RetentionOption) WorkerOption {
 			}
 		}
 		c.Retention = cfg
+		c.retentionSet = true
+	})
+}
+
+// RetentionDisabled fully disables automatic deletion of terminal jobs and
+// consumed signals. Use this when retention is managed externally or rows must
+// be kept indefinitely.
+func RetentionDisabled() WorkerOption {
+	return workerOptionFunc(func(c *WorkerConfig) {
+		c.Retention = RetentionConfig{Disabled: true}
+		c.retentionSet = true
 	})
 }
 

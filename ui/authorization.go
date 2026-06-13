@@ -2,10 +2,15 @@ package ui
 
 import "context"
 
-// Action identifies a mutating dashboard RPC operation.
+// Action identifies a dashboard RPC operation.
 type Action string
 
 const (
+	ActionViewJobs    Action = "view_jobs"
+	ActionViewJob     Action = "view_job"
+	ActionViewStats   Action = "view_stats"
+	ActionWatchEvents Action = "watch_events"
+
 	ActionRetryJob       Action = "retry_job"
 	ActionDeleteJob      Action = "delete_job"
 	ActionBulkRetryJobs  Action = "bulk_retry_jobs"

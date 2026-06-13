@@ -5,7 +5,6 @@ import (
 	"time"
 
 	"gorm.io/gorm"
-	"gorm.io/gorm/clause"
 
 	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
 )
@@ -29,6 +28,13 @@ func (s *GormStorage) DeleteTerminalJobsOlderThan(ctx context.Context, status co
 		cutoff = time.Now().Add(-age).UTC()
 	}
 
+	parentChildGuard := "NOT EXISTS (SELECT 1 FROM jobs c WHERE c.parent_job_id = jobs.id AND c.status NOT IN ('completed','failed','cancelled'))"
+	rootChildGuard := "NOT EXISTS (SELECT 1 FROM jobs c WHERE c.root_job_id = jobs.id AND c.status NOT IN ('completed','failed','cancelled'))"
+	if s.dialect() == dialectMySQL {
+		parentChildGuard = "NOT EXISTS (SELECT 1 FROM jobs c WHERE c.pending_parent_ref = jobs.id)"
+		rootChildGuard = "NOT EXISTS (SELECT 1 FROM jobs c WHERE c.pending_root_ref = jobs.id)"
+	}
+
 	var deleted int64
 	err := s.withSerializationRetry(ctx, func() error {
 		deleted = 0
@@ -38,13 +44,12 @@ func (s *GormStorage) DeleteTerminalJobsOlderThan(ctx context.Context, status co
 				Where("status = ?", status).
 				Where("completed_at IS NOT NULL").
 				Where("completed_at < ?", cutoff).
-				Where("NOT EXISTS (SELECT 1 FROM jobs c WHERE (c.parent_job_id = jobs.id OR c.root_job_id = jobs.id) AND c.status NOT IN ('completed','failed','cancelled'))").
+				Where(parentChildGuard).
+				Where(rootChildGuard).
 				Where("NOT EXISTS (SELECT 1 FROM fan_outs f WHERE f.parent_job_id = jobs.id AND f.status = 'pending')").
 				Order("completed_at ASC, id ASC").
 				Limit(limit)
-			if !s.isSQLite {
-				query = query.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"})
-			}
+			query = s.lockForUpdate(query, true)
 			if err := query.Pluck("id", &ids).Error; err != nil {
 				return err
 			}

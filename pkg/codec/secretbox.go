@@ -18,6 +18,9 @@ var (
 	// ErrSecretboxAuthentication is returned when a versioned ciphertext cannot
 	// be authenticated with the primary key or any fallback key.
 	ErrSecretboxAuthentication = errors.New("jobs: secretbox payload authentication failed")
+	// ErrSecretboxLegacyPlaintext is returned by strict Secretbox codecs when a
+	// stored payload does not have the versioned ciphertext prefix.
+	ErrSecretboxLegacyPlaintext = errors.New("jobs: secretbox strict decode rejected legacy plaintext")
 )
 
 // Secretbox encrypts payload bytes with NaCl secretbox.
@@ -27,6 +30,7 @@ var (
 type Secretbox struct {
 	primary   [32]byte
 	fallbacks [][32]byte
+	strict    bool
 }
 
 var _ core.PayloadCodec = (*Secretbox)(nil)
@@ -37,6 +41,17 @@ func NewSecretbox(primaryKey [32]byte, fallbackKeys ...[32]byte) (*Secretbox, er
 	cp := make([][32]byte, len(fallbackKeys))
 	copy(cp, fallbackKeys)
 	return &Secretbox{primary: primaryKey, fallbacks: cp}, nil
+}
+
+// NewSecretboxStrict creates a codec that rejects un-prefixed legacy plaintext
+// during Decode. Use it after migrating existing plaintext payloads.
+func NewSecretboxStrict(primaryKey [32]byte, fallbackKeys ...[32]byte) (*Secretbox, error) {
+	c, err := NewSecretbox(primaryKey, fallbackKeys...)
+	if err != nil {
+		return nil, err
+	}
+	c.strict = true
+	return c, nil
 }
 
 // Encode encrypts plaintext with a fresh random nonce.
@@ -62,6 +77,9 @@ func (s *Secretbox) Decode(stored []byte) ([]byte, error) {
 		return stored, nil
 	}
 	if !bytes.HasPrefix(stored, magic) {
+		if s.strict {
+			return nil, ErrSecretboxLegacyPlaintext
+		}
 		return stored, nil
 	}
 	if len(stored) < len(magic)+24+secretbox.Overhead {

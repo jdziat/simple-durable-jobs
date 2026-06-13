@@ -21,6 +21,12 @@ import (
 // serialization is handled by the DB advisory lock in withMigrationLock.
 var migrateMu sync.Mutex
 
+var (
+	jobStatuses      = "'pending','running','completed','failed','retrying','waiting','cancelled','paused'"
+	fanOutStrategies = "'fail_fast','collect_all','threshold'"
+	fanOutStatuses   = "'pending','completed','failed'"
+)
+
 // migrateMinConns is the connection floor Migrate needs: one for the fleet lock
 // (held on a dedicated connection for the migration's duration) plus at least
 // one for the work. gorm's AutoMigrate is multi-statement and takes a pool
@@ -220,6 +226,36 @@ var schemaMigrations = []schemaMigration{
 		Name:    "deadletter_precision_align",
 		Up:      migrateDeadLetterPrecisionAlign,
 	},
+	{
+		Version: 19,
+		Name:    "retention_workflow_indexes",
+		Up:      migrateRetentionWorkflowIndexes,
+	},
+	{
+		Version: 20,
+		Name:    "scale_finish_indexes",
+		Up:      migrateScaleFinishIndexes,
+	},
+	{
+		Version: 21,
+		Name:    "indexing_qc1",
+		Up:      migrateIndexingQC1,
+	},
+	{
+		Version: 22,
+		Name:    "check_constraints",
+		Up:      migrateCheckConstraints,
+	},
+	{
+		Version: 23,
+		Name:    "metadata_integrity",
+		Up:      migrateMetadataIntegrity,
+	},
+	{
+		Version: 24,
+		Name:    "drop_redundant_signal_index",
+		Up:      migrateDropRedundantSignalIndex,
+	},
 }
 
 // applyPendingMigrations runs every migration whose version is absent from the
@@ -269,7 +305,8 @@ func isBenignDDLError(err error) bool {
 	return strings.Contains(m, "Error 1061") || strings.Contains(m, "Duplicate key name") || // index already exists
 		strings.Contains(m, "Error 1060") || strings.Contains(m, "Duplicate column name") || // column already exists
 		strings.Contains(m, "Error 1091") || strings.Contains(m, "check that column/key exists") || // dropping a missing index
-		strings.Contains(m, "Error 1826") || strings.Contains(m, "Duplicate foreign key constraint name") // FK already exists
+		strings.Contains(m, "Error 1826") || strings.Contains(m, "Duplicate foreign key constraint name") || // FK already exists
+		strings.Contains(m, "Error 3822") || strings.Contains(m, "Duplicate check constraint name") // CHECK already exists
 }
 
 // migrateReworkDequeueIndex replaces the original idx_jobs_dequeue, whose column
@@ -755,6 +792,350 @@ func migrateDeadLetterPrecisionAlign(ctx context.Context, db *gorm.DB, dialect s
 		return fmt.Errorf("modify dead_lettered_at precision: %w", err)
 	}
 	return nil
+}
+
+func migrateRetentionWorkflowIndexes(ctx context.Context, db *gorm.DB, dialect string) error {
+	switch dialect {
+	case dialectMySQL:
+		m := db.Migrator()
+		if !m.HasColumn(&core.Job{}, "pending_parent_ref") {
+			if err := db.WithContext(ctx).Exec(
+				"ALTER TABLE jobs ADD COLUMN pending_parent_ref varchar(36) " +
+					"GENERATED ALWAYS AS (CASE WHEN status NOT IN ('completed','failed','cancelled') " +
+					"THEN parent_job_id END) STORED",
+			).Error; err != nil && !isBenignDDLError(err) {
+				return fmt.Errorf("add pending_parent_ref column: %w", err)
+			}
+		}
+		if !m.HasColumn(&core.Job{}, "pending_root_ref") {
+			if err := db.WithContext(ctx).Exec(
+				"ALTER TABLE jobs ADD COLUMN pending_root_ref varchar(36) " +
+					"GENERATED ALWAYS AS (CASE WHEN status NOT IN ('completed','failed','cancelled') " +
+					"THEN root_job_id END) STORED",
+			).Error; err != nil && !isBenignDDLError(err) {
+				return fmt.Errorf("add pending_root_ref column: %w", err)
+			}
+		}
+		if !m.HasIndex(&core.Job{}, "idx_jobs_parent_nonterminal") {
+			if err := db.WithContext(ctx).Exec(
+				"CREATE INDEX idx_jobs_parent_nonterminal ON jobs (pending_parent_ref)",
+			).Error; err != nil && !isBenignDDLError(err) {
+				return fmt.Errorf("create idx_jobs_parent_nonterminal: %w", err)
+			}
+		}
+		if !m.HasIndex(&core.Job{}, "idx_jobs_root_nonterminal") {
+			if err := db.WithContext(ctx).Exec(
+				"CREATE INDEX idx_jobs_root_nonterminal ON jobs (pending_root_ref)",
+			).Error; err != nil && !isBenignDDLError(err) {
+				return fmt.Errorf("create idx_jobs_root_nonterminal: %w", err)
+			}
+		}
+		return nil
+	default:
+		if err := db.WithContext(ctx).Exec(
+			"CREATE INDEX IF NOT EXISTS idx_jobs_parent_nonterminal ON jobs (parent_job_id) WHERE status NOT IN ('completed','failed','cancelled')",
+		).Error; err != nil {
+			return fmt.Errorf("create idx_jobs_parent_nonterminal: %w", err)
+		}
+		if err := db.WithContext(ctx).Exec(
+			"CREATE INDEX IF NOT EXISTS idx_jobs_root_nonterminal ON jobs (root_job_id) WHERE status NOT IN ('completed','failed','cancelled')",
+		).Error; err != nil {
+			return fmt.Errorf("create idx_jobs_root_nonterminal: %w", err)
+		}
+		return nil
+	}
+}
+
+func migrateScaleFinishIndexes(ctx context.Context, db *gorm.DB, dialect string) error {
+	switch dialect {
+	case dialectMySQL:
+		m := db.Migrator()
+		if m.HasIndex(&core.Job{}, "idx_jobs_status") {
+			if err := m.DropIndex(&core.Job{}, "idx_jobs_status"); err != nil && !isBenignDDLError(err) {
+				return fmt.Errorf("drop idx_jobs_status: %w", err)
+			}
+		}
+		if !m.HasIndex(&core.Signal{}, "idx_signals_consumed_at") {
+			if err := db.WithContext(ctx).Exec(
+				"CREATE INDEX idx_signals_consumed_at ON signals (consumed_at, id)",
+			).Error; err != nil && !isBenignDDLError(err) {
+				return fmt.Errorf("create idx_signals_consumed_at: %w", err)
+			}
+		}
+		if m.HasIndex(&core.Job{}, "idx_jobs_retention_terminal") {
+			if err := m.DropIndex(&core.Job{}, "idx_jobs_retention_terminal"); err != nil && !isBenignDDLError(err) {
+				return fmt.Errorf("drop idx_jobs_retention_terminal: %w", err)
+			}
+		}
+		if err := db.WithContext(ctx).Exec(
+			"CREATE INDEX idx_jobs_retention_terminal ON jobs (status, completed_at, id)",
+		).Error; err != nil && !isBenignDDLError(err) {
+			return fmt.Errorf("create idx_jobs_retention_terminal: %w", err)
+		}
+		return nil
+	default:
+		if err := db.WithContext(ctx).Exec("DROP INDEX IF EXISTS idx_jobs_status").Error; err != nil {
+			return fmt.Errorf("drop idx_jobs_status: %w", err)
+		}
+		if err := db.WithContext(ctx).Exec(
+			"CREATE INDEX IF NOT EXISTS idx_signals_consumed_at ON signals (consumed_at, id) WHERE consumed_at IS NOT NULL",
+		).Error; err != nil {
+			return fmt.Errorf("create idx_signals_consumed_at: %w", err)
+		}
+		if err := db.WithContext(ctx).Exec("DROP INDEX IF EXISTS idx_jobs_retention_terminal").Error; err != nil {
+			return fmt.Errorf("drop idx_jobs_retention_terminal: %w", err)
+		}
+		if err := db.WithContext(ctx).Exec(
+			"CREATE INDEX IF NOT EXISTS idx_jobs_retention_terminal ON jobs (status, completed_at, id) WHERE status IN ('completed','failed','cancelled') AND completed_at IS NOT NULL",
+		).Error; err != nil {
+			return fmt.Errorf("create idx_jobs_retention_terminal: %w", err)
+		}
+		return nil
+	}
+}
+
+func migrateIndexingQC1(ctx context.Context, db *gorm.DB, dialect string) error {
+	// Keep idx_concurrency_slots_expires_at: DeleteExpiredConcurrencySlots is a
+	// global expires_at sweep, and idx_concurrency_slots_live leads slot_name.
+	switch dialect {
+	case dialectMySQL:
+		m := db.Migrator()
+		for _, indexName := range []string{
+			"idx_jobs_run_at",
+			"idx_jobs_fan_out_id",
+		} {
+			if m.HasIndex(&core.Job{}, indexName) {
+				if err := m.DropIndex(&core.Job{}, indexName); err != nil && !isBenignDDLError(err) {
+					return fmt.Errorf("drop %s: %w", indexName, err)
+				}
+			}
+		}
+		if m.HasIndex(&core.RateLimitWindow{}, "idx_rate_limit_windows_lookup") {
+			if err := m.DropIndex(&core.RateLimitWindow{}, "idx_rate_limit_windows_lookup"); err != nil && !isBenignDDLError(err) {
+				return fmt.Errorf("drop idx_rate_limit_windows_lookup: %w", err)
+			}
+		}
+		for _, spec := range []struct {
+			name string
+			sql  string
+		}{
+			{
+				name: "idx_jobs_status_created",
+				sql:  "CREATE INDEX idx_jobs_status_created ON jobs (status, created_at DESC)",
+			},
+			{
+				name: "idx_jobs_queue_created",
+				sql:  "CREATE INDEX idx_jobs_queue_created ON jobs (queue, created_at DESC)",
+			},
+			{
+				name: "idx_jobs_fan_out_status",
+				sql:  "CREATE INDEX idx_jobs_fan_out_status ON jobs (fan_out_id, status)",
+			},
+		} {
+			if !m.HasIndex(&core.Job{}, spec.name) {
+				if err := db.WithContext(ctx).Exec(spec.sql).Error; err != nil && !isBenignDDLError(err) {
+					return fmt.Errorf("create %s: %w", spec.name, err)
+				}
+			}
+		}
+		// R19 parity: MySQL's v8 idx_jobs_stale_lock is a plain composite
+		// (status, last_heartbeat_at, started_at, locked_until), so the reaper's
+		// ORDER BY COALESCE(last_heartbeat_at, started_at, locked_until) cannot
+		// ride it and filesorts the whole running set every tick. Rebuild it as
+		// an expression index (status, (COALESCE(...))) so MySQL gets the same
+		// index-ordered range scan PG/SQLite get from their functional/partial
+		// idx_jobs_stale_lock. Functional key parts need MySQL 8.0.13+.
+		if m.HasIndex(&core.Job{}, "idx_jobs_stale_lock") {
+			if err := m.DropIndex(&core.Job{}, "idx_jobs_stale_lock"); err != nil && !isBenignDDLError(err) {
+				return fmt.Errorf("drop idx_jobs_stale_lock: %w", err)
+			}
+		}
+		if err := db.WithContext(ctx).Exec(
+			"CREATE INDEX idx_jobs_stale_lock ON jobs (status, ((COALESCE(last_heartbeat_at, started_at, locked_until))))",
+		).Error; err != nil && !isBenignDDLError(err) {
+			return fmt.Errorf("create idx_jobs_stale_lock expression index: %w", err)
+		}
+		return nil
+	default:
+		for _, indexName := range []string{
+			"idx_jobs_run_at",
+			"idx_jobs_fan_out_id",
+			"idx_rate_limit_windows_lookup",
+		} {
+			if err := db.WithContext(ctx).Exec("DROP INDEX IF EXISTS " + indexName).Error; err != nil {
+				return fmt.Errorf("drop %s: %w", indexName, err)
+			}
+		}
+		for _, spec := range []struct {
+			name string
+			sql  string
+		}{
+			{
+				name: "idx_jobs_status_created",
+				sql:  "CREATE INDEX IF NOT EXISTS idx_jobs_status_created ON jobs (status, created_at DESC)",
+			},
+			{
+				name: "idx_jobs_queue_created",
+				sql:  "CREATE INDEX IF NOT EXISTS idx_jobs_queue_created ON jobs (queue, created_at DESC)",
+			},
+			{
+				name: "idx_jobs_fan_out_status",
+				sql:  "CREATE INDEX IF NOT EXISTS idx_jobs_fan_out_status ON jobs (fan_out_id, status)",
+			},
+		} {
+			if err := db.WithContext(ctx).Exec(spec.sql).Error; err != nil {
+				return fmt.Errorf("create %s: %w", spec.name, err)
+			}
+		}
+		return nil
+	}
+}
+
+// migrateCheckConstraints is migration-only: no gorm check tags, so AutoMigrate
+// never creates a dialect-mismatched constraint or flaps these on startup.
+// Postgres adds each CHECK as NOT VALID and then validates it; MySQL applies
+// utf8mb4_0900_as_cs COLLATE on string-enum operands so enum checks are
+// case-sensitive (R05x). SQLite is a no-op because ALTER TABLE ADD CHECK is not
+// supported there.
+func migrateCheckConstraints(ctx context.Context, db *gorm.DB, dialect string) error {
+	type checkConstraint struct {
+		model     any
+		table     string
+		name      string
+		pgExpr    string
+		mysqlExpr string
+	}
+
+	constraints := []checkConstraint{
+		{
+			model:     &core.Job{},
+			table:     "jobs",
+			name:      "chk_jobs_status",
+			pgExpr:    "status IN (" + jobStatuses + ")",
+			mysqlExpr: "status COLLATE utf8mb4_0900_as_cs IN (" + jobStatuses + ")",
+		},
+		{
+			model:     &core.Job{},
+			table:     "jobs",
+			name:      "chk_jobs_attempt_nonneg",
+			pgExpr:    "attempt >= 0",
+			mysqlExpr: "attempt >= 0",
+		},
+		{
+			model:     &core.Job{},
+			table:     "jobs",
+			name:      "chk_jobs_max_retries_nonneg",
+			pgExpr:    "max_retries >= 0",
+			mysqlExpr: "max_retries >= 0",
+		},
+		{
+			model:     &core.FanOut{},
+			table:     "fan_outs",
+			name:      "chk_fan_outs_strategy",
+			pgExpr:    "strategy IN (" + fanOutStrategies + ")",
+			mysqlExpr: "strategy COLLATE utf8mb4_0900_as_cs IN (" + fanOutStrategies + ")",
+		},
+		{
+			model:     &core.FanOut{},
+			table:     "fan_outs",
+			name:      "chk_fan_outs_status",
+			pgExpr:    "status IN (" + fanOutStatuses + ")",
+			mysqlExpr: "status COLLATE utf8mb4_0900_as_cs IN (" + fanOutStatuses + ")",
+		},
+		{
+			model:     &core.FanOut{},
+			table:     "fan_outs",
+			name:      "chk_fan_outs_counts_nonneg",
+			pgExpr:    "total_count >= 0 AND completed_count >= 0 AND failed_count >= 0 AND cancelled_count >= 0",
+			mysqlExpr: "total_count >= 0 AND completed_count >= 0 AND failed_count >= 0 AND cancelled_count >= 0",
+		},
+	}
+
+	m := db.Migrator()
+	switch dialect {
+	case dialectPostgres:
+		for _, constraint := range constraints {
+			if m.HasConstraint(constraint.model, constraint.name) {
+				continue
+			}
+			if err := db.WithContext(ctx).Exec(
+				fmt.Sprintf("ALTER TABLE %s ADD CONSTRAINT %s CHECK (%s) NOT VALID", constraint.table, constraint.name, constraint.pgExpr),
+			).Error; err != nil {
+				return fmt.Errorf("add %s: %w", constraint.name, err)
+			}
+			if err := db.WithContext(ctx).Exec(
+				fmt.Sprintf("ALTER TABLE %s VALIDATE CONSTRAINT %s", constraint.table, constraint.name),
+			).Error; err != nil {
+				return fmt.Errorf("validate %s: %w", constraint.name, err)
+			}
+		}
+		return nil
+	case dialectMySQL:
+		for _, constraint := range constraints {
+			if m.HasConstraint(constraint.model, constraint.name) {
+				continue
+			}
+			if err := db.WithContext(ctx).Exec(
+				fmt.Sprintf("ALTER TABLE %s ADD CONSTRAINT %s CHECK (%s)", constraint.table, constraint.name, constraint.mysqlExpr),
+			).Error; err != nil && !isBenignDDLError(err) {
+				return fmt.Errorf("add %s: %w", constraint.name, err)
+			}
+		}
+		return nil
+	default:
+		// CHECK enforcement is on the production engines (Postgres/MySQL);
+		// SQLite dev tables rely on the Go enum types.
+		return nil
+	}
+}
+
+// migrateMetadataIntegrity is migration-only: no gorm check tag, so
+// AutoMigrate never creates or flaps it. The OR guard accepts NULL, empty
+// string, and valid JSON, and rejects only non-empty invalid JSON, which the
+// json serializer never produces.
+func migrateMetadataIntegrity(ctx context.Context, db *gorm.DB, dialect string) error {
+	switch dialect {
+	case dialectMySQL:
+		const (
+			name = "chk_jobs_metadata_json"
+			expr = "metadata IS NULL OR metadata = '' OR JSON_VALID(metadata)"
+		)
+		m := db.Migrator()
+		if m.HasConstraint(&core.Job{}, name) {
+			return nil
+		}
+		if err := db.WithContext(ctx).Exec(
+			fmt.Sprintf("ALTER TABLE %s ADD CONSTRAINT %s CHECK (%s)", "jobs", name, expr),
+		).Error; err != nil && !isBenignDDLError(err) {
+			return fmt.Errorf("add %s: %w", name, err)
+		}
+		return nil
+	case dialectPostgres:
+		// PG already validates metadata via the idx_jobs_metadata_gin expression
+		// index ((NULLIF(metadata,'')::jsonb)), so a CHECK would be redundant.
+		return nil
+	default:
+		// SQLite is dev-only and ALTER TABLE ADD CHECK is unsupported there.
+		return nil
+	}
+}
+
+func migrateDropRedundantSignalIndex(ctx context.Context, db *gorm.DB, dialect string) error {
+	switch dialect {
+	case dialectMySQL:
+		m := db.Migrator()
+		if m.HasIndex(&core.Signal{}, "idx_signals_job_id") {
+			if err := m.DropIndex(&core.Signal{}, "idx_signals_job_id"); err != nil && !isBenignDDLError(err) {
+				return fmt.Errorf("drop idx_signals_job_id: %w", err)
+			}
+		}
+		return nil
+	default:
+		if err := db.WithContext(ctx).Exec("DROP INDEX IF EXISTS idx_signals_job_id").Error; err != nil {
+			return fmt.Errorf("drop idx_signals_job_id: %w", err)
+		}
+		return nil
+	}
 }
 
 func migrateIntegrityForeignKeys(ctx context.Context, db *gorm.DB, dialect string) error {

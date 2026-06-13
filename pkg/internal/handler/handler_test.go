@@ -876,3 +876,65 @@ func TestHandler_Execute_TwoReturnValues_ErrorReturnsNilBytes(t *testing.T) {
 	require.Error(t, err)
 	assert.Nil(t, resultBytes, "result bytes must be nil when handler returns an error")
 }
+
+// ---------------------------------------------------------------------------
+// ValidateArgs — args-vs-handler-type validation used by Queue.Enqueue.
+// (End-to-end coverage lives in pkg/queue; these exercise the rule branches
+// directly so the handler package credits its own logic.)
+// ---------------------------------------------------------------------------
+
+type validateOtherArgs struct {
+	Count int `json:"count"`
+}
+
+func TestValidateArgs(t *testing.T) {
+	withArgs, err := NewHandler(func(_ context.Context, _ testArgs) error { return nil })
+	require.NoError(t, err)
+	noArgs, err := NewHandler(func(_ context.Context) error { return nil })
+	require.NoError(t, err)
+
+	t.Run("nil ArgsType handler accepts anything", func(t *testing.T) {
+		require.Nil(t, noArgs.ArgsType)
+		assert.NoError(t, noArgs.ValidateArgs("noargs", testArgs{Name: "x"}))
+		assert.NoError(t, noArgs.ValidateArgs("noargs", "anything"))
+		assert.NoError(t, noArgs.ValidateArgs("noargs", nil))
+	})
+
+	t.Run("nil args passes", func(t *testing.T) {
+		assert.NoError(t, withArgs.ValidateArgs("h", nil))
+	})
+
+	t.Run("assignable value type passes", func(t *testing.T) {
+		assert.NoError(t, withArgs.ValidateArgs("h", testArgs{Name: "x", Value: 1}))
+	})
+
+	t.Run("pointer to the arg type passes (one-layer deref)", func(t *testing.T) {
+		assert.NoError(t, withArgs.ValidateArgs("h", &testArgs{Name: "x"}))
+	})
+
+	t.Run("different concrete struct is rejected", func(t *testing.T) {
+		err := withArgs.ValidateArgs("h", validateOtherArgs{Count: 7})
+		require.Error(t, err)
+		assert.ErrorIs(t, err, core.ErrJobArgsMismatch)
+	})
+
+	t.Run("scalar into a struct handler is rejected", func(t *testing.T) {
+		err := withArgs.ValidateArgs("h", "just-a-string")
+		require.Error(t, err)
+		assert.ErrorIs(t, err, core.ErrJobArgsMismatch)
+	})
+
+	t.Run("shape-compatible map passes (runtime-consistent leniency)", func(t *testing.T) {
+		assert.NoError(t, withArgs.ValidateArgs("h", map[string]any{"name": "x", "value": 2}))
+	})
+
+	t.Run("map with extra fields passes (not stricter than dispatch)", func(t *testing.T) {
+		assert.NoError(t, withArgs.ValidateArgs("h", map[string]any{"name": "x", "extra": true}))
+	})
+
+	t.Run("unmarshalable value is rejected", func(t *testing.T) {
+		err := withArgs.ValidateArgs("h", make(chan int))
+		require.Error(t, err)
+		assert.ErrorIs(t, err, core.ErrJobArgsMismatch)
+	})
+}

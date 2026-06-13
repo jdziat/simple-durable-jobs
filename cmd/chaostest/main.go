@@ -378,6 +378,8 @@ func runWorker(parent context.Context, a *app) error {
 	w := jobs.NewWorker(
 		a.q,
 		jobs.Concurrency(8),
+		jobs.ConcurrencyCap("chaos", 64),
+		jobs.RateLimit("chaos", 1000),
 		jobs.WithScheduler(true),
 		jobs.WithPollInterval(50*time.Millisecond),
 		jobs.WithStaleLockInterval(2*time.Second),
@@ -514,6 +516,15 @@ func resetHarnessData(ctx context.Context, db *gorm.DB, dialect string) error {
 func runCheck(ctx context.Context, a *app) error {
 	if err := waitForDrain(ctx, a.db, 120*time.Second, 10*time.Second); err != nil {
 		fmt.Printf("drain wait: %v\n", err)
+		inv := checkNoWedge(ctx, a.db)
+		status := "PASS"
+		if !inv.pass {
+			status = "FAIL"
+		}
+		fmt.Println("chaostest invariant report:")
+		fmt.Printf("%-26s %-4s %-4s %s\n", inv.name, inv.level, status, inv.detail)
+		fmt.Println("chaostest result: DID NOT DRAIN (wedged or still draining)")
+		return fmt.Errorf("chaostest did not drain: %w", err)
 	}
 
 	results := []invariant{
@@ -526,6 +537,8 @@ func runCheck(ctx context.Context, a *app) error {
 		checkSchedule(ctx, a.db),
 		checkSignalExactlyOnce(ctx, a.db),
 		checkTimerExactlyOnce(ctx, a.db),
+		checkSlotNoLeak(ctx, a.db),
+		checkRateWellFormed(ctx, a.db, a.dialect),
 	}
 
 	hardFailed := 0
@@ -725,6 +738,33 @@ func checkTimerExactlyOnce(ctx context.Context, db *gorm.DB) invariant {
 		level:  "HARD",
 		pass:   pass,
 		detail: fmt.Sprintf("expected=%d fired=%d reexec=%d unfinished=%d", expected, fired, reexec, unfinished),
+	}
+}
+
+func checkSlotNoLeak(ctx context.Context, db *gorm.DB) invariant {
+	var n int64
+	db.WithContext(ctx).Raw(`SELECT count(*) FROM concurrency_slots WHERE job_id <> '' AND expires_at > NOW()`).Scan(&n)
+	return invariant{
+		name:   "INV-SLOT-NO-LEAK",
+		level:  "HARD",
+		pass:   n == 0,
+		detail: fmt.Sprintf("live_nonsentinel_slots=%d", n),
+	}
+}
+
+func checkRateWellFormed(ctx context.Context, db *gorm.DB, dialect string) invariant {
+	countColumn := `"count"`
+	if dialect == "mysql" {
+		countColumn = "`count`"
+	}
+	var negs, total int64
+	db.WithContext(ctx).Raw(`SELECT count(*) FROM rate_limit_windows WHERE ` + countColumn + ` < 0`).Scan(&negs)
+	db.WithContext(ctx).Raw(`SELECT count(*) FROM rate_limit_windows`).Scan(&total)
+	return invariant{
+		name:   "INV-RATE-WELLFORMED",
+		level:  "HARD",
+		pass:   negs == 0,
+		detail: fmt.Sprintf("negative_counts=%d total_windows=%d", negs, total),
 	}
 }
 

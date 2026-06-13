@@ -335,8 +335,19 @@ still must be idempotent. See [Dead-Letter Queue]({{< relref
 
 ## Retention And GC
 
-Retention is disabled by default. Without retention, completed, failed,
-cancelled, and consumed-signal rows accumulate forever. Configure it on workers:
+Retention is enabled by default on workers with generous windows: completed
+jobs are deleted after 30 days, failed and cancelled jobs after 90 days, and
+consumed signals after 7 days. Disable it only if you manage retention
+externally or must keep terminal rows indefinitely:
+
+```go
+w := jobs.NewWorker(q,
+	jobs.RetentionDisabled(),
+)
+```
+
+Tune the windows explicitly when your operational policy needs different
+retention:
 
 ```go
 w := jobs.NewWorker(q,
@@ -350,13 +361,65 @@ w := jobs.NewWorker(q,
 )
 ```
 
-`jobs.DefaultRetention()` is an explicit opt-in preset: completed jobs 7 days,
+`jobs.DefaultRetention()` remains a conservative preset: completed jobs 7 days,
 terminal failed/cancelled jobs 30 days, consumed signals 7 days.
 
 Set `RetentionFailedAfter` long enough for operators to inspect and requeue DLQ
 rows. Retention deletes are permanent. See [Retention GC]({{< relref
 "/docs/advanced/retention-gc" >}}) for checkpoint GC, batch sizing, and storage
 support details.
+
+### Retention, Bloat & VACUUM
+
+Delete-based retention removes old rows from `jobs`, `checkpoints`, and
+`signals`, but PostgreSQL keeps the deleted row versions as dead tuples until
+VACUUM reclaims them. On high-write queues, tune autovacuum per table instead
+of relying only on the database-wide defaults:
+
+> **Why `jobs` bloats fastest.** A job's `status` transitions (pending → running
+> → completed/failed) are **non-HOT by construction**: PostgreSQL treats a
+> partial index's predicate columns as HOT-blocking, and `status` is a
+> predicate/key column of the dequeue, stale-lock, retention, and active-unique
+> indexes. Every status change therefore writes fresh index tuples (and dead old
+> ones), independent of how few indexes name `status` directly — which is exactly
+> why aggressive autovacuum on `jobs` matters. (The redundant full `idx_jobs_status`
+> was dropped in v20 to cut per-write index maintenance; the inherent non-HOT
+> cost on the remaining partial indexes is unavoidable for an indexed queue.)
+
+```sql
+ALTER TABLE jobs SET (
+  autovacuum_vacuum_scale_factor = 0.02,
+  autovacuum_vacuum_threshold = 1000
+);
+
+ALTER TABLE checkpoints SET (
+  autovacuum_vacuum_scale_factor = 0.02,
+  autovacuum_vacuum_threshold = 1000
+);
+
+ALTER TABLE signals SET (
+  autovacuum_vacuum_scale_factor = 0.02,
+  autovacuum_vacuum_threshold = 1000
+);
+```
+
+Very high-volume installs can avoid most delete bloat by partitioning retention
+tables by time and dropping old partitions instead of deleting rows in batches.
+That design is application-specific, but the goal is the same: remove cold data
+without forcing VACUUM to chase millions of dead row versions.
+
+Watch dead tuples with `pg_stat_user_tables`:
+
+```sql
+SELECT relname, n_live_tup, n_dead_tup
+FROM pg_stat_user_tables
+WHERE relname IN ('jobs', 'checkpoints', 'signals')
+ORDER BY n_dead_tup DESC;
+```
+
+Sustained growth in `n_dead_tup` after retention runs means autovacuum is not
+keeping up; lower the scale factor or threshold, increase autovacuum capacity,
+or move high-volume history to partition-drop retention.
 
 ## Operational Coverage
 

@@ -213,6 +213,10 @@ worker := queue.NewWorker(
 )
 ```
 
+Workers also run retention GC by default: completed jobs are kept for 30 days,
+failed and cancelled jobs for 90 days, and consumed signals for 7 days. Use
+`jobs.RetentionDisabled()` only when you manage retention outside the worker.
+
 {{< callout type="info" >}}
 When `Concurrency()` is used inside `WorkerQueue()`, it applies only to that queue. Each queue independently tracks how many jobs it has running and only dequeues more when below its limit.
 {{< /callout >}}
@@ -321,10 +325,13 @@ ctx, cancel := context.WithCancel(context.Background())
 defer cancel()
 
 mux.Handle("/jobs/", http.StripPrefix("/jobs", ui.Handler(storage,
-    ui.WithQueue(queue),      // Enable event streaming
-    ui.WithContext(ctx),      // Lifecycle context for graceful shutdown
+    ui.WithQueue(queue),                         // Enable event streaming
+    ui.WithContext(ctx),                         // Lifecycle context for graceful shutdown
+    ui.WithInsecureAllowUnauthenticated(),       // Local/trusted networks only
 )))
 ```
+
+The dashboard is secure by default; use `ui.WithInsecureAllowUnauthenticated()` only for local development or trusted networks, and use an `ui.Authorizer` for production.
 
 The dashboard shows real-time queue stats, historical charts, live event streaming, and job management controls.
 

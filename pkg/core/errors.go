@@ -14,6 +14,7 @@ var (
 	ErrInvalidQueueName   = errors.New("jobs: invalid queue name")
 	ErrQueueNameTooLong   = errors.New("jobs: queue name too long")
 	ErrJobArgsTooLarge    = errors.New("jobs: job arguments exceed size limit")
+	ErrJobArgsMismatch    = errors.New("jobs: job arguments do not match the registered handler's argument type")
 	ErrJobNotOwned        = errors.New("jobs: job not owned by this worker")
 	ErrDuplicateJob       = errors.New("jobs: duplicate job with same unique key")
 	ErrUniqueKeyTooLong   = errors.New("jobs: unique key exceeds maximum length")
@@ -122,6 +123,7 @@ var sentinelsByKey = map[string]error{
 	"ErrInvalidQueueName":   ErrInvalidQueueName,
 	"ErrQueueNameTooLong":   ErrQueueNameTooLong,
 	"ErrJobArgsTooLarge":    ErrJobArgsTooLarge,
+	"ErrJobArgsMismatch":    ErrJobArgsMismatch,
 	"ErrJobNotOwned":        ErrJobNotOwned,
 	"ErrDuplicateJob":       ErrDuplicateJob,
 	"ErrUniqueKeyTooLong":   ErrUniqueKeyTooLong,

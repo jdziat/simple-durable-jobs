@@ -630,9 +630,10 @@ mux.Handle("/jobs/", http.StripPrefix("/jobs", ui.Handler(storage,
     ui.WithQueue(queue),                       // Enable event streaming and scheduled jobs
     ui.WithContext(ctx),                        // Graceful shutdown for background workers
     ui.WithStatsRetention(7 * 24 * time.Hour), // Keep stats for 7 days
+    ui.WithInsecureAllowUnauthenticated(),     // Local/trusted networks only
     ui.WithMiddleware(func(next http.Handler) http.Handler {
         return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-            // Add authentication here
+            // Add logging, compression, or other HTTP middleware here.
             next.ServeHTTP(w, r)
         })
     }),
@@ -640,6 +641,8 @@ mux.Handle("/jobs/", http.StripPrefix("/jobs", ui.Handler(storage,
 
 log.Fatal(http.ListenAndServe(":8080", mux))
 ```
+
+The dashboard is secure by default; use `ui.WithInsecureAllowUnauthenticated()` only for local development or trusted networks, and use an `ui.Authorizer` for production.
 
 ---
 

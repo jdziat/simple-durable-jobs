@@ -3,8 +3,10 @@ title: "Dashboard Authorization"
 weight: 18
 ---
 
-The dashboard protects mutating Connect RPCs with an optional per-action
-`ui.Authorizer`. The dashboard does not impose an identity model. Your
+The dashboard protects every Connect RPC with a per-action `ui.Authorizer` by
+default. Without an authorizer, RPCs fail closed unless you explicitly opt in
+with `ui.WithInsecureAllowUnauthenticated()` for local development or trusted
+networks. The dashboard does not impose an identity model. Your
 middleware authenticates the request, extracts whatever principal your
 application uses, and stores it on the request context. The authorizer receives
 that context and the requested dashboard action.
@@ -41,6 +43,8 @@ func (DashboardAuthorizer) Authorize(ctx context.Context, action ui.Action) erro
 	}
 
 	switch action {
+	case ui.ActionViewJobs, ui.ActionViewJob, ui.ActionViewStats, ui.ActionWatchEvents:
+		return nil
 	case ui.ActionRetryJob, ui.ActionBulkRetryJobs:
 		if user.Role == "operator" || user.Role == "admin" {
 			return nil
@@ -106,6 +110,18 @@ return a `*connect.Error`, its code is preserved, so policies can return
 
 ## Actions
 
+The dashboard passes one of these actions for read RPCs:
+
+| Action | RPC |
+|---|---|
+| `ui.ActionViewStats` | `GetStats`, `GetStatsHistory`, `ListQueues` |
+| `ui.ActionViewJobs` | `ListJobs`, `ListScheduledJobs`, `ListWorkflows` |
+| `ui.ActionViewJob` | `GetJob`, `GetWorkflow` |
+| `ui.ActionWatchEvents` | `WatchEvents` |
+
+Unknown read RPCs default to `ui.ActionViewJobs` so new procedures are not left
+ungated.
+
 The dashboard passes one of these actions for mutating RPCs:
 
 | Action | RPC |
@@ -121,21 +137,51 @@ The dashboard passes one of these actions for mutating RPCs:
 | `ui.ActionResumeQueue` | `ResumeQueue` |
 | `ui.ActionPurgeQueue` | `PurgeQueue` |
 
-Read-only RPCs are never passed to the authorizer.
+## Default Gate
 
-## Existing Write Gate
+`ui.Handler` is secure by default. Without `ui.WithAuthorizer(...)` or
+`ui.WithInsecureAllowUnauthenticated()`, all dashboard RPCs return
+`PermissionDenied`. Static frontend assets remain public because they do not
+carry job payloads or metadata.
 
-Without `ui.WithAuthorizer`, dashboard write behavior is unchanged: mutating
-RPCs require either `ui.WithMiddleware(...)` or
-`ui.WithInsecureAllowUnauthenticatedWrites()`.
+Use the insecure opt-in only for local development or a trusted network:
 
-When `ui.WithAuthorizer` is set, it governs mutating dashboard RPCs directly.
-You usually still pair it with middleware so the authorizer has a principal to
-read, but the dashboard does not require a specific middleware or identity
-type.
+```go
+http.Handle("/jobs/", http.StripPrefix("/jobs", ui.Handler(
+	store,
+	ui.WithQueue(q),
+	ui.WithInsecureAllowUnauthenticated(),
+)))
+```
 
-`ui.WithInsecureAllowUnauthenticatedWrites()` remains a development and test
-escape hatch for deployments that do not configure an authorizer.
+`ui.WithInsecureAllowUnauthenticatedWrites()` remains available as a deprecated
+alias for `ui.WithInsecureAllowUnauthenticated()`. The alias now permits both
+reads and writes, matching the dashboard's unified explicit opt-in.
+
+`ui.WithMiddleware(...)` does not grant access by itself. Middleware is useful
+for authentication, logging, headers, and principal injection, but RPC access is
+controlled only by `ui.WithAuthorizer(...)` or the explicit insecure opt-in.
+
+## Origin Checks for Mutations
+
+Mutating dashboard RPCs also check the browser `Origin` header. Requests with
+no `Origin` header are allowed so CLI and server-to-server Connect clients keep
+working. Browser requests with an `Origin` must be same-origin with the request
+host or match an explicit allow-list:
+
+```go
+http.Handle("/jobs/", http.StripPrefix("/jobs", ui.Handler(
+	store,
+	ui.WithMiddleware(authMiddleware),
+	ui.WithAuthorizer(DashboardAuthorizer{}),
+	ui.WithAllowedOrigins("https://ops.example.com"),
+)))
+```
+
+The embedded SPA is served from the same origin as the API, so it does not need
+this option. Cross-origin dashboard deployments do. If your authentication uses
+cookies or any automatically attached browser credential, keep this Origin check
+enabled and list only trusted dashboard origins.
 
 ## Programmatic Reuse
 

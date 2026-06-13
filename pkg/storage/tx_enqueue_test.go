@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -166,4 +167,22 @@ func TestGormStorage_EnqueueTx_Defaults(t *testing.T) {
 	assert.NotEmpty(t, job.ID)
 	assert.Equal(t, core.StatusPending, job.Status)
 	assert.Equal(t, "default", job.Queue)
+}
+
+func TestTxEnqueueGodocMentionsMySQLSerializationRetry(t *testing.T) {
+	src, err := os.ReadFile("tx_enqueue.go")
+	require.NoError(t, err)
+	text := string(src)
+
+	for _, method := range []string{"EnqueueTx", "EnqueueUniqueTx", "EnqueueBatchTx"} {
+		funcIdx := strings.Index(text, "func (s *GormStorage) "+method)
+		require.NotEqualf(t, -1, funcIdx, "missing %s implementation", method)
+		docStart := strings.LastIndex(text[:funcIdx], "// "+method)
+		require.NotEqualf(t, -1, docStart, "missing %s godoc", method)
+		doc := text[docStart:funcIdx]
+		assert.Contains(t, doc, "Under MySQL")
+		assert.Contains(t, doc, "MUST wrap the owning transaction")
+		assert.Contains(t, doc, "error 1213")
+		assert.Contains(t, doc, "GormStorage.WithSerializationRetry")
+	}
 }

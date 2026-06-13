@@ -77,6 +77,39 @@ func NewHandler(fn any) (*Handler, error) {
 	return handler, nil
 }
 
+func (h *Handler) ValidateArgs(name string, args any) error {
+	if h.ArgsType == nil {
+		return nil
+	}
+	if args == nil {
+		return nil
+	}
+
+	at := reflect.TypeOf(args)
+	argsType := h.ArgsType
+	if at.Kind() == reflect.Ptr {
+		at = at.Elem()
+	}
+	if argsType.Kind() == reflect.Ptr {
+		argsType = argsType.Elem()
+	}
+	if at.AssignableTo(argsType) {
+		return nil
+	}
+	if at.Kind() == reflect.Struct && argsType.Kind() == reflect.Struct && at != argsType {
+		return fmt.Errorf("%w: handler %q expects %s, got %s", core.ErrJobArgsMismatch, name, argsType, at)
+	}
+
+	b, err := json.Marshal(args)
+	if err != nil {
+		return fmt.Errorf("%w: %v", core.ErrJobArgsMismatch, err)
+	}
+	if err := json.Unmarshal(b, reflect.New(argsType).Interface()); err != nil {
+		return fmt.Errorf("%w: %v", core.ErrJobArgsMismatch, err)
+	}
+	return nil
+}
+
 // Execute runs the handler with the given context and arguments.
 // Returns the JSON-marshaled return value (or nil for error-only handlers
 // or when the handler returned an error) and any handler error.

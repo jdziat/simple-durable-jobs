@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"gorm.io/gorm"
-	"gorm.io/gorm/clause"
 
 	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
 )
@@ -46,6 +45,10 @@ func (s *GormStorage) PeekSignal(ctx context.Context, jobID, name string) (*core
 	return &sig, nil
 }
 
+func (s *GormStorage) pendingSignalsLocked(tx *gorm.DB, jobID, name string) *gorm.DB {
+	return s.lockForUpdate(tx.Where("job_id = ? AND name = ? AND consumed_at IS NULL", jobID, name).Order("created_at ASC"), true)
+}
+
 // ConsumeSignal atomically takes the oldest pending signal of name for the job
 // (marking it consumed), or returns nil if none are pending. Concurrent
 // consumers receive disjoint signals (FOR UPDATE SKIP LOCKED on Postgres/MySQL;
@@ -55,11 +58,7 @@ func (s *GormStorage) ConsumeSignal(ctx context.Context, jobID, name string) (*c
 	err := s.withSerializationRetry(ctx, func() error {
 		out = nil
 		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-			q := tx.Where("job_id = ? AND name = ? AND consumed_at IS NULL", jobID, name).
-				Order("created_at ASC")
-			if !s.isSQLite {
-				q = q.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"})
-			}
+			q := s.pendingSignalsLocked(tx, jobID, name)
 			var sig core.Signal
 			err := q.First(&sig).Error
 			if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -99,11 +98,7 @@ func (s *GormStorage) DrainSignals(ctx context.Context, jobID, name string) ([]*
 	err := s.withSerializationRetry(ctx, func() error {
 		out = nil
 		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-			q := tx.Where("job_id = ? AND name = ? AND consumed_at IS NULL", jobID, name).
-				Order("created_at ASC")
-			if !s.isSQLite {
-				q = q.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"})
-			}
+			q := s.pendingSignalsLocked(tx, jobID, name)
 			var sigs []*core.Signal
 			if err := q.Find(&sigs).Error; err != nil {
 				return err
@@ -158,11 +153,7 @@ func (s *GormStorage) ConsumeSignalTx(ctx context.Context, jobID, name string, b
 	err := s.withSerializationRetry(ctx, func() error {
 		out = nil
 		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-			q := tx.Where("job_id = ? AND name = ? AND consumed_at IS NULL", jobID, name).
-				Order("created_at ASC")
-			if !s.isSQLite {
-				q = q.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"})
-			}
+			q := s.pendingSignalsLocked(tx, jobID, name)
 			var sig core.Signal
 			err := q.First(&sig).Error
 			if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -216,11 +207,7 @@ func (s *GormStorage) DrainSignalsTx(ctx context.Context, jobID, name string, bu
 	err := s.withSerializationRetry(ctx, func() error {
 		out = nil
 		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-			q := tx.Where("job_id = ? AND name = ? AND consumed_at IS NULL", jobID, name).
-				Order("created_at ASC")
-			if !s.isSQLite {
-				q = q.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"})
-			}
+			q := s.pendingSignalsLocked(tx, jobID, name)
 			var sigs []*core.Signal
 			if err := q.Find(&sigs).Error; err != nil {
 				return err
@@ -303,9 +290,7 @@ func (s *GormStorage) DeleteConsumedSignalsOlderThan(ctx context.Context, age ti
 				Where("consumed_at < ?", cutoff).
 				Order("consumed_at ASC, id ASC").
 				Limit(limit)
-			if !s.isSQLite {
-				query = query.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"})
-			}
+			query = s.lockForUpdate(query, true)
 			if err := query.Pluck("id", &ids).Error; err != nil {
 				return err
 			}
@@ -342,7 +327,7 @@ func (s *GormStorage) MarkWaitingWithDeadline(ctx context.Context, jobID, worker
 	}
 	result := s.db.WithContext(ctx).
 		Model(&core.Job{}).
-		Where("id = ? AND locked_by = ?", jobID, workerID).
+		Where("id = ? AND locked_by = ? AND status = ?", jobID, workerID, core.StatusRunning).
 		Updates(map[string]any{
 			"status":       core.StatusWaiting,
 			"locked_by":    "",

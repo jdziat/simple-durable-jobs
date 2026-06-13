@@ -201,6 +201,20 @@ func applyMetaContains(s *GormStorage, q *gorm.DB, m *core.MetadataMap) *gorm.DB
 			return q
 		}
 		return q.Where("(NULLIF(metadata, '')::jsonb) @> ?::jsonb", string(jsonBytes))
+	case dialectMySQL:
+		jsonBytes, err := json.Marshal(*m)
+		if err != nil {
+			_ = q.AddError(fmt.Errorf("marshal metadata contains: %w", err))
+			return q
+		}
+		// JSON_CONTAINS is canonical containment (matches PG @>, unlike
+		// substring LIKE which can false-match). MySQL has no general
+		// JSON-containment index (PG GIN has no MySQL equivalent —
+		// multi-valued indexes are per-array-path only) so this remains a
+		// correct full scan, acceptable because metadata search is a
+		// dashboard/admin cold path not the dequeue hot path. The metadata <>
+		// empty-string guard prevents JSON_CONTAINS erroring on empty rows.
+		return q.Where("metadata IS NOT NULL AND metadata <> '' AND JSON_CONTAINS(metadata, CAST(? AS JSON))", string(jsonBytes))
 	default:
 		for key, value := range *m {
 			pattern := `%` + escapeLikePattern(metadataPairFragment(key, value)) + `%`

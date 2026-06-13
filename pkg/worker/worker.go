@@ -55,7 +55,9 @@ type Worker struct {
 	rateLimitStorageMissingLogged  atomic.Bool
 	retentionStorageMissingLogged  atomic.Bool
 	retentionUnconfiguredLogged    atomic.Bool
+	retentionConfiguredLogged      atomic.Bool
 	uniqueLockStorageMissingLogged atomic.Bool
+	slotSweepStorageMissingLogged  atomic.Bool
 
 	// futureSleepSuppressions memoizes (jobID -> run_at) for sleeping jobs the
 	// signal-resume backstop has already inspected, capping checkpoint lookups
@@ -116,6 +118,10 @@ type concurrencySlotStorage interface {
 	ReleaseConcurrencySlot(ctx context.Context, slotName, jobID string) error
 }
 
+type concurrencySlotRenewer interface {
+	RenewConcurrencySlot(ctx context.Context, slotName, jobID string, ttl time.Duration) (bool, error)
+}
+
 type rateLimiterStorage interface {
 	TryConsumeRate(ctx context.Context, limitName string, perSecond float64, window time.Duration, now time.Time) (bool, error)
 }
@@ -126,6 +132,10 @@ type retentionStorage interface {
 
 type uniqueLockSweepStorage interface {
 	DeleteExpiredUniqueLocks(ctx context.Context, limit int) (int64, error)
+}
+
+type concurrencySlotSweepStorage interface {
+	DeleteExpiredConcurrencySlots(ctx context.Context, cutoff time.Time) (int64, error)
 }
 
 // consumedSignalRetentionStorage is implemented by backends that can prune
@@ -200,7 +210,11 @@ func NewWorker(q *queue.Queue, opts ...WorkerOption) *Worker {
 
 	// If no queues configured, use default
 	if config.Queues == nil {
-		config.Queues = map[string]int{"default": 10}
+		n := 10
+		if config.topLevelConcurrency != nil {
+			n = *config.topLevelConcurrency
+		}
+		config.Queues = map[string]int{"default": n}
 	}
 
 	// Set default retry configs if not specified
@@ -231,6 +245,15 @@ func NewWorker(q *queue.Queue, opts ...WorkerOption) *Worker {
 	}
 	if config.FanOutRecoveryStaleAge <= 0 {
 		config.FanOutRecoveryStaleAge = 2 * time.Minute
+	}
+	if !config.retentionSet && !config.Retention.enabled() {
+		config.Retention = RetentionConfig{
+			CompletedAfter:       defaultRetentionCompletedAfter,
+			FailedAfter:          defaultRetentionFailedAfter,
+			ConsumedSignalsAfter: defaultRetentionConsumedSignalsAfter,
+			Interval:             defaultRetentionInterval,
+			BatchSize:            defaultRetentionBatchSize,
+		}
 	}
 
 	// Clamp the heartbeat interval below StaleLockAge. The reaper now reclaims a
@@ -326,6 +349,11 @@ func (w *Worker) Start(ctx context.Context) error {
 	w.started.Store(true)
 	defer w.started.Store(false)
 
+	if err := w.validateConfiguredStorageCapabilities(); err != nil {
+		return err
+	}
+	w.logStorageCapabilities()
+
 	totalConcurrency := 0
 	for _, c := range w.config.Queues {
 		totalConcurrency += c
@@ -360,7 +388,10 @@ func (w *Worker) Start(ctx context.Context) error {
 		w.goTracked(func() { w.runUniqueLockSweep(ctx) })
 	}
 
+	w.goTracked(func() { w.runConcurrencySlotSweep(ctx) })
+
 	if w.config.Retention.enabled() {
+		w.logRetentionConfigured()
 		w.goTracked(func() { w.runRetention(ctx) })
 	} else {
 		w.warnIfRetentionUnconfigured()
@@ -395,6 +426,21 @@ func (w *Worker) Start(ctx context.Context) error {
 			w.drainDequeuedJobs(ctx, jobsChan, totalConcurrency)
 		}
 	}
+}
+
+func (w *Worker) validateConfiguredStorageCapabilities() error {
+	storage := w.queue.Storage()
+	if count := len(w.config.ConcurrencyCaps); count > 0 {
+		if _, ok := storage.(concurrencySlotStorage); !ok {
+			return fmt.Errorf("worker has %d ConcurrencyCap(s) configured but storage %T does not support DB-backed concurrency slots; the cap would be silently ignored", count, storage)
+		}
+	}
+	if count := len(w.config.RateLimits); count > 0 {
+		if _, ok := storage.(rateLimiterStorage); !ok {
+			return fmt.Errorf("worker has %d RateLimit(s) configured but storage %T does not support DB-backed rate limiting; the rate limit would be silently ignored", count, storage)
+		}
+	}
+	return nil
 }
 
 func (w *Worker) drainDequeuedJobs(ctx context.Context, jobsChan chan<- *core.Job, totalConcurrency int) {
@@ -577,12 +623,6 @@ func (w *Worker) dispatchDequeuedJobs(ctx context.Context, jobsChan chan<- *core
 			released++
 			continue
 		}
-		if ok := w.tryConsumeRateLimits(ctx, job); !ok {
-			w.refundQueueRateLimit(job.Queue)
-			w.releaseDequeuedJobOnShutdown(ctx, job)
-			released++
-			continue
-		}
 		if ok := w.tryAcquireConcurrencySlots(ctx, job); !ok {
 			w.refundQueueRateLimit(job.Queue)
 			w.releaseDequeuedJobOnShutdown(ctx, job)
@@ -590,6 +630,12 @@ func (w *Worker) dispatchDequeuedJobs(ctx context.Context, jobsChan chan<- *core
 			continue
 		}
 		if ctx.Err() != nil {
+			w.refundQueueRateLimit(job.Queue)
+			w.releaseDequeuedJobOnShutdown(ctx, job)
+			released++
+			continue
+		}
+		if ok := w.tryConsumeRateLimits(ctx, job); !ok {
 			w.refundQueueRateLimit(job.Queue)
 			w.releaseDequeuedJobOnShutdown(ctx, job)
 			released++
@@ -647,16 +693,22 @@ func (w *Worker) goTracked(fn func()) {
 	}()
 }
 
-// warnIfRetentionUnconfigured emits exactly one WARN per worker process (deduped
-// via CompareAndSwap, so repeated Start calls don't re-log) when no retention
-// window is configured. It makes the silent "retention is fully opt-in" footgun
-// loud: completed/failed/cancelled job rows and consumed signals accumulate
-// forever until an operator enables retention. Checkpoints can be bounded
-// independently via jobs.RetentionDeleteCheckpointsOnComplete(), so the message
-// points operators at both the row/signal sweep and the inline checkpoint GC.
+// warnIfRetentionUnconfigured emits exactly one WARN per worker process when an
+// operator explicitly disables the retention sweep.
 func (w *Worker) warnIfRetentionUnconfigured() {
 	if w.retentionUnconfiguredLogged.CompareAndSwap(false, true) {
-		w.logger.Warn("retention is not configured; completed/failed/cancelled job rows and consumed signals accumulate forever — enable jobs.WithRetention(...) or jobs.DefaultRetention() to bound table growth (add jobs.RetentionDeleteCheckpointsOnComplete() to also prune successful jobs' checkpoints)")
+		w.logger.Warn("retention is disabled; completed/failed/cancelled job rows and consumed signals accumulate forever")
+	}
+}
+
+func (w *Worker) logRetentionConfigured() {
+	if w.retentionConfiguredLogged.CompareAndSwap(false, true) {
+		cfg := w.config.Retention
+		w.logger.Info("retention GC enabled",
+			"completed_after", cfg.CompletedAfter,
+			"failed_after", cfg.FailedAfter,
+			"consumed_signals_after", cfg.ConsumedSignalsAfter,
+			"disable_hint", "disable with jobs.RetentionDisabled()")
 	}
 }
 
@@ -786,6 +838,35 @@ func (w *Worker) deleteExpiredUniqueLocks(ctx context.Context, storage uniqueLoc
 		if deleted < int64(batchSize) {
 			return
 		}
+	}
+}
+
+func (w *Worker) runConcurrencySlotSweep(ctx context.Context) {
+	storage, ok := w.queue.Storage().(concurrencySlotSweepStorage)
+	if !ok {
+		if w.slotSweepStorageMissingLogged.CompareAndSwap(false, true) {
+			w.logger.Warn("storage backend does not support concurrency slot GC; expired concurrency-cap slot sweep disabled")
+		}
+		return
+	}
+
+	ticker := time.NewTicker(defaultUniqueLockSweepInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			w.deleteExpiredConcurrencySlots(ctx, storage)
+		}
+	}
+}
+
+func (w *Worker) deleteExpiredConcurrencySlots(ctx context.Context, storage concurrencySlotSweepStorage) {
+	_, err := storage.DeleteExpiredConcurrencySlots(ctx, time.Now().UTC())
+	if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+		w.logger.Warn("concurrency slot GC pass failed", "error", err)
 	}
 }
 
@@ -1005,13 +1086,13 @@ func (w *Worker) renewConcurrencySlots(ctx context.Context, jobID string) {
 	if len(slots) == 0 {
 		return
 	}
-	storage, ok := w.queue.Storage().(concurrencySlotStorage)
+	storage, ok := w.queue.Storage().(concurrencySlotRenewer)
 	if !ok {
 		return
 	}
 	ttl := w.concurrencySlotTTL()
 	for _, slot := range slots {
-		if _, err := storage.TryAcquireConcurrencySlot(ctx, slot, jobID, w.config.WorkerID, 1, ttl); err != nil {
+		if _, err := storage.RenewConcurrencySlot(ctx, slot, jobID, ttl); err != nil {
 			w.logger.Warn("failed to renew concurrency slot", "job_id", jobID, "slot", slot, "error", err)
 		}
 	}
@@ -1184,73 +1265,33 @@ func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 		w.handleError(ctx, jobCtx, job, err)
 		cancelHeartbeat()
 	} else {
-		if completer, ok := w.queue.Storage().(completeWithResultStorage); ok {
-			fo, completeErr := w.completeWithResult(ctx, completer, job.ID, resultBytes)
+		completer, ok := w.queue.Storage().(completeWithResultStorage)
+		if !ok {
+			w.logger.Error("storage does not implement CompleteWithResult; cannot complete job", "job_id", job.ID)
 			cancelHeartbeat()
-			if errors.Is(completeErr, core.ErrJobNotOwned) {
-				w.logger.Warn("job no longer owned at completion; skipping completion handling",
-					"job_id", job.ID)
-				return
-			}
-			if completeErr != nil {
-				w.logger.Error("failed to complete job after retries", "job_id", job.ID, "error", completeErr)
-				w.releaseAfterTerminalWriteError(ctx, job.ID, "completion")
-				return
-			}
-
-			w.queue.CallCompleteHooks(jobCtx, job)
-			w.queue.Emit(&core.JobCompleted{Job: job, Duration: time.Since(startTime), Timestamp: time.Now()})
-			if err := w.checkFanOutCompletion(ctx, fo); err != nil {
-				w.logger.Error("failed to handle sub-job completion", "job_id", job.ID, "error", err)
-			}
+			w.releaseAfterTerminalWriteError(ctx, job.ID, "completion")
 			return
 		}
-
-		// Legacy storage path: keep the original split result/complete/fan-out
-		// writes for storages that do not implement CompleteWithResult.
+		fo, completeErr := w.completeWithResult(ctx, completer, job.ID, resultBytes)
 		cancelHeartbeat()
-		if resultBytes != nil {
-			if saveErr := w.queue.Storage().SaveJobResult(ctx, job.ID, w.config.WorkerID, resultBytes); saveErr != nil {
-				w.logger.Error("failed to persist job result", "job_id", job.ID, "error", saveErr)
-				// fall through — completion still proceeds
-			}
-		}
-		completeErr := w.completeWithRetry(ctx, job.ID)
 		if errors.Is(completeErr, core.ErrJobNotOwned) {
-			// The job was reclaimed, cancelled, or already completed by
-			// another path while this handler was running. The worker that
-			// now owns it is responsible for fan-out accounting; doing it
-			// here would double-count the fan-out and race the new owner.
 			w.logger.Warn("job no longer owned at completion; skipping completion handling",
 				"job_id", job.ID)
 			return
 		}
 		if completeErr != nil {
 			w.logger.Error("failed to complete job after retries", "job_id", job.ID, "error", completeErr)
-			// Still handle sub-job completion — the work is done even if
-			// we couldn't mark it in the DB. Without this, the fan-out
-			// counter never increments and the parent stays in 'waiting'.
-		} else {
-			w.queue.CallCompleteHooks(jobCtx, job)
-			// Emit completion event
-			w.queue.Emit(&core.JobCompleted{Job: job, Duration: time.Since(startTime), Timestamp: time.Now()})
+			w.releaseAfterTerminalWriteError(ctx, job.ID, "completion")
+			return
 		}
 
-		// Handle sub-job completion (resume parent if needed) — always run
-		// regardless of whether Complete() succeeded, to prevent orphaned
-		// parent jobs stuck in 'waiting' with all sub-jobs actually done.
-		// (The lost-ownership case returned above.)
-		if err := w.handleSubJobCompletion(ctx, job, completeErr == nil); err != nil {
+		w.queue.CallCompleteHooks(jobCtx, job)
+		w.queue.Emit(&core.JobCompleted{Job: job, Duration: time.Since(startTime), Timestamp: time.Now()})
+		if err := w.checkFanOutCompletion(ctx, fo); err != nil {
 			w.logger.Error("failed to handle sub-job completion", "job_id", job.ID, "error", err)
 		}
+		return
 	}
-}
-
-// completeWithRetry marks a job complete with retry on transient failures.
-func (w *Worker) completeWithRetry(ctx context.Context, jobID string) error {
-	return retryWithBackoff(ctx, *w.config.StorageRetry, func() error {
-		return w.queue.Storage().Complete(ctx, jobID, w.config.WorkerID)
-	})
 }
 
 func (w *Worker) completeWithResult(ctx context.Context, storage completeWithResultStorage, jobID string, result []byte) (*core.FanOut, error) {
@@ -1656,7 +1697,17 @@ func (w *Worker) completeFanOut(ctx context.Context, fo *core.FanOut, status cor
 			w.logger.Debug("parent job not yet in resumable status, retrying",
 				"parent_job_id", fo.ParentJobID,
 				"attempt", attempt+1)
-			time.Sleep(time.Duration(100*(1<<attempt)) * time.Millisecond) // 100ms, 200ms, 400ms, 800ms
+			delay := time.Duration(100*(1<<attempt)) * time.Millisecond // 100ms, 200ms, 400ms, 800ms
+			select {
+			case <-ctx.Done():
+				// Abort the inline retry promptly on shutdown/cancellation (do
+				// not park the processLoop). The fan-out status was already
+				// CAS-advanced upstream; a parent left in 'waiting' is healed by
+				// the GetStalledFanOutParents backstop poll, so returning nil
+				// here is safe — it is not a completion failure.
+				return nil
+			case <-time.After(delay):
+			}
 		}
 	}
 	if !resumed {

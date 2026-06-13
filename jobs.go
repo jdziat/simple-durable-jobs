@@ -317,6 +317,7 @@ var (
 	ErrInvalidQueueName      = core.ErrInvalidQueueName
 	ErrQueueNameTooLong      = core.ErrQueueNameTooLong
 	ErrJobArgsTooLarge       = core.ErrJobArgsTooLarge
+	ErrJobArgsMismatch       = core.ErrJobArgsMismatch
 	ErrJobNotCompleted       = core.ErrJobNotCompleted
 	ErrJobFailed             = core.ErrJobFailed
 	ErrJobCancelled          = core.ErrJobCancelled
@@ -717,17 +718,23 @@ func RateLimitKey(fn func(*Job) string) RateLimitOption {
 	return worker.RateLimitKey(fn)
 }
 
-// WithRetention enables optional automatic garbage collection of terminal jobs.
+// WithRetention configures automatic garbage collection of terminal jobs.
 func WithRetention(opts ...RetentionOption) WorkerOption {
 	return worker.WithRetention(opts...)
 }
 
-// DefaultRetention is an explicit opt-in conservative retention preset (NOT a
-// silent default): completed jobs 7 days, terminal failed/cancelled jobs 30
-// days, consumed signals 7 days. Tune individual windows by composing the
-// Retention* options under WithRetention instead.
+// DefaultRetention is a conservative retention preset: completed jobs 7 days,
+// terminal failed/cancelled jobs 30 days, consumed signals 7 days. Tune
+// individual windows by composing the Retention* options under WithRetention
+// instead.
 func DefaultRetention() WorkerOption {
 	return worker.DefaultRetention()
+}
+
+// RetentionDisabled fully disables automatic deletion of terminal jobs and
+// consumed signals.
+func RetentionDisabled() WorkerOption {
+	return worker.RetentionDisabled()
 }
 
 // RetentionCompletedAfter deletes completed jobs older than d. A non-positive
@@ -1046,6 +1053,7 @@ func Requeue(ctx context.Context, q *Queue, jobID string) (bool, error) {
 	type requeuer interface {
 		Requeue(ctx context.Context, jobID string) (bool, error)
 	}
+	var _ requeuer = (*storage.GormStorage)(nil)
 	r, ok := q.Storage().(requeuer)
 	if !ok {
 		return false, fmt.Errorf("jobs: storage backend does not support Requeue")
@@ -1059,6 +1067,7 @@ func ListDeadLettered(ctx context.Context, q *Queue, opts ...DeadLetterOption) (
 	type deadLetterLister interface {
 		ListDeadLettered(ctx context.Context, filter core.DeadLetterFilter) ([]*core.Job, error)
 	}
+	var _ deadLetterLister = (*storage.GormStorage)(nil)
 	l, ok := q.Storage().(deadLetterLister)
 	if !ok {
 		return nil, fmt.Errorf("jobs: storage backend does not support dead-letter triage")
@@ -1072,6 +1081,7 @@ func CountDeadLettered(ctx context.Context, q *Queue, opts ...DeadLetterOption) 
 	type deadLetterCounter interface {
 		CountDeadLettered(ctx context.Context, filter core.DeadLetterFilter) (int64, error)
 	}
+	var _ deadLetterCounter = (*storage.GormStorage)(nil)
 	c, ok := q.Storage().(deadLetterCounter)
 	if !ok {
 		return 0, fmt.Errorf("jobs: storage backend does not support dead-letter triage")
@@ -1140,6 +1150,7 @@ func Signal(ctx context.Context, q *Queue, jobID, name string, payload any) erro
 	type signalSender interface {
 		SendSignal(ctx context.Context, jobID, name string, payload []byte) error
 	}
+	var _ signalSender = (*storage.GormStorage)(nil)
 	sender, ok := q.Storage().(signalSender)
 	if !ok {
 		return core.ErrStorageNoSignals
@@ -1178,6 +1189,7 @@ func Signal(ctx context.Context, q *Queue, jobID, name string, payload any) erro
 		type signalResumer interface {
 			ResumeSignalWaitingJob(ctx context.Context, jobID string) (bool, error)
 		}
+		var _ signalResumer = (*storage.GormStorage)(nil)
 		if r, ok := q.Storage().(signalResumer); ok {
 			resumed, err := r.ResumeSignalWaitingJob(ctx, jobID)
 			if err != nil {

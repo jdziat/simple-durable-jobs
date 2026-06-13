@@ -50,9 +50,7 @@ func (s *GormStorage) TryConsumeRate(ctx context.Context, limitName string, perS
 			}
 
 			query := tx.Where("limit_name = ? AND window_start = ?", limitName, windowStart)
-			if !s.isSQLite {
-				query = query.Clauses(clause.Locking{Strength: "UPDATE"})
-			}
+			query = s.lockForUpdate(query, false)
 			var row core.RateLimitWindow
 			if err := query.First(&row).Error; err != nil {
 				return err

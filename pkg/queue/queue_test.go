@@ -2,6 +2,7 @@ package queue
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -322,6 +323,78 @@ func TestQueue_Enqueue_Success(t *testing.T) {
 	assert.Equal(t, "default", job.Queue)
 }
 
+type enqueueGoodArgs struct {
+	Name string
+}
+
+type enqueueWrongArgs struct {
+	Count int
+}
+
+func TestQueue_Enqueue_ValidatesArgsAgainstRegisteredHandler(t *testing.T) {
+	store := newMockStorage()
+	q := New(store)
+	ctx := context.Background()
+
+	q.Register("typed-job", func(ctx context.Context, args enqueueGoodArgs) error {
+		return nil
+	})
+
+	jobID, err := q.Enqueue(ctx, "typed-job", enqueueGoodArgs{Name: "x"})
+	require.NoError(t, err)
+	assert.NotEmpty(t, jobID)
+
+	jobID, err = q.Enqueue(ctx, "typed-job", &enqueueGoodArgs{Name: "x"})
+	require.NoError(t, err)
+	assert.NotEmpty(t, jobID)
+
+	_, err = q.Enqueue(ctx, "typed-job", enqueueWrongArgs{Count: 7})
+	require.ErrorIs(t, err, core.ErrJobArgsMismatch)
+
+	_, err = q.Enqueue(ctx, "typed-job", "just-a-string")
+	require.ErrorIs(t, err, core.ErrJobArgsMismatch)
+
+	jobID, err = q.Enqueue(ctx, "typed-job", map[string]any{"Name": "x"})
+	require.NoError(t, err)
+	assert.NotEmpty(t, jobID)
+
+	jobID, err = q.Enqueue(ctx, "typed-job", map[string]any{"Name": "x", "extra": 1})
+	require.NoError(t, err)
+	assert.NotEmpty(t, jobID)
+
+	jobID, err = q.Enqueue(ctx, "typed-job", nil)
+	require.NoError(t, err)
+	assert.NotEmpty(t, jobID)
+}
+
+func TestQueue_Enqueue_NoArgsHandlerSkipsArgsValidation(t *testing.T) {
+	store := newMockStorage()
+	q := New(store)
+	ctx := context.Background()
+
+	q.Register("no-args-job", func(ctx context.Context) error {
+		return nil
+	})
+
+	jobID, err := q.Enqueue(ctx, "no-args-job", enqueueWrongArgs{Count: 7})
+	require.NoError(t, err)
+	assert.NotEmpty(t, jobID)
+}
+
+func TestQueue_EnqueueRemote_DoesNotValidateRegisteredHandlerArgs(t *testing.T) {
+	store := newMockStorage()
+	q := New(store)
+	ctx := context.Background()
+
+	q.Register("typed-job", func(ctx context.Context, args enqueueGoodArgs) error {
+		return nil
+	})
+
+	jobID, err := q.EnqueueRemote(ctx, "typed-job", enqueueWrongArgs{Count: 7})
+	require.NoError(t, err)
+	assert.NotEmpty(t, jobID)
+}
+
 func TestQueue_Enqueue_WithOptions(t *testing.T) {
 	store := newMockStorage()
 	q := New(store)
@@ -371,6 +444,31 @@ func TestQueue_Enqueue_WithTenantAndMetadata(t *testing.T) {
 		"plan":   "pro",
 		"region": "us",
 	}, job.Metadata)
+}
+
+func TestQueue_Enqueue_MetadataSizeLimit(t *testing.T) {
+	assert.Equal(t, 64<<10, DefaultMaxMetadataSize)
+
+	store := newMockStorage()
+	q := New(store)
+	q.Register("test-job", func(ctx context.Context, args string) error {
+		return nil
+	})
+
+	underValue := strings.Repeat("a", 64)
+	jobID, err := q.Enqueue(context.Background(), "test-job", "hello",
+		WithMetadata(map[string]string{"payload": underValue}),
+		WithMaxMetadataSize(128),
+	)
+	require.NoError(t, err)
+	assert.NotEmpty(t, jobID)
+
+	_, err = q.Enqueue(context.Background(), "test-job", "hello",
+		WithMetadata(map[string]string{"payload": strings.Repeat("b", 200)}),
+		WithMaxMetadataSize(128),
+	)
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, ErrJobMetadataTooLarge))
 }
 
 func TestQueue_Enqueue_TenantTooLongReturnsError(t *testing.T) {

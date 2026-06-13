@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 
@@ -34,10 +35,14 @@ var (
 //	mux.Handle("/jobs/", http.StripPrefix("/jobs", ui.Handler(storage)))
 func Handler(storage core.Storage, opts ...Option) http.Handler {
 	cfg := &config{
-		ctx: context.Background(),
+		ctx:               context.Background(),
+		metadataRedaction: true,
 	}
 	for _, opt := range opts {
 		opt.apply(cfg)
+	}
+	if cfg.authorizer == nil && cfg.insecureAllowUnauthenticated {
+		slog.Default().Warn("jobs UI running WITHOUT authentication — all job payloads are exposed; use only on a local/trusted network")
 	}
 
 	// Set up stats storage if we have a GORM-backed storage
@@ -63,13 +68,15 @@ func Handler(storage core.Storage, opts ...Option) http.Handler {
 
 	// Create the jobs service
 	svc := newJobsService(storage, cfg.queue, statsStorage)
+	svc.metadataRedaction = cfg.metadataRedaction
 
 	// Register Connect-RPC handler
 	path, handler := jobsv1connect.NewJobsServiceHandler(
 		svc,
-		connect.WithInterceptors(writeAuthInterceptor(
-			cfg.middleware != nil || cfg.insecureAllowUnauthenticatedWrites,
+		connect.WithInterceptors(authInterceptor(
+			cfg.insecureAllowUnauthenticated,
 			cfg.authorizer,
+			cfg.allowedOrigins,
 		)),
 	)
 	mux.Handle(path, handler)
@@ -97,8 +104,18 @@ func Handler(storage core.Storage, opts ...Option) http.Handler {
 		})
 	}
 
+	withHostHeader := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Always overwrite the header-map Host from the server-authoritative
+		// r.Host so the same-origin check cannot be fooled by a client-injected
+		// Host header (browsers can't set Host; a non-browser client could).
+		if r.Host != "" {
+			r.Header.Set("Host", r.Host)
+		}
+		mux.ServeHTTP(w, r)
+	})
+
 	// Wrap with H2C for HTTP/2 over cleartext (needed for Connect streaming)
-	h2cHandler := h2c.NewHandler(mux, &http2.Server{})
+	h2cHandler := h2c.NewHandler(withHostHeader, &http2.Server{})
 
 	// Apply middleware if configured
 	if cfg.middleware != nil {
@@ -132,29 +149,111 @@ var mutatingProcedures = map[string]Action{
 	jobsv1connect.JobsServicePurgeQueueProcedure:     ActionPurgeQueue,
 }
 
-func writeAuthInterceptor(allowWrites bool, authorizer Authorizer) connect.Interceptor {
-	return connect.UnaryInterceptorFunc(func(next connect.UnaryFunc) connect.UnaryFunc {
-		return connect.UnaryFunc(func(ctx context.Context, req connect.AnyRequest) (connect.AnyResponse, error) {
-			action, mutates := mutatingProcedures[req.Spec().Procedure]
-			if !mutates {
-				return next(ctx, req)
+var readProcedures = map[string]Action{
+	jobsv1connect.JobsServiceGetStatsProcedure:          ActionViewStats,
+	jobsv1connect.JobsServiceGetStatsHistoryProcedure:   ActionViewStats,
+	jobsv1connect.JobsServiceListJobsProcedure:          ActionViewJobs,
+	jobsv1connect.JobsServiceGetJobProcedure:            ActionViewJob,
+	jobsv1connect.JobsServiceListQueuesProcedure:        ActionViewStats,
+	jobsv1connect.JobsServiceListScheduledJobsProcedure: ActionViewJobs,
+	jobsv1connect.JobsServiceGetWorkflowProcedure:       ActionViewJob,
+	jobsv1connect.JobsServiceListWorkflowsProcedure:     ActionViewJobs,
+	jobsv1connect.JobsServiceWatchEventsProcedure:       ActionWatchEvents,
+}
+
+const authRequiredMessage = "jobs UI requires an Authorizer (ui.WithAuthorizer) or an explicit ui.WithInsecureAllowUnauthenticated() for local/trusted-network use"
+
+type dashboardAuthInterceptor struct {
+	insecureAllowUnauthenticated bool
+	authorizer                   Authorizer
+	allowedOrigins               map[string]struct{}
+}
+
+func authInterceptor(insecureAllowUnauthenticated bool, authorizer Authorizer, allowedOrigins map[string]struct{}) connect.Interceptor {
+	return dashboardAuthInterceptor{
+		insecureAllowUnauthenticated: insecureAllowUnauthenticated,
+		authorizer:                   authorizer,
+		allowedOrigins:               allowedOrigins,
+	}
+}
+
+func (i dashboardAuthInterceptor) WrapUnary(next connect.UnaryFunc) connect.UnaryFunc {
+	return connect.UnaryFunc(func(ctx context.Context, req connect.AnyRequest) (connect.AnyResponse, error) {
+		if _, mutates := mutatingProcedures[req.Spec().Procedure]; mutates {
+			if err := i.authorizeOrigin(req); err != nil {
+				return nil, err
 			}
-			if authorizer != nil {
-				if err := authorizer.Authorize(ctx, action); err != nil {
-					var connectErr *connect.Error
-					if errors.As(err, &connectErr) {
-						return nil, connectErr
-					}
-					return nil, connect.NewError(connect.CodePermissionDenied, err)
-				}
-				return next(ctx, req)
-			}
-			if !allowWrites {
-				return nil, connect.NewError(connect.CodePermissionDenied, errors.New("jobs UI write RPCs require auth middleware or explicit insecure opt-in"))
-			}
-			return next(ctx, req)
-		})
+		}
+		if err := i.authorize(ctx, req.Spec().Procedure); err != nil {
+			return nil, err
+		}
+		return next(ctx, req)
 	})
+}
+
+func (i dashboardAuthInterceptor) WrapStreamingClient(next connect.StreamingClientFunc) connect.StreamingClientFunc {
+	return next
+}
+
+func (i dashboardAuthInterceptor) WrapStreamingHandler(next connect.StreamingHandlerFunc) connect.StreamingHandlerFunc {
+	return connect.StreamingHandlerFunc(func(ctx context.Context, conn connect.StreamingHandlerConn) error {
+		if err := i.authorize(ctx, conn.Spec().Procedure); err != nil {
+			return err
+		}
+		return next(ctx, conn)
+	})
+}
+
+func (i dashboardAuthInterceptor) authorize(ctx context.Context, procedure string) error {
+	action := actionForProcedure(procedure)
+	if i.authorizer != nil {
+		if err := i.authorizer.Authorize(ctx, action); err != nil {
+			var connectErr *connect.Error
+			if errors.As(err, &connectErr) {
+				return connectErr
+			}
+			return connect.NewError(connect.CodePermissionDenied, err)
+		}
+		return nil
+	}
+	if i.insecureAllowUnauthenticated {
+		return nil
+	}
+	return connect.NewError(connect.CodePermissionDenied, errors.New(authRequiredMessage))
+}
+
+func (i dashboardAuthInterceptor) authorizeOrigin(req connect.AnyRequest) error {
+	origin := req.Header().Get("Origin")
+	if origin == "" {
+		return nil
+	}
+	if _, ok := i.allowedOrigins[origin]; ok {
+		return nil
+	}
+	// Same-origin check compares the browser Origin against the server's real
+	// Host (copied into the Host header by withHostHeader). Client-supplied
+	// X-Forwarded-Host is deliberately NOT trusted — it is forgeable by any
+	// caller and would defeat the check. Cross-origin operators use
+	// WithAllowedOrigins.
+	originURL, err := url.Parse(origin)
+	if err == nil && originURL.Host != "" {
+		if host := req.Header().Get("Host"); host != "" && strings.EqualFold(originURL.Host, host) {
+			return nil
+		}
+	}
+	return connect.NewError(connect.CodePermissionDenied, errors.New("origin not allowed; configure ui.WithAllowedOrigins"))
+}
+
+func actionForProcedure(procedure string) Action {
+	if action, mutates := mutatingProcedures[procedure]; mutates {
+		return action
+	}
+	if action, ok := readProcedures[procedure]; ok {
+		return action
+	}
+	// Any read procedure not explicitly mapped is still authorized (fail-closed),
+	// just under the coarse ActionViewJobs — never treated as public.
+	return ActionViewJobs
 }
 
 const placeholderHTML = `<!DOCTYPE html>

@@ -180,14 +180,8 @@ func (s *GormStorage) Migrate(ctx context.Context) error {
 			}
 		}
 
-		// The core.Job dispatcher columns carry `not null` tags so AutoMigrate
-		// keeps them NOT NULL and never drifts them back to nullable (a drift
-		// would force a table-copy MODIFY on every MySQL startup). AutoMigrate
-		// runs before the versioned migrations, so backfill any pre-existing
-		// NULLs (only reachable via raw SQL — the Go model never writes them)
-		// FIRST, otherwise AutoMigrate's SET NOT NULL would fail on a populated
-		// table. Idempotent + cheap: after the first migrate the columns are
-		// NOT NULL, so the predicate is constraint-excluded.
+		// Heal pre-existing NULL dispatcher columns BEFORE AutoMigrate enforces
+		// their NOT NULL constraints (cheap EXISTS short-circuit on clean tables).
 		if err := backfillDispatcherNulls(ctx, db, s.dialect()); err != nil {
 			return err
 		}
@@ -226,18 +220,32 @@ func (s *GormStorage) Migrate(ctx context.Context) error {
 	})
 }
 
-// backfillDispatcherNulls fills any pre-existing NULL dispatcher columns with
-// their defaults BEFORE AutoMigrate applies the `not null` tags, so AutoMigrate's
-// SET NOT NULL cannot fail on a populated table. Such NULLs are only reachable via
-// raw SQL (the Go model never writes them). PG/MySQL only; on a fresh DB the jobs
-// table does not exist yet (AutoMigrate creates it NOT NULL from the tags), so
-// skip. Idempotent + cheap: once the columns are NOT NULL the predicate is
-// constraint-excluded (no scan).
+// backfillDispatcherNulls fills pre-existing NULL dispatcher columns with their
+// defaults. It is run by schema migration v19, not on every Migrate call, so the
+// legacy cleanup is recorded in schema_migrations and paid at most once.
 func backfillDispatcherNulls(ctx context.Context, db *gorm.DB, dialect string) error {
 	if dialect != dialectPostgres && dialect != dialectMySQL {
 		return nil
 	}
 	if !db.Migrator().HasTable(&core.Job{}) {
+		return nil
+	}
+	// Cheap EXISTS short-circuit: on a clean table (the overwhelmingly common
+	// case) this probe is sub-millisecond and avoids the full-table UPDATE on
+	// every startup (R25), while still letting the heal run BEFORE AutoMigrate's
+	// SET NOT NULL so a legacy nullable table that still holds NULLs is fixed
+	// before the constraint is enforced (preserves the schema-campaign ordering).
+	var hasNulls bool
+	if err := db.WithContext(ctx).Raw(`
+		SELECT EXISTS(
+			SELECT 1 FROM jobs
+			WHERE status IS NULL OR queue IS NULL OR priority IS NULL
+			   OR attempt IS NULL OR max_retries IS NULL
+		)
+	`).Scan(&hasNulls).Error; err != nil {
+		return err
+	}
+	if !hasNulls {
 		return nil
 	}
 	return db.WithContext(ctx).Exec(`
@@ -317,6 +325,14 @@ func (s *GormStorage) withSerializationRetry(ctx context.Context, fn func() erro
 	return fmt.Errorf("transaction failed after %d retries: %w", maxAttempts, lastErr)
 }
 
+// WithSerializationRetry retries fn on transient serialization/deadlock
+// failures with jittered backoff. Use it to wrap caller-owned outbox
+// transactions on MySQL, for example begin -> EnqueueBatchTx -> commit, so the
+// whole transaction is retried when gap-lock deadlocks surface.
+func (s *GormStorage) WithSerializationRetry(ctx context.Context, fn func() error) error {
+	return s.withSerializationRetry(ctx, fn)
+}
+
 // isSerializationFailure reports whether err is a transient
 // serialization/deadlock failure that can be resolved by retrying the
 // enclosing transaction. String matching is used deliberately to avoid
@@ -377,9 +393,7 @@ func (s *GormStorage) EnqueueUnique(ctx context.Context, job *core.Job, uniqueKe
 
 			// SQLite doesn't support FOR UPDATE, but its serializable transactions
 			// provide equivalent protection for single-process scenarios
-			if !s.isSQLite {
-				query = query.Clauses(clause.Locking{Strength: "UPDATE"})
-			}
+			query = s.lockForUpdate(query, false)
 
 			var existing core.Job
 			err := query.First(&existing).Error
@@ -466,20 +480,13 @@ func (s *GormStorage) Dequeue(ctx context.Context, queues []string, workerID str
 	// add a predicate that assumes the two reads are equal.
 	nowExpr := s.nowExpr()
 	lockUntilExpr := s.offsetExpr(s.lockDuration)
-	eligExpr := s.dequeueEligibleExpr()
 	silentDB := s.db.Session(&gorm.Session{Logger: s.db.Logger.LogMode(logger.Silent)})
 	err = silentDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		// FOR UPDATE SKIP LOCKED ensures:
 		// 1. The selected row is locked for this transaction
 		// 2. Other workers skip locked rows instead of waiting
 		// This prevents duplicate job execution in distributed scenarios
-		result := tx.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).
-			Where("queue IN ?", activeQueues).
-			Where("status = ?", core.StatusPending).
-			Where(eligExpr+" <= ?", nowExpr).
-			Where("(locked_until IS NULL OR locked_until < ?)", nowExpr).
-			Order("priority DESC, " + eligExpr + " ASC").
-			First(&job)
+		result := s.claimableCandidates(s.lockForUpdate(tx, true), activeQueues, nowExpr).First(&job)
 
 		if result.Error != nil {
 			if errors.Is(result.Error, gorm.ErrRecordNotFound) {
@@ -532,17 +539,10 @@ func (s *GormStorage) Dequeue(ctx context.Context, queues []string, workerID str
 // This is NOT safe for multiple concurrent workers - use PostgreSQL for production.
 func (s *GormStorage) dequeueSQLite(ctx context.Context, queues []string, workerID string, now time.Time, lockUntil time.Time) (*core.Job, error) {
 	var job core.Job
-	eligExpr := s.dequeueEligibleExpr()
 
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		// Find a candidate job
-		result := tx.
-			Where("queue IN ?", queues).
-			Where("status = ?", core.StatusPending).
-			Where(eligExpr+" <= ?", now).
-			Where("(locked_until IS NULL OR locked_until < ?)", now).
-			Order("priority DESC, " + eligExpr + " ASC").
-			First(&job)
+		result := s.claimableCandidates(tx, queues, now).First(&job)
 
 		if result.Error != nil {
 			if errors.Is(result.Error, gorm.ErrRecordNotFound) {
@@ -810,6 +810,18 @@ func (s *GormStorage) accountTerminalWithFanOut(ctx context.Context, jobID, work
 				if err := tx.Where("job_id = ?", jobID).Delete(&core.Checkpoint{}).Error; err != nil {
 					return err
 				}
+			}
+
+			// Release any fleet concurrency slots this job holds, atomically with
+			// the terminal write. The worker also releases them best-effort after
+			// processJob returns, but a crash in the window between this commit and
+			// that deferred release would otherwise orphan a live slot for a
+			// finished job until its TTL (~45m), silently shrinking the cap. Doing
+			// it in the terminal tx makes slot release crash-safe. Keyed by job_id
+			// so it covers every configured cap; the permanent per-slot-name
+			// sentinel (job_id = '') is never matched.
+			if err := tx.Where("job_id = ?", jobID).Delete(&core.ConcurrencySlot{}).Error; err != nil {
+				return err
 			}
 
 			var job core.Job
@@ -1172,12 +1184,12 @@ func (s *GormStorage) ReleaseStaleLocks(ctx context.Context, staleDuration time.
 	err := s.withSerializationRetry(ctx, func() error {
 		released = nil
 		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-			// Unordered LIMIT: the reaper is idempotent and self-draining (a
-			// stale lock stays running+expired until released), so a per-tick
-			// cap bounds the IN-list update without needing a stable sort.
+			// ORDER BY matches idx_jobs_stale_lock's freshness expression, so
+			// the planner can use it while the per-tick cap bounds the update.
 			if err := tx.Model(&core.Job{}).
 				Where("status = ?", core.StatusRunning).
 				Where("COALESCE(last_heartbeat_at, started_at, locked_until) < ?", cutoff).
+				Order("COALESCE(last_heartbeat_at, started_at, locked_until) ASC").
 				Limit(maxResumeBatch).
 				Pluck("id", &released).Error; err != nil {
 				return err
@@ -1506,9 +1518,7 @@ func (s *GormStorage) CancelSubJobs(ctx context.Context, fanOutID string) ([]str
 			query := tx.Model(&core.Job{}).
 				Where("fan_out_id = ? AND status IN ?", fanOutID, []core.JobStatus{core.StatusPending, core.StatusRunning}).
 				Order("fan_out_index ASC")
-			if !s.isSQLite {
-				query = query.Clauses(clause.Locking{Strength: "UPDATE"})
-			}
+			query = s.lockForUpdate(query, false)
 			if err := query.Pluck("id", &cancelled).Error; err != nil {
 				return err
 			}
@@ -1527,6 +1537,13 @@ func (s *GormStorage) CancelSubJobs(ctx context.Context, fanOutID string) ([]str
 				})
 			if result.Error != nil {
 				return result.Error
+			}
+
+			// Release any fleet concurrency slots held by the cancelled sub-jobs,
+			// atomically with the cancel write, so a worker that dies before its
+			// deferred release cannot orphan a live slot for a now-terminal job.
+			if err := tx.Where("job_id IN ?", cancelled).Delete(&core.ConcurrencySlot{}).Error; err != nil {
+				return err
 			}
 			return nil
 		})
@@ -1611,7 +1628,7 @@ func (s *GormStorage) CancelSubJob(ctx context.Context, jobID string) (*core.Fan
 func (s *GormStorage) MarkWaiting(ctx context.Context, jobID string, workerID string) error {
 	result := s.db.WithContext(ctx).
 		Model(&core.Job{}).
-		Where("id = ? AND locked_by = ?", jobID, workerID).
+		Where("id = ? AND locked_by = ? AND status = ?", jobID, workerID, core.StatusRunning).
 		Updates(map[string]any{
 			"status":       core.StatusWaiting,
 			"locked_by":    "",

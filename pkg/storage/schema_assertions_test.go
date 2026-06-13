@@ -57,19 +57,47 @@ func TestPostgresSchemaAssertions(t *testing.T) {
 		"idx_jobs_active_unique":      "WHERE",
 		"idx_jobs_dequeue_eligible":   "WHERE",
 		"idx_jobs_retention_terminal": "WHERE",
+		"idx_signals_consumed_at":     "consumed_at IS NOT NULL",
 		"idx_jobs_stale_lock":         "COALESCE",
 	}
 	for indexName, mustContain := range defs {
 		indexDef := postgresIndexDef(t, db, indexName)
 		require.Contains(t, strings.ToUpper(indexDef), strings.ToUpper(mustContain), "%s definition:\n%s", indexName, indexDef)
 	}
+	require.Contains(t, strings.ToLower(postgresIndexDef(t, db, "idx_jobs_retention_terminal")), "id", "idx_jobs_retention_terminal must include id")
 	require.Contains(t, postgresIndexDef(t, db, "idx_jobs_stale_lock"), "WHERE", "idx_jobs_stale_lock must stay partial")
 	require.Contains(t, strings.ToUpper(postgresIndexDef(t, db, "idx_jobs_dequeue_eligible")), "COALESCE")
+	parentNonterminalDef := strings.ToLower(postgresIndexDef(t, db, "idx_jobs_parent_nonterminal"))
+	require.Contains(t, parentNonterminalDef, "parent_job_id", "idx_jobs_parent_nonterminal definition:\n%s", parentNonterminalDef)
+	require.Contains(t, parentNonterminalDef, "where", "idx_jobs_parent_nonterminal must stay partial:\n%s", parentNonterminalDef)
+	require.True(t,
+		strings.Contains(parentNonterminalDef, "not in") || strings.Contains(parentNonterminalDef, "<> all"),
+		"idx_jobs_parent_nonterminal must filter terminal statuses:\n%s", parentNonterminalDef,
+	)
+	rootNonterminalDef := strings.ToLower(postgresIndexDef(t, db, "idx_jobs_root_nonterminal"))
+	require.Contains(t, rootNonterminalDef, "root_job_id", "idx_jobs_root_nonterminal definition:\n%s", rootNonterminalDef)
+	require.Contains(t, rootNonterminalDef, "where", "idx_jobs_root_nonterminal must stay partial:\n%s", rootNonterminalDef)
+	require.True(t,
+		strings.Contains(rootNonterminalDef, "not in") || strings.Contains(rootNonterminalDef, "<> all"),
+		"idx_jobs_root_nonterminal must filter terminal statuses:\n%s", rootNonterminalDef,
+	)
 	metadataIndexDef := postgresIndexDef(t, db, "idx_jobs_metadata_gin")
 	require.Contains(t, strings.ToLower(metadataIndexDef), "using gin", "idx_jobs_metadata_gin definition:\n%s", metadataIndexDef)
 	require.Contains(t, strings.ToUpper(metadataIndexDef), "NULLIF(METADATA", "idx_jobs_metadata_gin definition:\n%s", metadataIndexDef)
 	require.Contains(t, metadataIndexDef, "jsonb_path_ops", "idx_jobs_metadata_gin definition:\n%s", metadataIndexDef)
 	require.True(t, postgresIndexExists(t, db, "idx_jobs_tenant"), "idx_jobs_tenant must exist")
+	statusCreatedDef := strings.ToLower(postgresIndexDef(t, db, "idx_jobs_status_created"))
+	require.Contains(t, statusCreatedDef, "status", "idx_jobs_status_created definition:\n%s", statusCreatedDef)
+	require.Contains(t, statusCreatedDef, "created_at", "idx_jobs_status_created definition:\n%s", statusCreatedDef)
+	queueCreatedDef := strings.ToLower(postgresIndexDef(t, db, "idx_jobs_queue_created"))
+	require.Contains(t, queueCreatedDef, "queue", "idx_jobs_queue_created definition:\n%s", queueCreatedDef)
+	require.Contains(t, queueCreatedDef, "created_at", "idx_jobs_queue_created definition:\n%s", queueCreatedDef)
+	fanOutStatusDef := strings.ToLower(postgresIndexDef(t, db, "idx_jobs_fan_out_status"))
+	require.Contains(t, fanOutStatusDef, "fan_out_id", "idx_jobs_fan_out_status definition:\n%s", fanOutStatusDef)
+	require.Contains(t, fanOutStatusDef, "status", "idx_jobs_fan_out_status definition:\n%s", fanOutStatusDef)
+	require.True(t, postgresIndexExists(t, db, "idx_concurrency_slots_expires_at"), "idx_concurrency_slots_expires_at must exist")
+	require.False(t, postgresIndexExists(t, db, "idx_rate_limit_windows_lookup"), "idx_rate_limit_windows_lookup must not exist after migration")
+	require.True(t, postgresIndexExists(t, db, "idx_signals_pending"), "idx_signals_pending must remain on postgres")
 
 	for _, indexName := range []string{
 		"idx_jobs_priority",
@@ -78,12 +106,18 @@ func TestPostgresSchemaAssertions(t *testing.T) {
 		"idx_jobs_dequeue",
 		"idx_jobs_unique_key",
 		"idx_jobs_dequeue_order",
+		"idx_jobs_status",
+		"idx_jobs_run_at",
+		"idx_jobs_fan_out_id",
+		"idx_signals_job_id",
 	} {
 		require.False(t, postgresIndexExists(t, db, indexName), "%s must not exist after migration", indexName)
 	}
 	requirePostgresCascadeFKs(t, db)
 	requirePostgresDispatcherColumnsNotNull(t, db)
 	requirePostgresFanOutThresholdDouble(t, db)
+	requirePostgresCheckConstraints(t, db)
+	requirePostgresCheckConstraintsEnforced(t, db)
 
 	// Regression (P5): a bare AutoMigrate must NOT drift the NOT NULL dispatcher
 	// columns or the double-precision threshold back (the core.Job/FanOut tags
@@ -152,15 +186,53 @@ func TestMySQLSchemaAssertions(t *testing.T) {
 		"idx_jobs_locked_until",
 		"idx_jobs_dequeue",
 		"idx_jobs_dequeue_order",
+		"idx_jobs_status",
+		"idx_jobs_run_at",
+		"idx_jobs_fan_out_id",
 	} {
 		require.False(t, mysqlIndexExists(t, db, indexName), "%s must not exist after migration", indexName)
 	}
 	require.True(t, mysqlIndexExists(t, db, "idx_jobs_unique_key"), "idx_jobs_unique_key must remain on mysql")
 	require.True(t, mysqlIndexExists(t, db, "idx_jobs_dequeue_eligible"), "idx_jobs_dequeue_eligible must exist on mysql")
+	require.True(t, mysqlIndexExists(t, db, "idx_jobs_retention_terminal"), "idx_jobs_retention_terminal must exist on mysql")
+	require.Equal(t, []string{"status", "completed_at", "id"}, mysqlIndexColumns(t, db, "jobs", "idx_jobs_retention_terminal"))
+	require.True(t, mysqlIndexExists(t, db, "idx_jobs_status_created"), "idx_jobs_status_created must exist on mysql")
+	require.Equal(t, []string{"status", "created_at"}, mysqlIndexColumns(t, db, "jobs", "idx_jobs_status_created"))
+	require.True(t, mysqlIndexExists(t, db, "idx_jobs_queue_created"), "idx_jobs_queue_created must exist on mysql")
+	require.Equal(t, []string{"queue", "created_at"}, mysqlIndexColumns(t, db, "jobs", "idx_jobs_queue_created"))
+	require.True(t, mysqlIndexExists(t, db, "idx_jobs_fan_out_status"), "idx_jobs_fan_out_status must exist on mysql")
+	require.Equal(t, []string{"fan_out_id", "status"}, mysqlIndexColumns(t, db, "jobs", "idx_jobs_fan_out_status"))
+	// idx_jobs_stale_lock must be an EXPRESSION index on MySQL (status +
+	// functional COALESCE key part) so the reaper's ORDER BY COALESCE(...) rides
+	// the index instead of filesorting — parity with the PG/SQLite partial
+	// functional index (R19).
+	require.True(t, mysqlIndexExists(t, db, "idx_jobs_stale_lock"), "idx_jobs_stale_lock must exist on mysql")
+	var staleLockExprParts int
+	require.NoError(t, db.Raw(`
+		SELECT COUNT(*)
+		FROM information_schema.STATISTICS
+		WHERE TABLE_SCHEMA = DATABASE()
+		  AND TABLE_NAME = 'jobs'
+		  AND INDEX_NAME = 'idx_jobs_stale_lock'
+		  AND EXPRESSION IS NOT NULL
+	`).Scan(&staleLockExprParts).Error)
+	require.GreaterOrEqual(t, staleLockExprParts, 1, "idx_jobs_stale_lock must be a COALESCE expression index so the reaper ORDER BY rides it (no filesort)")
+	require.True(t, mysqlTableIndexExists(t, db, "signals", "idx_signals_consumed_at"), "idx_signals_consumed_at must exist on mysql")
+	require.False(t, mysqlTableIndexExists(t, db, "signals", "idx_signals_job_id"), "idx_signals_job_id must not exist after migration")
+	require.True(t, mysqlTableIndexExists(t, db, "signals", "idx_signals_pending"), "idx_signals_pending must remain on mysql")
+	require.True(t, mysqlTableIndexExists(t, db, "concurrency_slots", "idx_concurrency_slots_expires_at"), "idx_concurrency_slots_expires_at must exist on mysql")
+	require.False(t, mysqlTableIndexExists(t, db, "rate_limit_windows", "idx_rate_limit_windows_lookup"), "idx_rate_limit_windows_lookup must not exist after migration")
+	requireMySQLGeneratedVarchar36Column(t, db, "pending_parent_ref")
+	requireMySQLGeneratedVarchar36Column(t, db, "pending_root_ref")
+	require.True(t, mysqlIndexExists(t, db, "idx_jobs_parent_nonterminal"), "idx_jobs_parent_nonterminal must exist on mysql")
+	require.True(t, mysqlIndexExists(t, db, "idx_jobs_root_nonterminal"), "idx_jobs_root_nonterminal must exist on mysql")
 	require.True(t, mysqlIndexExists(t, db, "idx_jobs_tenant"), "idx_jobs_tenant must exist on mysql")
 	requireMySQLCascadeFKs(t, db)
 	requireMySQLUniqueKeyCollations(t, db)
 	requireMySQLDispatcherColumnsNotNull(t, db)
+	requireMySQLCheckConstraints(t, db)
+	requireMySQLCheckConstraintsEnforced(t, db)
+	requireMySQLMetadataIntegrity(t, db)
 
 	// Regression (P5): a bare AutoMigrate must NOT drift the NOT NULL dispatcher
 	// columns back to nullable. Before the core.Job `not null` tags, AutoMigrate
@@ -338,6 +410,57 @@ func requirePostgresFanOutThresholdDouble(t *testing.T, db *gorm.DB) {
 	require.Equal(t, "double precision", dataType, "postgres fan_outs.threshold must be double precision")
 }
 
+func requirePostgresCheckConstraints(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	for _, constraintName := range checkConstraintNames() {
+		var count int
+		require.NoError(t, db.Raw(`
+			SELECT COUNT(*)
+			FROM pg_constraint
+			WHERE contype = 'c'
+			  AND conname = ?
+			  AND conrelid IN ('jobs'::regclass, 'fan_outs'::regclass)
+		`, constraintName).Scan(&count).Error)
+		require.Equal(t, 1, count, "%s CHECK constraint must exist on postgres", constraintName)
+	}
+}
+
+func requirePostgresCheckConstraintsEnforced(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	tx := db.Begin()
+	require.NoError(t, tx.Error)
+	defer func() {
+		require.NoError(t, tx.Rollback().Error)
+	}()
+
+	require.NoError(t, tx.Exec(`
+		INSERT INTO jobs (id, type, status, queue, priority, attempt, max_retries, timeout, determinism)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, "check-pg-parent", "schema.check", "pending", "default", 0, 0, 3, 0, 0).Error)
+
+	requireExecRejectedWithSavepoint(t, tx, "pg_bad_job_status", `
+		INSERT INTO jobs (id, type, status, queue, priority, attempt, max_retries, timeout, determinism)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, "check-pg-bad-status", "schema.check", "BOGUS", "default", 0, 0, 3, 0, 0)
+	requireExecRejectedWithSavepoint(t, tx, "pg_bad_job_attempt", `
+		INSERT INTO jobs (id, type, status, queue, priority, attempt, max_retries, timeout, determinism)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, "check-pg-bad-attempt", "schema.check", "pending", "default", 0, -1, 3, 0, 0)
+	requireExecRejectedWithSavepoint(t, tx, "pg_bad_fanout_strategy", `
+		INSERT INTO fan_outs (id, parent_job_id, total_count, strategy)
+		VALUES (?, ?, ?, ?)
+	`, "check-pg-bad-strategy", "check-pg-parent", 1, "nope")
+	requireExecRejectedWithSavepoint(t, tx, "pg_bad_fanout_count", `
+		INSERT INTO fan_outs (id, parent_job_id, total_count, completed_count)
+		VALUES (?, ?, ?, ?)
+	`, "check-pg-bad-count", "check-pg-parent", 1, -1)
+
+	require.NoError(t, tx.Exec(`
+		INSERT INTO fan_outs (id, parent_job_id, total_count, completed_count, failed_count, cancelled_count, strategy, status)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+	`, "check-pg-good-fanout", "check-pg-parent", 1, 0, 0, 0, "fail_fast", "pending").Error)
+}
+
 type postgresColumnType struct {
 	DataType          string `gorm:"column:data_type"`
 	DateTimePrecision int    `gorm:"column:datetime_precision"`
@@ -398,6 +521,157 @@ func requireMySQLDeadLetteredAtPrecision(t *testing.T, db *gorm.DB, want int) {
 	require.Equal(t, want, precision, "dead_lettered_at must be datetime(%d)", want)
 }
 
+func requireMySQLCheckConstraints(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	for _, constraintName := range checkConstraintNames() {
+		var count int
+		require.NoError(t, db.Raw(`
+			SELECT COUNT(*)
+			FROM information_schema.TABLE_CONSTRAINTS
+			WHERE CONSTRAINT_SCHEMA = DATABASE()
+			  AND CONSTRAINT_TYPE = 'CHECK'
+			  AND CONSTRAINT_NAME = ?
+		`, constraintName).Scan(&count).Error)
+		require.Equal(t, 1, count, "%s CHECK constraint must exist on mysql", constraintName)
+	}
+}
+
+func requireMySQLCheckConstraintsEnforced(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	tx := db.Begin()
+	require.NoError(t, tx.Error)
+	defer func() {
+		require.NoError(t, tx.Rollback().Error)
+	}()
+
+	require.NoError(t, tx.Exec(`
+		INSERT INTO jobs (id, type, status, queue, priority, attempt, max_retries, timeout, determinism)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, "check-mysql-parent", "schema.check", "pending", "default", 0, 0, 3, 0, 0).Error)
+
+	requireExecRejectedWithSavepoint(t, tx, "mysql_bad_job_case", `
+		INSERT INTO jobs (id, type, status, queue, priority, attempt, max_retries, timeout, determinism)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, "check-mysql-bad-case", "schema.check", "PENDING", "default", 0, 0, 3, 0, 0)
+	requireExecRejectedWithSavepoint(t, tx, "mysql_bad_job_status", `
+		INSERT INTO jobs (id, type, status, queue, priority, attempt, max_retries, timeout, determinism)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, "check-mysql-bad-status", "schema.check", "BOGUS", "default", 0, 0, 3, 0, 0)
+	requireExecRejectedWithSavepoint(t, tx, "mysql_bad_job_attempt", `
+		INSERT INTO jobs (id, type, status, queue, priority, attempt, max_retries, timeout, determinism)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, "check-mysql-bad-attempt", "schema.check", "pending", "default", 0, -1, 3, 0, 0)
+	requireExecRejectedWithSavepoint(t, tx, "mysql_bad_fanout_strategy", `
+		INSERT INTO fan_outs (id, parent_job_id, total_count, strategy)
+		VALUES (?, ?, ?, ?)
+	`, "check-mysql-bad-strategy", "check-mysql-parent", 1, "nope")
+	requireExecRejectedWithSavepoint(t, tx, "mysql_bad_fanout_count", `
+		INSERT INTO fan_outs (id, parent_job_id, total_count, completed_count)
+		VALUES (?, ?, ?, ?)
+	`, "check-mysql-bad-count", "check-mysql-parent", 1, -1)
+
+	require.NoError(t, tx.Exec(`
+		INSERT INTO fan_outs (id, parent_job_id, total_count, completed_count, failed_count, cancelled_count, strategy, status)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+	`, "check-mysql-good-fanout", "check-mysql-parent", 1, 0, 0, 0, "fail_fast", "pending").Error)
+}
+
+func requireMySQLMetadataIntegrity(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	var count int
+	require.NoError(t, db.Raw(`
+		SELECT COUNT(*)
+		FROM information_schema.TABLE_CONSTRAINTS
+		WHERE CONSTRAINT_SCHEMA = DATABASE()
+		  AND CONSTRAINT_TYPE = 'CHECK'
+		  AND CONSTRAINT_NAME = 'chk_jobs_metadata_json'
+	`).Scan(&count).Error)
+	require.Equal(t, 1, count, "chk_jobs_metadata_json CHECK constraint must exist on mysql")
+
+	tx := db.Begin()
+	require.NoError(t, tx.Error)
+	defer func() {
+		require.NoError(t, tx.Rollback().Error)
+	}()
+
+	now := time.Now().UTC()
+	requireExecRejectedWithSavepoint(t, tx, "mysql_bad_metadata_json", `
+		INSERT INTO jobs (id, type, queue, status, priority, attempt, max_retries, timeout, determinism, created_at, metadata)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, "metadata-bad-json", "schema.metadata", "default", "pending", 0, 0, 3, 0, 0, now, "not-valid-json")
+
+	require.NoError(t, tx.Exec(`
+		INSERT INTO jobs (id, type, queue, status, priority, attempt, max_retries, timeout, determinism, created_at, metadata)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, "metadata-empty", "schema.metadata", "default", "pending", 0, 0, 3, 0, 0, now, "").Error)
+	require.NoError(t, tx.Exec(`
+		INSERT INTO jobs (id, type, queue, status, priority, attempt, max_retries, timeout, determinism, created_at, metadata)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, "metadata-null", "schema.metadata", "default", "pending", 0, 0, 3, 0, 0, now, nil).Error)
+	require.NoError(t, tx.Exec(`
+		INSERT INTO jobs (id, type, queue, status, priority, attempt, max_retries, timeout, determinism, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, "metadata-omitted", "schema.metadata", "default", "pending", 0, 0, 3, 0, 0, now).Error)
+	require.NoError(t, tx.Exec(`
+		INSERT INTO jobs (id, type, queue, status, priority, attempt, max_retries, timeout, determinism, created_at, metadata)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, "metadata-json-contains-prod", "schema.metadata", "default", "pending", 0, 0, 3, 0, 0, now, `{"env":"prod"}`).Error)
+	require.NoError(t, tx.Exec(`
+		INSERT INTO jobs (id, type, queue, status, priority, attempt, max_retries, timeout, determinism, created_at, metadata)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, "metadata-json-near-value", "schema.metadata", "default", "pending", 0, 0, 3, 0, 0, now, `{"env":"prod-test"}`).Error)
+	require.NoError(t, tx.Exec(`
+		INSERT INTO jobs (id, type, queue, status, priority, attempt, max_retries, timeout, determinism, created_at, metadata)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, "metadata-json-near-key", "schema.metadata", "default", "pending", 0, 0, 3, 0, 0, now, `{"team":"prod"}`).Error)
+
+	var matches []string
+	require.NoError(t, tx.Raw(`
+		SELECT id
+		FROM jobs
+		WHERE metadata IS NOT NULL
+		  AND metadata <> ''
+		  AND JSON_CONTAINS(metadata, CAST(? AS JSON))
+		ORDER BY id
+	`, `{"env":"prod"}`).Scan(&matches).Error)
+	require.Equal(t, []string{"metadata-json-contains-prod"}, matches, "JSON_CONTAINS must exclude substring-only metadata near-matches")
+}
+
+func requireMySQLGeneratedVarchar36Column(t *testing.T, db *gorm.DB, columnName string) {
+	t.Helper()
+	var count int
+	require.NoError(t, db.Raw(`
+		SELECT COUNT(*)
+		FROM information_schema.COLUMNS
+		WHERE TABLE_SCHEMA = DATABASE()
+		  AND TABLE_NAME = 'jobs'
+		  AND COLUMN_NAME = ?
+		  AND DATA_TYPE = 'varchar'
+		  AND CHARACTER_MAXIMUM_LENGTH = 36
+		  AND GENERATION_EXPRESSION <> ''
+	`, columnName).Scan(&count).Error)
+	require.Equal(t, 1, count, "%s generated varchar(36) column must exist", columnName)
+}
+
+func checkConstraintNames() []string {
+	return []string{
+		"chk_jobs_status",
+		"chk_jobs_attempt_nonneg",
+		"chk_jobs_max_retries_nonneg",
+		"chk_fan_outs_strategy",
+		"chk_fan_outs_status",
+		"chk_fan_outs_counts_nonneg",
+	}
+}
+
+func requireExecRejectedWithSavepoint(t *testing.T, tx *gorm.DB, savepointName, stmt string, args ...any) {
+	t.Helper()
+	require.NoError(t, tx.Exec("SAVEPOINT "+savepointName).Error)
+	require.Error(t, tx.Exec(stmt, args...).Error)
+	require.NoError(t, tx.Exec("ROLLBACK TO SAVEPOINT "+savepointName).Error)
+	require.NoError(t, tx.Exec("RELEASE SAVEPOINT "+savepointName).Error)
+}
+
 func postgresIndexDef(t *testing.T, db *gorm.DB, indexName string) string {
 	t.Helper()
 	var indexDef string
@@ -419,15 +693,35 @@ func postgresIndexExists(t *testing.T, db *gorm.DB, indexName string) bool {
 
 func mysqlIndexExists(t *testing.T, db *gorm.DB, indexName string) bool {
 	t.Helper()
+	return mysqlTableIndexExists(t, db, "jobs", indexName)
+}
+
+func mysqlTableIndexExists(t *testing.T, db *gorm.DB, tableName, indexName string) bool {
+	t.Helper()
 	var count int
 	require.NoError(t, db.Raw(`
 		SELECT COUNT(*)
 		FROM information_schema.STATISTICS
 		WHERE TABLE_SCHEMA = DATABASE()
-		  AND TABLE_NAME = 'jobs'
+		  AND TABLE_NAME = ?
 		  AND INDEX_NAME = ?
-	`, indexName).Scan(&count).Error)
+	`, tableName, indexName).Scan(&count).Error)
 	return count > 0
+}
+
+func mysqlIndexColumns(t *testing.T, db *gorm.DB, tableName, indexName string) []string {
+	t.Helper()
+	var columns []string
+	require.NoError(t, db.Raw(`
+		SELECT COLUMN_NAME
+		FROM information_schema.STATISTICS
+		WHERE TABLE_SCHEMA = DATABASE()
+		  AND TABLE_NAME = ?
+		  AND INDEX_NAME = ?
+		ORDER BY SEQ_IN_INDEX
+	`, tableName, indexName).Scan(&columns).Error)
+	require.NotEmpty(t, columns, "%s must exist on %s", indexName, tableName)
+	return columns
 }
 
 func buildSchemaDequeuePlanQuery(s *GormStorage, queues []string, limit int) *gorm.DB {

@@ -8,7 +8,43 @@ Simple Durable Jobs does not provide schema-level multi-tenancy. The built-in te
 
 Use this when tenants share an application database and you need fair scheduling or noisy-neighbor controls. Do not use it as a substitute for regulatory, contractual, or security isolation.
 
+Tenant filtering is advisory application-level filtering. In storage queries it
+is a convenience predicate such as `WHERE tenant = ?`; it is not a database
+isolation boundary. Simple Durable Jobs does not install row-level security
+policies, does not scope worker dequeue by tenant, and does not prevent a caller
+with broad storage or dashboard authorization from reading another tenant's job
+rows.
+
 For API details, see [Job Options]({{< relref "/docs/api-reference/job-options" >}}) for `WithTenant` and [Types]({{< relref "/docs/api-reference/types" >}}) for `Job.Tenant` and `JobFilter.Tenant`.
+
+## Threat Model
+
+`Job.Tenant` is appropriate when your own application already enforces tenant
+authorization and you need the queue to carry the same label for filtering,
+fairness, routing, and operations. It assumes trusted application code,
+trusted workers, and trusted operators with dashboard or database access.
+
+It does not protect against a compromised application component, a buggy admin
+endpoint that omits the tenant filter, an overbroad dashboard authorizer, direct
+database access, or a worker that intentionally processes jobs for another
+tenant. Treat tenant filters as defense against accidental mixing and as an
+operations tool, not as enforced isolation.
+
+## Enforced Isolation Patterns
+
+For hard tenant isolation, use one or more of these controls outside the queue
+label:
+
+- Separate database, schema, or deployment per tenant. This is the clearest
+  boundary for regulated or contractual isolation.
+- Dashboard authorization that pins the principal's tenant. Store the tenant in
+  your authenticated principal, permit only matching `Job.Tenant` views, and do
+  not expose broad search or mutation rights to tenant-scoped users.
+- Database row-level security or equivalent views/policies managed by your
+  application. If you add RLS, ensure every queue, dashboard, retention, and
+  operational connection sets the correct database principal or tenant setting.
+- Per-tenant encryption domains if operators or database snapshots must not
+  reveal another tenant's payloads.
 
 ## Primary Pattern: Set `Job.Tenant`
 
