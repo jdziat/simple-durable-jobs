@@ -245,6 +245,11 @@ var schemaMigrations = []schemaMigration{
 		Name:    "metadata_integrity",
 		Up:      migrateMetadataIntegrity,
 	},
+	{
+		Version: 24,
+		Name:    "drop_redundant_signal_index",
+		Up:      migrateDropRedundantSignalIndex,
+	},
 }
 
 // applyPendingMigrations runs every migration whose version is absent from the
@@ -1109,6 +1114,24 @@ func migrateMetadataIntegrity(ctx context.Context, db *gorm.DB, dialect string) 
 		return nil
 	default:
 		// SQLite is dev-only and ALTER TABLE ADD CHECK is unsupported there.
+		return nil
+	}
+}
+
+func migrateDropRedundantSignalIndex(ctx context.Context, db *gorm.DB, dialect string) error {
+	switch dialect {
+	case dialectMySQL:
+		m := db.Migrator()
+		if m.HasIndex(&core.Signal{}, "idx_signals_job_id") {
+			if err := m.DropIndex(&core.Signal{}, "idx_signals_job_id"); err != nil && !isBenignDDLError(err) {
+				return fmt.Errorf("drop idx_signals_job_id: %w", err)
+			}
+		}
+		return nil
+	default:
+		if err := db.WithContext(ctx).Exec("DROP INDEX IF EXISTS idx_signals_job_id").Error; err != nil {
+			return fmt.Errorf("drop idx_signals_job_id: %w", err)
+		}
 		return nil
 	}
 }

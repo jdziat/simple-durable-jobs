@@ -97,6 +97,7 @@ func TestPostgresSchemaAssertions(t *testing.T) {
 	require.Contains(t, fanOutStatusDef, "status", "idx_jobs_fan_out_status definition:\n%s", fanOutStatusDef)
 	require.True(t, postgresIndexExists(t, db, "idx_concurrency_slots_expires_at"), "idx_concurrency_slots_expires_at must exist")
 	require.False(t, postgresIndexExists(t, db, "idx_rate_limit_windows_lookup"), "idx_rate_limit_windows_lookup must not exist after migration")
+	require.True(t, postgresIndexExists(t, db, "idx_signals_pending"), "idx_signals_pending must remain on postgres")
 
 	for _, indexName := range []string{
 		"idx_jobs_priority",
@@ -108,6 +109,7 @@ func TestPostgresSchemaAssertions(t *testing.T) {
 		"idx_jobs_status",
 		"idx_jobs_run_at",
 		"idx_jobs_fan_out_id",
+		"idx_signals_job_id",
 	} {
 		require.False(t, postgresIndexExists(t, db, indexName), "%s must not exist after migration", indexName)
 	}
@@ -216,6 +218,8 @@ func TestMySQLSchemaAssertions(t *testing.T) {
 	`).Scan(&staleLockExprParts).Error)
 	require.GreaterOrEqual(t, staleLockExprParts, 1, "idx_jobs_stale_lock must be a COALESCE expression index so the reaper ORDER BY rides it (no filesort)")
 	require.True(t, mysqlTableIndexExists(t, db, "signals", "idx_signals_consumed_at"), "idx_signals_consumed_at must exist on mysql")
+	require.False(t, mysqlTableIndexExists(t, db, "signals", "idx_signals_job_id"), "idx_signals_job_id must not exist after migration")
+	require.True(t, mysqlTableIndexExists(t, db, "signals", "idx_signals_pending"), "idx_signals_pending must remain on mysql")
 	require.True(t, mysqlTableIndexExists(t, db, "concurrency_slots", "idx_concurrency_slots_expires_at"), "idx_concurrency_slots_expires_at must exist on mysql")
 	require.False(t, mysqlTableIndexExists(t, db, "rate_limit_windows", "idx_rate_limit_windows_lookup"), "idx_rate_limit_windows_lookup must not exist after migration")
 	requireMySQLGeneratedVarchar36Column(t, db, "pending_parent_ref")
