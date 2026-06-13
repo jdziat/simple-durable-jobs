@@ -5,7 +5,6 @@ import (
 	"time"
 
 	"gorm.io/gorm"
-	"gorm.io/gorm/clause"
 
 	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
 )
@@ -50,9 +49,7 @@ func (s *GormStorage) DeleteTerminalJobsOlderThan(ctx context.Context, status co
 				Where("NOT EXISTS (SELECT 1 FROM fan_outs f WHERE f.parent_job_id = jobs.id AND f.status = 'pending')").
 				Order("completed_at ASC, id ASC").
 				Limit(limit)
-			if !s.isSQLite {
-				query = query.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"})
-			}
+			query = s.lockForUpdate(query, true)
 			if err := query.Pluck("id", &ids).Error; err != nil {
 				return err
 			}

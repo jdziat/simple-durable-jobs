@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"gorm.io/gorm"
-	"gorm.io/gorm/clause"
 	"gorm.io/gorm/logger"
 
 	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
@@ -87,7 +86,6 @@ func activeQueuesExcludingPaused(queues, pausedQueues []string) []string {
 func (s *GormStorage) dequeueBatchLocked(ctx context.Context, queues []string, workerID string, limit int, perQueueBudgets map[string]int) ([]*core.Job, error) {
 	nowExpr := s.nowExpr()
 	lockUntilExpr := s.offsetExpr(s.lockDuration)
-	eligExpr := s.dequeueEligibleExpr()
 	silentDB := s.db.Session(&gorm.Session{Logger: s.db.Logger.LogMode(logger.Silent)})
 
 	claimedIDs := make([]string, 0, limit)
@@ -115,11 +113,7 @@ func (s *GormStorage) dequeueBatchLocked(ctx context.Context, queues []string, w
 				for len(batchIDs) < remaining {
 					var candidates []*core.Job
 					needed := remaining - len(batchIDs)
-					query := tx.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).
-						Where("queue IN ?", queues).
-						Where("status = ?", core.StatusPending).
-						Where(eligExpr+" <= ?", nowExpr).
-						Where("(locked_until IS NULL OR locked_until < ?)", nowExpr)
+					query := s.claimableCandidates(s.lockForUpdate(tx, true), queues, nowExpr)
 					if len(skippedIDs) > 0 {
 						query = query.Where("id NOT IN ?", skippedIDs)
 					}
@@ -131,7 +125,6 @@ func (s *GormStorage) dequeueBatchLocked(ctx context.Context, queues []string, w
 						query = query.Where("id NOT IN ?", ids)
 					}
 					result := query.
-						Order("priority DESC, " + eligExpr + " ASC").
 						Limit(needed).
 						Find(&candidates)
 					if result.Error != nil {
@@ -237,14 +230,9 @@ func (s *GormStorage) dequeueBatchLocked(ctx context.Context, queues []string, w
 
 func (s *GormStorage) hasClaimableBatchJob(ctx context.Context, queues []string) (bool, error) {
 	var job core.Job
-	err := s.db.Session(&gorm.Session{Logger: s.db.Logger.LogMode(logger.Silent)}).
+	err := s.claimableCandidates(s.db.Session(&gorm.Session{Logger: s.db.Logger.LogMode(logger.Silent)}), queues, s.nowExpr()).
 		WithContext(ctx).
 		Select("id").
-		Where("queue IN ?", queues).
-		Where("status = ?", core.StatusPending).
-		Where(s.dequeueEligibleExpr()+" <= ?", s.nowExpr()).
-		Where("(locked_until IS NULL OR locked_until < ?)", s.nowExpr()).
-		Order("priority DESC, " + s.dequeueEligibleExpr() + " ASC").
 		First(&job).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return false, nil
@@ -266,7 +254,6 @@ func sleepDequeueBatchRetry(ctx context.Context, d time.Duration) error {
 func (s *GormStorage) dequeueBatchSQLite(ctx context.Context, queues []string, workerID string, limit int, perQueueBudgets map[string]int) ([]*core.Job, error) {
 	now := time.Now()
 	lockUntil := now.Add(s.lockDuration)
-	eligExpr := s.dequeueEligibleExpr()
 
 	var jobs []*core.Job
 	err := s.withSerializationRetry(ctx, func() error {
@@ -276,11 +263,7 @@ func (s *GormStorage) dequeueBatchSQLite(ctx context.Context, queues []string, w
 		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 			for len(jobs) < limit {
 				var job core.Job
-				query := tx.
-					Where("queue IN ?", queues).
-					Where("status = ?", core.StatusPending).
-					Where(eligExpr+" <= ?", now).
-					Where("(locked_until IS NULL OR locked_until < ?)", now)
+				query := s.claimableCandidates(tx, queues, now)
 				if len(claimedIDs) > 0 {
 					ids := make([]string, 0, len(claimedIDs))
 					for id := range claimedIDs {
@@ -288,7 +271,7 @@ func (s *GormStorage) dequeueBatchSQLite(ctx context.Context, queues []string, w
 					}
 					query = query.Where("id NOT IN ?", ids)
 				}
-				result := query.Order("priority DESC, " + eligExpr + " ASC").First(&job)
+				result := query.First(&job)
 				if result.Error != nil {
 					if errors.Is(result.Error, gorm.ErrRecordNotFound) {
 						return nil

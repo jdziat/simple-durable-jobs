@@ -45,9 +45,7 @@ func (s *GormStorage) TryAcquireConcurrencySlot(ctx context.Context, slotName, j
 				return err
 			}
 			sentinel := tx.Where("slot_name = ? AND job_id = ?", slotName, "")
-			if !s.isSQLite {
-				sentinel = sentinel.Clauses(clause.Locking{Strength: "UPDATE"})
-			}
+			sentinel = s.lockForUpdate(sentinel, false)
 			var guard core.ConcurrencySlot
 			if err := sentinel.First(&guard).Error; err != nil {
 				return err
@@ -72,9 +70,7 @@ func (s *GormStorage) TryAcquireConcurrencySlot(ctx context.Context, slotName, j
 			live := tx.Model(&core.ConcurrencySlot{}).
 				Where("slot_name = ? AND expires_at >= ?", slotName, nowVal).
 				Where("job_id <> ?", "")
-			if !s.isSQLite {
-				live = live.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"})
-			}
+			live = s.lockForUpdate(live, true)
 			var liveSlots []core.ConcurrencySlot
 			if err := live.Find(&liveSlots).Error; err != nil {
 				return err

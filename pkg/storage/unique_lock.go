@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"gorm.io/gorm"
-	"gorm.io/gorm/clause"
 
 	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
 )
@@ -152,9 +151,7 @@ func (s *GormStorage) DeleteExpiredUniqueLocks(ctx context.Context, limit int) (
 				Where("expires_at <= ?", nowVal).
 				Order("expires_at ASC, scope_hash ASC").
 				Limit(limit)
-			if !s.isSQLite {
-				query = query.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"})
-			}
+			query = s.lockForUpdate(query, true)
 			if err := query.Pluck("scope_hash", &hashes).Error; err != nil {
 				return err
 			}

@@ -385,9 +385,7 @@ func (s *GormStorage) EnqueueUnique(ctx context.Context, job *core.Job, uniqueKe
 
 			// SQLite doesn't support FOR UPDATE, but its serializable transactions
 			// provide equivalent protection for single-process scenarios
-			if !s.isSQLite {
-				query = query.Clauses(clause.Locking{Strength: "UPDATE"})
-			}
+			query = s.lockForUpdate(query, false)
 
 			var existing core.Job
 			err := query.First(&existing).Error
@@ -474,20 +472,13 @@ func (s *GormStorage) Dequeue(ctx context.Context, queues []string, workerID str
 	// add a predicate that assumes the two reads are equal.
 	nowExpr := s.nowExpr()
 	lockUntilExpr := s.offsetExpr(s.lockDuration)
-	eligExpr := s.dequeueEligibleExpr()
 	silentDB := s.db.Session(&gorm.Session{Logger: s.db.Logger.LogMode(logger.Silent)})
 	err = silentDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		// FOR UPDATE SKIP LOCKED ensures:
 		// 1. The selected row is locked for this transaction
 		// 2. Other workers skip locked rows instead of waiting
 		// This prevents duplicate job execution in distributed scenarios
-		result := tx.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).
-			Where("queue IN ?", activeQueues).
-			Where("status = ?", core.StatusPending).
-			Where(eligExpr+" <= ?", nowExpr).
-			Where("(locked_until IS NULL OR locked_until < ?)", nowExpr).
-			Order("priority DESC, " + eligExpr + " ASC").
-			First(&job)
+		result := s.claimableCandidates(s.lockForUpdate(tx, true), activeQueues, nowExpr).First(&job)
 
 		if result.Error != nil {
 			if errors.Is(result.Error, gorm.ErrRecordNotFound) {
@@ -540,17 +531,10 @@ func (s *GormStorage) Dequeue(ctx context.Context, queues []string, workerID str
 // This is NOT safe for multiple concurrent workers - use PostgreSQL for production.
 func (s *GormStorage) dequeueSQLite(ctx context.Context, queues []string, workerID string, now time.Time, lockUntil time.Time) (*core.Job, error) {
 	var job core.Job
-	eligExpr := s.dequeueEligibleExpr()
 
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		// Find a candidate job
-		result := tx.
-			Where("queue IN ?", queues).
-			Where("status = ?", core.StatusPending).
-			Where(eligExpr+" <= ?", now).
-			Where("(locked_until IS NULL OR locked_until < ?)", now).
-			Order("priority DESC, " + eligExpr + " ASC").
-			First(&job)
+		result := s.claimableCandidates(tx, queues, now).First(&job)
 
 		if result.Error != nil {
 			if errors.Is(result.Error, gorm.ErrRecordNotFound) {
@@ -1514,9 +1498,7 @@ func (s *GormStorage) CancelSubJobs(ctx context.Context, fanOutID string) ([]str
 			query := tx.Model(&core.Job{}).
 				Where("fan_out_id = ? AND status IN ?", fanOutID, []core.JobStatus{core.StatusPending, core.StatusRunning}).
 				Order("fan_out_index ASC")
-			if !s.isSQLite {
-				query = query.Clauses(clause.Locking{Strength: "UPDATE"})
-			}
+			query = s.lockForUpdate(query, false)
 			if err := query.Pluck("id", &cancelled).Error; err != nil {
 				return err
 			}

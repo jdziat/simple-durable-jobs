@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"gorm.io/gorm"
-	"gorm.io/gorm/clause"
 
 	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
 )
@@ -57,9 +56,7 @@ func (s *GormStorage) ConsumeSignal(ctx context.Context, jobID, name string) (*c
 		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 			q := tx.Where("job_id = ? AND name = ? AND consumed_at IS NULL", jobID, name).
 				Order("created_at ASC")
-			if !s.isSQLite {
-				q = q.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"})
-			}
+			q = s.lockForUpdate(q, true)
 			var sig core.Signal
 			err := q.First(&sig).Error
 			if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -101,9 +98,7 @@ func (s *GormStorage) DrainSignals(ctx context.Context, jobID, name string) ([]*
 		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 			q := tx.Where("job_id = ? AND name = ? AND consumed_at IS NULL", jobID, name).
 				Order("created_at ASC")
-			if !s.isSQLite {
-				q = q.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"})
-			}
+			q = s.lockForUpdate(q, true)
 			var sigs []*core.Signal
 			if err := q.Find(&sigs).Error; err != nil {
 				return err
@@ -160,9 +155,7 @@ func (s *GormStorage) ConsumeSignalTx(ctx context.Context, jobID, name string, b
 		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 			q := tx.Where("job_id = ? AND name = ? AND consumed_at IS NULL", jobID, name).
 				Order("created_at ASC")
-			if !s.isSQLite {
-				q = q.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"})
-			}
+			q = s.lockForUpdate(q, true)
 			var sig core.Signal
 			err := q.First(&sig).Error
 			if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -218,9 +211,7 @@ func (s *GormStorage) DrainSignalsTx(ctx context.Context, jobID, name string, bu
 		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 			q := tx.Where("job_id = ? AND name = ? AND consumed_at IS NULL", jobID, name).
 				Order("created_at ASC")
-			if !s.isSQLite {
-				q = q.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"})
-			}
+			q = s.lockForUpdate(q, true)
 			var sigs []*core.Signal
 			if err := q.Find(&sigs).Error; err != nil {
 				return err
@@ -303,9 +294,7 @@ func (s *GormStorage) DeleteConsumedSignalsOlderThan(ctx context.Context, age ti
 				Where("consumed_at < ?", cutoff).
 				Order("consumed_at ASC, id ASC").
 				Limit(limit)
-			if !s.isSQLite {
-				query = query.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"})
-			}
+			query = s.lockForUpdate(query, true)
 			if err := query.Pluck("id", &ids).Error; err != nil {
 				return err
 			}

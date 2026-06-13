@@ -58,9 +58,7 @@ func (s *GormStorage) EnqueueUniqueTx(ctx context.Context, tx *gorm.DB, job *cor
 
 	query := db.Where("unique_key = ?", uniqueKey).
 		Where("status IN ?", []core.JobStatus{core.StatusPending, core.StatusRunning})
-	if !s.isSQLite {
-		query = query.Clauses(clause.Locking{Strength: "UPDATE"})
-	}
+	query = s.lockForUpdate(query, false)
 
 	var existing core.Job
 	err := query.First(&existing).Error
@@ -132,9 +130,7 @@ func (s *GormStorage) enqueueBatchWithDB(db *gorm.DB, jobs []*core.Job) error {
 			Select("unique_key").
 			Where("unique_key IN ? AND status IN ?", keys,
 				[]core.JobStatus{core.StatusPending, core.StatusRunning, core.StatusCompleted})
-		if !s.isSQLite {
-			query = query.Clauses(clause.Locking{Strength: "UPDATE"})
-		}
+		query = s.lockForUpdate(query, false)
 
 		var found []string
 		if err := query.Pluck("unique_key", &found).Error; err != nil {
