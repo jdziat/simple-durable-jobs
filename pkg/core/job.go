@@ -18,6 +18,10 @@ const (
 	StatusPaused    JobStatus = "paused"    // Paused, won't be picked up
 )
 
+// AllJobStatuses is the single source of truth that the migration CHECK and
+// drift guard derive from.
+var AllJobStatuses = []JobStatus{StatusPending, StatusRunning, StatusCompleted, StatusFailed, StatusRetrying, StatusWaiting, StatusCancelled, StatusPaused}
+
 // MetadataMap stores queryable string metadata for jobs and job filters.
 type MetadataMap map[string]string
 

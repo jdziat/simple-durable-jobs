@@ -514,6 +514,15 @@ func resetHarnessData(ctx context.Context, db *gorm.DB, dialect string) error {
 func runCheck(ctx context.Context, a *app) error {
 	if err := waitForDrain(ctx, a.db, 120*time.Second, 10*time.Second); err != nil {
 		fmt.Printf("drain wait: %v\n", err)
+		inv := checkNoWedge(ctx, a.db)
+		status := "PASS"
+		if !inv.pass {
+			status = "FAIL"
+		}
+		fmt.Println("chaostest invariant report:")
+		fmt.Printf("%-26s %-4s %-4s %s\n", inv.name, inv.level, status, inv.detail)
+		fmt.Println("chaostest result: DID NOT DRAIN (wedged or still draining)")
+		return fmt.Errorf("chaostest did not drain: %w", err)
 	}
 
 	results := []invariant{

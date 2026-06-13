@@ -14,6 +14,10 @@ const (
 	StrategyThreshold  FanOutStrategy = "threshold"   // Ok if threshold% succeed
 )
 
+// AllFanOutStrategies is the single source of truth that the migration CHECK
+// and drift guard derive from.
+var AllFanOutStrategies = []FanOutStrategy{StrategyFailFast, StrategyCollectAll, StrategyThreshold}
+
 // FanOutStatus represents the state of a fan-out batch.
 type FanOutStatus string
 
@@ -22,6 +26,10 @@ const (
 	FanOutCompleted FanOutStatus = "completed"
 	FanOutFailed    FanOutStatus = "failed"
 )
+
+// AllFanOutStatuses is the single source of truth that the migration CHECK and
+// drift guard derive from.
+var AllFanOutStatuses = []FanOutStatus{FanOutPending, FanOutCompleted, FanOutFailed}
 
 // FanOut tracks a batch of sub-jobs spawned by a parent job.
 type FanOut struct {

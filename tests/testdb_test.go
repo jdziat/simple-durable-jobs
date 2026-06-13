@@ -113,7 +113,7 @@ func cleanupExternalIntegrationDB(t *testing.T, db *gorm.DB) {
 	// scheduled_fires and leases hold per-test state (scheduler anchor, recovery
 	// lease); clean them too so integration tests are isolated on a persistent
 	// external DB. schema_migrations is intentionally left (migration ledger).
-	tables := []string{"signals", "checkpoints", "fan_outs", "queue_states", "jobs", "scheduled_fires", "leases"}
+	tables := []string{"signals", "checkpoints", "fan_outs", "queue_states", "jobs", "scheduled_fires", "leases", "unique_locks", "concurrency_slots", "rate_limit_windows"}
 	for _, tbl := range tables {
 		db.Exec("DELETE FROM " + tbl)
 	}

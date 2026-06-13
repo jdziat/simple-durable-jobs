@@ -21,6 +21,12 @@ import (
 // serialization is handled by the DB advisory lock in withMigrationLock.
 var migrateMu sync.Mutex
 
+var (
+	jobStatuses      = "'pending','running','completed','failed','retrying','waiting','cancelled','paused'"
+	fanOutStrategies = "'fail_fast','collect_all','threshold'"
+	fanOutStatuses   = "'pending','completed','failed'"
+)
+
 // migrateMinConns is the connection floor Migrate needs: one for the fleet lock
 // (held on a dedicated connection for the migration's duration) plus at least
 // one for the work. gorm's AutoMigrate is multi-statement and takes a pool
@@ -999,10 +1005,6 @@ func migrateCheckConstraints(ctx context.Context, db *gorm.DB, dialect string) e
 		pgExpr    string
 		mysqlExpr string
 	}
-
-	const jobStatuses = "'pending','running','completed','failed','retrying','waiting','cancelled','paused'"
-	const fanOutStrategies = "'fail_fast','collect_all','threshold'"
-	const fanOutStatuses = "'pending','completed','failed'"
 
 	constraints := []checkConstraint{
 		{
