@@ -22,6 +22,7 @@ func TestSentinelErrorByMessage_AllSentinels(t *testing.T) {
 		ErrInvalidQueueName,
 		ErrQueueNameTooLong,
 		ErrJobArgsTooLarge,
+		ErrJobArgsMismatch,
 		ErrJobNotOwned,
 		ErrDuplicateJob,
 		ErrUniqueKeyTooLong,

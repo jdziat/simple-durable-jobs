@@ -317,6 +317,7 @@ var (
 	ErrInvalidQueueName      = core.ErrInvalidQueueName
 	ErrQueueNameTooLong      = core.ErrQueueNameTooLong
 	ErrJobArgsTooLarge       = core.ErrJobArgsTooLarge
+	ErrJobArgsMismatch       = core.ErrJobArgsMismatch
 	ErrJobNotCompleted       = core.ErrJobNotCompleted
 	ErrJobFailed             = core.ErrJobFailed
 	ErrJobCancelled          = core.ErrJobCancelled
