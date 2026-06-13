@@ -15,8 +15,9 @@ import (
 
 type capMockStorage struct {
 	*releaseStateStorage
-	mu    sync.Mutex
-	slots map[string]map[string]bool
+	mu      sync.Mutex
+	slots   map[string]map[string]bool
+	renewed []string
 }
 
 func newCapMockStorage(jobs []*core.Job) *capMockStorage {
@@ -54,6 +55,25 @@ func (s *capMockStorage) ReleaseConcurrencySlot(_ context.Context, slotName, job
 	defer s.mu.Unlock()
 	delete(s.slots[slotName], jobID)
 	return nil
+}
+
+// RenewConcurrencySlot is renew-only: it refreshes an already-held slot and
+// never creates one, mirroring GormStorage. It records each (slotName, jobID)
+// renewal so a test can assert renewConcurrencySlots drove it.
+func (s *capMockStorage) RenewConcurrencySlot(_ context.Context, slotName, jobID string, _ time.Duration) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.renewed = append(s.renewed, slotName+":"+jobID)
+	if s.slots[slotName] != nil && s.slots[slotName][jobID] {
+		return true, nil
+	}
+	return false, nil
+}
+
+func (s *capMockStorage) renewals() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.renewed...)
 }
 
 func (s *capMockStorage) slotCount(slotName string) int {
@@ -134,4 +154,34 @@ func TestWorkerConcurrencyCapReleasesOnCompletion(t *testing.T) {
 	job.Args = []byte(`{}`)
 	w.processJob(context.Background(), job)
 	assert.Equal(t, 0, store.slotCount("customer:a"))
+}
+
+// TestRenewConcurrencySlots covers the heartbeat-driven renewal path:
+// renewConcurrencySlots must renew (never recreate) every slot a live job
+// holds, and skip cleanly when the job holds none.
+func TestRenewConcurrencySlots(t *testing.T) {
+	job := runningJob("job-1", "a")
+	store := newCapMockStorage([]*core.Job{job})
+	w := NewWorker(queue.New(store),
+		WorkerQueue("default", Concurrency(1)),
+		ConcurrencyCap("customer", 1, CapKey(func(job *core.Job) string { return job.UniqueKey })),
+		DisableRetry(),
+	)
+	w.config.WorkerID = "worker-1"
+
+	// Acquire the slot and record it the way dispatch does, then renew.
+	ok, err := store.TryAcquireConcurrencySlot(context.Background(), "customer:a", "job-1", "worker-1", 1, time.Minute)
+	require.NoError(t, err)
+	require.True(t, ok)
+	w.slotJobIDMu.Lock()
+	w.slotJobID["job-1"] = []string{"customer:a"}
+	w.slotJobIDMu.Unlock()
+
+	w.renewConcurrencySlots(context.Background(), "job-1")
+	assert.Equal(t, []string{"customer:a:job-1"}, store.renewals(), "the held slot must be renewed exactly once")
+	assert.Equal(t, 1, store.slotCount("customer:a"), "renewal must not drop or duplicate the slot")
+
+	// A job holding no slots is a no-op (no renewal attempted).
+	w.renewConcurrencySlots(context.Background(), "job-unknown")
+	assert.Equal(t, []string{"customer:a:job-1"}, store.renewals())
 }
