@@ -266,6 +266,11 @@ var schemaMigrations = []schemaMigration{
 		Name:    "int_width_rightsizing",
 		Up:      migrateIntWidthRightsizing,
 	},
+	{
+		Version: 27,
+		Name:    "checkpoint_call_index_width",
+		Up:      migrateCheckpointCallIndexWidth,
+	},
 }
 
 // applyPendingMigrations runs every migration whose version is absent from the
@@ -1261,6 +1266,61 @@ func migrateV25PostMergeSchema(ctx context.Context, db *gorm.DB, dialect string)
 		if err := db.WithContext(ctx).Exec("DROP INDEX IF EXISTS idx_jobs_root_job_id").Error; err != nil {
 			return fmt.Errorf("drop idx_jobs_root_job_id: %w", err)
 		}
+		return nil
+	}
+}
+
+// migrateCheckpointCallIndexWidth right-sizes checkpoints.call_index from bigint
+// to a 4-byte integer (R52 follow-up). The Go field stays int; only the SQL
+// column type narrows. call_index is a per-job sequential call counter that never
+// approaches 2.1e9, so integer is safe. It participates in the composite unique
+// index idx_checkpoints_job_call; an in-place type change (PG ALTER TYPE / MySQL
+// MODIFY) rebuilds that index automatically without dropping it. Idempotent via an
+// information_schema precheck; sqlite is a no-op (INTEGER affinity).
+func migrateCheckpointCallIndexWidth(ctx context.Context, db *gorm.DB, dialect string) error {
+	switch dialect {
+	case dialectPostgres:
+		var dataType string
+		if err := db.WithContext(ctx).Raw(`
+			SELECT data_type
+			FROM information_schema.COLUMNS
+			WHERE table_schema = CURRENT_SCHEMA()
+			  AND table_name = 'checkpoints'
+			  AND column_name = 'call_index'
+		`).Scan(&dataType).Error; err != nil {
+			return fmt.Errorf("read checkpoints.call_index type: %w", err)
+		}
+		if dataType == "integer" {
+			return nil
+		}
+		if err := db.WithContext(ctx).Exec(
+			"ALTER TABLE checkpoints ALTER COLUMN call_index TYPE integer",
+		).Error; err != nil {
+			return fmt.Errorf("alter checkpoints.call_index type: %w", err)
+		}
+		return nil
+	case dialectMySQL:
+		var dataType string
+		if err := db.WithContext(ctx).Raw(`
+			SELECT DATA_TYPE
+			FROM information_schema.COLUMNS
+			WHERE TABLE_SCHEMA = DATABASE()
+			  AND TABLE_NAME = 'checkpoints'
+			  AND COLUMN_NAME = 'call_index'
+		`).Scan(&dataType).Error; err != nil {
+			return fmt.Errorf("read checkpoints.call_index type: %w", err)
+		}
+		if strings.EqualFold(dataType, "int") {
+			return nil
+		}
+		if err := db.WithContext(ctx).Exec(
+			"ALTER TABLE checkpoints MODIFY call_index int NOT NULL",
+		).Error; err != nil && !isBenignDDLError(err) {
+			return fmt.Errorf("modify checkpoints.call_index type: %w", err)
+		}
+		return nil
+	default:
+		// SQLite uses INTEGER affinity; declared integer width is cosmetic.
 		return nil
 	}
 }
