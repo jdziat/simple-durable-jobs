@@ -2,16 +2,11 @@ package typed
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
-	"log/slog"
-	"strings"
 	"time"
 
 	"github.com/jdziat/simple-durable-jobs/v3/pkg/core"
 	"github.com/jdziat/simple-durable-jobs/v3/pkg/fanout"
 	"github.com/jdziat/simple-durable-jobs/v3/pkg/queue"
-	"github.com/jdziat/simple-durable-jobs/v3/pkg/security"
 	"github.com/jdziat/simple-durable-jobs/v3/pkg/signal"
 )
 
@@ -32,63 +27,12 @@ func SubJobOf[A any, R any](def *Def[A, R], args A, opts ...queue.Option) fanout
 }
 
 // Signal delivers a named signal carrying payload to a job.
+// Signal delivers a signal to a job from within the typed workflow API. It is a
+// thin wrapper over (*queue.Queue).Signal so the validation, delivery, event
+// emission, and immediate signal-resume behavior stay defined in exactly one
+// place (R36 moved the canonical implementation onto *Queue).
 func Signal(ctx context.Context, q *queue.Queue, jobID core.UUID, name string, payload any) error {
-	if name == "" {
-		return fmt.Errorf("jobs: signal name must not be empty")
-	}
-	if strings.HasPrefix(name, "_") {
-		return signal.ErrSignalNameReserved
-	}
-	if len(name) > security.MaxSignalNameLength {
-		return core.ErrSignalNameTooLong
-	}
-	type signalSender interface {
-		SendSignal(ctx context.Context, jobID core.UUID, name string, payload []byte) error
-	}
-	sender, ok := q.Storage().(signalSender)
-	if !ok {
-		return core.ErrStorageNoSignals
-	}
-
-	data, err := json.Marshal(payload)
-	if err != nil {
-		return fmt.Errorf("jobs: marshal signal payload: %w", err)
-	}
-	if len(data) > security.MaxResultSize {
-		return fmt.Errorf("jobs: signal %q payload is %d bytes, limit is %d", name, len(data), security.MaxResultSize)
-	}
-
-	job, err := q.Storage().GetJob(ctx, jobID)
-	if err != nil {
-		return err
-	}
-	if job == nil {
-		return fmt.Errorf("%w: %s", core.ErrJobNotFound, jobID)
-	}
-
-	if err := sender.SendSignal(ctx, jobID, name, data); err != nil {
-		return err
-	}
-	q.Emit(&core.SignalDelivered{JobID: jobID, Name: name, Timestamp: time.Now()})
-
-	if job.Status == core.StatusWaiting {
-		if signal.WaitingOnFutureSleep(ctx, q.Storage(), job, slog.Default()) {
-			return nil
-		}
-		type signalResumer interface {
-			ResumeSignalWaitingJob(ctx context.Context, jobID core.UUID) (bool, error)
-		}
-		if r, ok := q.Storage().(signalResumer); ok {
-			resumed, err := r.ResumeSignalWaitingJob(ctx, jobID)
-			if err != nil {
-				return fmt.Errorf("jobs: signal sent but resume failed (poll will recover): %w", err)
-			}
-			if resumed {
-				q.Emit(&core.JobResumedBySignal{JobID: jobID, SignalName: name, Timestamp: time.Now()})
-			}
-		}
-	}
-	return nil
+	return q.Signal(ctx, jobID, name, payload)
 }
 
 // WaitForSignal consumes the oldest pending signal of name from a job handler.

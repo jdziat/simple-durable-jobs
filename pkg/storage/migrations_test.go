@@ -168,6 +168,7 @@ func TestIntWidthRightsizedColumnsRoundTripAfterMigrate(t *testing.T) {
 		CompletedCount: 12,
 		FailedCount:    3,
 		CancelledCount: 4,
+		Threshold:      0.75,
 		Status:         core.FanOutPending,
 	}
 	require.NoError(t, s.CreateFanOut(ctx, fanOut))
@@ -178,6 +179,29 @@ func TestIntWidthRightsizedColumnsRoundTripAfterMigrate(t *testing.T) {
 	require.Equal(t, 12, gotFanOut.CompletedCount)
 	require.Equal(t, 3, gotFanOut.FailedCount)
 	require.Equal(t, 4, gotFanOut.CancelledCount)
+	require.Equal(t, 0.75, gotFanOut.Threshold)
+
+	// A fan-out created without an explicit Threshold gets the column default of 1
+	// (the gorm tag default:1 must match what the DB stores so AutoMigrate does not
+	// re-issue a MODIFY on every Migrate).
+	defFanOutID := core.NewID()
+	require.NoError(t, s.CreateFanOut(ctx, &core.FanOut{ID: defFanOutID, ParentJobID: job.ID, TotalCount: 1, Status: core.FanOutPending}))
+	var defFanOut core.FanOut
+	require.NoError(t, s.DB().WithContext(ctx).First(&defFanOut, "id = ?", defFanOutID).Error)
+	require.Equal(t, 1.0, defFanOut.Threshold)
+
+	// checkpoints.call_index is right-sized to integer (R52 follow-up); a
+	// non-trivial value must survive the round trip.
+	require.NoError(t, s.SaveCheckpoint(ctx, &core.Checkpoint{
+		ID:        core.NewID(),
+		JobID:     job.ID,
+		CallIndex: 65000,
+		CallType:  "int-width.checkpoint",
+	}))
+	cps, err := s.GetCheckpoints(ctx, job.ID)
+	require.NoError(t, err)
+	require.Len(t, cps, 1)
+	require.Equal(t, 65000, cps[0].CallIndex)
 }
 
 func TestMigrateSecondRunDoesNotUpdateJobs(t *testing.T) {

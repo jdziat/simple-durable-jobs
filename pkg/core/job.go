@@ -77,7 +77,7 @@ type Job struct {
 type Checkpoint struct {
 	ID        UUID   `gorm:"primaryKey"`
 	JobID     UUID   `gorm:"index;uniqueIndex:idx_checkpoints_job_call,priority:1;not null"`
-	CallIndex int    `gorm:"uniqueIndex:idx_checkpoints_job_call,priority:2;not null"`
+	CallIndex int    `gorm:"type:integer;uniqueIndex:idx_checkpoints_job_call,priority:2;not null"`
 	CallType  string `gorm:"uniqueIndex:idx_checkpoints_job_call,priority:3;size:255;not null"`
 	Result    []byte `gorm:"type:bytes"`
 	Error     string `gorm:"type:text"`

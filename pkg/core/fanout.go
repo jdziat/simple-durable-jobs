@@ -40,7 +40,7 @@ type FanOut struct {
 	FailedCount    int            `gorm:"type:integer;default:0"`
 	CancelledCount int            `gorm:"type:integer;default:0"`
 	Strategy       FanOutStrategy `gorm:"size:20;default:'fail_fast'"`
-	Threshold      float64        `gorm:"type:double precision;default:1.0"`
+	Threshold      float64        `gorm:"type:double precision;default:1"`
 	Status         FanOutStatus   `gorm:"size:20;default:'pending';index:idx_fan_outs_parent_status,priority:2"`
 	TimeoutAt      *time.Time     `gorm:"index"`
 	CancelOnFail   bool           `gorm:"default:false"`
