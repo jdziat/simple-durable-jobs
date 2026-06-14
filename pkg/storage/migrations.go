@@ -286,6 +286,11 @@ var schemaMigrations = []schemaMigration{
 		Name:    "checkpoint_call_index_width",
 		Up:      migrateCheckpointCallIndexWidth,
 	},
+	{
+		Version: 28,
+		Name:    "forbid_zero_uuid_refs",
+		Up:      migrateForbidZeroUUIDRefs,
+	},
 }
 
 // applyPreMigrations runs every registered pre-AutoMigrate one-shot through a
@@ -1236,6 +1241,98 @@ func migrateMetadataIntegrity(ctx context.Context, db *gorm.DB, dialect string) 
 		return nil
 	default:
 		// SQLite is dev-only and ALTER TABLE ADD CHECK is unsupported there.
+		return nil
+	}
+}
+
+// migrateForbidZeroUUIDRefs is migration-only: no gorm check tags, so
+// AutoMigrate never creates a dialect-mismatched constraint or flaps these on
+// startup. Postgres adds each CHECK as NOT VALID and then validates it; MySQL
+// applies the equivalent binary(16) zero literal. SQLite is a no-op because
+// ALTER TABLE ADD CHECK is not supported there.
+func migrateForbidZeroUUIDRefs(ctx context.Context, db *gorm.DB, dialect string) error {
+	type checkConstraint struct {
+		model     any
+		table     string
+		name      string
+		pgExpr    string
+		mysqlExpr string
+	}
+
+	const zeroUUID = "00000000-0000-0000-0000-000000000000"
+	const zeroUUIDBytes = "0x00000000000000000000000000000000"
+	constraints := []checkConstraint{
+		{
+			model:     &core.Job{},
+			table:     "jobs",
+			name:      "chk_jobs_parent_job_not_zero",
+			pgExpr:    "parent_job_id IS NULL OR parent_job_id <> '" + zeroUUID + "'",
+			mysqlExpr: "parent_job_id IS NULL OR parent_job_id <> " + zeroUUIDBytes,
+		},
+		{
+			model:     &core.Job{},
+			table:     "jobs",
+			name:      "chk_jobs_root_job_not_zero",
+			pgExpr:    "root_job_id IS NULL OR root_job_id <> '" + zeroUUID + "'",
+			mysqlExpr: "root_job_id IS NULL OR root_job_id <> " + zeroUUIDBytes,
+		},
+		{
+			model:     &core.Job{},
+			table:     "jobs",
+			name:      "chk_jobs_fan_out_not_zero",
+			pgExpr:    "fan_out_id IS NULL OR fan_out_id <> '" + zeroUUID + "'",
+			mysqlExpr: "fan_out_id IS NULL OR fan_out_id <> " + zeroUUIDBytes,
+		},
+	}
+
+	m := db.Migrator()
+	switch dialect {
+	case dialectPostgres:
+		for _, column := range []string{"parent_job_id", "root_job_id", "fan_out_id"} {
+			if err := db.WithContext(ctx).Exec(
+				fmt.Sprintf("UPDATE jobs SET %s = NULL WHERE %s = '%s'", column, column, zeroUUID),
+			).Error; err != nil {
+				return fmt.Errorf("pre-clean jobs.%s zero UUID refs: %w", column, err)
+			}
+		}
+		for _, constraint := range constraints {
+			if m.HasConstraint(constraint.model, constraint.name) {
+				continue
+			}
+			if err := db.WithContext(ctx).Exec(
+				fmt.Sprintf("ALTER TABLE %s ADD CONSTRAINT %s CHECK (%s) NOT VALID", constraint.table, constraint.name, constraint.pgExpr),
+			).Error; err != nil {
+				return fmt.Errorf("add %s: %w", constraint.name, err)
+			}
+			if err := db.WithContext(ctx).Exec(
+				fmt.Sprintf("ALTER TABLE %s VALIDATE CONSTRAINT %s", constraint.table, constraint.name),
+			).Error; err != nil {
+				return fmt.Errorf("validate %s: %w", constraint.name, err)
+			}
+		}
+		return nil
+	case dialectMySQL:
+		for _, column := range []string{"parent_job_id", "root_job_id", "fan_out_id"} {
+			if err := db.WithContext(ctx).Exec(
+				fmt.Sprintf("UPDATE jobs SET %s = NULL WHERE %s = %s", column, column, zeroUUIDBytes),
+			).Error; err != nil {
+				return fmt.Errorf("pre-clean jobs.%s zero UUID refs: %w", column, err)
+			}
+		}
+		for _, constraint := range constraints {
+			if m.HasConstraint(constraint.model, constraint.name) {
+				continue
+			}
+			if err := db.WithContext(ctx).Exec(
+				fmt.Sprintf("ALTER TABLE %s ADD CONSTRAINT %s CHECK (%s)", constraint.table, constraint.name, constraint.mysqlExpr),
+			).Error; err != nil && !isBenignDDLError(err) {
+				return fmt.Errorf("add %s: %w", constraint.name, err)
+			}
+		}
+		return nil
+	default:
+		// CHECK enforcement is on the production engines (Postgres/MySQL);
+		// SQLite dev tables rely on the Go UUID scanner.
 		return nil
 	}
 }

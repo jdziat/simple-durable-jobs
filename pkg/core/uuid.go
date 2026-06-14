@@ -92,8 +92,7 @@ func (u *UUID) Scan(src any) error {
 			}
 			return nil
 		}
-		*u = UUID(v)
-		return nil
+		return fmt.Errorf("core.UUID: invalid uuid string %q", v)
 	default:
 		return fmt.Errorf("core.UUID: cannot scan %T", src)
 	}
