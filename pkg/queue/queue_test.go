@@ -880,14 +880,24 @@ func (m *mockStarter) Start(ctx context.Context) error {
 
 // Pause operation methods for mock storage
 func (m *mockStorage) PauseJob(ctx context.Context, jobID core.UUID) error {
+	return m.PauseJobWithMode(ctx, jobID, core.PauseModeAggressive)
+}
+
+func (m *mockStorage) PauseJobWithMode(ctx context.Context, jobID core.UUID, mode core.PauseMode) error {
 	job, ok := m.jobs[string(jobID)]
 	if !ok {
 		return fmt.Errorf("job not found: %s", jobID)
+	}
+	if job.Status == core.StatusPaused {
+		return core.ErrJobAlreadyPaused
 	}
 	switch job.Status {
 	case core.StatusPending, core.StatusWaiting:
 		job.Status = core.StatusPaused
 	case core.StatusRunning:
+		if mode == core.PauseModeGraceful {
+			return core.ErrCannotPauseStatus
+		}
 		job.Status = core.StatusCancelled
 	default:
 		return core.ErrCannotPauseStatus

@@ -1231,6 +1231,142 @@ func TestPauseJob_CancelsRunningJob(t *testing.T) {
 	assert.Nil(t, got.LockedUntil)
 }
 
+func TestPauseJobWithMode(t *testing.T) {
+	t.Run("graceful running returns error and leaves running", func(t *testing.T) {
+		ctx := context.Background()
+		s := newTestStorage(t)
+
+		job := newTestJob("default", "task.run")
+		require.NoError(t, s.Enqueue(ctx, job))
+
+		_, err := s.Dequeue(ctx, []string{"default"}, "worker-1")
+		require.NoError(t, err)
+
+		err = s.PauseJobWithMode(ctx, job.ID, core.PauseModeGraceful)
+		require.ErrorIs(t, err, core.ErrCannotPauseStatus)
+
+		got, err := s.GetJob(ctx, job.ID)
+		require.NoError(t, err)
+		require.NotNil(t, got)
+		assert.Equal(t, core.StatusRunning, got.Status)
+		assert.NotEqual(t, core.StatusCancelled, got.Status)
+	})
+
+	t.Run("graceful pending pauses", func(t *testing.T) {
+		ctx := context.Background()
+		s := newTestStorage(t)
+
+		job := newTestJob("default", "task.run")
+		require.NoError(t, s.Enqueue(ctx, job))
+
+		require.NoError(t, s.PauseJobWithMode(ctx, job.ID, core.PauseModeGraceful))
+
+		got, err := s.GetJob(ctx, job.ID)
+		require.NoError(t, err)
+		require.NotNil(t, got)
+		assert.Equal(t, core.StatusPaused, got.Status)
+		assert.Equal(t, core.StatusPending, got.PreviousStatus)
+	})
+
+	t.Run("graceful waiting pauses", func(t *testing.T) {
+		ctx := context.Background()
+		s := newTestStorage(t)
+
+		job := newTestJob("default", "task.run")
+		require.NoError(t, s.Enqueue(ctx, job))
+		_, err := s.Dequeue(ctx, []string{"default"}, "worker-1")
+		require.NoError(t, err)
+		require.NoError(t, s.MarkWaiting(ctx, job.ID, "worker-1"))
+
+		require.NoError(t, s.PauseJobWithMode(ctx, job.ID, core.PauseModeGraceful))
+
+		got, err := s.GetJob(ctx, job.ID)
+		require.NoError(t, err)
+		require.NotNil(t, got)
+		assert.Equal(t, core.StatusPaused, got.Status)
+		assert.Equal(t, core.StatusWaiting, got.PreviousStatus)
+	})
+
+	t.Run("aggressive running cancels", func(t *testing.T) {
+		ctx := context.Background()
+		s := newTestStorage(t)
+
+		job := newTestJob("default", "task.run")
+		require.NoError(t, s.Enqueue(ctx, job))
+
+		_, err := s.Dequeue(ctx, []string{"default"}, "worker-1")
+		require.NoError(t, err)
+
+		require.NoError(t, s.PauseJobWithMode(ctx, job.ID, core.PauseModeAggressive))
+
+		got, err := s.GetJob(ctx, job.ID)
+		require.NoError(t, err)
+		require.NotNil(t, got)
+		assert.Equal(t, core.StatusCancelled, got.Status)
+		assert.Equal(t, "cancelled by user", got.LastError)
+	})
+}
+
+func TestPauseJobWithMode_GracefulRaceNeverCancels(t *testing.T) {
+	ctx := context.Background()
+	s := newConcurrentTestStorage(t)
+
+	for i := 0; i < 200; i++ {
+		job := newTestJob("default", "task.race")
+		require.NoError(t, s.Enqueue(ctx, job))
+
+		start := make(chan struct{})
+		errs := make(chan error, 2)
+		var wg sync.WaitGroup
+		wg.Add(2)
+
+		go func(jobID core.UUID) {
+			defer wg.Done()
+			<-start
+			err := s.PauseJobWithMode(ctx, jobID, core.PauseModeGraceful)
+			if err != nil && !errors.Is(err, core.ErrCannotPauseStatus) {
+				errs <- err
+			}
+		}(job.ID)
+
+		go func(jobID core.UUID) {
+			defer wg.Done()
+			<-start
+			err := s.withSerializationRetry(ctx, func() error {
+				return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+					now := time.Now()
+					result := tx.Model(&core.Job{}).
+						Where("id = ? AND status = ?", jobID, core.StatusPending).
+						Updates(map[string]any{
+							"status":       core.StatusRunning,
+							"locked_by":    "worker-1",
+							"locked_until": now.Add(time.Minute),
+							"started_at":   now,
+							"attempt":      gorm.Expr("attempt + 1"),
+						})
+					return result.Error
+				})
+			})
+			if err != nil {
+				errs <- err
+			}
+		}(job.ID)
+
+		close(start)
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			require.NoError(t, err)
+		}
+
+		got, err := s.GetJob(ctx, job.ID)
+		require.NoError(t, err)
+		require.NotNil(t, got)
+		assert.NotEqual(t, core.StatusCancelled, got.Status, "iteration %d: graceful pause must never cancel", i)
+		assert.Contains(t, []core.JobStatus{core.StatusPaused, core.StatusRunning}, got.Status)
+	}
+}
+
 func TestComplete_DoesNotOverwriteCancelledJob(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStorage(t)

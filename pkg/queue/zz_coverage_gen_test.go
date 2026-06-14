@@ -406,6 +406,10 @@ func (g *getJobErrStorage) GetJob(ctx context.Context, jobID core.UUID) (*core.J
 	return nil, errors.New("get failed")
 }
 
+func (g *getJobErrStorage) PauseJobWithMode(ctx context.Context, jobID core.UUID, mode core.PauseMode) error {
+	return errors.New("get failed")
+}
+
 func TestQueue_LoadStatus_StorageError(t *testing.T) {
 	store := &getJobErrStorage{mockStorage: newMockStorage()}
 	q := New(store)
