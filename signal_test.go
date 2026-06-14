@@ -81,7 +81,7 @@ func TestSignal_ReturnsNilWhenImmediateResumeFailsAfterDelivery(t *testing.T) {
 	store.resumeErr = errors.New("resume unavailable")
 	job := seedWaitingSignalJob(t, ctx, store)
 
-	err := jobs.Signal(ctx, q, job.ID, "ready", map[string]string{"ok": "true"})
+	err := q.Signal(ctx, job.ID, "ready", map[string]string{"ok": "true"})
 
 	require.NoError(t, err)
 	assert.EqualValues(t, 1, store.sendCount.Load(), "Signal must not ask callers to retry a durably delivered signal")
@@ -100,7 +100,7 @@ func TestSignal_HappyPathEmitsJobResumedBySignal(t *testing.T) {
 	defer q.Unsubscribe(events)
 	job := seedWaitingSignalJob(t, ctx, store)
 
-	require.NoError(t, jobs.Signal(ctx, q, job.ID, "ready", "payload"))
+	require.NoError(t, q.Signal(ctx, job.ID, "ready", "payload"))
 	assert.EqualValues(t, 1, store.sendCount.Load())
 	waitForJobResumedBySignal(t, events, job.ID, "ready")
 

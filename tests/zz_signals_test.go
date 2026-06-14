@@ -73,7 +73,7 @@ func TestSignals_WaitThenSendResumes(t *testing.T) {
 		return st == jobs.StatusWaiting
 	}, 10*time.Second, 50*time.Millisecond, "job should suspend waiting for a signal")
 
-	require.NoError(t, jobs.Signal(ctx, q, id, "ctx", "hello-from-outside"))
+	require.NoError(t, q.Signal(ctx, id, "ctx", "hello-from-outside"))
 
 	require.Eventually(t, func() bool {
 		v, ok := box.get(id)
@@ -105,7 +105,7 @@ func TestSignals_BufferedBeforeWait(t *testing.T) {
 	require.NoError(t, err)
 
 	// Send BEFORE starting the worker, so the signal is buffered.
-	require.NoError(t, jobs.Signal(ctx, q, id, "ctx", "buffered"))
+	require.NoError(t, q.Signal(ctx, id, "ctx", "buffered"))
 
 	startWorker(t, q)
 
@@ -198,7 +198,7 @@ func TestSignals_EmitsDeliveredEvent(t *testing.T) {
 	require.NoError(t, err)
 
 	events := q.Events()
-	require.NoError(t, jobs.Signal(ctx, q, id, "ctx", "x"))
+	require.NoError(t, q.Signal(ctx, id, "ctx", "x"))
 
 	timeout := time.After(3 * time.Second)
 	for {
@@ -232,7 +232,7 @@ func TestSignals_EmitsResumedBySignalOnFastPath(t *testing.T) {
 	}, 10*time.Second, 50*time.Millisecond)
 
 	events := q.Events()
-	require.NoError(t, jobs.Signal(ctx, q, id, "ctx", "x"))
+	require.NoError(t, q.Signal(ctx, id, "ctx", "x"))
 
 	timeout := time.After(3 * time.Second)
 	for {
@@ -319,7 +319,7 @@ func TestSignals_PeekThenDrain(t *testing.T) {
 	id, err := q.Enqueue(ctx, "agent-peek-drain", struct{}{})
 	require.NoError(t, err)
 	for _, v := range []string{"a", "b", "c"} {
-		require.NoError(t, jobs.Signal(ctx, q, id, "ctx", v))
+		require.NoError(t, q.Signal(ctx, id, "ctx", v))
 	}
 
 	startWorker(t, q)

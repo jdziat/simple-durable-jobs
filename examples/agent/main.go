@@ -143,7 +143,7 @@ func main() {
 		// are durable and FIFO per job/name, so the approval is still consumed.
 		time.Sleep(8 * time.Second)
 		fmt.Println("Main sending human approval signal")
-		if err := jobs.Signal(ctx, queue, jobID, "approval", true); err != nil {
+		if err := queue.Signal(ctx, jobID, "approval", true); err != nil {
 			log.Printf("failed to send approval: %v", err)
 		}
 	}()

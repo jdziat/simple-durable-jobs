@@ -100,7 +100,7 @@ func main() {
 	}
 	fmt.Printf("Enqueued approval workflow %s\n", jobID[:8])
 
-	if err := jobs.Signal(ctx, queue, jobID, "audit-note", "approved by alice@example.com"); err != nil {
+	if err := queue.Signal(ctx, jobID, "audit-note", "approved by alice@example.com"); err != nil {
 		log.Fatal(err)
 	}
 	fmt.Println("Main pre-buffered audit note before the workflow checked signals")
@@ -118,10 +118,10 @@ func main() {
 	}
 	fmt.Println("Main observed workflow waiting; sending audit note and approval")
 
-	if err := jobs.Signal(ctx, queue, jobID, "audit-note", "approval confirmed while waiting"); err != nil {
+	if err := queue.Signal(ctx, jobID, "audit-note", "approval confirmed while waiting"); err != nil {
 		log.Fatal(err)
 	}
-	if err := jobs.Signal(ctx, queue, jobID, "approval", true); err != nil {
+	if err := queue.Signal(ctx, jobID, "approval", true); err != nil {
 		log.Fatal(err)
 	}
 

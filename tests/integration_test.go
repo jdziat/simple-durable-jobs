@@ -401,7 +401,7 @@ func TestIntegration_SchedulerRecurringJobs(t *testing.T) {
 	})
 
 	// Schedule job to run every 200ms
-	queue.Schedule("recurring-task", nil, jobs.Every(200*time.Millisecond))
+	require.NoError(t, queue.Schedule("recurring-task", nil, jobs.Every(200*time.Millisecond)))
 
 	// Worker lifetime is generous so the poll below has room even when a loaded
 	// CI runner is slow to begin dispatching scheduled fires.

@@ -1818,10 +1818,12 @@ func TestListScheduledJobs_NilQueue(t *testing.T) {
 func TestListScheduledJobs_PopulatesNextRunForEveryAndCron(t *testing.T) {
 	store := &mockStorage{}
 	q := queue.New(store)
-	q.Schedule("every-report", nil, schedule.Every(time.Hour), queue.QueueOpt("reports"))
+	registerScheduledTestHandler(q, "every-report")
+	require.NoError(t, q.Schedule("every-report", nil, schedule.Every(time.Hour), queue.QueueOpt("reports")))
 	cronSchedule, err := schedule.Cron("*/15 * * * *")
 	require.NoError(t, err)
-	q.Schedule("cron-sync", nil, cronSchedule, queue.QueueOpt("sync"))
+	registerScheduledTestHandler(q, "cron-sync")
+	require.NoError(t, q.Schedule("cron-sync", nil, cronSchedule, queue.QueueOpt("sync")))
 	svc := newJobsService(store, q, nil)
 
 	resp, err := svc.ListScheduledJobs(context.Background(), connect.NewRequest(&jobsv1.ListScheduledJobsRequest{}))
@@ -1838,7 +1840,8 @@ func TestListScheduledJobs_PopulatesNextRunForEveryAndCron(t *testing.T) {
 func TestListScheduledJobs_SkipsZeroNextRun(t *testing.T) {
 	store := &mockStorage{}
 	q := queue.New(store)
-	q.Schedule("never", nil, zeroSchedule{})
+	registerScheduledTestHandler(q, "never")
+	require.NoError(t, q.Schedule("never", nil, zeroSchedule{}))
 	svc := newJobsService(store, q, nil)
 
 	resp, err := svc.ListScheduledJobs(context.Background(), connect.NewRequest(&jobsv1.ListScheduledJobsRequest{}))
@@ -1850,7 +1853,8 @@ func TestListScheduledJobs_SkipsZeroNextRun(t *testing.T) {
 func TestListScheduledJobs_LastRunAbsentWithoutCapability(t *testing.T) {
 	store := &mockStorage{}
 	q := queue.New(store)
-	q.Schedule("hourly", nil, schedule.Every(time.Hour))
+	registerScheduledTestHandler(q, "hourly")
+	require.NoError(t, q.Schedule("hourly", nil, schedule.Every(time.Hour)))
 	svc := newJobsService(store, q, nil)
 
 	resp, err := svc.ListScheduledJobs(context.Background(), connect.NewRequest(&jobsv1.ListScheduledJobsRequest{}))
@@ -1863,7 +1867,8 @@ func TestListScheduledJobs_LastRunAbsentWithoutCapability(t *testing.T) {
 func TestListScheduledJobs_LastRunAbsentForSeededOnlySchedule(t *testing.T) {
 	ctx := context.Background()
 	svc, q := setupServiceWithQueue(t)
-	q.Schedule("hourly", nil, schedule.Every(time.Hour))
+	registerScheduledTestHandler(q, "hourly")
+	require.NoError(t, q.Schedule("hourly", nil, schedule.Every(time.Hour)))
 	anchor := time.Now().UTC().Truncate(time.Second)
 	_, err := svc.storage.(interface {
 		SeedScheduledFire(context.Context, string, time.Time) (time.Time, error)
@@ -1879,7 +1884,8 @@ func TestListScheduledJobs_LastRunAbsentForSeededOnlySchedule(t *testing.T) {
 func TestListScheduledJobs_LastRunAfterClaimScheduledFire(t *testing.T) {
 	ctx := context.Background()
 	svc, q := setupServiceWithQueue(t)
-	q.Schedule("hourly", nil, schedule.Every(time.Hour))
+	registerScheduledTestHandler(q, "hourly")
+	require.NoError(t, q.Schedule("hourly", nil, schedule.Every(time.Hour)))
 	anchor := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
 	_, err := svc.storage.(interface {
 		SeedScheduledFire(context.Context, string, time.Time) (time.Time, error)
@@ -2156,11 +2162,18 @@ func setupServiceWithQueue(t *testing.T) (*jobsService, *queue.Queue) {
 	return svc, q
 }
 
+func registerScheduledTestHandler(q *queue.Queue, name string) {
+	q.Register(name, func(context.Context, struct{}) error {
+		return nil
+	})
+}
+
 func TestListScheduledJobs_WithScheduledJobs(t *testing.T) {
 	svc, q := setupServiceWithQueue(t)
 
 	// Register a scheduled job using the every-schedule (no String() method).
-	q.Schedule("daily-report", nil, schedule.Every(24*time.Hour))
+	registerScheduledTestHandler(q, "daily-report")
+	require.NoError(t, q.Schedule("daily-report", nil, schedule.Every(24*time.Hour)))
 
 	resp, err := svc.ListScheduledJobs(context.Background(), connect.NewRequest(&jobsv1.ListScheduledJobsRequest{}))
 	require.NoError(t, err)
@@ -2181,7 +2194,8 @@ func (zeroSchedule) Next(time.Time) time.Time { return time.Time{} }
 func TestListScheduledJobs_WithStringerSchedule(t *testing.T) {
 	svc, q := setupServiceWithQueue(t)
 
-	q.Schedule("hourly-sync", nil, &stringerSchedule{label: "every 1h"})
+	registerScheduledTestHandler(q, "hourly-sync")
+	require.NoError(t, q.Schedule("hourly-sync", nil, &stringerSchedule{label: "every 1h"}))
 
 	resp, err := svc.ListScheduledJobs(context.Background(), connect.NewRequest(&jobsv1.ListScheduledJobsRequest{}))
 	require.NoError(t, err)

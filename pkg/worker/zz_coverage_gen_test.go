@@ -164,16 +164,17 @@ func TestGen_RunOwnershipAudit_QueryError(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// runScheduler — cover the Enqueue-error branch. q.Enqueue returns an error
-// when no handler is registered for the scheduled job's name.
+// runScheduler — cover the Enqueue-error branch. q.Enqueue returns an argument
+// validation error when the scheduled args don't match the registered handler.
 // ---------------------------------------------------------------------------
 
 func TestGen_RunScheduler_EnqueueErrorIsLogged(t *testing.T) {
 	mock := &mockStorage{}
 	q := queue.New(mock)
-	// Intentionally DO NOT register a handler — q.Enqueue will fail with
-	// "no handler registered", driving runScheduler's enqueue-error branch.
-	q.Schedule("unregistered-task", nil, schedule.Every(1*time.Millisecond))
+	q.Register("bad-args-task", func(context.Context, struct{ Name string }) error {
+		return nil
+	})
+	require.NoError(t, q.Schedule("bad-args-task", "wrong args", schedule.Every(1*time.Millisecond)))
 
 	w := NewWorker(q, WithStaleLockInterval(0))
 

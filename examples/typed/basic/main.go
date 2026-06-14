@@ -33,12 +33,12 @@ func main() {
 	}
 	q := jobs.New(store)
 
-	sendEmail := jobs.Define(q, "typedSendEmail", func(_ context.Context, a emailArgs) (emailResult, error) {
+	sendEmail := jobs.Define[emailArgs, emailResult](q, "typedSendEmail", func(_ context.Context, a emailArgs) (emailResult, error) {
 		return emailResult{MessageID: "msg-" + a.To}, nil
 	})
 
 	results := make(chan emailResult, 1)
-	runExample := jobs.Define(q, "typedSendEmailExample", func(ctx context.Context, a emailArgs) (emailResult, error) {
+	runExample := jobs.Define[emailArgs, emailResult](q, "typedSendEmailExample", func(ctx context.Context, a emailArgs) (emailResult, error) {
 		got, err := sendEmail.Call(ctx, a)
 		if err != nil {
 			return emailResult{}, err

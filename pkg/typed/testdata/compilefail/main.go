@@ -13,7 +13,7 @@ type args struct {
 
 func main() {
 	q := queue.New(nil)
-	def := typed.Define(q, "compileTyped", func(context.Context, args) (string, error) {
+	def := typed.Define[args, string](q, "compileTyped", func(context.Context, args) (string, error) {
 		return "", nil
 	})
 	_, _ = def.Enqueue(context.Background(), "not args")

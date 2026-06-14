@@ -721,7 +721,7 @@ func TestLoadResult_CompletedWithNilResult(t *testing.T) {
 	assert.Equal(t, "", got)
 }
 
-func TestRequeue_FacadeResetsFailedJob(t *testing.T) {
+func TestQueueRequeue_MethodResetsFailedJob(t *testing.T) {
 	q, store := setupTestStorage(t)
 	ctx := context.Background()
 	id := jobs.NewID()
@@ -729,7 +729,7 @@ func TestRequeue_FacadeResetsFailedJob(t *testing.T) {
 		ID: id, Type: "x", Status: jobs.StatusFailed, LastError: "boom",
 	}))
 
-	ok, err := jobs.Requeue(ctx, q, id)
+	ok, err := q.Requeue(ctx, id)
 	require.NoError(t, err)
 	assert.True(t, ok)
 
@@ -738,7 +738,31 @@ func TestRequeue_FacadeResetsFailedJob(t *testing.T) {
 	assert.Equal(t, jobs.StatusPending, got.Status)
 
 	// A missing job is reported as not requeued, without error.
-	ok, err = jobs.Requeue(ctx, q, jobs.NewID())
+	ok, err = q.Requeue(ctx, jobs.NewID())
 	require.NoError(t, err)
 	assert.False(t, ok)
+}
+
+func TestQueueDeadLetterMethods_ListAndCount(t *testing.T) {
+	q, store := setupTestStorage(t)
+	ctx := context.Background()
+	deadLetteredAt := time.Now()
+	id := jobs.NewID()
+	require.NoError(t, store.Enqueue(ctx, &jobs.Job{
+		ID:               id,
+		Type:             "email.send",
+		Queue:            "mail",
+		Status:           jobs.StatusFailed,
+		DeadLetteredAt:   &deadLetteredAt,
+		DeadLetterReason: "max retries exhausted: boom",
+	}))
+
+	count, err := q.CountDeadLettered(ctx, jobs.DeadLetterQueue("mail"), jobs.DeadLetterType("email.send"))
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), count)
+
+	got, err := q.ListDeadLettered(ctx, jobs.DeadLetterQueue("mail"), jobs.DeadLetterLimit(10))
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	assert.Equal(t, id, got[0].ID)
 }

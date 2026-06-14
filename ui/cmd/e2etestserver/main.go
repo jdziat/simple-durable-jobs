@@ -61,7 +61,12 @@ func main() {
 	}
 
 	q := queue.New(store)
-	q.Schedule("cleanup", map[string]any{"mode": "e2e"}, stringSchedule{Schedule: schedule.Every(5 * time.Minute), value: "*/5 * * * *"}, queue.QueueOpt("maintenance"))
+	q.Register("cleanup", func(context.Context, map[string]any) error {
+		return nil
+	})
+	if err := q.Schedule("cleanup", map[string]any{"mode": "e2e"}, stringSchedule{Schedule: schedule.Every(5 * time.Minute), value: "*/5 * * * *"}, queue.QueueOpt("maintenance")); err != nil {
+		log.Fatalf("Failed to schedule cleanup: %v", err)
+	}
 	ctx, cancel := context.WithCancel(seedCtx)
 	defer cancel()
 

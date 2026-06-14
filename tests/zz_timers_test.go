@@ -193,7 +193,7 @@ func TestSleep_UserSignalCannotWakeSleep(t *testing.T) {
 		return st == jobs.StatusWaiting
 	}, 10*time.Second, 50*time.Millisecond)
 
-	require.NoError(t, jobs.Signal(ctx, q, id, "unrelated", "payload"))
+	require.NoError(t, q.Signal(ctx, id, "unrelated", "payload"))
 	deadline := time.After(6 * time.Second)
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
@@ -215,7 +215,7 @@ checked:
 		return st == jobs.StatusWaiting && runs.Load() == 1
 	}, time.Second, 100*time.Millisecond, "sleep should still be waiting after the signal isolation window")
 
-	err = jobs.Signal(ctx, q, id, "_sleep", "payload")
+	err = q.Signal(ctx, id, "_sleep", "payload")
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, jobs.ErrSignalNameReserved))
 }

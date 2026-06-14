@@ -395,6 +395,22 @@ func TestQueue_EnqueueRemote_DoesNotValidateRegisteredHandlerArgs(t *testing.T) 
 	assert.NotEmpty(t, jobID)
 }
 
+func TestQueue_EnqueueRemote_ValidatesJobName(t *testing.T) {
+	store := newMockStorage()
+	q := New(store)
+	ctx := context.Background()
+
+	_, err := q.EnqueueRemote(ctx, "", struct{}{})
+	require.Error(t, err)
+
+	_, err = q.EnqueueRemote(ctx, "has space", struct{}{})
+	require.Error(t, err)
+
+	jobID, err := q.EnqueueRemote(ctx, "remote-job", struct{}{})
+	require.NoError(t, err)
+	assert.NotEmpty(t, jobID)
+}
+
 func TestQueue_Enqueue_WithOptions(t *testing.T) {
 	store := newMockStorage()
 	q := New(store)
@@ -572,19 +588,22 @@ func TestDeterminism_ExplicitOverridesQueueDefault(t *testing.T) {
 func TestQueue_Schedule(t *testing.T) {
 	store := newMockStorage()
 	q := New(store)
+	q.Register("scheduled-job", func(ctx context.Context, args map[string]string) error {
+		return nil
+	})
 
 	// Mock schedule
 	mockSched := &mockSchedule{}
 	args := map[string]string{"tenant": "acme"}
 	runAt := time.Now().Add(time.Hour)
-	q.Schedule("scheduled-job", args, mockSched,
+	require.NoError(t, q.Schedule("scheduled-job", args, mockSched,
 		QueueOpt("scheduled"),
 		Priority(7),
 		Retries(4),
 		Delay(time.Minute),
 		At(runAt),
 		Timeout(30*time.Second),
-	)
+	))
 
 	scheduled := q.GetScheduledJobs()
 	require.NotNil(t, scheduled)
@@ -596,6 +615,30 @@ func TestQueue_Schedule(t *testing.T) {
 	assert.Equal(t, time.Minute, scheduled["scheduled-job"].Options.Delay)
 	assert.Equal(t, runAt, *scheduled["scheduled-job"].Options.RunAt)
 	assert.Equal(t, 30*time.Second, scheduled["scheduled-job"].Options.Timeout)
+}
+
+func TestQueue_Schedule_UnregisteredHandlerReturnsError(t *testing.T) {
+	store := newMockStorage()
+	q := New(store)
+
+	err := q.Schedule("missing-job", nil, &mockSchedule{})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `no handler registered for "missing-job"`)
+}
+
+func TestQueue_Schedule_DuplicateReturnsError(t *testing.T) {
+	store := newMockStorage()
+	q := New(store)
+	q.Register("scheduled-job", func(ctx context.Context, _ struct{}) error {
+		return nil
+	})
+
+	require.NoError(t, q.Schedule("scheduled-job", nil, &mockSchedule{}))
+	err := q.Schedule("scheduled-job", nil, &mockSchedule{})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `schedule already registered for "scheduled-job"`)
 }
 
 type mockSchedule struct{}
@@ -1542,8 +1585,11 @@ func TestQueue_PauseJob_WithPauseMode_Aggressive(t *testing.T) {
 func TestQueue_GetScheduledJobs_ReturnsCopy(t *testing.T) {
 	store := newMockStorage()
 	q := New(store)
+	q.Register("job-a", func(ctx context.Context, _ struct{}) error {
+		return nil
+	})
 
-	q.Schedule("job-a", nil, nil)
+	require.NoError(t, q.Schedule("job-a", nil, nil))
 	scheduled := q.GetScheduledJobs()
 	require.Contains(t, scheduled, "job-a")
 

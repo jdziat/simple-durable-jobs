@@ -9,6 +9,8 @@ import (
 	"errors"
 	"fmt"
 	"hash"
+	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -19,6 +21,7 @@ import (
 	"github.com/jdziat/simple-durable-jobs/v3/pkg/internal/handler"
 	"github.com/jdziat/simple-durable-jobs/v3/pkg/schedule"
 	"github.com/jdziat/simple-durable-jobs/v3/pkg/security"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/signal"
 	"github.com/jdziat/simple-durable-jobs/v3/pkg/storage"
 )
 
@@ -180,6 +183,9 @@ func (q *Queue) Enqueue(ctx context.Context, name string, args any, opts ...Opti
 // EnqueueRemote adds a job to the queue without requiring a local handler registration.
 // Use this for producer-only clients that enqueue jobs for workers in a separate process.
 func (q *Queue) EnqueueRemote(ctx context.Context, name string, args any, opts ...Option) (core.UUID, error) {
+	if err := security.ValidateJobTypeName(name); err != nil {
+		return core.NilUUID, err
+	}
 	return q.enqueue(ctx, name, args, opts...)
 }
 
@@ -494,15 +500,22 @@ func (q *Queue) runEnqueueMiddleware(ctx context.Context, job *core.Job, persist
 }
 
 // Schedule registers a recurring job.
-func (q *Queue) Schedule(name string, args any, sched schedule.Schedule, opts ...Option) {
+func (q *Queue) Schedule(name string, args any, sched schedule.Schedule, opts ...Option) error {
 	options := NewOptions()
 	for _, opt := range opts {
 		opt.Apply(options)
 	}
 
 	q.mu.Lock()
+	defer q.mu.Unlock()
+	if _, ok := q.handlers[name]; !ok {
+		return fmt.Errorf("jobs: Schedule: no handler registered for %q", name)
+	}
 	if q.scheduledJobs == nil {
 		q.scheduledJobs = make(map[string]*ScheduledJob)
+	}
+	if _, exists := q.scheduledJobs[name]; exists {
+		return fmt.Errorf("jobs: Schedule: schedule already registered for %q", name)
 	}
 	q.scheduledJobs[name] = &ScheduledJob{
 		Name:     name,
@@ -510,7 +523,7 @@ func (q *Queue) Schedule(name string, args any, sched schedule.Schedule, opts ..
 		Args:     args,
 		Options:  options,
 	}
-	q.mu.Unlock()
+	return nil
 }
 
 // GetScheduledJobs returns the scheduled jobs map (for worker scheduler).
@@ -531,6 +544,178 @@ func (q *Queue) GetScheduledJobs() map[string]*ScheduledJob {
 // Storage returns the underlying storage.
 func (q *Queue) Storage() core.Storage {
 	return q.storage
+}
+
+// Signal delivers a named signal carrying payload to a job (workflow). Signal
+// names starting with "_" are reserved for library-internal primitives such as
+// durable timers and are rejected with ErrSignalNameReserved. The signal is
+// buffered durably, so it is not lost if sent before the handler waits for it.
+// Once Signal returns nil, the signal is durably delivered in FIFO order per
+// (job, name). If the target job is currently waiting on a signal, Signal wakes
+// it immediately when possible; otherwise the resume poll wakes it. A failed
+// immediate wake after delivery is not returned as an error.
+//
+// The handler receives signals with WaitForSignal / WaitForSignalTimeout /
+// CheckSignal / DrainSignals. Returns ErrJobNotFound if the job does not exist,
+// ErrStorageNoSignals if the backend lacks signal support,
+// ErrSignalNameReserved, or ErrSignalNameTooLong.
+func (q *Queue) Signal(ctx context.Context, jobID core.UUID, name string, payload any) error {
+	if name == "" {
+		return fmt.Errorf("jobs: signal name must not be empty")
+	}
+	if strings.HasPrefix(name, "_") {
+		return signal.ErrSignalNameReserved
+	}
+	if len(name) > security.MaxSignalNameLength {
+		return core.ErrSignalNameTooLong
+	}
+	type signalSender interface {
+		SendSignal(ctx context.Context, jobID core.UUID, name string, payload []byte) error
+	}
+	var _ signalSender = (*storage.GormStorage)(nil)
+	sender, ok := q.Storage().(signalSender)
+	if !ok {
+		return core.ErrStorageNoSignals
+	}
+
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("jobs: marshal signal payload: %w", err)
+	}
+	if len(data) > security.MaxResultSize {
+		return fmt.Errorf("jobs: signal %q payload is %d bytes, limit is %d", name, len(data), security.MaxResultSize)
+	}
+
+	job, err := q.Storage().GetJob(ctx, jobID)
+	if err != nil {
+		return err
+	}
+	if job == nil {
+		return fmt.Errorf("%w: %s", core.ErrJobNotFound, jobID)
+	}
+
+	if err := sender.SendSignal(ctx, jobID, name, data); err != nil {
+		return err
+	}
+	q.Emit(&core.SignalDelivered{JobID: jobID, Name: name, Timestamp: time.Now()})
+
+	// Fast path: wake a job that's currently waiting. ResumeSignalWaitingJob
+	// matches StatusWaiting only (its WHERE guard closes the TOCTOU where the job
+	// is paused between the GetJob read above and the resume), so a producer can
+	// never un-pause an operator-paused job. The signal-resume poll backstops the
+	// deliver-vs-suspend race for anything this fast path misses.
+	if job.Status == core.StatusWaiting {
+		if signal.WaitingOnFutureSleep(ctx, q.Storage(), job, slog.Default()) {
+			return nil
+		}
+		type signalResumer interface {
+			ResumeSignalWaitingJob(ctx context.Context, jobID core.UUID) (bool, error)
+		}
+		var _ signalResumer = (*storage.GormStorage)(nil)
+		if r, ok := q.Storage().(signalResumer); ok {
+			resumed, err := r.ResumeSignalWaitingJob(ctx, jobID)
+			if err != nil {
+				slog.Default().Warn("signal delivered but immediate resume failed; the resume poll will wake the job", "job_id", jobID, "name", name, "error", err)
+			} else if resumed {
+				q.Emit(&core.JobResumedBySignal{JobID: jobID, SignalName: name, Timestamp: time.Now()})
+			}
+		}
+	}
+	return nil
+}
+
+// Requeue resets a terminally failed or cancelled job back to pending so it
+// runs again from scratch. Exhausted failed jobs are the dead-letter set; query
+// them with ListDeadLettered/CountDeadLettered and replay one with Requeue.
+// DLQ metadata and checkpoints are cleared so a workflow replays from the
+// beginning (handlers must be idempotent regardless), which is the safe behavior
+// when the usual reason to requeue is a code or dependency fix that changes the
+// workflow's steps. Requeuing a fan-out parent also clears its entire fan-out
+// subtree (descendant fan-outs and sub-jobs at every depth, including nested
+// workflows) so the replay re-dispatches cleanly.
+//
+// Returns true if the job was requeued, false if it was not found or not in a
+// requeuable (failed/cancelled) state. Returns ErrCannotRequeueSubJob for a
+// fan-out sub-job (requeue its parent instead), or an error if the storage
+// backend does not support requeueing.
+func (q *Queue) Requeue(ctx context.Context, jobID core.UUID) (bool, error) {
+	type requeuer interface {
+		Requeue(ctx context.Context, jobID core.UUID) (bool, error)
+	}
+	var _ requeuer = (*storage.GormStorage)(nil)
+	r, ok := q.Storage().(requeuer)
+	if !ok {
+		return false, fmt.Errorf("jobs: storage backend does not support Requeue")
+	}
+	return r.Requeue(ctx, jobID)
+}
+
+// DeadLetterOption configures dead-letter triage queries.
+type DeadLetterOption func(*core.DeadLetterFilter)
+
+// ListDeadLettered returns jobs with explicit DLQ metadata, ordered by
+// dead_lettered_at descending. Replay a returned job with Requeue.
+func (q *Queue) ListDeadLettered(ctx context.Context, opts ...DeadLetterOption) ([]*core.Job, error) {
+	type deadLetterLister interface {
+		ListDeadLettered(ctx context.Context, filter core.DeadLetterFilter) ([]*core.Job, error)
+	}
+	var _ deadLetterLister = (*storage.GormStorage)(nil)
+	l, ok := q.Storage().(deadLetterLister)
+	if !ok {
+		return nil, fmt.Errorf("jobs: storage backend does not support dead-letter triage")
+	}
+	filter := newDeadLetterFilter(opts...)
+	return l.ListDeadLettered(ctx, filter)
+}
+
+// CountDeadLettered returns the number of jobs with explicit DLQ metadata.
+func (q *Queue) CountDeadLettered(ctx context.Context, opts ...DeadLetterOption) (int64, error) {
+	type deadLetterCounter interface {
+		CountDeadLettered(ctx context.Context, filter core.DeadLetterFilter) (int64, error)
+	}
+	var _ deadLetterCounter = (*storage.GormStorage)(nil)
+	c, ok := q.Storage().(deadLetterCounter)
+	if !ok {
+		return 0, fmt.Errorf("jobs: storage backend does not support dead-letter triage")
+	}
+	filter := newDeadLetterFilter(opts...)
+	return c.CountDeadLettered(ctx, filter)
+}
+
+// DeadLetterQueue filters dead-letter queries to one queue.
+func DeadLetterQueue(queue string) DeadLetterOption {
+	return func(f *core.DeadLetterFilter) {
+		f.Queue = queue
+	}
+}
+
+// DeadLetterType filters dead-letter queries to one job type.
+func DeadLetterType(jobType string) DeadLetterOption {
+	return func(f *core.DeadLetterFilter) {
+		f.Type = jobType
+	}
+}
+
+// DeadLetterLimit sets the maximum number of dead-lettered jobs returned.
+func DeadLetterLimit(limit int) DeadLetterOption {
+	return func(f *core.DeadLetterFilter) {
+		f.Limit = limit
+	}
+}
+
+// DeadLetterOffset sets the pagination offset for dead-lettered jobs.
+func DeadLetterOffset(offset int) DeadLetterOption {
+	return func(f *core.DeadLetterFilter) {
+		f.Offset = offset
+	}
+}
+
+func newDeadLetterFilter(opts ...DeadLetterOption) core.DeadLetterFilter {
+	var filter core.DeadLetterFilter
+	for _, opt := range opts {
+		opt(&filter)
+	}
+	return filter
 }
 
 // LoadStatus returns the current status of a job by ID.

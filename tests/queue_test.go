@@ -251,7 +251,7 @@ func TestQueue_Schedule(t *testing.T) {
 		return nil
 	})
 
-	queue.Schedule("scheduled-task", nil, jobs.Every(200*time.Millisecond))
+	require.NoError(t, queue.Schedule("scheduled-task", nil, jobs.Every(200*time.Millisecond)))
 
 	worker := queue.NewWorker(jobs.WithScheduler(true))
 	// Generous worker lifetime so the poll below has room when a loaded CI
@@ -277,10 +277,10 @@ func TestQueue_Schedule_WithOptions(t *testing.T) {
 		return nil
 	})
 
-	queue.Schedule("priority-scheduled", nil, jobs.Every(100*time.Millisecond),
+	require.NoError(t, queue.Schedule("priority-scheduled", nil, jobs.Every(100*time.Millisecond),
 		jobs.QueueOpt("high-priority"),
 		jobs.Priority(100),
-	)
+	))
 
 	worker := queue.NewWorker(
 		jobs.WorkerQueue("high-priority", jobs.Concurrency(1)),

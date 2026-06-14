@@ -319,7 +319,7 @@ func registerHandlers(q *jobs.Queue, db *gorm.DB, dialect string) {
 				if _, done := jobs.LoadPhaseCheckpoint[bool](ctx, phase); done {
 					continue
 				}
-				if err := jobs.Signal(ctx, q, jobs.UUID(t.JobID), "sig", seq); err != nil {
+				if err := q.Signal(ctx, jobs.UUID(t.JobID), "sig", seq); err != nil {
 					return err
 				}
 				if err := jobs.SavePhaseCheckpoint(ctx, phase, true); err != nil {
@@ -368,7 +368,9 @@ func registerHandlers(q *jobs.Queue, db *gorm.DB, dialect string) {
 		}
 		return db.WithContext(ctx).Exec(stmt).Error
 	})
-	q.Schedule("chaos.tick", nil, jobs.Every(5*time.Second), jobs.Retries(0))
+	if err := q.Schedule("chaos.tick", nil, jobs.Every(5*time.Second), jobs.Retries(0)); err != nil {
+		panic(err)
+	}
 }
 
 func runWorker(parent context.Context, a *app) error {

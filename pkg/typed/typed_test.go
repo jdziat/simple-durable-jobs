@@ -54,7 +54,7 @@ func TestTypedEnqueueMatchesStringlyArgsBytes(t *testing.T) {
 	ctx := context.Background()
 	q, store := newTestQueue(t, nil)
 
-	def := typed.Define(q, "goldenTyped", func(_ context.Context, a args) (result, error) {
+	def := typed.Define[args, result](q, "goldenTyped", func(_ context.Context, a args) (result, error) {
 		return result{Message: a.Name, Total: a.Count}, nil
 	})
 
@@ -72,11 +72,11 @@ func TestTypedEnqueueMatchesStringlyArgsBytes(t *testing.T) {
 	assert.True(t, bytes.Equal(stringlyJob.Args, typedJob.Args), "typed enqueue must preserve stringly JSON bytes")
 }
 
-func TestDeclareEnqueueRemoteDoesNotRequireRegistration(t *testing.T) {
+func TestDeclareUncheckedEnqueueRemoteDoesNotRequireRegistration(t *testing.T) {
 	ctx := context.Background()
 	q, store := newTestQueue(t, nil)
 
-	def := typed.Declare[args, result](q, "remoteTyped")
+	def := typed.DeclareUnchecked[args, result](q, "remoteTyped")
 	jobID, err := def.EnqueueRemote(ctx, args{Name: "producer", Count: 2})
 	require.NoError(t, err)
 
@@ -84,6 +84,28 @@ func TestDeclareEnqueueRemoteDoesNotRequireRegistration(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, job)
 	assert.Equal(t, def.Name(), job.Type)
+}
+
+func TestDefineERejectsMismatchedResultType(t *testing.T) {
+	q, _ := newTestQueue(t, nil)
+
+	def, err := typed.DefineE[args, string](q, "mismatchedTyped", func(_ context.Context, a args) (int, error) {
+		return a.Count, nil
+	})
+
+	require.Error(t, err)
+	assert.Nil(t, def)
+	assert.Contains(t, err.Error(), "result type mismatch")
+}
+
+func TestDefinePanicsOnMismatchedResultType(t *testing.T) {
+	q, _ := newTestQueue(t, nil)
+
+	assert.Panics(t, func() {
+		typed.Define[args, string](q, "panicMismatchedTyped", func(_ context.Context, a args) (int, error) {
+			return a.Count, nil
+		})
+	})
 }
 
 func TestSecretboxCodecRoundTripsTypedResult(t *testing.T) {
@@ -94,7 +116,7 @@ func TestSecretboxCodecRoundTripsTypedResult(t *testing.T) {
 	require.NoError(t, err)
 
 	q, store := newTestQueue(t, []storage.GormStorageOption{storage.WithCodec(secretbox)})
-	def := typed.Define(q, "secretboxRoundTrip", func(_ context.Context, a args) (result, error) {
+	def := typed.Define[args, result](q, "secretboxRoundTrip", func(_ context.Context, a args) (result, error) {
 		return result{Message: "sealed:" + a.Name, Total: a.Count + 1}, nil
 	})
 
@@ -111,10 +133,10 @@ func TestDefineEnqueueLoadAndNestedCall(t *testing.T) {
 	ctx := context.Background()
 	q, store := newTestQueue(t, nil)
 
-	child := typed.Define(q, "childTyped", func(_ context.Context, a args) (result, error) {
+	child := typed.Define[args, result](q, "childTyped", func(_ context.Context, a args) (result, error) {
 		return result{Message: "child:" + a.Name, Total: a.Count + 10}, nil
 	})
-	parent := typed.Define(q, "parentTyped", func(ctx context.Context, a args) (result, error) {
+	parent := typed.Define[args, result](q, "parentTyped", func(ctx context.Context, a args) (result, error) {
 		got, err := child.Call(ctx, a)
 		if err != nil {
 			return result{}, err
@@ -155,7 +177,7 @@ func TestDefineVoid(t *testing.T) {
 
 func TestTypedSubJobOfUsesDefinitionNameAndTypedArgs(t *testing.T) {
 	q, _ := newTestQueue(t, nil)
-	def := typed.Define(q, "typedSubJobOf", func(_ context.Context, a args) (result, error) {
+	def := typed.Define[args, result](q, "typedSubJobOf", func(_ context.Context, a args) (result, error) {
 		return result{Message: a.Name, Total: a.Count}, nil
 	})
 
@@ -174,7 +196,7 @@ func TestTypedSignalAndWaitForSignalResumeWorkflow(t *testing.T) {
 	events := q.Events()
 	defer q.Unsubscribe(events)
 
-	def := typed.Define(q, "typedSignalWait", func(ctx context.Context, a args) (result, error) {
+	def := typed.Define[args, result](q, "typedSignalWait", func(ctx context.Context, a args) (result, error) {
 		approved, err := typed.WaitForSignal[bool](ctx, "approved")
 		if err != nil {
 			return result{}, err
@@ -214,7 +236,7 @@ func TestTypedWaitForSignalTimeoutConsumesBufferedSignal(t *testing.T) {
 	ctx := context.Background()
 	q, store := newTestQueue(t, nil)
 
-	def := typed.Define(q, "typedSignalTimeout", func(ctx context.Context, _ args) (result, error) {
+	def := typed.Define[args, result](q, "typedSignalTimeout", func(ctx context.Context, _ args) (result, error) {
 		value, ok, err := typed.WaitForSignalTimeout[string](ctx, "ready", time.Minute)
 		if err != nil {
 			return result{}, err
@@ -247,10 +269,10 @@ func TestTypedFanOutRunsTypedSubJobs(t *testing.T) {
 	ctx := context.Background()
 	q, store := newTestQueue(t, nil)
 
-	child := typed.Define(q, "typedFanOutChild", func(_ context.Context, a args) (result, error) {
+	child := typed.Define[args, result](q, "typedFanOutChild", func(_ context.Context, a args) (result, error) {
 		return result{Message: "child:" + a.Name, Total: a.Count + 1}, nil
 	})
-	parent := typed.Define(q, "typedFanOutParent", func(ctx context.Context, values []args) ([]result, error) {
+	parent := typed.Define[[]args, []result](q, "typedFanOutParent", func(ctx context.Context, values []args) ([]result, error) {
 		subJobs := make([]typed.SubJob, len(values))
 		for i, value := range values {
 			subJobs[i] = typed.SubJobOf(child, value)

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"reflect"
 
 	"gorm.io/gorm"
 
@@ -32,10 +33,10 @@ type Def[A any, R any] struct {
 func Define[A any, R any](
 	q *queue.Queue,
 	name string,
-	fn func(context.Context, A) (R, error),
+	fn any,
 	opts ...queue.Option,
 ) *Def[A, R] {
-	def, err := DefineE(q, name, fn, opts...)
+	def, err := DefineE[A, R](q, name, fn, opts...)
 	if err != nil {
 		panic(err)
 	}
@@ -50,26 +51,44 @@ func Define[A any, R any](
 func DefineE[A any, R any](
 	q *queue.Queue,
 	name string,
-	fn func(context.Context, A) (R, error),
+	fn any,
 	opts ...queue.Option,
 ) (*Def[A, R], error) {
 	if err := q.RegisterE(name, fn, opts...); err != nil {
 		return nil, err
 	}
+	h, ok := q.GetHandler(name)
+	if !ok {
+		return nil, fmt.Errorf("jobs: handler for %q was not registered", name)
+	}
+	wantA := reflect.TypeOf((*A)(nil)).Elem()
+	if h.ArgsType == nil {
+		return nil, fmt.Errorf("jobs: typed definition %q argument type mismatch: handler accepts no arguments, definition expects %s", name, wantA)
+	}
+	if !wantA.AssignableTo(h.ArgsType) {
+		return nil, fmt.Errorf("jobs: typed definition %q argument type mismatch: handler accepts %s, definition expects %s", name, h.ArgsType, wantA)
+	}
+	wantR := reflect.TypeOf((*R)(nil)).Elem()
+	if h.ResultType == nil {
+		return nil, fmt.Errorf("jobs: typed definition %q result type mismatch: handler returns no result, definition expects %s", name, wantR)
+	}
+	if !h.ResultType.AssignableTo(wantR) {
+		return nil, fmt.Errorf("jobs: typed definition %q result type mismatch: handler returns %s, definition expects %s", name, h.ResultType, wantR)
+	}
 	return &Def[A, R]{q: q, name: name}, nil
 }
 
-// Declare returns a typed definition handle without registering a handler.
+// DeclareUnchecked returns a typed definition handle without registering a handler.
 //
-// Use Declare in producer-only processes that enqueue work for workers running
-// elsewhere. The returned handle remains string-routed by name and does not
-// create a type-keyed registry.
+// Use DeclareUnchecked in producer-only processes that enqueue work for workers
+// running elsewhere. The returned handle remains string-routed by name and does
+// not create a type-keyed registry.
 //
 // Warning: A and R are unchecked on this producer-only EnqueueRemote path.
-// There is no registered handler for Declare to validate them against, so they
-// must be hand-synchronized with the remote worker's handler signature or the
-// worker will fail to decode the payload.
-func Declare[A any, R any](q *queue.Queue, name string) *Def[A, R] {
+// There is no registered handler for DeclareUnchecked to validate them against,
+// so they must be hand-synchronized with the remote worker's handler signature
+// or the worker will fail to decode the payload.
+func DeclareUnchecked[A any, R any](q *queue.Queue, name string) *Def[A, R] {
 	return &Def[A, R]{q: q, name: name}
 }
 
@@ -86,7 +105,7 @@ func DefineVoid[A any](
 	wrapped := func(ctx context.Context, args A) (struct{}, error) {
 		return struct{}{}, fn(ctx, args)
 	}
-	return Define(q, name, wrapped, opts...)
+	return Define[A, struct{}](q, name, wrapped, opts...)
 }
 
 // Name returns the string job type registered for d.

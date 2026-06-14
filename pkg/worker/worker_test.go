@@ -3358,7 +3358,7 @@ func TestWorker_RunScheduler_DoesNotFireFutureScheduleOnStartup(t *testing.T) {
 	q.Register("scheduled-task", func(_ context.Context, _ struct{}) error {
 		return nil
 	})
-	q.Schedule("scheduled-task", nil, offsetSchedule{offset: time.Hour})
+	require.NoError(t, q.Schedule("scheduled-task", nil, offsetSchedule{offset: time.Hour}))
 
 	w := NewWorker(q, WithStaleLockInterval(0))
 
@@ -3383,7 +3383,7 @@ func TestWorker_RunScheduler_EnqueuesDueJob(t *testing.T) {
 
 	// Register a schedule that always returns a time in the past so the
 	// scheduler immediately considers the job due.
-	q.Schedule("scheduled-task", nil, schedule.Every(1*time.Millisecond))
+	require.NoError(t, q.Schedule("scheduled-task", nil, schedule.Every(1*time.Millisecond)))
 
 	w := NewWorker(q, WithStaleLockInterval(0))
 
@@ -3413,14 +3413,14 @@ func TestWorker_RunScheduler_ForwardsArgsOptionsAndUserUniqueKey(t *testing.T) {
 	fire := time.Now().Add(300 * time.Millisecond)
 	runAt := fire.Add(time.Minute)
 	args := map[string]string{"tenant": "acme"}
-	q.Schedule("scheduled-task", args, fixedBoundarySchedule{fire: fire},
+	require.NoError(t, q.Schedule("scheduled-task", args, fixedBoundarySchedule{fire: fire},
 		queue.QueueOpt("scheduled"),
 		queue.Priority(9),
 		queue.Retries(5),
 		queue.At(runAt),
 		queue.Timeout(time.Second),
 		queue.Unique("user:scheduled-task"),
-	)
+	))
 
 	w := NewWorker(q, WithStaleLockInterval(0))
 
@@ -3462,7 +3462,7 @@ func TestWorker_RunScheduler_ClaimRefusalAdvancesBoundary(t *testing.T) {
 	})
 
 	fire := time.Now().Add(250 * time.Millisecond)
-	q.Schedule("scheduled-task", nil, fixedBoundarySchedule{fire: fire})
+	require.NoError(t, q.Schedule("scheduled-task", nil, fixedBoundarySchedule{fire: fire}))
 
 	w := NewWorker(q, WithStaleLockInterval(0))
 
@@ -3488,7 +3488,7 @@ func TestWorker_RunScheduler_ClaimedBoundaryEnqueuesOnce(t *testing.T) {
 	})
 
 	fire := time.Now().Add(250 * time.Millisecond)
-	q.Schedule("scheduled-task", nil, fixedBoundarySchedule{fire: fire})
+	require.NoError(t, q.Schedule("scheduled-task", nil, fixedBoundarySchedule{fire: fire}))
 
 	w := NewWorker(q, WithStaleLockInterval(0))
 
@@ -3530,8 +3530,8 @@ func TestScheduler_CatchUpAfterFleetGap(t *testing.T) {
 	q := queue.New(mock)
 	q.Register("catch-up-task", func(_ context.Context, _ struct{}) error { return nil })
 	q.Register("fresh-task", func(_ context.Context, _ struct{}) error { return nil })
-	q.Schedule("catch-up-task", nil, offsetSchedule{offset: period})
-	q.Schedule("fresh-task", nil, offsetSchedule{offset: period})
+	require.NoError(t, q.Schedule("catch-up-task", nil, offsetSchedule{offset: period}))
+	require.NoError(t, q.Schedule("fresh-task", nil, offsetSchedule{offset: period}))
 
 	w := NewWorker(q, WithStaleLockInterval(0))
 	ctx, cancel := context.WithCancel(context.Background())
