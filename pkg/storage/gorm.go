@@ -230,9 +230,29 @@ func (s *GormStorage) Migrate(ctx context.Context) error {
 	})
 }
 
-// backfillDispatcherNulls fills pre-existing NULL dispatcher columns with their
-// defaults. It is run by schema migration v19, not on every Migrate call, so the
-// legacy cleanup is recorded in schema_migrations and paid at most once.
+// backfillDispatcherNulls fills pre-existing NULL columns on the jobs table with
+// their model defaults BEFORE AutoMigrate enforces the corresponding NOT NULL
+// constraints. It runs on every Migrate call, but a cheap EXISTS probe
+// short-circuits to a no-op on the overwhelmingly common clean table.
+//
+// The covered columns are exactly the jobs columns that the core.Job model marks
+// `not null` AND that can pre-exist as nullable in a legacy baseline (so the
+// constraint is later applied to an existing column — via AutoMigrate's
+// `ALTER COLUMN ... SET NOT NULL`/MySQL column rebuild, or migrateIntWidthRightsizing's
+// `MODIFY ... NOT NULL` — rather than a backfilling `ADD COLUMN ... NOT NULL DEFAULT`):
+//   - status/queue/priority/attempt/max_retries — the original dispatcher set.
+//   - timeout — shipped originally WITHOUT a gorm tag (a genuinely nullable era), then
+//     later tightened to `not null;default:0`.
+//   - determinism — likewise introduced untagged/nullable and later tightened to
+//     `not null;default:0`. A pre-v3 baseline therefore holds NULL for both columns,
+//     and migrateIntWidthRightsizing's `MODIFY determinism int NOT NULL DEFAULT 0`
+//     aborts at boot on a NULL determinism (MySQL Error 1265; PG would 23502 on
+//     SET NOT NULL).
+//
+// A baseline holding any of these NULLs would otherwise crash Migrate at boot (PG
+// 23502 / MySQL 1265). type was `not null` from introduction (no baseline can hold a
+// NULL); fan_outs.total_count is `not null` with no default and intrinsic to every
+// fan-out row, so it is never NULL in a real baseline.
 func backfillDispatcherNulls(ctx context.Context, db *gorm.DB, dialect string) error {
 	if dialect != dialectPostgres && dialect != dialectMySQL {
 		return nil
@@ -250,7 +270,8 @@ func backfillDispatcherNulls(ctx context.Context, db *gorm.DB, dialect string) e
 		SELECT EXISTS(
 			SELECT 1 FROM jobs
 			WHERE status IS NULL OR queue IS NULL OR priority IS NULL
-			   OR attempt IS NULL OR max_retries IS NULL
+			   OR attempt IS NULL OR max_retries IS NULL OR timeout IS NULL
+			   OR determinism IS NULL
 		)
 	`).Scan(&hasNulls).Error; err != nil {
 		return err
@@ -264,9 +285,12 @@ func backfillDispatcherNulls(ctx context.Context, db *gorm.DB, dialect string) e
 		    queue = COALESCE(queue, 'default'),
 		    priority = COALESCE(priority, 0),
 		    attempt = COALESCE(attempt, 0),
-		    max_retries = COALESCE(max_retries, 3)
+		    max_retries = COALESCE(max_retries, 3),
+		    timeout = COALESCE(timeout, 0),
+		    determinism = COALESCE(determinism, 0)
 		WHERE status IS NULL OR queue IS NULL OR priority IS NULL
-		   OR attempt IS NULL OR max_retries IS NULL
+		   OR attempt IS NULL OR max_retries IS NULL OR timeout IS NULL
+		   OR determinism IS NULL
 	`).Error
 }
 
