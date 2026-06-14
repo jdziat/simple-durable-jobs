@@ -192,7 +192,7 @@ func (s *GormStorage) Migrate(ctx context.Context) error {
 		if err := backfillDispatcherNulls(ctx, db, s.dialect()); err != nil {
 			return err
 		}
-		if err := convertLegacyStringUUIDColumns(ctx, db, s.dialect()); err != nil {
+		if err := s.applyPreMigrations(ctx, db); err != nil {
 			return err
 		}
 

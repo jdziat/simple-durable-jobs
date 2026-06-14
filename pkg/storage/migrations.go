@@ -3,9 +3,11 @@ package storage
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -130,6 +132,19 @@ type schemaMigration struct {
 	Version int
 	Name    string
 	Up      func(ctx context.Context, db *gorm.DB, dialect string) error
+}
+
+// preMigration is a one-shot migration that must run before AutoMigrate. The
+// body remains idempotent; the schema_pre_migrations fence records START and
+// DONE states so a crash can be resumed without confusing in-progress with
+// never-started.
+type preMigration struct {
+	Name string
+	Up   func(ctx context.Context, db *gorm.DB, dialect string) error
+}
+
+var preMigrations = []preMigration{
+	{Name: "uuid_binary_conversion", Up: convertLegacyStringUUIDColumns},
 }
 
 // schemaMigrations is the ordered list of versioned migrations. Append new
@@ -271,6 +286,92 @@ var schemaMigrations = []schemaMigration{
 		Name:    "checkpoint_call_index_width",
 		Up:      migrateCheckpointCallIndexWidth,
 	},
+}
+
+// applyPreMigrations runs every registered pre-AutoMigrate one-shot through a
+// START/DONE fence. A completed row skips the body. A missing row or a STARTED
+// row with no completed_at runs the idempotent body and records completion.
+func (s *GormStorage) applyPreMigrations(ctx context.Context, db *gorm.DB) error {
+	dialect := s.dialect()
+	if err := ensurePreMigrationTable(ctx, db, dialect); err != nil {
+		return err
+	}
+	for _, migration := range preMigrations {
+		if err := applyPreMigration(ctx, db, dialect, migration); err != nil {
+			return fmt.Errorf("storage: pre-migration %s: %w", migration.Name, err)
+		}
+	}
+	return nil
+}
+
+func ensurePreMigrationTable(ctx context.Context, db *gorm.DB, dialect string) error {
+	var stmt string
+	switch dialect {
+	case dialectMySQL:
+		stmt = `
+			CREATE TABLE IF NOT EXISTS schema_pre_migrations (
+				name varchar(255) NOT NULL PRIMARY KEY,
+				started_at datetime(6) NULL,
+				completed_at datetime(6) NULL
+			)`
+	case dialectPostgres:
+		stmt = `
+			CREATE TABLE IF NOT EXISTS schema_pre_migrations (
+				name varchar(255) PRIMARY KEY,
+				started_at timestamp with time zone NULL,
+				completed_at timestamp with time zone NULL
+			)`
+	default:
+		stmt = `
+			CREATE TABLE IF NOT EXISTS schema_pre_migrations (
+				name varchar(255) PRIMARY KEY,
+				started_at datetime NULL,
+				completed_at datetime NULL
+			)`
+	}
+	if err := db.WithContext(ctx).Exec(stmt).Error; err != nil {
+		return fmt.Errorf("storage: create schema_pre_migrations ledger: %w", err)
+	}
+	return nil
+}
+
+func applyPreMigration(ctx context.Context, db *gorm.DB, dialect string, migration preMigration) error {
+	var row core.PreMigration
+	err := db.WithContext(ctx).First(&row, "name = ?", migration.Name).Error
+	switch {
+	case err == nil && row.CompletedAt != nil:
+		return nil
+	case err == nil:
+	case errors.Is(err, gorm.ErrRecordNotFound):
+	default:
+		return fmt.Errorf("read fence: %w", err)
+	}
+
+	startedAt := time.Now()
+	if err := db.WithContext(ctx).Clauses(clause.OnConflict{
+		Columns: []clause.Column{{Name: "name"}},
+		DoUpdates: clause.Assignments(map[string]any{
+			"started_at":   startedAt,
+			"completed_at": nil,
+		}),
+	}).Create(&core.PreMigration{
+		Name:      migration.Name,
+		StartedAt: &startedAt,
+	}).Error; err != nil {
+		return fmt.Errorf("write start fence: %w", err)
+	}
+
+	if err := migration.Up(ctx, db, dialect); err != nil {
+		return err
+	}
+
+	completedAt := time.Now()
+	if err := db.WithContext(ctx).Model(&core.PreMigration{}).
+		Where("name = ?", migration.Name).
+		Update("completed_at", completedAt).Error; err != nil {
+		return fmt.Errorf("write done marker: %w", err)
+	}
+	return nil
 }
 
 // applyPendingMigrations runs every migration whose version is absent from the
