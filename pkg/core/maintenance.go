@@ -14,6 +14,19 @@ type SchemaMigration struct {
 	AppliedAt time.Time `gorm:"autoCreateTime"`
 }
 
+// PreMigration records one pre-AutoMigrate one-shot migration. These migrations
+// need to run before GORM can safely inspect or alter the schema, so their
+// ledger table is created manually by the storage migration runner.
+type PreMigration struct {
+	Name        string     `gorm:"primaryKey;size:255"`
+	StartedAt   *time.Time `gorm:"column:started_at"`
+	CompletedAt *time.Time `gorm:"column:completed_at"`
+}
+
+func (PreMigration) TableName() string {
+	return "schema_pre_migrations"
+}
+
 // Lease is a generic, expiring advisory lease. It is used to elect a single
 // worker in a fleet to run periodic, fleet-wide maintenance (e.g. the fan-out
 // recovery poll) so that N workers do not all run the same scan every tick.
