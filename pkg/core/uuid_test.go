@@ -69,6 +69,7 @@ func TestUUID_Scan(t *testing.T) {
 		// The Postgres path: a uuid column comes back as canonical text.
 		{"nil-uuid string -> NilUUID (postgres path)", nilUUIDString, NilUUID, false},
 		{"canonical string passthrough", "018f7c1a-9b2e-7d3f-8a4b-1c2d3e4f5a6b", UUID("018f7c1a-9b2e-7d3f-8a4b-1c2d3e4f5a6b"), false},
+		{"invalid string -> error", "garbage", NilUUID, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -84,6 +84,14 @@ func TestMigratePostgresLegacyBaselineMissingSignalsAndOrphans(t *testing.T) {
 		require.NoError(t, db.Exec("ALTER TABLE "+fk.Table+" DROP CONSTRAINT IF EXISTS "+fk.Constraint).Error)
 	}
 
+	// Drop the zero-UUID CHECK constraints (migration v28): their expression
+	// compares the uuid columns to a uuid literal, so reverting those columns to
+	// varchar below would fail with "operator does not exist: character varying <> uuid".
+	// The conversion + v28 re-create them on the re-migrate; a true v1.x baseline never had them.
+	for _, c := range []string{"chk_jobs_parent_job_not_zero", "chk_jobs_root_job_not_zero", "chk_jobs_fan_out_not_zero"} {
+		require.NoError(t, db.Exec("ALTER TABLE jobs DROP CONSTRAINT IF EXISTS "+c).Error)
+	}
+
 	// Revert native-uuid columns back to legacy varchar(36).
 	legacyReverts := []struct{ table, column string }{
 		{"checkpoints", "id"}, {"checkpoints", "job_id"},
