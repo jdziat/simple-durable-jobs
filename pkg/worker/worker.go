@@ -512,6 +512,14 @@ func (w *Worker) dequeueAvailableJobs(ctx context.Context, availableQueues []str
 	return []*core.Job{job}, nil
 }
 
+// Dispatch accounting invariant: totalConcurrency is the sum of per-queue caps
+// and also the jobsChan buffer size. dequeueSlots is only an upper-bound
+// estimate and may over-claim because RunningJobCount lags jobs already
+// buffered in jobsChan. The real caps are enforced downstream: per-queue by the
+// queueRunning CAS in tryTrackQueueJob, named limits by
+// tryAcquireConcurrencySlots, and total concurrency by the bounded channel. Any
+// job that fails admission is released back to storage, and releaseBudget bounds
+// per-tick claim/release churn.
 func (w *Worker) dequeueSlots(availableQueues []string, totalConcurrency int) int {
 	if len(availableQueues) == 0 {
 		return 0
@@ -923,6 +931,10 @@ func (w *Worker) trackQueueJob(jobID core.UUID, queueName string) {
 	w.queueJobIDMu.Unlock()
 }
 
+// tryTrackQueueJob is the authoritative per-queue admission gate. Its atomic
+// CAS is not advisory: once a queue is at its configured cap, dispatch must
+// release the dequeued job instead of letting it borrow capacity from another
+// queue.
 func (w *Worker) tryTrackQueueJob(jobID core.UUID, queueName string) bool {
 	counter, ok := w.queueRunning[queueName]
 	if !ok {
