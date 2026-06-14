@@ -2,12 +2,21 @@ package storage
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"gorm.io/gorm"
 
 	"github.com/jdziat/simple-durable-jobs/v3/pkg/core"
 )
+
+func quotedTerminalJobStatuses() string {
+	quoted := make([]string, 0, len(core.TerminalJobStatuses))
+	for _, status := range core.TerminalJobStatuses {
+		quoted = append(quoted, "'"+string(status)+"'")
+	}
+	return strings.Join(quoted, ",")
+}
 
 // DeleteTerminalJobsOlderThan deletes at most limit jobs in one terminal status
 // whose terminal timestamp is older than age. It is an optional storage
@@ -28,8 +37,9 @@ func (s *GormStorage) DeleteTerminalJobsOlderThan(ctx context.Context, status co
 		cutoff = time.Now().Add(-age).UTC()
 	}
 
-	parentChildGuard := "NOT EXISTS (SELECT 1 FROM jobs c WHERE c.parent_job_id = jobs.id AND c.status NOT IN ('completed','failed','cancelled'))"
-	rootChildGuard := "NOT EXISTS (SELECT 1 FROM jobs c WHERE c.root_job_id = jobs.id AND c.status NOT IN ('completed','failed','cancelled'))"
+	terminalStatuses := quotedTerminalJobStatuses()
+	parentChildGuard := "NOT EXISTS (SELECT 1 FROM jobs c WHERE c.parent_job_id = jobs.id AND c.status NOT IN (" + terminalStatuses + "))"
+	rootChildGuard := "NOT EXISTS (SELECT 1 FROM jobs c WHERE c.root_job_id = jobs.id AND c.status NOT IN (" + terminalStatuses + "))"
 	if s.dialect() == dialectMySQL {
 		parentChildGuard = "NOT EXISTS (SELECT 1 FROM jobs c WHERE c.pending_parent_ref = jobs.id)"
 		rootChildGuard = "NOT EXISTS (SELECT 1 FROM jobs c WHERE c.pending_root_ref = jobs.id)"

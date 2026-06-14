@@ -1148,7 +1148,7 @@ func (s *GormStorage) FindOrphanedJobs(ctx context.Context, jobIDs []core.UUID, 
 		Where(
 			s.db.Where("locked_by IS NULL").
 				Or("locked_by != ?", workerID).
-				Or("status IN ?", []core.JobStatus{core.StatusCancelled, core.StatusCompleted, core.StatusFailed}),
+				Or("status IN ?", core.TerminalJobStatuses),
 		).
 		Pluck("id", &orphaned).Error
 	if err != nil {

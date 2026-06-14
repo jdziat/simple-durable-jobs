@@ -22,6 +22,20 @@ const (
 // drift guard derive from.
 var AllJobStatuses = []JobStatus{StatusPending, StatusRunning, StatusCompleted, StatusFailed, StatusRetrying, StatusWaiting, StatusCancelled, StatusPaused}
 
+// TerminalJobStatuses are statuses past which a job does no more work.
+// Retention may reap terminal jobs, and workflow parent/root refs are cleared.
+var TerminalJobStatuses = []JobStatus{StatusCompleted, StatusFailed, StatusCancelled}
+
+// IsTerminal reports whether s is a terminal job status.
+func (s JobStatus) IsTerminal() bool {
+	for _, status := range TerminalJobStatuses {
+		if s == status {
+			return true
+		}
+	}
+	return false
+}
+
 // MetadataMap stores queryable string metadata for jobs and job filters.
 type MetadataMap map[string]string
 
