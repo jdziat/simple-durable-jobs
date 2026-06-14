@@ -802,40 +802,7 @@ func migrateDeadLetterPrecisionAlign(ctx context.Context, db *gorm.DB, dialect s
 func migrateRetentionWorkflowIndexes(ctx context.Context, db *gorm.DB, dialect string) error {
 	switch dialect {
 	case dialectMySQL:
-		m := db.Migrator()
-		if !m.HasColumn(&core.Job{}, "pending_parent_ref") {
-			if err := db.WithContext(ctx).Exec(
-				"ALTER TABLE jobs ADD COLUMN pending_parent_ref binary(16) " +
-					"GENERATED ALWAYS AS (CASE WHEN status NOT IN ('completed','failed','cancelled') " +
-					"THEN parent_job_id END) STORED",
-			).Error; err != nil && !isBenignDDLError(err) {
-				return fmt.Errorf("add pending_parent_ref column: %w", err)
-			}
-		}
-		if !m.HasColumn(&core.Job{}, "pending_root_ref") {
-			if err := db.WithContext(ctx).Exec(
-				"ALTER TABLE jobs ADD COLUMN pending_root_ref binary(16) " +
-					"GENERATED ALWAYS AS (CASE WHEN status NOT IN ('completed','failed','cancelled') " +
-					"THEN root_job_id END) STORED",
-			).Error; err != nil && !isBenignDDLError(err) {
-				return fmt.Errorf("add pending_root_ref column: %w", err)
-			}
-		}
-		if !m.HasIndex(&core.Job{}, "idx_jobs_parent_nonterminal") {
-			if err := db.WithContext(ctx).Exec(
-				"CREATE INDEX idx_jobs_parent_nonterminal ON jobs (pending_parent_ref)",
-			).Error; err != nil && !isBenignDDLError(err) {
-				return fmt.Errorf("create idx_jobs_parent_nonterminal: %w", err)
-			}
-		}
-		if !m.HasIndex(&core.Job{}, "idx_jobs_root_nonterminal") {
-			if err := db.WithContext(ctx).Exec(
-				"CREATE INDEX idx_jobs_root_nonterminal ON jobs (pending_root_ref)",
-			).Error; err != nil && !isBenignDDLError(err) {
-				return fmt.Errorf("create idx_jobs_root_nonterminal: %w", err)
-			}
-		}
-		return nil
+		return migrateMySQLRetentionWorkflowGeneratedColumns(ctx, db)
 	default:
 		if err := db.WithContext(ctx).Exec(
 			"CREATE INDEX IF NOT EXISTS idx_jobs_parent_nonterminal ON jobs (parent_job_id) WHERE status NOT IN ('completed','failed','cancelled')",
@@ -849,6 +816,43 @@ func migrateRetentionWorkflowIndexes(ctx context.Context, db *gorm.DB, dialect s
 		}
 		return nil
 	}
+}
+
+func migrateMySQLRetentionWorkflowGeneratedColumns(ctx context.Context, db *gorm.DB) error {
+	m := db.Migrator()
+	if !m.HasColumn(&core.Job{}, "pending_parent_ref") {
+		if err := db.WithContext(ctx).Exec(
+			"ALTER TABLE jobs ADD COLUMN pending_parent_ref binary(16) " +
+				"GENERATED ALWAYS AS (CASE WHEN status NOT IN ('completed','failed','cancelled') " +
+				"THEN parent_job_id END) STORED",
+		).Error; err != nil && !isBenignDDLError(err) {
+			return fmt.Errorf("add pending_parent_ref column: %w", err)
+		}
+	}
+	if !m.HasColumn(&core.Job{}, "pending_root_ref") {
+		if err := db.WithContext(ctx).Exec(
+			"ALTER TABLE jobs ADD COLUMN pending_root_ref binary(16) " +
+				"GENERATED ALWAYS AS (CASE WHEN status NOT IN ('completed','failed','cancelled') " +
+				"THEN root_job_id END) STORED",
+		).Error; err != nil && !isBenignDDLError(err) {
+			return fmt.Errorf("add pending_root_ref column: %w", err)
+		}
+	}
+	if !m.HasIndex(&core.Job{}, "idx_jobs_parent_nonterminal") {
+		if err := db.WithContext(ctx).Exec(
+			"CREATE INDEX idx_jobs_parent_nonterminal ON jobs (pending_parent_ref)",
+		).Error; err != nil && !isBenignDDLError(err) {
+			return fmt.Errorf("create idx_jobs_parent_nonterminal: %w", err)
+		}
+	}
+	if !m.HasIndex(&core.Job{}, "idx_jobs_root_nonterminal") {
+		if err := db.WithContext(ctx).Exec(
+			"CREATE INDEX idx_jobs_root_nonterminal ON jobs (pending_root_ref)",
+		).Error; err != nil && !isBenignDDLError(err) {
+			return fmt.Errorf("create idx_jobs_root_nonterminal: %w", err)
+		}
+	}
+	return nil
 }
 
 func migrateScaleFinishIndexes(ctx context.Context, db *gorm.DB, dialect string) error {
