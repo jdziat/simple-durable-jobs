@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand/v2"
+	"regexp"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -29,6 +30,8 @@ const (
 	maxFanOutTreeDepth = 256
 )
 
+var indexedMetadataKeyPattern = regexp.MustCompile(`^[A-Za-z0-9_]{1,48}$`)
+
 // GormStorageOption configures a GormStorage.
 type GormStorageOption func(*GormStorage)
 
@@ -52,6 +55,36 @@ func WithCodec(c core.PayloadCodec) GormStorageOption {
 	}
 }
 
+// WithIndexedMetadataKeys declares metadata keys that should get MySQL
+// generated-column indexes for dashboard/DLQ tag filters. This is a MySQL-only
+// optimization: PostgreSQL is already covered by the metadata GIN index, and
+// SQLite keeps using the LIKE fallback. Declaring a key makes filters on that
+// key use a generated-column index instead of a full metadata scan.
+func WithIndexedMetadataKeys(keys ...string) GormStorageOption {
+	return func(s *GormStorage) {
+		seen := make(map[string]struct{}, len(keys))
+		deduped := make([]string, 0, len(keys))
+		for _, key := range keys {
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			deduped = append(deduped, key)
+		}
+		// Stored behind a pointer so GormStorage stays comparable (a []string
+		// field would make the struct non-comparable, an api-compat break).
+		s.indexedMetadataKeys = &deduped
+	}
+}
+
+// indexedMetadataKeyList returns the declared indexed metadata keys (nil if none).
+func (s *GormStorage) indexedMetadataKeyList() []string {
+	if s.indexedMetadataKeys == nil {
+		return nil
+	}
+	return *s.indexedMetadataKeys
+}
+
 // withoutDefaultPool disables the bounded connection pool that NewGormStorage
 // applies by default. It is unexported because it exists only so
 // NewGormStorageWithPool (which has already sized the pool itself, possibly to
@@ -67,11 +100,12 @@ func withoutDefaultPool() GormStorageOption {
 var _ core.Storage = (*GormStorage)(nil)
 
 type GormStorage struct {
-	db              *gorm.DB
-	isSQLite        bool
-	lockDuration    atomic.Int64
-	codec           core.PayloadCodec
-	skipDefaultPool bool
+	db                  *gorm.DB
+	isSQLite            bool
+	lockDuration        atomic.Int64
+	codec               core.PayloadCodec
+	indexedMetadataKeys *[]string
+	skipDefaultPool     bool
 
 	// deleteCheckpointsOnComplete, when true, deletes a job's checkpoints in the
 	// SAME transaction as its success terminal write (Complete /
@@ -226,8 +260,43 @@ func (s *GormStorage) Migrate(ctx context.Context) error {
 			}
 		}
 
-		return s.applyPendingMigrations(ctx, db)
+		if err := s.applyPendingMigrations(ctx, db); err != nil {
+			return err
+		}
+		return s.applyIndexedMetadataKeyIndexes(ctx, db)
 	})
+}
+
+func (s *GormStorage) applyIndexedMetadataKeyIndexes(ctx context.Context, db *gorm.DB) error {
+	keys := s.indexedMetadataKeyList()
+	if s.dialect() != dialectMySQL || len(keys) == 0 {
+		return nil
+	}
+	for _, key := range keys {
+		if !indexedMetadataKeyPattern.MatchString(key) {
+			return fmt.Errorf("storage: indexed metadata key %q must match [A-Za-z0-9_]{1,48}", key)
+		}
+	}
+	m := db.Migrator()
+	for _, key := range keys {
+		indexName := "idx_jobs_meta_" + key
+		columnName := mysqlMetadataGenColumn(key)
+		if !m.HasColumn("jobs", columnName) {
+			if err := db.WithContext(ctx).Exec(
+				"ALTER TABLE jobs ADD COLUMN " + mysqlMetadataGenColumnDefinition(key),
+			).Error; err != nil && !isBenignDDLError(err) {
+				return fmt.Errorf("add %s column: %w", columnName, err)
+			}
+		}
+		if !m.HasIndex("jobs", indexName) {
+			if err := db.WithContext(ctx).Exec(
+				"ALTER TABLE jobs ADD INDEX " + indexName + " (" + columnName + ")",
+			).Error; err != nil && !isBenignDDLError(err) {
+				return fmt.Errorf("create %s: %w", indexName, err)
+			}
+		}
+	}
+	return nil
 }
 
 // backfillDispatcherNulls fills pre-existing NULL columns on the jobs table with
