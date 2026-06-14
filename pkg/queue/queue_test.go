@@ -627,6 +627,20 @@ func TestQueue_Schedule_UnregisteredHandlerReturnsError(t *testing.T) {
 	assert.Contains(t, err.Error(), `no handler registered for "missing-job"`)
 }
 
+func TestQueue_Schedule_NilScheduleReturnsError(t *testing.T) {
+	store := newMockStorage()
+	q := New(store)
+	q.Register("scheduled-job", func(ctx context.Context, _ struct{}) error {
+		return nil
+	})
+
+	err := q.Schedule("scheduled-job", nil, nil)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `schedule must not be nil for "scheduled-job"`)
+	assert.Nil(t, q.GetScheduledJobs())
+}
+
 func TestQueue_Schedule_DuplicateReturnsError(t *testing.T) {
 	store := newMockStorage()
 	q := New(store)
@@ -1599,7 +1613,7 @@ func TestQueue_GetScheduledJobs_ReturnsCopy(t *testing.T) {
 		return nil
 	})
 
-	require.NoError(t, q.Schedule("job-a", nil, nil))
+	require.NoError(t, q.Schedule("job-a", nil, &mockSchedule{}))
 	scheduled := q.GetScheduledJobs()
 	require.Contains(t, scheduled, "job-a")
 

@@ -38,6 +38,9 @@ var _ core.PayloadCodec = (*Secretbox)(nil)
 // NewSecretbox creates a codec using primaryKey for new writes and fallbackKeys
 // only for decrypting older ciphertext after key rotation.
 func NewSecretbox(primaryKey [32]byte, fallbackKeys ...[32]byte) (*Secretbox, error) {
+	if primaryKey == [32]byte{} {
+		return nil, fmt.Errorf("jobs: secretbox primary key must not be all zero")
+	}
 	cp := make([][32]byte, len(fallbackKeys))
 	copy(cp, fallbackKeys)
 	return &Secretbox{primary: primaryKey, fallbacks: cp}, nil

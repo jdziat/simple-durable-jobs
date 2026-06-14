@@ -204,6 +204,28 @@ func TestQueue_EnqueueBatch_BuildErrorPersistsNothing(t *testing.T) {
 	assert.Empty(t, store.jobs)
 }
 
+func TestQueue_EnqueueBatch_ValidatesJobTypeName(t *testing.T) {
+	store := &batchCountingStorage{mockStorage: newMockStorage()}
+	q := New(store)
+
+	_, err := q.EnqueueBatch(context.Background(), []BatchEntry{
+		Batch("job.a", "a"),
+		Batch("has space", "b"),
+	})
+	require.Error(t, err)
+	assert.Zero(t, store.enqueueBatchCalls)
+	assert.Empty(t, store.jobs)
+
+	ids, err := q.EnqueueBatch(context.Background(), []BatchEntry{
+		Batch("job.valid", "ok"),
+	})
+	require.NoError(t, err)
+	require.Len(t, ids, 1)
+	assert.Equal(t, 1, store.enqueueBatchCalls)
+	require.Len(t, store.batchJobs, 1)
+	assert.Equal(t, "job.valid", store.batchJobs[0].Type)
+}
+
 func TestQueue_EnqueueBatch_DoesNotRequireRegisteredHandlers(t *testing.T) {
 	ctx := context.Background()
 	store := newQueueBatchTestStorage(t)
@@ -273,4 +295,33 @@ func TestQueue_EnqueueBatch_DuplicateUniqueKeyInOneBatchReturnsInputLengthAndIns
 	var count int64
 	require.NoError(t, store.DB().Model(&core.Job{}).Where("unique_key = ?", "same-key").Count(&count).Error)
 	assert.EqualValues(t, 1, count)
+}
+
+func TestQueue_EnqueueBatchTx_ValidatesJobTypeName(t *testing.T) {
+	ctx := context.Background()
+	store := newQueueBatchTestStorage(t)
+	q := New(store)
+
+	tx := store.DB().Begin()
+	require.NoError(t, tx.Error)
+	_, err := q.EnqueueBatchTx(ctx, tx, []BatchEntry{
+		Batch("batch.valid", "a"),
+		Batch("has space", "b"),
+	})
+	require.Error(t, err)
+	require.NoError(t, tx.Rollback().Error)
+
+	tx = store.DB().Begin()
+	require.NoError(t, tx.Error)
+	ids, err := q.EnqueueBatchTx(ctx, tx, []BatchEntry{
+		Batch("batch.tx.valid", "ok"),
+	})
+	require.NoError(t, err)
+	require.Len(t, ids, 1)
+	require.NoError(t, tx.Commit().Error)
+
+	job, err := store.GetJob(ctx, ids[0])
+	require.NoError(t, err)
+	require.NotNil(t, job)
+	assert.Equal(t, "batch.tx.valid", job.Type)
 }

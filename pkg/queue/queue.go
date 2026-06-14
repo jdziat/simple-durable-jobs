@@ -299,6 +299,11 @@ func (q *Queue) enqueueWithOptions(ctx context.Context, name string, args any, o
 }
 
 func (q *Queue) buildJob(name string, args any, options *Options) (*core.Job, error) {
+	// Validate job type name
+	if err := security.ValidateJobTypeName(name); err != nil {
+		return nil, err
+	}
+
 	// Validate queue name
 	if err := security.ValidateQueueName(options.Queue); err != nil {
 		return nil, err
@@ -504,6 +509,10 @@ func (q *Queue) Schedule(name string, args any, sched schedule.Schedule, opts ..
 	options := NewOptions()
 	for _, opt := range opts {
 		opt.Apply(options)
+	}
+
+	if sched == nil {
+		return fmt.Errorf("jobs: Schedule: schedule must not be nil for %q", name)
 	}
 
 	q.mu.Lock()

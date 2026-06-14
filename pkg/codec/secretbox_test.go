@@ -32,6 +32,20 @@ func TestSecretboxStrictRejectsLegacyPlaintext(t *testing.T) {
 	assert.True(t, errors.Is(err, ErrSecretboxLegacyPlaintext))
 }
 
+func TestNewSecretboxRejectsZeroPrimaryKey(t *testing.T) {
+	var key [32]byte
+
+	c, err := NewSecretbox(key)
+	require.Error(t, err)
+	assert.Nil(t, c)
+	assert.Contains(t, err.Error(), "primary key must not be all zero")
+
+	c, err = NewSecretboxStrict(key)
+	require.Error(t, err)
+	assert.Nil(t, c)
+	assert.Contains(t, err.Error(), "primary key must not be all zero")
+}
+
 func TestSecretboxRoundTrip(t *testing.T) {
 	var key [32]byte
 	key[0] = 1

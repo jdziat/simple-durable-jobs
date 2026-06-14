@@ -49,6 +49,29 @@ func TestQueue_EnqueueTx_DoesNotRequireRegisteredHandlerAndUsesMiddleware(t *tes
 	assert.EqualValues(t, 1, calls.Load())
 }
 
+func TestQueue_EnqueueTx_ValidatesJobTypeName(t *testing.T) {
+	ctx := context.Background()
+	store := newQueueBatchTestStorage(t)
+	q := New(store)
+
+	tx := store.DB().Begin()
+	require.NoError(t, tx.Error)
+	_, err := q.EnqueueTx(ctx, tx, "has space", "payload")
+	require.Error(t, err)
+	require.NoError(t, tx.Rollback().Error)
+
+	tx = store.DB().Begin()
+	require.NoError(t, tx.Error)
+	id, err := q.EnqueueTx(ctx, tx, "remote.valid", "payload")
+	require.NoError(t, err)
+	require.NoError(t, tx.Commit().Error)
+
+	job, err := store.GetJob(ctx, id)
+	require.NoError(t, err)
+	require.NotNil(t, job)
+	assert.Equal(t, "remote.valid", job.Type)
+}
+
 func TestQueue_EnqueueTx_UniqueDuplicateReturnsSentinel(t *testing.T) {
 	ctx := context.Background()
 	store := newQueueBatchTestStorage(t)
