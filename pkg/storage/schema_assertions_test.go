@@ -777,14 +777,13 @@ func mysqlIndexColumns(t *testing.T, db *gorm.DB, tableName, indexName string) [
 
 func buildSchemaDequeuePlanQuery(s *GormStorage, queues []string, limit int) *gorm.DB {
 	var candidates []*core.Job
-	eligExpr := s.dequeueEligibleExpr()
-	return s.db.Session(&gorm.Session{DryRun: true}).
-		Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).
-		Where("queue IN ?", queues).
-		Where("status = ?", core.StatusPending).
-		Where(eligExpr+" <= ?", s.nowExpr()).
-		Where("(locked_until IS NULL OR locked_until < ?)", s.nowExpr()).
-		Order("priority DESC, " + eligExpr + " ASC").
+	// Route through the REAL shared claimableCandidates predicate (incl. the
+	// paused-queue exclusion subquery) so the EXPLAIN plan tests guard the actual
+	// production dequeue SQL — a hand-rolled WHERE here would vacuously pass while
+	// the shipping predicate regressed (e.g. a correlated anti-join adding a Sort).
+	base := s.db.Session(&gorm.Session{DryRun: true}).
+		Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"})
+	return s.claimableCandidates(base, queues, s.nowExpr()).
 		Limit(limit).
 		Find(&candidates)
 }

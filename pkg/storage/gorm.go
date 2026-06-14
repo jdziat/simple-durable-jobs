@@ -538,31 +538,9 @@ func (s *GormStorage) Dequeue(ctx context.Context, queues []string, workerID str
 	lockDuration := time.Duration(s.lockDuration.Load())
 	lockUntil := now.Add(lockDuration)
 
-	// Get paused queues
-	pausedQueues, err := s.GetPausedQueues(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	// Filter out paused queues
-	activeQueues := make([]string, 0, len(queues))
-	pausedSet := make(map[string]bool)
-	for _, q := range pausedQueues {
-		pausedSet[q] = true
-	}
-	for _, q := range queues {
-		if !pausedSet[q] {
-			activeQueues = append(activeQueues, q)
-		}
-	}
-
-	if len(activeQueues) == 0 {
-		return nil, nil // All queues are paused
-	}
-
 	// SQLite uses optimistic locking - no row-level locks available
 	if s.isSQLite {
-		return s.dequeueSQLite(ctx, activeQueues, workerID, now, lockUntil)
+		return s.dequeueSQLite(ctx, queues, workerID, now, lockUntil)
 	}
 
 	// PostgreSQL/MySQL: Use FOR UPDATE SKIP LOCKED for proper distributed locking
@@ -585,12 +563,12 @@ func (s *GormStorage) Dequeue(ctx context.Context, queues []string, workerID str
 	nowExpr := s.nowExpr()
 	lockUntilExpr := s.offsetExpr(lockDuration)
 	silentDB := s.db.Session(&gorm.Session{Logger: s.db.Logger.LogMode(logger.Silent)})
-	err = silentDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err := silentDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		// FOR UPDATE SKIP LOCKED ensures:
 		// 1. The selected row is locked for this transaction
 		// 2. Other workers skip locked rows instead of waiting
 		// This prevents duplicate job execution in distributed scenarios
-		result := s.claimableCandidates(s.lockForUpdate(tx, true), activeQueues, nowExpr).First(&job)
+		result := s.claimableCandidates(s.lockForUpdate(tx, true), queues, nowExpr).First(&job)
 
 		if result.Error != nil {
 			if errors.Is(result.Error, gorm.ErrRecordNotFound) {

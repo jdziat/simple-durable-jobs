@@ -89,6 +89,15 @@ func (s *GormStorage) claimableCandidates(q *gorm.DB, queues []string, now any) 
 	eligExpr := s.dequeueEligibleExpr()
 	return q.
 		Where("queue IN ?", queues).
+		// Exclude paused queues in-SQL (always fresh, no extra round-trip). Use an
+		// UNCORRELATED subquery, NOT a correlated `NOT EXISTS (... qs.queue =
+		// jobs.queue ...)`: a correlated anti-join sits between the index scan and
+		// the ORDER BY, defeating idx_jobs_dequeue_eligible's ordering and forcing a
+		// Sort/filesort on the dequeue hot path (PG abandons the index on a large
+		// backlog). The uncorrelated form evaluates the tiny paused set once and
+		// preserves the ordered, LIMIT-bounded index scan. queue_states.queue is
+		// NOT NULL (PK), so the NOT IN never hits the NULL-elimination trap.
+		Where("queue NOT IN (SELECT queue FROM queue_states WHERE paused = ?)", true).
 		Where("status = ?", core.StatusPending).
 		Where(eligExpr+" <= ?", now).
 		Where("(locked_until IS NULL OR locked_until < ?)", now).
