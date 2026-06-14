@@ -261,6 +261,11 @@ var schemaMigrations = []schemaMigration{
 		Name:    "signal_fifo_index_drop_root_index_mysql_precision_collation",
 		Up:      migrateV25PostMergeSchema,
 	},
+	{
+		Version: 26,
+		Name:    "int_width_rightsizing",
+		Up:      migrateIntWidthRightsizing,
+	},
 }
 
 // applyPendingMigrations runs every migration whose version is absent from the
@@ -1256,6 +1261,76 @@ func migrateV25PostMergeSchema(ctx context.Context, db *gorm.DB, dialect string)
 		if err := db.WithContext(ctx).Exec("DROP INDEX IF EXISTS idx_jobs_root_job_id").Error; err != nil {
 			return fmt.Errorf("drop idx_jobs_root_job_id: %w", err)
 		}
+		return nil
+	}
+}
+
+func migrateIntWidthRightsizing(ctx context.Context, db *gorm.DB, dialect string) error {
+	type columnSpec struct {
+		table       string
+		column      string
+		mysqlClause string
+	}
+
+	columns := []columnSpec{
+		{table: "jobs", column: "priority", mysqlClause: "int NOT NULL DEFAULT 0"},
+		{table: "jobs", column: "attempt", mysqlClause: "int NOT NULL DEFAULT 0"},
+		{table: "jobs", column: "max_retries", mysqlClause: "int NOT NULL DEFAULT 3"},
+		{table: "jobs", column: "determinism", mysqlClause: "int NOT NULL DEFAULT 0"},
+		{table: "jobs", column: "fan_out_index", mysqlClause: "int DEFAULT 0"},
+		{table: "fan_outs", column: "total_count", mysqlClause: "int NOT NULL"},
+		{table: "fan_outs", column: "completed_count", mysqlClause: "int DEFAULT 0"},
+		{table: "fan_outs", column: "failed_count", mysqlClause: "int DEFAULT 0"},
+		{table: "fan_outs", column: "cancelled_count", mysqlClause: "int DEFAULT 0"},
+	}
+
+	switch dialect {
+	case dialectPostgres:
+		for _, col := range columns {
+			var dataType string
+			if err := db.WithContext(ctx).Raw(`
+				SELECT data_type
+				FROM information_schema.COLUMNS
+				WHERE table_schema = CURRENT_SCHEMA()
+				  AND table_name = ?
+				  AND column_name = ?
+			`, col.table, col.column).Scan(&dataType).Error; err != nil {
+				return fmt.Errorf("read %s.%s type: %w", col.table, col.column, err)
+			}
+			if dataType == "integer" {
+				continue
+			}
+			if err := db.WithContext(ctx).Exec(
+				fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s TYPE integer", col.table, col.column),
+			).Error; err != nil {
+				return fmt.Errorf("alter %s.%s type: %w", col.table, col.column, err)
+			}
+		}
+		return nil
+	case dialectMySQL:
+		for _, col := range columns {
+			var dataType string
+			if err := db.WithContext(ctx).Raw(`
+				SELECT DATA_TYPE
+				FROM information_schema.COLUMNS
+				WHERE TABLE_SCHEMA = DATABASE()
+				  AND TABLE_NAME = ?
+				  AND COLUMN_NAME = ?
+			`, col.table, col.column).Scan(&dataType).Error; err != nil {
+				return fmt.Errorf("read %s.%s type: %w", col.table, col.column, err)
+			}
+			if strings.EqualFold(dataType, "int") {
+				continue
+			}
+			if err := db.WithContext(ctx).Exec(
+				fmt.Sprintf("ALTER TABLE %s MODIFY %s %s", col.table, col.column, col.mysqlClause),
+			).Error; err != nil && !isBenignDDLError(err) {
+				return fmt.Errorf("modify %s.%s type: %w", col.table, col.column, err)
+			}
+		}
+		return nil
+	default:
+		// SQLite uses INTEGER affinity; declared integer width is cosmetic.
 		return nil
 	}
 }

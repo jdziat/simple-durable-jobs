@@ -132,6 +132,54 @@ func TestMigrationsApplyAndRecordAllVersions(t *testing.T) {
 	require.True(t, s.DB().Migrator().HasIndex(&core.UniqueLock{}, "idx_unique_locks_expires_at"), "unique_locks expiry index should exist")
 }
 
+func TestIntWidthRightsizedColumnsRoundTripAfterMigrate(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+	s := NewGormStorage(db)
+	require.NoError(t, s.Migrate(ctx))
+
+	job := &core.Job{
+		Type:        "int-width.job",
+		Queue:       "default",
+		Priority:    42,
+		Attempt:     7,
+		MaxRetries:  11,
+		Determinism: 2,
+		FanOutIndex: 123,
+		Timeout:     10 * time.Second,
+	}
+	require.NoError(t, s.Enqueue(ctx, job))
+
+	gotJob, err := s.GetJob(ctx, job.ID)
+	require.NoError(t, err)
+	require.NotNil(t, gotJob)
+	require.Equal(t, 42, gotJob.Priority)
+	require.Equal(t, 7, gotJob.Attempt)
+	require.Equal(t, 11, gotJob.MaxRetries)
+	require.Equal(t, 2, gotJob.Determinism)
+	require.Equal(t, 123, gotJob.FanOutIndex)
+	require.Equal(t, 10*time.Second, gotJob.Timeout)
+
+	fanOutID := core.NewID()
+	fanOut := &core.FanOut{
+		ID:             fanOutID,
+		ParentJobID:    job.ID,
+		TotalCount:     25,
+		CompletedCount: 12,
+		FailedCount:    3,
+		CancelledCount: 4,
+		Status:         core.FanOutPending,
+	}
+	require.NoError(t, s.CreateFanOut(ctx, fanOut))
+
+	var gotFanOut core.FanOut
+	require.NoError(t, s.DB().WithContext(ctx).First(&gotFanOut, "id = ?", fanOutID).Error)
+	require.Equal(t, 25, gotFanOut.TotalCount)
+	require.Equal(t, 12, gotFanOut.CompletedCount)
+	require.Equal(t, 3, gotFanOut.FailedCount)
+	require.Equal(t, 4, gotFanOut.CancelledCount)
+}
+
 func TestMigrateSecondRunDoesNotUpdateJobs(t *testing.T) {
 	ctx := context.Background()
 	db := openTestDB(t)
