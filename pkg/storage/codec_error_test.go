@@ -9,14 +9,14 @@ import (
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
 
-	payloadcodec "github.com/jdziat/simple-durable-jobs/v2/pkg/codec"
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/security"
+	payloadcodec "github.com/jdziat/simple-durable-jobs/v3/pkg/codec"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/security"
 )
 
 // rawJobErrorText reads last_error / dead_letter_reason directly via SQL as a
 // string, bypassing the codec funnel, so tests can assert on the at-rest bytes.
-func rawJobErrorText(t *testing.T, db *gorm.DB, jobID, column string) string {
+func rawJobErrorText(t *testing.T, db *gorm.DB, jobID core.UUID, column string) string {
 	t.Helper()
 	query := ""
 	switch column {
@@ -34,7 +34,7 @@ func rawJobErrorText(t *testing.T, db *gorm.DB, jobID, column string) string {
 
 // failTerminally enqueues a MaxRetries:1 job, dequeues it, and Fails it once so
 // the single attempt exhausts retries → terminal dead-letter write.
-func failTerminally(t *testing.T, ctx context.Context, s *GormStorage, errMsg string) string {
+func failTerminally(t *testing.T, ctx context.Context, s *GormStorage, errMsg string) core.UUID {
 	t.Helper()
 	job := &core.Job{Type: "codec.err", Queue: "default", MaxRetries: 1}
 	require.NoError(t, s.Enqueue(ctx, job))

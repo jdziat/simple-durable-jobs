@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/core"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -402,7 +402,7 @@ type getJobErrStorage struct {
 	*mockStorage
 }
 
-func (g *getJobErrStorage) GetJob(ctx context.Context, jobID string) (*core.Job, error) {
+func (g *getJobErrStorage) GetJob(ctx context.Context, jobID core.UUID) (*core.Job, error) {
 	return nil, errors.New("get failed")
 }
 
@@ -429,7 +429,7 @@ type unpauseJobErrStorage struct {
 	*mockStorage
 }
 
-func (u *unpauseJobErrStorage) UnpauseJob(ctx context.Context, jobID string) error {
+func (u *unpauseJobErrStorage) UnpauseJob(ctx context.Context, jobID core.UUID) error {
 	return errors.New("unpause failed")
 }
 
@@ -482,7 +482,7 @@ type cancelSubJobErrStorage struct {
 	*mockStorage
 }
 
-func (c *cancelSubJobErrStorage) CancelSubJob(ctx context.Context, jobID string) (*core.FanOut, error) {
+func (c *cancelSubJobErrStorage) CancelSubJob(ctx context.Context, jobID core.UUID) (*core.FanOut, error) {
 	return nil, errors.New("cancel sub-job failed")
 }
 
@@ -501,11 +501,11 @@ type fanOutUpdateErrStorage struct {
 	fo *core.FanOut
 }
 
-func (f *fanOutUpdateErrStorage) CancelSubJob(ctx context.Context, jobID string) (*core.FanOut, error) {
+func (f *fanOutUpdateErrStorage) CancelSubJob(ctx context.Context, jobID core.UUID) (*core.FanOut, error) {
 	return f.fo, nil
 }
 
-func (f *fanOutUpdateErrStorage) UpdateFanOutStatus(ctx context.Context, fanOutID string, status core.FanOutStatus) (bool, error) {
+func (f *fanOutUpdateErrStorage) UpdateFanOutStatus(ctx context.Context, fanOutID core.UUID, status core.FanOutStatus) (bool, error) {
 	return false, errors.New("update status failed")
 }
 
@@ -532,15 +532,15 @@ type fanOutResumeErrStorage struct {
 	fo *core.FanOut
 }
 
-func (f *fanOutResumeErrStorage) CancelSubJob(ctx context.Context, jobID string) (*core.FanOut, error) {
+func (f *fanOutResumeErrStorage) CancelSubJob(ctx context.Context, jobID core.UUID) (*core.FanOut, error) {
 	return f.fo, nil
 }
 
-func (f *fanOutResumeErrStorage) UpdateFanOutStatus(ctx context.Context, fanOutID string, status core.FanOutStatus) (bool, error) {
+func (f *fanOutResumeErrStorage) UpdateFanOutStatus(ctx context.Context, fanOutID core.UUID, status core.FanOutStatus) (bool, error) {
 	return true, nil
 }
 
-func (f *fanOutResumeErrStorage) ResumeJob(ctx context.Context, jobID string) (bool, error) {
+func (f *fanOutResumeErrStorage) ResumeJob(ctx context.Context, jobID core.UUID) (bool, error) {
 	return false, errors.New("resume parent failed")
 }
 

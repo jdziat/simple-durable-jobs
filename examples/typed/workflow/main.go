@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"time"
 
-	jobs "github.com/jdziat/simple-durable-jobs/v2"
+	jobs "github.com/jdziat/simple-durable-jobs/v3"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
@@ -33,11 +33,11 @@ func main() {
 	}
 	q := jobs.New(store)
 
-	charge := jobs.Define(q, "typedCharge", func(_ context.Context, a paymentArgs) (paymentResult, error) {
+	charge := jobs.Define[paymentArgs, paymentResult](q, "typedCharge", func(_ context.Context, a paymentArgs) (paymentResult, error) {
 		return paymentResult{ReceiptID: "receipt-" + a.OrderID}, nil
 	})
 	results := make(chan paymentResult, 1)
-	processOrder := jobs.Define(q, "typedProcessOrder", func(ctx context.Context, a paymentArgs) (paymentResult, error) {
+	processOrder := jobs.Define[paymentArgs, paymentResult](q, "typedProcessOrder", func(ctx context.Context, a paymentArgs) (paymentResult, error) {
 		receipt, err := charge.Call(ctx, a)
 		if err != nil {
 			return paymentResult{}, err

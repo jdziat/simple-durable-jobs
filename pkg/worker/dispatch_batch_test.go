@@ -9,8 +9,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/queue"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/queue"
 )
 
 type batchMockStorage struct {
@@ -53,10 +53,10 @@ type releaseStateStorage struct {
 	jobs map[string]*core.Job
 }
 
-func (s *releaseStateStorage) Release(_ context.Context, jobID, workerID string) error {
+func (s *releaseStateStorage) Release(_ context.Context, jobID core.UUID, workerID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	job := s.jobs[jobID]
+	job := s.jobs[string(jobID)]
 	if job == nil {
 		return core.ErrJobNotOwned
 	}
@@ -157,7 +157,7 @@ func TestWorkerBatchDequeueFallsBackWhenStorageLacksCapability(t *testing.T) {
 	jobs, err := w.dequeueAvailableJobs(context.Background(), []string{"default"}, 4)
 	require.NoError(t, err)
 	require.Len(t, jobs, 1)
-	assert.Equal(t, "job-1", jobs[0].ID)
+	assert.Equal(t, core.UUID("job-1"), jobs[0].ID)
 }
 
 func TestWorkerBatchDispatchReleasesUndeliveredJobsOnShutdown(t *testing.T) {
@@ -201,7 +201,7 @@ func TestWorkerBatchDispatchReleasesUndeliveredJobsOnShutdown(t *testing.T) {
 	<-cancelled
 
 	delivered := <-jobsChan
-	assert.Equal(t, "job-1", delivered.ID)
+	assert.Equal(t, core.UUID("job-1"), delivered.ID)
 	assert.Equal(t, core.StatusRunning, jobs[0].Status)
 	assert.Equal(t, "worker-1", jobs[0].LockedBy)
 
@@ -212,7 +212,7 @@ func TestWorkerBatchDispatchReleasesUndeliveredJobsOnShutdown(t *testing.T) {
 		assert.Nil(t, job.StartedAt)
 		assert.Equal(t, 0, job.Attempt)
 	}
-	assert.ElementsMatch(t, []string{"job-2", "job-3"}, store.getReleasedJobIDs())
+	assert.ElementsMatch(t, []core.UUID{core.UUID("job-2"), core.UUID("job-3")}, store.getReleasedJobIDs())
 	assert.Equal(t, 1, int(w.queueRunning["default"].Load()))
 }
 

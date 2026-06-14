@@ -1,31 +1,36 @@
+import { v5 as uuidv5 } from 'uuid'
+
+const e2eId = (name: string) => uuidv5(`sdj-e2e/${name}`, uuidv5.URL)
+
 // Job IDs matching the Go test server seed data
 export const JOBS = {
-  PENDING_1: 'e2e-pending-001',
-  PENDING_2: 'e2e-pending-002',
-  PENDING_3: 'e2e-pending-003',
-  PENDING_4: 'e2e-pending-004',
-  PENDING_5: 'e2e-pending-005',
-  RUNNING_1: 'e2e-running-001',
-  RUNNING_2: 'e2e-running-002',
-  RUNNING_3: 'e2e-running-003',
-  COMPLETED_1: 'e2e-completed-001',
-  COMPLETED_2: 'e2e-completed-002',
-  FAILED_1: 'e2e-failed-001',
-  FAILED_2: 'e2e-failed-002',
+  PENDING_1: e2eId('e2e-pending-001'),
+  PENDING_2: e2eId('e2e-pending-002'),
+  PENDING_3: e2eId('e2e-pending-003'),
+  PENDING_4: e2eId('e2e-pending-004'),
+  PENDING_5: e2eId('e2e-pending-005'),
+  RUNNING_1: e2eId('e2e-running-001'),
+  RUNNING_2: e2eId('e2e-running-002'),
+  RUNNING_3: e2eId('e2e-running-003'),
+  COMPLETED_1: e2eId('e2e-completed-001'),
+  COMPLETED_2: e2eId('e2e-completed-002'),
+  FAILED_1: e2eId('e2e-failed-001'),
+  FAILED_2: e2eId('e2e-failed-002'),
   // e2e-failed-003 is the dead-lettered fixture. It is deliberately a job no
   // other test navigates to or mutates, so FAILED_1/FAILED_2 stay plain failed
   // (their status/retry assertions don't collide with the Dead-lettered badge)
   // and the DLQ assertions stay stable regardless of test order.
-  DEADLETTERED_1: 'e2e-failed-003',
-  DEADLETTERED_REQUEUE: 'e2e-failed-006',
-  DEADLETTERED_ACME_2: 'e2e-failed-007',
-  PAUSED_1: 'e2e-paused-001',
-  PAUSED_2: 'e2e-paused-002',
-  CANCELLED_1: 'e2e-cancelled-001',
-  WORKFLOW_ROOT: 'e2e-workflow-root',
-  WORKFLOW_CHILD_1: 'e2e-workflow-child-001',
-  WORKFLOW_CHILD_2: 'e2e-workflow-child-002',
-  WORKFLOW_CHILD_3: 'e2e-workflow-child-003',
+  DEADLETTERED_1: e2eId('e2e-failed-003'),
+  FAILED_4: e2eId('e2e-failed-004'),
+  DEADLETTERED_REQUEUE: e2eId('e2e-failed-006'),
+  DEADLETTERED_ACME_2: e2eId('e2e-failed-007'),
+  PAUSED_1: e2eId('e2e-paused-001'),
+  PAUSED_2: e2eId('e2e-paused-002'),
+  CANCELLED_1: e2eId('e2e-cancelled-001'),
+  WORKFLOW_ROOT: e2eId('e2e-workflow-root'),
+  WORKFLOW_CHILD_1: e2eId('e2e-workflow-child-001'),
+  WORKFLOW_CHILD_2: e2eId('e2e-workflow-child-002'),
+  WORKFLOW_CHILD_3: e2eId('e2e-workflow-child-003'),
 } as const
 
 export const QUEUES = ['default', 'emails'] as const

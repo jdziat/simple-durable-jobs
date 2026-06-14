@@ -9,8 +9,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/queue"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/queue"
 )
 
 type capMockStorage struct {
@@ -23,7 +23,7 @@ type capMockStorage struct {
 func newCapMockStorage(jobs []*core.Job) *capMockStorage {
 	byID := make(map[string]*core.Job, len(jobs))
 	for _, job := range jobs {
-		byID[job.ID] = job
+		byID[string(job.ID)] = job
 	}
 	return &capMockStorage{
 		releaseStateStorage: &releaseStateStorage{
@@ -34,37 +34,37 @@ func newCapMockStorage(jobs []*core.Job) *capMockStorage {
 	}
 }
 
-func (s *capMockStorage) TryAcquireConcurrencySlot(_ context.Context, slotName, jobID, _ string, limit int, _ time.Duration) (bool, error) {
+func (s *capMockStorage) TryAcquireConcurrencySlot(_ context.Context, slotName string, jobID core.UUID, _ string, limit int, _ time.Duration) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.slots[slotName] == nil {
 		s.slots[slotName] = map[string]bool{}
 	}
-	if s.slots[slotName][jobID] {
+	if s.slots[slotName][string(jobID)] {
 		return true, nil
 	}
 	if len(s.slots[slotName]) >= limit {
 		return false, nil
 	}
-	s.slots[slotName][jobID] = true
+	s.slots[slotName][string(jobID)] = true
 	return true, nil
 }
 
-func (s *capMockStorage) ReleaseConcurrencySlot(_ context.Context, slotName, jobID string) error {
+func (s *capMockStorage) ReleaseConcurrencySlot(_ context.Context, slotName string, jobID core.UUID) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	delete(s.slots[slotName], jobID)
+	delete(s.slots[slotName], string(jobID))
 	return nil
 }
 
 // RenewConcurrencySlot is renew-only: it refreshes an already-held slot and
 // never creates one, mirroring GormStorage. It records each (slotName, jobID)
 // renewal so a test can assert renewConcurrencySlots drove it.
-func (s *capMockStorage) RenewConcurrencySlot(_ context.Context, slotName, jobID string, _ time.Duration) (bool, error) {
+func (s *capMockStorage) RenewConcurrencySlot(_ context.Context, slotName string, jobID core.UUID, _ time.Duration) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.renewed = append(s.renewed, slotName+":"+jobID)
-	if s.slots[slotName] != nil && s.slots[slotName][jobID] {
+	s.renewed = append(s.renewed, slotName+":"+string(jobID))
+	if s.slots[slotName] != nil && s.slots[slotName][string(jobID)] {
 		return true, nil
 	}
 	return false, nil
@@ -85,7 +85,7 @@ func (s *capMockStorage) slotCount(slotName string) int {
 func runningJob(id, customer string) *core.Job {
 	now := time.Now()
 	return &core.Job{
-		ID:          id,
+		ID:          core.UUID(id),
 		Type:        "work",
 		Queue:       "default",
 		Status:      core.StatusRunning,
@@ -119,10 +119,10 @@ func TestWorkerConcurrencyCapPerKeyAdmission(t *testing.T) {
 
 	delivered := make([]string, 0, len(jobsChan))
 	for len(jobsChan) > 0 {
-		delivered = append(delivered, (<-jobsChan).ID)
+		delivered = append(delivered, string((<-jobsChan).ID))
 	}
 	assert.ElementsMatch(t, []string{"job-a1", "job-a2", "job-b1"}, delivered)
-	assert.ElementsMatch(t, []string{"job-a3"}, store.getReleasedJobIDs())
+	assert.ElementsMatch(t, []core.UUID{core.UUID("job-a3")}, store.getReleasedJobIDs())
 	assert.Equal(t, 2, store.slotCount("customer:a"))
 	assert.Equal(t, 1, store.slotCount("customer:b"))
 

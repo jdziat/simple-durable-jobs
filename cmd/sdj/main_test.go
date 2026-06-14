@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	jobs "github.com/jdziat/simple-durable-jobs/v2"
+	jobs "github.com/jdziat/simple-durable-jobs/v3"
 )
 
 func TestRunMigrateAndQueuesSQLite(t *testing.T) {
@@ -22,7 +22,7 @@ func TestRunMigrateAndQueuesSQLite(t *testing.T) {
 			name: "pending jobs by queue",
 			seed: []*jobs.Job{
 				{
-					ID:         "job-email-1",
+					ID:         "00000000-0000-7000-8000-000000000101",
 					Type:       "SendEmail",
 					Queue:      "email",
 					Status:     jobs.StatusPending,
@@ -32,7 +32,7 @@ func TestRunMigrateAndQueuesSQLite(t *testing.T) {
 					CreatedAt:  time.Now().Add(-2 * time.Hour),
 				},
 				{
-					ID:         "job-email-2",
+					ID:         "00000000-0000-7000-8000-000000000102",
 					Type:       "SendEmail",
 					Queue:      "email",
 					Status:     jobs.StatusPending,
@@ -138,9 +138,9 @@ func TestRunDLQListTenantAndMetadataSQLite(t *testing.T) {
 	}
 
 	store := openSQLiteStoreForTest(t, dbPath)
-	seedCLIDeadLetterJob(t, store, "dlq-acme-prod", "emails", "tenant-a", jobs.MetadataMap{"env": "prod"})
-	seedCLIDeadLetterJob(t, store, "dlq-acme-dev", "emails", "tenant-a", jobs.MetadataMap{"env": "dev"})
-	seedCLIDeadLetterJob(t, store, "dlq-globex-prod", "emails", "tenant-b", jobs.MetadataMap{"env": "prod"})
+	seedCLIDeadLetterJob(t, store, "00000000-0000-7000-8000-000000000201", "emails", "tenant-a", jobs.MetadataMap{"env": "prod"})
+	seedCLIDeadLetterJob(t, store, "00000000-0000-7000-8000-000000000202", "emails", "tenant-a", jobs.MetadataMap{"env": "dev"})
+	seedCLIDeadLetterJob(t, store, "00000000-0000-7000-8000-000000000203", "emails", "tenant-b", jobs.MetadataMap{"env": "prod"})
 
 	stdout.Reset()
 	stderr.Reset()
@@ -149,10 +149,10 @@ func TestRunDLQListTenantAndMetadataSQLite(t *testing.T) {
 		t.Fatalf("dlq list exit code = %d, stderr = %q", code, stderr.String())
 	}
 	got := stdout.String()
-	if !strings.Contains(got, "dlq-acme-prod") {
+	if !strings.Contains(got, "00000000-0000-7000-8000-000000000201") {
 		t.Fatalf("stdout = %q, want filtered job", got)
 	}
-	for _, notWant := range []string{"dlq-acme-dev", "dlq-globex-prod"} {
+	for _, notWant := range []string{"00000000-0000-7000-8000-000000000202", "00000000-0000-7000-8000-000000000203"} {
 		if strings.Contains(got, notWant) {
 			t.Fatalf("stdout = %q, did not want %q", got, notWant)
 		}
@@ -168,9 +168,9 @@ func TestRunDLQRequeueBulkSQLite(t *testing.T) {
 	}
 
 	store := openSQLiteStoreForTest(t, dbPath)
-	seedCLIDeadLetterJob(t, store, "dlq-acme-1", "emails", "tenant-a", nil)
-	seedCLIDeadLetterJob(t, store, "dlq-acme-2", "emails", "tenant-a", nil)
-	seedCLIDeadLetterJob(t, store, "dlq-globex-1", "emails", "tenant-b", nil)
+	seedCLIDeadLetterJob(t, store, "00000000-0000-7000-8000-000000000211", "emails", "tenant-a", nil)
+	seedCLIDeadLetterJob(t, store, "00000000-0000-7000-8000-000000000212", "emails", "tenant-a", nil)
+	seedCLIDeadLetterJob(t, store, "00000000-0000-7000-8000-000000000213", "emails", "tenant-b", nil)
 
 	stdout.Reset()
 	stderr.Reset()
@@ -186,7 +186,7 @@ func TestRunDLQRequeueBulkSQLite(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list dead-lettered: %v", err)
 	}
-	if len(dead) != 1 || dead[0].ID != "dlq-globex-1" {
+	if len(dead) != 1 || dead[0].ID != "00000000-0000-7000-8000-000000000213" {
 		t.Fatalf("remaining dead-lettered = %v, want only dlq-globex-1", dead)
 	}
 }
@@ -315,7 +315,7 @@ func seedCLIDeadLetterJob(t *testing.T, store *jobs.GormStorage, id, queue, tena
 	t.Helper()
 	now := time.Now()
 	err := store.DB().Create(&jobs.Job{
-		ID:               id,
+		ID:               jobs.UUID(id),
 		Type:             "send-email",
 		Queue:            queue,
 		Tenant:           tenant,

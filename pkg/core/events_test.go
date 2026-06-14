@@ -86,7 +86,7 @@ func TestJobPaused_EventMarker(t *testing.T) {
 	e.eventMarker()
 
 	var _ Event = e
-	assert.Equal(t, "jp", e.Job.ID)
+	assert.Equal(t, UUID("jp"), e.Job.ID)
 	assert.Equal(t, PauseModeGraceful, e.Mode)
 }
 
@@ -98,7 +98,7 @@ func TestJobResumed_EventMarker(t *testing.T) {
 	e.eventMarker()
 
 	var _ Event = e
-	assert.Equal(t, "jres", e.Job.ID)
+	assert.Equal(t, UUID("jres"), e.Job.ID)
 }
 
 func TestJobResumedBySignal_EventMarker(t *testing.T) {
@@ -110,7 +110,7 @@ func TestJobResumedBySignal_EventMarker(t *testing.T) {
 	e.eventMarker()
 
 	var _ Event = e
-	assert.Equal(t, "jres-sig", e.JobID)
+	assert.Equal(t, UUID("jres-sig"), e.JobID)
 	assert.Equal(t, "ctx", e.SignalName)
 }
 
@@ -125,7 +125,7 @@ func TestJobReclaimed_EventMarker(t *testing.T) {
 
 	var _ Event = e
 	assert.NotNil(t, e)
-	assert.Equal(t, "jr", e.JobID)
+	assert.Equal(t, UUID("jr"), e.JobID)
 	assert.Equal(t, "w1", e.WorkerID)
 	assert.Equal(t, ReclaimReasonStaleLock, e.Reason)
 }
@@ -186,7 +186,7 @@ func TestCustomEvent_EventMarker(t *testing.T) {
 	e.eventMarker()
 
 	var _ Event = e
-	assert.Equal(t, "job-42", e.JobID)
+	assert.Equal(t, UUID("job-42"), e.JobID)
 	assert.Equal(t, "progress", e.Kind)
 	assert.Equal(t, 50, e.Data["pct"])
 }
@@ -282,7 +282,7 @@ func TestJobPausedEvent(t *testing.T) {
 
 	// Verify it implements Event interface
 	var _ Event = e
-	assert.Equal(t, "test-123", e.Job.ID)
+	assert.Equal(t, UUID("test-123"), e.Job.ID)
 	assert.Equal(t, PauseModeGraceful, e.Mode)
 }
 
@@ -294,7 +294,7 @@ func TestJobResumedEvent(t *testing.T) {
 	}
 
 	var _ Event = e
-	assert.Equal(t, "test-123", e.Job.ID)
+	assert.Equal(t, UUID("test-123"), e.Job.ID)
 }
 
 func TestQueuePausedEvent(t *testing.T) {

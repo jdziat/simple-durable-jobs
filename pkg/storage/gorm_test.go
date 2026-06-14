@@ -3,7 +3,6 @@ package storage
 import (
 	"context"
 	"errors"
-	"fmt"
 	"os"
 	"strings"
 	"sync"
@@ -16,7 +15,7 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/core"
 )
 
 // newTestStorage creates a fresh storage instance for each test.
@@ -40,7 +39,7 @@ func newTestJob(queue, jobType string) *core.Job {
 	}
 }
 
-func seedTestJob(t *testing.T, ctx context.Context, s *GormStorage, id string, status core.JobStatus) {
+func seedTestJob(t *testing.T, ctx context.Context, s *GormStorage, id core.UUID, status core.JobStatus) {
 	t.Helper()
 	require.NoError(t, s.db.WithContext(ctx).
 		Where("id = ?", id).
@@ -204,11 +203,11 @@ func TestEnqueue_PreservesExistingID(t *testing.T) {
 	s := newTestStorage(t)
 
 	job := &core.Job{
-		ID:   "my-custom-id",
+		ID:   testUUID("my-custom-id"),
 		Type: "task.run",
 	}
 	require.NoError(t, s.Enqueue(ctx, job))
-	assert.Equal(t, "my-custom-id", job.ID)
+	assert.Equal(t, testUUID("my-custom-id"), job.ID)
 }
 
 func TestEnqueue_PreservesExistingStatus(t *testing.T) {
@@ -509,16 +508,16 @@ func TestGetJob_RetrievesById(t *testing.T) {
 	s := newTestStorage(t)
 
 	job := &core.Job{
-		ID:    "test-job-id",
+		ID:    core.NewID(),
 		Type:  "email.send",
 		Queue: "default",
 	}
 	require.NoError(t, s.Enqueue(ctx, job))
 
-	found, err := s.GetJob(ctx, "test-job-id")
+	found, err := s.GetJob(ctx, job.ID)
 	require.NoError(t, err)
 	require.NotNil(t, found)
-	assert.Equal(t, "test-job-id", found.ID)
+	assert.Equal(t, job.ID, found.ID)
 	assert.Equal(t, "email.send", found.Type)
 }
 
@@ -526,7 +525,7 @@ func TestGetJob_ReturnsNilForMissingJob(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStorage(t)
 
-	found, err := s.GetJob(ctx, "does-not-exist")
+	found, err := s.GetJob(ctx, core.NewID())
 	require.NoError(t, err)
 	assert.Nil(t, found)
 }
@@ -781,11 +780,11 @@ func TestReleaseStaleLocks_ReapedJobIsOrphanedAndDequeuable(t *testing.T) {
 
 	released, err := s.ReleaseStaleLocks(ctx, time.Hour)
 	require.NoError(t, err)
-	require.Equal(t, []string{got.ID}, released)
+	require.Equal(t, []core.UUID{got.ID}, released)
 
-	orphaned, err := s.FindOrphanedJobs(ctx, []string{got.ID}, "worker-1")
+	orphaned, err := s.FindOrphanedJobs(ctx, []core.UUID{got.ID}, "worker-1")
 	require.NoError(t, err)
-	require.Equal(t, []string{got.ID}, orphaned)
+	require.Equal(t, []core.UUID{got.ID}, orphaned)
 
 	reacquired, err := s.Dequeue(ctx, []string{"default"}, "worker-2")
 	require.NoError(t, err)
@@ -867,7 +866,7 @@ func TestReleaseStaleLocks_ReclaimsByLastContactNotStackedLease(t *testing.T) {
 
 	released, err := s.ReleaseStaleLocks(ctx, time.Hour)
 	require.NoError(t, err)
-	require.Equal(t, []string{got.ID}, released, "stale-by-last-contact job must be reclaimed despite a future lease")
+	require.Equal(t, []core.UUID{got.ID}, released, "stale-by-last-contact job must be reclaimed despite a future lease")
 
 	row, err := s.GetJob(ctx, got.ID)
 	require.NoError(t, err)
@@ -928,7 +927,7 @@ func TestReleaseStaleLocks_NullHeartbeatFallsBackToStartedAt(t *testing.T) {
 
 	released, err := s.ReleaseStaleLocks(ctx, time.Hour)
 	require.NoError(t, err)
-	require.Equal(t, []string{got.ID}, released, "should reclaim via started_at fallback")
+	require.Equal(t, []core.UUID{got.ID}, released, "should reclaim via started_at fallback")
 
 	row, err := s.GetJob(ctx, got.ID)
 	require.NoError(t, err)
@@ -956,7 +955,7 @@ func TestReleaseStaleLocks_NullHeartbeatAndStartedFallsBackToLockedUntil(t *test
 
 	released, err := s.ReleaseStaleLocks(ctx, time.Hour)
 	require.NoError(t, err)
-	require.Equal(t, []string{job.ID}, released, "should reclaim via locked_until last-resort fallback")
+	require.Equal(t, []core.UUID{job.ID}, released, "should reclaim via locked_until last-resort fallback")
 
 	row, err := s.GetJob(ctx, job.ID)
 	require.NoError(t, err)
@@ -1012,13 +1011,13 @@ func TestSaveCheckpoint_PreservesExistingID(t *testing.T) {
 	require.NoError(t, s.Enqueue(ctx, job))
 
 	cp := &core.Checkpoint{
-		ID:        "custom-cp-id",
+		ID:        testUUID("custom-cp-id"),
 		JobID:     job.ID,
 		CallIndex: 0,
 		CallType:  "http.get",
 	}
 	require.NoError(t, s.SaveCheckpoint(ctx, cp))
-	assert.Equal(t, "custom-cp-id", cp.ID)
+	assert.Equal(t, testUUID("custom-cp-id"), cp.ID)
 }
 
 func TestSaveCheckpoint_UpsertsOnSameJobCallIndexCallType(t *testing.T) {
@@ -1106,7 +1105,7 @@ func TestGetCheckpoints_ReturnsEmptySliceForUnknownJob(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStorage(t)
 
-	checkpoints, err := s.GetCheckpoints(ctx, "no-such-job")
+	checkpoints, err := s.GetCheckpoints(ctx, testUUID("no-such-job"))
 	require.NoError(t, err)
 	assert.Empty(t, checkpoints)
 }
@@ -1276,7 +1275,7 @@ func TestPauseJob_NotFoundReturnsError(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStorage(t)
 
-	err := s.PauseJob(ctx, "ghost-job-id")
+	err := s.PauseJob(ctx, core.NewID())
 	require.Error(t, err)
 }
 
@@ -1313,7 +1312,7 @@ func TestUnpauseJob_NotFoundReturnsError(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStorage(t)
 
-	err := s.UnpauseJob(ctx, "ghost-job-id")
+	err := s.UnpauseJob(ctx, testUUID("ghost-job-id"))
 	require.Error(t, err)
 }
 
@@ -1335,7 +1334,7 @@ func TestGetPausedJobs_ReturnsPausedJobIDs(t *testing.T) {
 	require.NoError(t, err)
 	assert.Len(t, jobs, 2)
 
-	ids := make([]string, len(jobs))
+	ids := make([]core.UUID, len(jobs))
 	for i, j := range jobs {
 		ids[i] = j.ID
 	}
@@ -1347,7 +1346,7 @@ func TestIsJobPaused_ReturnsFalseForUnknownJob(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStorage(t)
 
-	paused, err := s.IsJobPaused(ctx, "no-such-job")
+	paused, err := s.IsJobPaused(ctx, core.NewID())
 	require.NoError(t, err)
 	assert.False(t, paused)
 }
@@ -1494,22 +1493,22 @@ func TestGetFanOut_ReturnsNilForMissing(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStorage(t)
 
-	got, err := s.GetFanOut(ctx, "no-such-fanout")
+	got, err := s.GetFanOut(ctx, testUUID("no-such-fanout"))
 	require.NoError(t, err)
 	assert.Nil(t, got)
 }
 
-func p2bID(t *testing.T, suffix string) string {
+func p2bID(t *testing.T, suffix string) core.UUID {
 	t.Helper()
 	// Must fit the varchar(36) id columns (Job.ID, FanOut.ID/ParentJobID). The
 	// previous t.Name() prefix overflowed on Postgres/MySQL ("value too long for
 	// type character varying(36)", SQLSTATE 22001); SQLite does not enforce
 	// varchar length so it masked the bug. suffix ("fo"/"parent"/"job") + UnixNano
 	// is ~26 chars, unique across shared-DB runs, and distinct within a call.
-	return fmt.Sprintf("%s-%d", suffix, time.Now().UnixNano())
+	return core.NewID()
 }
 
-func createRunningP2BJob(t *testing.T, ctx context.Context, s *GormStorage, fanOutID *string, workerID string) *core.Job {
+func createRunningP2BJob(t *testing.T, ctx context.Context, s *GormStorage, fanOutID *core.UUID, workerID string) *core.Job {
 	t.Helper()
 	lockUntil := time.Now().Add(time.Hour)
 	job := &core.Job{
@@ -1540,7 +1539,7 @@ func createP2BFanOut(t *testing.T, ctx context.Context, s *GormStorage, status c
 	return fo
 }
 
-func seedFanOutChild(t *testing.T, ctx context.Context, s *GormStorage, fanOutID string, status core.JobStatus) *core.Job {
+func seedFanOutChild(t *testing.T, ctx context.Context, s *GormStorage, fanOutID core.UUID, status core.JobStatus) *core.Job {
 	t.Helper()
 	job := &core.Job{
 		Type:     "fanout.child",
@@ -1793,12 +1792,12 @@ func TestCreateFanOut_PreservesExistingID(t *testing.T) {
 	require.NoError(t, s.Enqueue(ctx, parent))
 
 	fanOut := &core.FanOut{
-		ID:          "my-fanout-id",
+		ID:          testUUID("my-fanout-id"),
 		ParentJobID: parent.ID,
 		TotalCount:  2,
 	}
 	require.NoError(t, s.CreateFanOut(ctx, fanOut))
-	assert.Equal(t, "my-fanout-id", fanOut.ID)
+	assert.Equal(t, testUUID("my-fanout-id"), fanOut.ID)
 }
 
 func TestIncrementFanOutCompleted(t *testing.T) {
@@ -2461,7 +2460,7 @@ func TestCancelSubJobs_CancelsPendingSubJobs(t *testing.T) {
 	cancelledIDs, err := s.CancelSubJobs(ctx, fanOut.ID)
 	require.NoError(t, err)
 	assert.Len(t, cancelledIDs, 3, "should return all three sub-job IDs")
-	gotIDs := map[string]bool{}
+	gotIDs := map[core.UUID]bool{}
 	for _, id := range cancelledIDs {
 		gotIDs[id] = true
 	}
@@ -2958,7 +2957,7 @@ func TestGetCompletablePendingFanOuts(t *testing.T) {
 	got, err := s.GetCompletablePendingFanOuts(ctx, cutoff)
 	require.NoError(t, err)
 
-	gotParents := make(map[string]bool, len(got))
+	gotParents := make(map[core.UUID]bool, len(got))
 	for _, fo := range got {
 		gotParents[fo.ParentJobID] = true
 	}
@@ -3075,7 +3074,7 @@ func TestEnqueueBatch_PreservesExistingIDs(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStorage(t)
 
-	customID := "my-batch-job-id"
+	customID := core.NewID()
 	jobs := []*core.Job{
 		{ID: customID, Type: "task.a"},
 	}
@@ -3389,7 +3388,7 @@ func TestUnpauseJob_NotFound(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStorage(t)
 
-	err := s.UnpauseJob(ctx, "nonexistent")
+	err := s.UnpauseJob(ctx, testUUID("nonexistent"))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "job not found")
 }
@@ -3455,12 +3454,13 @@ func TestMarkWaiting_NonRunningOwnedJobReturnsErrJobNotOwned(t *testing.T) {
 func TestCancelSubJob_CancelsPendingSubJob(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStorage(t)
-	seedTestJob(t, ctx, s, "parent-1", core.StatusWaiting)
+	parentID := core.NewID()
+	seedTestJob(t, ctx, s, parentID, core.StatusWaiting)
 
 	// Create a fan-out.
 	fo := &core.FanOut{
-		ID:          "fo-cancel",
-		ParentJobID: "parent-1",
+		ID:          core.NewID(),
+		ParentJobID: parentID,
 		TotalCount:  2,
 		Strategy:    core.StrategyCollectAll,
 		Status:      core.FanOutPending,
@@ -3468,7 +3468,7 @@ func TestCancelSubJob_CancelsPendingSubJob(t *testing.T) {
 	require.NoError(t, s.CreateFanOut(ctx, fo))
 
 	// Create a pending sub-job linked to the fan-out.
-	fanOutID := "fo-cancel"
+	fanOutID := fo.ID
 	subJob := &core.Job{
 		Type:     "step",
 		Queue:    "default",
@@ -3495,18 +3495,19 @@ func TestCancelSubJob_CancelsPendingSubJob(t *testing.T) {
 func TestCancelSubJobs_CancelsMultiplePending(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStorage(t)
-	seedTestJob(t, ctx, s, "parent-1", core.StatusWaiting)
+	parentID := core.NewID()
+	seedTestJob(t, ctx, s, parentID, core.StatusWaiting)
 
 	fo := &core.FanOut{
-		ID:          "fo-multi",
-		ParentJobID: "parent-1",
+		ID:          core.NewID(),
+		ParentJobID: parentID,
 		TotalCount:  3,
 		Strategy:    core.StrategyCollectAll,
 		Status:      core.FanOutPending,
 	}
 	require.NoError(t, s.CreateFanOut(ctx, fo))
 
-	fanOutID := "fo-multi"
+	fanOutID := fo.ID
 	for i := range 3 {
 		j := &core.Job{
 			Type:        "step",
@@ -3518,12 +3519,12 @@ func TestCancelSubJobs_CancelsMultiplePending(t *testing.T) {
 		require.NoError(t, s.Enqueue(ctx, j))
 	}
 
-	cancelled, err := s.CancelSubJobs(ctx, "fo-multi")
+	cancelled, err := s.CancelSubJobs(ctx, fo.ID)
 	require.NoError(t, err)
 	assert.Len(t, cancelled, 3)
 
 	// Verify fan-out cancelled_count was updated.
-	updated, err := s.GetFanOut(ctx, "fo-multi")
+	updated, err := s.GetFanOut(ctx, fo.ID)
 	require.NoError(t, err)
 	assert.Equal(t, 3, updated.CancelledCount)
 }
@@ -3535,24 +3536,25 @@ func TestCancelSubJobs_CancelsMultiplePending(t *testing.T) {
 func TestIncrementFanOutCancelled_ReturnsUpdatedFanOut(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStorage(t)
-	seedTestJob(t, ctx, s, "p1", core.StatusWaiting)
+	parentID := core.NewID()
+	seedTestJob(t, ctx, s, parentID, core.StatusWaiting)
 
 	fo := &core.FanOut{
-		ID:          "fo-inc-cancel",
-		ParentJobID: "p1",
+		ID:          core.NewID(),
+		ParentJobID: parentID,
 		TotalCount:  5,
 		Strategy:    core.StrategyCollectAll,
 		Status:      core.FanOutPending,
 	}
 	require.NoError(t, s.CreateFanOut(ctx, fo))
 
-	seedFanOutChild(t, ctx, s, "fo-inc-cancel", core.StatusCancelled)
-	result, err := s.IncrementFanOutCancelled(ctx, "fo-inc-cancel")
+	seedFanOutChild(t, ctx, s, fo.ID, core.StatusCancelled)
+	result, err := s.IncrementFanOutCancelled(ctx, fo.ID)
 	require.NoError(t, err)
 	assert.Equal(t, 1, result.CancelledCount)
 
-	seedFanOutChild(t, ctx, s, "fo-inc-cancel", core.StatusCancelled)
-	result2, err := s.IncrementFanOutCancelled(ctx, "fo-inc-cancel")
+	seedFanOutChild(t, ctx, s, fo.ID, core.StatusCancelled)
+	result2, err := s.IncrementFanOutCancelled(ctx, fo.ID)
 	require.NoError(t, err)
 	assert.Equal(t, 2, result2.CancelledCount)
 }
@@ -3564,11 +3566,12 @@ func TestIncrementFanOutCancelled_ReturnsUpdatedFanOut(t *testing.T) {
 func TestUpdateFanOutStatus_CompleteThenFail(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStorage(t)
-	seedTestJob(t, ctx, s, "p1", core.StatusWaiting)
+	parentID := core.NewID()
+	seedTestJob(t, ctx, s, parentID, core.StatusWaiting)
 
 	fo := &core.FanOut{
-		ID:          "fo-status",
-		ParentJobID: "p1",
+		ID:          core.NewID(),
+		ParentJobID: parentID,
 		TotalCount:  2,
 		Strategy:    core.StrategyFailFast,
 		Status:      core.FanOutPending,
@@ -3576,12 +3579,12 @@ func TestUpdateFanOutStatus_CompleteThenFail(t *testing.T) {
 	require.NoError(t, s.CreateFanOut(ctx, fo))
 
 	// First update succeeds.
-	ok, err := s.UpdateFanOutStatus(ctx, "fo-status", core.FanOutCompleted)
+	ok, err := s.UpdateFanOutStatus(ctx, fo.ID, core.FanOutCompleted)
 	require.NoError(t, err)
 	assert.True(t, ok)
 
 	// Second update should return false (already completed, not pending).
-	ok2, err := s.UpdateFanOutStatus(ctx, "fo-status", core.FanOutFailed)
+	ok2, err := s.UpdateFanOutStatus(ctx, fo.ID, core.FanOutFailed)
 	require.NoError(t, err)
 	assert.False(t, ok2)
 }
@@ -3644,7 +3647,7 @@ func TestIsJobPaused_NotFound(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStorage(t)
 
-	paused, err := s.IsJobPaused(ctx, "nonexistent")
+	paused, err := s.IsJobPaused(ctx, core.NewID())
 	require.NoError(t, err)
 	assert.False(t, paused)
 }
@@ -3796,7 +3799,7 @@ func TestGetFanOut_NotFound(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStorage(t)
 
-	fo, err := s.GetFanOut(ctx, "nonexistent")
+	fo, err := s.GetFanOut(ctx, testUUID("nonexistent"))
 	require.NoError(t, err)
 	assert.Nil(t, fo)
 }
@@ -3854,19 +3857,19 @@ func TestReleaseStaleLocks_DBError(t *testing.T) {
 
 func TestSaveCheckpoint_DBError(t *testing.T) {
 	s := closedStorage(t)
-	err := s.SaveCheckpoint(context.Background(), &core.Checkpoint{JobID: "j1", CallIndex: 0})
+	err := s.SaveCheckpoint(context.Background(), &core.Checkpoint{JobID: testUUID("j1"), CallIndex: 0})
 	assert.Error(t, err)
 }
 
 func TestGetCheckpoints_DBError(t *testing.T) {
 	s := closedStorage(t)
-	_, err := s.GetCheckpoints(context.Background(), "j1")
+	_, err := s.GetCheckpoints(context.Background(), testUUID("j1"))
 	assert.Error(t, err)
 }
 
 func TestGetJob_DBError(t *testing.T) {
 	s := closedStorage(t)
-	_, err := s.GetJob(context.Background(), "j1")
+	_, err := s.GetJob(context.Background(), testUUID("j1"))
 	assert.Error(t, err)
 }
 
@@ -3927,7 +3930,7 @@ func TestUpdateFanOutStatus_DBError(t *testing.T) {
 
 func TestCreateFanOut_DBError(t *testing.T) {
 	s := closedStorage(t)
-	err := s.CreateFanOut(context.Background(), &core.FanOut{ID: "fo1", ParentJobID: "p1"})
+	err := s.CreateFanOut(context.Background(), &core.FanOut{ID: core.NewID(), ParentJobID: core.NewID()})
 	assert.Error(t, err)
 }
 
@@ -3957,19 +3960,19 @@ func TestMarkWaiting_DBError(t *testing.T) {
 
 func TestResumeJob_DBError(t *testing.T) {
 	s := closedStorage(t)
-	_, err := s.ResumeJob(context.Background(), "j1")
+	_, err := s.ResumeJob(context.Background(), testUUID("j1"))
 	assert.Error(t, err)
 }
 
 func TestPauseJob_DBError(t *testing.T) {
 	s := closedStorage(t)
-	err := s.PauseJob(context.Background(), "j1")
+	err := s.PauseJob(context.Background(), testUUID("j1"))
 	assert.Error(t, err)
 }
 
 func TestUnpauseJob_DBError(t *testing.T) {
 	s := closedStorage(t)
-	err := s.UnpauseJob(context.Background(), "j1")
+	err := s.UnpauseJob(context.Background(), testUUID("j1"))
 	assert.Error(t, err)
 }
 
@@ -3981,7 +3984,7 @@ func TestGetPausedJobs_DBError(t *testing.T) {
 
 func TestIsJobPaused_DBError(t *testing.T) {
 	s := closedStorage(t)
-	_, err := s.IsJobPaused(context.Background(), "j1")
+	_, err := s.IsJobPaused(context.Background(), testUUID("j1"))
 	assert.Error(t, err)
 }
 
@@ -4129,7 +4132,7 @@ func TestStorageWideSetters_ConcurrentWithHotPathReaders(t *testing.T) {
 	require.NotNil(t, runningHeartbeatJob)
 
 	const completeJobs = 50
-	completeJobIDs := make([]string, 0, completeJobs)
+	completeJobIDs := make([]core.UUID, 0, completeJobs)
 	for i := 0; i < completeJobs; i++ {
 		job := newTestJob("complete-race", "task.complete")
 		require.NoError(t, s.Enqueue(ctx, job))
@@ -4305,7 +4308,7 @@ func TestEnqueueBatch_SkipsDuplicatesByUniqueKey(t *testing.T) {
 	assert.Len(t, all, 3, "replay must not create duplicate sub-jobs")
 
 	// The surviving rows are the originals.
-	originalIDs := map[string]bool{first[0].ID: true, first[1].ID: true, first[2].ID: true}
+	originalIDs := map[core.UUID]bool{first[0].ID: true, first[1].ID: true, first[2].ID: true}
 	for _, j := range all {
 		assert.Truef(t, originalIDs[j.ID], "unexpected duplicate job %q", j.ID)
 	}
@@ -4502,11 +4505,11 @@ func TestFindOrphanedJobs_FlagsReclaimedAndCancelled(t *testing.T) {
 		Where("id = ?", jobD.ID).
 		Update("status", core.StatusCancelled).Error)
 
-	orphaned, err := s.FindOrphanedJobs(ctx, []string{jobA.ID, jobB.ID, jobC.ID, jobD.ID}, "worker-A")
+	orphaned, err := s.FindOrphanedJobs(ctx, []core.UUID{jobA.ID, jobB.ID, jobC.ID, jobD.ID}, "worker-A")
 	require.NoError(t, err)
 
 	// Convert to set for order-independent assertion.
-	got := map[string]bool{}
+	got := map[core.UUID]bool{}
 	for _, id := range orphaned {
 		got[id] = true
 	}
@@ -4524,7 +4527,7 @@ func TestFindOrphanedJobs_EmptyInputReturnsEmpty(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, orphaned)
 
-	orphaned, err = s.FindOrphanedJobs(ctx, []string{}, "worker-A")
+	orphaned, err = s.FindOrphanedJobs(ctx, []core.UUID{}, "worker-A")
 	require.NoError(t, err)
 	assert.Empty(t, orphaned)
 }
@@ -4536,7 +4539,7 @@ func TestFindOrphanedJobs_UnknownIDsAreNotReturned(t *testing.T) {
 	// Asking about IDs that don't exist must not cause errors and must
 	// not return those IDs (they're not in the DB, so not technically
 	// orphaned — they're just non-existent).
-	orphaned, err := s.FindOrphanedJobs(ctx, []string{"does-not-exist-1", "does-not-exist-2"}, "worker-A")
+	orphaned, err := s.FindOrphanedJobs(ctx, []core.UUID{core.NewID(), core.NewID()}, "worker-A")
 	require.NoError(t, err)
 	assert.Empty(t, orphaned)
 }
@@ -4565,7 +4568,7 @@ func TestFindOrphanedJobs_DoesNotFlagSelfSuspended(t *testing.T) {
 	require.NoError(t, s.MarkWaiting(ctx, job.ID, "worker-A"))
 
 	// The audit must NOT flag the job the worker just suspended for itself.
-	orphaned, err := s.FindOrphanedJobs(ctx, []string{job.ID}, "worker-A")
+	orphaned, err := s.FindOrphanedJobs(ctx, []core.UUID{job.ID}, "worker-A")
 	require.NoError(t, err)
 	assert.NotContains(t, orphaned, job.ID,
 		"a self-suspended (waiting) job must not be reported as orphaned to its own worker")
@@ -4590,7 +4593,7 @@ func TestFindOrphanedJobs_DoesNotFlagPaused(t *testing.T) {
 		Where("id = ?", job.ID).
 		Updates(map[string]any{"status": core.StatusPaused, "locked_by": "", "locked_until": nil}).Error)
 
-	orphaned, err := s.FindOrphanedJobs(ctx, []string{job.ID}, "worker-A")
+	orphaned, err := s.FindOrphanedJobs(ctx, []core.UUID{job.ID}, "worker-A")
 	require.NoError(t, err)
 	assert.NotContains(t, orphaned, job.ID,
 		"a paused job must not be reported as orphaned")

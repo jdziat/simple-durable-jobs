@@ -13,8 +13,8 @@ import (
 	"gorm.io/gorm/clause"
 	"gorm.io/gorm/logger"
 
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/security"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/security"
 )
 
 const (
@@ -190,6 +190,9 @@ func (s *GormStorage) Migrate(ctx context.Context) error {
 		// Heal pre-existing NULL dispatcher columns BEFORE AutoMigrate enforces
 		// their NOT NULL constraints (cheap EXISTS short-circuit on clean tables).
 		if err := backfillDispatcherNulls(ctx, db, s.dialect()); err != nil {
+			return err
+		}
+		if err := convertLegacyStringUUIDColumns(ctx, db, s.dialect()); err != nil {
 			return err
 		}
 
@@ -622,7 +625,7 @@ func (s *GormStorage) dequeueSQLite(ctx context.Context, queues []string, worker
 // (the job stays running and is replayed) or commits both. Checkpoints are
 // deleted only when SetDeleteCheckpointsOnComplete(true) was set; the default
 // keeps them for the dashboard. A not-owned Complete deletes nothing.
-func (s *GormStorage) Complete(ctx context.Context, jobID string, workerID string) error {
+func (s *GormStorage) Complete(ctx context.Context, jobID core.UUID, workerID string) error {
 	now := time.Now()
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		result := tx.Model(&core.Job{}).
@@ -651,14 +654,14 @@ func (s *GormStorage) Complete(ctx context.Context, jobID string, workerID strin
 
 // CompleteWithResult marks a job completed and, when it is a sub-job, accounts
 // for its fan-out completion in the same ownership-guarded transaction.
-func (s *GormStorage) CompleteWithResult(ctx context.Context, jobID, workerID string, result []byte) (*core.FanOut, error) {
+func (s *GormStorage) CompleteWithResult(ctx context.Context, jobID core.UUID, workerID string, result []byte) (*core.FanOut, error) {
 	updates := map[string]any{
 		"status":       core.StatusCompleted,
 		"locked_by":    "",
 		"locked_until": nil,
 	}
 	if result != nil {
-		encoded, err := s.encodePayload("job result", jobID, result)
+		encoded, err := s.encodePayload("job result", string(jobID), result)
 		if err != nil {
 			return nil, err
 		}
@@ -672,13 +675,13 @@ func (s *GormStorage) CompleteWithResult(ctx context.Context, jobID, workerID st
 // Fail marks a job as failed, optionally scheduling a retry.
 // Validates that the worker owns the job before failing.
 // Error messages are sanitized before storage.
-func (s *GormStorage) Fail(ctx context.Context, jobID string, workerID string, errMsg string, retryAt *time.Time) error {
+func (s *GormStorage) Fail(ctx context.Context, jobID core.UUID, workerID string, errMsg string, retryAt *time.Time) error {
 	// Sanitize error message to prevent sensitive data leakage
 	sanitizedErr := security.SanitizeErrorMessage(errMsg)
 	// Encrypt the handler error text at rest when a real codec is configured.
 	// PII can surface in retryable failures shown in the UI, so encode in both
 	// branches. Under the default identity codec this returns plaintext verbatim.
-	encErr, err := s.encodeErrorText("job last_error", jobID, sanitizedErr)
+	encErr, err := s.encodeErrorText("job last_error", string(jobID), sanitizedErr)
 	if err != nil {
 		return err
 	}
@@ -719,12 +722,12 @@ func (s *GormStorage) Fail(ctx context.Context, jobID string, workerID string, e
 // FailTerminalWithResult marks a job terminally failed and, when it is a
 // sub-job, accounts for its fan-out failure in the same ownership-guarded
 // transaction. Retryable failures must continue to use Fail.
-func (s *GormStorage) FailTerminalWithResult(ctx context.Context, jobID, workerID, errMsg string) (*core.FanOut, error) {
+func (s *GormStorage) FailTerminalWithResult(ctx context.Context, jobID core.UUID, workerID, errMsg string) (*core.FanOut, error) {
 	sanitizedErr := security.SanitizeErrorMessage(errMsg)
 	// Encrypt the error text at rest when a real codec is configured. The
 	// encoded form flows into both last_error and the dead_letter_reason suffix
 	// (the label stays plaintext via deadLetterReasonExpr). Identity codec → no-op.
-	encErr, err := s.encodeErrorText("job last_error", jobID, sanitizedErr)
+	encErr, err := s.encodeErrorText("job last_error", string(jobID), sanitizedErr)
 	if err != nil {
 		return nil, err
 	}
@@ -779,9 +782,9 @@ func deadLetterReasonExpr(lastError string) clause.Expr {
 //
 // Note: this builds a per-attempt copy of jobUpdates because the transaction
 // body may be retried after serialization failures.
-func (s *GormStorage) accountTerminalWithFanOut(ctx context.Context, jobID, workerID string, jobUpdates map[string]any, _ string, deleteCheckpoints bool) (*core.FanOut, error) {
+func (s *GormStorage) accountTerminalWithFanOut(ctx context.Context, jobID core.UUID, workerID string, jobUpdates map[string]any, _ string, deleteCheckpoints bool) (*core.FanOut, error) {
 	var fanOut core.FanOut
-	var fanOutID string
+	var fanOutID core.UUID
 
 	err := s.withSerializationRetry(ctx, func() error {
 		fanOutID = ""
@@ -911,7 +914,7 @@ func (s *GormStorage) SaveCheckpoint(ctx context.Context, cp *core.Checkpoint) e
 }
 
 // GetCheckpoints retrieves all checkpoints for a job.
-func (s *GormStorage) GetCheckpoints(ctx context.Context, jobID string) ([]core.Checkpoint, error) {
+func (s *GormStorage) GetCheckpoints(ctx context.Context, jobID core.UUID) ([]core.Checkpoint, error) {
 	var checkpoints []core.Checkpoint
 	err := s.db.WithContext(ctx).
 		Where("job_id = ?", jobID).
@@ -927,7 +930,7 @@ func (s *GormStorage) GetCheckpoints(ctx context.Context, jobID string) ([]core.
 }
 
 // DeleteCheckpoints removes all checkpoints for a job.
-func (s *GormStorage) DeleteCheckpoints(ctx context.Context, jobID string) error {
+func (s *GormStorage) DeleteCheckpoints(ctx context.Context, jobID core.UUID) error {
 	return s.db.WithContext(ctx).
 		Where("job_id = ?", jobID).
 		Delete(&core.Checkpoint{}).Error
@@ -1058,7 +1061,7 @@ func (s *GormStorage) GetScheduledFireTimes(ctx context.Context) (map[string]tim
 
 // Heartbeat extends the lock on a running job.
 // Returns ErrJobNotOwned if the job is no longer owned by this worker.
-func (s *GormStorage) Heartbeat(ctx context.Context, jobID string, workerID string) error {
+func (s *GormStorage) Heartbeat(ctx context.Context, jobID core.UUID, workerID string) error {
 	updates := map[string]any{}
 	if s.useDBClock() {
 		// Extend the lock on the DB clock so it stays comparable with the
@@ -1087,7 +1090,7 @@ func (s *GormStorage) Heartbeat(ctx context.Context, jobID string, workerID stri
 
 // Release returns an owned, still-running job to pending so it can be
 // immediately dequeued by another worker after a local dispatch is abandoned.
-func (s *GormStorage) Release(ctx context.Context, jobID, workerID string) error {
+func (s *GormStorage) Release(ctx context.Context, jobID core.UUID, workerID string) error {
 	result := s.db.WithContext(ctx).
 		Model(&core.Job{}).
 		Where("id = ? AND locked_by = ? AND status = ?", jobID, workerID, core.StatusRunning).
@@ -1133,11 +1136,11 @@ func (s *GormStorage) Release(ctx context.Context, jobID, workerID string) error
 //
 // Returns an empty slice (not nil) when no jobs are orphaned, so callers
 // can len()-test without nil-checking.
-func (s *GormStorage) FindOrphanedJobs(ctx context.Context, jobIDs []string, workerID string) ([]string, error) {
+func (s *GormStorage) FindOrphanedJobs(ctx context.Context, jobIDs []core.UUID, workerID string) ([]core.UUID, error) {
 	if len(jobIDs) == 0 {
-		return []string{}, nil
+		return []core.UUID{}, nil
 	}
-	var orphaned []string
+	var orphaned []core.UUID
 	err := s.db.WithContext(ctx).
 		Model(&core.Job{}).
 		Where("id IN ?", jobIDs).
@@ -1152,7 +1155,7 @@ func (s *GormStorage) FindOrphanedJobs(ctx context.Context, jobIDs []string, wor
 		return nil, err
 	}
 	if orphaned == nil {
-		orphaned = []string{}
+		orphaned = []core.UUID{}
 	}
 	return orphaned, nil
 }
@@ -1172,7 +1175,7 @@ func (s *GormStorage) FindOrphanedJobs(ctx context.Context, jobIDs []string, wor
 // ~lockDuration+staleDuration, which the lease-stacking Dequeue/Heartbeat pushes
 // inflated. last_heartbeat_at was written for exactly this purpose but was
 // previously never read by the reaper.
-func (s *GormStorage) ReleaseStaleLocks(ctx context.Context, staleDuration time.Duration) ([]string, error) {
+func (s *GormStorage) ReleaseStaleLocks(ctx context.Context, staleDuration time.Duration) ([]core.UUID, error) {
 	// The cutoff is computed on the DB clock for multi-worker backends so it is
 	// comparable with the DB-clock last_heartbeat_at/started_at/locked_until
 	// written by Dequeue/Heartbeat. Comparing a client-computed cutoff against a
@@ -1190,7 +1193,7 @@ func (s *GormStorage) ReleaseStaleLocks(ctx context.Context, staleDuration time.
 	// the same transaction so the reader and the writer agree. RETURNING
 	// would let us do this in one statement but isn't portable across all
 	// GORM drivers, so we do it the long way.
-	var released []string
+	var released []core.UUID
 	err := s.withSerializationRetry(ctx, func() error {
 		released = nil
 		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
@@ -1231,7 +1234,7 @@ func (s *GormStorage) ReleaseStaleLocks(ctx context.Context, staleDuration time.
 }
 
 // GetJob retrieves a job by ID.
-func (s *GormStorage) GetJob(ctx context.Context, jobID string) (*core.Job, error) {
+func (s *GormStorage) GetJob(ctx context.Context, jobID core.UUID) (*core.Job, error) {
 	var job core.Job
 	err := s.db.WithContext(ctx).First(&job, "id = ?", jobID).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -1272,7 +1275,7 @@ func (s *GormStorage) CreateFanOut(ctx context.Context, fanOut *core.FanOut) err
 	return s.db.WithContext(ctx).Create(fanOut).Error
 }
 
-func liveFanOutCounts(db *gorm.DB, fanOutID string) (completed, failed, cancelled int, err error) {
+func liveFanOutCounts(db *gorm.DB, fanOutID core.UUID) (completed, failed, cancelled int, err error) {
 	type countRow struct {
 		Status string
 		Count  int64
@@ -1318,8 +1321,8 @@ func overlayLiveFanOutCountsBatch(db *gorm.DB, fanOuts []*core.FanOut) error {
 	if len(fanOuts) == 0 {
 		return nil
 	}
-	ids := make([]string, 0, len(fanOuts))
-	byID := make(map[string]*core.FanOut, len(fanOuts))
+	ids := make([]core.UUID, 0, len(fanOuts))
+	byID := make(map[core.UUID]*core.FanOut, len(fanOuts))
 	for _, fanOut := range fanOuts {
 		if fanOut == nil {
 			continue
@@ -1333,7 +1336,7 @@ func overlayLiveFanOutCountsBatch(db *gorm.DB, fanOuts []*core.FanOut) error {
 	}
 
 	type countRow struct {
-		FanOutID string
+		FanOutID core.UUID
 		Status   string
 		Count    int64
 	}
@@ -1363,7 +1366,7 @@ func overlayLiveFanOutCountsBatch(db *gorm.DB, fanOuts []*core.FanOut) error {
 }
 
 // GetFanOut retrieves a fan-out by ID.
-func (s *GormStorage) GetFanOut(ctx context.Context, fanOutID string) (*core.FanOut, error) {
+func (s *GormStorage) GetFanOut(ctx context.Context, fanOutID core.UUID) (*core.FanOut, error) {
 	var fanOut core.FanOut
 	err := s.db.WithContext(ctx).First(&fanOut, "id = ?", fanOutID).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -1379,21 +1382,21 @@ func (s *GormStorage) GetFanOut(ctx context.Context, fanOutID string) (*core.Fan
 }
 
 // IncrementFanOutCompleted returns the fan-out with live completed count.
-func (s *GormStorage) IncrementFanOutCompleted(ctx context.Context, fanOutID string) (*core.FanOut, error) {
+func (s *GormStorage) IncrementFanOutCompleted(ctx context.Context, fanOutID core.UUID) (*core.FanOut, error) {
 	return s.getFanOutWithLiveCounts(ctx, fanOutID)
 }
 
 // IncrementFanOutFailed returns the fan-out with live failed count.
-func (s *GormStorage) IncrementFanOutFailed(ctx context.Context, fanOutID string) (*core.FanOut, error) {
+func (s *GormStorage) IncrementFanOutFailed(ctx context.Context, fanOutID core.UUID) (*core.FanOut, error) {
 	return s.getFanOutWithLiveCounts(ctx, fanOutID)
 }
 
 // IncrementFanOutCancelled returns the fan-out with live cancelled count.
-func (s *GormStorage) IncrementFanOutCancelled(ctx context.Context, fanOutID string) (*core.FanOut, error) {
+func (s *GormStorage) IncrementFanOutCancelled(ctx context.Context, fanOutID core.UUID) (*core.FanOut, error) {
 	return s.getFanOutWithLiveCounts(ctx, fanOutID)
 }
 
-func (s *GormStorage) getFanOutWithLiveCounts(ctx context.Context, fanOutID string) (*core.FanOut, error) {
+func (s *GormStorage) getFanOutWithLiveCounts(ctx context.Context, fanOutID core.UUID) (*core.FanOut, error) {
 	var fanOut core.FanOut
 	db := s.db.WithContext(ctx)
 	if err := db.First(&fanOut, "id = ?", fanOutID).Error; err != nil {
@@ -1409,7 +1412,7 @@ func (s *GormStorage) getFanOutWithLiveCounts(ctx context.Context, fanOutID stri
 // Returns (true, nil) if the status was updated, (false, nil) if already completed
 // by another worker, or (false, error) on database error.
 // This prevents race conditions where multiple workers try to complete the same fan-out.
-func (s *GormStorage) UpdateFanOutStatus(ctx context.Context, fanOutID string, status core.FanOutStatus) (bool, error) {
+func (s *GormStorage) UpdateFanOutStatus(ctx context.Context, fanOutID core.UUID, status core.FanOutStatus) (bool, error) {
 	var updated bool
 	err := s.withSerializationRetry(ctx, func() error {
 		completed, failed, cancelled, err := liveFanOutCounts(s.db.WithContext(ctx), fanOutID)
@@ -1437,7 +1440,7 @@ func (s *GormStorage) UpdateFanOutStatus(ctx context.Context, fanOutID string, s
 }
 
 // GetFanOutsByParent retrieves all fan-outs for a parent job.
-func (s *GormStorage) GetFanOutsByParent(ctx context.Context, parentJobID string) ([]*core.FanOut, error) {
+func (s *GormStorage) GetFanOutsByParent(ctx context.Context, parentJobID core.UUID) ([]*core.FanOut, error) {
 	var fanOuts []*core.FanOut
 	err := s.db.WithContext(ctx).
 		Where("parent_job_id = ?", parentJobID).
@@ -1491,7 +1494,7 @@ func (s *GormStorage) enqueueBatchTx(ctx context.Context, jobs []*core.Job) erro
 }
 
 // GetSubJobs retrieves all sub-jobs for a fan-out.
-func (s *GormStorage) GetSubJobs(ctx context.Context, fanOutID string) ([]*core.Job, error) {
+func (s *GormStorage) GetSubJobs(ctx context.Context, fanOutID core.UUID) ([]*core.Job, error) {
 	var jobs []*core.Job
 	err := s.db.WithContext(ctx).
 		Where("fan_out_id = ?", fanOutID).
@@ -1507,7 +1510,7 @@ func (s *GormStorage) GetSubJobs(ctx context.Context, fanOutID string) ([]*core.
 }
 
 // GetSubJobResults retrieves completed/failed sub-jobs for result collection.
-func (s *GormStorage) GetSubJobResults(ctx context.Context, fanOutID string) ([]*core.Job, error) {
+func (s *GormStorage) GetSubJobResults(ctx context.Context, fanOutID core.UUID) ([]*core.Job, error) {
 	var jobs []*core.Job
 	err := s.db.WithContext(ctx).
 		Where("fan_out_id = ? AND status IN ?", fanOutID, []core.JobStatus{core.StatusCompleted, core.StatusFailed}).
@@ -1525,8 +1528,8 @@ func (s *GormStorage) GetSubJobResults(ctx context.Context, fanOutID string) ([]
 // CancelSubJobs cancels pending/running sub-jobs for a fan-out and returns their
 // IDs so the caller can cancel any local in-flight handlers — see
 // core.Storage.CancelSubJobs for the rationale.
-func (s *GormStorage) CancelSubJobs(ctx context.Context, fanOutID string) ([]string, error) {
-	var cancelled []string
+func (s *GormStorage) CancelSubJobs(ctx context.Context, fanOutID core.UUID) ([]core.UUID, error) {
+	var cancelled []core.UUID
 	err := s.withSerializationRetry(ctx, func() error {
 		cancelled = nil
 		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
@@ -1575,7 +1578,7 @@ func (s *GormStorage) CancelSubJobs(ctx context.Context, fanOutID string) ([]str
 // CancelSubJob cancels a single sub-job and returns its fan-out with live counts.
 // Returns the updated FanOut record so the caller can check for completion.
 // Returns (nil, nil) if the job has no fan-out ID (not a sub-job).
-func (s *GormStorage) CancelSubJob(ctx context.Context, jobID string) (*core.FanOut, error) {
+func (s *GormStorage) CancelSubJob(ctx context.Context, jobID core.UUID) (*core.FanOut, error) {
 	var fanOut core.FanOut
 	var hasFanOut bool
 
@@ -1643,7 +1646,7 @@ func (s *GormStorage) CancelSubJob(ctx context.Context, jobID string) (*core.Fan
 
 // MarkWaiting suspends a job to waiting status.
 // Returns ErrJobNotOwned if the job is no longer owned by this worker.
-func (s *GormStorage) MarkWaiting(ctx context.Context, jobID string, workerID string) error {
+func (s *GormStorage) MarkWaiting(ctx context.Context, jobID core.UUID, workerID string) error {
 	result := s.db.WithContext(ctx).
 		Model(&core.Job{}).
 		Where("id = ? AND locked_by = ? AND status = ?", jobID, workerID, core.StatusRunning).
@@ -1668,7 +1671,7 @@ func (s *GormStorage) MarkWaiting(ctx context.Context, jobID string, workerID st
 // a real retry. Without this, each fan-out round eats one retry attempt
 // and the job exhausts max_retries before completing.
 // Returns (true, nil) if resumed, (false, nil) if job was not in a resumable status.
-func (s *GormStorage) ResumeJob(ctx context.Context, jobID string) (bool, error) {
+func (s *GormStorage) ResumeJob(ctx context.Context, jobID core.UUID) (bool, error) {
 	// Accept both waiting and paused status — paused jobs should also be
 	// resumable when their fan-out completes. run_at is deliberately left
 	// untouched so a delayed job that was paused before its run_at and then
@@ -1694,7 +1697,7 @@ func (s *GormStorage) ResumeJob(ctx context.Context, jobID string) (bool, error)
 // WaitForSignalTimeout parks a future run_at as its wake deadline, so when a
 // signal arrives early the resume must not leave a future run_at that would
 // block Dequeue until that deadline. Returns whether a row was resumed.
-func (s *GormStorage) ResumeSignalWaitingJob(ctx context.Context, jobID string) (bool, error) {
+func (s *GormStorage) ResumeSignalWaitingJob(ctx context.Context, jobID core.UUID) (bool, error) {
 	result := s.db.WithContext(ctx).
 		Model(&core.Job{}).
 		Where("id = ? AND status = ?", jobID, core.StatusWaiting).
@@ -1733,7 +1736,7 @@ func (s *GormStorage) ResumeSignalWaitingJob(ctx context.Context, jobID string) 
 //
 // Returns true if a job was requeued, false if it was not found or not in a
 // requeuable (failed/cancelled) state.
-func (s *GormStorage) Requeue(ctx context.Context, jobID string) (bool, error) {
+func (s *GormStorage) Requeue(ctx context.Context, jobID core.UUID) (bool, error) {
 	var requeued bool
 	err := s.withSerializationRetry(ctx, func() error {
 		requeued = false
@@ -1810,11 +1813,11 @@ func (s *GormStorage) Requeue(ctx context.Context, jobID string) (bool, error) {
 // (there is no FK on jobs.fan_out_id, so the cascade stops at fan_outs and the
 // grandchild sub-jobs would be stranded). The depth cap bounds cyclically corrupt
 // data; IN-lists stay bounded to one level's width during the walk.
-func (s *GormStorage) deleteFanOutSubtree(tx *gorm.DB, rootJobID string) error {
-	var allFanOutIDs, allSubJobIDs []string
-	frontier := []string{rootJobID}
+func (s *GormStorage) deleteFanOutSubtree(tx *gorm.DB, rootJobID core.UUID) error {
+	var allFanOutIDs, allSubJobIDs []core.UUID
+	frontier := []core.UUID{rootJobID}
 	for depth := 0; len(frontier) > 0 && depth < maxFanOutTreeDepth; depth++ {
-		var fanOutIDs []string
+		var fanOutIDs []core.UUID
 		if err := tx.Model(&core.FanOut{}).
 			Where("parent_job_id IN ?", frontier).
 			Pluck("id", &fanOutIDs).Error; err != nil {
@@ -1824,7 +1827,7 @@ func (s *GormStorage) deleteFanOutSubtree(tx *gorm.DB, rootJobID string) error {
 			break // reached the leaves
 		}
 
-		var subJobIDs []string
+		var subJobIDs []core.UUID
 		if err := tx.Model(&core.Job{}).
 			Where("fan_out_id IN ?", fanOutIDs).
 			Pluck("id", &subJobIDs).Error; err != nil {
@@ -1983,8 +1986,8 @@ func (s *GormStorage) GetCompletablePendingFanOuts(ctx context.Context, olderTha
 }
 
 // SaveJobResult stores the serialized result for a job.
-func (s *GormStorage) SaveJobResult(ctx context.Context, jobID string, workerID string, result []byte) error {
-	encoded, err := s.encodePayload("job result", jobID, result)
+func (s *GormStorage) SaveJobResult(ctx context.Context, jobID core.UUID, workerID string, result []byte) error {
+	encoded, err := s.encodePayload("job result", string(jobID), result)
 	if err != nil {
 		return err
 	}
@@ -2006,7 +2009,7 @@ func (s *GormStorage) SaveJobResult(ctx context.Context, jobID string, workerID 
 // PauseJob pauses a job, preventing it from being picked up.
 // Only pending and waiting jobs can be paused. Running jobs cannot be paused
 // because the worker holds the lock and clearing it would corrupt state.
-func (s *GormStorage) PauseJob(ctx context.Context, jobID string) error {
+func (s *GormStorage) PauseJob(ctx context.Context, jobID core.UUID) error {
 	return s.withSerializationRetry(ctx, func() error {
 		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 			var job core.Job
@@ -2055,7 +2058,7 @@ func (s *GormStorage) PauseJob(ctx context.Context, jobID string) error {
 }
 
 // UnpauseJob resumes a paused job back to its previous status.
-func (s *GormStorage) UnpauseJob(ctx context.Context, jobID string) error {
+func (s *GormStorage) UnpauseJob(ctx context.Context, jobID core.UUID) error {
 	return s.withSerializationRetry(ctx, func() error {
 		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 			var job core.Job
@@ -2104,7 +2107,7 @@ func (s *GormStorage) GetPausedJobs(ctx context.Context, queue string) ([]*core.
 }
 
 // IsJobPaused checks if a job is paused.
-func (s *GormStorage) IsJobPaused(ctx context.Context, jobID string) (bool, error) {
+func (s *GormStorage) IsJobPaused(ctx context.Context, jobID core.UUID) (bool, error) {
 	var job core.Job
 	err := s.db.WithContext(ctx).
 		Select("status").

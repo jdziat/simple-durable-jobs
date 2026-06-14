@@ -12,7 +12,7 @@ import (
 // scope while ExpiresAt is live.
 type UniqueLock struct {
 	ScopeHash string    `gorm:"primaryKey;size:64"`
-	JobID     string    `gorm:"size:36;not null"`
+	JobID     UUID      `gorm:"not null"`
 	ExpiresAt time.Time `gorm:"not null;index:idx_unique_locks_expires_at"`
 	CreatedAt time.Time `gorm:"autoCreateTime"`
 }
@@ -22,7 +22,7 @@ type UniqueLock struct {
 // the same transaction, returning the existing job ID when a live lock already
 // exists.
 type UniqueLockEnqueuer interface {
-	EnqueueWithUniqueLock(ctx context.Context, job *Job, scopeHash string, ttl time.Duration) (string, error)
+	EnqueueWithUniqueLock(ctx context.Context, job *Job, scopeHash string, ttl time.Duration) (UUID, error)
 }
 
 // UniqueLockSweeper is an optional storage capability for pruning expired

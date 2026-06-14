@@ -20,7 +20,7 @@ import (
 	"errors"
 	"log/slog"
 
-	jobs "github.com/jdziat/simple-durable-jobs/v2"
+	jobs "github.com/jdziat/simple-durable-jobs/v3"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )

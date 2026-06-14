@@ -24,7 +24,7 @@ bundled `GormStorage` (SQLite/Postgres/MySQL) does. A backend without it returns
 
 ## Producer side (outside the workflow)
 
-### `Signal(ctx context.Context, q *Queue, jobID, name string, payload any) error`
+### `(*Queue) Signal(ctx context.Context, jobID, name string, payload any) error`
 
 Delivers a named signal carrying `payload` to a job. The signal is persisted
 durably (so it is **not lost** if sent before the handler waits for it), and if
@@ -32,7 +32,7 @@ the target job is currently `waiting` on a signal, the call resumes it promptly.
 
 ```go
 // hivemind wants to update a running agent's context
-err := jobs.Signal(ctx, queue, agentJobID, "ctx", map[string]any{
+err := queue.Signal(ctx, agentJobID, "ctx", map[string]any{
     "instruction": "user changed their mind: optimize for latency, not cost",
 })
 ```
@@ -67,7 +67,7 @@ queue.Register("agent", func(ctx context.Context, in AgentInput) error {
     if err != nil {
         return err // includes the internal "waiting" sentinel — return it as-is
     }
-    // resumes here with `update` once Signal(..., "ctx", ...) is delivered
+    // resumes here with `update` once queue.Signal(..., "ctx", ...) is delivered
     return nil
 })
 ```

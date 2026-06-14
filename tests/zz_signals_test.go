@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	jobs "github.com/jdziat/simple-durable-jobs/v2"
+	jobs "github.com/jdziat/simple-durable-jobs/v3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -18,15 +18,15 @@ type resultBox struct {
 }
 
 func newResultBox() *resultBox { return &resultBox{m: map[string]string{}} }
-func (b *resultBox) set(id, v string) {
+func (b *resultBox) set(id jobs.UUID, v string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.m[id] = v
+	b.m[string(id)] = v
 }
-func (b *resultBox) get(id string) (string, bool) {
+func (b *resultBox) get(id jobs.UUID) (string, bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	v, ok := b.m[id]
+	v, ok := b.m[string(id)]
 	return v, ok
 }
 
@@ -73,7 +73,7 @@ func TestSignals_WaitThenSendResumes(t *testing.T) {
 		return st == jobs.StatusWaiting
 	}, 10*time.Second, 50*time.Millisecond, "job should suspend waiting for a signal")
 
-	require.NoError(t, jobs.Signal(ctx, q, id, "ctx", "hello-from-outside"))
+	require.NoError(t, q.Signal(ctx, id, "ctx", "hello-from-outside"))
 
 	require.Eventually(t, func() bool {
 		v, ok := box.get(id)
@@ -105,7 +105,7 @@ func TestSignals_BufferedBeforeWait(t *testing.T) {
 	require.NoError(t, err)
 
 	// Send BEFORE starting the worker, so the signal is buffered.
-	require.NoError(t, jobs.Signal(ctx, q, id, "ctx", "buffered"))
+	require.NoError(t, q.Signal(ctx, id, "ctx", "buffered"))
 
 	startWorker(t, q)
 
@@ -147,7 +147,7 @@ func TestSignals_PollBackstopResumes(t *testing.T) {
 
 	// Deliver via storage only — no ResumeJob — so the poll must recover it.
 	sender, ok := store.(interface {
-		SendSignal(context.Context, string, string, []byte) error
+		SendSignal(context.Context, jobs.UUID, string, []byte) error
 	})
 	require.True(t, ok, "storage must support signals")
 	require.NoError(t, sender.SendSignal(ctx, id, "ctx", []byte(`"via-poll"`)))
@@ -198,7 +198,7 @@ func TestSignals_EmitsDeliveredEvent(t *testing.T) {
 	require.NoError(t, err)
 
 	events := q.Events()
-	require.NoError(t, jobs.Signal(ctx, q, id, "ctx", "x"))
+	require.NoError(t, q.Signal(ctx, id, "ctx", "x"))
 
 	timeout := time.After(3 * time.Second)
 	for {
@@ -232,7 +232,7 @@ func TestSignals_EmitsResumedBySignalOnFastPath(t *testing.T) {
 	}, 10*time.Second, 50*time.Millisecond)
 
 	events := q.Events()
-	require.NoError(t, jobs.Signal(ctx, q, id, "ctx", "x"))
+	require.NoError(t, q.Signal(ctx, id, "ctx", "x"))
 
 	timeout := time.After(3 * time.Second)
 	for {
@@ -267,7 +267,7 @@ func TestSignals_EmitsResumedBySignalOnPollBackstop(t *testing.T) {
 
 	events := q.Events()
 	sender, ok := store.(interface {
-		SendSignal(context.Context, string, string, []byte) error
+		SendSignal(context.Context, jobs.UUID, string, []byte) error
 	})
 	require.True(t, ok, "storage must support signals")
 	require.NoError(t, sender.SendSignal(ctx, id, "ctx", []byte(`"via-poll"`)))
@@ -305,12 +305,12 @@ func TestSignals_PeekThenDrain(t *testing.T) {
 			return err
 		}
 		mu.Lock()
-		c := seen[id]
+		c := seen[string(id)]
 		if peeked {
 			c.peeked = 1
 		}
 		c.drained = len(all)
-		seen[id] = c
+		seen[string(id)] = c
 		mu.Unlock()
 		return nil
 	})
@@ -319,7 +319,7 @@ func TestSignals_PeekThenDrain(t *testing.T) {
 	id, err := q.Enqueue(ctx, "agent-peek-drain", struct{}{})
 	require.NoError(t, err)
 	for _, v := range []string{"a", "b", "c"} {
-		require.NoError(t, jobs.Signal(ctx, q, id, "ctx", v))
+		require.NoError(t, q.Signal(ctx, id, "ctx", v))
 	}
 
 	startWorker(t, q)
@@ -327,11 +327,11 @@ func TestSignals_PeekThenDrain(t *testing.T) {
 	require.Eventually(t, func() bool {
 		mu.Lock()
 		defer mu.Unlock()
-		c, ok := seen[id]
+		c, ok := seen[string(id)]
 		return ok && c.drained == 3
 	}, 10*time.Second, 50*time.Millisecond, "drain should return all three buffered signals")
 
 	mu.Lock()
 	defer mu.Unlock()
-	assert.Equal(t, 1, seen[id].peeked, "CheckSignal observed a pending signal without consuming it")
+	assert.Equal(t, 1, seen[string(id)].peeked, "CheckSignal observed a pending signal without consuming it")
 }

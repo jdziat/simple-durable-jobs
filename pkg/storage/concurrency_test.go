@@ -10,7 +10,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/core"
 )
 
 func uniqueSlotName(t *testing.T) string {
@@ -23,34 +23,34 @@ func TestConcurrencySlotLimitReleaseAndExpiry(t *testing.T) {
 	ctx := context.Background()
 	slot := uniqueSlotName(t)
 
-	ok, err := s.TryAcquireConcurrencySlot(ctx, slot, "job-1", "worker-1", 2, time.Hour)
+	ok, err := s.TryAcquireConcurrencySlot(ctx, slot, testUUID("job-1"), "worker-1", 2, time.Hour)
 	require.NoError(t, err)
 	require.True(t, ok)
-	ok, err = s.TryAcquireConcurrencySlot(ctx, slot, "job-2", "worker-1", 2, time.Hour)
+	ok, err = s.TryAcquireConcurrencySlot(ctx, slot, testUUID("job-2"), "worker-1", 2, time.Hour)
 	require.NoError(t, err)
 	require.True(t, ok)
 
-	ok, err = s.TryAcquireConcurrencySlot(ctx, slot, "job-3", "worker-1", 2, time.Hour)
+	ok, err = s.TryAcquireConcurrencySlot(ctx, slot, testUUID("job-3"), "worker-1", 2, time.Hour)
 	require.NoError(t, err)
 	assert.False(t, ok, "third live slot must be denied at limit 2")
 
-	ok, err = s.TryAcquireConcurrencySlot(ctx, slot, "job-1", "worker-1", 2, time.Hour)
+	ok, err = s.TryAcquireConcurrencySlot(ctx, slot, testUUID("job-1"), "worker-1", 2, time.Hour)
 	require.NoError(t, err)
 	assert.True(t, ok, "re-acquiring the same job renews instead of double-counting")
 
-	require.NoError(t, s.ReleaseConcurrencySlot(ctx, slot, "job-2"))
-	ok, err = s.TryAcquireConcurrencySlot(ctx, slot, "job-3", "worker-1", 2, time.Hour)
+	require.NoError(t, s.ReleaseConcurrencySlot(ctx, slot, testUUID("job-2")))
+	ok, err = s.TryAcquireConcurrencySlot(ctx, slot, testUUID("job-3"), "worker-1", 2, time.Hour)
 	require.NoError(t, err)
 	assert.True(t, ok, "released slot should free capacity")
 
 	expiredSlot := slot + "-expired"
 	require.NoError(t, s.db.WithContext(ctx).Create(&core.ConcurrencySlot{
 		SlotName:  expiredSlot,
-		JobID:     "expired-job",
+		JobID:     testUUID("expired-job"),
 		WorkerID:  "worker-1",
 		ExpiresAt: time.Now().Add(-time.Hour),
 	}).Error)
-	ok, err = s.TryAcquireConcurrencySlot(ctx, expiredSlot, "fresh-job", "worker-2", 1, time.Hour)
+	ok, err = s.TryAcquireConcurrencySlot(ctx, expiredSlot, testUUID("fresh-job"), "worker-2", 1, time.Hour)
 	require.NoError(t, err)
 	assert.True(t, ok, "expired slots must not count against the cap")
 }
@@ -60,35 +60,35 @@ func TestRenewConcurrencySlotRenewOnly(t *testing.T) {
 	ctx := context.Background()
 	slot := uniqueSlotName(t)
 
-	ok, err := s.TryAcquireConcurrencySlot(ctx, slot, "job-live", "worker-1", 1, time.Second)
+	ok, err := s.TryAcquireConcurrencySlot(ctx, slot, testUUID("job-live"), "worker-1", 1, time.Second)
 	require.NoError(t, err)
 	require.True(t, ok)
 
 	var before core.ConcurrencySlot
 	require.NoError(t, s.db.WithContext(ctx).
-		Where("slot_name = ? AND job_id = ?", slot, "job-live").
+		Where("slot_name = ? AND job_id = ?", slot, testUUID("job-live")).
 		First(&before).Error)
 
-	renewed, err := s.RenewConcurrencySlot(ctx, slot, "job-live", time.Hour)
+	renewed, err := s.RenewConcurrencySlot(ctx, slot, testUUID("job-live"), time.Hour)
 	require.NoError(t, err)
 	require.True(t, renewed)
 
 	var after core.ConcurrencySlot
 	require.NoError(t, s.db.WithContext(ctx).
-		Where("slot_name = ? AND job_id = ?", slot, "job-live").
+		Where("slot_name = ? AND job_id = ?", slot, testUUID("job-live")).
 		First(&after).Error)
 	assert.True(t, after.ExpiresAt.After(before.ExpiresAt), "live slot renewal should advance expiry")
 	assert.Equal(t, before.WorkerID, after.WorkerID, "renew-only update preserves the current worker id")
 
-	require.NoError(t, s.ReleaseConcurrencySlot(ctx, slot, "job-live"))
-	renewed, err = s.RenewConcurrencySlot(ctx, slot, "job-live", time.Hour)
+	require.NoError(t, s.ReleaseConcurrencySlot(ctx, slot, testUUID("job-live")))
+	renewed, err = s.RenewConcurrencySlot(ctx, slot, testUUID("job-live"), time.Hour)
 	require.NoError(t, err)
 	assert.False(t, renewed, "released slots must not be resurrected by renewal")
 
 	var heldRows int64
 	require.NoError(t, s.db.WithContext(ctx).
 		Model(&core.ConcurrencySlot{}).
-		Where("slot_name = ? AND job_id = ?", slot, "job-live").
+		Where("slot_name = ? AND job_id = ?", slot, testUUID("job-live")).
 		Count(&heldRows).Error)
 	assert.Equal(t, int64(0), heldRows)
 }
@@ -98,7 +98,7 @@ func TestConcurrencySlotConcurrentLastSlotRace(t *testing.T) {
 	ctx := context.Background()
 	slot := uniqueSlotName(t)
 
-	ok, err := s.TryAcquireConcurrencySlot(ctx, slot, "job-existing", "worker-1", 2, time.Hour)
+	ok, err := s.TryAcquireConcurrencySlot(ctx, slot, core.NewID(), "worker-1", 2, time.Hour)
 	require.NoError(t, err)
 	require.True(t, ok)
 
@@ -114,7 +114,7 @@ func TestConcurrencySlotConcurrentLastSlotRace(t *testing.T) {
 			acquired, acquireErr := s.TryAcquireConcurrencySlot(
 				ctx,
 				slot,
-				fmt.Sprintf("job-racer-%d", i),
+				core.NewID(),
 				fmt.Sprintf("worker-%d", i),
 				2,
 				time.Hour,
@@ -157,13 +157,13 @@ func TestDeleteExpiredConcurrencySlotsPreservesLiveAndSentinel(t *testing.T) {
 	}).Error)
 	require.NoError(t, s.db.WithContext(ctx).Create(&core.ConcurrencySlot{
 		SlotName:  slot,
-		JobID:     "expired-job",
+		JobID:     testUUID("expired-job"),
 		WorkerID:  "worker-1",
 		ExpiresAt: now.Add(-time.Hour),
 	}).Error)
 	require.NoError(t, s.db.WithContext(ctx).Create(&core.ConcurrencySlot{
 		SlotName:  slot,
-		JobID:     "live-job",
+		JobID:     testUUID("live-job"),
 		WorkerID:  "worker-1",
 		ExpiresAt: now.Add(time.Hour),
 	}).Error)
@@ -182,6 +182,6 @@ func TestDeleteExpiredConcurrencySlotsPreservesLiveAndSentinel(t *testing.T) {
 		Order("job_id ASC").
 		Find(&remaining).Error)
 	require.Len(t, remaining, 2)
-	assert.Equal(t, "", remaining[0].JobID, "sentinel row must not be deleted")
-	assert.Equal(t, "live-job", remaining[1].JobID, "live held slot must not be deleted")
+	assert.Equal(t, core.NilUUID, remaining[0].JobID, "sentinel row must not be deleted")
+	assert.Equal(t, testUUID("live-job"), remaining[1].JobID, "live held slot must not be deleted")
 }

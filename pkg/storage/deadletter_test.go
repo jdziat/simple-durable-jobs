@@ -8,7 +8,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/core"
 )
 
 func TestDeadLetterMetadata_TerminalFailureOnlyAndRequeueClears(t *testing.T) {
@@ -81,7 +81,7 @@ func TestDeadLetterQueries_FilterPaginationAndCount(t *testing.T) {
 	seedDeadLetterJob(t, s, "new-import", "imports", "import", base.Add(2*time.Minute))
 	require.NoError(t, s.withSerializationRetry(ctx, func() error {
 		return s.db.WithContext(ctx).Create(&core.Job{
-			ID:     "failed-without-dlq",
+			ID:     testUUID("failed-without-dlq"),
 			Type:   "send",
 			Queue:  "email",
 			Status: core.StatusFailed,
@@ -101,7 +101,7 @@ func TestDeadLetterQueries_FilterPaginationAndCount(t *testing.T) {
 	sendPage, err := s.ListDeadLettered(ctx, core.DeadLetterFilter{Type: "send", Limit: 1, Offset: 1})
 	require.NoError(t, err)
 	require.Len(t, sendPage, 1)
-	assert.Equal(t, "old-email", sendPage[0].ID)
+	assert.Equal(t, testUUID("old-email"), sendPage[0].ID)
 
 	count, err := s.CountDeadLettered(ctx, core.DeadLetterFilter{})
 	require.NoError(t, err)
@@ -118,7 +118,7 @@ func TestDeadLetterQueries_TenantMetadataAndSearch(t *testing.T) {
 
 	base := time.Now().UTC().Add(-time.Hour).Truncate(time.Millisecond)
 	seedDeadLetterJobWithDetails(t, s, &core.Job{
-		ID:       "dlq-acme-prod",
+		ID:       testUUID("dlq-acme-prod"),
 		Type:     "sync",
 		Queue:    "default",
 		Tenant:   "tenant-a",
@@ -126,7 +126,7 @@ func TestDeadLetterQueries_TenantMetadataAndSearch(t *testing.T) {
 		Args:     []byte(`{"account":"needle"}`),
 	}, base.Add(3*time.Minute))
 	seedDeadLetterJobWithDetails(t, s, &core.Job{
-		ID:       "dlq-acme-dev",
+		ID:       testUUID("dlq-acme-dev"),
 		Type:     "sync",
 		Queue:    "default",
 		Tenant:   "tenant-a",
@@ -134,7 +134,7 @@ func TestDeadLetterQueries_TenantMetadataAndSearch(t *testing.T) {
 		Args:     []byte(`{"account":"other"}`),
 	}, base.Add(2*time.Minute))
 	seedDeadLetterJobWithDetails(t, s, &core.Job{
-		ID:       "dlq-globex-prod",
+		ID:       testUUID("dlq-globex-prod"),
 		Type:     "sync",
 		Queue:    "default",
 		Tenant:   "tenant-b",
@@ -151,7 +151,7 @@ func TestDeadLetterQueries_TenantMetadataAndSearch(t *testing.T) {
 	matches, err := s.ListDeadLettered(ctx, filter)
 	require.NoError(t, err)
 	require.Len(t, matches, 1)
-	assert.Equal(t, "dlq-acme-prod", matches[0].ID)
+	assert.Equal(t, testUUID("dlq-acme-prod"), matches[0].ID)
 
 	total, err := s.CountDeadLettered(ctx, filter)
 	require.NoError(t, err)
@@ -164,25 +164,25 @@ func TestDeadLetterQueries_MetaContainsRequiresAllPairs(t *testing.T) {
 
 	base := time.Now().UTC().Add(-time.Hour).Truncate(time.Millisecond)
 	seedDeadLetterJobWithDetails(t, s, &core.Job{
-		ID:       "dlq-region-us-prod",
+		ID:       testUUID("dlq-region-us-prod"),
 		Type:     "sync",
 		Queue:    "default",
 		Metadata: core.MetadataMap{"env": "prod", "region": "us", "tier": "gold"},
 	}, base.Add(3*time.Minute))
 	seedDeadLetterJobWithDetails(t, s, &core.Job{
-		ID:       "dlq-region-us-dev",
+		ID:       testUUID("dlq-region-us-dev"),
 		Type:     "sync",
 		Queue:    "default",
 		Metadata: core.MetadataMap{"env": "dev", "region": "us", "tier": "gold"},
 	}, base.Add(2*time.Minute))
 	seedDeadLetterJobWithDetails(t, s, &core.Job{
-		ID:       "dlq-region-eu-prod",
+		ID:       testUUID("dlq-region-eu-prod"),
 		Type:     "sync",
 		Queue:    "default",
 		Metadata: core.MetadataMap{"env": "prod", "region": "eu", "tier": "silver"},
 	}, base.Add(time.Minute))
 	seedDeadLetterJobWithDetails(t, s, &core.Job{
-		ID:       "dlq-no-match",
+		ID:       testUUID("dlq-no-match"),
 		Type:     "sync",
 		Queue:    "default",
 		Metadata: core.MetadataMap{"env": "stage", "region": "ap"},
@@ -194,7 +194,7 @@ func TestDeadLetterQueries_MetaContainsRequiresAllPairs(t *testing.T) {
 	}
 	regionMatches, err := s.ListDeadLettered(ctx, regionFilter)
 	require.NoError(t, err)
-	assert.ElementsMatch(t, []string{"dlq-region-us-prod", "dlq-region-us-dev"}, deadLetterJobIDs(regionMatches))
+	assert.ElementsMatch(t, []string{string(testUUID("dlq-region-us-prod")), string(testUUID("dlq-region-us-dev"))}, deadLetterJobIDs(regionMatches))
 
 	multiPairFilter := core.DeadLetterFilter{
 		MetaContains: &core.MetadataMap{"env": "prod", "region": "us"},
@@ -203,7 +203,7 @@ func TestDeadLetterQueries_MetaContainsRequiresAllPairs(t *testing.T) {
 	multiPairMatches, err := s.ListDeadLettered(ctx, multiPairFilter)
 	require.NoError(t, err)
 	require.Len(t, multiPairMatches, 1)
-	assert.Equal(t, "dlq-region-us-prod", multiPairMatches[0].ID)
+	assert.Equal(t, testUUID("dlq-region-us-prod"), multiPairMatches[0].ID)
 
 	total, err := s.CountDeadLettered(ctx, multiPairFilter)
 	require.NoError(t, err)
@@ -213,15 +213,24 @@ func TestDeadLetterQueries_MetaContainsRequiresAllPairs(t *testing.T) {
 func seedDeadLetterJob(t *testing.T, s *GormStorage, id, queue, jobType string, at time.Time) {
 	t.Helper()
 	seedDeadLetterJobWithDetails(t, s, &core.Job{
-		ID:    id,
 		Type:  jobType,
 		Queue: queue,
+		Metadata: map[string]string{
+			"test_id": id,
+		},
 	}, at)
 }
 
 func seedDeadLetterJobWithDetails(t *testing.T, s *GormStorage, job *core.Job, at time.Time) {
 	t.Helper()
 	ctx := context.Background()
+	if job.ID == "" {
+		if job.Metadata != nil && job.Metadata["test_id"] != "" {
+			job.ID = testUUID(job.Metadata["test_id"])
+		} else {
+			job.ID = core.NewID()
+		}
+	}
 	job.Status = core.StatusFailed
 	job.Attempt = 1
 	job.MaxRetries = 1
@@ -237,7 +246,11 @@ func seedDeadLetterJobWithDetails(t *testing.T, s *GormStorage, job *core.Job, a
 func deadLetterJobIDs(jobs []*core.Job) []string {
 	ids := make([]string, len(jobs))
 	for i, job := range jobs {
-		ids[i] = job.ID
+		if job.Metadata != nil && job.Metadata["test_id"] != "" {
+			ids[i] = job.Metadata["test_id"]
+		} else {
+			ids[i] = string(job.ID)
+		}
 	}
 	return ids
 }

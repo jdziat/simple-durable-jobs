@@ -6,6 +6,6 @@
 //   - Clamping functions to enforce safe limits on retries and concurrency
 //   - Security-related constants defining maximum sizes and counts
 //
-// Most users should import the root package github.com/jdziat/simple-durable-jobs/v2
+// Most users should import the root package github.com/jdziat/simple-durable-jobs/v3
 // which re-exports these functions.
 package security

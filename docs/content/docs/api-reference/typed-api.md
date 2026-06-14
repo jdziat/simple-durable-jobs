@@ -6,7 +6,7 @@ weight: 4
 ## Package `typed`
 
 ```go
-import typed "github.com/jdziat/simple-durable-jobs/v2/pkg/typed"
+import typed "github.com/jdziat/simple-durable-jobs/v3/pkg/typed"
 ```
 
 The typed API adds compile-time checked handles over the existing string-keyed
@@ -16,7 +16,8 @@ and `Queue.Enqueue`.
 
 Keep using `Queue.Register`, `Queue.Enqueue`, and `Queue.EnqueueRemote` directly
 when job names are dynamic, configured at runtime, or produced by non-Go
-systems.
+systems. `Queue.EnqueueRemote` still permits producer-only enqueue, but rejects
+malformed job names.
 
 ---
 
@@ -25,7 +26,8 @@ systems.
 ### `Define[A any, R any](q *queue.Queue, name string, fn func(context.Context, A) (R, error), opts ...queue.Option) *Def[A, R]`
 
 Registers a typed handler and returns a typed definition handle. Like
-`Queue.Register`, invalid handler registration panics.
+`Queue.Register`, invalid handler registration panics. The result type `R` must
+match the handler's return type.
 
 ```go
 sendEmail := typed.Define(queue, "send-email", func(ctx context.Context, args SendEmailArgs) (SendEmailResult, error) {
@@ -33,18 +35,18 @@ sendEmail := typed.Define(queue, "send-email", func(ctx context.Context, args Se
 })
 ```
 
-### `Declare[A any, R any](q *queue.Queue, name string) *Def[A, R]`
+### `DeclareUnchecked[A any, R any](q *queue.Queue, name string) *Def[A, R]`
 
 Returns a typed handle without registering a local handler. Use this in
 producer-only processes that enqueue work for workers running elsewhere.
 
 ```go
-sendEmail := typed.Declare[SendEmailArgs, SendEmailResult](queue, "send-email")
+sendEmail := typed.DeclareUnchecked[SendEmailArgs, SendEmailResult](queue, "send-email")
 jobID, err := sendEmail.EnqueueRemote(ctx, SendEmailArgs{To: "user@example.com"})
 ```
 
-`Declare` cannot validate that the remote worker's handler uses the same
-argument and result types. Keep those types synchronized with the worker.
+`DeclareUnchecked` cannot validate that the remote worker's handler uses the
+same argument and result types. Keep those types synchronized with the worker.
 
 ### `DefineVoid[A any](q *queue.Queue, name string, fn func(context.Context, A) error, opts ...queue.Option) *Def[A, struct{}]`
 
@@ -102,10 +104,9 @@ approval, ok, err := typed.WaitForSignalTimeout[Approval](ctx, "approval", time.
 
 ### `Signal(ctx context.Context, q *queue.Queue, jobID, name string, payload any) error`
 
-Sends a signal to a specific job ID, preserving the root
-`jobs.Signal(ctx, q, jobID, name, payload)` shape. The payload is still accepted
-as `any` because senders often live outside the workflow and may not share a
-typed definition handle for the receiving wait.
+Sends a signal to a specific job ID. The payload is still accepted as `any`
+because senders often live outside the workflow and may not share a typed
+definition handle for the receiving wait.
 
 ```go
 err := typed.Signal(ctx, queue, jobID, "approval", Approval{ApprovedBy: "alice"})
@@ -141,7 +142,7 @@ jobID, err := sendEmail.Enqueue(ctx, SendEmailArgs{To: "user@example.com"},
 ### `(*Def[A, R]) EnqueueRemote(ctx context.Context, args A, opts ...queue.Option) (string, error)`
 
 Adds a typed job without requiring a local handler registration. This is the
-typed wrapper for `Queue.EnqueueRemote`.
+typed wrapper for `Queue.EnqueueRemote`; malformed job names are rejected.
 
 ```go
 jobID, err := sendEmail.EnqueueRemote(ctx, SendEmailArgs{To: "user@example.com"})
@@ -187,8 +188,8 @@ import (
     "context"
     "fmt"
 
-    jobs "github.com/jdziat/simple-durable-jobs/v2"
-    typed "github.com/jdziat/simple-durable-jobs/v2/pkg/typed"
+    jobs "github.com/jdziat/simple-durable-jobs/v3"
+    typed "github.com/jdziat/simple-durable-jobs/v3/pkg/typed"
     "gorm.io/driver/sqlite"
     "gorm.io/gorm"
 )

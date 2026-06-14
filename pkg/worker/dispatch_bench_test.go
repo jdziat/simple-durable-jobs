@@ -9,8 +9,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/queue"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/queue"
 )
 
 type deterministicDequeueStorage struct {
@@ -23,7 +23,7 @@ func newDeterministicDequeueStorage(n int) *deterministicDequeueStorage {
 	jobs := make([]*core.Job, 0, n)
 	for i := 0; i < n; i++ {
 		jobs = append(jobs, &core.Job{
-			ID:     fmt.Sprintf("job-%04d", i),
+			ID:     core.UUID(fmt.Sprintf("job-%04d", i)),
 			Type:   "work",
 			Queue:  "default",
 			Args:   []byte(`{}`),

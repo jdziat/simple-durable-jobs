@@ -16,7 +16,7 @@ import (
 	"strings"
 	"time"
 
-	jobs "github.com/jdziat/simple-durable-jobs/v2"
+	jobs "github.com/jdziat/simple-durable-jobs/v3"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
@@ -143,7 +143,7 @@ func main() {
 		// are durable and FIFO per job/name, so the approval is still consumed.
 		time.Sleep(8 * time.Second)
 		fmt.Println("Main sending human approval signal")
-		if err := jobs.Signal(ctx, queue, jobID, "approval", true); err != nil {
+		if err := queue.Signal(ctx, jobID, "approval", true); err != nil {
 			log.Printf("failed to send approval: %v", err)
 		}
 	}()
@@ -157,7 +157,7 @@ func main() {
 	fmt.Println("Agent example complete: durable agent reached the final action")
 }
 
-func waitForStatus(ctx context.Context, storage jobs.Storage, jobID string, want jobs.JobStatus, timeout time.Duration) error {
+func waitForStatus(ctx context.Context, storage jobs.Storage, jobID jobs.UUID, want jobs.JobStatus, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		job, err := storage.GetJob(ctx, jobID)

@@ -8,11 +8,11 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/queue"
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/storage"
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/typed"
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/worker"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/queue"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/storage"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/typed"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/worker"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
@@ -28,7 +28,7 @@ type exampleResult struct {
 
 func ExampleDef() {
 	q := queue.New(nil)
-	def := typed.Define(q, "typedExampleDef", func(_ context.Context, a exampleArgs) (exampleResult, error) {
+	def := typed.Define[exampleArgs, exampleResult](q, "typedExampleDef", func(_ context.Context, a exampleArgs) (exampleResult, error) {
 		return exampleResult{Greeting: "hello " + a.UserID}, nil
 	})
 
@@ -38,7 +38,7 @@ func ExampleDef() {
 
 func ExampleDefine() {
 	q := queue.New(nil)
-	def := typed.Define(q, "typedExampleDefine", func(_ context.Context, a exampleArgs) (exampleResult, error) {
+	def := typed.Define[exampleArgs, exampleResult](q, "typedExampleDefine", func(_ context.Context, a exampleArgs) (exampleResult, error) {
 		return exampleResult{Greeting: "hello " + a.UserID}, nil
 	})
 
@@ -48,7 +48,7 @@ func ExampleDefine() {
 
 func ExampleDefineE() {
 	q := queue.New(nil)
-	def, err := typed.DefineE(q, "typedExampleDefineE", func(_ context.Context, a exampleArgs) (exampleResult, error) {
+	def, err := typed.DefineE[exampleArgs, exampleResult](q, "typedExampleDefineE", func(_ context.Context, a exampleArgs) (exampleResult, error) {
 		return exampleResult{Greeting: "hello " + a.UserID}, nil
 	})
 	if err != nil {
@@ -59,9 +59,9 @@ func ExampleDefineE() {
 	// Output: typedExampleDefineE
 }
 
-func ExampleDeclare() {
+func ExampleDeclareUnchecked() {
 	q := queue.New(newExampleStorage())
-	def := typed.Declare[exampleArgs, exampleResult](q, "typedExampleDeclaredRemote")
+	def := typed.DeclareUnchecked[exampleArgs, exampleResult](q, "typedExampleDeclaredRemote")
 
 	jobID, err := def.EnqueueRemote(context.Background(), exampleArgs{UserID: "u-123"})
 	if err != nil {
@@ -83,7 +83,7 @@ func ExampleDefineVoid() {
 
 func ExampleDef_Name() {
 	q := queue.New(nil)
-	def := typed.Define(q, "typedExampleName", func(_ context.Context, a exampleArgs) (exampleResult, error) {
+	def := typed.Define[exampleArgs, exampleResult](q, "typedExampleName", func(_ context.Context, a exampleArgs) (exampleResult, error) {
 		return exampleResult{Greeting: a.UserID}, nil
 	})
 
@@ -93,7 +93,7 @@ func ExampleDef_Name() {
 
 func ExampleDef_Enqueue() {
 	q := queue.New(newExampleStorage())
-	def := typed.Define(q, "typedExampleEnqueue", func(_ context.Context, a exampleArgs) (exampleResult, error) {
+	def := typed.Define[exampleArgs, exampleResult](q, "typedExampleEnqueue", func(_ context.Context, a exampleArgs) (exampleResult, error) {
 		return exampleResult{Greeting: a.UserID}, nil
 	})
 
@@ -107,7 +107,7 @@ func ExampleDef_Enqueue() {
 
 func ExampleDef_EnqueueRemote() {
 	q := queue.New(newExampleStorage())
-	def := typed.Declare[exampleArgs, exampleResult](q, "typedExampleEnqueueRemote")
+	def := typed.DeclareUnchecked[exampleArgs, exampleResult](q, "typedExampleEnqueueRemote")
 
 	jobID, err := def.EnqueueRemote(context.Background(), exampleArgs{UserID: "u-123"})
 	if err != nil {
@@ -121,7 +121,7 @@ func ExampleDef_EnqueueTx() {
 	q, store, cleanup := newExampleDurableQueue()
 	defer cleanup()
 
-	def := typed.Define(q, "typedExampleEnqueueTx", func(_ context.Context, a exampleArgs) (exampleResult, error) {
+	def := typed.Define[exampleArgs, exampleResult](q, "typedExampleEnqueueTx", func(_ context.Context, a exampleArgs) (exampleResult, error) {
 		return exampleResult{Greeting: a.UserID}, nil
 	})
 
@@ -154,10 +154,10 @@ func ExampleDef_Call() {
 	q, store, cleanup := newExampleDurableQueue()
 	defer cleanup()
 
-	child := typed.Define(q, "typedExampleCallChild", func(_ context.Context, a exampleArgs) (exampleResult, error) {
+	child := typed.Define[exampleArgs, exampleResult](q, "typedExampleCallChild", func(_ context.Context, a exampleArgs) (exampleResult, error) {
 		return exampleResult{Greeting: "child:" + a.UserID}, nil
 	})
-	parent := typed.Define(q, "typedExampleCallParent", func(ctx context.Context, a exampleArgs) (exampleResult, error) {
+	parent := typed.Define[exampleArgs, exampleResult](q, "typedExampleCallParent", func(ctx context.Context, a exampleArgs) (exampleResult, error) {
 		got, err := child.Call(ctx, a)
 		if err != nil {
 			return exampleResult{}, err
@@ -182,7 +182,7 @@ func ExampleDef_Call() {
 
 func ExampleDef_Load() {
 	q := queue.New(newExampleStorage())
-	def := typed.Define(q, "typedExampleLoad", func(_ context.Context, a exampleArgs) (exampleResult, error) {
+	def := typed.Define[exampleArgs, exampleResult](q, "typedExampleLoad", func(_ context.Context, a exampleArgs) (exampleResult, error) {
 		return exampleResult{Greeting: a.UserID}, nil
 	})
 
@@ -234,7 +234,7 @@ func ExampleWaitForSignalTimeout() {
 
 func ExampleSubJobOf() {
 	q := queue.New(nil)
-	def := typed.Define(q, "typedExampleSubJobOf", func(_ context.Context, a exampleArgs) (exampleResult, error) {
+	def := typed.Define[exampleArgs, exampleResult](q, "typedExampleSubJobOf", func(_ context.Context, a exampleArgs) (exampleResult, error) {
 		return exampleResult{Greeting: a.UserID}, nil
 	})
 
@@ -274,7 +274,7 @@ func newExampleDurableQueue() (*queue.Queue, core.Storage, func()) {
 	return queue.New(store), store, cleanup
 }
 
-func runExampleWorkerUntilStatus(q *queue.Queue, store core.Storage, jobID string, want core.JobStatus) {
+func runExampleWorkerUntilStatus(q *queue.Queue, store core.Storage, jobID core.UUID, want core.JobStatus) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 

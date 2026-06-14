@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	jobs "github.com/jdziat/simple-durable-jobs/v2"
+	jobs "github.com/jdziat/simple-durable-jobs/v3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -33,7 +33,7 @@ func startExecWorker(t *testing.T, q *jobs.Queue) {
 	})
 }
 
-func waitForExecJob(t *testing.T, store jobs.Storage, jobID string, want jobs.JobStatus) *jobs.Job {
+func waitForExecJob(t *testing.T, store jobs.Storage, jobID jobs.UUID, want jobs.JobStatus) *jobs.Job {
 	t.Helper()
 	var got *jobs.Job
 	require.Eventually(t, func() bool {

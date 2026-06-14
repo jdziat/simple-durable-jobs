@@ -8,7 +8,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/core"
 )
 
 func TestGormStorage_SaveCheckpointTx_CommitAndRollbackVisibility(t *testing.T) {
@@ -16,12 +16,12 @@ func TestGormStorage_SaveCheckpointTx_CommitAndRollbackVisibility(t *testing.T) 
 	s := newTxEnqueueTestStorage(t)
 
 	t.Run("commit", func(t *testing.T) {
-		seedTestJob(t, ctx, s, "job-tx-commit", core.StatusRunning)
-		seedTestJob(t, ctx, s, "job-plain-commit", core.StatusRunning)
+		seedTestJob(t, ctx, s, testUUID("job-tx-commit"), core.StatusRunning)
+		seedTestJob(t, ctx, s, testUUID("job-plain-commit"), core.StatusRunning)
 		resultBytes, err := json.Marshal(map[string]string{"status": "done"})
 		require.NoError(t, err)
 		cp := &core.Checkpoint{
-			JobID:     "job-tx-commit",
+			JobID:     testUUID("job-tx-commit"),
 			CallIndex: -1,
 			CallType:  "phase.commit",
 			Result:    resultBytes,
@@ -47,7 +47,7 @@ func TestGormStorage_SaveCheckpointTx_CommitAndRollbackVisibility(t *testing.T) 
 		assert.JSONEq(t, string(resultBytes), string(after[0].Result))
 
 		plain := &core.Checkpoint{
-			JobID:     "job-plain-commit",
+			JobID:     testUUID("job-plain-commit"),
 			CallIndex: -1,
 			CallType:  "phase.commit",
 			Result:    resultBytes,
@@ -62,9 +62,9 @@ func TestGormStorage_SaveCheckpointTx_CommitAndRollbackVisibility(t *testing.T) 
 	})
 
 	t.Run("rollback", func(t *testing.T) {
-		seedTestJob(t, ctx, s, "job-tx-rollback", core.StatusRunning)
+		seedTestJob(t, ctx, s, testUUID("job-tx-rollback"), core.StatusRunning)
 		cp := &core.Checkpoint{
-			JobID:     "job-tx-rollback",
+			JobID:     testUUID("job-tx-rollback"),
 			CallIndex: -1,
 			CallType:  "phase.rollback",
 			Result:    []byte(`"rolled-back"`),

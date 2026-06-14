@@ -8,7 +8,7 @@ import "time"
 // instead of consuming another slot.
 type ConcurrencySlot struct {
 	SlotName  string    `gorm:"primaryKey;size:255;index:idx_concurrency_slots_live,priority:1"`
-	JobID     string    `gorm:"primaryKey;size:36"`
+	JobID     UUID      `gorm:"primaryKey"`
 	WorkerID  string    `gorm:"size:255"`
 	ExpiresAt time.Time `gorm:"index;index:idx_concurrency_slots_live,priority:2"`
 }

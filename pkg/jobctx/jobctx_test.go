@@ -15,9 +15,9 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
-	intctx "github.com/jdziat/simple-durable-jobs/v2/pkg/internal/context"
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/storage"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/core"
+	intctx "github.com/jdziat/simple-durable-jobs/v3/pkg/internal/context"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/storage"
 )
 
 func TestJobFromContext(t *testing.T) {
@@ -351,7 +351,7 @@ func TestSavePhaseCheckpoint(t *testing.T) {
 	})
 }
 
-func newTestVersionContext(jobID string, checkpoints []core.Checkpoint, save func(context.Context, *core.Checkpoint) error) context.Context {
+func newTestVersionContext(jobID core.UUID, checkpoints []core.Checkpoint, save func(context.Context, *core.Checkpoint) error) context.Context {
 	if save == nil {
 		save = func(context.Context, *core.Checkpoint) error { return nil }
 	}

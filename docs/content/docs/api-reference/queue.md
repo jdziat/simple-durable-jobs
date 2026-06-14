@@ -6,7 +6,7 @@ weight: 1
 ## Package `jobs`
 
 ```go
-import jobs "github.com/jdziat/simple-durable-jobs/v2"
+import jobs "github.com/jdziat/simple-durable-jobs/v3"
 ```
 
 ---
@@ -49,12 +49,31 @@ jobID, err := queue.Enqueue(ctx, "send-email", EmailArgs{
 })
 ```
 
-### `(*Queue) Schedule(name string, args any, sched Schedule, opts ...Option)`
+### `(*Queue) EnqueueRemote(ctx context.Context, name string, args any, opts ...Option) (string, error)`
 
-Registers a recurring job with the given schedule.
+Adds a job without requiring a local handler registration. Use this for
+producer-only processes that enqueue work for workers running elsewhere.
+Malformed job names are rejected.
 
 ```go
-queue.Schedule("cleanup", nil, jobs.Every(5 * time.Minute))
+jobID, err := queue.EnqueueRemote(ctx, "send-email", EmailArgs{
+    To: "user@example.com",
+})
+```
+
+### `(*Queue) Schedule(name string, args any, sched Schedule, opts ...Option) error`
+
+Registers a recurring job with the given schedule. The job name must already be
+registered, and duplicate scheduled names return an error.
+
+```go
+queue.Register("cleanup", func(ctx context.Context, _ struct{}) error {
+    return cleanup(ctx)
+})
+
+if err := queue.Schedule("cleanup", nil, jobs.Every(5*time.Minute)); err != nil {
+    return err
+}
 ```
 
 ### `(*Queue) NewWorker(opts ...WorkerOption) *Worker`

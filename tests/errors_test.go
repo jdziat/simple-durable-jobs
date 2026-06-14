@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jdziat/simple-durable-jobs/v2"
+	"github.com/jdziat/simple-durable-jobs/v3"
 	"github.com/stretchr/testify/assert"
 )
 

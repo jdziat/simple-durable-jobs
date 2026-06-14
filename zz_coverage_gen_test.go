@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	jobs "github.com/jdziat/simple-durable-jobs/v2"
+	jobs "github.com/jdziat/simple-durable-jobs/v3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -151,18 +151,19 @@ func TestGenQueueNewWorker_NoOptions(t *testing.T) {
 
 func TestGenLoadResult_JobNotFound(t *testing.T) {
 	q, _ := setupIsolatedStorage(t)
-	_, err := jobs.LoadResult[string](context.Background(), q, "does-not-exist")
+	_, err := jobs.LoadResult[string](context.Background(), q, jobs.NewID())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "not found")
 }
 
 func TestGenLoadResult_DecodeFailure(t *testing.T) {
 	q, store := setupIsolatedStorage(t)
+	id := jobs.NewID()
 
 	// Persist a completed job whose Result is a JSON string, then attempt to
 	// decode it into a struct — forcing json.Unmarshal to fail.
 	require.NoError(t, store.Enqueue(context.Background(), &jobs.Job{
-		ID:     "job-bad-decode",
+		ID:     id,
 		Type:   "x",
 		Status: jobs.StatusCompleted,
 		Result: []byte(`"a plain string"`),
@@ -171,7 +172,7 @@ func TestGenLoadResult_DecodeFailure(t *testing.T) {
 	type Target struct {
 		Field int `json:"field"`
 	}
-	_, err := jobs.LoadResult[Target](context.Background(), q, "job-bad-decode")
+	_, err := jobs.LoadResult[Target](context.Background(), q, id)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "decode")
 }

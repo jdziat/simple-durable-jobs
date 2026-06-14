@@ -42,7 +42,7 @@ func TestJob_WithValues(t *testing.T) {
 		RunAt:      &now,
 	}
 
-	assert.Equal(t, "test-123", job.ID)
+	assert.Equal(t, UUID("test-123"), job.ID)
 	assert.Equal(t, "send-email", job.Type)
 	assert.Equal(t, "emails", job.Queue)
 	assert.Equal(t, 10, job.Priority)
@@ -61,8 +61,8 @@ func TestCheckpoint_Fields(t *testing.T) {
 		Error:     "",
 	}
 
-	assert.Equal(t, "cp-123", cp.ID)
-	assert.Equal(t, "job-456", cp.JobID)
+	assert.Equal(t, UUID("cp-123"), cp.ID)
+	assert.Equal(t, UUID("job-456"), cp.JobID)
 	assert.Equal(t, 0, cp.CallIndex)
 	assert.Equal(t, "fetch-data", cp.CallType)
 	assert.NotEmpty(t, cp.Result)

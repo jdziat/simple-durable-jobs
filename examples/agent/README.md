@@ -78,4 +78,4 @@ The repeated `Starting task` and `Iteration 0/1 result` lines are replays. The m
 - [API Reference - Workflow Signals](https://jdziat.github.io/simple-durable-jobs/docs/api-reference/signals/)
 - [Advanced - Durable Timers](https://jdziat.github.io/simple-durable-jobs/docs/advanced/durable-timers/)
 - [Advanced - Workflow Versioning](https://jdziat.github.io/simple-durable-jobs/docs/advanced/workflow-versioning/)
-- [pkg.go.dev - simple-durable-jobs](https://pkg.go.dev/github.com/jdziat/simple-durable-jobs/v2)
+- [pkg.go.dev - simple-durable-jobs](https://pkg.go.dev/github.com/jdziat/simple-durable-jobs/v3)

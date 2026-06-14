@@ -17,9 +17,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
-	intctx "github.com/jdziat/simple-durable-jobs/v2/pkg/internal/context"
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/security"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/core"
+	intctx "github.com/jdziat/simple-durable-jobs/v3/pkg/internal/context"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/security"
 )
 
 // maxSignalNameLen bounds the signal name (matches the storage column size).
@@ -38,18 +38,18 @@ var ErrSignalNameReserved = errors.New("signal: names starting with _ are reserv
 // implements it; backends that don't get core.ErrStorageNoSignals. MarkWaiting
 // (indefinite wait) is part of core.Storage and used directly.
 type signalStorage interface {
-	SendSignal(ctx context.Context, jobID, name string, payload []byte) error
-	PeekSignal(ctx context.Context, jobID, name string) (*core.Signal, error)
+	SendSignal(ctx context.Context, jobID core.UUID, name string, payload []byte) error
+	PeekSignal(ctx context.Context, jobID core.UUID, name string) (*core.Signal, error)
 	// ConsumeSignalTx consumes the oldest pending signal of name AND persists
 	// the replay checkpoint built from it in ONE transaction (atomic
 	// consume+checkpoint). Replaces the old ConsumeSignal+separate-writeCheckpoint
 	// torn-write pair.
-	ConsumeSignalTx(ctx context.Context, jobID, name string, buildCheckpoint func(sig *core.Signal) (*core.Checkpoint, error)) (*core.Signal, error)
+	ConsumeSignalTx(ctx context.Context, jobID core.UUID, name string, buildCheckpoint func(sig *core.Signal) (*core.Checkpoint, error)) (*core.Signal, error)
 	// DrainSignalsTx consumes ALL pending signals of name AND persists a single
 	// replay checkpoint built from the batch in ONE transaction (the closure is
 	// always invoked, even for an empty batch).
-	DrainSignalsTx(ctx context.Context, jobID, name string, buildCheckpoint func(sigs []*core.Signal) (*core.Checkpoint, error)) ([]*core.Signal, error)
-	MarkWaitingWithDeadline(ctx context.Context, jobID, workerID string, d time.Duration) error
+	DrainSignalsTx(ctx context.Context, jobID core.UUID, name string, buildCheckpoint func(sigs []*core.Signal) (*core.Checkpoint, error)) ([]*core.Signal, error)
+	MarkWaitingWithDeadline(ctx context.Context, jobID core.UUID, workerID string, d time.Duration) error
 }
 
 // WaitingError signals the worker that the job has suspended itself into
@@ -195,7 +195,7 @@ type sleepCheckpoint struct {
 }
 
 type checkpointReader interface {
-	GetCheckpoints(ctx context.Context, jobID string) ([]core.Checkpoint, error)
+	GetCheckpoints(ctx context.Context, jobID core.UUID) ([]core.Checkpoint, error)
 }
 
 // WaitingOnFutureSleep reports whether job is currently parked by an

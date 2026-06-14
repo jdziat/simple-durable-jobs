@@ -6,7 +6,7 @@ import (
 
 	"gorm.io/gorm"
 
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/core"
 )
 
 // DeleteTerminalJobsOlderThan deletes at most limit jobs in one terminal status
@@ -39,7 +39,7 @@ func (s *GormStorage) DeleteTerminalJobsOlderThan(ctx context.Context, status co
 	err := s.withSerializationRetry(ctx, func() error {
 		deleted = 0
 		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-			var ids []string
+			var ids []core.UUID
 			query := tx.Model(&core.Job{}).
 				Where("status = ?", status).
 				Where("completed_at IS NOT NULL").

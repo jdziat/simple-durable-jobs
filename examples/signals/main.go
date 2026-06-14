@@ -14,7 +14,7 @@ import (
 	"path/filepath"
 	"time"
 
-	jobs "github.com/jdziat/simple-durable-jobs/v2"
+	jobs "github.com/jdziat/simple-durable-jobs/v3"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
@@ -100,7 +100,7 @@ func main() {
 	}
 	fmt.Printf("Enqueued approval workflow %s\n", jobID[:8])
 
-	if err := jobs.Signal(ctx, queue, jobID, "audit-note", "approved by alice@example.com"); err != nil {
+	if err := queue.Signal(ctx, jobID, "audit-note", "approved by alice@example.com"); err != nil {
 		log.Fatal(err)
 	}
 	fmt.Println("Main pre-buffered audit note before the workflow checked signals")
@@ -118,10 +118,10 @@ func main() {
 	}
 	fmt.Println("Main observed workflow waiting; sending audit note and approval")
 
-	if err := jobs.Signal(ctx, queue, jobID, "audit-note", "approval confirmed while waiting"); err != nil {
+	if err := queue.Signal(ctx, jobID, "audit-note", "approval confirmed while waiting"); err != nil {
 		log.Fatal(err)
 	}
-	if err := jobs.Signal(ctx, queue, jobID, "approval", true); err != nil {
+	if err := queue.Signal(ctx, jobID, "approval", true); err != nil {
 		log.Fatal(err)
 	}
 
@@ -134,7 +134,7 @@ func main() {
 	fmt.Println("Signals example complete: approval workflow finished successfully")
 }
 
-func waitForStatus(ctx context.Context, storage jobs.Storage, jobID string, want jobs.JobStatus, timeout time.Duration) error {
+func waitForStatus(ctx context.Context, storage jobs.Storage, jobID jobs.UUID, want jobs.JobStatus, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		job, err := storage.GetJob(ctx, jobID)

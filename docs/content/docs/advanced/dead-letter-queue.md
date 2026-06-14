@@ -26,7 +26,7 @@ Use the named triage helpers to inspect poison jobs without scanning all failed
 rows:
 
 ```go
-dead, err := jobs.ListDeadLettered(ctx, q,
+dead, err := q.ListDeadLettered(ctx,
 	jobs.DeadLetterQueue("emails"),
 	jobs.DeadLetterType("send-email"),
 	jobs.DeadLetterLimit(50),
@@ -35,7 +35,7 @@ if err != nil {
 	return err
 }
 
-count, err := jobs.CountDeadLettered(ctx, q, jobs.DeadLetterQueue("emails"))
+count, err := q.CountDeadLettered(ctx, jobs.DeadLetterQueue("emails"))
 if err != nil {
 	return err
 }
@@ -63,7 +63,7 @@ default identity codec the error text is stored verbatim. See
 [Payload Codec]({{< relref "/docs/advanced/payload-codec" >}}) for details.
 
 ```go
-ok, err := jobs.Requeue(ctx, q, jobID)
+ok, err := q.Requeue(ctx, jobID)
 if err != nil {
 	return err
 }

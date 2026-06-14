@@ -10,7 +10,7 @@ import (
 	"syscall"
 	"time"
 
-	jobs "github.com/jdziat/simple-durable-jobs/v2"
+	jobs "github.com/jdziat/simple-durable-jobs/v3"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
@@ -60,11 +60,15 @@ func main() {
 	// Schedule recurring jobs
 
 	// Health check every 5 seconds
-	queue.Schedule("health-check", nil, jobs.Every(5*time.Second))
+	if err := queue.Schedule("health-check", nil, jobs.Every(5*time.Second)); err != nil {
+		log.Fatal(err)
+	}
 	fmt.Println("Scheduled: health-check (every 5 seconds)")
 
 	// Cleanup every 10 seconds
-	queue.Schedule("cleanup-temp-files", nil, jobs.Every(10*time.Second))
+	if err := queue.Schedule("cleanup-temp-files", nil, jobs.Every(10*time.Second)); err != nil {
+		log.Fatal(err)
+	}
 	fmt.Println("Scheduled: cleanup-temp-files (every 10 seconds)")
 
 	// For demo purposes, using short intervals
@@ -80,10 +84,14 @@ func main() {
 	// queue.Schedule("health-check", nil, jobs.Cron("0 * * * *"))
 
 	// For demo, schedule these more frequently
-	queue.Schedule("send-daily-report", nil, jobs.Every(15*time.Second))
+	if err := queue.Schedule("send-daily-report", nil, jobs.Every(15*time.Second)); err != nil {
+		log.Fatal(err)
+	}
 	fmt.Println("Scheduled: send-daily-report (every 15 seconds for demo)")
 
-	queue.Schedule("backup-database", nil, jobs.Every(20*time.Second))
+	if err := queue.Schedule("backup-database", nil, jobs.Every(20*time.Second)); err != nil {
+		log.Fatal(err)
+	}
 	fmt.Println("Scheduled: backup-database (every 20 seconds for demo)")
 
 	// Start worker with scheduler enabled

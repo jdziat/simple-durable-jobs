@@ -3,9 +3,9 @@ package jobs
 import (
 	"context"
 
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/queue"
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/security"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/queue"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/security"
 )
 
 // PauseMode determines how pause operations behave.
@@ -25,7 +25,7 @@ const (
 // PauseJob pauses a specific job by ID.
 // This delegates to Queue.PauseJob so that running jobs have their context
 // cancelled via the running-job registry when PauseModeAggressive is used.
-func PauseJob(ctx context.Context, q *Queue, jobID string, opts ...PauseOption) error {
+func PauseJob(ctx context.Context, q *Queue, jobID UUID, opts ...PauseOption) error {
 	return q.PauseJob(ctx, jobID, opts...)
 }
 
@@ -35,18 +35,18 @@ func PauseJob(ctx context.Context, q *Queue, jobID string, opts ...PauseOption) 
 // waiting jobs follow the underlying pause behavior. Already paused jobs,
 // terminal jobs, and missing jobs return the same sentinel errors as PauseJob,
 // such as ErrJobAlreadyPaused, ErrCannotPauseStatus, or ErrJobNotFound.
-func CancelJob(ctx context.Context, q *Queue, jobID string) error {
+func CancelJob(ctx context.Context, q *Queue, jobID UUID) error {
 	return q.CancelJob(ctx, jobID)
 }
 
 // ResumeJob resumes a paused job using storage only.
 // It does not emit a JobResumed event; callers wanting events should use Queue.ResumeJob.
-func ResumeJob(ctx context.Context, storage Storage, jobID string) error {
+func ResumeJob(ctx context.Context, storage Storage, jobID UUID) error {
 	return storage.UnpauseJob(ctx, jobID)
 }
 
 // IsJobPaused checks if a job is paused.
-func IsJobPaused(ctx context.Context, storage Storage, jobID string) (bool, error) {
+func IsJobPaused(ctx context.Context, storage Storage, jobID UUID) (bool, error) {
 	return storage.IsJobPaused(ctx, jobID)
 }
 

@@ -8,10 +8,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
-	intctx "github.com/jdziat/simple-durable-jobs/v2/pkg/internal/context"
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/internal/handler"
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/security"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/core"
+	intctx "github.com/jdziat/simple-durable-jobs/v3/pkg/internal/context"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/internal/handler"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/security"
 )
 
 func TestCallWithoutJobContext(t *testing.T) {
@@ -1141,7 +1141,7 @@ func (s *testCheckpointStore) SaveCheckpoint(ctx context.Context, cp *core.Check
 	return nil
 }
 
-func (s *testCheckpointStore) GetCheckpoints(ctx context.Context, jobID string) ([]core.Checkpoint, error) {
+func (s *testCheckpointStore) GetCheckpoints(ctx context.Context, jobID core.UUID) ([]core.Checkpoint, error) {
 	var checkpoints []core.Checkpoint
 	for _, cp := range s.checkpoints {
 		if cp.JobID == jobID {

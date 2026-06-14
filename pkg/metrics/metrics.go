@@ -2,7 +2,7 @@
 //
 // Usage:
 //
-//	import jobsmetrics "github.com/jdziat/simple-durable-jobs/v2/pkg/metrics"
+//	import jobsmetrics "github.com/jdziat/simple-durable-jobs/v3/pkg/metrics"
 //
 //	queue := jobs.New(storage)
 //	jobsmetrics.Instrument(queue)
@@ -26,11 +26,11 @@ import (
 	"go.opentelemetry.io/otel/metric"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/queue"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/queue"
 )
 
-const instrumentationName = "github.com/jdziat/simple-durable-jobs/v2/pkg/metrics"
+const instrumentationName = "github.com/jdziat/simple-durable-jobs/v3/pkg/metrics"
 
 const (
 	metricJobsStarted      = "jobs.started"
@@ -215,8 +215,8 @@ func retryHook(inst *instruments) func(context.Context, *core.Job, int, error) {
 	}
 }
 
-func reclaimHook(inst *instruments) func(context.Context, string, string) {
-	return func(ctx context.Context, _ string, reason string) {
+func reclaimHook(inst *instruments) func(context.Context, core.UUID, string) {
+	return func(ctx context.Context, _ core.UUID, reason string) {
 		inst.reclaimed.Add(ctx, 1, metric.WithAttributes(attribute.String(attrReason, reason)))
 	}
 }

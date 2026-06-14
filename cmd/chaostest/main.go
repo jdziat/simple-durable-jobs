@@ -14,7 +14,7 @@ import (
 	"syscall"
 	"time"
 
-	jobs "github.com/jdziat/simple-durable-jobs/v2"
+	jobs "github.com/jdziat/simple-durable-jobs/v3"
 	"gorm.io/driver/mysql"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
@@ -319,7 +319,7 @@ func registerHandlers(q *jobs.Queue, db *gorm.DB, dialect string) {
 				if _, done := jobs.LoadPhaseCheckpoint[bool](ctx, phase); done {
 					continue
 				}
-				if err := jobs.Signal(ctx, q, t.JobID, "sig", seq); err != nil {
+				if err := q.Signal(ctx, jobs.UUID(t.JobID), "sig", seq); err != nil {
 					return err
 				}
 				if err := jobs.SavePhaseCheckpoint(ctx, phase, true); err != nil {
@@ -368,7 +368,9 @@ func registerHandlers(q *jobs.Queue, db *gorm.DB, dialect string) {
 		}
 		return db.WithContext(ctx).Exec(stmt).Error
 	})
-	q.Schedule("chaos.tick", nil, jobs.Every(5*time.Second), jobs.Retries(0))
+	if err := q.Schedule("chaos.tick", nil, jobs.Every(5*time.Second), jobs.Retries(0)); err != nil {
+		panic(err)
+	}
 }
 
 func runWorker(parent context.Context, a *app) error {
@@ -456,7 +458,7 @@ func runSeed(ctx context.Context, a *app) error {
 				return
 			}
 			uniqueWindowedOK++
-			windowedIDs[id] = struct{}{}
+			windowedIDs[string(id)] = struct{}{}
 		}()
 	}
 	wg.Wait()
@@ -743,7 +745,21 @@ func checkTimerExactlyOnce(ctx context.Context, db *gorm.DB) invariant {
 
 func checkSlotNoLeak(ctx context.Context, db *gorm.DB) invariant {
 	var n int64
-	db.WithContext(ctx).Raw(`SELECT count(*) FROM concurrency_slots WHERE job_id <> '' AND expires_at > NOW()`).Scan(&n)
+	// The sentinel slot is stored as the nil UUID (16 zero bytes); job_id is now a
+	// binary uuid column, so compare against the bound nil-UUID value (its Value()
+	// encodes to 16 zero bytes per dialect) rather than the literal ''. Checking the
+	// error matters: a comparison that fails to typecheck must fail the invariant,
+	// not silently leave n=0 and report a false pass.
+	if err := db.WithContext(ctx).
+		Raw(`SELECT count(*) FROM concurrency_slots WHERE job_id <> ? AND expires_at > NOW()`, jobs.NilUUID).
+		Scan(&n).Error; err != nil {
+		return invariant{
+			name:   "INV-SLOT-NO-LEAK",
+			level:  "HARD",
+			pass:   false,
+			detail: fmt.Sprintf("slot-leak query failed: %v", err),
+		}
+	}
 	return invariant{
 		name:   "INV-SLOT-NO-LEAK",
 		level:  "HARD",
@@ -768,26 +784,28 @@ func checkRateWellFormed(ctx context.Context, db *gorm.DB, dialect string) invar
 	}
 }
 
-func insertSignalTarget(ctx context.Context, db *gorm.DB, jobID string, n int) error {
-	return db.WithContext(ctx).Exec(`INSERT INTO chaos_signal_targets (job_id, sig_count) VALUES (?, ?)`, jobID, n).Error
+func insertSignalTarget(ctx context.Context, db *gorm.DB, jobID jobs.UUID, n int) error {
+	return db.WithContext(ctx).Exec(`INSERT INTO chaos_signal_targets (job_id, sig_count) VALUES (?, ?)`, string(jobID), n).Error
 }
 
-func insertEffect(ctx context.Context, db *gorm.DB, jobID, marker string) error {
-	if jobID == "" {
-		jobID = "unknown"
+func insertEffect(ctx context.Context, db *gorm.DB, jobID jobs.UUID, marker string) error {
+	id := string(jobID)
+	if id == "" {
+		id = "unknown"
 	}
-	return db.WithContext(ctx).Exec(`INSERT INTO chaos_effects (job_id, marker) VALUES (?, ?)`, jobID, marker).Error
+	return db.WithContext(ctx).Exec(`INSERT INTO chaos_effects (job_id, marker) VALUES (?, ?)`, id, marker).Error
 }
 
-func insertEffectIgnoreDuplicate(ctx context.Context, db *gorm.DB, dialect, jobID, marker string) error {
-	if jobID == "" {
-		jobID = "unknown"
+func insertEffectIgnoreDuplicate(ctx context.Context, db *gorm.DB, dialect string, jobID jobs.UUID, marker string) error {
+	id := string(jobID)
+	if id == "" {
+		id = "unknown"
 	}
 	stmt := `INSERT INTO chaos_effects (job_id, marker) VALUES (?, ?) ON CONFLICT (job_id, marker) DO NOTHING`
 	if dialect == "mysql" {
 		stmt = `INSERT IGNORE INTO chaos_effects (job_id, marker) VALUES (?, ?)`
 	}
-	return db.WithContext(ctx).Exec(stmt, jobID, marker).Error
+	return db.WithContext(ctx).Exec(stmt, id, marker).Error
 }
 
 func isDuplicate(err error) bool {

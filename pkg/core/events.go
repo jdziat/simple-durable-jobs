@@ -46,7 +46,7 @@ func (*JobRetrying) eventMarker() {}
 
 // CheckpointSaved is emitted when a checkpoint is saved.
 type CheckpointSaved struct {
-	JobID     string
+	JobID     UUID
 	CallIndex int
 	CallType  string
 	Timestamp time.Time
@@ -79,7 +79,7 @@ func (*JobResumed) eventMarker() {}
 // timeout-deadline resumes without a pending signal, are not signal resumes and
 // should not emit this event.
 type JobResumedBySignal struct {
-	JobID      string
+	JobID      UUID
 	SignalName string
 	Timestamp  time.Time
 }
@@ -111,7 +111,7 @@ const (
 // reaper (stale_lock) and once on the victim (ownership_audit), on different
 // workers — keep the reason separable and do not sum across reasons.
 type JobReclaimed struct {
-	JobID     string
+	JobID     UUID
 	WorkerID  string
 	Reason    string
 	Timestamp time.Time
@@ -123,7 +123,7 @@ func (*JobReclaimed) eventMarker() {}
 // (via Signal). It lets an orchestrator observe that a signal landed; the job
 // consumes it later via WaitForSignal/CheckSignal/DrainSignals.
 type SignalDelivered struct {
-	JobID     string
+	JobID     UUID
 	Name      string
 	Timestamp time.Time
 }
@@ -166,7 +166,7 @@ func (*WorkerResumed) eventMarker() {}
 // CustomEvent is emitted by workers to carry arbitrary progress data
 // through the Events() channel without requiring new event types.
 type CustomEvent struct {
-	JobID     string
+	JobID     UUID
 	Kind      string // "progress", "phase_change", "log", etc.
 	Data      map[string]any
 	Timestamp time.Time

@@ -15,8 +15,8 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 
-	payloadcodec "github.com/jdziat/simple-durable-jobs/v2/pkg/codec"
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
+	payloadcodec "github.com/jdziat/simple-durable-jobs/v3/pkg/codec"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/core"
 )
 
 type markerXORCodec struct{}
@@ -279,7 +279,7 @@ func TestGormStorageSecretboxBypassesTenantAndMetadata(t *testing.T) {
 	}
 }
 
-func rawJobBytes(t *testing.T, db *gorm.DB, jobID, column string) []byte {
+func rawJobBytes(t *testing.T, db *gorm.DB, jobID core.UUID, column string) []byte {
 	t.Helper()
 	query := ""
 	switch column {
@@ -295,7 +295,7 @@ func rawJobBytes(t *testing.T, db *gorm.DB, jobID, column string) []byte {
 	return out
 }
 
-func rawJobString(t *testing.T, db *gorm.DB, jobID, column string) string {
+func rawJobString(t *testing.T, db *gorm.DB, jobID core.UUID, column string) string {
 	t.Helper()
 	query := ""
 	switch column {
@@ -311,14 +311,14 @@ func rawJobString(t *testing.T, db *gorm.DB, jobID, column string) string {
 	return out
 }
 
-func rawCheckpointResult(t *testing.T, db *gorm.DB, checkpointID string) []byte {
+func rawCheckpointResult(t *testing.T, db *gorm.DB, checkpointID core.UUID) []byte {
 	t.Helper()
 	var out []byte
 	require.NoError(t, db.Raw("SELECT result FROM checkpoints WHERE id = ?", checkpointID).Row().Scan(&out))
 	return out
 }
 
-func rawOldestSignalPayload(t *testing.T, db *gorm.DB, jobID, name string) []byte {
+func rawOldestSignalPayload(t *testing.T, db *gorm.DB, jobID core.UUID, name string) []byte {
 	t.Helper()
 	var out []byte
 	require.NoError(t, db.Raw(
@@ -424,7 +424,7 @@ func TestGormStorageCodecDecodesUIJobReadPaths(t *testing.T) {
 			assert.Equal(t, rootArgs, gotRoot.Args)
 
 			fanOut := &core.FanOut{
-				ID:          "ui-codec-fanout-" + name,
+				ID:          core.NewID(),
 				ParentJobID: rootJob.ID,
 				TotalCount:  1,
 				Strategy:    core.StrategyFailFast,
@@ -440,7 +440,7 @@ func TestGormStorageCodecDecodesUIJobReadPaths(t *testing.T) {
 			}
 			require.NoError(t, s.Enqueue(ctx, subJob))
 
-			subJobs, err := s.GetSubJobsByFanOuts(ctx, []string{fanOut.ID})
+			subJobs, err := s.GetSubJobsByFanOuts(ctx, []core.UUID{fanOut.ID})
 			require.NoError(t, err)
 			require.Len(t, subJobs, 1)
 			assert.Equal(t, subArgs, subJobs[0].Args)

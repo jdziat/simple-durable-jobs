@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jdziat/simple-durable-jobs/v2"
+	"github.com/jdziat/simple-durable-jobs/v3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
@@ -251,7 +251,7 @@ func TestQueue_Schedule(t *testing.T) {
 		return nil
 	})
 
-	queue.Schedule("scheduled-task", nil, jobs.Every(200*time.Millisecond))
+	require.NoError(t, queue.Schedule("scheduled-task", nil, jobs.Every(200*time.Millisecond)))
 
 	worker := queue.NewWorker(jobs.WithScheduler(true))
 	// Generous worker lifetime so the poll below has room when a loaded CI
@@ -277,10 +277,10 @@ func TestQueue_Schedule_WithOptions(t *testing.T) {
 		return nil
 	})
 
-	queue.Schedule("priority-scheduled", nil, jobs.Every(100*time.Millisecond),
+	require.NoError(t, queue.Schedule("priority-scheduled", nil, jobs.Every(100*time.Millisecond),
 		jobs.QueueOpt("high-priority"),
 		jobs.Priority(100),
-	)
+	))
 
 	worker := queue.NewWorker(
 		jobs.WorkerQueue("high-priority", jobs.Concurrency(1)),
@@ -354,7 +354,7 @@ func TestQueue_Enqueue_ConcurrentAccess(t *testing.T) {
 	// Enqueue concurrently
 	var wg atomic.Int32
 	wg.Store(10)
-	done := make(chan string, 10)
+	done := make(chan jobs.UUID, 10)
 
 	for i := 0; i < 10; i++ {
 		go func(n int) {
@@ -365,7 +365,7 @@ func TestQueue_Enqueue_ConcurrentAccess(t *testing.T) {
 	}
 
 	// Collect all job IDs
-	ids := make(map[string]bool)
+	ids := make(map[jobs.UUID]bool)
 	for i := 0; i < 10; i++ {
 		id := <-done
 		ids[id] = true

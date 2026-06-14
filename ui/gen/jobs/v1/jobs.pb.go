@@ -2904,7 +2904,7 @@ const file_jobs_v1_jobs_proto_rawDesc = "" +
 	"\x11ListScheduledJobs\x12!.jobs.v1.ListScheduledJobsRequest\x1a\".jobs.v1.ListScheduledJobsResponse\x12H\n" +
 	"\vGetWorkflow\x12\x1b.jobs.v1.GetWorkflowRequest\x1a\x1c.jobs.v1.GetWorkflowResponse\x12N\n" +
 	"\rListWorkflows\x12\x1d.jobs.v1.ListWorkflowsRequest\x1a\x1e.jobs.v1.ListWorkflowsResponse\x12<\n" +
-	"\vWatchEvents\x12\x1b.jobs.v1.WatchEventsRequest\x1a\x0e.jobs.v1.Event0\x01B@Z>github.com/jdziat/simple-durable-jobs/v2/ui/gen/jobs/v1;jobsv1b\x06proto3"
+	"\vWatchEvents\x12\x1b.jobs.v1.WatchEventsRequest\x1a\x0e.jobs.v1.Event0\x01B@Z>github.com/jdziat/simple-durable-jobs/v3/ui/gen/jobs/v1;jobsv1b\x06proto3"
 
 var (
 	file_jobs_v1_jobs_proto_rawDescOnce sync.Once

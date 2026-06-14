@@ -11,9 +11,9 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
-	intctx "github.com/jdziat/simple-durable-jobs/v2/pkg/internal/context"
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/signal"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/core"
+	intctx "github.com/jdziat/simple-durable-jobs/v3/pkg/internal/context"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/signal"
 )
 
 // fakeSignalStore implements the (unexported) signalStorage capability plus the
@@ -35,14 +35,14 @@ type fakeSignalStore struct {
 	onCheckpoint func(*core.Checkpoint) error
 }
 
-func (f *fakeSignalStore) SendSignal(_ context.Context, _, name string, payload []byte) error {
+func (f *fakeSignalStore) SendSignal(_ context.Context, _ core.UUID, name string, payload []byte) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.pending = append(f.pending, &core.Signal{Name: name, Payload: payload})
 	return nil
 }
 
-func (f *fakeSignalStore) PeekSignal(_ context.Context, _, name string) (*core.Signal, error) {
+func (f *fakeSignalStore) PeekSignal(_ context.Context, _ core.UUID, name string) (*core.Signal, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	for _, s := range f.pending {
@@ -58,7 +58,7 @@ func (f *fakeSignalStore) PeekSignal(_ context.Context, _, name string) (*core.S
 // checkpoint via onCheckpoint. If either the build or the write fails, the signal
 // is restored at its original position (the tx rolled back) and the error is
 // returned, leaving nothing consumed and no checkpoint recorded.
-func (f *fakeSignalStore) ConsumeSignalTx(_ context.Context, _, name string, buildCheckpoint func(sig *core.Signal) (*core.Checkpoint, error)) (*core.Signal, error) {
+func (f *fakeSignalStore) ConsumeSignalTx(_ context.Context, _ core.UUID, name string, buildCheckpoint func(sig *core.Signal) (*core.Checkpoint, error)) (*core.Signal, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	for i, s := range f.pending {
@@ -85,7 +85,7 @@ func (f *fakeSignalStore) ConsumeSignalTx(_ context.Context, _, name string, bui
 // pending signals of name, ALWAYS invokes buildCheckpoint (even for an empty
 // batch), and writes the checkpoint via onCheckpoint. On any error the drained
 // signals are restored (the tx rolled back) and nothing is consumed.
-func (f *fakeSignalStore) DrainSignalsTx(_ context.Context, _, name string, buildCheckpoint func(sigs []*core.Signal) (*core.Checkpoint, error)) ([]*core.Signal, error) {
+func (f *fakeSignalStore) DrainSignalsTx(_ context.Context, _ core.UUID, name string, buildCheckpoint func(sigs []*core.Signal) (*core.Checkpoint, error)) ([]*core.Signal, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	var out, rest []*core.Signal
@@ -119,14 +119,14 @@ func (f *fakeSignalStore) restoreAt(i int, sig *core.Signal) {
 	f.pending = append(f.pending[:i], append([]*core.Signal{sig}, f.pending[i:]...)...)
 }
 
-func (f *fakeSignalStore) MarkWaiting(_ context.Context, _, _ string) error {
+func (f *fakeSignalStore) MarkWaiting(_ context.Context, _ core.UUID, _ string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.suspended++
 	return nil
 }
 
-func (f *fakeSignalStore) MarkWaitingWithDeadline(_ context.Context, _, _ string, d time.Duration) error {
+func (f *fakeSignalStore) MarkWaitingWithDeadline(_ context.Context, _ core.UUID, _ string, d time.Duration) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.suspended++
@@ -134,7 +134,7 @@ func (f *fakeSignalStore) MarkWaitingWithDeadline(_ context.Context, _, _ string
 	return nil
 }
 
-func (f *fakeSignalStore) GetCheckpoints(_ context.Context, _ string) ([]core.Checkpoint, error) {
+func (f *fakeSignalStore) GetCheckpoints(_ context.Context, _ core.UUID) ([]core.Checkpoint, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]core.Checkpoint(nil), f.checkpoints...), f.checkpointsErr

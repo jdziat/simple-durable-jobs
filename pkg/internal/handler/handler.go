@@ -7,14 +7,15 @@ import (
 	"reflect"
 	"time"
 
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/security"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/security"
 )
 
 // Handler holds metadata about a registered job handler.
 type Handler struct {
 	Fn         reflect.Value
 	ArgsType   reflect.Type
+	ResultType reflect.Type
 	HasContext bool
 	Timeout    time.Duration // max wall time for handler execution; 0 means no limit
 	Backoff    core.BackoffPolicy
@@ -70,6 +71,7 @@ func NewHandler(fn any) (*Handler, error) {
 		if !fnType.Out(1).Implements(reflect.TypeOf((*error)(nil)).Elem()) {
 			return nil, fmt.Errorf("handler must return (T, error)")
 		}
+		handler.ResultType = fnType.Out(0)
 	default:
 		return nil, fmt.Errorf("handler must return error or (T, error)")
 	}

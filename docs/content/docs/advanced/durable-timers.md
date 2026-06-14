@@ -114,7 +114,7 @@ returning the result it recorded originally.
 ## Signals Are Separate
 
 User signals cannot complete or consume a durable timer. Signal names beginning
-with `_` are reserved for library internals and `jobs.Signal` rejects them with
+with `_` are reserved for library internals and `Queue.Signal` rejects them with
 `jobs.ErrSignalNameReserved`.
 
 ## Versioning Timer Changes

@@ -9,17 +9,20 @@ import (
 	"errors"
 	"fmt"
 	"hash"
+	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"gorm.io/gorm"
 
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/internal/handler"
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/schedule"
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/security"
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/storage"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/internal/handler"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/schedule"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/security"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/signal"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/storage"
 )
 
 // EnqueueMiddleware wraps the enqueue operation.
@@ -39,7 +42,7 @@ type Queue struct {
 	onComplete []func(context.Context, *core.Job)
 	onFail     []func(context.Context, *core.Job, error)
 	onRetry    []func(context.Context, *core.Job, int, error)
-	onReclaim  []func(context.Context, string, string)
+	onReclaim  []func(context.Context, core.UUID, string)
 
 	// Enqueue middleware chain
 	enqueueMiddleware []EnqueueMiddleware
@@ -54,7 +57,7 @@ type Queue struct {
 	droppedEvents atomic.Uint64
 
 	// Running job cancellation registry (used by workers to register cancel funcs)
-	runningJobs   map[string]context.CancelFunc
+	runningJobs   map[core.UUID]context.CancelFunc
 	runningJobsMu sync.Mutex
 
 	// Config
@@ -75,7 +78,7 @@ func New(s core.Storage) *Queue {
 		storage:     s,
 		handlers:    make(map[string]*handler.Handler),
 		determinism: ExplicitCheckpoints,
-		runningJobs: make(map[string]context.CancelFunc),
+		runningJobs: make(map[core.UUID]context.CancelFunc),
 	}
 }
 
@@ -162,16 +165,16 @@ func (q *Queue) CallDirect(ctx context.Context, name string, argsJSON []byte) er
 // ErrJobArgsMismatch at the call instead of failing far later at dispatch.
 // Producers that intentionally send a dynamic or differently-shaped payload
 // (no local handler) should use EnqueueRemote/EnqueueTx, which are unchecked.
-func (q *Queue) Enqueue(ctx context.Context, name string, args any, opts ...Option) (string, error) {
+func (q *Queue) Enqueue(ctx context.Context, name string, args any, opts ...Option) (core.UUID, error) {
 	q.mu.RLock()
 	h, ok := q.handlers[name]
 	q.mu.RUnlock()
 
 	if !ok {
-		return "", fmt.Errorf("jobs: no handler registered for %q", name)
+		return core.NilUUID, fmt.Errorf("jobs: no handler registered for %q", name)
 	}
 	if err := h.ValidateArgs(name, args); err != nil {
-		return "", err
+		return core.NilUUID, err
 	}
 
 	return q.enqueue(ctx, name, args, opts...)
@@ -179,14 +182,17 @@ func (q *Queue) Enqueue(ctx context.Context, name string, args any, opts ...Opti
 
 // EnqueueRemote adds a job to the queue without requiring a local handler registration.
 // Use this for producer-only clients that enqueue jobs for workers in a separate process.
-func (q *Queue) EnqueueRemote(ctx context.Context, name string, args any, opts ...Option) (string, error) {
+func (q *Queue) EnqueueRemote(ctx context.Context, name string, args any, opts ...Option) (core.UUID, error) {
+	if err := security.ValidateJobTypeName(name); err != nil {
+		return core.NilUUID, err
+	}
 	return q.enqueue(ctx, name, args, opts...)
 }
 
 // EnqueueTx adds a job through a caller-owned GORM transaction without requiring
 // a local handler registration. The caller is responsible for committing or
 // rolling back tx.
-func (q *Queue) EnqueueTx(ctx context.Context, tx *gorm.DB, name string, args any, opts ...Option) (string, error) {
+func (q *Queue) EnqueueTx(ctx context.Context, tx *gorm.DB, name string, args any, opts ...Option) (core.UUID, error) {
 	options := NewOptions()
 	for _, opt := range opts {
 		opt.Apply(options)
@@ -194,7 +200,7 @@ func (q *Queue) EnqueueTx(ctx context.Context, tx *gorm.DB, name string, args an
 	return q.enqueueTxWithOptions(ctx, tx, name, args, options)
 }
 
-func (q *Queue) enqueue(ctx context.Context, name string, args any, opts ...Option) (string, error) {
+func (q *Queue) enqueue(ctx context.Context, name string, args any, opts ...Option) (core.UUID, error) {
 	options := NewOptions()
 	for _, opt := range opts {
 		opt.Apply(options)
@@ -202,15 +208,15 @@ func (q *Queue) enqueue(ctx context.Context, name string, args any, opts ...Opti
 	return q.enqueueWithOptions(ctx, name, args, options)
 }
 
-func (q *Queue) enqueueTxWithOptions(ctx context.Context, tx *gorm.DB, name string, args any, options *Options) (string, error) {
+func (q *Queue) enqueueTxWithOptions(ctx context.Context, tx *gorm.DB, name string, args any, options *Options) (core.UUID, error) {
 	txEnqueuer, ok := q.storage.(storage.TxEnqueuer)
 	if !ok {
-		return "", core.ErrStorageNoTxEnqueue
+		return core.NilUUID, core.ErrStorageNoTxEnqueue
 	}
 
 	job, err := q.buildJob(name, args, options)
 	if err != nil {
-		return "", err
+		return core.NilUUID, err
 	}
 
 	persist := func(ctx context.Context, j *core.Job) error {
@@ -243,16 +249,16 @@ func (q *Queue) enqueueTxWithOptions(ctx context.Context, tx *gorm.DB, name stri
 	}
 
 	if err := q.runEnqueueMiddleware(ctx, job, persist); err != nil {
-		return "", err
+		return core.NilUUID, err
 	}
 	return job.ID, nil
 }
 
 // enqueueWithOptions adds a job using a pre-built Options value.
-func (q *Queue) enqueueWithOptions(ctx context.Context, name string, args any, options *Options) (string, error) {
+func (q *Queue) enqueueWithOptions(ctx context.Context, name string, args any, options *Options) (core.UUID, error) {
 	job, err := q.buildJob(name, args, options)
 	if err != nil {
-		return "", err
+		return core.NilUUID, err
 	}
 
 	// Build the persist function that the middleware chain will eventually call
@@ -286,7 +292,7 @@ func (q *Queue) enqueueWithOptions(ctx context.Context, name string, args any, o
 
 	// Run enqueue middleware chain
 	if err := q.runEnqueueMiddleware(ctx, job, persist); err != nil {
-		return "", err
+		return core.NilUUID, err
 	}
 
 	return job.ID, nil
@@ -408,13 +414,13 @@ func cloneOptionsMetadata(m *core.MetadataMap) map[string]string {
 // and enqueue middleware runs once per entry before persistence. Returned IDs
 // match input order. When Unique keys collide, storage deduplicates silently;
 // a returned ID for a deduped entry refers to the existing job.
-func (q *Queue) EnqueueBatch(ctx context.Context, entries []BatchEntry) ([]string, error) {
+func (q *Queue) EnqueueBatch(ctx context.Context, entries []BatchEntry) ([]core.UUID, error) {
 	return q.enqueueBatch(ctx, entries, q.storage.EnqueueBatch)
 }
 
 // EnqueueBatchTx adds multiple jobs through a caller-owned GORM transaction.
 // The caller is responsible for committing or rolling back tx.
-func (q *Queue) EnqueueBatchTx(ctx context.Context, tx *gorm.DB, entries []BatchEntry) ([]string, error) {
+func (q *Queue) EnqueueBatchTx(ctx context.Context, tx *gorm.DB, entries []BatchEntry) ([]core.UUID, error) {
 	txEnqueuer, ok := q.storage.(storage.TxEnqueuer)
 	if !ok {
 		return nil, core.ErrStorageNoTxEnqueue
@@ -424,13 +430,13 @@ func (q *Queue) EnqueueBatchTx(ctx context.Context, tx *gorm.DB, entries []Batch
 	})
 }
 
-func (q *Queue) enqueueBatch(ctx context.Context, entries []BatchEntry, enqueueBatch func(context.Context, []*core.Job) error) ([]string, error) {
+func (q *Queue) enqueueBatch(ctx context.Context, entries []BatchEntry, enqueueBatch func(context.Context, []*core.Job) error) ([]core.UUID, error) {
 	if len(entries) == 0 {
-		return []string{}, nil
+		return []core.UUID{}, nil
 	}
 
 	jobs := make([]*core.Job, len(entries))
-	ids := make([]string, len(entries))
+	ids := make([]core.UUID, len(entries))
 	for i, entry := range entries {
 		options := NewOptions()
 		for _, opt := range entry.Options {
@@ -444,7 +450,7 @@ func (q *Queue) enqueueBatch(ctx context.Context, entries []BatchEntry, enqueueB
 		ids[i] = job.ID
 	}
 
-	seenUnique := make(map[string]string, len(jobs))
+	seenUnique := make(map[string]core.UUID, len(jobs))
 	for i, job := range jobs {
 		if job.UniqueKey == "" {
 			continue
@@ -494,15 +500,22 @@ func (q *Queue) runEnqueueMiddleware(ctx context.Context, job *core.Job, persist
 }
 
 // Schedule registers a recurring job.
-func (q *Queue) Schedule(name string, args any, sched schedule.Schedule, opts ...Option) {
+func (q *Queue) Schedule(name string, args any, sched schedule.Schedule, opts ...Option) error {
 	options := NewOptions()
 	for _, opt := range opts {
 		opt.Apply(options)
 	}
 
 	q.mu.Lock()
+	defer q.mu.Unlock()
+	if _, ok := q.handlers[name]; !ok {
+		return fmt.Errorf("jobs: Schedule: no handler registered for %q", name)
+	}
 	if q.scheduledJobs == nil {
 		q.scheduledJobs = make(map[string]*ScheduledJob)
+	}
+	if _, exists := q.scheduledJobs[name]; exists {
+		return fmt.Errorf("jobs: Schedule: schedule already registered for %q", name)
 	}
 	q.scheduledJobs[name] = &ScheduledJob{
 		Name:     name,
@@ -510,7 +523,7 @@ func (q *Queue) Schedule(name string, args any, sched schedule.Schedule, opts ..
 		Args:     args,
 		Options:  options,
 	}
-	q.mu.Unlock()
+	return nil
 }
 
 // GetScheduledJobs returns the scheduled jobs map (for worker scheduler).
@@ -533,13 +546,185 @@ func (q *Queue) Storage() core.Storage {
 	return q.storage
 }
 
+// Signal delivers a named signal carrying payload to a job (workflow). Signal
+// names starting with "_" are reserved for library-internal primitives such as
+// durable timers and are rejected with ErrSignalNameReserved. The signal is
+// buffered durably, so it is not lost if sent before the handler waits for it.
+// Once Signal returns nil, the signal is durably delivered in FIFO order per
+// (job, name). If the target job is currently waiting on a signal, Signal wakes
+// it immediately when possible; otherwise the resume poll wakes it. A failed
+// immediate wake after delivery is not returned as an error.
+//
+// The handler receives signals with WaitForSignal / WaitForSignalTimeout /
+// CheckSignal / DrainSignals. Returns ErrJobNotFound if the job does not exist,
+// ErrStorageNoSignals if the backend lacks signal support,
+// ErrSignalNameReserved, or ErrSignalNameTooLong.
+func (q *Queue) Signal(ctx context.Context, jobID core.UUID, name string, payload any) error {
+	if name == "" {
+		return fmt.Errorf("jobs: signal name must not be empty")
+	}
+	if strings.HasPrefix(name, "_") {
+		return signal.ErrSignalNameReserved
+	}
+	if len(name) > security.MaxSignalNameLength {
+		return core.ErrSignalNameTooLong
+	}
+	type signalSender interface {
+		SendSignal(ctx context.Context, jobID core.UUID, name string, payload []byte) error
+	}
+	var _ signalSender = (*storage.GormStorage)(nil)
+	sender, ok := q.Storage().(signalSender)
+	if !ok {
+		return core.ErrStorageNoSignals
+	}
+
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("jobs: marshal signal payload: %w", err)
+	}
+	if len(data) > security.MaxResultSize {
+		return fmt.Errorf("jobs: signal %q payload is %d bytes, limit is %d", name, len(data), security.MaxResultSize)
+	}
+
+	job, err := q.Storage().GetJob(ctx, jobID)
+	if err != nil {
+		return err
+	}
+	if job == nil {
+		return fmt.Errorf("%w: %s", core.ErrJobNotFound, jobID)
+	}
+
+	if err := sender.SendSignal(ctx, jobID, name, data); err != nil {
+		return err
+	}
+	q.Emit(&core.SignalDelivered{JobID: jobID, Name: name, Timestamp: time.Now()})
+
+	// Fast path: wake a job that's currently waiting. ResumeSignalWaitingJob
+	// matches StatusWaiting only (its WHERE guard closes the TOCTOU where the job
+	// is paused between the GetJob read above and the resume), so a producer can
+	// never un-pause an operator-paused job. The signal-resume poll backstops the
+	// deliver-vs-suspend race for anything this fast path misses.
+	if job.Status == core.StatusWaiting {
+		if signal.WaitingOnFutureSleep(ctx, q.Storage(), job, slog.Default()) {
+			return nil
+		}
+		type signalResumer interface {
+			ResumeSignalWaitingJob(ctx context.Context, jobID core.UUID) (bool, error)
+		}
+		var _ signalResumer = (*storage.GormStorage)(nil)
+		if r, ok := q.Storage().(signalResumer); ok {
+			resumed, err := r.ResumeSignalWaitingJob(ctx, jobID)
+			if err != nil {
+				slog.Default().Warn("signal delivered but immediate resume failed; the resume poll will wake the job", "job_id", jobID, "name", name, "error", err)
+			} else if resumed {
+				q.Emit(&core.JobResumedBySignal{JobID: jobID, SignalName: name, Timestamp: time.Now()})
+			}
+		}
+	}
+	return nil
+}
+
+// Requeue resets a terminally failed or cancelled job back to pending so it
+// runs again from scratch. Exhausted failed jobs are the dead-letter set; query
+// them with ListDeadLettered/CountDeadLettered and replay one with Requeue.
+// DLQ metadata and checkpoints are cleared so a workflow replays from the
+// beginning (handlers must be idempotent regardless), which is the safe behavior
+// when the usual reason to requeue is a code or dependency fix that changes the
+// workflow's steps. Requeuing a fan-out parent also clears its entire fan-out
+// subtree (descendant fan-outs and sub-jobs at every depth, including nested
+// workflows) so the replay re-dispatches cleanly.
+//
+// Returns true if the job was requeued, false if it was not found or not in a
+// requeuable (failed/cancelled) state. Returns ErrCannotRequeueSubJob for a
+// fan-out sub-job (requeue its parent instead), or an error if the storage
+// backend does not support requeueing.
+func (q *Queue) Requeue(ctx context.Context, jobID core.UUID) (bool, error) {
+	type requeuer interface {
+		Requeue(ctx context.Context, jobID core.UUID) (bool, error)
+	}
+	var _ requeuer = (*storage.GormStorage)(nil)
+	r, ok := q.Storage().(requeuer)
+	if !ok {
+		return false, fmt.Errorf("jobs: storage backend does not support Requeue")
+	}
+	return r.Requeue(ctx, jobID)
+}
+
+// DeadLetterOption configures dead-letter triage queries.
+type DeadLetterOption func(*core.DeadLetterFilter)
+
+// ListDeadLettered returns jobs with explicit DLQ metadata, ordered by
+// dead_lettered_at descending. Replay a returned job with Requeue.
+func (q *Queue) ListDeadLettered(ctx context.Context, opts ...DeadLetterOption) ([]*core.Job, error) {
+	type deadLetterLister interface {
+		ListDeadLettered(ctx context.Context, filter core.DeadLetterFilter) ([]*core.Job, error)
+	}
+	var _ deadLetterLister = (*storage.GormStorage)(nil)
+	l, ok := q.Storage().(deadLetterLister)
+	if !ok {
+		return nil, fmt.Errorf("jobs: storage backend does not support dead-letter triage")
+	}
+	filter := newDeadLetterFilter(opts...)
+	return l.ListDeadLettered(ctx, filter)
+}
+
+// CountDeadLettered returns the number of jobs with explicit DLQ metadata.
+func (q *Queue) CountDeadLettered(ctx context.Context, opts ...DeadLetterOption) (int64, error) {
+	type deadLetterCounter interface {
+		CountDeadLettered(ctx context.Context, filter core.DeadLetterFilter) (int64, error)
+	}
+	var _ deadLetterCounter = (*storage.GormStorage)(nil)
+	c, ok := q.Storage().(deadLetterCounter)
+	if !ok {
+		return 0, fmt.Errorf("jobs: storage backend does not support dead-letter triage")
+	}
+	filter := newDeadLetterFilter(opts...)
+	return c.CountDeadLettered(ctx, filter)
+}
+
+// DeadLetterQueue filters dead-letter queries to one queue.
+func DeadLetterQueue(queue string) DeadLetterOption {
+	return func(f *core.DeadLetterFilter) {
+		f.Queue = queue
+	}
+}
+
+// DeadLetterType filters dead-letter queries to one job type.
+func DeadLetterType(jobType string) DeadLetterOption {
+	return func(f *core.DeadLetterFilter) {
+		f.Type = jobType
+	}
+}
+
+// DeadLetterLimit sets the maximum number of dead-lettered jobs returned.
+func DeadLetterLimit(limit int) DeadLetterOption {
+	return func(f *core.DeadLetterFilter) {
+		f.Limit = limit
+	}
+}
+
+// DeadLetterOffset sets the pagination offset for dead-lettered jobs.
+func DeadLetterOffset(offset int) DeadLetterOption {
+	return func(f *core.DeadLetterFilter) {
+		f.Offset = offset
+	}
+}
+
+func newDeadLetterFilter(opts ...DeadLetterOption) core.DeadLetterFilter {
+	var filter core.DeadLetterFilter
+	for _, opt := range opts {
+		opt(&filter)
+	}
+	return filter
+}
+
 // LoadStatus returns the current status of a job by ID.
 //
 // Returns:
 //   - The job's current status if found.
 //   - An error formatted as "jobs: job not found: <id>" if no row matches the ID.
 //   - The underlying storage error (unwrapped) if GetJob itself fails.
-func (q *Queue) LoadStatus(ctx context.Context, jobID string) (core.JobStatus, error) {
+func (q *Queue) LoadStatus(ctx context.Context, jobID core.UUID) (core.JobStatus, error) {
 	job, err := q.storage.GetJob(ctx, jobID)
 	if err != nil {
 		return "", err
@@ -606,7 +791,7 @@ func (q *Queue) OnRetry(fn func(context.Context, *core.Job, int, error)) {
 // presumed-dead owner (stale-lock reaper) or observed reclaimed by a peer
 // (ownership audit). The callback receives the job ID and the reclaim reason
 // (core.ReclaimReasonStaleLock or core.ReclaimReasonOwnershipAudit).
-func (q *Queue) OnJobReclaimed(fn func(ctx context.Context, jobID, reason string)) {
+func (q *Queue) OnJobReclaimed(fn func(ctx context.Context, jobID core.UUID, reason string)) {
 	q.mu.Lock()
 	q.onReclaim = append(q.onReclaim, fn)
 	q.mu.Unlock()
@@ -667,7 +852,7 @@ func (q *Queue) Emit(e core.Event) {
 // EmitCustomEvent emits a CustomEvent for a specific job with arbitrary data.
 // Custom events are ephemeral — they are broadcast to Events() subscribers
 // but not persisted. Callers should persist to their own storage if needed.
-func (q *Queue) EmitCustomEvent(jobID, kind string, data map[string]any) {
+func (q *Queue) EmitCustomEvent(jobID core.UUID, kind string, data map[string]any) {
 	q.Emit(&core.CustomEvent{
 		JobID:     jobID,
 		Kind:      kind,
@@ -739,9 +924,9 @@ func (q *Queue) CallRetryHooks(ctx context.Context, job *core.Job, attempt int, 
 }
 
 // CallJobReclaimedHooks calls all registered job-reclaimed hooks.
-func (q *Queue) CallJobReclaimedHooks(ctx context.Context, jobID, reason string) {
+func (q *Queue) CallJobReclaimedHooks(ctx context.Context, jobID core.UUID, reason string) {
 	q.mu.RLock()
-	hooks := make([]func(context.Context, string, string), len(q.onReclaim))
+	hooks := make([]func(context.Context, core.UUID, string), len(q.onReclaim))
 	copy(hooks, q.onReclaim)
 	q.mu.RUnlock()
 
@@ -758,7 +943,7 @@ var WorkerFactory func(q *Queue, opts ...any) core.Starter
 // Options should be worker.WorkerOption values.
 func (q *Queue) NewWorker(opts ...any) core.Starter {
 	if WorkerFactory == nil {
-		panic("jobs: WorkerFactory not initialized - import github.com/jdziat/simple-durable-jobs/v2 to initialize")
+		panic("jobs: WorkerFactory not initialized - import github.com/jdziat/simple-durable-jobs/v3 to initialize")
 	}
 	return WorkerFactory(q, opts...)
 }
@@ -793,7 +978,7 @@ func WithPauseMode(mode core.PauseMode) PauseOption {
 // RegisterRunningJob registers a cancel function for a running job.
 // Workers call this when they start executing a job so that PauseJob
 // can cancel running jobs via context cancellation.
-func (q *Queue) RegisterRunningJob(jobID string, cancel context.CancelFunc) {
+func (q *Queue) RegisterRunningJob(jobID core.UUID, cancel context.CancelFunc) {
 	q.runningJobsMu.Lock()
 	q.runningJobs[jobID] = cancel
 	q.runningJobsMu.Unlock()
@@ -801,7 +986,7 @@ func (q *Queue) RegisterRunningJob(jobID string, cancel context.CancelFunc) {
 
 // UnregisterRunningJob removes a job from the running registry.
 // Workers call this when a job finishes executing.
-func (q *Queue) UnregisterRunningJob(jobID string) {
+func (q *Queue) UnregisterRunningJob(jobID core.UUID) {
 	q.runningJobsMu.Lock()
 	delete(q.runningJobs, jobID)
 	q.runningJobsMu.Unlock()
@@ -813,7 +998,7 @@ func (q *Queue) UnregisterRunningJob(jobID string) {
 // to paused in storage. Running jobs require aggressive mode, which cancels
 // the local job context when the job is running in this process. Graceful mode
 // returns ErrCannotPauseStatus for running jobs.
-func (q *Queue) PauseJob(ctx context.Context, jobID string, opts ...PauseOption) error {
+func (q *Queue) PauseJob(ctx context.Context, jobID core.UUID, opts ...PauseOption) error {
 	po := &PauseOptions{Mode: core.PauseModeGraceful}
 	for _, opt := range opts {
 		opt.ApplyPause(po)
@@ -857,12 +1042,12 @@ func (q *Queue) PauseJob(ctx context.Context, jobID string, opts ...PauseOption)
 // Pending or waiting jobs are paused by the underlying pause operation. Already
 // paused jobs, terminal jobs, and missing jobs return the same sentinel errors
 // as PauseJob, such as ErrJobAlreadyPaused, ErrCannotPauseStatus, or ErrJobNotFound.
-func (q *Queue) CancelJob(ctx context.Context, jobID string) error {
+func (q *Queue) CancelJob(ctx context.Context, jobID core.UUID) error {
 	return q.PauseJob(ctx, jobID, WithPauseMode(core.PauseModeAggressive))
 }
 
 // ResumeJob resumes a paused job.
-func (q *Queue) ResumeJob(ctx context.Context, jobID string) error {
+func (q *Queue) ResumeJob(ctx context.Context, jobID core.UUID) error {
 	if err := q.storage.UnpauseJob(ctx, jobID); err != nil {
 		return err
 	}
@@ -876,7 +1061,7 @@ func (q *Queue) ResumeJob(ctx context.Context, jobID string) error {
 }
 
 // IsJobPaused checks if a job is paused.
-func (q *Queue) IsJobPaused(ctx context.Context, jobID string) (bool, error) {
+func (q *Queue) IsJobPaused(ctx context.Context, jobID core.UUID) (bool, error) {
 	return q.storage.IsJobPaused(ctx, jobID)
 }
 
@@ -930,7 +1115,7 @@ func (q *Queue) GetPausedQueues(ctx context.Context) ([]string, error) {
 // CancelSubJob cancels a single sub-job and checks if its fan-out is now complete.
 // If all sub-jobs are accounted for (completed + failed + cancelled = total), the parent
 // job is automatically resumed. Returns the updated FanOut, or nil if the job is not a sub-job.
-func (q *Queue) CancelSubJob(ctx context.Context, jobID string) (*core.FanOut, error) {
+func (q *Queue) CancelSubJob(ctx context.Context, jobID core.UUID) (*core.FanOut, error) {
 	fo, err := q.storage.CancelSubJob(ctx, jobID)
 	if err != nil {
 		return nil, err

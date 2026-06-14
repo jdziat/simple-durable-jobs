@@ -7,6 +7,6 @@
 //   - Weekly() for weekly schedules on a specific day and time
 //   - Cron() for cron expression-based schedules
 //
-// Most users should import the root package github.com/jdziat/simple-durable-jobs/v2
+// Most users should import the root package github.com/jdziat/simple-durable-jobs/v3
 // which re-exports these functions.
 package schedule

@@ -21,7 +21,7 @@ Asynq is a Redis-backed Go task queue. Simple Durable Jobs is a SQL-backed Go jo
 | `ProcessIn(...)` | `jobs.Delay(duration)` |
 | `ProcessAt(...)` | `jobs.At(time)` |
 | Max retry option | `jobs.Retries(n)` |
-| Cron scheduler | `queue.Schedule(name, args, jobs.MustCron(expr))` |
+| Cron scheduler | `queue.Schedule(name, args, jobs.MustCron(expr))` after registering `name` |
 
 ## Side-by-Side
 
@@ -114,10 +114,16 @@ return worker.Start(ctx)
 Cron-like recurring enqueue moves to the built-in scheduler:
 
 ```go
-queue.Schedule("email.digest", EmailPayload{UserID: "user-123"},
+queue.Register("email.digest", func(ctx context.Context, p EmailPayload) error {
+	return sendDigest(p.UserID)
+})
+
+if err := queue.Schedule("email.digest", EmailPayload{UserID: "user-123"},
 	jobs.MustCron("0 9 * * *"),
 	jobs.QueueOpt("mailers"),
-)
+); err != nil {
+	return err
+}
 
 worker := queue.NewWorker(
 	jobs.WorkerQueue("mailers", jobs.Concurrency(10)),

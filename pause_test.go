@@ -6,7 +6,7 @@ import (
 	"sync/atomic"
 	"testing"
 
-	jobs "github.com/jdziat/simple-durable-jobs/v2"
+	jobs "github.com/jdziat/simple-durable-jobs/v3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/driver/sqlite"
@@ -110,7 +110,7 @@ func TestGetPausedJobs_ReturnsPausedJobIDs(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, paused, 2)
 
-	ids := make([]string, 0, len(paused))
+	ids := make([]jobs.UUID, 0, len(paused))
 	for _, j := range paused {
 		ids = append(ids, j.ID)
 	}

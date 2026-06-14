@@ -10,7 +10,8 @@ import (
 	"time"
 
 	mysqlcfg "github.com/go-sql-driver/mysql"
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
+	"github.com/google/uuid"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/core"
 	"github.com/stretchr/testify/require"
 	"gorm.io/driver/mysql"
 	"gorm.io/driver/postgres"
@@ -18,6 +19,15 @@ import (
 	"gorm.io/gorm/clause"
 	"gorm.io/gorm/logger"
 )
+
+// schemaCheckID derives a deterministic, valid UUID from a readable name so the
+// raw INSERTs in the schema-assertion helpers satisfy the binary uuid id columns
+// (v3) while preserving parent/child references (same name -> same UUID). It is
+// returned as core.UUID so Exec binds it through Value() and encodes correctly on
+// every dialect (postgres uuid / mysql binary(16) / sqlite blob).
+func schemaCheckID(name string) core.UUID {
+	return core.UUID(uuid.NewSHA1(uuid.NameSpaceURL, []byte("sdj-schema-check/"+name)).String())
+}
 
 func TestPostgresSchemaAssertions(t *testing.T) {
 	dsn := os.Getenv("TEST_DATABASE_URL")
@@ -235,8 +245,8 @@ func TestMySQLSchemaAssertions(t *testing.T) {
 	require.Contains(t, mysqlIndexColumns(t, db, "signals", "idx_signals_pending"), "created_at", "idx_signals_pending must include created_at on mysql")
 	require.True(t, mysqlTableIndexExists(t, db, "concurrency_slots", "idx_concurrency_slots_expires_at"), "idx_concurrency_slots_expires_at must exist on mysql")
 	require.False(t, mysqlTableIndexExists(t, db, "rate_limit_windows", "idx_rate_limit_windows_lookup"), "idx_rate_limit_windows_lookup must not exist after migration")
-	requireMySQLGeneratedVarchar36Column(t, db, "pending_parent_ref")
-	requireMySQLGeneratedVarchar36Column(t, db, "pending_root_ref")
+	requireMySQLGeneratedBinary16Column(t, db, "pending_parent_ref")
+	requireMySQLGeneratedBinary16Column(t, db, "pending_root_ref")
 	require.True(t, mysqlIndexExists(t, db, "idx_jobs_parent_nonterminal"), "idx_jobs_parent_nonterminal must exist on mysql")
 	require.True(t, mysqlIndexExists(t, db, "idx_jobs_root_nonterminal"), "idx_jobs_root_nonterminal must exist on mysql")
 	require.True(t, mysqlIndexExists(t, db, "idx_jobs_tenant"), "idx_jobs_tenant must exist on mysql")
@@ -450,29 +460,29 @@ func requirePostgresCheckConstraintsEnforced(t *testing.T, db *gorm.DB) {
 	require.NoError(t, tx.Exec(`
 		INSERT INTO jobs (id, type, status, queue, priority, attempt, max_retries, timeout, determinism)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, "check-pg-parent", "schema.check", "pending", "default", 0, 0, 3, 0, 0).Error)
+	`, schemaCheckID("check-pg-parent"), "schema.check", "pending", "default", 0, 0, 3, 0, 0).Error)
 
 	requireExecRejectedWithSavepoint(t, tx, "pg_bad_job_status", `
 		INSERT INTO jobs (id, type, status, queue, priority, attempt, max_retries, timeout, determinism)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, "check-pg-bad-status", "schema.check", "BOGUS", "default", 0, 0, 3, 0, 0)
+	`, schemaCheckID("check-pg-bad-status"), "schema.check", "BOGUS", "default", 0, 0, 3, 0, 0)
 	requireExecRejectedWithSavepoint(t, tx, "pg_bad_job_attempt", `
 		INSERT INTO jobs (id, type, status, queue, priority, attempt, max_retries, timeout, determinism)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, "check-pg-bad-attempt", "schema.check", "pending", "default", 0, -1, 3, 0, 0)
+	`, schemaCheckID("check-pg-bad-attempt"), "schema.check", "pending", "default", 0, -1, 3, 0, 0)
 	requireExecRejectedWithSavepoint(t, tx, "pg_bad_fanout_strategy", `
 		INSERT INTO fan_outs (id, parent_job_id, total_count, strategy)
 		VALUES (?, ?, ?, ?)
-	`, "check-pg-bad-strategy", "check-pg-parent", 1, "nope")
+	`, schemaCheckID("check-pg-bad-strategy"), schemaCheckID("check-pg-parent"), 1, "nope")
 	requireExecRejectedWithSavepoint(t, tx, "pg_bad_fanout_count", `
 		INSERT INTO fan_outs (id, parent_job_id, total_count, completed_count)
 		VALUES (?, ?, ?, ?)
-	`, "check-pg-bad-count", "check-pg-parent", 1, -1)
+	`, schemaCheckID("check-pg-bad-count"), schemaCheckID("check-pg-parent"), 1, -1)
 
 	require.NoError(t, tx.Exec(`
 		INSERT INTO fan_outs (id, parent_job_id, total_count, completed_count, failed_count, cancelled_count, strategy, status)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-	`, "check-pg-good-fanout", "check-pg-parent", 1, 0, 0, 0, "fail_fast", "pending").Error)
+	`, schemaCheckID("check-pg-good-fanout"), schemaCheckID("check-pg-parent"), 1, 0, 0, 0, "fail_fast", "pending").Error)
 }
 
 type postgresColumnType struct {
@@ -588,33 +598,33 @@ func requireMySQLCheckConstraintsEnforced(t *testing.T, db *gorm.DB) {
 	require.NoError(t, tx.Exec(`
 		INSERT INTO jobs (id, type, status, queue, priority, attempt, max_retries, timeout, determinism)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, "check-mysql-parent", "schema.check", "pending", "default", 0, 0, 3, 0, 0).Error)
+	`, schemaCheckID("check-mysql-parent"), "schema.check", "pending", "default", 0, 0, 3, 0, 0).Error)
 
 	requireExecRejectedWithSavepoint(t, tx, "mysql_bad_job_case", `
 		INSERT INTO jobs (id, type, status, queue, priority, attempt, max_retries, timeout, determinism)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, "check-mysql-bad-case", "schema.check", "PENDING", "default", 0, 0, 3, 0, 0)
+	`, schemaCheckID("check-mysql-bad-case"), "schema.check", "PENDING", "default", 0, 0, 3, 0, 0)
 	requireExecRejectedWithSavepoint(t, tx, "mysql_bad_job_status", `
 		INSERT INTO jobs (id, type, status, queue, priority, attempt, max_retries, timeout, determinism)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, "check-mysql-bad-status", "schema.check", "BOGUS", "default", 0, 0, 3, 0, 0)
+	`, schemaCheckID("check-mysql-bad-status"), "schema.check", "BOGUS", "default", 0, 0, 3, 0, 0)
 	requireExecRejectedWithSavepoint(t, tx, "mysql_bad_job_attempt", `
 		INSERT INTO jobs (id, type, status, queue, priority, attempt, max_retries, timeout, determinism)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, "check-mysql-bad-attempt", "schema.check", "pending", "default", 0, -1, 3, 0, 0)
+	`, schemaCheckID("check-mysql-bad-attempt"), "schema.check", "pending", "default", 0, -1, 3, 0, 0)
 	requireExecRejectedWithSavepoint(t, tx, "mysql_bad_fanout_strategy", `
 		INSERT INTO fan_outs (id, parent_job_id, total_count, strategy)
 		VALUES (?, ?, ?, ?)
-	`, "check-mysql-bad-strategy", "check-mysql-parent", 1, "nope")
+	`, schemaCheckID("check-mysql-bad-strategy"), schemaCheckID("check-mysql-parent"), 1, "nope")
 	requireExecRejectedWithSavepoint(t, tx, "mysql_bad_fanout_count", `
 		INSERT INTO fan_outs (id, parent_job_id, total_count, completed_count)
 		VALUES (?, ?, ?, ?)
-	`, "check-mysql-bad-count", "check-mysql-parent", 1, -1)
+	`, schemaCheckID("check-mysql-bad-count"), schemaCheckID("check-mysql-parent"), 1, -1)
 
 	require.NoError(t, tx.Exec(`
 		INSERT INTO fan_outs (id, parent_job_id, total_count, completed_count, failed_count, cancelled_count, strategy, status)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-	`, "check-mysql-good-fanout", "check-mysql-parent", 1, 0, 0, 0, "fail_fast", "pending").Error)
+	`, schemaCheckID("check-mysql-good-fanout"), schemaCheckID("check-mysql-parent"), 1, 0, 0, 0, "fail_fast", "pending").Error)
 }
 
 func requireMySQLMetadataIntegrity(t *testing.T, db *gorm.DB) {
@@ -639,34 +649,34 @@ func requireMySQLMetadataIntegrity(t *testing.T, db *gorm.DB) {
 	requireExecRejectedWithSavepoint(t, tx, "mysql_bad_metadata_json", `
 		INSERT INTO jobs (id, type, queue, status, priority, attempt, max_retries, timeout, determinism, created_at, metadata)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, "metadata-bad-json", "schema.metadata", "default", "pending", 0, 0, 3, 0, 0, now, "not-valid-json")
+	`, schemaCheckID("metadata-bad-json"), "schema.metadata", "default", "pending", 0, 0, 3, 0, 0, now, "not-valid-json")
 
 	require.NoError(t, tx.Exec(`
 		INSERT INTO jobs (id, type, queue, status, priority, attempt, max_retries, timeout, determinism, created_at, metadata)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, "metadata-empty", "schema.metadata", "default", "pending", 0, 0, 3, 0, 0, now, "").Error)
+	`, schemaCheckID("metadata-empty"), "schema.metadata", "default", "pending", 0, 0, 3, 0, 0, now, "").Error)
 	require.NoError(t, tx.Exec(`
 		INSERT INTO jobs (id, type, queue, status, priority, attempt, max_retries, timeout, determinism, created_at, metadata)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, "metadata-null", "schema.metadata", "default", "pending", 0, 0, 3, 0, 0, now, nil).Error)
+	`, schemaCheckID("metadata-null"), "schema.metadata", "default", "pending", 0, 0, 3, 0, 0, now, nil).Error)
 	require.NoError(t, tx.Exec(`
 		INSERT INTO jobs (id, type, queue, status, priority, attempt, max_retries, timeout, determinism, created_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, "metadata-omitted", "schema.metadata", "default", "pending", 0, 0, 3, 0, 0, now).Error)
+	`, schemaCheckID("metadata-omitted"), "schema.metadata", "default", "pending", 0, 0, 3, 0, 0, now).Error)
 	require.NoError(t, tx.Exec(`
 		INSERT INTO jobs (id, type, queue, status, priority, attempt, max_retries, timeout, determinism, created_at, metadata)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, "metadata-json-contains-prod", "schema.metadata", "default", "pending", 0, 0, 3, 0, 0, now, `{"env":"prod"}`).Error)
+	`, schemaCheckID("metadata-json-contains-prod"), "schema.metadata", "default", "pending", 0, 0, 3, 0, 0, now, `{"env":"prod"}`).Error)
 	require.NoError(t, tx.Exec(`
 		INSERT INTO jobs (id, type, queue, status, priority, attempt, max_retries, timeout, determinism, created_at, metadata)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, "metadata-json-near-value", "schema.metadata", "default", "pending", 0, 0, 3, 0, 0, now, `{"env":"prod-test"}`).Error)
+	`, schemaCheckID("metadata-json-near-value"), "schema.metadata", "default", "pending", 0, 0, 3, 0, 0, now, `{"env":"prod-test"}`).Error)
 	require.NoError(t, tx.Exec(`
 		INSERT INTO jobs (id, type, queue, status, priority, attempt, max_retries, timeout, determinism, created_at, metadata)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, "metadata-json-near-key", "schema.metadata", "default", "pending", 0, 0, 3, 0, 0, now, `{"team":"prod"}`).Error)
+	`, schemaCheckID("metadata-json-near-key"), "schema.metadata", "default", "pending", 0, 0, 3, 0, 0, now, `{"team":"prod"}`).Error)
 
-	var matches []string
+	var matches []core.UUID
 	require.NoError(t, tx.Raw(`
 		SELECT id
 		FROM jobs
@@ -675,10 +685,10 @@ func requireMySQLMetadataIntegrity(t *testing.T, db *gorm.DB) {
 		  AND JSON_CONTAINS(metadata, CAST(? AS JSON))
 		ORDER BY id
 	`, `{"env":"prod"}`).Scan(&matches).Error)
-	require.Equal(t, []string{"metadata-json-contains-prod"}, matches, "JSON_CONTAINS must exclude substring-only metadata near-matches")
+	require.Equal(t, []core.UUID{schemaCheckID("metadata-json-contains-prod")}, matches, "JSON_CONTAINS must exclude substring-only metadata near-matches")
 }
 
-func requireMySQLGeneratedVarchar36Column(t *testing.T, db *gorm.DB, columnName string) {
+func requireMySQLGeneratedBinary16Column(t *testing.T, db *gorm.DB, columnName string) {
 	t.Helper()
 	var count int
 	require.NoError(t, db.Raw(`
@@ -687,11 +697,11 @@ func requireMySQLGeneratedVarchar36Column(t *testing.T, db *gorm.DB, columnName 
 		WHERE TABLE_SCHEMA = DATABASE()
 		  AND TABLE_NAME = 'jobs'
 		  AND COLUMN_NAME = ?
-		  AND DATA_TYPE = 'varchar'
-		  AND CHARACTER_MAXIMUM_LENGTH = 36
+		  AND DATA_TYPE = 'binary'
+		  AND CHARACTER_MAXIMUM_LENGTH = 16
 		  AND GENERATION_EXPRESSION <> ''
 	`, columnName).Scan(&count).Error)
-	require.Equal(t, 1, count, "%s generated varchar(36) column must exist", columnName)
+	require.Equal(t, 1, count, "%s generated binary(16) column must exist", columnName)
 }
 
 func checkConstraintNames() []string {
@@ -794,7 +804,7 @@ func seedDequeuePlanJobs(t *testing.T, ctx context.Context, db *gorm.DB) {
 	for i := 0; i < seedCount; i++ {
 		createdAt := now.Add(-time.Duration(seedCount-i) * time.Second)
 		jobs = append(jobs, &core.Job{
-			ID:         fmt.Sprintf("dequeue-plan-%04d", i),
+			ID:         core.NewID(),
 			Type:       "explain.dequeue",
 			Args:       []byte(`{}`),
 			Queue:      queues[i%len(queues)],

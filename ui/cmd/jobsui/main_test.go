@@ -15,9 +15,9 @@ func TestIsLoopbackAddr(t *testing.T) {
 		{"localhost:8080", true},
 		{"[::1]:8080", true},
 		{"127.0.0.1", true},
-		{":8080", false},          // empty host -> binds 0.0.0.0 / [::]
-		{"0.0.0.0:8080", false},   // unspecified IPv4 -> all interfaces
-		{"[::]:8080", false},      // unspecified IPv6 -> all interfaces
+		{":8080", false},        // empty host -> binds 0.0.0.0 / [::]
+		{"0.0.0.0:8080", false}, // unspecified IPv4 -> all interfaces
+		{"[::]:8080", false},    // unspecified IPv6 -> all interfaces
 		{"192.168.1.10:8080", false},
 		{"example.com:8080", false},
 	} {

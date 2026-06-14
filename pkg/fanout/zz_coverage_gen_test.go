@@ -6,8 +6,8 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
-	intctx "github.com/jdziat/simple-durable-jobs/v2/pkg/internal/context"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/core"
+	intctx "github.com/jdziat/simple-durable-jobs/v3/pkg/internal/context"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -32,7 +32,7 @@ func newErrStorage() *errStorage {
 	return &errStorage{minimalStorage: newMinimalStorage()}
 }
 
-func (s *errStorage) GetFanOut(ctx context.Context, fanOutID string) (*core.FanOut, error) {
+func (s *errStorage) GetFanOut(ctx context.Context, fanOutID core.UUID) (*core.FanOut, error) {
 	if s.getFanOutErr != nil {
 		return nil, s.getFanOutErr
 	}
@@ -42,14 +42,14 @@ func (s *errStorage) GetFanOut(ctx context.Context, fanOutID string) (*core.FanO
 	return s.minimalStorage.GetFanOut(ctx, fanOutID)
 }
 
-func (s *errStorage) GetSubJobs(ctx context.Context, fanOutID string) ([]*core.Job, error) {
+func (s *errStorage) GetSubJobs(ctx context.Context, fanOutID core.UUID) ([]*core.Job, error) {
 	if s.getSubJobsErr != nil {
 		return nil, s.getSubJobsErr
 	}
 	return s.minimalStorage.GetSubJobs(ctx, fanOutID)
 }
 
-func (s *errStorage) MarkWaiting(ctx context.Context, jobID, workerID string) error {
+func (s *errStorage) MarkWaiting(ctx context.Context, jobID core.UUID, workerID string) error {
 	if s.suspendErr != nil {
 		return s.suspendErr
 	}
@@ -63,7 +63,7 @@ func (s *errStorage) CreateFanOut(ctx context.Context, fo *core.FanOut) error {
 	return s.minimalStorage.CreateFanOut(ctx, fo)
 }
 
-func (s *errStorage) ResumeJob(ctx context.Context, jobID string) (bool, error) {
+func (s *errStorage) ResumeJob(ctx context.Context, jobID core.UUID) (bool, error) {
 	if s.resumeErr != nil {
 		return false, s.resumeErr
 	}
@@ -73,9 +73,9 @@ func (s *errStorage) ResumeJob(ctx context.Context, jobID string) (bool, error) 
 // makeErrJobCtx mirrors makeJobCtx but wires the parent job + SaveCheckpoint
 // against an errStorage so its overridable methods are reachable. An optional
 // saveCheckpoint override lets a test force a checkpoint-save failure.
-func makeErrJobCtx(store *errStorage, parentJobID, queueName string) *intctx.JobContext {
+func makeErrJobCtx(store *errStorage, parentJobID core.UUID, queueName string) *intctx.JobContext {
 	job := &core.Job{ID: parentJobID, Queue: queueName}
-	store.jobs[parentJobID] = job
+	store.jobs[string(parentJobID)] = job
 
 	return &intctx.JobContext{
 		Job:      job,
@@ -106,7 +106,7 @@ func buildCtxErr(jc *intctx.JobContext, checkpoints []core.Checkpoint) context.C
 // FanOut() — resume-path error branches
 // ---------------------------------------------------------------------------
 
-func resumeCheckpoint(parentID, fanOutID string) core.Checkpoint {
+func resumeCheckpoint(parentID, fanOutID core.UUID) core.Checkpoint {
 	cpData, _ := json.Marshal(core.FanOutCheckpoint{FanOutID: fanOutID, CallIndex: 0})
 	return core.Checkpoint{
 		ID:        "cp-resume",
@@ -119,11 +119,11 @@ func resumeCheckpoint(parentID, fanOutID string) core.Checkpoint {
 
 func TestGen_FanOut_Resume_GetFanOutError(t *testing.T) {
 	store := newErrStorage()
-	parentID := "p-getfo-err"
+	parentID := core.UUID("p-getfo-err")
 	jc := makeErrJobCtx(store, parentID, "default")
 	store.getFanOutErr = errors.New("boom getfanout")
 
-	ctx := buildCtxErr(jc, []core.Checkpoint{resumeCheckpoint(parentID, "fo-x")})
+	ctx := buildCtxErr(jc, []core.Checkpoint{resumeCheckpoint(parentID, core.NewID())})
 	_, err := FanOut[string](ctx, []SubJob{{Type: "do-work", Args: "x"}})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "failed to get fan-out")
@@ -131,11 +131,11 @@ func TestGen_FanOut_Resume_GetFanOutError(t *testing.T) {
 
 func TestGen_FanOut_Resume_FanOutNil(t *testing.T) {
 	store := newErrStorage()
-	parentID := "p-fo-nil"
+	parentID := core.UUID("p-fo-nil")
 	jc := makeErrJobCtx(store, parentID, "default")
 	store.getFanOutNil = true // checkpoint exists but no fan-out record
 
-	ctx := buildCtxErr(jc, []core.Checkpoint{resumeCheckpoint(parentID, "fo-missing")})
+	ctx := buildCtxErr(jc, []core.Checkpoint{resumeCheckpoint(parentID, core.NewID())})
 	_, err := FanOut[string](ctx, []SubJob{{Type: "do-work", Args: "x"}})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "fan-out not found")
@@ -143,11 +143,11 @@ func TestGen_FanOut_Resume_FanOutNil(t *testing.T) {
 
 func TestGen_FanOut_Resume_BuildSubJobsError(t *testing.T) {
 	store := newErrStorage()
-	parentID := "p-build-err"
+	parentID := core.UUID("p-build-err")
 	jc := makeErrJobCtx(store, parentID, "default")
 
-	fanOutID := "fo-build"
-	store.fanOuts[fanOutID] = &core.FanOut{
+	fanOutID := core.NewID()
+	store.fanOuts[string(fanOutID)] = &core.FanOut{
 		ID:          fanOutID,
 		ParentJobID: parentID,
 		TotalCount:  1,
@@ -163,12 +163,12 @@ func TestGen_FanOut_Resume_BuildSubJobsError(t *testing.T) {
 
 func TestGen_FanOut_Resume_TotalCountMismatch(t *testing.T) {
 	store := newErrStorage()
-	parentID := "p-count-mismatch"
+	parentID := core.UUID("p-count-mismatch")
 	jc := makeErrJobCtx(store, parentID, "default")
 
-	fanOutID := "fo-mismatch"
+	fanOutID := core.NewID()
 	// Stored TotalCount is 5, but we pass a single sub-job on replay.
-	store.fanOuts[fanOutID] = &core.FanOut{
+	store.fanOuts[string(fanOutID)] = &core.FanOut{
 		ID:          fanOutID,
 		ParentJobID: parentID,
 		TotalCount:  5,
@@ -183,11 +183,11 @@ func TestGen_FanOut_Resume_TotalCountMismatch(t *testing.T) {
 
 func TestGen_FanOut_Resume_GetSubJobsError(t *testing.T) {
 	store := newErrStorage()
-	parentID := "p-getsubjobs-err"
+	parentID := core.UUID("p-getsubjobs-err")
 	jc := makeErrJobCtx(store, parentID, "default")
 
-	fanOutID := "fo-getsubs"
-	store.fanOuts[fanOutID] = &core.FanOut{
+	fanOutID := core.NewID()
+	store.fanOuts[string(fanOutID)] = &core.FanOut{
 		ID:          fanOutID,
 		ParentJobID: parentID,
 		TotalCount:  1,
@@ -203,11 +203,11 @@ func TestGen_FanOut_Resume_GetSubJobsError(t *testing.T) {
 
 func TestGen_FanOut_Resume_EnqueueBatchError(t *testing.T) {
 	store := newErrStorage()
-	parentID := "p-resume-enqueue-err"
+	parentID := core.UUID("p-resume-enqueue-err")
 	jc := makeErrJobCtx(store, parentID, "default")
 
-	fanOutID := "fo-resume-enq"
-	store.fanOuts[fanOutID] = &core.FanOut{
+	fanOutID := core.NewID()
+	store.fanOuts[string(fanOutID)] = &core.FanOut{
 		ID:          fanOutID,
 		ParentJobID: parentID,
 		TotalCount:  1,
@@ -225,11 +225,11 @@ func TestGen_FanOut_Resume_EnqueueBatchError(t *testing.T) {
 
 func TestGen_FanOut_Resume_MarkWaitingError(t *testing.T) {
 	store := newErrStorage()
-	parentID := "p-resume-suspend-err"
+	parentID := core.UUID("p-resume-suspend-err")
 	jc := makeErrJobCtx(store, parentID, "default")
 
-	fanOutID := "fo-resume-suspend"
-	store.fanOuts[fanOutID] = &core.FanOut{
+	fanOutID := core.NewID()
+	store.fanOuts[string(fanOutID)] = &core.FanOut{
 		ID:          fanOutID,
 		ParentJobID: parentID,
 		TotalCount:  1,
@@ -257,7 +257,7 @@ func TestGen_FanOut_Resume_MarkWaitingError(t *testing.T) {
 
 func TestGen_FanOut_First_CreateFanOutError(t *testing.T) {
 	store := newErrStorage()
-	parentID := "p-create-fo-err"
+	parentID := core.UUID("p-create-fo-err")
 	jc := makeErrJobCtx(store, parentID, "default")
 	store.createFanOutErr = errors.New("boom createfanout")
 
@@ -269,7 +269,7 @@ func TestGen_FanOut_First_CreateFanOutError(t *testing.T) {
 
 func TestGen_FanOut_First_SaveCheckpointError(t *testing.T) {
 	store := newErrStorage()
-	parentID := "p-save-cp-err"
+	parentID := core.UUID("p-save-cp-err")
 	jc := makeErrJobCtx(store, parentID, "default")
 	store.saveCheckpoint = func(ctx context.Context, cp *core.Checkpoint) error {
 		return errors.New("boom savecheckpoint")
@@ -283,7 +283,7 @@ func TestGen_FanOut_First_SaveCheckpointError(t *testing.T) {
 
 func TestGen_FanOut_First_MarkWaitingError(t *testing.T) {
 	store := newErrStorage()
-	parentID := "p-first-suspend-err"
+	parentID := core.UUID("p-first-suspend-err")
 	jc := makeErrJobCtx(store, parentID, "default")
 	store.suspendErr = errors.New("boom suspend first")
 
@@ -298,7 +298,7 @@ func TestGen_FanOut_First_EnqueueFails_ResumeAlsoErrors(t *testing.T) {
 	// the recovery ResumeJob call itself returns an error (the error is
 	// swallowed; the original enqueue error is still surfaced).
 	store := newErrStorage()
-	parentID := "p-first-enqueue-resume-err"
+	parentID := core.UUID("p-first-enqueue-resume-err")
 	jc := makeErrJobCtx(store, parentID, "default")
 	store.enqueueBatchErr = errors.New("boom enqueue first")
 	store.resumeErr = errors.New("boom resume recovery")
@@ -315,7 +315,7 @@ func TestGen_FanOut_First_EnqueueFails_ResumeAlsoErrors(t *testing.T) {
 
 func TestGen_FanOut_UnmarshalableArgs_ReturnsMarshalError(t *testing.T) {
 	store := newErrStorage()
-	parentID := "p-bad-args"
+	parentID := core.UUID("p-bad-args")
 	jc := makeErrJobCtx(store, parentID, "default")
 	ctx := buildCtxErr(jc, nil)
 
@@ -332,23 +332,23 @@ func TestGen_FanOut_UnmarshalableArgs_ReturnsMarshalError(t *testing.T) {
 
 func TestGen_CollectResults_GetFanOutError(t *testing.T) {
 	store := newErrStorage()
-	parentID := "p-cr-getfo-err"
+	parentID := core.UUID("p-cr-getfo-err")
 	jc := makeErrJobCtx(store, parentID, "default")
 	store.getFanOutErr = errors.New("boom cr getfanout")
 
 	ctx := buildCtxErr(jc, nil)
-	_, err := CollectResults[string](ctx, "fo-any")
+	_, err := CollectResults[string](ctx, core.NewID())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "failed to get fan-out")
 }
 
 func TestGen_CollectResults_GetSubJobsError(t *testing.T) {
 	store := newErrStorage()
-	parentID := "p-cr-getsubs-err"
+	parentID := core.UUID("p-cr-getsubs-err")
 	jc := makeErrJobCtx(store, parentID, "default")
 
-	fanOutID := "fo-cr-subs"
-	store.fanOuts[fanOutID] = &core.FanOut{
+	fanOutID := core.NewID()
+	store.fanOuts[string(fanOutID)] = &core.FanOut{
 		ID:          fanOutID,
 		ParentJobID: parentID,
 		TotalCount:  1,
@@ -364,12 +364,12 @@ func TestGen_CollectResults_GetSubJobsError(t *testing.T) {
 
 func TestGen_CollectResults_OutOfRangeFanOutIndex_Skipped(t *testing.T) {
 	store := newErrStorage()
-	parentID := "p-cr-oob"
+	parentID := core.UUID("p-cr-oob")
 	jc := makeErrJobCtx(store, parentID, "default")
 	ctx := buildCtxErr(jc, nil)
 
-	fanOutID := "fo-cr-oob"
-	store.fanOuts[fanOutID] = &core.FanOut{
+	fanOutID := core.NewID()
+	store.fanOuts[string(fanOutID)] = &core.FanOut{
 		ID:          fanOutID,
 		ParentJobID: parentID,
 		TotalCount:  1,
@@ -399,12 +399,12 @@ func TestGen_CollectResults_OutOfRangeFanOutIndex_Skipped(t *testing.T) {
 
 func TestGen_CollectResults_NonTerminalStatus_DefaultBranch(t *testing.T) {
 	store := newErrStorage()
-	parentID := "p-cr-default"
+	parentID := core.UUID("p-cr-default")
 	jc := makeErrJobCtx(store, parentID, "default")
 	ctx := buildCtxErr(jc, nil)
 
-	fanOutID := "fo-cr-default"
-	store.fanOuts[fanOutID] = &core.FanOut{
+	fanOutID := core.NewID()
+	store.fanOuts[string(fanOutID)] = &core.FanOut{
 		ID:          fanOutID,
 		ParentJobID: parentID,
 		TotalCount:  1,

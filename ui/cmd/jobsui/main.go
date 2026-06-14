@@ -18,11 +18,10 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/google/uuid"
 
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/storage"
-	"github.com/jdziat/simple-durable-jobs/v2/ui"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/storage"
+	"github.com/jdziat/simple-durable-jobs/v3/ui"
 	"gorm.io/driver/postgres"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
@@ -132,7 +131,7 @@ func seedDatabase(ctx context.Context, store *storage.GormStorage) error {
 	// Pending jobs
 	for i := 0; i < 15; i++ {
 		jobs = append(jobs, &core.Job{
-			ID:         uuid.New().String(),
+			ID:         core.NewID(),
 			Type:       jobTypes[rand.Intn(len(jobTypes))],
 			Queue:      queues[rand.Intn(len(queues))],
 			Status:     core.StatusPending,
@@ -148,14 +147,14 @@ func seedDatabase(ctx context.Context, store *storage.GormStorage) error {
 	for i := 0; i < 5; i++ {
 		startedAt := now.Add(-time.Duration(rand.Intn(10)) * time.Minute)
 		jobs = append(jobs, &core.Job{
-			ID:         uuid.New().String(),
+			ID:         core.NewID(),
 			Type:       jobTypes[rand.Intn(len(jobTypes))],
 			Queue:      queues[rand.Intn(len(queues))],
 			Status:     core.StatusRunning,
 			Priority:   rand.Intn(10),
 			Attempt:    1,
 			MaxRetries: 3,
-			Args:       mustJSON(map[string]any{"batch_id": uuid.New().String()}),
+			Args:       mustJSON(map[string]any{"batch_id": core.NewID()}),
 			CreatedAt:  startedAt.Add(-time.Minute),
 			StartedAt:  &startedAt,
 			LockedBy:   fmt.Sprintf("worker-%d", rand.Intn(3)+1),
@@ -168,7 +167,7 @@ func seedDatabase(ctx context.Context, store *storage.GormStorage) error {
 		startedAt := createdAt.Add(time.Duration(rand.Intn(60)) * time.Second)
 		completedAt := startedAt.Add(time.Duration(rand.Intn(300)) * time.Second)
 		jobs = append(jobs, &core.Job{
-			ID:          uuid.New().String(),
+			ID:          core.NewID(),
 			Type:        jobTypes[rand.Intn(len(jobTypes))],
 			Queue:       queues[rand.Intn(len(queues))],
 			Status:      core.StatusCompleted,
@@ -196,14 +195,14 @@ func seedDatabase(ctx context.Context, store *storage.GormStorage) error {
 		startedAt := createdAt.Add(time.Duration(rand.Intn(60)) * time.Second)
 		completedAt := startedAt.Add(time.Duration(rand.Intn(60)) * time.Second)
 		jobs = append(jobs, &core.Job{
-			ID:          uuid.New().String(),
+			ID:          core.NewID(),
 			Type:        jobTypes[rand.Intn(len(jobTypes))],
 			Queue:       queues[rand.Intn(len(queues))],
 			Status:      core.StatusFailed,
 			Priority:    rand.Intn(10),
 			Attempt:     3,
 			MaxRetries:  3,
-			Args:        mustJSON(map[string]any{"request_id": uuid.New().String()}),
+			Args:        mustJSON(map[string]any{"request_id": core.NewID()}),
 			LastError:   errors[rand.Intn(len(errors))],
 			CreatedAt:   createdAt,
 			StartedAt:   &startedAt,
@@ -215,7 +214,7 @@ func seedDatabase(ctx context.Context, store *storage.GormStorage) error {
 	for i := 0; i < 5; i++ {
 		runAt := now.Add(time.Duration(rand.Intn(60)+1) * time.Minute)
 		jobs = append(jobs, &core.Job{
-			ID:         uuid.New().String(),
+			ID:         core.NewID(),
 			Type:       jobTypes[rand.Intn(len(jobTypes))],
 			Queue:      queues[rand.Intn(len(queues))],
 			Status:     core.StatusPending,
@@ -240,7 +239,7 @@ func seedDatabase(ctx context.Context, store *storage.GormStorage) error {
 		if i < len(jobs) && jobs[i].Status == core.StatusCompleted {
 			for j := 0; j < rand.Intn(3)+1; j++ {
 				cp := &core.Checkpoint{
-					ID:        uuid.New().String(),
+					ID:        core.NewID(),
 					JobID:     jobs[i].ID,
 					CallIndex: j,
 					CallType:  "http.Get",

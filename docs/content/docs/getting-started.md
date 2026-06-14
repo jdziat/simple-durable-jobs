@@ -25,7 +25,7 @@ stateDiagram-v2
 ## Installation
 
 ```bash
-go get github.com/jdziat/simple-durable-jobs/v2
+go get github.com/jdziat/simple-durable-jobs/v3
 ```
 
 You'll also need a database driver. For development, SQLite works great:
@@ -50,7 +50,7 @@ package main
 import (
     "context"
 
-    jobs "github.com/jdziat/simple-durable-jobs/v2"
+    jobs "github.com/jdziat/simple-durable-jobs/v3"
     "gorm.io/driver/sqlite"
     "gorm.io/gorm"
 )
@@ -119,7 +119,7 @@ queue.Register("calculate", func(ctx context.Context, x int) (int, error) {
 The string-keyed `Register` path is still useful for remote producers, dynamic job names, and interoperability with non-Go systems. For compile-time checked producer code, use the typed API:
 
 ```go
-import typed "github.com/jdziat/simple-durable-jobs/v2/pkg/typed"
+import typed "github.com/jdziat/simple-durable-jobs/v3/pkg/typed"
 
 type SendEmailResult struct {
     MessageID string `json:"message_id"`
@@ -135,8 +135,8 @@ cleanup := typed.DefineVoid(queue, "cleanup", func(ctx context.Context, _ struct
     return nil
 })
 
-// Producer-only process: create a typed handle without registering a local handler.
-remoteSendEmail := typed.Declare[SendEmailArgs, SendEmailResult](queue, "send-email")
+// Producer-only process: create an unchecked typed handle without registering a local handler.
+remoteSendEmail := typed.DeclareUnchecked[SendEmailArgs, SendEmailResult](queue, "send-email")
 
 jobID, err := sendEmail.Enqueue(ctx, SendEmailArgs{To: "user@example.com"})
 if err != nil {
@@ -154,6 +154,11 @@ _, err = remoteSendEmail.EnqueueRemote(ctx, SendEmailArgs{To: "remote@example.co
 _ = result
 _ = loaded
 ```
+
+`DeclareUnchecked` is the unchecked producer-only path; keep its argument and
+result types synchronized with the worker. The checked `Define` and `DefineE`
+paths validate that the declared result type matches the handler's return type.
+`EnqueueRemote` rejects malformed job names.
 
 ### 3. Enqueue Jobs
 
@@ -251,17 +256,30 @@ queue.Register("process-order", func(ctx context.Context, order Order) error {
 Set up recurring jobs:
 
 ```go
+queue.Register("cleanup", func(ctx context.Context, _ struct{}) error { return nil })
+queue.Register("report", func(ctx context.Context, _ struct{}) error { return nil })
+queue.Register("backup", func(ctx context.Context, _ struct{}) error { return nil })
+queue.Register("hourly", func(ctx context.Context, _ struct{}) error { return nil })
+
 // Every 5 minutes
-queue.Schedule("cleanup", nil, jobs.Every(5 * time.Minute))
+if err := queue.Schedule("cleanup", nil, jobs.Every(5*time.Minute)); err != nil {
+    return err
+}
 
 // Daily at 9:00 AM
-queue.Schedule("report", nil, jobs.Daily(9, 0))
+if err := queue.Schedule("report", nil, jobs.Daily(9, 0)); err != nil {
+    return err
+}
 
 // Weekly on Sunday at 2:00 AM
-queue.Schedule("backup", nil, jobs.Weekly(time.Sunday, 2, 0))
+if err := queue.Schedule("backup", nil, jobs.Weekly(time.Sunday, 2, 0)); err != nil {
+    return err
+}
 
 // Cron expression
-queue.Schedule("hourly", nil, jobs.Cron("0 * * * *"))
+if err := queue.Schedule("hourly", nil, jobs.Cron("0 * * * *")); err != nil {
+    return err
+}
 
 // Remember to enable scheduler in worker
 worker := queue.NewWorker(jobs.WithScheduler(true))
@@ -319,7 +337,7 @@ worker.Pause(jobs.PauseModeAggressive)
 Mount a monitoring dashboard into your HTTP server:
 
 ```go
-import "github.com/jdziat/simple-durable-jobs/v2/ui"
+import "github.com/jdziat/simple-durable-jobs/v3/ui"
 
 ctx, cancel := context.WithCancel(context.Background())
 defer cancel()

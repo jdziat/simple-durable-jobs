@@ -2,7 +2,6 @@ package storage
 
 import (
 	"context"
-	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -10,7 +9,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/core"
 )
 
 func TestEnqueueWithUniqueLockDedupesWithinWindowAndRefreshesAfterExpiry(t *testing.T) {
@@ -18,19 +17,19 @@ func TestEnqueueWithUniqueLockDedupesWithinWindowAndRefreshesAfterExpiry(t *test
 	ctx := context.Background()
 	scope := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
-	first := &core.Job{ID: "unique-lock-first", Type: "work", Queue: "default", Args: []byte(`{"n":1}`)}
+	first := &core.Job{ID: core.NewID(), Type: "work", Queue: "default", Args: []byte(`{"n":1}`)}
 	firstID, err := s.EnqueueWithUniqueLock(ctx, first, scope, time.Hour)
 	require.NoError(t, err)
 	assert.Equal(t, first.ID, firstID)
 
-	second := &core.Job{ID: "unique-lock-second", Type: "work", Queue: "default", Args: []byte(`{"n":2}`)}
+	second := &core.Job{ID: core.NewID(), Type: "work", Queue: "default", Args: []byte(`{"n":2}`)}
 	secondID, err := s.EnqueueWithUniqueLock(ctx, second, scope, time.Hour)
 	require.NoError(t, err)
 	assert.Equal(t, first.ID, secondID)
 
 	var jobCount int64
 	require.NoError(t, s.db.WithContext(ctx).Model(&core.Job{}).
-		Where("id IN ?", []string{first.ID, second.ID}).
+		Where("id IN ?", []core.UUID{first.ID, second.ID}).
 		Count(&jobCount).Error)
 	assert.EqualValues(t, 1, jobCount)
 
@@ -38,13 +37,13 @@ func TestEnqueueWithUniqueLockDedupesWithinWindowAndRefreshesAfterExpiry(t *test
 		Where("scope_hash = ?", scope).
 		Update("expires_at", time.Now().Add(-time.Hour).UTC()).Error)
 
-	third := &core.Job{ID: "unique-lock-third", Type: "work", Queue: "default", Args: []byte(`{"n":3}`)}
+	third := &core.Job{ID: core.NewID(), Type: "work", Queue: "default", Args: []byte(`{"n":3}`)}
 	thirdID, err := s.EnqueueWithUniqueLock(ctx, third, scope, time.Hour)
 	require.NoError(t, err)
 	assert.Equal(t, third.ID, thirdID)
 
 	require.NoError(t, s.db.WithContext(ctx).Model(&core.Job{}).
-		Where("id IN ?", []string{first.ID, second.ID, third.ID}).
+		Where("id IN ?", []core.UUID{first.ID, second.ID, third.ID}).
 		Count(&jobCount).Error)
 	assert.EqualValues(t, 2, jobCount)
 }
@@ -57,7 +56,7 @@ func TestEnqueueWithUniqueLockConcurrentSameKeyCreatesOneJobAndLock(t *testing.T
 	const scope = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
 
 	start := make(chan struct{})
-	ids := make(chan string, concurrency)
+	ids := make(chan core.UUID, concurrency)
 	errs := make(chan error, concurrency)
 	var wg sync.WaitGroup
 
@@ -66,7 +65,7 @@ func TestEnqueueWithUniqueLockConcurrentSameKeyCreatesOneJobAndLock(t *testing.T
 		go func(i int) {
 			defer wg.Done()
 			job := &core.Job{
-				ID:    fmt.Sprintf("ulr-%02d-%d", i, time.Now().UnixNano()),
+				ID:    core.NewID(),
 				Type:  "unique-lock-race",
 				Queue: "default",
 				Args:  []byte(`{"race":true}`),
@@ -90,7 +89,7 @@ func TestEnqueueWithUniqueLockConcurrentSameKeyCreatesOneJobAndLock(t *testing.T
 		require.NoError(t, err)
 	}
 
-	seenIDs := map[string]struct{}{}
+	seenIDs := map[core.UUID]struct{}{}
 	for id := range ids {
 		seenIDs[id] = struct{}{}
 	}
@@ -116,12 +115,12 @@ func TestDeleteExpiredUniqueLocks(t *testing.T) {
 
 	require.NoError(t, s.db.WithContext(ctx).Create(&core.UniqueLock{
 		ScopeHash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-		JobID:     "expired",
+		JobID:     testUUID("expired"),
 		ExpiresAt: now.Add(-time.Hour),
 	}).Error)
 	require.NoError(t, s.db.WithContext(ctx).Create(&core.UniqueLock{
 		ScopeHash: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-		JobID:     "live",
+		JobID:     testUUID("live"),
 		ExpiresAt: now.Add(time.Hour),
 	}).Error)
 
@@ -132,5 +131,5 @@ func TestDeleteExpiredUniqueLocks(t *testing.T) {
 	var remaining []core.UniqueLock
 	require.NoError(t, s.db.WithContext(ctx).Order("scope_hash ASC").Find(&remaining).Error)
 	require.Len(t, remaining, 1)
-	assert.Equal(t, "live", remaining[0].JobID)
+	assert.Equal(t, testUUID("live"), remaining[0].JobID)
 }

@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	jobs "github.com/jdziat/simple-durable-jobs/v2"
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/fanout"
+	jobs "github.com/jdziat/simple-durable-jobs/v3"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/fanout"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/driver/sqlite"
@@ -588,15 +588,16 @@ func TestLoadResult_DecodesCompletedJob(t *testing.T) {
 	want := Video{Name: "demo", Sec: 12}
 	resultBytes, err := json.Marshal(want)
 	require.NoError(t, err)
+	id := jobs.NewID()
 
 	require.NoError(t, store.Enqueue(context.Background(), &jobs.Job{
-		ID:     "job-ok",
+		ID:     id,
 		Type:   "x",
 		Status: jobs.StatusCompleted,
 		Result: resultBytes,
 	}))
 
-	got, err := jobs.LoadResult[Video](context.Background(), q, "job-ok")
+	got, err := jobs.LoadResult[Video](context.Background(), q, id)
 	require.NoError(t, err)
 	assert.Equal(t, want, got)
 }
@@ -606,41 +607,44 @@ func TestLoadResult_DecodesZeroValueResult(t *testing.T) {
 
 	resultBytes, err := json.Marshal(0)
 	require.NoError(t, err)
+	id := jobs.NewID()
 
 	require.NoError(t, store.Enqueue(context.Background(), &jobs.Job{
-		ID:     "job-zero-result",
+		ID:     id,
 		Type:   "x",
 		Status: jobs.StatusCompleted,
 		Result: resultBytes,
 	}))
 
-	got, err := jobs.LoadResult[int](context.Background(), q, "job-zero-result")
+	got, err := jobs.LoadResult[int](context.Background(), q, id)
 	require.NoError(t, err)
 	assert.Equal(t, 0, got)
 }
 
 func TestLoadResult_NotCompleted(t *testing.T) {
 	q, store := setupTestStorage(t)
+	id := jobs.NewID()
 	require.NoError(t, store.Enqueue(context.Background(), &jobs.Job{
-		ID:     "job-pending",
+		ID:     id,
 		Type:   "x",
 		Status: jobs.StatusPending,
 	}))
 
-	_, err := jobs.LoadResult[string](context.Background(), q, "job-pending")
+	_, err := jobs.LoadResult[string](context.Background(), q, id)
 	require.ErrorIs(t, err, jobs.ErrJobNotCompleted)
 }
 
 func TestLoadResult_FailedJobReturnsError(t *testing.T) {
 	q, store := setupTestStorage(t)
+	id := jobs.NewID()
 	require.NoError(t, store.Enqueue(context.Background(), &jobs.Job{
-		ID:        "job-failed",
+		ID:        id,
 		Type:      "x",
 		Status:    jobs.StatusFailed,
 		LastError: "boom",
 	}))
 
-	_, err := jobs.LoadResult[string](context.Background(), q, "job-failed")
+	_, err := jobs.LoadResult[string](context.Background(), q, id)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "boom")
 	require.ErrorIs(t, err, jobs.ErrJobFailed)
@@ -649,13 +653,14 @@ func TestLoadResult_FailedJobReturnsError(t *testing.T) {
 
 func TestLoadResult_CancelledJobReturnsSentinel(t *testing.T) {
 	q, store := setupTestStorage(t)
+	id := jobs.NewID()
 	require.NoError(t, store.Enqueue(context.Background(), &jobs.Job{
-		ID:     "job-cancelled",
+		ID:     id,
 		Type:   "x",
 		Status: jobs.StatusCancelled,
 	}))
 
-	_, err := jobs.LoadResult[string](context.Background(), q, "job-cancelled")
+	_, err := jobs.LoadResult[string](context.Background(), q, id)
 	require.Error(t, err)
 	require.ErrorIs(t, err, jobs.ErrJobCancelled)
 	require.NotErrorIs(t, err, jobs.ErrJobNotCompleted)
@@ -678,7 +683,7 @@ func TestLoadResult_PollerDiscrimination(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			id := "poller-" + tc.name
+			id := jobs.NewID()
 			require.NoError(t, store.Enqueue(ctx, &jobs.Job{
 				ID:        id,
 				Type:      "x",
@@ -704,34 +709,60 @@ func TestLoadResult_PollerDiscrimination(t *testing.T) {
 
 func TestLoadResult_CompletedWithNilResult(t *testing.T) {
 	q, store := setupTestStorage(t)
+	id := jobs.NewID()
 	require.NoError(t, store.Enqueue(context.Background(), &jobs.Job{
-		ID:     "job-no-result",
+		ID:     id,
 		Type:   "x",
 		Status: jobs.StatusCompleted,
 	}))
 
-	got, err := jobs.LoadResult[string](context.Background(), q, "job-no-result")
+	got, err := jobs.LoadResult[string](context.Background(), q, id)
 	require.ErrorIs(t, err, jobs.ErrNoResult)
 	assert.Equal(t, "", got)
 }
 
-func TestRequeue_FacadeResetsFailedJob(t *testing.T) {
+func TestQueueRequeue_MethodResetsFailedJob(t *testing.T) {
 	q, store := setupTestStorage(t)
 	ctx := context.Background()
+	id := jobs.NewID()
 	require.NoError(t, store.Enqueue(ctx, &jobs.Job{
-		ID: "job-rq", Type: "x", Status: jobs.StatusFailed, LastError: "boom",
+		ID: id, Type: "x", Status: jobs.StatusFailed, LastError: "boom",
 	}))
 
-	ok, err := jobs.Requeue(ctx, q, "job-rq")
+	ok, err := q.Requeue(ctx, id)
 	require.NoError(t, err)
 	assert.True(t, ok)
 
-	got, err := store.GetJob(ctx, "job-rq")
+	got, err := store.GetJob(ctx, id)
 	require.NoError(t, err)
 	assert.Equal(t, jobs.StatusPending, got.Status)
 
 	// A missing job is reported as not requeued, without error.
-	ok, err = jobs.Requeue(ctx, q, "does-not-exist")
+	ok, err = q.Requeue(ctx, jobs.NewID())
 	require.NoError(t, err)
 	assert.False(t, ok)
+}
+
+func TestQueueDeadLetterMethods_ListAndCount(t *testing.T) {
+	q, store := setupTestStorage(t)
+	ctx := context.Background()
+	deadLetteredAt := time.Now()
+	id := jobs.NewID()
+	require.NoError(t, store.Enqueue(ctx, &jobs.Job{
+		ID:               id,
+		Type:             "email.send",
+		Queue:            "mail",
+		Status:           jobs.StatusFailed,
+		DeadLetteredAt:   &deadLetteredAt,
+		DeadLetterReason: "max retries exhausted: boom",
+	}))
+
+	count, err := q.CountDeadLettered(ctx, jobs.DeadLetterQueue("mail"), jobs.DeadLetterType("email.send"))
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), count)
+
+	got, err := q.ListDeadLettered(ctx, jobs.DeadLetterQueue("mail"), jobs.DeadLetterLimit(10))
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	assert.Equal(t, id, got[0].ID)
 }

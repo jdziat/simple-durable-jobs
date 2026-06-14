@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"time"
 
-	jobs "github.com/jdziat/simple-durable-jobs/v2"
-	typed "github.com/jdziat/simple-durable-jobs/v2/pkg/typed"
+	jobs "github.com/jdziat/simple-durable-jobs/v3"
+	typed "github.com/jdziat/simple-durable-jobs/v3/pkg/typed"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
@@ -75,7 +75,7 @@ func ExampleDefine() {
 	}
 
 	q := jobs.New(store)
-	sendEmail := typed.Define(q, "typed-send-email", func(ctx context.Context, args exampleTypedEmail) (exampleTypedEmailResult, error) {
+	sendEmail := typed.Define[exampleTypedEmail, exampleTypedEmailResult](q, "typed-send-email", func(ctx context.Context, args exampleTypedEmail) (exampleTypedEmailResult, error) {
 		return exampleTypedEmailResult{MessageID: "msg_" + args.To}, nil
 	})
 
@@ -277,7 +277,7 @@ func ExampleSignal() {
 	if err != nil {
 		panic(err)
 	}
-	if err := jobs.Signal(ctx, q, jobID, "approved", true); err != nil {
+	if err := q.Signal(ctx, jobID, "approved", true); err != nil {
 		panic(err)
 	}
 }

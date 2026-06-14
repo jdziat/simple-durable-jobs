@@ -15,9 +15,9 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/queue"
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/storage"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/queue"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/storage"
 )
 
 func TestInstrument_RecordsLifecycleMetrics(t *testing.T) {
@@ -31,7 +31,7 @@ func TestInstrument_RecordsLifecycleMetrics(t *testing.T) {
 
 	startedAt := time.Now().Add(-2 * time.Second)
 	job := &core.Job{
-		ID:        "job-1",
+		ID:        core.NewID(),
 		Type:      "email",
 		Queue:     "critical",
 		CreatedAt: startedAt.Add(-3 * time.Second),
@@ -97,9 +97,9 @@ func TestInstrument_RecordsQueueDepthGauge(t *testing.T) {
 	ctx := context.Background()
 	store := newSQLiteStore(t)
 
-	require.NoError(t, store.Enqueue(ctx, &core.Job{ID: "pending-alpha", Type: "email", Queue: "alpha"}))
-	require.NoError(t, store.Enqueue(ctx, &core.Job{ID: "pending-beta", Type: "report", Queue: "beta"}))
-	require.NoError(t, store.Enqueue(ctx, &core.Job{ID: "running-alpha", Type: "email", Queue: "alpha"}))
+	require.NoError(t, store.Enqueue(ctx, &core.Job{ID: core.NewID(), Type: "email", Queue: "alpha"}))
+	require.NoError(t, store.Enqueue(ctx, &core.Job{ID: core.NewID(), Type: "report", Queue: "beta"}))
+	require.NoError(t, store.Enqueue(ctx, &core.Job{ID: core.NewID(), Type: "email", Queue: "alpha"}))
 	running, err := store.Dequeue(ctx, []string{"alpha"}, "worker-1")
 	require.NoError(t, err)
 	require.NotNil(t, running)
@@ -128,8 +128,8 @@ func TestInstrument_RecordsBacklogOldestAgeGauge(t *testing.T) {
 	store := newSQLiteStore(t)
 	createdAt := time.Now().Add(-5 * time.Minute)
 
-	require.NoError(t, store.Enqueue(ctx, &core.Job{ID: "pending-alpha", Type: "email", Queue: "alpha", CreatedAt: createdAt}))
-	require.NoError(t, store.Enqueue(ctx, &core.Job{ID: "running-alpha", Type: "email", Queue: "alpha", Status: core.StatusRunning, CreatedAt: createdAt.Add(-time.Hour)}))
+	require.NoError(t, store.Enqueue(ctx, &core.Job{ID: core.NewID(), Type: "email", Queue: "alpha", CreatedAt: createdAt}))
+	require.NoError(t, store.Enqueue(ctx, &core.Job{ID: core.NewID(), Type: "email", Queue: "alpha", Status: core.StatusRunning, CreatedAt: createdAt.Add(-time.Hour)}))
 
 	reader := sdkmetric.NewManualReader()
 	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
@@ -150,9 +150,9 @@ func TestInstrument_RecordsDeadLetterDepthGauge(t *testing.T) {
 	ctx := context.Background()
 	store := newSQLiteStore(t)
 
-	seedDeadLetteredJob(t, store, "alpha-1", "alpha")
-	seedDeadLetteredJob(t, store, "alpha-2", "alpha")
-	seedDeadLetteredJob(t, store, "beta-1", "beta")
+	seedDeadLetteredJob(t, store, string(core.NewID()), "alpha")
+	seedDeadLetteredJob(t, store, string(core.NewID()), "alpha")
+	seedDeadLetteredJob(t, store, string(core.NewID()), "beta")
 
 	reader := sdkmetric.NewManualReader()
 	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
@@ -351,7 +351,7 @@ type noDepthStorage struct {
 func seedDeadLetteredJob(t *testing.T, store *storage.GormStorage, id, queueName string) {
 	t.Helper()
 	ctx := context.Background()
-	require.NoError(t, store.Enqueue(ctx, &core.Job{ID: id, Type: "work", Queue: queueName, MaxRetries: 1}))
+	require.NoError(t, store.Enqueue(ctx, &core.Job{ID: core.UUID(id), Type: "work", Queue: queueName, MaxRetries: 1}))
 	job, err := store.Dequeue(ctx, []string{queueName}, "worker-1")
 	require.NoError(t, err)
 	require.NotNil(t, job)

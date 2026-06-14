@@ -8,7 +8,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/core"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -174,7 +174,7 @@ func TestZZ_DeleteJob_RemovesJobAndCheckpoints(t *testing.T) {
 	require.NoError(t, s.Enqueue(ctx, j))
 
 	cp := &core.Checkpoint{
-		ID:        "cp-1",
+		ID:        testUUID("cp-1"),
 		JobID:     j.ID,
 		CallIndex: 0,
 		CallType:  "Call",
@@ -197,7 +197,7 @@ func TestZZ_DeleteJob_NonexistentIsNoError(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStorage(t)
 
-	require.NoError(t, s.DeleteJob(ctx, "nope"))
+	require.NoError(t, s.DeleteJob(ctx, testUUID("nope")))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -325,14 +325,14 @@ func TestZZ_GetFanOutsByParents_And_SubJobsByFanOuts(t *testing.T) {
 	require.NoError(t, s.Enqueue(ctx, parent2))
 
 	fo1 := &core.FanOut{
-		ID:          "fo-1",
+		ID:          testUUID("fo-1"),
 		ParentJobID: parent1.ID,
 		TotalCount:  2,
 		Strategy:    core.StrategyFailFast,
 		Status:      core.FanOutPending,
 	}
 	fo2 := &core.FanOut{
-		ID:          "fo-2",
+		ID:          testUUID("fo-2"),
 		ParentJobID: parent2.ID,
 		TotalCount:  1,
 		Strategy:    core.StrategyCollectAll,
@@ -359,16 +359,16 @@ func TestZZ_GetFanOutsByParents_And_SubJobsByFanOuts(t *testing.T) {
 	sub2.ParentJobID = &parent2.ID
 	require.NoError(t, s.Enqueue(ctx, sub2))
 
-	fanOuts, err := s.GetFanOutsByParents(ctx, []string{parent1.ID, parent2.ID})
+	fanOuts, err := s.GetFanOutsByParents(ctx, []core.UUID{parent1.ID, parent2.ID})
 	require.NoError(t, err)
 	require.Len(t, fanOuts, 2)
 
-	subJobs, err := s.GetSubJobsByFanOuts(ctx, []string{fo1.ID, fo2.ID})
+	subJobs, err := s.GetSubJobsByFanOuts(ctx, []core.UUID{fo1.ID, fo2.ID})
 	require.NoError(t, err)
 	assert.Len(t, subJobs, 3)
 
 	// Verify ordering within a single fan-out (fan_out_index ascending).
-	onlyFo1, err := s.GetSubJobsByFanOuts(ctx, []string{fo1.ID})
+	onlyFo1, err := s.GetSubJobsByFanOuts(ctx, []core.UUID{fo1.ID})
 	require.NoError(t, err)
 	require.Len(t, onlyFo1, 2)
 	assert.Equal(t, 0, onlyFo1[0].FanOutIndex)
@@ -388,7 +388,7 @@ func TestZZ_GetSubJobsByFanOuts_EmptyInput(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStorage(t)
 
-	jobs, err := s.GetSubJobsByFanOuts(ctx, []string{})
+	jobs, err := s.GetSubJobsByFanOuts(ctx, []core.UUID{})
 	require.NoError(t, err)
 	assert.Nil(t, jobs)
 }
@@ -404,7 +404,7 @@ func TestZZ_SearchJobs_FiltersAndPaging(t *testing.T) {
 	base := time.Now()
 	mk := func(id, queue, jobType string, status core.JobStatus, created time.Time) {
 		j := &core.Job{
-			ID:        id,
+			ID:        testUUID(id),
 			Type:      jobType,
 			Queue:     queue,
 			Status:    status,
@@ -439,7 +439,7 @@ func TestZZ_SearchJobs_FiltersAndPaging(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, int64(1), wtotal)
 	require.Len(t, windowed, 1)
-	assert.Equal(t, "j-mid", windowed[0].ID)
+	assert.Equal(t, testUUID("j-mid"), windowed[0].ID)
 
 	// Default limit branch (Limit <= 0) and offset.
 	page, ptotal, err := s.SearchJobs(ctx, core.JobFilter{Offset: 1})

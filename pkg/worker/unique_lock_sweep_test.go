@@ -9,8 +9,8 @@ import (
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
 
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/queue"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/queue"
 )
 
 func TestUniqueLockSweepGate(t *testing.T) {
@@ -66,12 +66,12 @@ func TestWorkerUniqueLockSweepDeletesExpiredLocks(t *testing.T) {
 
 	require.NoError(t, db.Create(&core.UniqueLock{
 		ScopeHash: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-		JobID:     "expired",
+		JobID:     workerTestUUID("expired"),
 		ExpiresAt: now.Add(-time.Hour),
 	}).Error)
 	require.NoError(t, db.Create(&core.UniqueLock{
 		ScopeHash: "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
-		JobID:     "live",
+		JobID:     workerTestUUID("live"),
 		ExpiresAt: now.Add(time.Hour),
 	}).Error)
 

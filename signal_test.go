@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	jobs "github.com/jdziat/simple-durable-jobs/v2"
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
+	jobs "github.com/jdziat/simple-durable-jobs/v3"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/core"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/driver/sqlite"
@@ -23,12 +23,12 @@ type signalTestStorage struct {
 	resumeErr error
 }
 
-func (s *signalTestStorage) SendSignal(ctx context.Context, jobID, name string, payload []byte) error {
+func (s *signalTestStorage) SendSignal(ctx context.Context, jobID core.UUID, name string, payload []byte) error {
 	s.sendCount.Add(1)
 	return s.GormStorage.SendSignal(ctx, jobID, name, payload)
 }
 
-func (s *signalTestStorage) ResumeSignalWaitingJob(ctx context.Context, jobID string) (bool, error) {
+func (s *signalTestStorage) ResumeSignalWaitingJob(ctx context.Context, jobID core.UUID) (bool, error) {
 	if s.resumeErr != nil {
 		return false, s.resumeErr
 	}
@@ -59,7 +59,7 @@ func seedWaitingSignalJob(t *testing.T, ctx context.Context, store *signalTestSt
 	return job
 }
 
-func waitForJobResumedBySignal(t *testing.T, events <-chan core.Event, jobID, name string) {
+func waitForJobResumedBySignal(t *testing.T, events <-chan core.Event, jobID core.UUID, name string) {
 	t.Helper()
 	deadline := time.After(time.Second)
 	for {
@@ -81,7 +81,7 @@ func TestSignal_ReturnsNilWhenImmediateResumeFailsAfterDelivery(t *testing.T) {
 	store.resumeErr = errors.New("resume unavailable")
 	job := seedWaitingSignalJob(t, ctx, store)
 
-	err := jobs.Signal(ctx, q, job.ID, "ready", map[string]string{"ok": "true"})
+	err := q.Signal(ctx, job.ID, "ready", map[string]string{"ok": "true"})
 
 	require.NoError(t, err)
 	assert.EqualValues(t, 1, store.sendCount.Load(), "Signal must not ask callers to retry a durably delivered signal")
@@ -100,7 +100,7 @@ func TestSignal_HappyPathEmitsJobResumedBySignal(t *testing.T) {
 	defer q.Unsubscribe(events)
 	job := seedWaitingSignalJob(t, ctx, store)
 
-	require.NoError(t, jobs.Signal(ctx, q, job.ID, "ready", "payload"))
+	require.NoError(t, q.Signal(ctx, job.ID, "ready", "payload"))
 	assert.EqualValues(t, 1, store.sendCount.Load())
 	waitForJobResumedBySignal(t, events, job.ID, "ready")
 

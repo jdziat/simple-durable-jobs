@@ -6,9 +6,9 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
-	intctx "github.com/jdziat/simple-durable-jobs/v2/pkg/internal/context"
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/security"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/core"
+	intctx "github.com/jdziat/simple-durable-jobs/v3/pkg/internal/context"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/security"
 )
 
 // FanOut spawns sub-jobs in parallel and waits for all results.
@@ -44,7 +44,7 @@ func FanOut[T any](ctx context.Context, subJobs []SubJob, opts ...Option) ([]Res
 	checkpoint, hasCheckpoint := cs.Checkpoints[intctx.CheckpointKey{Index: callIndex, Type: "fanout"}]
 	cs.Mu.Unlock()
 
-	var fanOutID string
+	var fanOutID core.UUID
 
 	if hasCheckpoint {
 		// Resume: extract fan-out ID from checkpoint
@@ -157,7 +157,7 @@ func FanOut[T any](ctx context.Context, subJobs []SubJob, opts ...Option) ([]Res
 	return nil, &WaitingError{FanOutID: fanOutID}
 }
 
-func buildSubJobs(subJobs []SubJob, cfg *config, jc *intctx.JobContext, fanOutID string) ([]*core.Job, error) {
+func buildSubJobs(subJobs []SubJob, cfg *config, jc *intctx.JobContext, fanOutID core.UUID) ([]*core.Job, error) {
 	jobs := make([]*core.Job, len(subJobs))
 	for i, sj := range subJobs {
 		if err := security.ValidateJobTypeName(sj.Type); err != nil {
@@ -248,7 +248,7 @@ func cloneMetadata(m map[string]string) map[string]string {
 // worker uses this signal to stop processing the current handler without
 // treating the outcome as a failure.
 type WaitingError struct {
-	FanOutID string
+	FanOutID core.UUID
 }
 
 func (e *WaitingError) Error() string {
@@ -268,7 +268,7 @@ func IsWaitingError(err error) bool {
 
 // CollectResults gathers results from completed sub-jobs.
 // Called when parent job resumes after fan-out.
-func CollectResults[T any](ctx context.Context, fanOutID string) ([]Result[T], error) {
+func CollectResults[T any](ctx context.Context, fanOutID core.UUID) ([]Result[T], error) {
 	jc := intctx.GetJobContext(ctx)
 	if jc == nil {
 		return nil, fmt.Errorf("CollectResults must be used within a job handler")

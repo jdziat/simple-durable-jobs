@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	jobs "github.com/jdziat/simple-durable-jobs/v2"
+	jobs "github.com/jdziat/simple-durable-jobs/v3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -46,7 +46,7 @@ func TestSavePhaseCheckpointTx_CommitSkipsOnReplay(t *testing.T) {
 
 		effectRuns.Add(1)
 		if err := tx.Create(&txCheckpointEffect{
-			JobID: jobs.JobIDFromContext(ctx),
+			JobID: string(jobs.JobIDFromContext(ctx)),
 			Name:  "committed",
 		}).Error; err != nil {
 			return err
@@ -68,7 +68,7 @@ func TestSavePhaseCheckpointTx_CommitSkipsOnReplay(t *testing.T) {
 	assert.EqualValues(t, 1, effectRuns.Load())
 
 	var count int64
-	require.NoError(t, gormStore.DB().Model(&txCheckpointEffect{}).Where("job_id = ?", jobID).Count(&count).Error)
+	require.NoError(t, gormStore.DB().Model(&txCheckpointEffect{}).Where("job_id = ?", string(jobID)).Count(&count).Error)
 	assert.EqualValues(t, 1, count)
 	assertPhaseCheckpoint(t, store, jobID, "business-effect", "done")
 }
@@ -94,7 +94,7 @@ func TestSavePhaseCheckpointTx_RollbackReexecutesOnReplay(t *testing.T) {
 		defer tx.Rollback()
 
 		if err := tx.Create(&txCheckpointEffect{
-			JobID: jobs.JobIDFromContext(ctx),
+			JobID: string(jobs.JobIDFromContext(ctx)),
 			Name:  fmt.Sprintf("attempt-%d", attempts.Add(1)),
 		}).Error; err != nil {
 			return err
@@ -116,7 +116,7 @@ func TestSavePhaseCheckpointTx_RollbackReexecutesOnReplay(t *testing.T) {
 	assert.EqualValues(t, 2, misses.Load(), "rolled-back checkpoint must not be visible on replay")
 
 	var count int64
-	require.NoError(t, gormStore.DB().Model(&txCheckpointEffect{}).Where("job_id = ?", jobID).Count(&count).Error)
+	require.NoError(t, gormStore.DB().Model(&txCheckpointEffect{}).Where("job_id = ?", string(jobID)).Count(&count).Error)
 	assert.EqualValues(t, 1, count)
 	assertPhaseCheckpoint(t, store, jobID, "business-effect", "done")
 }
@@ -177,7 +177,7 @@ func TestSavePhaseCheckpointTx_CrashBeforeCommitHasExactlyOnceCommittedEffect(t 
 		defer tx.Rollback()
 
 		if err := tx.Create(&txCheckpointEffect{
-			JobID: jobs.JobIDFromContext(ctx),
+			JobID: string(jobs.JobIDFromContext(ctx)),
 			Name:  "external-effect",
 		}).Error; err != nil {
 			return err
@@ -197,17 +197,17 @@ func TestSavePhaseCheckpointTx_CrashBeforeCommitHasExactlyOnceCommittedEffect(t 
 
 	assert.EqualValues(t, 2, attempts.Load())
 	var count int64
-	require.NoError(t, gormStore.DB().Model(&txCheckpointEffect{}).Where("job_id = ?", jobID).Count(&count).Error)
+	require.NoError(t, gormStore.DB().Model(&txCheckpointEffect{}).Where("job_id = ?", string(jobID)).Count(&count).Error)
 	assert.EqualValues(t, 1, count)
 	assertPhaseCheckpoint(t, store, jobID, "external-effect", "done")
 }
 
-func runWorkerUntilDone(t *testing.T, q *jobs.Queue, store jobs.Storage, jobID string) {
+func runWorkerUntilDone(t *testing.T, q *jobs.Queue, store jobs.Storage, jobID jobs.UUID) {
 	t.Helper()
 	runWorkerUntilStatus(t, q, store, jobID, jobs.StatusCompleted)
 }
 
-func runWorkerUntilStatus(t *testing.T, q *jobs.Queue, store jobs.Storage, jobID string, status jobs.JobStatus) {
+func runWorkerUntilStatus(t *testing.T, q *jobs.Queue, store jobs.Storage, jobID jobs.UUID, status jobs.JobStatus) {
 	t.Helper()
 	workerCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -224,7 +224,7 @@ func runWorkerUntilStatus(t *testing.T, q *jobs.Queue, store jobs.Storage, jobID
 	}
 }
 
-func assertPhaseCheckpoint(t *testing.T, store jobs.Storage, jobID, phaseName, want string) {
+func assertPhaseCheckpoint(t *testing.T, store jobs.Storage, jobID jobs.UUID, phaseName, want string) {
 	t.Helper()
 	checkpoints, err := store.GetCheckpoints(context.Background(), jobID)
 	require.NoError(t, err)

@@ -15,8 +15,8 @@ import (
 	"golang.org/x/net/http2/h2c"
 	"gorm.io/gorm"
 
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
-	"github.com/jdziat/simple-durable-jobs/v2/ui/gen/jobs/v1/jobsv1connect"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/v3/ui/gen/jobs/v1/jobsv1connect"
 )
 
 var (

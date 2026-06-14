@@ -9,9 +9,9 @@ import (
 
 	"gorm.io/gorm"
 
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
-	intctx "github.com/jdziat/simple-durable-jobs/v2/pkg/internal/context"
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/storage"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/core"
+	intctx "github.com/jdziat/simple-durable-jobs/v3/pkg/internal/context"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/storage"
 )
 
 // DefaultVersion is the sentinel version used for code paths that existed
@@ -34,11 +34,11 @@ func JobFromContext(ctx context.Context) *core.Job {
 	return jc.Job
 }
 
-// JobIDFromContext returns the current job ID from context, or empty string if not in a job handler.
-func JobIDFromContext(ctx context.Context) string {
+// JobIDFromContext returns the current job ID from context, or empty UUID if not in a job handler.
+func JobIDFromContext(ctx context.Context) core.UUID {
 	job := JobFromContext(ctx)
 	if job == nil {
-		return ""
+		return core.NilUUID
 	}
 	return job.ID
 }

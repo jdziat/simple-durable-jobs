@@ -15,7 +15,7 @@ import (
 	"time"
 
 	mysqlcfg "github.com/go-sql-driver/mysql"
-	jobs "github.com/jdziat/simple-durable-jobs/v2"
+	jobs "github.com/jdziat/simple-durable-jobs/v3"
 	gormmysql "gorm.io/driver/mysql"
 	"gorm.io/driver/postgres"
 	"gorm.io/driver/sqlite"
@@ -420,7 +420,11 @@ Usage:
 		return a.runDLQRequeueBulk(ctx, opened.store, filter)
 	}
 	jobID := fs.Arg(0)
-	requeued, err := opened.store.Requeue(ctx, jobID)
+	parsedJobID, err := jobs.ParseUUID(jobID)
+	if err != nil {
+		return a.fail("invalid job id %q: %s", jobID, userError(err))
+	}
+	requeued, err := opened.store.Requeue(ctx, parsedJobID)
 	if err != nil {
 		return a.fail("could not requeue job %q; verify the job is not a fan-out sub-job and storage is healthy: %s", jobID, userError(err))
 	}

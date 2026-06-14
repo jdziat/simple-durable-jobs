@@ -2,7 +2,7 @@
 //
 // Usage:
 //
-//	import jobsotel "github.com/jdziat/simple-durable-jobs/v2/pkg/otel"
+//	import jobsotel "github.com/jdziat/simple-durable-jobs/v3/pkg/otel"
 //
 //	queue := jobs.New(storage)
 //	jobsotel.Instrument(queue)
@@ -24,11 +24,11 @@ import (
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
 
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/queue"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/queue"
 )
 
-const instrumentationName = "github.com/jdziat/simple-durable-jobs/v2/pkg/otel"
+const instrumentationName = "github.com/jdziat/simple-durable-jobs/v3/pkg/otel"
 
 // instrumentConfig holds configuration for the OTel integration.
 type instrumentConfig struct {
@@ -113,7 +113,7 @@ func enqueueMiddleware(tracer trace.Tracer, prop propagation.TextMapPropagator) 
 			return err
 		}
 
-		span.SetAttributes(attribute.String("job.id", job.ID))
+		span.SetAttributes(attribute.String("job.id", string(job.ID)))
 		return nil
 	}
 }
@@ -190,7 +190,7 @@ func jobAttributes(job *core.Job) []attribute.KeyValue {
 		attribute.Int("job.attempt", job.Attempt),
 	}
 	if job.ID != "" {
-		attrs = append(attrs, attribute.String("job.id", job.ID))
+		attrs = append(attrs, attribute.String("job.id", string(job.ID)))
 	}
 	return attrs
 }

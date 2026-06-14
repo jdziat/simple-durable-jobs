@@ -14,7 +14,7 @@ steps:
 Use `jobs.GetVersion` to record a small version marker before a code change and
 branch on the recorded value. The marker is stored in the same checkpoint table
 as `Call` and `SavePhaseCheckpoint`, so it survives retry, suspend/resume, and
-worker restarts. `jobs.Requeue` clears checkpoints for a full replay, so a
+worker restarts. `q.Requeue` clears checkpoints for a full replay, so a
 requeued run records versions again from the current code.
 
 ## API
@@ -38,7 +38,7 @@ returns it. On replay, it returns the recorded version even if a later deploy
 increases `maxSupported`.
 
 Each distinct `changeID` records exactly one checkpoint row, which persists for
-the life of the run (cleared only by `jobs.Requeue` or job deletion). The
+the life of the run (cleared only by `q.Requeue` or job deletion). The
 `jobs.version:` checkpoint-type prefix is reserved: do not pass a
 `SavePhaseCheckpoint` phase name of the form `jobs.version:<changeID>` that would
 collide with a `GetVersion` marker in the same job.

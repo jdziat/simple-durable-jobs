@@ -33,12 +33,12 @@ var AllFanOutStatuses = []FanOutStatus{FanOutPending, FanOutCompleted, FanOutFai
 
 // FanOut tracks a batch of sub-jobs spawned by a parent job.
 type FanOut struct {
-	ID             string         `gorm:"primaryKey;size:36"`
-	ParentJobID    string         `gorm:"index;index:idx_fan_outs_parent_status,priority:1;size:36;not null"`
-	TotalCount     int            `gorm:"not null"`
-	CompletedCount int            `gorm:"default:0"`
-	FailedCount    int            `gorm:"default:0"`
-	CancelledCount int            `gorm:"default:0"`
+	ID             UUID           `gorm:"primaryKey"`
+	ParentJobID    UUID           `gorm:"index;index:idx_fan_outs_parent_status,priority:1;not null"`
+	TotalCount     int            `gorm:"type:integer;not null"`
+	CompletedCount int            `gorm:"type:integer;default:0"`
+	FailedCount    int            `gorm:"type:integer;default:0"`
+	CancelledCount int            `gorm:"type:integer;default:0"`
 	Strategy       FanOutStrategy `gorm:"size:20;default:'fail_fast'"`
 	Threshold      float64        `gorm:"type:double precision;default:1.0"`
 	Status         FanOutStatus   `gorm:"size:20;default:'pending';index:idx_fan_outs_parent_status,priority:2"`

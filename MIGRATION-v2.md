@@ -16,7 +16,7 @@ schema — is **unchanged**. Migration is three find/replace steps.
 ## Coexistence: there is no forced cutover
 
 v1 and v2 are **distinct module paths** (`…/simple-durable-jobs` vs
-`…/simple-durable-jobs/v2`). You can depend on both at once and migrate package
+`…/simple-durable-jobs/v3`). You can depend on both at once and migrate package
 by package; the v1 line stays installable forever (it just stops getting new
 features). Nothing is deleted from v1.
 
@@ -30,7 +30,7 @@ safe: deploy v2 workers alongside v1, drain v1, decommission. No data migration.
 ## Step 1 — update the import path
 
 ```sh
-go get github.com/jdziat/simple-durable-jobs/v2@v2.0.0
+go get github.com/jdziat/simple-durable-jobs/v3@v2.0.0
 ```
 
 Rewrite imports across your code (the `/v2` suffix is the only change):
@@ -38,7 +38,7 @@ Rewrite imports across your code (the `/v2` suffix is the only change):
 ```sh
 # preview, then apply
 grep -rl '"github.com/jdziat/simple-durable-jobs' --include='*.go' . \
-  | xargs sed -i 's|"github.com/jdziat/simple-durable-jobs|"github.com/jdziat/simple-durable-jobs/v2|g'
+  | xargs sed -i 's|"github.com/jdziat/simple-durable-jobs|"github.com/jdziat/simple-durable-jobs/v3|g'
 goimports -w .   # or: gofmt -w .
 ```
 

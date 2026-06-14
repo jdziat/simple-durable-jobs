@@ -68,7 +68,7 @@ test.describe('Jobs Page', () => {
   test('clicking a job row navigates to detail', async ({ page }) => {
     const firstRow = page.locator('.jobs-table tbody tr.clickable').first()
     await firstRow.click()
-    await expect(page).toHaveURL(/#\/jobs\/e2e-/)
+    await expect(page).toHaveURL(/#\/jobs\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/)
   })
 
   test('pagination shows total count', async ({ page }) => {

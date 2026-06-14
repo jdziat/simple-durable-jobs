@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/jdziat/simple-durable-jobs/v2/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/core"
 )
 
 var (
@@ -39,7 +39,7 @@ type Result[T any] struct {
 
 // Error contains details about fan-out failures.
 type Error struct {
-	FanOutID    string
+	FanOutID    core.UUID
 	TotalCount  int
 	FailedCount int
 	Strategy    core.FanOutStrategy
@@ -53,7 +53,7 @@ func (e *Error) Error() string {
 // SubJobFailure contains details about a single sub-job failure.
 type SubJobFailure struct {
 	Index   int
-	JobID   string
+	JobID   core.UUID
 	Error   string
 	Attempt int
 }
