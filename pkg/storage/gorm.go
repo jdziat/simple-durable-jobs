@@ -2007,52 +2007,100 @@ func (s *GormStorage) SaveJobResult(ctx context.Context, jobID core.UUID, worker
 // --- Job pause operations ---
 
 // PauseJob pauses a job, preventing it from being picked up.
-// Only pending and waiting jobs can be paused. Running jobs cannot be paused
-// because the worker holds the lock and clearing it would corrupt state.
+// It preserves the legacy storage behavior: running jobs are cancelled.
 func (s *GormStorage) PauseJob(ctx context.Context, jobID core.UUID) error {
+	return s.PauseJobWithMode(ctx, jobID, core.PauseModeAggressive)
+}
+
+// PauseJobWithMode pauses or cancels a job according to mode.
+// Graceful pause only transitions pending/waiting jobs to paused. Aggressive
+// mode preserves PauseJob's legacy behavior and cancels running jobs.
+func (s *GormStorage) PauseJobWithMode(ctx context.Context, jobID core.UUID, mode core.PauseMode) error {
+	if mode == core.PauseModeGraceful {
+		return s.pauseJobGraceful(ctx, jobID)
+	}
+	return s.pauseJobAggressive(ctx, jobID)
+}
+
+func (s *GormStorage) pauseJobGraceful(ctx context.Context, jobID core.UUID) error {
 	return s.withSerializationRetry(ctx, func() error {
 		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			result := tx.Model(&core.Job{}).
+				Where("id = ? AND status IN ?", jobID, []core.JobStatus{core.StatusPending, core.StatusWaiting}).
+				Updates(map[string]any{
+					"status":          core.StatusPaused,
+					"previous_status": gorm.Expr("status"),
+					"updated_at":      time.Now(),
+				})
+			if result.Error != nil {
+				return result.Error
+			}
+			if result.RowsAffected > 0 {
+				return nil
+			}
+
 			var job core.Job
-			if err := tx.First(&job, "id = ?", jobID).Error; err != nil {
+			if err := tx.Select("status").First(&job, "id = ?", jobID).Error; err != nil {
 				if errors.Is(err, gorm.ErrRecordNotFound) {
 					return fmt.Errorf("job not found: %s", jobID)
 				}
 				return err
 			}
-
-			// Check if already paused
 			if job.Status == core.StatusPaused {
 				return core.ErrJobAlreadyPaused
 			}
+			return core.ErrCannotPauseStatus
+		})
+	})
+}
 
+func (s *GormStorage) pauseJobAggressive(ctx context.Context, jobID core.UUID) error {
+	return s.withSerializationRetry(ctx, func() error {
+		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 			now := time.Now()
-
-			switch job.Status {
-			case core.StatusPending, core.StatusWaiting:
-				// Pause: store previous status for restoration on unpause
-				return tx.Model(&core.Job{}).
-					Where("id = ?", jobID).
-					Updates(map[string]any{
-						"status":          core.StatusPaused,
-						"previous_status": job.Status,
-						"updated_at":      now,
-					}).Error
-			case core.StatusRunning:
-				// Cancel: running jobs transition directly to cancelled
-				return tx.Model(&core.Job{}).
-					Where("id = ?", jobID).
-					Updates(map[string]any{
-						"status":       core.StatusCancelled,
-						"completed_at": now,
-						"updated_at":   now,
-						// non-PII constant; intentionally stored plaintext
-						"last_error":   "cancelled by user",
-						"locked_by":    "",
-						"locked_until": nil,
-					}).Error
-			default:
-				return core.ErrCannotPauseStatus
+			pauseResult := tx.Model(&core.Job{}).
+				Where("id = ? AND status IN ?", jobID, []core.JobStatus{core.StatusPending, core.StatusWaiting}).
+				Updates(map[string]any{
+					"status":          core.StatusPaused,
+					"previous_status": gorm.Expr("status"),
+					"updated_at":      now,
+				})
+			if pauseResult.Error != nil {
+				return pauseResult.Error
 			}
+			if pauseResult.RowsAffected > 0 {
+				return nil
+			}
+
+			cancelResult := tx.Model(&core.Job{}).
+				Where("id = ? AND status = ?", jobID, core.StatusRunning).
+				Updates(map[string]any{
+					"status":       core.StatusCancelled,
+					"completed_at": now,
+					"updated_at":   now,
+					// non-PII constant; intentionally stored plaintext
+					"last_error":   "cancelled by user",
+					"locked_by":    "",
+					"locked_until": nil,
+				})
+			if cancelResult.Error != nil {
+				return cancelResult.Error
+			}
+			if cancelResult.RowsAffected > 0 {
+				return nil
+			}
+
+			var job core.Job
+			if err := tx.Select("status").First(&job, "id = ?", jobID).Error; err != nil {
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					return fmt.Errorf("job not found: %s", jobID)
+				}
+				return err
+			}
+			if job.Status == core.StatusPaused {
+				return core.ErrJobAlreadyPaused
+			}
+			return core.ErrCannotPauseStatus
 		})
 	})
 }

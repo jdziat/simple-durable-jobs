@@ -1004,21 +1004,22 @@ func (q *Queue) PauseJob(ctx context.Context, jobID core.UUID, opts ...PauseOpti
 		opt.ApplyPause(po)
 	}
 
-	job, err := q.storage.GetJob(ctx, jobID)
-	if err != nil {
-		return err
-	}
-	if job != nil && job.Status == core.StatusRunning && po.Mode == core.PauseModeGraceful {
-		return core.ErrCannotPauseStatus
-	}
-
 	// Check if the job is running locally before touching storage,
 	// so we can cancel its context after the DB update.
 	q.runningJobsMu.Lock()
 	cancel, runningLocally := q.runningJobs[jobID]
 	q.runningJobsMu.Unlock()
 
-	err = q.storage.PauseJob(ctx, jobID)
+	type pauseModeStorage interface {
+		PauseJobWithMode(ctx context.Context, jobID core.UUID, mode core.PauseMode) error
+	}
+	var _ pauseModeStorage = (*storage.GormStorage)(nil)
+	var err error
+	if pm, ok := q.storage.(pauseModeStorage); ok {
+		err = pm.PauseJobWithMode(ctx, jobID, po.Mode)
+	} else {
+		err = q.storage.PauseJob(ctx, jobID)
+	}
 	if err != nil {
 		return err
 	}
