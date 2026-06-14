@@ -96,6 +96,56 @@ func TestDefineERejectsMismatchedResultType(t *testing.T) {
 	require.Error(t, err)
 	assert.Nil(t, def)
 	assert.Contains(t, err.Error(), "result type mismatch")
+	assert.False(t, q.HasHandler("mismatchedTyped"))
+	_, ok := q.GetHandler("mismatchedTyped")
+	assert.False(t, ok)
+}
+
+func TestDefineERejectsMismatchedArgTypeWithoutRegistering(t *testing.T) {
+	q, _ := newTestQueue(t, nil)
+
+	def, err := typed.DefineE[args, result](q, "mismatchedArgTyped", func(_ context.Context, a string) (result, error) {
+		return result{Message: a}, nil
+	})
+
+	require.Error(t, err)
+	assert.Nil(t, def)
+	assert.Contains(t, err.Error(), "argument type mismatch")
+	assert.False(t, q.HasHandler("mismatchedArgTyped"))
+	_, ok := q.GetHandler("mismatchedArgTyped")
+	assert.False(t, ok)
+}
+
+func TestDefineEPreservesExistingHandlerOnMismatch(t *testing.T) {
+	q, _ := newTestQueue(t, nil)
+	q.Register("preservedTyped", func(_ context.Context, a args) (result, error) {
+		return result{Message: a.Name, Total: a.Count}, nil
+	})
+	before, ok := q.GetHandler("preservedTyped")
+	require.True(t, ok)
+
+	def, err := typed.DefineE[args, string](q, "preservedTyped", func(_ context.Context, a args) (int, error) {
+		return a.Count, nil
+	})
+
+	require.Error(t, err)
+	assert.Nil(t, def)
+	after, ok := q.GetHandler("preservedTyped")
+	require.True(t, ok)
+	assert.Same(t, before, after)
+}
+
+func TestDefineERegistersMatchingHandler(t *testing.T) {
+	q, _ := newTestQueue(t, nil)
+
+	def, err := typed.DefineE[args, result](q, "matchingTyped", func(_ context.Context, a args) (result, error) {
+		return result{Message: a.Name, Total: a.Count}, nil
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, def)
+	assert.Equal(t, "matchingTyped", def.Name())
+	assert.True(t, q.HasHandler("matchingTyped"))
 }
 
 func TestDefinePanicsOnMismatchedResultType(t *testing.T) {

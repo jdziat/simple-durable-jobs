@@ -11,6 +11,7 @@ import (
 
 	"github.com/jdziat/simple-durable-jobs/v3/pkg/call"
 	"github.com/jdziat/simple-durable-jobs/v3/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/internal/handler"
 	"github.com/jdziat/simple-durable-jobs/v3/pkg/queue"
 )
 
@@ -54,12 +55,9 @@ func DefineE[A any, R any](
 	fn any,
 	opts ...queue.Option,
 ) (*Def[A, R], error) {
-	if err := q.RegisterE(name, fn, opts...); err != nil {
-		return nil, err
-	}
-	h, ok := q.GetHandler(name)
-	if !ok {
-		return nil, fmt.Errorf("jobs: handler for %q was not registered", name)
+	h, err := handler.NewHandler(fn)
+	if err != nil {
+		return nil, fmt.Errorf("jobs: handler for %q: %w", name, err)
 	}
 	wantA := reflect.TypeOf((*A)(nil)).Elem()
 	if h.ArgsType == nil {
@@ -74,6 +72,9 @@ func DefineE[A any, R any](
 	}
 	if !h.ResultType.AssignableTo(wantR) {
 		return nil, fmt.Errorf("jobs: typed definition %q result type mismatch: handler returns %s, definition expects %s", name, h.ResultType, wantR)
+	}
+	if err := q.RegisterE(name, fn, opts...); err != nil {
+		return nil, err
 	}
 	return &Def[A, R]{q: q, name: name}, nil
 }
