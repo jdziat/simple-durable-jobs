@@ -91,12 +91,31 @@ func convertPostgresLegacyStringUUIDColumns(ctx context.Context, db *gorm.DB) er
 		return nil
 	}
 
+	// Child foreign keys are dropped before the type rewrite and re-added after.
+	// Each entry is guarded by HasTable so a legacy (pre-v3) baseline that predates
+	// a child table — e.g. a v1.x baseline with no `signals` table — does not abort
+	// the conversion with "relation does not exist" (42P01); a missing child table
+	// is created later by AutoMigrate with the correct native-uuid shape. Before
+	// re-adding each FK we prune orphan child rows: legacy schemas had no child FKs,
+	// so a child can reference an already-pruned parent, and ADD CONSTRAINT would
+	// otherwise abort with a foreign-key violation (23503) — the migration set's own
+	// orphan cleanup runs after this point and cannot rescue the conversion.
+	childFKs := []struct {
+		table      string
+		constraint string
+		column     string
+	}{
+		{table: "checkpoints", constraint: "fk_checkpoints_job", column: "job_id"},
+		{table: "fan_outs", constraint: "fk_fanouts_parent", column: "parent_job_id"},
+		{table: "signals", constraint: "fk_signals_job", column: "job_id"},
+	}
+
 	return db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		for _, stmt := range []string{
-			"ALTER TABLE checkpoints DROP CONSTRAINT IF EXISTS fk_checkpoints_job",
-			"ALTER TABLE fan_outs DROP CONSTRAINT IF EXISTS fk_fanouts_parent",
-			"ALTER TABLE signals DROP CONSTRAINT IF EXISTS fk_signals_job",
-		} {
+		for _, fk := range childFKs {
+			if !tx.Migrator().HasTable(fk.table) {
+				continue
+			}
+			stmt := fmt.Sprintf("ALTER TABLE %s DROP CONSTRAINT IF EXISTS %s", fk.table, fk.constraint)
 			if err := tx.Exec(stmt).Error; err != nil {
 				return err
 			}
@@ -119,12 +138,22 @@ func convertPostgresLegacyStringUUIDColumns(ctx context.Context, db *gorm.DB) er
 			}
 		}
 
-		for _, stmt := range []string{
-			"ALTER TABLE checkpoints ADD CONSTRAINT fk_checkpoints_job FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE",
-			"ALTER TABLE fan_outs ADD CONSTRAINT fk_fanouts_parent FOREIGN KEY (parent_job_id) REFERENCES jobs(id) ON DELETE CASCADE",
-			"ALTER TABLE signals ADD CONSTRAINT fk_signals_job FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE",
-		} {
-			if err := tx.Exec(stmt).Error; err != nil {
+		for _, fk := range childFKs {
+			if !tx.Migrator().HasTable(fk.table) {
+				continue
+			}
+			prune := fmt.Sprintf(
+				"DELETE FROM %s WHERE %s IS NOT NULL AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.id = %s.%s)",
+				fk.table, fk.column, fk.table, fk.column,
+			)
+			if err := tx.Exec(prune).Error; err != nil {
+				return fmt.Errorf("prune orphan %s rows: %w", fk.table, err)
+			}
+			add := fmt.Sprintf(
+				"ALTER TABLE %s ADD CONSTRAINT %s FOREIGN KEY (%s) REFERENCES jobs(id) ON DELETE CASCADE",
+				fk.table, fk.constraint, fk.column,
+			)
+			if err := tx.Exec(add).Error; err != nil {
 				return err
 			}
 		}
@@ -183,6 +212,13 @@ func convertMySQLLegacyStringUUIDColumns(ctx context.Context, db *gorm.DB) error
 			{table: "fan_outs", name: "fk_fanouts_parent"},
 			{table: "signals", name: "fk_signals_job"},
 		} {
+			// Skip a child table that predates v3 (e.g. a v1.x baseline with no
+			// signals table): DROP FOREIGN KEY on a missing table raises MySQL
+			// Error 1146, which is NOT a benign DDL error, so it would crashloop
+			// the cutover. The table is recreated later by AutoMigrate with the FK.
+			if !db.Migrator().HasTable(fk.table) {
+				continue
+			}
 			if err := db.WithContext(ctx).Exec("ALTER TABLE " + fk.table + " DROP FOREIGN KEY " + fk.name).Error; err != nil && !isBenignDDLError(err) {
 				return fmt.Errorf("drop %s: %w", fk.name, err)
 			}
@@ -295,6 +331,12 @@ func recreateMySQLConvertedCompositeIndexes(ctx context.Context, db *gorm.DB) (m
 	var stats mysqlCompositeIndexRecreateStats
 	m := db.Migrator()
 	for _, spec := range mysqlConvertedCompositeIndexes {
+		// Skip a table that predates v3 (e.g. a v1.x baseline with no signals
+		// table): CREATE INDEX on a missing table raises MySQL Error 1146, which is
+		// not benign. AutoMigrate creates the table and its indexes afterward.
+		if !m.HasTable(spec.table) {
+			continue
+		}
 		matches, err := mysqlConvertedCompositeIndexMatches(db, spec)
 		if err != nil {
 			return stats, err
@@ -356,8 +398,23 @@ func ensureMySQLConvertedForeignKeys(ctx context.Context, db *gorm.DB) error {
 		{model: &core.FanOut{}, table: "fan_outs", name: "fk_fanouts_parent", col: "parent_job_id"},
 		{model: &core.Signal{}, table: "signals", name: "fk_signals_job", col: "job_id"},
 	} {
+		// Skip a child table that predates v3 (e.g. a v1.x baseline with no signals
+		// table) — AutoMigrate creates it later with the FK already in place.
+		if !db.Migrator().HasTable(fk.table) {
+			continue
+		}
 		if db.Migrator().HasConstraint(fk.model, fk.name) {
 			continue
+		}
+		// Prune orphan child rows before re-adding the FK: legacy schemas had no
+		// child FKs, so a child can reference an already-pruned parent and ADD
+		// CONSTRAINT would otherwise abort with a foreign-key violation (1452).
+		prune := fmt.Sprintf(
+			"DELETE FROM %s WHERE %s IS NOT NULL AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.id = %s.%s)",
+			fk.table, fk.col, fk.table, fk.col,
+		)
+		if err := db.WithContext(ctx).Exec(prune).Error; err != nil && !isBenignDDLError(err) {
+			return fmt.Errorf("prune orphan %s rows: %w", fk.table, err)
 		}
 		stmt := fmt.Sprintf(
 			"ALTER TABLE %s ADD CONSTRAINT %s FOREIGN KEY (%s) REFERENCES jobs(id) ON DELETE CASCADE",
