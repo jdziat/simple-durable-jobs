@@ -346,14 +346,26 @@ func main() {
         fmt.Println("Running weekly backup...")
         return nil
     })
+    queue.Register("hourly-task", func(ctx context.Context, _ struct{}) error {
+        fmt.Println("Running hourly task...")
+        return nil
+    })
 
     // Schedule jobs
-    queue.Schedule("health-check", nil, jobs.Every(1 * time.Minute))
-    queue.Schedule("daily-report", nil, jobs.Daily(9, 0))        // 9:00 AM UTC
-    queue.Schedule("weekly-backup", nil, jobs.Weekly(time.Sunday, 2, 0)) // Sunday 2:00 AM
+    if err := queue.Schedule("health-check", nil, jobs.Every(1*time.Minute)); err != nil {
+        panic(err)
+    }
+    if err := queue.Schedule("daily-report", nil, jobs.Daily(9, 0)); err != nil { // 9:00 AM UTC
+        panic(err)
+    }
+    if err := queue.Schedule("weekly-backup", nil, jobs.Weekly(time.Sunday, 2, 0)); err != nil { // Sunday 2:00 AM
+        panic(err)
+    }
 
     // Cron expression: every hour at minute 0
-    queue.Schedule("hourly-task", nil, jobs.Cron("0 * * * *"))
+    if err := queue.Schedule("hourly-task", nil, jobs.Cron("0 * * * *")); err != nil {
+        panic(err)
+    }
 
     // Start worker with scheduler enabled
     worker := queue.NewWorker(jobs.WithScheduler(true))
@@ -692,7 +704,7 @@ if err != nil {
 	return err
 }
 
-err = jobs.Signal(ctx, queue, jobID, "approval", Approval{
+err = queue.Signal(ctx, jobID, "approval", Approval{
 	ApprovedBy: "alice@example.com",
 })
 ```

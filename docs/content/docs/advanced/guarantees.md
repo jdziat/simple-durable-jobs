@@ -133,11 +133,11 @@ cancelled) stays in `failed` status and is queryable:
 failed, _ := q.Storage().GetJobsByStatus(ctx, jobs.StatusFailed, 100)
 ```
 
-Replay one with `jobs.Requeue` (checkpoints are preserved, so a workflow resumes
+Replay one with `q.Requeue` (checkpoints are preserved, so a workflow resumes
 from its last successful step):
 
 ```go
-ok, err := jobs.Requeue(ctx, q, jobID)
+ok, err := q.Requeue(ctx, jobID)
 ```
 
 Tune the retry backoff cap with `WithMaxRetryBackoff(d)` (default 1 minute) so a

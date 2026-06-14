@@ -210,7 +210,7 @@ func seedE2EData(ctx context.Context, store *storage.GormStorage, db *gorm.DB) e
 	}
 	deadLetteredJobs := []*core.Job{
 		{
-			ID:               "e2e-failed-006",
+			ID:               e2eID("e2e-failed-006"),
 			Type:             "SendWebhook",
 			Queue:            "default",
 			Tenant:           "beta",
@@ -228,7 +228,7 @@ func seedE2EData(ctx context.Context, store *storage.GormStorage, db *gorm.DB) e
 			CompletedAt:      ptrTime(now.Add(-90 * time.Minute)),
 		},
 		{
-			ID:               "e2e-failed-007",
+			ID:               e2eID("e2e-failed-007"),
 			Type:             "ProcessRefund",
 			Queue:            "default",
 			Tenant:           "acme",

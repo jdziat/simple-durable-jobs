@@ -10,7 +10,7 @@ messages on `main` by `go-semantic-release`:
 
 ## Compatibility promise
 
-Within a major version (currently `v2`):
+Within a major version (currently `v3`):
 
 - The exported API of the root `jobs` package does not break.
 - The `core.Storage` interface does not gain or change required methods.
@@ -22,7 +22,7 @@ New optional storage capabilities are added as **optional interfaces**
 (discovered via type assertion), never as new required methods on
 `core.Storage`, so custom backends keep compiling.
 
-CI runs an API-compatibility gate against the latest released `v2` module.
+CI runs an API-compatibility gate against the latest released `v3` module.
 
 ## Deprecations
 
@@ -32,7 +32,7 @@ Removal happens only in the next major version.
 
 Shipped in `v2.0.0` (the deliberate major cut — see `MIGRATION-v2.md`):
 
-- Module import path moved to `github.com/jdziat/simple-durable-jobs/v3`.
+- Module import path moved to `github.com/jdziat/simple-durable-jobs/v2`.
 - `core.Storage.SuspendJob` → `MarkWaiting` and `SuspendJobWithDeadline` →
   `MarkWaitingWithDeadline` (the status they set is `waiting`).
 - Removed the deprecated `IsSuspendError` and `SuspendError` aliases

@@ -16,7 +16,7 @@ River and Simple Durable Jobs both fit Go applications that want workers close t
 | `InsertTx` | `queue.EnqueueTx(ctx, tx, name, args, opts...)` |
 | `JobArgs` | Typed Go argument struct marshaled to JSON |
 | Queue name | `jobs.QueueOpt("queue")` and `jobs.WorkerQueue("queue", ...)` |
-| Periodic jobs | `queue.Schedule(name, args, jobs.Every(...))`, `jobs.Daily`, `jobs.Weekly`, `jobs.Cron` |
+| Periodic jobs | `queue.Schedule(name, args, jobs.Every(...))`, `jobs.Daily`, `jobs.Weekly`, `jobs.Cron` after registering `name` |
 | Unique jobs | `jobs.Unique(key)` |
 | `UniqueOpts.ByPeriod` | `jobs.UniqueFor(ttl)` |
 | Retries | `jobs.Retries(n)` plus worker backoff options |

@@ -220,7 +220,7 @@ test.describe('Job Detail', () => {
   })
 
   test('last error copy button is visible', async ({ page }) => {
-    await page.goto('/#/jobs/e2e-failed-004')
+    await page.goto(`/#/jobs/${JOBS.FAILED_4}`)
     await page.waitForSelector('.error-box', { timeout: 10000 })
     await expect(page.locator('.error-box').getByRole('button', { name: 'Copy' })).toBeVisible()
   })

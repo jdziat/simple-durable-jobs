@@ -50,6 +50,7 @@ backend support tiers, and crash-recovery tuning.
 - [Benchmarks](https://jdziat.github.io/simple-durable-jobs/docs/benchmarks/) - Measured numbers, methodology, and throughput tuning
 - [Choosing a Job System](https://jdziat.github.io/simple-durable-jobs/docs/comparison/) - An honest comparison vs River, Temporal, and Asynq
 - [Migrating from River](https://jdziat.github.io/simple-durable-jobs/docs/migrating-from-river/) / [Migrating from Asynq](https://jdziat.github.io/simple-durable-jobs/docs/migrating-from-asynq/)
+- [Migrating from v2 to v3](https://jdziat.github.io/simple-durable-jobs/docs/migration-v2-to-v3/) - `/v3` import-path, API, and schema conversion notes
 - [Migrating from v1 to v2](https://jdziat.github.io/simple-durable-jobs/docs/migration-v1-to-v2/) - Mechanical `/v2` import-path migration and storage rename notes
 - [Embedded Web UI](https://jdziat.github.io/simple-durable-jobs/docs/embedded-ui/)
 - [Live Demo](https://jdziat.github.io/simple-durable-jobs/docs/live-demo/)
@@ -96,7 +97,7 @@ backend support tiers, and crash-recovery tuning.
 go get github.com/jdziat/simple-durable-jobs/v3
 ```
 
-Upgrading from v1? See [MIGRATION-v2.md](./MIGRATION-v2.md).
+Upgrading from v2? See the [v2 to v3 migration guide](https://jdziat.github.io/simple-durable-jobs/docs/migration-v2-to-v3/).
 
 ## Quick Start
 
@@ -147,7 +148,7 @@ type EmailArgs struct {
 }
 ```
 
-Prefer compile-time checked producer handles? See the [typed API reference](https://jdziat.github.io/simple-durable-jobs/docs/api-reference/typed-api/) for `Define`, `Declare`, `DefineVoid`, and typed `Enqueue`/`Call`/`Load`.
+Prefer compile-time checked producer handles? See the [typed API reference](https://jdziat.github.io/simple-durable-jobs/docs/api-reference/typed-api/) for `Define`, `DeclareUnchecked`, `DefineVoid`, and typed `Enqueue`/`Call`/`Load`.
 
 ## Durable Workflows
 
@@ -310,17 +311,30 @@ The dashboard provides:
 ## Scheduled Jobs
 
 ```go
+queue.Register("cleanup", func(ctx context.Context, _ struct{}) error { return nil })
+queue.Register("daily-report", func(ctx context.Context, _ struct{}) error { return nil })
+queue.Register("backup", func(ctx context.Context, _ struct{}) error { return nil })
+queue.Register("hourly-check", func(ctx context.Context, _ struct{}) error { return nil })
+
 // Run every 5 minutes
-queue.Schedule("cleanup", nil, jobs.Every(5 * time.Minute))
+if err := queue.Schedule("cleanup", nil, jobs.Every(5*time.Minute)); err != nil {
+    return err
+}
 
 // Run daily at 9:00 AM
-queue.Schedule("daily-report", nil, jobs.Daily(9, 0))
+if err := queue.Schedule("daily-report", nil, jobs.Daily(9, 0)); err != nil {
+    return err
+}
 
 // Run weekly on Sunday at 2:00 AM
-queue.Schedule("backup", nil, jobs.Weekly(time.Sunday, 2, 0))
+if err := queue.Schedule("backup", nil, jobs.Weekly(time.Sunday, 2, 0)); err != nil {
+    return err
+}
 
 // Use cron expressions
-queue.Schedule("hourly-check", nil, jobs.Cron("0 * * * *"))
+if err := queue.Schedule("hourly-check", nil, jobs.Cron("0 * * * *")); err != nil {
+    return err
+}
 
 // Start worker with scheduler enabled
 worker := queue.NewWorker(jobs.WithScheduler(true))

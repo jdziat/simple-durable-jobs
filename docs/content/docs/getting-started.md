@@ -135,8 +135,8 @@ cleanup := typed.DefineVoid(queue, "cleanup", func(ctx context.Context, _ struct
     return nil
 })
 
-// Producer-only process: create a typed handle without registering a local handler.
-remoteSendEmail := typed.Declare[SendEmailArgs, SendEmailResult](queue, "send-email")
+// Producer-only process: create an unchecked typed handle without registering a local handler.
+remoteSendEmail := typed.DeclareUnchecked[SendEmailArgs, SendEmailResult](queue, "send-email")
 
 jobID, err := sendEmail.Enqueue(ctx, SendEmailArgs{To: "user@example.com"})
 if err != nil {
@@ -154,6 +154,11 @@ _, err = remoteSendEmail.EnqueueRemote(ctx, SendEmailArgs{To: "remote@example.co
 _ = result
 _ = loaded
 ```
+
+`DeclareUnchecked` is the unchecked producer-only path; keep its argument and
+result types synchronized with the worker. The checked `Define` and `DefineE`
+paths validate that the declared result type matches the handler's return type.
+`EnqueueRemote` rejects malformed job names.
 
 ### 3. Enqueue Jobs
 
@@ -251,17 +256,30 @@ queue.Register("process-order", func(ctx context.Context, order Order) error {
 Set up recurring jobs:
 
 ```go
+queue.Register("cleanup", func(ctx context.Context, _ struct{}) error { return nil })
+queue.Register("report", func(ctx context.Context, _ struct{}) error { return nil })
+queue.Register("backup", func(ctx context.Context, _ struct{}) error { return nil })
+queue.Register("hourly", func(ctx context.Context, _ struct{}) error { return nil })
+
 // Every 5 minutes
-queue.Schedule("cleanup", nil, jobs.Every(5 * time.Minute))
+if err := queue.Schedule("cleanup", nil, jobs.Every(5*time.Minute)); err != nil {
+    return err
+}
 
 // Daily at 9:00 AM
-queue.Schedule("report", nil, jobs.Daily(9, 0))
+if err := queue.Schedule("report", nil, jobs.Daily(9, 0)); err != nil {
+    return err
+}
 
 // Weekly on Sunday at 2:00 AM
-queue.Schedule("backup", nil, jobs.Weekly(time.Sunday, 2, 0))
+if err := queue.Schedule("backup", nil, jobs.Weekly(time.Sunday, 2, 0)); err != nil {
+    return err
+}
 
 // Cron expression
-queue.Schedule("hourly", nil, jobs.Cron("0 * * * *"))
+if err := queue.Schedule("hourly", nil, jobs.Cron("0 * * * *")); err != nil {
+    return err
+}
 
 // Remember to enable scheduler in worker
 worker := queue.NewWorker(jobs.WithScheduler(true))
