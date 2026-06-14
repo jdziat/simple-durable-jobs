@@ -2,6 +2,8 @@ package storage
 
 import (
 	"context"
+	"fmt"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -9,7 +11,9 @@ import (
 	"github.com/jdziat/simple-durable-jobs/v3/pkg/core"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
 )
 
 func TestMigrateConvertsLegacySQLiteTextUUIDsToBinary(t *testing.T) {
@@ -314,6 +318,77 @@ func TestMySQLUUIDConversionProcessesJobsIDLast(t *testing.T) {
 	}
 }
 
+func TestMigrateMySQLUUIDConversionConvergesFromPartialStates(t *testing.T) {
+	dsn := os.Getenv("TEST_MYSQL_URL")
+	if dsn == "" {
+		t.Skip("TEST_MYSQL_URL not set")
+	}
+
+	adminDB, err := gorm.Open(mysql.Open(dsn), &gorm.Config{
+		Logger: logger.Default.LogMode(logger.Silent),
+	})
+	require.NoError(t, err, "open mysql admin db")
+	closeDBOnCleanup(t, adminDB)
+
+	// These cover the two dangerous auto-committed MySQL DDL crash windows:
+	// a child UUID column is binary while jobs.id is still varchar, and all UUID
+	// columns are binary while generated columns, indexes, FKs, and the completion
+	// marker have not yet been restored.
+	for _, tc := range []struct {
+		name    string
+		partial func(*testing.T, context.Context, *gorm.DB)
+	}{
+		{
+			name: "mid_child_before_jobs_id",
+			partial: func(t *testing.T, ctx context.Context, db *gorm.DB) {
+				t.Helper()
+				require.NoError(t, convertMySQLLegacyUUIDColumn(ctx, db, legacyUUIDColumn{table: "checkpoints", column: "job_id"}))
+			},
+		},
+		{
+			name: "binary_no_marker",
+			partial: func(t *testing.T, ctx context.Context, db *gorm.DB) {
+				t.Helper()
+				for _, col := range mysqlLegacyUUIDColumnsInConversionOrder() {
+					require.NoError(t, convertMySQLLegacyUUIDColumn(ctx, db, col), "%s.%s", col.table, col.column)
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			databaseName := uniqueSchemaAssertionsName("uuid_mysql_converge")
+			require.NoError(t, adminDB.Exec("CREATE DATABASE "+quoteMySQLIdent(databaseName)).Error)
+			t.Cleanup(func() {
+				require.NoError(t, adminDB.Exec("DROP DATABASE IF EXISTS "+quoteMySQLIdent(databaseName)).Error)
+			})
+
+			db, err := gorm.Open(mysql.Open(mysqlDSNWithDatabase(t, dsn, databaseName)), &gorm.Config{
+				Logger: logger.Default.LogMode(logger.Silent),
+			})
+			require.NoError(t, err, "open isolated mysql database")
+			closeDBOnCleanup(t, db)
+
+			ctx := context.Background()
+			ids := seedLegacyMySQLUUIDRows(t, db, "mysql-"+tc.name)
+			tc.partial(t, ctx, db)
+			require.NoError(t, ensurePreMigrationTable(ctx, db, dialectMySQL))
+			require.NoError(t, db.WithContext(ctx).
+				Where("name = ?", "uuid_binary_conversion").
+				Delete(&core.PreMigration{}).Error)
+
+			require.NoError(t, NewGormStorage(db).Migrate(ctx), "partial MySQL UUID conversion state must converge")
+			assertMySQLUUIDConversionConverged(t, ctx, db, ids)
+
+			capture := &stmtCaptureLogger{Interface: logger.Default.LogMode(logger.Silent)}
+			require.NoError(t, NewGormStorage(db.Session(&gorm.Session{Logger: capture})).Migrate(ctx), "final Migrate must be idempotent")
+			for _, stmt := range capture.stmts {
+				require.Falsef(t, strings.HasPrefix(strings.ToLower(strings.TrimSpace(stmt)), "alter "),
+					"steady-state MySQL UUID conversion must issue 0 ALTERs: %s", stmt)
+			}
+		})
+	}
+}
+
 func createMatchingSQLiteMySQLConvertedCompositeIndexes(t *testing.T, db *gorm.DB) {
 	t.Helper()
 	for _, spec := range mysqlConvertedCompositeIndexes {
@@ -325,6 +400,264 @@ func createMatchingSQLiteMySQLConvertedCompositeIndexes(t *testing.T, db *gorm.D
 			"CREATE "+unique+"INDEX "+spec.name+" ON "+spec.table+" ("+strings.Join(spec.columns, ", ")+")",
 		).Error)
 	}
+}
+
+func seedLegacyMySQLUUIDRows(t *testing.T, db *gorm.DB, prefix string) map[string]core.UUID {
+	t.Helper()
+
+	createLegacyMySQLUUIDSchema(t, db)
+	now := time.Now().UTC().Truncate(time.Second)
+	ids := map[string]core.UUID{
+		"root":        testUUID(prefix + "-root"),
+		"child":       testUUID(prefix + "-child"),
+		"fan_out":     testUUID(prefix + "-fanout"),
+		"checkpoint":  testUUID(prefix + "-checkpoint"),
+		"signal":      testUUID(prefix + "-signal"),
+		"held_slot":   testUUID(prefix + "-held-slot"),
+		"unique_lock": testUUID(prefix + "-unique-lock"),
+	}
+
+	require.NoError(t, db.Exec(`
+		INSERT INTO jobs (
+			id, type, args, queue, tenant, metadata, priority, status, previous_status,
+			attempt, max_retries, timeout, determinism, last_error, dead_letter_reason,
+			created_at, updated_at, locked_by, unique_key, parent_job_id, root_job_id,
+			fan_out_id, fan_out_index
+		) VALUES
+		(?, 'root', X'7B7D', 'default', '', '{}', 0, 'waiting', '', 0, 3, 0, 0, '', '', ?, ?, '', '', NULL, NULL, NULL, 0),
+		(?, 'child', X'7B7D', 'default', '', '{}', 1, 'pending', '', 0, 3, 0, 0, '', '', ?, ?, '', '', ?, ?, ?, 0)
+	`, ids["root"].String(), now, now, ids["child"].String(), now, now, ids["root"].String(), ids["root"].String(), ids["fan_out"].String()).Error)
+	require.NoError(t, db.Exec(`
+		INSERT INTO fan_outs (
+			id, parent_job_id, total_count, completed_count, failed_count, cancelled_count,
+			strategy, threshold, status, cancel_on_fail, created_at, updated_at
+		) VALUES (?, ?, 1, 0, 0, 0, 'fail_fast', 1.0, 'pending', false, ?, ?)
+	`, ids["fan_out"].String(), ids["root"].String(), now, now).Error)
+	require.NoError(t, db.Exec(`
+		INSERT INTO checkpoints (
+			id, job_id, call_index, call_type, result, error, error_kind, error_cause,
+			error_delay_nanos, created_at
+		) VALUES (?, ?, 0, 'call', X'01', '', '', '', 0, ?)
+	`, ids["checkpoint"].String(), ids["child"].String(), now).Error)
+	require.NoError(t, db.Exec(`
+		INSERT INTO signals (id, job_id, name, payload, created_at)
+		VALUES (?, ?, 'ready', X'02', ?)
+	`, ids["signal"].String(), ids["child"].String(), now).Error)
+	require.NoError(t, db.Exec(`
+		INSERT INTO concurrency_slots (slot_name, job_id, worker_id, expires_at)
+		VALUES ('sentinel', '', '', ?), ('held', ?, 'worker-1', ?)
+	`, now, ids["held_slot"].String(), now).Error)
+	require.NoError(t, db.Exec(`
+		INSERT INTO unique_locks (scope_hash, job_id, expires_at, created_at)
+		VALUES ('abc123', ?, ?, ?)
+	`, ids["unique_lock"].String(), now, now).Error)
+
+	return ids
+}
+
+func createLegacyMySQLUUIDSchema(t *testing.T, db *gorm.DB) {
+	t.Helper()
+
+	stmts := []string{
+		`
+		CREATE TABLE jobs (
+			id varchar(36) NOT NULL PRIMARY KEY,
+			type varchar(255) NOT NULL DEFAULT '',
+			args blob,
+			queue varchar(255) NOT NULL DEFAULT 'default',
+			tenant varchar(255) NULL,
+			metadata json NULL,
+			priority bigint NOT NULL DEFAULT 0,
+			status varchar(20) NOT NULL DEFAULT 'pending',
+			previous_status varchar(20) NULL,
+			attempt bigint NOT NULL DEFAULT 0,
+			max_retries bigint NOT NULL DEFAULT 3,
+			timeout bigint NOT NULL DEFAULT 0,
+			determinism bigint NOT NULL DEFAULT 0,
+			last_error text NULL,
+			dead_lettered_at datetime(6) NULL,
+			dead_letter_reason text NULL,
+			run_at datetime(6) NULL,
+			started_at datetime(6) NULL,
+			completed_at datetime(6) NULL,
+			created_at datetime(6) NULL,
+			updated_at datetime(6) NULL,
+			locked_by varchar(255) NULL,
+			locked_until datetime(6) NULL,
+			last_heartbeat_at datetime(6) NULL,
+			unique_key varchar(255) NULL,
+			parent_job_id varchar(36) NULL,
+			root_job_id varchar(36) NULL,
+			fan_out_id varchar(36) NULL,
+			fan_out_index bigint DEFAULT 0,
+			result blob,
+			trace_context blob
+		)`,
+		`
+		CREATE TABLE fan_outs (
+			id varchar(36) NOT NULL PRIMARY KEY,
+			parent_job_id varchar(36) NOT NULL,
+			total_count bigint NOT NULL,
+			completed_count bigint DEFAULT 0,
+			failed_count bigint DEFAULT 0,
+			cancelled_count bigint DEFAULT 0,
+			strategy varchar(20) DEFAULT 'fail_fast',
+			threshold double DEFAULT 1.0,
+			status varchar(20) DEFAULT 'pending',
+			timeout_at datetime(6) NULL,
+			cancel_on_fail boolean DEFAULT false,
+			created_at datetime(6) NULL,
+			updated_at datetime(6) NULL
+		)`,
+		`
+		CREATE TABLE checkpoints (
+			id varchar(36) NOT NULL PRIMARY KEY,
+			job_id varchar(36) NOT NULL,
+			call_index bigint NOT NULL,
+			call_type varchar(255) NOT NULL,
+			result blob,
+			error text NULL,
+			error_kind varchar(64) NULL,
+			error_cause text NULL,
+			error_delay_nanos bigint DEFAULT 0,
+			created_at datetime(6) NULL
+		)`,
+		`
+		CREATE TABLE signals (
+			id varchar(36) NOT NULL PRIMARY KEY,
+			job_id varchar(36) NOT NULL,
+			name varchar(255) NOT NULL,
+			payload blob,
+			consumed_at datetime(6) NULL,
+			created_at datetime(6) NULL
+		)`,
+		`
+		CREATE TABLE concurrency_slots (
+			slot_name varchar(255) NOT NULL,
+			job_id varchar(36) NOT NULL,
+			worker_id varchar(255) NULL,
+			expires_at datetime(6) NULL,
+			PRIMARY KEY (slot_name, job_id)
+		)`,
+		`
+		CREATE TABLE unique_locks (
+			scope_hash varchar(64) NOT NULL PRIMARY KEY,
+			job_id varchar(36) NOT NULL,
+			expires_at datetime(6) NOT NULL,
+			created_at datetime(6) NOT NULL
+		)`,
+	}
+	for _, stmt := range stmts {
+		require.NoError(t, db.Exec(stmt).Error)
+	}
+}
+
+func assertMySQLUUIDConversionConverged(t *testing.T, ctx context.Context, db *gorm.DB, ids map[string]core.UUID) {
+	t.Helper()
+
+	for _, col := range legacyUUIDColumns {
+		if !db.Migrator().HasTable(col.table) {
+			continue
+		}
+		assertMySQLBinaryUUIDColumn(t, ctx, db, col.table, col.column)
+	}
+	requireMySQLPrimaryKey(t, ctx, db, "jobs")
+	for _, name := range []string{"pending_parent_ref", "pending_root_ref"} {
+		assertMySQLBinaryUUIDColumn(t, ctx, db, "jobs", name)
+	}
+	for _, spec := range mysqlConvertedCompositeIndexes {
+		matches, err := mysqlConvertedCompositeIndexMatches(db, spec)
+		require.NoError(t, err)
+		require.Truef(t, matches, "%s.%s should be restored", spec.table, spec.name)
+	}
+	for _, fk := range []struct {
+		table string
+		name  string
+	}{
+		{table: "checkpoints", name: "fk_checkpoints_job"},
+		{table: "fan_outs", name: "fk_fanouts_parent"},
+		{table: "signals", name: "fk_signals_job"},
+	} {
+		requireMySQLForeignKey(t, ctx, db, fk.table, fk.name)
+	}
+	complete, err := mysqlUUIDBinaryConversionComplete(ctx, db)
+	require.NoError(t, err)
+	require.True(t, complete, "completion marker should be set")
+
+	requireMySQLUUIDValue(t, ctx, db, "jobs", "id", "type = 'root'", ids["root"])
+	requireMySQLUUIDValue(t, ctx, db, "jobs", "id", "type = 'child'", ids["child"])
+	requireMySQLUUIDValue(t, ctx, db, "jobs", "parent_job_id", "type = 'child'", ids["root"])
+	requireMySQLUUIDValue(t, ctx, db, "jobs", "root_job_id", "type = 'child'", ids["root"])
+	requireMySQLUUIDValue(t, ctx, db, "jobs", "fan_out_id", "type = 'child'", ids["fan_out"])
+	requireMySQLUUIDValue(t, ctx, db, "fan_outs", "id", "status = 'pending'", ids["fan_out"])
+	requireMySQLUUIDValue(t, ctx, db, "fan_outs", "parent_job_id", "status = 'pending'", ids["root"])
+	requireMySQLUUIDValue(t, ctx, db, "checkpoints", "id", "call_type = 'call'", ids["checkpoint"])
+	requireMySQLUUIDValue(t, ctx, db, "checkpoints", "job_id", "call_type = 'call'", ids["child"])
+	requireMySQLUUIDValue(t, ctx, db, "signals", "id", "name = 'ready'", ids["signal"])
+	requireMySQLUUIDValue(t, ctx, db, "signals", "job_id", "name = 'ready'", ids["child"])
+	requireMySQLUUIDValue(t, ctx, db, "concurrency_slots", "job_id", "slot_name = 'held'", ids["held_slot"])
+	requireMySQLUUIDValue(t, ctx, db, "unique_locks", "job_id", "scope_hash = 'abc123'", ids["unique_lock"])
+	requireMySQLUUIDValue(t, ctx, db, "concurrency_slots", "job_id", "slot_name = 'sentinel'", core.NilUUID)
+}
+
+func assertMySQLBinaryUUIDColumn(t *testing.T, ctx context.Context, db *gorm.DB, table, column string) {
+	t.Helper()
+
+	var row struct {
+		DataType string `gorm:"column:DATA_TYPE"`
+		Length   int64  `gorm:"column:CHARACTER_MAXIMUM_LENGTH"`
+	}
+	require.NoError(t, db.WithContext(ctx).Raw(`
+		SELECT DATA_TYPE, CHARACTER_MAXIMUM_LENGTH
+		FROM information_schema.COLUMNS
+		WHERE TABLE_SCHEMA = DATABASE()
+		  AND TABLE_NAME = ?
+		  AND COLUMN_NAME = ?
+	`, table, column).Scan(&row).Error)
+	require.Equal(t, "binary", strings.ToLower(row.DataType), table+"."+column)
+	require.Equal(t, int64(16), row.Length, table+"."+column)
+}
+
+func requireMySQLPrimaryKey(t *testing.T, ctx context.Context, db *gorm.DB, table string) {
+	t.Helper()
+
+	var count int64
+	require.NoError(t, db.WithContext(ctx).Raw(`
+		SELECT COUNT(*)
+		FROM information_schema.TABLE_CONSTRAINTS
+		WHERE CONSTRAINT_SCHEMA = DATABASE()
+		  AND TABLE_NAME = ?
+		  AND CONSTRAINT_TYPE = 'PRIMARY KEY'
+	`, table).Scan(&count).Error)
+	require.Equal(t, int64(1), count, table+" primary key")
+}
+
+func requireMySQLForeignKey(t *testing.T, ctx context.Context, db *gorm.DB, table, name string) {
+	t.Helper()
+
+	var count int64
+	require.NoError(t, db.WithContext(ctx).Raw(`
+		SELECT COUNT(*)
+		FROM information_schema.TABLE_CONSTRAINTS
+		WHERE CONSTRAINT_SCHEMA = DATABASE()
+		  AND TABLE_NAME = ?
+		  AND CONSTRAINT_NAME = ?
+		  AND CONSTRAINT_TYPE = 'FOREIGN KEY'
+	`, table, name).Scan(&count).Error)
+	require.Equal(t, int64(1), count, table+"."+name)
+}
+
+func requireMySQLUUIDValue(t *testing.T, ctx context.Context, db *gorm.DB, table, column, where string, want core.UUID) {
+	t.Helper()
+
+	var got string
+	require.NoError(t, db.WithContext(ctx).Raw(
+		fmt.Sprintf("SELECT BIN_TO_UUID(%s) FROM %s WHERE %s LIMIT 1", column, table, where),
+	).Scan(&got).Error)
+	if strings.EqualFold(got, nilUUIDString) {
+		got = core.NilUUID.String()
+	}
+	require.Equal(t, want.String(), strings.ToLower(got), table+"."+column)
 }
 
 func replacePreMigrationsForTest(t *testing.T, migrations []preMigration) func() {
