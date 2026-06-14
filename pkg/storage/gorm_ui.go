@@ -195,9 +195,30 @@ func applyMetaContains(s *GormStorage, q *gorm.DB, m *core.MetadataMap) *gorm.DB
 		}
 		return q.Where("(NULLIF(metadata, '')::jsonb) @> ?::jsonb", string(jsonBytes))
 	case dialectMySQL:
-		jsonBytes, err := json.Marshal(*m)
-		if err != nil {
-			_ = q.AddError(fmt.Errorf("marshal metadata contains: %w", err))
+		declared := s.indexedMetadataKeyList()
+		indexed := make(map[string]struct{}, len(declared))
+		for _, key := range declared {
+			if indexedMetadataKeyPattern.MatchString(key) {
+				indexed[key] = struct{}{}
+			}
+		}
+		// Route a declared key to its STORED generated column (meta_<key>, indexed)
+		// when the filter value fits the VARCHAR(255) width; longer values would be
+		// truncated in the column and could false-match, so they fall back to the
+		// untruncated JSON_CONTAINS. This relies on metadata values being JSON
+		// strings: core.Job.Metadata is map[string]string serialized via
+		// serializer:json, so the gencol (JSON_VALUE ... RETURNING CHAR) and
+		// JSON_CONTAINS agree. A non-string JSON value could only be injected via
+		// raw out-of-band SQL, which is outside the library's contract.
+		fallback := make(map[string]string, len(*m))
+		for key, value := range *m {
+			if _, ok := indexed[key]; ok && len(value) <= 255 {
+				q = q.Where(mysqlMetadataGenColumn(key)+" = ?", value)
+				continue
+			}
+			fallback[key] = value
+		}
+		if len(fallback) == 0 {
 			return q
 		}
 		// JSON_CONTAINS is canonical containment (matches PG @>, unlike
@@ -207,6 +228,11 @@ func applyMetaContains(s *GormStorage, q *gorm.DB, m *core.MetadataMap) *gorm.DB
 		// correct full scan, acceptable because metadata search is a
 		// dashboard/admin cold path not the dequeue hot path. The metadata <>
 		// empty-string guard prevents JSON_CONTAINS erroring on empty rows.
+		jsonBytes, err := json.Marshal(fallback)
+		if err != nil {
+			_ = q.AddError(fmt.Errorf("marshal metadata contains: %w", err))
+			return q
+		}
 		return q.Where("metadata IS NOT NULL AND metadata <> '' AND JSON_CONTAINS(metadata, CAST(? AS JSON))", string(jsonBytes))
 	default:
 		for key, value := range *m {
@@ -215,6 +241,16 @@ func applyMetaContains(s *GormStorage, q *gorm.DB, m *core.MetadataMap) *gorm.DB
 		}
 		return q
 	}
+}
+
+func mysqlMetadataGenColumn(key string) string {
+	return "meta_" + key
+}
+
+func mysqlMetadataGenColumnDefinition(key string) string {
+	column := mysqlMetadataGenColumn(key)
+	return column + " VARCHAR(255) COLLATE utf8mb4_bin " +
+		"GENERATED ALWAYS AS (JSON_VALUE(metadata, '$." + key + "' RETURNING CHAR(255) NULL ON ERROR)) STORED"
 }
 
 func metadataTextExpression(s *GormStorage) string {
