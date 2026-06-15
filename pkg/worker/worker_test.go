@@ -3449,6 +3449,41 @@ func TestWorker_RunScheduler_ForwardsArgsOptionsAndUserUniqueKey(t *testing.T) {
 	assert.Equal(t, "user:scheduled-task", job.UniqueKey)
 }
 
+// arch-10x/F3: a scheduled fire must carry the tenant and metadata configured on
+// the schedule — they were silently dropped by the old fixed option allowlist,
+// producing untenanted/untagged jobs.
+func TestWorker_RunScheduler_ForwardsTenantAndMetadata(t *testing.T) {
+	mock := &mockStorage{}
+	q := queue.New(mock)
+	q.Register("tagged-task", func(_ context.Context, _ map[string]string) error { return nil })
+
+	fire := time.Now().Add(150 * time.Millisecond)
+	require.NoError(t, q.Schedule("tagged-task", map[string]string{}, fixedBoundarySchedule{fire: fire},
+		queue.WithTenant("tenant-x"),
+		queue.WithMetadata(map[string]string{"env": "prod", "team": "core"}),
+	))
+
+	w := NewWorker(q, WithStaleLockInterval(0))
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	go func() { w.runScheduler(ctx) }()
+
+	require.Eventually(t, func() bool {
+		mock.enqueueMu.Lock()
+		defer mock.enqueueMu.Unlock()
+		return len(mock.enqueuedJobs) == 1
+	}, 900*time.Millisecond, 20*time.Millisecond)
+
+	mock.enqueueMu.Lock()
+	defer mock.enqueueMu.Unlock()
+	require.Len(t, mock.enqueuedJobs, 1)
+	job := mock.enqueuedJobs[0]
+	assert.Equal(t, "tenant-x", job.Tenant, "scheduled fire must carry the schedule's tenant")
+	require.NotNil(t, job.Metadata, "scheduled fire must carry the schedule's metadata")
+	assert.Equal(t, "prod", job.Metadata["env"])
+	assert.Equal(t, "core", job.Metadata["team"])
+}
+
 func TestWorker_RunScheduler_ClaimRefusalAdvancesBoundary(t *testing.T) {
 	var claimCalls atomic.Int32
 	mock := &mockStorage{}
