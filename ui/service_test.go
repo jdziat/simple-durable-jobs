@@ -934,8 +934,8 @@ func TestGetStats_FallbackStorageError(t *testing.T) {
 
 func TestGetStats_TotalsAggregatedAcrossQueues(t *testing.T) {
 	qs := []*jobsv1.QueueStats{
-		{Name: "q1", Pending: 3, Running: 1, Completed: 5, Failed: 2},
-		{Name: "q2", Pending: 7, Running: 0, Completed: 2, Failed: 0},
+		{Name: "q1", Pending: 3, Running: 1, Completed: 5, Failed: 2, Retrying: 4, Waiting: 1, Cancelled: 2},
+		{Name: "q2", Pending: 7, Running: 0, Completed: 2, Failed: 0, Retrying: 1, Waiting: 3, Cancelled: 0},
 	}
 	store := &mockUIStorage{
 		getQueueStatsFn: func(_ context.Context) ([]*jobsv1.QueueStats, error) {
@@ -949,6 +949,9 @@ func TestGetStats_TotalsAggregatedAcrossQueues(t *testing.T) {
 	assert.Equal(t, int64(1), resp.Msg.TotalRunning)
 	assert.Equal(t, int64(7), resp.Msg.TotalCompleted)
 	assert.Equal(t, int64(2), resp.Msg.TotalFailed)
+	assert.Equal(t, int64(5), resp.Msg.TotalRetrying)
+	assert.Equal(t, int64(4), resp.Msg.TotalWaiting)
+	assert.Equal(t, int64(2), resp.Msg.TotalCancelled)
 }
 
 func TestGetStats_ActiveWorkersCapabilityPresent(t *testing.T) {
@@ -2127,6 +2130,9 @@ func TestGetQueueStats_FallbackMultipleStatuses(t *testing.T) {
 		core.StatusRunning:   {sampleJob(uiTestID("j2"), "q1", "work", core.StatusRunning)},
 		core.StatusCompleted: {sampleJob(uiTestID("j3"), "q1", "work", core.StatusCompleted)},
 		core.StatusFailed:    {sampleJob(uiTestID("j4"), "q1", "work", core.StatusFailed)},
+		core.StatusRetrying:  {sampleJob(uiTestID("j5"), "q1", "work", core.StatusRetrying)},
+		core.StatusWaiting:   {sampleJob(uiTestID("j6"), "q1", "work", core.StatusWaiting)},
+		core.StatusCancelled: {sampleJob(uiTestID("j7"), "q1", "work", core.StatusCancelled)},
 	}
 	store := &mockStorage{
 		getJobsByStatusFn: func(_ context.Context, status core.JobStatus, _ int) ([]*core.Job, error) {
@@ -2142,6 +2148,9 @@ func TestGetQueueStats_FallbackMultipleStatuses(t *testing.T) {
 	assert.Equal(t, int64(1), qs.Running)
 	assert.Equal(t, int64(1), qs.Completed)
 	assert.Equal(t, int64(1), qs.Failed)
+	assert.Equal(t, int64(1), qs.Retrying)
+	assert.Equal(t, int64(1), qs.Waiting)
+	assert.Equal(t, int64(1), qs.Cancelled)
 }
 
 // ---------------------------------------------------------------------------

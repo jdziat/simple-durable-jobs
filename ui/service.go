@@ -62,6 +62,9 @@ func (s *jobsService) GetStats(ctx context.Context, req *connect.Request[jobsv1.
 		resp.TotalCompleted += qs.Completed
 		resp.TotalFailed += qs.Failed
 		resp.TotalPaused += qs.Paused
+		resp.TotalRetrying += qs.Retrying
+		resp.TotalWaiting += qs.Waiting
+		resp.TotalCancelled += qs.Cancelled
 	}
 
 	if active, ok := s.storage.(activeWorkersStorage); ok {
@@ -616,7 +619,16 @@ func (s *jobsService) getQueueStats(ctx context.Context) ([]*jobsv1.QueueStats, 
 	const maxFallbackJobs = 1000
 	stats := make(map[string]*jobsv1.QueueStats)
 
-	for _, status := range []core.JobStatus{core.StatusPending, core.StatusRunning, core.StatusCompleted, core.StatusFailed, core.StatusPaused} {
+	for _, status := range []core.JobStatus{
+		core.StatusPending,
+		core.StatusRunning,
+		core.StatusCompleted,
+		core.StatusFailed,
+		core.StatusPaused,
+		core.StatusRetrying,
+		core.StatusWaiting,
+		core.StatusCancelled,
+	} {
 		jobs, err := s.storage.GetJobsByStatus(ctx, status, maxFallbackJobs)
 		if err != nil {
 			return nil, err
@@ -638,6 +650,12 @@ func (s *jobsService) getQueueStats(ctx context.Context) ([]*jobsv1.QueueStats, 
 				qs.Failed++
 			case core.StatusPaused:
 				qs.Paused++
+			case core.StatusRetrying:
+				qs.Retrying++
+			case core.StatusWaiting:
+				qs.Waiting++
+			case core.StatusCancelled:
+				qs.Cancelled++
 			}
 		}
 	}

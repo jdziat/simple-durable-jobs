@@ -292,6 +292,21 @@ export class QueueStats extends Message<QueueStats> {
    */
   oldestPendingAt?: Timestamp;
 
+  /**
+   * @generated from field: int64 retrying = 9;
+   */
+  retrying = protoInt64.zero;
+
+  /**
+   * @generated from field: int64 waiting = 10;
+   */
+  waiting = protoInt64.zero;
+
+  /**
+   * @generated from field: int64 cancelled = 11;
+   */
+  cancelled = protoInt64.zero;
+
   constructor(data?: PartialMessage<QueueStats>) {
     super();
     proto3.util.initPartial(data, this);
@@ -308,6 +323,9 @@ export class QueueStats extends Message<QueueStats> {
     { no: 6, name: "paused", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
     { no: 7, name: "is_paused", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
     { no: 8, name: "oldest_pending_at", kind: "message", T: Timestamp },
+    { no: 9, name: "retrying", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 10, name: "waiting", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 11, name: "cancelled", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): QueueStats {
@@ -579,6 +597,21 @@ export class GetStatsResponse extends Message<GetStatsResponse> {
    */
   totalPaused = protoInt64.zero;
 
+  /**
+   * @generated from field: int64 total_retrying = 8;
+   */
+  totalRetrying = protoInt64.zero;
+
+  /**
+   * @generated from field: int64 total_waiting = 9;
+   */
+  totalWaiting = protoInt64.zero;
+
+  /**
+   * @generated from field: int64 total_cancelled = 10;
+   */
+  totalCancelled = protoInt64.zero;
+
   constructor(data?: PartialMessage<GetStatsResponse>) {
     super();
     proto3.util.initPartial(data, this);
@@ -594,6 +627,9 @@ export class GetStatsResponse extends Message<GetStatsResponse> {
     { no: 5, name: "total_failed", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
     { no: 6, name: "active_workers", kind: "scalar", T: 5 /* ScalarType.INT32 */ },
     { no: 7, name: "total_paused", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 8, name: "total_retrying", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 9, name: "total_waiting", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 10, name: "total_cancelled", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetStatsResponse {

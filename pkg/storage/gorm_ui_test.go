@@ -191,6 +191,44 @@ func TestGetQueueDepthStats_OldestPendingAt(t *testing.T) {
 	assert.Nil(t, byQueue["archive"].OldestPendingAt)
 }
 
+func TestGetQueueDepthStats_IncludesRetryingWaitingCancelled(t *testing.T) {
+	ctx := context.Background()
+	store := newUITestStorage(t)
+	now := time.Now()
+
+	jobs := []*core.Job{
+		{ID: testUUID("default-retrying-1"), Type: "work", Queue: "default", Status: core.StatusRetrying, Args: []byte(`{}`), CreatedAt: now},
+		{ID: testUUID("default-retrying-2"), Type: "work", Queue: "default", Status: core.StatusRetrying, Args: []byte(`{}`), CreatedAt: now.Add(time.Second)},
+		{ID: testUUID("default-waiting"), Type: "work", Queue: "default", Status: core.StatusWaiting, Args: []byte(`{}`), CreatedAt: now.Add(2 * time.Second)},
+		{ID: testUUID("emails-waiting"), Type: "work", Queue: "emails", Status: core.StatusWaiting, Args: []byte(`{}`), CreatedAt: now.Add(3 * time.Second)},
+		{ID: testUUID("emails-cancelled"), Type: "work", Queue: "emails", Status: core.StatusCancelled, Args: []byte(`{}`), CreatedAt: now.Add(4 * time.Second)},
+		{ID: testUUID("archive-cancelled"), Type: "work", Queue: "archive", Status: core.StatusCancelled, Args: []byte(`{}`), CreatedAt: now.Add(5 * time.Second)},
+		{ID: testUUID("archive-pending"), Type: "work", Queue: "archive", Status: core.StatusPending, Args: []byte(`{}`), CreatedAt: now.Add(6 * time.Second)},
+	}
+	for _, job := range jobs {
+		require.NoError(t, store.Enqueue(ctx, job))
+	}
+
+	stats, err := store.GetQueueDepthStats(ctx)
+	require.NoError(t, err)
+	byQueue := queueStatsByName(stats)
+
+	require.Contains(t, byQueue, "default")
+	assert.Equal(t, int64(2), byQueue["default"].Retrying)
+	assert.Equal(t, int64(1), byQueue["default"].Waiting)
+	assert.Equal(t, int64(0), byQueue["default"].Cancelled)
+
+	require.Contains(t, byQueue, "emails")
+	assert.Equal(t, int64(0), byQueue["emails"].Retrying)
+	assert.Equal(t, int64(1), byQueue["emails"].Waiting)
+	assert.Equal(t, int64(1), byQueue["emails"].Cancelled)
+
+	require.Contains(t, byQueue, "archive")
+	assert.Equal(t, int64(0), byQueue["archive"].Retrying)
+	assert.Equal(t, int64(0), byQueue["archive"].Waiting)
+	assert.Equal(t, int64(1), byQueue["archive"].Cancelled)
+}
+
 func TestParseDBTimestamp_AcceptsRFC3339NanoAndSQLiteLiterals(t *testing.T) {
 	rfc3339Nano := "2026-06-07T12:34:56.123456789Z"
 	sqliteLiteral := "2026-06-07 12:34:56.123456789+00:00"

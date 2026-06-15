@@ -12,7 +12,7 @@
   import { statusToken } from '../lib/status'
   import { toast } from '../lib/stores/toast.svelte'
 
-  type QueueCountKey = 'pending' | 'running' | 'completed' | 'failed' | 'paused' | 'total'
+  type QueueCountKey = 'pending' | 'running' | 'retrying' | 'waiting' | 'completed' | 'failed' | 'paused' | 'cancelled' | 'total'
   type SortableQueueKey = 'name' | QueueCountKey
   type PurgeStatus = 'failed' | 'completed'
 
@@ -23,6 +23,9 @@
     completed: number
     failed: number
     paused: number
+    retrying: number
+    waiting: number
+    cancelled: number
     total: number
     isPaused: boolean
     oldestPendingAt: Date | null
@@ -41,9 +44,12 @@
     { key: 'name', label: 'Queue', sortable: true },
     { key: 'pending', label: 'Pending', align: 'right', sortable: true },
     { key: 'running', label: 'Running', align: 'right', sortable: true },
+    { key: 'retrying', label: 'Retrying', align: 'right', sortable: true },
+    { key: 'waiting', label: 'Waiting', align: 'right', sortable: true },
     { key: 'completed', label: 'Completed', align: 'right', sortable: true },
     { key: 'failed', label: 'Failed', align: 'right', sortable: true },
     { key: 'paused', label: 'Paused', align: 'right', sortable: true },
+    { key: 'cancelled', label: 'Cancelled', align: 'right', sortable: true },
     { key: 'total', label: 'Total', align: 'right', sortable: true },
     { key: 'backlogAge', label: 'Backlog Age', align: 'right' },
     { key: 'composition', label: 'Composition' },
@@ -82,9 +88,12 @@
         completed: acc.completed + queue.completed,
         failed: acc.failed + queue.failed,
         paused: acc.paused + queue.paused,
+        retrying: acc.retrying + queue.retrying,
+        waiting: acc.waiting + queue.waiting,
+        cancelled: acc.cancelled + queue.cancelled,
         total: acc.total + queue.total,
       }),
-      { pending: 0, running: 0, completed: 0, failed: 0, paused: 0, total: 0 }
+      { pending: 0, running: 0, completed: 0, failed: 0, paused: 0, retrying: 0, waiting: 0, cancelled: 0, total: 0 }
     )
   )
 
@@ -99,7 +108,7 @@
   }
 
   function handleSort(key: string) {
-    if (!['name', 'pending', 'running', 'completed', 'failed', 'paused', 'total'].includes(key)) return
+    if (!['name', 'pending', 'running', 'retrying', 'waiting', 'completed', 'failed', 'paused', 'cancelled', 'total'].includes(key)) return
     const nextKey = key as SortableQueueKey
     if (sortKey === nextKey) {
       sortDir = sortDir === 'asc' ? 'desc' : 'asc'
@@ -120,6 +129,9 @@
         const completed = numberValue(q.completed)
         const failed = numberValue(q.failed)
         const paused = numberValue(q.paused)
+        const retrying = numberValue(q.retrying)
+        const waiting = numberValue(q.waiting)
+        const cancelled = numberValue(q.cancelled)
         return {
           name: q.name,
           pending,
@@ -127,13 +139,16 @@
           completed,
           failed,
           paused,
-          total: pending + running + completed + failed + paused,
+          retrying,
+          waiting,
+          cancelled,
+          total: pending + running + retrying + waiting + completed + failed + paused + cancelled,
           isPaused: q.isPaused,
           oldestPendingAt: toDate(q.oldestPendingAt),
           // Honest micro-chart: QueueStats exposes only a point-in-time status
           // distribution, not throughput history. This snapshot is labeled as
           // composition so it cannot be mistaken for fabricated time-series data.
-          composition: [pending, running, completed, failed, paused],
+          composition: [pending, running, retrying, waiting, completed, failed, paused, cancelled],
         }
       })
     } catch (e) {
@@ -236,7 +251,7 @@
           <StatusBadge status="paused" class="badge-paused" />
         {/if}
       </div>
-    {:else if column.key === 'pending' || column.key === 'running' || column.key === 'completed' || column.key === 'failed' || column.key === 'paused' || column.key === 'total'}
+    {:else if column.key === 'pending' || column.key === 'running' || column.key === 'retrying' || column.key === 'waiting' || column.key === 'completed' || column.key === 'failed' || column.key === 'paused' || column.key === 'cancelled' || column.key === 'total'}
       {@const value = queue[column.key]}
       <span
         class:total={column.key === 'total'}
@@ -251,7 +266,7 @@
         <span class="data-gap">—</span>
       {/if}
     {:else if column.key === 'composition'}
-      <div class="spark-cell" title="Snapshot of pending, running, completed, failed, paused counts.">
+      <div class="spark-cell" title="Snapshot of pending, running, retrying, waiting, completed, failed, paused, cancelled counts.">
         <Sparkline data={queue.composition} color={queue.failed > 0 ? 'var(--sig-danger)' : 'var(--fg-secondary)'} label={`Status composition for ${queue.name}`} />
       </div>
     {:else if column.key === 'actions'}
@@ -291,9 +306,12 @@
       <span class="totals-label">All queues</span>
       <span><span class="num" use:deltaFlash={totals.pending}>{totals.pending}</span> pending</span>
       <span><span class="num" use:deltaFlash={totals.running}>{totals.running}</span> running</span>
+      <span><span class="num" style={countStyle('retrying', totals.retrying)} use:deltaFlash={totals.retrying}>{totals.retrying}</span> retrying</span>
+      <span><span class="num" style={countStyle('waiting', totals.waiting)} use:deltaFlash={totals.waiting}>{totals.waiting}</span> waiting</span>
       <span><span class="num" use:deltaFlash={totals.completed}>{totals.completed}</span> completed</span>
       <span><span class="num" style={countStyle('failed', totals.failed)} use:deltaFlash={totals.failed}>{totals.failed}</span> failed</span>
       <span><span class="num" style={countStyle('paused', totals.paused)} use:deltaFlash={totals.paused}>{totals.paused}</span> paused</span>
+      <span><span class="num" style={countStyle('cancelled', totals.cancelled)} use:deltaFlash={totals.cancelled}>{totals.cancelled}</span> cancelled</span>
       <span><span class="num total" use:deltaFlash={totals.total}>{totals.total}</span> total</span>
     </div>
   {/if}

@@ -1,4 +1,21 @@
-import { test, expect } from '@playwright/test'
+import { test, expect, type Page } from '@playwright/test'
+
+async function routeExtraQueueStatuses(page: Page) {
+  await page.route(url => new URL(url).pathname === '/jobs.v1.JobsService/ListQueues', async route => {
+    const response = await route.fetch()
+    const body = await response.json()
+    const message = body.result ?? body
+    message.queues = message.queues.map((queue: Record<string, unknown>, index: number) => ({
+      ...queue,
+      retrying: index === 0 ? '1' : '0',
+      waiting: index === 0 ? '1' : index === 1 ? '1' : '0',
+      cancelled: index === 0 ? '1' : '0',
+    }))
+    const headers = { ...response.headers(), 'content-type': 'application/json' }
+    delete headers['content-length']
+    await route.fulfill({ status: response.status(), headers, body: JSON.stringify(body) })
+  })
+}
 
 test.describe('Queues Page', () => {
   test.beforeEach(async ({ page }) => {
@@ -25,7 +42,7 @@ test.describe('Queues Page', () => {
     const firstRow = rows.first()
     const cells = firstRow.locator('.num')
     const cellCount = await cells.count()
-    expect(cellCount).toBeGreaterThanOrEqual(5) // pending, running, completed, failed, paused, total
+    expect(cellCount).toBeGreaterThanOrEqual(9)
   })
 
   test('shows honest queue telemetry columns', async ({ page }) => {
@@ -84,7 +101,7 @@ test.describe('Queues Page', () => {
 
   test('composition chart title explains snapshot', async ({ page }) => {
     const firstRow = page.locator('.queues-table tbody tr').first()
-    await expect(firstRow.locator('.spark-cell')).toHaveAttribute('title', 'Snapshot of pending, running, completed, failed, paused counts.')
+    await expect(firstRow.locator('.spark-cell')).toHaveAttribute('title', 'Snapshot of pending, running, retrying, waiting, completed, failed, paused, cancelled counts.')
   })
 
   test('totals footer is visible', async ({ page }) => {
@@ -99,8 +116,22 @@ test.describe('Queues Page', () => {
     await expect(totals).toContainText('running')
     await expect(totals).toContainText('completed')
     await expect(totals).toContainText('failed')
+    await expect(totals).toContainText('retrying')
+    await expect(totals).toContainText('waiting')
     await expect(totals).toContainText('paused')
+    await expect(totals).toContainText('cancelled')
     await expect(totals).toContainText('total')
+  })
+
+  test('totals footer shows retrying waiting and cancelled counts', async ({ page }) => {
+    await routeExtraQueueStatuses(page)
+    await page.reload()
+    await page.waitForSelector('.queues-table', { timeout: 10000 })
+
+    const totals = page.locator('.totals-footer')
+    await expect(totals).toContainText('1 retrying')
+    await expect(totals).toContainText('2 waiting')
+    await expect(totals).toContainText('1 cancelled')
   })
 
   test('default queue exposes purge completed when completed jobs exist', async ({ page }) => {
@@ -110,8 +141,8 @@ test.describe('Queues Page', () => {
 
   test('queue rows keep stable count cell contract', async ({ page }) => {
     const rows = page.locator('.queues-table tbody tr')
-    await expect(rows.first().locator('.num')).toHaveCount(6)
-    await expect(rows.nth(1).locator('.num')).toHaveCount(6)
+    await expect(rows.first().locator('.num')).toHaveCount(9)
+    await expect(rows.nth(1).locator('.num')).toHaveCount(9)
   })
 
   test('queue status badge is absent before pause', async ({ page }) => {
@@ -158,7 +189,7 @@ test.describe('Queues Page', () => {
 
   test('purge failed uses typed blast-radius confirmation', async ({ page }) => {
     const defaultRow = page.locator('.queues-table tbody tr', { hasText: 'default' })
-    const failedText = await defaultRow.locator('.num').nth(3).innerText()
+    const failedText = await defaultRow.locator('.num').nth(5).innerText()
     const failedCount = Number(failedText.trim())
     // This mutates the shared e2e server. The precondition guard keeps the test
     // explicit about requiring seeded failed jobs before it consumes them.

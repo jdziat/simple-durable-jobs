@@ -7,6 +7,9 @@ export interface QueueStat {
   completed: number
   failed: number
   paused: number
+  retrying: number
+  waiting: number
+  cancelled: number
   isPaused: boolean
   total: number
 }
@@ -17,6 +20,9 @@ export interface StatsSnapshot {
   totalCompleted: number
   totalFailed: number
   totalPaused: number
+  totalRetrying: number
+  totalWaiting: number
+  totalCancelled: number
   activeWorkers: number
   queues: QueueStat[]
 }
@@ -36,6 +42,9 @@ function mapStats(response: Awaited<ReturnType<typeof jobsClient.getStats>>): St
     totalCompleted: Number(response.totalCompleted),
     totalFailed: Number(response.totalFailed),
     totalPaused: Number(response.totalPaused),
+    totalRetrying: Number(response.totalRetrying),
+    totalWaiting: Number(response.totalWaiting),
+    totalCancelled: Number(response.totalCancelled),
     activeWorkers: Number(response.activeWorkers),
     queues: response.queues.map(q => {
       const pending = Number(q.pending)
@@ -43,6 +52,9 @@ function mapStats(response: Awaited<ReturnType<typeof jobsClient.getStats>>): St
       const completed = Number(q.completed)
       const failed = Number(q.failed)
       const paused = Number(q.paused)
+      const retrying = Number(q.retrying)
+      const waiting = Number(q.waiting)
+      const cancelled = Number(q.cancelled)
       return {
         name: q.name,
         pending,
@@ -50,8 +62,11 @@ function mapStats(response: Awaited<ReturnType<typeof jobsClient.getStats>>): St
         completed,
         failed,
         paused,
+        retrying,
+        waiting,
+        cancelled,
         isPaused: q.isPaused,
-        total: pending + running + completed + failed,
+        total: pending + running + completed + failed + paused + retrying + waiting + cancelled,
       }
     }),
   }

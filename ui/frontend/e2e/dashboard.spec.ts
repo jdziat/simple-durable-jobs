@@ -21,6 +21,26 @@ async function routeZeroFailedStats(page: Page) {
   })
 }
 
+async function routeExtraStatusStats(page: Page) {
+  await page.route(url => new URL(url).pathname === '/jobs.v1.JobsService/GetStats', async route => {
+    const response = await route.fetch()
+    const body = await response.json()
+    const message = body.result ?? body
+    message.totalRetrying = '1'
+    message.totalWaiting = '2'
+    message.totalCancelled = '1'
+    message.queues = message.queues.map((queue: Record<string, unknown>, index: number) => ({
+      ...queue,
+      retrying: index === 0 ? '1' : '0',
+      waiting: index === 0 ? '1' : index === 1 ? '1' : '0',
+      cancelled: index === 0 ? '1' : '0',
+    }))
+    const headers = { ...response.headers(), 'content-type': 'application/json' }
+    delete headers['content-length']
+    await route.fulfill({ status: response.status(), headers, body: JSON.stringify(body) })
+  })
+}
+
 test.describe('Dashboard', () => {
   test.beforeEach(async ({ page }) => {
     await page.goto('/#/')
@@ -31,9 +51,9 @@ test.describe('Dashboard', () => {
   test('shows stat cards', async ({ page }) => {
     const statsGrid = page.locator('.stats-grid')
     await expect(statsGrid).toBeVisible()
-    // Should have 6 metric cards: Failed, Pending, Running, Completed, Paused, Active workers
+    // Failed, Pending, Running, Completed, Retrying, Waiting, Paused, Cancelled, Active workers.
     const cards = statsGrid.locator('.card')
-    await expect(cards).toHaveCount(6)
+    await expect(cards).toHaveCount(9)
   })
 
   test('stat cards show non-zero values', async ({ page }) => {
@@ -42,7 +62,10 @@ test.describe('Dashboard', () => {
     await expect(grid.getByText('Running')).toBeVisible()
     await expect(grid.getByText('Completed')).toBeVisible()
     await expect(grid.getByText('Failed')).toBeVisible()
+    await expect(grid.getByText('Retrying')).toBeVisible()
+    await expect(grid.getByText('Waiting')).toBeVisible()
     await expect(grid.getByText('Paused')).toBeVisible()
+    await expect(grid.getByText('Cancelled')).toBeVisible()
     await expect(grid.getByText('Active workers')).toBeVisible()
   })
 
@@ -106,7 +129,10 @@ test.describe('Dashboard', () => {
     await expect(metricCard(page, 'Pending')).toHaveAttribute('href', '#/jobs?status=pending')
     await expect(metricCard(page, 'Running')).toHaveAttribute('href', '#/jobs?status=running')
     await expect(metricCard(page, 'Completed')).toHaveAttribute('href', '#/jobs?status=completed')
+    await expect(metricCard(page, 'Retrying')).toHaveAttribute('href', '#/jobs?status=retrying')
+    await expect(metricCard(page, 'Waiting')).toHaveAttribute('href', '#/jobs?status=waiting')
     await expect(metricCard(page, 'Paused')).toHaveAttribute('href', '#/jobs?status=paused')
+    await expect(metricCard(page, 'Cancelled')).toHaveAttribute('href', '#/jobs?status=cancelled')
   })
 
   test('failed card is dominant when seeded failures exist', async ({ page }) => {
@@ -208,6 +234,16 @@ test.describe('Dashboard', () => {
     await expect(page.locator('.ops-cell', { hasText: 'Total backlog' }).locator('strong')).not.toHaveText('0')
   })
 
+  test('dashboard stat cards include retrying waiting and cancelled totals', async ({ page }) => {
+    await routeExtraStatusStats(page)
+    await page.reload()
+    await page.waitForSelector('.stats-grid', { timeout: 15000 })
+
+    await expect(metricCard(page, 'Retrying').locator('.metric-value')).toHaveText('1')
+    await expect(metricCard(page, 'Waiting').locator('.metric-value')).toHaveText('2')
+    await expect(metricCard(page, 'Cancelled').locator('.metric-value')).toHaveText('1')
+  })
+
   test('throughput chart completed line has non-trivial geometry', async ({ page }) => {
     const path = page.locator('.completed-line')
     await expect(path).toBeVisible()
@@ -293,7 +329,7 @@ test.describe('Dashboard', () => {
   })
 
   test('stat card values use metric-value class', async ({ page }) => {
-    await expect(page.locator('.stats-grid .metric-value')).toHaveCount(6)
+    await expect(page.locator('.stats-grid .metric-value')).toHaveCount(9)
   })
 
   test('pending card shows a count', async ({ page }) => {

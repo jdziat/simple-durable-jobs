@@ -86,7 +86,7 @@ const JOB_TYPES = [
   'update-search-index',
 ] as const
 
-const STATUSES = ['pending', 'running', 'completed', 'failed', 'paused'] as const
+const STATUSES = ['pending', 'running', 'completed', 'failed', 'paused', 'retrying', 'waiting', 'cancelled'] as const
 type Status = (typeof STATUSES)[number]
 
 const QUEUE_FOR_TYPE: Record<string, QueueName> = {
@@ -810,6 +810,9 @@ function buildQueueStats(queueName: string): QueueStats {
     completed: i64(countByStatus(inQueue, 'completed')),
     failed: i64(countByStatus(inQueue, 'failed')),
     paused: i64(countByStatus(inQueue, 'paused')),
+    retrying: i64(countByStatus(inQueue, 'retrying')),
+    waiting: i64(countByStatus(inQueue, 'waiting')),
+    cancelled: i64(countByStatus(inQueue, 'cancelled')),
     isPaused: pausedQueues.has(queueName),
     oldestPendingAt: oldestPending ? ts(oldestPending) : undefined,
   })
@@ -828,6 +831,9 @@ export const mockJobsClient = {
       totalCompleted: i64(countByStatus(jobs, 'completed')),
       totalFailed: i64(countByStatus(jobs, 'failed')),
       totalPaused: i64(countByStatus(jobs, 'paused')),
+      totalRetrying: i64(countByStatus(jobs, 'retrying')),
+      totalWaiting: i64(countByStatus(jobs, 'waiting')),
+      totalCancelled: i64(countByStatus(jobs, 'cancelled')),
       activeWorkers: jobs.filter((j) => j.status === 'running').length,
     })
   },
