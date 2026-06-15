@@ -444,6 +444,41 @@ func TestPromoteReadyJobs_FlipsDueDelayedJob(t *testing.T) {
 	assert.Equal(t, job.ID, got.ID)
 }
 
+// PromoteReadyJobs bounds each pass to maxResumeBatch so a thundering herd of
+// simultaneously-eligible jobs can't make every worker rewrite the whole backlog
+// in one statement; the overflow is promoted on the next pass.
+func TestPromoteReadyJobs_RespectsLimitCap(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	const total = maxResumeBatch + 50
+	pastRunAt := time.Now().Add(-time.Minute)
+	for i := 0; i < total; i++ {
+		job := newTestJob("default", "task.bulk")
+		require.NoError(t, s.Enqueue(ctx, job))
+		require.NoError(t, s.DB().WithContext(ctx).Model(&core.Job{}).
+			Where("id = ?", job.ID).
+			Updates(map[string]any{"run_at": pastRunAt, "dq_ready": false}).Error)
+	}
+
+	first, err := s.PromoteReadyJobs(ctx)
+	require.NoError(t, err)
+	assert.EqualValues(t, maxResumeBatch, first, "first pass is capped at maxResumeBatch")
+
+	second, err := s.PromoteReadyJobs(ctx)
+	require.NoError(t, err)
+	assert.EqualValues(t, total-maxResumeBatch, second, "next pass drains the remainder")
+
+	third, err := s.PromoteReadyJobs(ctx)
+	require.NoError(t, err)
+	assert.EqualValues(t, 0, third, "nothing left to promote")
+
+	var unready int64
+	require.NoError(t, s.DB().WithContext(ctx).Model(&core.Job{}).
+		Where("status = ? AND dq_ready = ?", core.StatusPending, false).Count(&unready).Error)
+	assert.EqualValues(t, 0, unready, "all eligible jobs end up promoted")
+}
+
 func TestDQReady_CorrectnessNotAffectedByStaleTrue(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStorage(t)
