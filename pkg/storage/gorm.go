@@ -60,6 +60,13 @@ func WithCodec(c core.PayloadCodec) GormStorageOption {
 // optimization: PostgreSQL is already covered by the metadata GIN index, and
 // SQLite keeps using the LIKE fallback. Declaring a key makes filters on that
 // key use a generated-column index instead of a full metadata scan.
+//
+// Migrate only ADDS the generated column + index for each declared key; it never
+// drops them. Removing a key from this list on a later boot leaves its (inert,
+// narrow) meta_<key> column and idx_jobs_meta_<key> index in place — they simply
+// stop being used. Drop them manually if you want them gone. Keys are validated
+// against ^[A-Za-z0-9_]{1,48}$ (they are interpolated into DDL); an invalid key
+// fails Migrate before any DDL runs.
 func WithIndexedMetadataKeys(keys ...string) GormStorageOption {
 	return func(s *GormStorage) {
 		seen := make(map[string]struct{}, len(keys))

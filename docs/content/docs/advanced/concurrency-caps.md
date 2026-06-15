@@ -59,3 +59,18 @@ The built-in GORM storage implements this optional capability. Custom storage
 backends can opt in by implementing the worker's optional concurrency slot
 methods; otherwise `ConcurrencyCap` is ignored and per-worker `Concurrency`
 continues to apply.
+
+## Keep the cap key bounded
+
+When you partition a cap with `CapKey`, the effective slot name is
+`Name + ":" + key`. Each distinct slot name leaves a permanent
+admission-serialization row in the `concurrency_slots` table — a sentinel that
+the lease-expiry sweep intentionally preserves, so concurrent contenders for the
+same slot always have a row to lock before they count and insert.
+
+That permanent sentinel is what makes the cap correct, but it means the key must
+come from a **bounded, enumerable set** — a fixed list of tenants, regions, or
+resource classes. Partitioning on a high-cardinality value (a job ID, a UUID, or
+arbitrary user input) creates a new permanent row per distinct value and grows
+`concurrency_slots` without bound. For "only N of these at a time" use a bounded
+key; do not derive it from `job.ID` or free-form data.

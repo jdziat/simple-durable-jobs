@@ -74,6 +74,16 @@ func (c UniqueLockSweepConfig) enabled() bool {
 // the cap is fleet-wide and uses Name as the slot name. If Key is set, the
 // effective slot name is Name + ":" + Key(job), allowing per-tenant or per-key
 // partitions under the same configured cap.
+//
+// Key must return values from a BOUNDED, enumerable set (e.g. a fixed set of
+// tenants, regions, or resource classes). Each distinct effective slot name
+// leaves a permanent admission-serialization sentinel row in concurrency_slots
+// that is intentionally never garbage-collected (the expiry sweep preserves it
+// so concurrent contenders for the same slot always have a row to lock). A
+// high-cardinality Key — one that returns per-job IDs, arbitrary user input, or
+// otherwise unbounded values — therefore grows concurrency_slots without bound.
+// Partition on bounded dimensions; do not derive the key from job.ID, a UUID, or
+// free-form data.
 type ConcurrencyCapConfig struct {
 	Name  string
 	Limit int
