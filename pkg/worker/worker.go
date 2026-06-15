@@ -2011,6 +2011,30 @@ func (w *Worker) runScheduler(ctx context.Context) {
 						opts = append(opts, queue.Timeout(sj.Options.Timeout))
 					}
 					opts = append(opts, queue.Determinism(sj.Options.Determinism))
+					// Forward the remaining configured options so a scheduled fire is
+					// not silently stripped of its tenant/tags/dedup (arch-10x/F3).
+					if sj.Options.Tenant != "" {
+						opts = append(opts, queue.WithTenant(sj.Options.Tenant))
+					}
+					if sj.Options.Metadata != nil {
+						opts = append(opts, queue.WithMetadata(map[string]string(*sj.Options.Metadata)))
+					}
+					// Forward unconditionally (incl. 0 = unlimited) so an author's
+					// explicit metadata-size choice isn't reset to the default on fires.
+					opts = append(opts, queue.WithMaxMetadataSize(sj.Options.MaxMetadataSize))
+					// Handler backoff is intentionally NOT forwarded: Options.Backoff is
+					// only read by RegisterE at handler-registration time, and the retry
+					// path resolves backoff from the registered handler keyed by job
+					// type — never from enqueue options — so it would be a no-op here.
+					// Dedup controls are mutually exclusive (each constructor zeroes the
+					// other). A fixed IdempotencyKey on a RECURRING schedule dedups fires
+					// within UniqueLockTTL (at-most-once-per-window) — the schedule
+					// author's explicit choice, honored rather than silently dropped.
+					if sj.Options.IdempotencyKey != "" {
+						opts = append(opts, queue.IdempotencyKey(sj.Options.IdempotencyKey, sj.Options.UniqueLockTTL))
+					} else if sj.Options.UniqueForTTL > 0 {
+						opts = append(opts, queue.UniqueFor(sj.Options.UniqueForTTL))
+					}
 					_, err = w.queue.Enqueue(ctx, sj.Name, sj.Args,
 						opts...,
 					)
