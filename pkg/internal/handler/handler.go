@@ -169,6 +169,10 @@ func (h *Handler) Execute(ctx context.Context, argsJSON []byte) ([]byte, error) 
 	return nil, nil
 }
 
+// acceptsEmptyArgs is the shared empty-args policy for BOTH Execute (empty
+// argsJSON) and ExecuteCall (nil args): types that have a meaningful zero value
+// for an absent argument. Keep the two call sites consistent — a change here
+// affects both the top-level and nested-Call dispatch paths.
 func acceptsEmptyArgs(t reflect.Type) bool {
 	switch t.Kind() {
 	case reflect.Struct:
@@ -201,7 +205,18 @@ func ExecuteCall[T any](ctx context.Context, h *Handler, args any) (T, error) {
 
 	if h.ArgsType != nil {
 		argsVal := reflect.ValueOf(args)
-		if argsVal.Type() != h.ArgsType {
+		if !argsVal.IsValid() {
+			// args == nil: reflect.ValueOf(nil) is the zero Value, so calling
+			// .Type() on it panics ("reflect: call of reflect.Type on zero
+			// Value"). Mirror Execute's empty-args handling: a type that
+			// accepts empty args (struct{}, slice/map/ptr/interface) is
+			// zero-filled; anything else is a non-retryable args error rather
+			// than a panic that the caller would retry to exhaustion.
+			if !acceptsEmptyArgs(h.ArgsType) {
+				return zero, core.NoRetry(fmt.Errorf("jobs.Call: handler requires %s args but nil was passed", h.ArgsType))
+			}
+			argsVal = reflect.New(h.ArgsType).Elem()
+		} else if argsVal.Type() != h.ArgsType {
 			argsBytes, err := json.Marshal(args)
 			if err != nil {
 				return zero, fmt.Errorf("failed to marshal args: %w", err)

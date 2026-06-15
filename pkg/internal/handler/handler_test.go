@@ -489,6 +489,127 @@ func TestExecuteCall_StructResult_JSONRoundTrip(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// ExecuteCall – nil typed args must not panic (arch-10x/F1 regression).
+// reflect.ValueOf(nil) is the zero Value; calling .Type() on it panics, which
+// the worker would catch as an opaque retryable error and retry to exhaustion.
+// ExecuteCall must mirror Execute's empty-args handling instead.
+// ---------------------------------------------------------------------------
+
+func TestExecuteCall_NilArgs_NonEmptyStructIsNoRetry(t *testing.T) {
+	// A handler whose ArgsType is a non-empty struct cannot accept nil args.
+	// It must return a non-retryable error, never panic.
+	fn := func(_ context.Context, _ testArgs) (testResult, error) {
+		return testResult{}, nil
+	}
+	h, err := NewHandler(fn)
+	require.NoError(t, err)
+
+	var result testResult
+	require.NotPanics(t, func() {
+		result, err = ExecuteCall[testResult](context.Background(), h, nil)
+	})
+	require.Error(t, err)
+	assert.Equal(t, testResult{}, result)
+
+	var noRetry *core.NoRetryError
+	assert.True(t, errors.As(err, &noRetry), "nil args for a required-struct handler must be no-retry, not a retryable panic")
+}
+
+func TestExecuteCall_NilArgs_EmptyAcceptingTypesZeroFill(t *testing.T) {
+	// Types that accept empty args (struct{}, slice, map, pointer) zero-fill
+	// from nil and run normally — symmetric with Execute's empty-JSON path.
+	t.Run("emptyStruct", func(t *testing.T) {
+		fn := func(_ context.Context, _ struct{}) (string, error) { return "ok", nil }
+		h, err := NewHandler(fn)
+		require.NoError(t, err)
+		var result string
+		require.NotPanics(t, func() {
+			result, err = ExecuteCall[string](context.Background(), h, nil)
+		})
+		require.NoError(t, err)
+		assert.Equal(t, "ok", result)
+	})
+
+	t.Run("slice", func(t *testing.T) {
+		fn := func(_ context.Context, args []int) (int, error) { return len(args), nil }
+		h, err := NewHandler(fn)
+		require.NoError(t, err)
+		var result int
+		require.NotPanics(t, func() {
+			result, err = ExecuteCall[int](context.Background(), h, nil)
+		})
+		require.NoError(t, err)
+		assert.Equal(t, 0, result, "nil slice arg zero-fills to a nil (len 0) slice")
+	})
+
+	t.Run("map", func(t *testing.T) {
+		fn := func(_ context.Context, args map[string]int) (int, error) { return len(args), nil }
+		h, err := NewHandler(fn)
+		require.NoError(t, err)
+		var result int
+		require.NotPanics(t, func() {
+			result, err = ExecuteCall[int](context.Background(), h, nil)
+		})
+		require.NoError(t, err)
+		assert.Equal(t, 0, result)
+	})
+
+	t.Run("pointer", func(t *testing.T) {
+		fn := func(_ context.Context, args *testArgs) (bool, error) { return args == nil, nil }
+		h, err := NewHandler(fn)
+		require.NoError(t, err)
+		var result bool
+		require.NotPanics(t, func() {
+			result, err = ExecuteCall[bool](context.Background(), h, nil)
+		})
+		require.NoError(t, err)
+		assert.True(t, result, "nil pointer arg zero-fills to a nil pointer")
+	})
+
+	t.Run("interface", func(t *testing.T) {
+		fn := func(_ context.Context, args any) (bool, error) { return args == nil, nil }
+		h, err := NewHandler(fn)
+		require.NoError(t, err)
+		var result bool
+		require.NotPanics(t, func() {
+			result, err = ExecuteCall[bool](context.Background(), h, nil)
+		})
+		require.NoError(t, err)
+		assert.True(t, result, "nil interface arg zero-fills to a nil interface")
+	})
+}
+
+// TestExecuteCall_NilArgs_DivergesFromExecuteIntentionally locks the deliberate
+// policy difference for a non-empty struct: Execute marshals a nil arg to the
+// JSON literal "null" (len != 0), which unmarshals successfully into a zero
+// struct and RUNS the handler; ExecuteCall instead rejects a literal nil with a
+// non-retryable error rather than silently running zero-valued. The Call-side
+// fail-fast is intentional — a future change must not silently re-align them.
+func TestExecuteCall_NilArgs_DivergesFromExecuteIntentionally(t *testing.T) {
+	ran := false
+	fn := func(_ context.Context, _ testArgs) (testResult, error) {
+		ran = true
+		return testResult{}, nil
+	}
+	h, err := NewHandler(fn)
+	require.NoError(t, err)
+
+	// Execute path: nil -> "null" -> zero struct -> handler RUNS.
+	ran = false
+	_, execErr := h.Execute(context.Background(), []byte("null"))
+	require.NoError(t, execErr)
+	assert.True(t, ran, "Execute runs the handler zero-valued from \"null\"")
+
+	// ExecuteCall path: literal nil -> NoRetry, handler does NOT run.
+	ran = false
+	_, callErr := ExecuteCall[testResult](context.Background(), h, nil)
+	require.Error(t, callErr)
+	var noRetry *core.NoRetryError
+	assert.True(t, errors.As(callErr, &noRetry))
+	assert.False(t, ran, "ExecuteCall must not run the handler for a nil required-struct arg")
+}
+
+// ---------------------------------------------------------------------------
 // ExecuteCall – error propagated from handler body
 // ---------------------------------------------------------------------------
 
