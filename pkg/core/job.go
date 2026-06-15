@@ -71,6 +71,12 @@ type Job struct {
 	LockedUntil      *time.Time
 	LastHeartbeatAt  *time.Time // Tracks when the last heartbeat was received
 	UniqueKey        string     `gorm:"size:255"` // For job deduplication
+	// DQReady is a performance hint for MySQL dequeue: true iff this is a pending
+	// job eligible to run now (run_at is nil or in the past). It lets MySQL use an
+	// index that serves the priority-ordered dequeue without a filesort. It is NOT a
+	// correctness gate — Dequeue still filters dq_eligible_at <= now, so a stale
+	// dq_ready can only cost latency, never cause an incorrect dequeue.
+	DQReady bool `gorm:"column:dq_ready;not null;default:true"`
 
 	// Parent-child relationship
 	ParentJobID *UUID `gorm:"index"`

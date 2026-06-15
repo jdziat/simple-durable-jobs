@@ -44,8 +44,13 @@ func (s *GormStorage) EnqueueTx(ctx context.Context, tx *gorm.DB, job *core.Job)
 	}
 	db := tx.WithContext(ctx)
 	if job.UniqueKey == "" {
-		return db.Create(row).Error
+		dqReadyFalseIDs, dqReadyFalseRefs := dqReadyFalseJobs([]*core.Job{job})
+		if err := db.Create(row).Error; err != nil {
+			return err
+		}
+		return restoreDQReadyFalse(db, dqReadyFalseIDs, dqReadyFalseRefs)
 	}
+	dqReadyFalseIDs, dqReadyFalseRefs := dqReadyFalseJobs([]*core.Job{job})
 	result := db.Clauses(clause.OnConflict{DoNothing: true}).Create(row)
 	if result.Error != nil {
 		return result.Error
@@ -53,7 +58,7 @@ func (s *GormStorage) EnqueueTx(ctx context.Context, tx *gorm.DB, job *core.Job)
 	if result.RowsAffected == 0 {
 		return core.ErrDuplicateJob
 	}
-	return nil
+	return restoreDQReadyFalse(db, dqReadyFalseIDs, dqReadyFalseRefs)
 }
 
 // EnqueueUniqueTx adds a unique job using the caller-supplied transaction handle.
@@ -85,6 +90,7 @@ func (s *GormStorage) EnqueueUniqueTx(ctx context.Context, tx *gorm.DB, job *cor
 	if err != nil {
 		return err
 	}
+	dqReadyFalseIDs, dqReadyFalseRefs := dqReadyFalseJobs([]*core.Job{job})
 	result := db.Clauses(clause.OnConflict{DoNothing: true}).Create(row)
 	if result.Error != nil {
 		return result.Error
@@ -92,7 +98,7 @@ func (s *GormStorage) EnqueueUniqueTx(ctx context.Context, tx *gorm.DB, job *cor
 	if uniqueKey != "" && result.RowsAffected == 0 {
 		return core.ErrDuplicateJob
 	}
-	return nil
+	return restoreDQReadyFalse(db, dqReadyFalseIDs, dqReadyFalseRefs)
 }
 
 // EnqueueWithUniqueLockTx adds a job under a time-bounded unique lock using
@@ -132,6 +138,11 @@ func fillEnqueueDefaults(job *core.Job) {
 	if job.Queue == "" {
 		job.Queue = "default"
 	}
+	setDQReadyForCreate(job, time.Now())
+}
+
+func setDQReadyForCreate(job *core.Job, now time.Time) {
+	job.DQReady = job.Status == core.StatusPending && (job.RunAt == nil || !job.RunAt.After(now))
 }
 
 func (s *GormStorage) enqueueBatchWithDB(db *gorm.DB, jobs []*core.Job) error {
@@ -177,5 +188,34 @@ func (s *GormStorage) enqueueBatchWithDB(db *gorm.DB, jobs []*core.Job) error {
 	if err != nil {
 		return err
 	}
-	return db.Clauses(clause.OnConflict{DoNothing: true}).Create(rows).Error
+	dqReadyFalseIDs, dqReadyFalseRefs := dqReadyFalseJobs(toCreate)
+	if err := db.Clauses(clause.OnConflict{DoNothing: true}).Create(rows).Error; err != nil {
+		return err
+	}
+	return restoreDQReadyFalse(db, dqReadyFalseIDs, dqReadyFalseRefs)
+}
+
+func dqReadyFalseJobs(jobs []*core.Job) ([]core.UUID, []*core.Job) {
+	ids := make([]core.UUID, 0)
+	refs := make([]*core.Job, 0)
+	for _, job := range jobs {
+		if job != nil && !job.DQReady {
+			ids = append(ids, job.ID)
+			refs = append(refs, job)
+		}
+	}
+	return ids, refs
+}
+
+func restoreDQReadyFalse(db *gorm.DB, ids []core.UUID, jobs []*core.Job) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	err := db.Model(&core.Job{}).
+		Where("id IN ?", ids).
+		UpdateColumn("dq_ready", false).Error
+	for _, job := range jobs {
+		job.DQReady = false
+	}
+	return err
 }

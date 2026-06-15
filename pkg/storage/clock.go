@@ -1,11 +1,13 @@
 package storage
 
 import (
+	"context"
 	"strings"
 	"time"
 
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
+	"gorm.io/gorm/logger"
 
 	"github.com/jdziat/simple-durable-jobs/v3/pkg/core"
 )
@@ -70,6 +72,13 @@ func (s *GormStorage) dequeueEligibleExpr() string {
 	return "COALESCE(run_at, created_at)"
 }
 
+// dqReadyExpr returns the SQL boolean expression for "eligible to run now",
+// used when a write transitions a job into status=pending. now must be the
+// same clock expression the caller uses elsewhere (s.nowExpr() for DB-clock).
+func (s *GormStorage) dqReadyExpr(now any) clause.Expr {
+	return gorm.Expr("(run_at IS NULL OR run_at <= ?)", now)
+}
+
 // lockForUpdate applies a SELECT ... FOR UPDATE row lock, with SKIP LOCKED when
 // skipLocked is true. SQLite has no row locks, so it is a no-op there.
 func (s *GormStorage) lockForUpdate(q *gorm.DB, skipLocked bool) *gorm.DB {
@@ -99,9 +108,37 @@ func (s *GormStorage) claimableCandidates(q *gorm.DB, queues []string, now any) 
 		// NOT NULL (PK), so the NOT IN never hits the NULL-elimination trap.
 		Where("queue NOT IN (SELECT queue FROM queue_states WHERE paused = ?)", true).
 		Where("status = ?", core.StatusPending).
+		Where("dq_ready = ?", true).
 		Where(eligExpr+" <= ?", now).
 		Where("(locked_until IS NULL OR locked_until < ?)", now).
 		Order("priority DESC, " + eligExpr + " ASC")
+}
+
+// PromoteReadyJobs is the wedge-backstop for the dq_ready hint: it flips
+// dq_ready=true for any pending job that has become eligible (run_at passed) but
+// is still flagged not-ready. Returns the number of rows promoted. Safe to call
+// frequently; idempotent.
+func (s *GormStorage) PromoteReadyJobs(ctx context.Context) (int64, error) {
+	var now any
+	if s.useDBClock() {
+		now = s.nowExpr()
+	} else {
+		now = time.Now()
+	}
+	silentDB := s.db.Session(&gorm.Session{Logger: s.db.Logger.LogMode(logger.Silent)})
+	result := silentDB.WithContext(ctx).
+		Model(&core.Job{}).
+		Where("status = ?", core.StatusPending).
+		Where("dq_ready = ?", false).
+		Where("(run_at IS NULL OR run_at <= ?)", now).
+		Updates(map[string]any{
+			"dq_ready":   true,
+			"updated_at": now,
+		})
+	if result.Error != nil {
+		return 0, result.Error
+	}
+	return result.RowsAffected, nil
 }
 
 // offsetExpr returns a SQL expression for (DB now + d). A negative d yields a

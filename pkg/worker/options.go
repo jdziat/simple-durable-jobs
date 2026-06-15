@@ -197,6 +197,17 @@ type WorkerConfig struct {
 	// scales with concurrency, not fleet size.
 	OwnershipAuditInterval time.Duration
 
+	// ReadyPromoteInterval is how often the worker promotes pending jobs that
+	// have become eligible (their run_at passed) but are still flagged
+	// dq_ready=false — the wedge-backstop for the dequeue readiness hint. It is
+	// the maximum extra latency a delayed/scheduled job can incur before it
+	// becomes dequeue-visible. The promoter only ever flips false→true and is
+	// idempotent, so running it per-worker is safe. A non-positive value keeps
+	// the default; it cannot be disabled because it is the only mechanism that
+	// makes a delayed job dequeue-able. Default: the poll interval (so a delayed
+	// job's dequeue-visibility latency stays at ~one poll, as before dq_ready).
+	ReadyPromoteInterval time.Duration
+
 	// ownershipAuditSet records whether OwnershipAuditInterval was provided
 	// explicitly (via WithOwnershipAuditInterval). NewWorker needs this to
 	// tell "unset" (apply the 5s default) apart from an explicit 0, which
@@ -605,6 +616,18 @@ func WithStaleLockInterval(d time.Duration) WorkerOption {
 			d = minStaleLockInterval
 		}
 		c.StaleLockInterval = d
+	})
+}
+
+// WithReadyPromoteInterval sets how often the ready-promoter backstop runs (see
+// WorkerConfig.ReadyPromoteInterval). A non-positive value keeps the default; it
+// cannot be disabled.
+func WithReadyPromoteInterval(d time.Duration) WorkerOption {
+	return workerOptionFunc(func(c *WorkerConfig) {
+		if d <= 0 {
+			return
+		}
+		c.ReadyPromoteInterval = d
 	})
 }
 

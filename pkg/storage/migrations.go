@@ -306,6 +306,11 @@ var schemaMigrations = []schemaMigration{
 		Name:    "forbid_null_fan_out_counters",
 		Up:      migrateForbidNullFanOutCounters,
 	},
+	{
+		Version: 32,
+		Name:    "dqready_column_index",
+		Up:      migrateDQReadyColumnIndex,
+	},
 }
 
 // applyPreMigrations runs every registered pre-AutoMigrate one-shot through a
@@ -1494,6 +1499,59 @@ func migrateForbidNullFanOutCounters(ctx context.Context, db *gorm.DB, dialect s
 		// SQLite dev tables rely on value-typed Go fields.
 		return nil
 	}
+}
+
+func migrateDQReadyColumnIndex(ctx context.Context, db *gorm.DB, dialect string) error {
+	var now any
+	switch dialect {
+	case dialectMySQL:
+		now = gorm.Expr("NOW(6)")
+	case dialectPostgres:
+		now = gorm.Expr("NOW()")
+	default:
+		now = time.Now()
+	}
+	if err := db.WithContext(ctx).Exec(
+		"UPDATE jobs SET dq_ready = (run_at IS NULL OR run_at <= ?) WHERE status = ?",
+		now,
+		core.StatusPending,
+	).Error; err != nil {
+		return fmt.Errorf("backfill dq_ready: %w", err)
+	}
+
+	switch dialect {
+	case dialectMySQL:
+		// MySQL has no partial indexes; this composite serves both the dequeue
+		// (equality status,dq_ready then priority-ordered scan — no filesort) and
+		// the promoter's status='pending' AND dq_ready=false lookup via its
+		// (status, dq_ready) prefix.
+		m := db.Migrator()
+		if !m.HasIndex(&core.Job{}, "idx_jobs_dq_ready") {
+			if err := db.WithContext(ctx).Exec(
+				"CREATE INDEX idx_jobs_dq_ready ON jobs (status, dq_ready, priority DESC, dq_eligible_at, queue)",
+			).Error; err != nil && !isBenignDDLError(err) {
+				return fmt.Errorf("create idx_jobs_dq_ready: %w", err)
+			}
+		}
+	case dialectPostgres:
+		// PG dequeue keeps its priority-first partial index and just filters the
+		// cheap dq_ready boolean. The promoter scans only the (small) not-ready set
+		// via this partial index, so its per-tick cost is bounded by the number of
+		// not-yet-eligible pending jobs, not the whole ready backlog.
+		if err := db.WithContext(ctx).Exec(
+			"CREATE INDEX IF NOT EXISTS idx_jobs_dq_unready ON jobs (status, run_at) WHERE dq_ready = false",
+		).Error; err != nil {
+			return fmt.Errorf("create idx_jobs_dq_unready: %w", err)
+		}
+	default:
+		// sqlite: partial index on the not-ready set (boolean is stored as 0/1).
+		if err := db.WithContext(ctx).Exec(
+			"CREATE INDEX IF NOT EXISTS idx_jobs_dq_unready ON jobs (status, run_at) WHERE dq_ready = 0",
+		).Error; err != nil {
+			return fmt.Errorf("create idx_jobs_dq_unready: %w", err)
+		}
+	}
+	return nil
 }
 
 func migrateQueueStatesQueueCollation(ctx context.Context, db *gorm.DB, dialect string) error {

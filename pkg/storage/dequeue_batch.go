@@ -54,6 +54,22 @@ func (s *GormStorage) dequeueBatch(ctx context.Context, queues []string, workerI
 		limit = maxDequeueBatch
 	}
 
+	jobs, err := s.dequeueBatchOnce(ctx, queues, workerID, limit, perQueueBudgets)
+	if err != nil || len(jobs) > 0 {
+		return jobs, err
+	}
+	// Self-heal: nothing claimable this pass. Promote any pending job that has
+	// become eligible but is still flagged dq_ready=false and retry once, so
+	// batch dequeue correctness does not depend on the external promoter loop
+	// (see Dequeue).
+	promoted, perr := s.PromoteReadyJobs(ctx)
+	if perr != nil || promoted == 0 {
+		return jobs, nil
+	}
+	return s.dequeueBatchOnce(ctx, queues, workerID, limit, perQueueBudgets)
+}
+
+func (s *GormStorage) dequeueBatchOnce(ctx context.Context, queues []string, workerID string, limit int, perQueueBudgets map[string]int) ([]*core.Job, error) {
 	if s.isSQLite {
 		return s.dequeueBatchSQLite(ctx, queues, workerID, limit, perQueueBudgets)
 	}

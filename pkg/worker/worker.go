@@ -52,12 +52,13 @@ type Worker struct {
 	// with WithQueueRateLimit.
 	queueRateBuckets map[string]*tokenBucket
 
-	rateLimitStorageMissingLogged  atomic.Bool
-	retentionStorageMissingLogged  atomic.Bool
-	retentionUnconfiguredLogged    atomic.Bool
-	retentionConfiguredLogged      atomic.Bool
-	uniqueLockStorageMissingLogged atomic.Bool
-	slotSweepStorageMissingLogged  atomic.Bool
+	rateLimitStorageMissingLogged     atomic.Bool
+	retentionStorageMissingLogged     atomic.Bool
+	retentionUnconfiguredLogged       atomic.Bool
+	retentionConfiguredLogged         atomic.Bool
+	uniqueLockStorageMissingLogged    atomic.Bool
+	slotSweepStorageMissingLogged     atomic.Bool
+	readyPromoterStorageMissingLogged atomic.Bool
 
 	// futureSleepSuppressions memoizes (jobID -> run_at) for sleeping jobs the
 	// signal-resume backstop has already inspected, capping checkpoint lookups
@@ -136,6 +137,10 @@ type uniqueLockSweepStorage interface {
 
 type concurrencySlotSweepStorage interface {
 	DeleteExpiredConcurrencySlots(ctx context.Context, cutoff time.Time) (int64, error)
+}
+
+type readyPromoterStorage interface {
+	PromoteReadyJobs(ctx context.Context) (int64, error)
 }
 
 // consumedSignalRetentionStorage is implemented by backends that can prune
@@ -239,6 +244,17 @@ func NewWorker(q *queue.Queue, opts ...WorkerOption) *Worker {
 	// non-positive interval simply falls back to the 5m default.
 	if config.StaleLockInterval <= 0 {
 		config.StaleLockInterval = 5 * time.Minute
+	}
+	// Default the ready-promoter cadence to the poll interval. Dequeue requires
+	// dq_ready=true and the promoter is the only path that flips a future-dated
+	// job true, so a promoter slower than the poll would add dequeue latency to
+	// delayed/scheduled jobs and short RetryAfter backoffs; matching the poll
+	// keeps their visibility latency at ~one poll, as before dq_ready existed.
+	if config.ReadyPromoteInterval <= 0 {
+		config.ReadyPromoteInterval = config.PollInterval
+	}
+	if config.ReadyPromoteInterval <= 0 {
+		config.ReadyPromoteInterval = 100 * time.Millisecond
 	}
 	if config.StaleLockAge == 0 {
 		config.StaleLockAge = 45 * time.Minute
@@ -389,6 +405,10 @@ func (w *Worker) Start(ctx context.Context) error {
 	}
 
 	w.goTracked(func() { w.runConcurrencySlotSweep(ctx) })
+
+	// Ready-promoter backstop: makes delayed/scheduled jobs dequeue-visible once
+	// their run_at passes (and heals any missed dq_ready flag). Always runs.
+	w.goTracked(func() { w.runReadyPromoter(ctx) })
 
 	if w.config.Retention.enabled() {
 		w.logRetentionConfigured()
@@ -875,6 +895,43 @@ func (w *Worker) deleteExpiredConcurrencySlots(ctx context.Context, storage conc
 	_, err := storage.DeleteExpiredConcurrencySlots(ctx, time.Now().UTC())
 	if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 		w.logger.Warn("concurrency slot GC pass failed", "error", err)
+	}
+}
+
+// runReadyPromoter is the wedge-backstop for the dq_ready dequeue hint: it
+// periodically flips dq_ready=true for pending jobs that have become eligible
+// (run_at passed) but are still flagged not-ready — delayed/scheduled jobs
+// reaching their run_at, or any job a write path failed to flag. dq_ready is a
+// pure performance hint (Dequeue still gates on dq_eligible_at <= now), so this
+// loop only ever affects dequeue LATENCY, never correctness; running it
+// per-worker is safe and idempotent. It cannot be disabled because it is the
+// only mechanism that makes a delayed job dequeue-visible.
+func (w *Worker) runReadyPromoter(ctx context.Context) {
+	storage, ok := w.queue.Storage().(readyPromoterStorage)
+	if !ok {
+		if w.readyPromoterStorageMissingLogged.CompareAndSwap(false, true) {
+			w.logger.Warn("storage backend does not support ready promotion; delayed jobs rely on per-write dq_ready flagging only")
+		}
+		return
+	}
+
+	ticker := time.NewTicker(w.config.ReadyPromoteInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			w.promoteReadyJobsOnce(ctx, storage)
+		}
+	}
+}
+
+func (w *Worker) promoteReadyJobsOnce(ctx context.Context, storage readyPromoterStorage) {
+	if _, err := storage.PromoteReadyJobs(ctx); err != nil &&
+		!errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+		w.logger.Warn("ready promotion pass failed", "error", err)
 	}
 }
 

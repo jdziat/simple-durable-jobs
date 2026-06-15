@@ -360,6 +360,106 @@ func TestDequeue_SkipsFutureScheduledJobs(t *testing.T) {
 	assert.Nil(t, got, "future scheduled job should not be dequeued yet")
 }
 
+func TestDQReady_SetOnEnqueue(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	immediate := newTestJob("default", "task.immediate")
+	require.NoError(t, s.Enqueue(ctx, immediate))
+	assert.True(t, immediate.DQReady, "immediate pending job should be dq_ready in memory")
+	immediateRow, err := s.GetJob(ctx, immediate.ID)
+	require.NoError(t, err)
+	require.NotNil(t, immediateRow)
+	assert.True(t, immediateRow.DQReady, "immediate pending job should be dq_ready")
+
+	futureRunAt := time.Now().Add(time.Hour)
+	future := &core.Job{Type: "task.future", Queue: "default", RunAt: &futureRunAt}
+	require.NoError(t, s.Enqueue(ctx, future))
+	assert.False(t, future.DQReady, "future pending job should not be dq_ready in memory")
+	futureRow, err := s.GetJob(ctx, future.ID)
+	require.NoError(t, err)
+	require.NotNil(t, futureRow)
+	assert.False(t, futureRow.DQReady, "future pending job should not be dq_ready")
+}
+
+// dq_ready is transparent to correctness: an eligible job flagged dq_ready=false
+// (a missed write, or a delayed job whose run_at just passed) is SELF-HEALED by
+// Dequeue (promote-on-empty + retry), so it is still claimed without relying on
+// the external promoter loop; a future job stays invisible via the dq_eligible
+// gate. Net behavior matches pre-dq_ready, with the flag only an index hint.
+func TestDQReady_DequeueSelfHealsEligibleUnflagged(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	job := newTestJob("default", "task.eligible-unflagged")
+	require.NoError(t, s.Enqueue(ctx, job))
+	require.NoError(t, s.DB().WithContext(ctx).Model(&core.Job{}).
+		Where("id = ?", job.ID).
+		Update("dq_ready", false).Error)
+
+	got, err := s.Dequeue(ctx, []string{"default"}, "worker-1")
+	require.NoError(t, err)
+	require.NotNil(t, got, "Dequeue must self-heal an eligible-but-unflagged job, not strand it")
+	assert.Equal(t, job.ID, got.ID)
+
+	// A future job (dq_ready=false at enqueue) must NOT be dequeued — the
+	// dq_eligible_at<=now gate blocks it and self-heal won't promote a not-yet-due
+	// job.
+	futureRunAt := time.Now().Add(time.Hour)
+	future := &core.Job{Type: "task.future-unflagged", Queue: "default", RunAt: &futureRunAt}
+	require.NoError(t, s.Enqueue(ctx, future))
+	got, err = s.Dequeue(ctx, []string{"default"}, "worker-2")
+	require.NoError(t, err)
+	assert.Nil(t, got, "a future job must not be dequeued even with self-heal promotion")
+}
+
+func TestPromoteReadyJobs_FlipsDueDelayedJob(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	futureRunAt := time.Now().Add(time.Hour)
+	job := &core.Job{Type: "task.delayed", Queue: "default", RunAt: &futureRunAt}
+	require.NoError(t, s.Enqueue(ctx, job))
+
+	pastRunAt := time.Now().Add(-time.Minute)
+	require.NoError(t, s.DB().WithContext(ctx).Model(&core.Job{}).
+		Where("id = ?", job.ID).
+		Updates(map[string]any{
+			"run_at":   pastRunAt,
+			"dq_ready": false,
+		}).Error)
+
+	promoted, err := s.PromoteReadyJobs(ctx)
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, promoted)
+
+	row, err := s.GetJob(ctx, job.ID)
+	require.NoError(t, err)
+	require.NotNil(t, row)
+	assert.True(t, row.DQReady)
+
+	got, err := s.Dequeue(ctx, []string{"default"}, "worker-1")
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, job.ID, got.ID)
+}
+
+func TestDQReady_CorrectnessNotAffectedByStaleTrue(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	futureRunAt := time.Now().Add(time.Hour)
+	job := &core.Job{Type: "task.future-stale-true", Queue: "default", RunAt: &futureRunAt}
+	require.NoError(t, s.Enqueue(ctx, job))
+	require.NoError(t, s.DB().WithContext(ctx).Model(&core.Job{}).
+		Where("id = ?", job.ID).
+		Update("dq_ready", true).Error)
+
+	got, err := s.Dequeue(ctx, []string{"default"}, "worker-1")
+	require.NoError(t, err)
+	assert.Nil(t, got, "dq_eligible_at/run_at predicate must still prevent early dequeue")
+}
+
 func TestDequeue_PrioritisesHigherPriorityFirst(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStorage(t)
