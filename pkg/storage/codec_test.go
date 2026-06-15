@@ -458,3 +458,52 @@ func TestGormStorageCodecDecodesUIJobReadPaths(t *testing.T) {
 		})
 	}
 }
+
+// ST-01: free-text args search must not error on Postgres (22021) or silently
+// corrupt on MySQL when an encrypting codec stores non-UTF8 ciphertext in args.
+// Under encryption the search is gated to exact job-ID; a free-text term matches
+// nothing rather than erroring or returning unfiltered rows.
+func TestSearchJobs_SecretboxArgsSearchGuarded(t *testing.T) {
+	for name, db := range openCodecTestDBs(t) {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			var key [32]byte
+			for i := range key {
+				key[i] = byte(i + 1)
+			}
+			codec, err := payloadcodec.NewSecretbox(key)
+			require.NoError(t, err)
+			s := NewGormStorage(db, WithCodec(codec))
+			require.NoError(t, s.Migrate(ctx))
+			t.Cleanup(func() { cleanupCodecExternalDB(t, db) })
+
+			job := &core.Job{Type: "secret.job", Queue: "default", Args: []byte(`{"needle":"findme"}`)}
+			require.NoError(t, s.Enqueue(ctx, job))
+			// A second job so the assert-zero below also catches a future "drop the
+			// filter" regression (which would return the unfiltered set of 2), not
+			// only the PG 22021 error — on MySQL the cast silently no-matches, so
+			// row-count is the only signal there.
+			require.NoError(t, s.Enqueue(ctx, &core.Job{Type: "secret.job2", Queue: "default", Args: []byte(`{"needle":"findme"}`)}))
+
+			// Free-text over the (encrypted) args column: must NOT error and must NOT
+			// return unfiltered rows — it returns no rows under encryption.
+			jobs, total, err := s.SearchJobs(ctx, core.JobFilter{Search: "findme", Limit: 10})
+			require.NoError(t, err, "args free-text search under secretbox must not error (PG 22021 / MySQL corruption)")
+			assert.Equal(t, int64(0), total, "free-text args search returns nothing under encryption (not the unfiltered set)")
+			assert.Empty(t, jobs)
+
+			// Sanity: the jobs exist (an unfiltered list returns both), so the zero
+			// above is the guard at work, not an empty table.
+			_, allTotal, err := s.SearchJobs(ctx, core.JobFilter{Limit: 10})
+			require.NoError(t, err)
+			assert.Equal(t, int64(2), allTotal)
+
+			// Exact job-ID search still works under encryption.
+			jobs, total, err = s.SearchJobs(ctx, core.JobFilter{Search: job.ID.String(), Limit: 10})
+			require.NoError(t, err)
+			assert.Equal(t, int64(1), total)
+			require.Len(t, jobs, 1)
+			assert.Equal(t, job.ID, jobs[0].ID)
+		})
+	}
+}

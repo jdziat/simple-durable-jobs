@@ -281,11 +281,35 @@ func applyJobSearch(s *GormStorage, q *gorm.DB, rawSearch string) *gorm.DB {
 	if len(searchTerm) > maxUISearchLength {
 		searchTerm = searchTerm[:maxUISearchLength]
 	}
+	id, idErr := core.ParseUUID(strings.TrimSpace(searchTerm))
+	isUUID := idErr == nil && id != core.NilUUID
+
+	// Free-text args search only works on plaintext payloads. Under an encrypting
+	// codec the args column holds non-UTF8 ciphertext: convert_from(args,'UTF8')
+	// ERRORS on Postgres (22021) and CONVERT(args USING utf8mb4) SILENTLY corrupts
+	// on MySQL. So the args-LIKE branch is gated to the identity codec. Under
+	// encryption the search is limited to an exact job-ID match; a non-UUID term
+	// matches nothing (returning unfiltered rows would misrepresent an explicit
+	// search as "no filter applied" — exact-ID-only is the honest contract).
+	if !s.argsSearchable() {
+		if isUUID {
+			return q.Where("id = ?", id)
+		}
+		return q.Where("1 = 0")
+	}
+
 	argsLike := "%" + escapeLikePattern(searchTerm) + "%"
-	if id, err := core.ParseUUID(strings.TrimSpace(searchTerm)); err == nil && id != core.NilUUID {
+	if isUUID {
 		return q.Where("id = ? OR "+argsTextExpression(s)+" LIKE ? ESCAPE ?", id, argsLike, `\`)
 	}
 	return q.Where(argsTextExpression(s)+" LIKE ? ESCAPE ?", argsLike, `\`)
+}
+
+// argsSearchable reports whether the stored args column holds plaintext that can
+// be safely LIKE-searched. True only for the identity (non-encrypting) codec; an
+// encrypting codec stores non-UTF8 ciphertext that breaks text search.
+func (s *GormStorage) argsSearchable() bool {
+	return s.codec == nil || s.codec == core.IdentityCodec
 }
 
 func argsTextExpression(s *GormStorage) string {
