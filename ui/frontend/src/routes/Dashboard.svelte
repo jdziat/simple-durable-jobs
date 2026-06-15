@@ -194,19 +194,42 @@
     </section>
   {:else}
     <div class="stats-grid">
-      <div class:fail-glow={failedGlow}>
-        <!-- dominant is the only danger gate here; the href carries filtering. -->
-        <MetricCard label="Failed" value={formatNumber(snapshot.totalFailed)} href="#/jobs?status=failed" dominant={snapshot.totalFailed > 0} />
+      <div class="lifecycle-group lifecycle-group-wide">
+        <span class="lifecycle-label">In flight</span>
+        <div class="lifecycle-cards">
+          <MetricCard label="Pending" value={formatNumber(snapshot.totalPending)} status="pending" href="#/jobs?status=pending" />
+          <MetricCard label="Running" value={formatNumber(snapshot.totalRunning)} status="running" href="#/jobs?status=running" />
+          <MetricCard label="Retrying" value={formatNumber(snapshot.totalRetrying)} status="retrying" href="#/jobs?status=retrying" />
+        </div>
       </div>
-      <MetricCard label="Pending" value={formatNumber(snapshot.totalPending)} status="pending" href="#/jobs?status=pending" />
-      <MetricCard label="Running" value={formatNumber(snapshot.totalRunning)} status="running" href="#/jobs?status=running" />
-      <MetricCard label="Completed" value={formatNumber(snapshot.totalCompleted)} status="completed" href="#/jobs?status=completed" />
-      <MetricCard label="Retrying" value={formatNumber(snapshot.totalRetrying)} status="retrying" href="#/jobs?status=retrying" />
-      <MetricCard label="Waiting" value={formatNumber(snapshot.totalWaiting)} status="waiting" href="#/jobs?status=waiting" />
-      <MetricCard label="Paused" value={formatNumber(snapshot.totalPaused)} status="paused" href="#/jobs?status=paused" />
-      <MetricCard label="Cancelled" value={formatNumber(snapshot.totalCancelled)} status="cancelled" href="#/jobs?status=cancelled" />
-      <!-- Distinct workers currently holding running-job locks; idle workers are not counted. -->
-      <MetricCard label="Active workers" value={formatNumber(snapshot.activeWorkers)} />
+
+      <div class="lifecycle-group lifecycle-group-parked">
+        <span class="lifecycle-label">Parked</span>
+        <div class="lifecycle-cards lifecycle-cards-two">
+          <MetricCard label="Waiting" value={formatNumber(snapshot.totalWaiting)} status="waiting" href="#/jobs?status=waiting" />
+          <MetricCard label="Paused" value={formatNumber(snapshot.totalPaused)} status="paused" href="#/jobs?status=paused" />
+        </div>
+      </div>
+
+      <div class="lifecycle-group lifecycle-group-wide">
+        <span class="lifecycle-label">Terminal</span>
+        <div class="lifecycle-cards">
+          <MetricCard label="Completed" value={formatNumber(snapshot.totalCompleted)} status="completed" href="#/jobs?status=completed" />
+          <div class:fail-glow={failedGlow}>
+            <!-- dominant is the only danger gate here; the href carries filtering. -->
+            <MetricCard label="Failed" value={formatNumber(snapshot.totalFailed)} href="#/jobs?status=failed" dominant={snapshot.totalFailed > 0} />
+          </div>
+          <MetricCard label="Cancelled" value={formatNumber(snapshot.totalCancelled)} status="cancelled" href="#/jobs?status=cancelled" />
+        </div>
+      </div>
+
+      <div class="lifecycle-group lifecycle-group-workers">
+        <span class="lifecycle-label">Workers</span>
+        <div class="lifecycle-cards lifecycle-cards-one">
+          <!-- Distinct workers currently holding running-job locks; idle workers are not counted. -->
+          <MetricCard label="Active workers" value={formatNumber(snapshot.activeWorkers)} />
+        </div>
+      </div>
     </div>
 
     <div class="ops-row" aria-label="Operational numbers">
@@ -319,8 +342,45 @@
     gap: var(--sp-3);
   }
 
-  .stats-grid > :first-child {
+  .stats-grid > *,
+  .lifecycle-cards > * {
     min-width: 0;
+  }
+
+  .lifecycle-group {
+    display: grid;
+    gap: var(--sp-2);
+    min-width: 0;
+  }
+
+  .lifecycle-group-wide {
+    grid-column: 1 / -1;
+  }
+
+  .lifecycle-group-parked {
+    grid-column: span 2;
+  }
+
+  .lifecycle-label {
+    color: var(--fg-secondary);
+    font-size: var(--fs-micro);
+    font-weight: var(--fw-label);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+
+  .lifecycle-cards {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: var(--sp-3);
+  }
+
+  .lifecycle-cards-two {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .lifecycle-cards-one {
+    grid-template-columns: 1fr;
   }
 
   .ops-row {
@@ -543,6 +603,16 @@
   }
 
   @media (max-width: 1180px) {
+    .stats-grid {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .lifecycle-group-wide,
+    .lifecycle-group-parked,
+    .lifecycle-group-workers {
+      grid-column: 1 / -1;
+    }
+
     .ops-row {
       grid-template-columns: repeat(2, minmax(0, 1fr));
     }
@@ -550,6 +620,8 @@
 
   @media (max-width: 760px) {
     .stats-grid,
+    .lifecycle-cards,
+    .lifecycle-cards-two,
     .ops-row {
       grid-template-columns: 1fr;
     }
