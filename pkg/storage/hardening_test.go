@@ -2,14 +2,20 @@ package storage
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
+	"os"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/driver/mysql"
+	"gorm.io/driver/postgres"
+	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
 
 	"github.com/jdziat/simple-durable-jobs/v3/pkg/core"
 )
@@ -90,7 +96,7 @@ func TestRunMigrations_ConcurrentSafe(t *testing.T) {
 
 	var versions []int
 	require.NoError(t, s.db.Model(&core.SchemaMigration{}).Order("version").Pluck("version", &versions).Error)
-	assert.Equal(t, []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30}, versions, "every migration recorded exactly once")
+	assert.Equal(t, []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31}, versions, "every migration recorded exactly once")
 	assert.False(t, s.db.Migrator().HasIndex(&core.Job{}, "idx_jobs_dequeue"), "redundant dequeue index absent after v12")
 
 	// Pathological single-connection pool must not deadlock (lock + work share
@@ -107,6 +113,165 @@ func TestRunMigrations_ConcurrentSafe(t *testing.T) {
 	case <-time.After(30 * time.Second):
 		t.Fatal("Migrate deadlocked at MaxOpenConns=1")
 	}
+}
+
+func TestForbidNullFanOutCountersMigration(t *testing.T) {
+	if os.Getenv("TEST_DATABASE_URL") == "" && os.Getenv("TEST_MYSQL_URL") == "" {
+		t.Skip("TEST_DATABASE_URL/TEST_MYSQL_URL not set")
+	}
+
+	if dsn := os.Getenv("TEST_DATABASE_URL"); dsn != "" {
+		t.Run("postgres", func(t *testing.T) {
+			schemaName := uniqueSchemaAssertionsName("fanout_counters")
+
+			adminDB, err := gorm.Open(postgres.Open(dsn), &gorm.Config{
+				Logger: logger.Default.LogMode(logger.Silent),
+			})
+			require.NoError(t, err, "open postgres test db")
+			closeDBOnCleanup(t, adminDB)
+			require.NoError(t, adminDB.Exec("CREATE SCHEMA "+quotePostgresIdent(schemaName)).Error)
+			t.Cleanup(func() {
+				require.NoError(t, adminDB.Exec("DROP SCHEMA IF EXISTS "+quotePostgresIdent(schemaName)+" CASCADE").Error)
+			})
+
+			db, err := gorm.Open(postgres.Open(postgresDSNWithSearchPath(t, dsn, schemaName)), &gorm.Config{
+				Logger: logger.Default.LogMode(logger.Silent),
+			})
+			require.NoError(t, err, "open isolated postgres schema")
+			closeDBOnCleanup(t, db)
+
+			requireForbidNullFanOutCountersMigration(t, NewGormStorage(db), db, dialectPostgres)
+		})
+	}
+
+	if dsn := os.Getenv("TEST_MYSQL_URL"); dsn != "" {
+		t.Run("mysql", func(t *testing.T) {
+			databaseName := uniqueSchemaAssertionsName("fanout_counters")
+
+			adminDB, err := gorm.Open(mysql.Open(dsn), &gorm.Config{
+				Logger: logger.Default.LogMode(logger.Silent),
+			})
+			require.NoError(t, err, "open mysql test db")
+			closeDBOnCleanup(t, adminDB)
+			require.NoError(t, adminDB.Exec("CREATE DATABASE "+quoteMySQLIdent(databaseName)).Error)
+			t.Cleanup(func() {
+				require.NoError(t, adminDB.Exec("DROP DATABASE IF EXISTS "+quoteMySQLIdent(databaseName)).Error)
+			})
+
+			db, err := gorm.Open(mysql.Open(mysqlDSNWithDatabase(t, dsn, databaseName)), &gorm.Config{
+				Logger: logger.Default.LogMode(logger.Silent),
+			})
+			require.NoError(t, err, "open isolated mysql database")
+			closeDBOnCleanup(t, db)
+
+			requireForbidNullFanOutCountersMigration(t, NewGormStorage(db), db, dialectMySQL)
+		})
+	}
+}
+
+func requireForbidNullFanOutCountersMigration(t *testing.T, s *GormStorage, db *gorm.DB, dialect string) {
+	t.Helper()
+	ctx := context.Background()
+	require.NoError(t, s.Migrate(ctx))
+	require.NoError(t, s.Migrate(ctx), "second Migrate must be idempotent")
+
+	require.NoError(t, insertFanOutIndexCheckJob(ctx, db, schemaCheckID("fanout-index-zero"), 0))
+	require.NoError(t, insertFanOutCounterCheckFanOut(ctx, db,
+		schemaCheckID("counter-parent-valid"), schemaCheckID("counter-valid"), 2, 1, 0, 1,
+	))
+
+	require.Error(t, insertFanOutIndexCheckJob(ctx, db, schemaCheckID("fanout-index-null"), nil), "NULL fan_out_index must be rejected")
+	require.Error(t, insertFanOutCounterCheckFanOut(ctx, db,
+		schemaCheckID("counter-parent-null"), schemaCheckID("counter-null"), 1, nil, 0, 0,
+	), "NULL fan-out counter must be rejected")
+
+	require.NoError(t, dropFanOutCounterNullChecks(ctx, db, dialect))
+	require.NoError(t, db.WithContext(ctx).Delete(&core.SchemaMigration{}, "version = ?", 31).Error)
+
+	precleanJobID := schemaCheckID("fanout-index-preclean")
+	precleanFanOutID := schemaCheckID("counter-preclean")
+	require.NoError(t, insertFanOutIndexCheckJob(ctx, db, precleanJobID, nil))
+	require.NoError(t, insertFanOutCounterCheckFanOut(ctx, db,
+		schemaCheckID("counter-parent-preclean"), precleanFanOutID, 3, nil, nil, nil,
+	))
+
+	require.NoError(t, s.Migrate(ctx), "v31 must pre-clean NULL counters before adding CHECK constraints")
+
+	var fanOutIndex sql.NullInt64
+	require.NoError(t, db.WithContext(ctx).Raw(
+		"SELECT fan_out_index FROM jobs WHERE id = ?", precleanJobID,
+	).Scan(&fanOutIndex).Error)
+	require.True(t, fanOutIndex.Valid)
+	require.Equal(t, int64(0), fanOutIndex.Int64)
+
+	var counts struct {
+		Completed sql.NullInt64
+		Failed    sql.NullInt64
+		Cancelled sql.NullInt64
+	}
+	require.NoError(t, db.WithContext(ctx).Raw(`
+		SELECT completed_count AS completed,
+		       failed_count AS failed,
+		       cancelled_count AS cancelled
+		FROM fan_outs
+		WHERE id = ?
+	`, precleanFanOutID).Scan(&counts).Error)
+	require.True(t, counts.Completed.Valid)
+	require.True(t, counts.Failed.Valid)
+	require.True(t, counts.Cancelled.Valid)
+	require.Equal(t, int64(0), counts.Completed.Int64)
+	require.Equal(t, int64(0), counts.Failed.Int64)
+	require.Equal(t, int64(0), counts.Cancelled.Int64)
+}
+
+func insertFanOutIndexCheckJob(ctx context.Context, db *gorm.DB, id core.UUID, fanOutIndex any) error {
+	return db.WithContext(ctx).Exec(`
+		INSERT INTO jobs (id, type, status, queue, priority, attempt, max_retries, timeout, determinism, fan_out_index)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, id, "schema.fan_out_index", core.StatusPending, "default", 0, 0, 3, 0, 0, fanOutIndex).Error
+}
+
+func insertFanOutCounterCheckFanOut(
+	ctx context.Context,
+	db *gorm.DB,
+	parentID core.UUID,
+	fanOutID core.UUID,
+	totalCount int,
+	completedCount any,
+	failedCount any,
+	cancelledCount any,
+) error {
+	if err := insertFanOutIndexCheckJob(ctx, db, parentID, 0); err != nil {
+		return err
+	}
+	return db.WithContext(ctx).Exec(`
+		INSERT INTO fan_outs (
+			id, parent_job_id, total_count, completed_count, failed_count, cancelled_count, strategy, status
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+	`, fanOutID, parentID, totalCount, completedCount, failedCount, cancelledCount, core.StrategyFailFast, core.FanOutPending).Error
+}
+
+func dropFanOutCounterNullChecks(ctx context.Context, db *gorm.DB, dialect string) error {
+	checks := []struct {
+		table string
+		name  string
+	}{
+		{table: "jobs", name: "chk_jobs_fan_out_index_not_null"},
+		{table: "fan_outs", name: "chk_fan_outs_counts_not_null"},
+	}
+	for _, check := range checks {
+		var err error
+		switch dialect {
+		case dialectPostgres:
+			err = db.WithContext(ctx).Exec("ALTER TABLE " + check.table + " DROP CONSTRAINT IF EXISTS " + check.name).Error
+		case dialectMySQL:
+			err = db.WithContext(ctx).Exec("ALTER TABLE " + check.table + " DROP CHECK " + check.name).Error
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // TestRequeue_FanOutHandling verifies Requeue's fan-out rules: a sub-job is
