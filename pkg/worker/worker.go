@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"net/http"
 	"runtime/debug"
 	"sort"
@@ -915,17 +916,37 @@ func (w *Worker) runReadyPromoter(ctx context.Context) {
 		return
 	}
 
-	ticker := time.NewTicker(w.config.ReadyPromoteInterval)
-	defer ticker.Stop()
-
+	base := w.config.ReadyPromoteInterval
 	for {
+		// ±10% per-worker jitter so a fleet of workers doesn't fire the promotion
+		// UPDATE in lockstep and contend on the same newly-eligible rows every
+		// tick. The promoter is already capped + SKIP LOCKED, but staggering
+		// further reduces herd contention under a thundering-herd schedule.
+		d := base
+		if base > 0 {
+			d = base + readyPromoteJitter(base)
+			if d <= 0 {
+				d = base
+			}
+		}
+		timer := time.NewTimer(d)
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			return
-		case <-ticker.C:
+		case <-timer.C:
 			w.promoteReadyJobsOnce(ctx, storage)
 		}
 	}
+}
+
+// readyPromoteJitter returns a uniform offset in [-base/10, +base/10].
+func readyPromoteJitter(base time.Duration) time.Duration {
+	span := int64(base / 5) // 20% of base, centered → ±10%
+	if span <= 0 {
+		return 0
+	}
+	return time.Duration(rand.Int64N(span+1) - span/2)
 }
 
 func (w *Worker) promoteReadyJobsOnce(ctx context.Context, storage readyPromoterStorage) {

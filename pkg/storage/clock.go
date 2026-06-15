@@ -126,19 +126,46 @@ func (s *GormStorage) PromoteReadyJobs(ctx context.Context) (int64, error) {
 		now = time.Now()
 	}
 	silentDB := s.db.Session(&gorm.Session{Logger: s.db.Logger.LogMode(logger.Silent)})
-	result := silentDB.WithContext(ctx).
-		Model(&core.Job{}).
-		Where("status = ?", core.StatusPending).
-		Where("dq_ready = ?", false).
-		Where("(run_at IS NULL OR run_at <= ?)", now).
-		Updates(map[string]any{
-			"dq_ready":   true,
-			"updated_at": now,
+
+	// Two-step capped pass, mirroring ReleaseStaleLocks: pluck up to
+	// maxResumeBatch eligible-but-unready ids under FOR UPDATE SKIP LOCKED, then
+	// UPDATE that frozen set. This avoids `UPDATE ... LIMIT` (unsupported on
+	// Postgres) and bounds each tick to maxResumeBatch rows so a thundering herd
+	// of simultaneously-eligible jobs cannot make every worker rewrite the whole
+	// backlog in one statement. SKIP LOCKED lets concurrent promoters/dequeuers
+	// partition the work. Any overflow is promoted on the next tick (or a dequeue
+	// self-heal), which is safe because dq_ready is only a hint — Dequeue still
+	// gates on dq_eligible_at <= now.
+	var promoted []core.UUID
+	err := s.withSerializationRetry(ctx, func() error {
+		promoted = nil
+		return silentDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			q := tx.Model(&core.Job{}).
+				Where("status = ?", core.StatusPending).
+				Where("dq_ready = ?", false).
+				Where("(run_at IS NULL OR run_at <= ?)", now).
+				Limit(maxResumeBatch)
+			q = s.lockForUpdate(q, true)
+			if err := q.Pluck("id", &promoted).Error; err != nil {
+				return err
+			}
+			if len(promoted) == 0 {
+				return nil
+			}
+			return tx.Model(&core.Job{}).
+				Where("id IN ?", promoted).
+				Where("status = ?", core.StatusPending).
+				Where("dq_ready = ?", false).
+				Updates(map[string]any{
+					"dq_ready":   true,
+					"updated_at": now,
+				}).Error
 		})
-	if result.Error != nil {
-		return 0, result.Error
+	})
+	if err != nil {
+		return 0, err
 	}
-	return result.RowsAffected, nil
+	return int64(len(promoted)), nil
 }
 
 // offsetExpr returns a SQL expression for (DB now + d). A negative d yields a
