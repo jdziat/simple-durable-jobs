@@ -53,7 +53,11 @@ func (s *GormStorage) enqueueWithUniqueLockDB(ctx context.Context, db *gorm.DB, 
 	if err != nil {
 		return core.NilUUID, err
 	}
+	dqReadyFalseIDs, dqReadyFalseRefs := dqReadyFalseJobs([]*core.Job{job})
 	if err := db.WithContext(ctx).Create(row).Error; err != nil {
+		return core.NilUUID, err
+	}
+	if err := restoreDQReadyFalse(db.WithContext(ctx), dqReadyFalseIDs, dqReadyFalseRefs); err != nil {
 		return core.NilUUID, err
 	}
 	return job.ID, nil

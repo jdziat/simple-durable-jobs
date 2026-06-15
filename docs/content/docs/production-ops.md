@@ -199,20 +199,38 @@ eligibility key (`COALESCE(run_at, created_at)`):
 - **PostgreSQL / SQLite** — partial index on
   `(priority DESC, COALESCE(run_at, created_at), queue) WHERE status = 'pending'`.
   Terminal rows are excluded from the index entirely.
-- **MySQL** — `(status, priority DESC, dq_eligible_at, queue)`, where
-  `dq_eligible_at` is a `STORED` generated column
+- **MySQL** — `dq_eligible_at` is a `STORED` generated column
   `IF(status = 'pending', COALESCE(run_at, created_at), NULL)`. MySQL has no
-  partial indexes, so `status` leads the index as an equality (and the generated
-  column is `NULL` for non-pending rows). Leading with the `status` equality
-  followed by the `ORDER BY` keys lets the planner serve the dequeue **without a
-  filesort**.
+  partial indexes, so `status` leads the index as an equality. A single
+  index cannot both range-prune eligibility *and* provide the `priority DESC`
+  order, so a large steady-state **ready** backlog used to filesort. The
+  dequeue now also filters a stored `dq_ready` boolean (see below) and is served
+  by `idx_jobs_dq_ready (status, dq_ready, priority DESC, dq_eligible_at, queue)`:
+  equality on `(status, dq_ready)` then the index's own priority order — **no
+  filesort**, the claim reads one row and stops.
 
 This replaces the earlier `idx_jobs_dequeue` / `idx_jobs_dequeue_order` indexes,
-which were dropped: they could not serve delayed jobs, and on MySQL a
-range-leading variant forced a full pending-scan with `Using filesort`. The
-multi-backend CI suite EXPLAINs the real dequeue query on PostgreSQL and MySQL
-and fails the build on a `Sort` / `Using filesort` plan or the wrong index, so a
-future column-order regression cannot ship.
+which were dropped: they could not serve delayed jobs. The multi-backend CI suite
+EXPLAINs the real dequeue query on PostgreSQL and MySQL and fails the build on a
+`Sort` / `Using filesort` plan or the wrong index, so a future column-order
+regression cannot ship.
+
+### The `dq_ready` hint and the ready-promoter
+
+`dq_ready` is a stored boolean meaning "pending and eligible to run *now*"
+(`run_at` is null or in the past). It is a **pure performance hint** that lets
+MySQL separate ready from not-yet-due jobs in the index — Dequeue still filters
+`dq_eligible_at <= now`, so a stale flag can never cause an incorrect or early
+dequeue; it can only cost latency. Readiness depends on wall-clock time, which a
+generated column cannot express, so each worker runs a small **ready-promoter**
+loop (`WithReadyPromoteInterval`, default = the poll interval) that flips
+`dq_ready` true for pending jobs whose `run_at` has passed. It is the backstop
+that makes a delayed/scheduled job dequeue-visible, so it always runs and cannot
+be disabled; it is idempotent and bounded (PostgreSQL/SQLite use the partial
+index `idx_jobs_dq_unready`; MySQL uses the `(status, dq_ready)` prefix of
+`idx_jobs_dq_ready`), so it scans only the not-yet-eligible set, never the whole
+ready backlog. The chaos suite's `INV-READY-NO-STUCK` invariant asserts no
+eligible job is ever left unready.
 
 ## Schema Migrations At Scale
 

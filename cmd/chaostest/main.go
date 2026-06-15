@@ -533,6 +533,7 @@ func runCheck(ctx context.Context, a *app) error {
 		checkExactlyOnce(ctx, a.db),
 		checkAtLeastOnceWindow(ctx, a.db),
 		checkNoWedge(ctx, a.db),
+		checkReadyNoStuck(ctx, a.db),
 		checkFanOutCounts(ctx, a.db),
 		checkUnique(ctx, a.db),
 		checkUniqueWindowed(ctx, a.db),
@@ -633,6 +634,23 @@ func checkNoWedge(ctx context.Context, db *gorm.DB) invariant {
 		level:  "HARD",
 		pass:   waiting == 0 && running == 0,
 		detail: fmt.Sprintf("waiting=%d running=%d", waiting, running),
+	}
+}
+
+// checkReadyNoStuck asserts the dq_ready promoter backstop left no pending job
+// eligible-to-run-now but still flagged dq_ready=false. Such a row is invisible
+// to Dequeue (which requires dq_ready=true) — a latent wedge the per-worker
+// promoter must heal. run_at IS NULL OR run_at <= now is the eligibility test.
+func checkReadyNoStuck(ctx context.Context, db *gorm.DB) invariant {
+	var stuck int64
+	db.WithContext(ctx).Raw(
+		`SELECT count(*) FROM jobs WHERE status = 'pending' AND dq_ready = ? AND (run_at IS NULL OR run_at <= ?)`,
+		false, time.Now()).Scan(&stuck)
+	return invariant{
+		name:   "INV-READY-NO-STUCK",
+		level:  "HARD",
+		pass:   stuck == 0,
+		detail: fmt.Sprintf("eligible_but_unready=%d", stuck),
 	}
 }
 

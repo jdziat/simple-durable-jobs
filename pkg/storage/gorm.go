@@ -392,8 +392,13 @@ func (s *GormStorage) Enqueue(ctx context.Context, job *core.Job) error {
 	}
 	db := s.db.WithContext(ctx)
 	if job.UniqueKey == "" {
-		return db.Create(row).Error
+		dqReadyFalseIDs, dqReadyFalseRefs := dqReadyFalseJobs([]*core.Job{job})
+		if err := db.Create(row).Error; err != nil {
+			return err
+		}
+		return restoreDQReadyFalse(db, dqReadyFalseIDs, dqReadyFalseRefs)
 	}
+	dqReadyFalseIDs, dqReadyFalseRefs := dqReadyFalseJobs([]*core.Job{job})
 	result := db.Clauses(clause.OnConflict{DoNothing: true}).Create(row)
 	if result.Error != nil {
 		return result.Error
@@ -401,7 +406,7 @@ func (s *GormStorage) Enqueue(ctx context.Context, job *core.Job) error {
 	if result.RowsAffected == 0 {
 		return core.ErrDuplicateJob
 	}
-	return nil
+	return restoreDQReadyFalse(db, dqReadyFalseIDs, dqReadyFalseRefs)
 }
 
 // withSerializationRetry runs fn and retries it on transient serialization
@@ -524,6 +529,7 @@ func (s *GormStorage) EnqueueUnique(ctx context.Context, job *core.Job, uniqueKe
 			if err != nil {
 				return err
 			}
+			dqReadyFalseIDs, dqReadyFalseRefs := dqReadyFalseJobs([]*core.Job{job})
 			result := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(row)
 			if result.Error != nil {
 				return result.Error
@@ -531,7 +537,7 @@ func (s *GormStorage) EnqueueUnique(ctx context.Context, job *core.Job, uniqueKe
 			if uniqueKey != "" && result.RowsAffected == 0 {
 				return core.ErrDuplicateJob
 			}
-			return nil
+			return restoreDQReadyFalse(tx, dqReadyFalseIDs, dqReadyFalseRefs)
 		})
 	})
 }
@@ -539,7 +545,25 @@ func (s *GormStorage) EnqueueUnique(ctx context.Context, job *core.Job, uniqueKe
 // Dequeue fetches and locks the next available job.
 // Uses FOR UPDATE SKIP LOCKED to prevent multiple workers from selecting the same job.
 // For SQLite, uses optimistic locking with atomic update (suitable for dev/testing).
+// Dequeue claims the highest-priority eligible job. It is self-healing: if the
+// first claim finds nothing, it promotes any pending job that has become
+// eligible (run_at passed) but is still flagged dq_ready=false and retries once.
+// This keeps dequeue correctness independent of the external ready-promoter loop
+// — a storage wrapper that hides the promoter capability, or any window before
+// the loop's next tick, can never leave an eligible job permanently invisible.
 func (s *GormStorage) Dequeue(ctx context.Context, queues []string, workerID string) (*core.Job, error) {
+	job, err := s.dequeueOnce(ctx, queues, workerID)
+	if err != nil || job != nil {
+		return job, err
+	}
+	promoted, perr := s.PromoteReadyJobs(ctx)
+	if perr != nil || promoted == 0 {
+		return nil, nil
+	}
+	return s.dequeueOnce(ctx, queues, workerID)
+}
+
+func (s *GormStorage) dequeueOnce(ctx context.Context, queues []string, workerID string) (*core.Job, error) {
 	var job core.Job
 	now := time.Now()
 	lockDuration := time.Duration(s.lockDuration.Load())
@@ -776,6 +800,7 @@ func (s *GormStorage) Fail(ctx context.Context, jobID core.UUID, workerID string
 		return err
 	}
 
+	now := time.Now()
 	updates := map[string]any{
 		"last_error":   encErr,
 		"locked_by":    "",
@@ -785,9 +810,12 @@ func (s *GormStorage) Fail(ctx context.Context, jobID core.UUID, workerID string
 	if retryAt != nil {
 		updates["status"] = core.StatusPending
 		updates["run_at"] = retryAt
+		// retryAt is non-nil in this branch, so readiness is simply retryAt<=now.
+		// Compute it in Go: a bound "? IS NULL" parameter has no inferable type on
+		// Postgres (SQLSTATE 42P18), and a map Update writes an explicit bool fine.
+		updates["dq_ready"] = !retryAt.After(now)
 	} else {
 		updates["status"] = core.StatusFailed
-		now := time.Now()
 		updates["completed_at"] = now
 		updates["dead_lettered_at"] = now
 		// Label stays plaintext (fixed, non-PII); only the error suffix is
@@ -1181,6 +1209,7 @@ func (s *GormStorage) Heartbeat(ctx context.Context, jobID core.UUID, workerID s
 // Release returns an owned, still-running job to pending so it can be
 // immediately dequeued by another worker after a local dispatch is abandoned.
 func (s *GormStorage) Release(ctx context.Context, jobID core.UUID, workerID string) error {
+	now := time.Now()
 	result := s.db.WithContext(ctx).
 		Model(&core.Job{}).
 		Where("id = ? AND locked_by = ? AND status = ?", jobID, workerID, core.StatusRunning).
@@ -1190,7 +1219,8 @@ func (s *GormStorage) Release(ctx context.Context, jobID core.UUID, workerID str
 			"locked_until": nil,
 			"started_at":   nil,
 			"attempt":      gorm.Expr("CASE WHEN attempt > 0 THEN attempt - 1 ELSE 0 END"),
-			"updated_at":   time.Now(),
+			"dq_ready":     s.dqReadyExpr(now),
+			"updated_at":   now,
 		})
 	if result.Error != nil {
 		return result.Error
@@ -1272,11 +1302,14 @@ func (s *GormStorage) ReleaseStaleLocks(ctx context.Context, staleDuration time.
 	// DB-written timestamp is exactly the skew bug this avoids: a reaper whose
 	// wall clock ran ahead would otherwise reclaim a lock that is still live on
 	// the owning worker.
-	var cutoff any
+	var now, cutoff any
 	if s.useDBClock() {
+		now = s.nowExpr()
 		cutoff = s.offsetExpr(-staleDuration)
 	} else {
-		cutoff = time.Now().Add(-staleDuration)
+		nowTime := time.Now()
+		now = nowTime
+		cutoff = nowTime.Add(-staleDuration)
 	}
 
 	// Two-step: first capture the IDs of stale jobs, then update them in
@@ -1314,6 +1347,7 @@ func (s *GormStorage) ReleaseStaleLocks(ctx context.Context, staleDuration time.
 					"status":       core.StatusPending,
 					"locked_by":    "",
 					"locked_until": nil,
+					"dq_ready":     s.dqReadyExpr(now),
 				}).Error
 		})
 	})
@@ -1767,13 +1801,15 @@ func (s *GormStorage) ResumeJob(ctx context.Context, jobID core.UUID) (bool, err
 	// untouched so a delayed job that was paused before its run_at and then
 	// resumed still honors its original schedule. (Signal-waiting jobs use
 	// ResumeSignalWaitingJob instead, which clears the timeout wake deadline.)
+	now := time.Now()
 	result := s.db.WithContext(ctx).
 		Model(&core.Job{}).
 		Where("id = ? AND status IN (?, ?)", jobID, core.StatusWaiting, core.StatusPaused).
 		Updates(map[string]any{
 			"status":     core.StatusPending,
 			"attempt":    gorm.Expr("CASE WHEN attempt > 0 THEN attempt - 1 ELSE 0 END"),
-			"updated_at": time.Now(),
+			"dq_ready":   s.dqReadyExpr(now),
+			"updated_at": now,
 		})
 	if result.Error != nil {
 		return false, result.Error
@@ -1788,6 +1824,7 @@ func (s *GormStorage) ResumeJob(ctx context.Context, jobID core.UUID) (bool, err
 // signal arrives early the resume must not leave a future run_at that would
 // block Dequeue until that deadline. Returns whether a row was resumed.
 func (s *GormStorage) ResumeSignalWaitingJob(ctx context.Context, jobID core.UUID) (bool, error) {
+	now := time.Now()
 	result := s.db.WithContext(ctx).
 		Model(&core.Job{}).
 		Where("id = ? AND status = ?", jobID, core.StatusWaiting).
@@ -1795,7 +1832,8 @@ func (s *GormStorage) ResumeSignalWaitingJob(ctx context.Context, jobID core.UUI
 			"status":     core.StatusPending,
 			"attempt":    gorm.Expr("CASE WHEN attempt > 0 THEN attempt - 1 ELSE 0 END"),
 			"run_at":     nil,
-			"updated_at": time.Now(),
+			"dq_ready":   true,
+			"updated_at": now,
 		})
 	if result.Error != nil {
 		return false, result.Error
@@ -1861,6 +1899,7 @@ func (s *GormStorage) Requeue(ctx context.Context, jobID core.UUID) (bool, error
 					"started_at":         nil,
 					"completed_at":       nil,
 					"run_at":             nil,
+					"dq_ready":           true,
 					"updated_at":         time.Now(),
 				})
 			if result.Error != nil {
@@ -2217,13 +2256,19 @@ func (s *GormStorage) UnpauseJob(ctx context.Context, jobID core.UUID) error {
 				restoreStatus = core.StatusPending
 			}
 
+			now := time.Now()
+			updates := map[string]any{
+				"status":          restoreStatus,
+				"previous_status": "",
+				"updated_at":      now,
+			}
+			if restoreStatus == core.StatusPending {
+				updates["dq_ready"] = s.dqReadyExpr(now)
+			}
+
 			return tx.Model(&core.Job{}).
 				Where("id = ?", jobID).
-				Updates(map[string]any{
-					"status":          restoreStatus,
-					"previous_status": "",
-					"updated_at":      time.Now(),
-				}).Error
+				Updates(updates).Error
 		})
 	})
 }

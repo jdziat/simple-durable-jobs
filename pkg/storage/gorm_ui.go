@@ -355,6 +355,7 @@ func (s *GormStorage) RetryJob(ctx context.Context, jobID core.UUID) (*core.Job,
 		"locked_until":       nil,
 		"started_at":         nil,
 		"completed_at":       nil,
+		"dq_ready":           s.dqReadyExpr(now),
 		"updated_at":         now,
 	}).Error
 	if err != nil {
@@ -370,6 +371,7 @@ func (s *GormStorage) RetryJob(ctx context.Context, jobID core.UUID) (*core.Job,
 	job.LockedUntil = nil
 	job.StartedAt = nil
 	job.CompletedAt = nil
+	job.DQReady = job.RunAt == nil || !job.RunAt.After(now)
 	job.UpdatedAt = now
 	if err := s.decodeJobPayloads(&job); err != nil {
 		return nil, err
