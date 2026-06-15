@@ -1573,6 +1573,58 @@ func TestDequeue_SkipsJobsInPausedQueues(t *testing.T) {
 	assert.Nil(t, got, "should not dequeue from paused queue")
 }
 
+func TestDequeue_PausedQueuePredicateIsFreshAndDoesNotCallGetPausedQueues(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	paused := newTestJob("p", "task.paused")
+	paused.Priority = 100
+	activeFirst := newTestJob("a", "task.active.first")
+	activeFirst.Priority = 10
+	activeSecond := newTestJob("a", "task.active.second")
+	activeSecond.Priority = 9
+
+	require.NoError(t, s.Enqueue(ctx, paused))
+	require.NoError(t, s.Enqueue(ctx, activeFirst))
+	require.NoError(t, s.Enqueue(ctx, activeSecond))
+	require.NoError(t, s.PauseQueue(ctx, "p"))
+
+	getPausedQueuesCalls := 0
+	require.NoError(t, s.db.Callback().Query().After("gorm:query").Register("test:no_get_paused_queues_on_dequeue", func(db *gorm.DB) {
+		sql := strings.ToLower(db.Explain(db.Statement.SQL.String(), db.Statement.Vars...))
+		if strings.HasPrefix(sql, "select * from `queue_states` where paused = true") ||
+			strings.HasPrefix(sql, `select * from "queue_states" where paused = true`) ||
+			strings.HasPrefix(sql, "select * from queue_states where paused = true") {
+			getPausedQueuesCalls++
+		}
+	}))
+	t.Cleanup(func() {
+		require.NoError(t, s.db.Callback().Query().Remove("test:no_get_paused_queues_on_dequeue"))
+	})
+
+	got, err := s.Dequeue(ctx, []string{"p", "a"}, "worker-1")
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, "a", got.Queue)
+	assert.Equal(t, activeFirst.ID, got.ID)
+
+	require.NoError(t, s.PauseQueue(ctx, "a"))
+	got, err = s.Dequeue(ctx, []string{"p", "a"}, "worker-1")
+	require.NoError(t, err)
+	assert.Nil(t, got)
+	assert.Zero(t, getPausedQueuesCalls)
+
+	stillPendingPaused, err := s.GetJob(ctx, paused.ID)
+	require.NoError(t, err)
+	require.NotNil(t, stillPendingPaused)
+	assert.Equal(t, core.StatusPending, stillPendingPaused.Status)
+
+	stillPendingActive, err := s.GetJob(ctx, activeSecond.ID)
+	require.NoError(t, err)
+	require.NotNil(t, stillPendingActive)
+	assert.Equal(t, core.StatusPending, stillPendingActive.Status)
+}
+
 func TestIsQueuePaused_ReturnsFalseForUnknownQueue(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStorage(t)

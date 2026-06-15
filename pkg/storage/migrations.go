@@ -291,6 +291,11 @@ var schemaMigrations = []schemaMigration{
 		Name:    "forbid_zero_uuid_refs",
 		Up:      migrateForbidZeroUUIDRefs,
 	},
+	{
+		Version: 29,
+		Name:    "queue_states_queue_collation_as_cs",
+		Up:      migrateQueueStatesQueueCollation,
+	},
 }
 
 // applyPreMigrations runs every registered pre-AutoMigrate one-shot through a
@@ -1337,6 +1342,27 @@ func migrateForbidZeroUUIDRefs(ctx context.Context, db *gorm.DB, dialect string)
 	}
 }
 
+func migrateQueueStatesQueueCollation(ctx context.Context, db *gorm.DB, dialect string) error {
+	if dialect != dialectMySQL {
+		return nil
+	}
+
+	const collation = "utf8mb4_0900_as_cs"
+	queueCollation, err := mysqlColumnCollationForTable(ctx, db, "queue_states", "queue")
+	if err != nil {
+		return fmt.Errorf("read queue_states.queue collation: %w", err)
+	}
+	if queueCollation == collation {
+		return nil
+	}
+	if err := db.WithContext(ctx).Exec(
+		"ALTER TABLE queue_states MODIFY queue varchar(255) COLLATE utf8mb4_0900_as_cs NOT NULL",
+	).Error; err != nil && !isBenignDDLError(err) {
+		return fmt.Errorf("modify queue_states.queue collation: %w", err)
+	}
+	return nil
+}
+
 func migrateDropRedundantSignalIndex(ctx context.Context, db *gorm.DB, dialect string) error {
 	switch dialect {
 	case dialectMySQL:
@@ -1770,14 +1796,18 @@ func mysqlIndexHasColumn(ctx context.Context, db *gorm.DB, table, index, column 
 }
 
 func mysqlColumnCollation(ctx context.Context, db *gorm.DB, columnName string) (string, error) {
+	return mysqlColumnCollationForTable(ctx, db, "jobs", columnName)
+}
+
+func mysqlColumnCollationForTable(ctx context.Context, db *gorm.DB, tableName, columnName string) (string, error) {
 	var collation sql.NullString
 	if err := db.WithContext(ctx).Raw(`
 		SELECT COLLATION_NAME
 		FROM information_schema.COLUMNS
 		WHERE TABLE_SCHEMA = DATABASE()
-		  AND TABLE_NAME = 'jobs'
+		  AND TABLE_NAME = ?
 		  AND COLUMN_NAME = ?
-	`, columnName).Scan(&collation).Error; err != nil {
+	`, tableName, columnName).Scan(&collation).Error; err != nil {
 		return "", err
 	}
 	if !collation.Valid {

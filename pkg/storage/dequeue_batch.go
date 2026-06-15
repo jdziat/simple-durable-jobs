@@ -54,33 +54,10 @@ func (s *GormStorage) dequeueBatch(ctx context.Context, queues []string, workerI
 		limit = maxDequeueBatch
 	}
 
-	pausedQueues, err := s.GetPausedQueues(ctx)
-	if err != nil {
-		return nil, err
-	}
-	activeQueues := activeQueuesExcludingPaused(queues, pausedQueues)
-	if len(activeQueues) == 0 {
-		return []*core.Job{}, nil
-	}
-
 	if s.isSQLite {
-		return s.dequeueBatchSQLite(ctx, activeQueues, workerID, limit, perQueueBudgets)
+		return s.dequeueBatchSQLite(ctx, queues, workerID, limit, perQueueBudgets)
 	}
-	return s.dequeueBatchLocked(ctx, activeQueues, workerID, limit, perQueueBudgets)
-}
-
-func activeQueuesExcludingPaused(queues, pausedQueues []string) []string {
-	activeQueues := make([]string, 0, len(queues))
-	pausedSet := make(map[string]bool, len(pausedQueues))
-	for _, q := range pausedQueues {
-		pausedSet[q] = true
-	}
-	for _, q := range queues {
-		if !pausedSet[q] {
-			activeQueues = append(activeQueues, q)
-		}
-	}
-	return activeQueues
+	return s.dequeueBatchLocked(ctx, queues, workerID, limit, perQueueBudgets)
 }
 
 func (s *GormStorage) dequeueBatchLocked(ctx context.Context, queues []string, workerID string, limit int, perQueueBudgets map[string]int) ([]*core.Job, error) {
