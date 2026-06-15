@@ -90,7 +90,7 @@ func TestRunMigrations_ConcurrentSafe(t *testing.T) {
 
 	var versions []int
 	require.NoError(t, s.db.Model(&core.SchemaMigration{}).Order("version").Pluck("version", &versions).Error)
-	assert.Equal(t, []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29}, versions, "every migration recorded exactly once")
+	assert.Equal(t, []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30}, versions, "every migration recorded exactly once")
 	assert.False(t, s.db.Migrator().HasIndex(&core.Job{}, "idx_jobs_dequeue"), "redundant dequeue index absent after v12")
 
 	// Pathological single-connection pool must not deadlock (lock + work share

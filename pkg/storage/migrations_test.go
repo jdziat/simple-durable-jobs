@@ -256,12 +256,10 @@ func TestDequeueExplainPlanMySQL(t *testing.T) {
 	joined := strings.Join(plan, "\n")
 	t.Logf("mysql EXPLAIN:\n%s", joined)
 	require.Contains(t, joined, "key=idx_jobs_dequeue_eligible")
-	// P9 reordered the MySQL index to (status, priority DESC, dq_eligible_at, queue):
-	// status='pending' is now a leading equality, so the access type is "ref" (an
-	// equality lookup that returns rows already ordered by priority,dq_eligible_at)
-	// rather than the old "range" seek on a dq_eligible_at-leading index.
-	require.Contains(t, joined, "type=ref")
-	require.NotContains(t, joined, "Using filesort")
+	// v30 orders the MySQL index as (status, dq_eligible_at, priority, queue):
+	// status='pending' is the leading equality and dq_eligible_at<=now() is a
+	// true range bound, pruning to the ready set before a bounded priority sort.
+	require.Contains(t, joined, "type=range")
 
 	jsonRows, err := db.Raw("EXPLAIN FORMAT=JSON "+query.Statement.SQL.String(), query.Statement.Vars...).Rows()
 	require.NoError(t, err, "mysql explain json")

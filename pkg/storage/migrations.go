@@ -296,6 +296,11 @@ var schemaMigrations = []schemaMigration{
 		Name:    "queue_states_queue_collation_as_cs",
 		Up:      migrateQueueStatesQueueCollation,
 	},
+	{
+		Version: 30,
+		Name:    "mysql_dequeue_eligibility_first",
+		Up:      migrateMySQLDequeueEligibilityFirst,
+	},
 }
 
 // applyPreMigrations runs every registered pre-AutoMigrate one-shot through a
@@ -887,6 +892,40 @@ func migrateMySQLDequeueIndexOrder(ctx context.Context, db *gorm.DB, dialect str
 	}
 	if err := db.WithContext(ctx).Exec(
 		"CREATE INDEX idx_jobs_dequeue_eligible ON jobs (status, priority DESC, dq_eligible_at, queue)",
+	).Error; err != nil && !isBenignDDLError(err) {
+		return fmt.Errorf("create idx_jobs_dequeue_eligible: %w", err)
+	}
+	return nil
+}
+
+func migrateMySQLDequeueEligibilityFirst(ctx context.Context, db *gorm.DB, dialect string) error {
+	if dialect != dialectMySQL {
+		return nil
+	}
+
+	var secondColumn sql.NullString
+	if err := db.WithContext(ctx).Raw(`
+		SELECT COLUMN_NAME
+		FROM information_schema.STATISTICS
+		WHERE TABLE_SCHEMA = DATABASE()
+		  AND TABLE_NAME = 'jobs'
+		  AND INDEX_NAME = 'idx_jobs_dequeue_eligible'
+		  AND SEQ_IN_INDEX = 2
+	`).Scan(&secondColumn).Error; err != nil {
+		return fmt.Errorf("read idx_jobs_dequeue_eligible second column: %w", err)
+	}
+	if secondColumn.Valid && strings.EqualFold(secondColumn.String, "dq_eligible_at") {
+		return nil
+	}
+
+	m := db.Migrator()
+	if m.HasIndex(&core.Job{}, "idx_jobs_dequeue_eligible") {
+		if err := m.DropIndex(&core.Job{}, "idx_jobs_dequeue_eligible"); err != nil && !isBenignDDLError(err) {
+			return fmt.Errorf("drop idx_jobs_dequeue_eligible: %w", err)
+		}
+	}
+	if err := db.WithContext(ctx).Exec(
+		"CREATE INDEX idx_jobs_dequeue_eligible ON jobs (status, dq_eligible_at, priority, queue)",
 	).Error; err != nil && !isBenignDDLError(err) {
 		return fmt.Errorf("create idx_jobs_dequeue_eligible: %w", err)
 	}

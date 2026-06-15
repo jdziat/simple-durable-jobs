@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -216,6 +218,7 @@ func TestMySQLSchemaAssertions(t *testing.T) {
 	}
 	require.True(t, mysqlIndexExists(t, db, "idx_jobs_unique_key"), "idx_jobs_unique_key must remain on mysql")
 	require.True(t, mysqlIndexExists(t, db, "idx_jobs_dequeue_eligible"), "idx_jobs_dequeue_eligible must exist on mysql")
+	require.Equal(t, []string{"status", "dq_eligible_at", "priority", "queue"}, mysqlIndexColumns(t, db, "jobs", "idx_jobs_dequeue_eligible"))
 	require.True(t, mysqlIndexExists(t, db, "idx_jobs_retention_terminal"), "idx_jobs_retention_terminal must exist on mysql")
 	require.Equal(t, []string{"status", "completed_at", "id"}, mysqlIndexColumns(t, db, "jobs", "idx_jobs_retention_terminal"))
 	require.True(t, mysqlIndexExists(t, db, "idx_jobs_status_created"), "idx_jobs_status_created must exist on mysql")
@@ -304,7 +307,7 @@ func TestPostgresDequeuePlanUsesEligibleIndex(t *testing.T) {
 	require.NotContains(t, plan, `"Node Type": "Sort"`)
 }
 
-func TestMySQLDequeuePlanUsesEligibleIndexWithoutFilesort(t *testing.T) {
+func TestMySQLDequeuePrunesFutureBacklog(t *testing.T) {
 	dsn := os.Getenv("TEST_MYSQL_URL")
 	if dsn == "" {
 		t.Skip("TEST_MYSQL_URL not set")
@@ -330,18 +333,24 @@ func TestMySQLDequeuePlanUsesEligibleIndexWithoutFilesort(t *testing.T) {
 	ctx := context.Background()
 	s := NewGormStorage(db)
 	require.NoError(t, s.Migrate(ctx))
-	seedDequeuePlanJobs(t, ctx, db)
+	seedMySQLFutureHeavyDequeuePlanJobs(t, ctx, db)
 	analyzeExplainJobs(t, db)
 
-	query := buildSchemaDequeuePlanQuery(s, []string{"default"}, 10)
+	query := buildSchemaDequeuePlanQuery(s, []string{"default"}, dequeuePlanBatchLimit)
 	var plan string
-	require.NoError(t, db.Raw("EXPLAIN FORMAT=JSON "+query.Statement.SQL.String(), query.Statement.Vars...).Scan(&plan).Error)
-	t.Logf("mysql dequeue EXPLAIN JSON:\n%s", plan)
-	require.Contains(t, plan, `"key": "idx_jobs_dequeue_eligible"`)
-	// EXPLAIN FORMAT=JSON always emits the "using_filesort" field; assert it is
-	// false (no filesort), not merely that the substring "filesort" is absent —
-	// the field name itself contains "filesort" even when its value is false.
-	require.NotContains(t, plan, `"using_filesort": true`)
+	require.NoError(t, db.Raw("EXPLAIN ANALYZE "+query.Statement.SQL.String(), query.Statement.Vars...).Scan(&plan).Error)
+	t.Logf("mysql dequeue EXPLAIN ANALYZE tree:\n%s", plan)
+	// The load-bearing guard: the eligibility-first index turns dq_eligible_at<=now()
+	// into an index RANGE SCAN that prunes the future backlog. The old
+	// priority-first order produced an "Index lookup" (ref) that walked the
+	// priority-ordered set filtering eligibility. Assert the range-scan shape
+	// directly — EXPLAIN ANALYZE's reported "rows=N" on the node is RETURNED rows
+	// (capped by LIMIT), so a rows-bound check alone cannot distinguish the orders.
+	require.Contains(t, strings.ToLower(plan), "range scan",
+		"dequeue must range-scan idx_jobs_dequeue_eligible (eligibility-first), not an index lookup over the priority-ordered backlog")
+	rowsExamined := mysqlPlanRowsExaminedForIndex(t, plan, "idx_jobs_dequeue_eligible")
+	require.LessOrEqual(t, rowsExamined, float64(mysqlDequeuePlanReadyRows*2),
+		"dequeue must range-prune to the ready set, not walk the future backlog")
 }
 
 func TestMySQLMigrateRequiresUTCSession(t *testing.T) {
@@ -788,6 +797,12 @@ func buildSchemaDequeuePlanQuery(s *GormStorage, queues []string, limit int) *go
 		Find(&candidates)
 }
 
+const (
+	dequeuePlanBatchLimit      = 10
+	mysqlDequeuePlanFutureRows = 5000
+	mysqlDequeuePlanReadyRows  = 50
+)
+
 func seedDequeuePlanJobs(t *testing.T, ctx context.Context, db *gorm.DB) {
 	t.Helper()
 
@@ -815,6 +830,63 @@ func seedDequeuePlanJobs(t *testing.T, ctx context.Context, db *gorm.DB) {
 		})
 	}
 	require.NoError(t, db.WithContext(ctx).CreateInBatches(jobs, 250).Error)
+}
+
+func seedMySQLFutureHeavyDequeuePlanJobs(t *testing.T, ctx context.Context, db *gorm.DB) {
+	t.Helper()
+
+	now := time.Now().UTC()
+	jobs := make([]*core.Job, 0, mysqlDequeuePlanFutureRows+mysqlDequeuePlanReadyRows)
+	for i := 0; i < mysqlDequeuePlanFutureRows; i++ {
+		createdAt := now.Add(-time.Duration(mysqlDequeuePlanFutureRows+i) * time.Second)
+		runAt := now.Add(24*time.Hour + time.Duration(i)*time.Second)
+		jobs = append(jobs, &core.Job{
+			ID:         core.NewID(),
+			Type:       "explain.dequeue.future",
+			Args:       []byte(`{}`),
+			Queue:      "default",
+			Priority:   1000,
+			Status:     core.StatusPending,
+			MaxRetries: 3,
+			RunAt:      &runAt,
+			CreatedAt:  createdAt,
+			UpdatedAt:  createdAt,
+		})
+	}
+	for i := 0; i < mysqlDequeuePlanReadyRows; i++ {
+		createdAt := now.Add(-time.Duration(mysqlDequeuePlanReadyRows-i) * time.Second)
+		jobs = append(jobs, &core.Job{
+			ID:         core.NewID(),
+			Type:       "explain.dequeue.ready",
+			Args:       []byte(`{}`),
+			Queue:      "default",
+			Priority:   i % 10,
+			Status:     core.StatusPending,
+			MaxRetries: 3,
+			CreatedAt:  createdAt,
+			UpdatedAt:  createdAt,
+		})
+	}
+	require.NoError(t, db.WithContext(ctx).CreateInBatches(jobs, 250).Error)
+}
+
+func mysqlPlanRowsExaminedForIndex(t *testing.T, plan string, indexName string) float64 {
+	t.Helper()
+
+	actualRowsRE := regexp.MustCompile(`actual time=[^)]*\brows=([0-9]+(?:\.[0-9]+)?)\s+loops=`)
+	for _, line := range strings.Split(plan, "\n") {
+		if !strings.Contains(line, indexName) {
+			continue
+		}
+		match := actualRowsRE.FindStringSubmatch(line)
+		require.Len(t, match, 2, "plan must report actual rows for %s:\n%s", indexName, plan)
+		rows, err := strconv.ParseFloat(match[1], 64)
+		require.NoError(t, err, "parse MySQL EXPLAIN ANALYZE rows for %s", indexName)
+		require.Greater(t, rows, 0.0, "plan must report rows examined for %s:\n%s", indexName, plan)
+		return rows
+	}
+	require.Failf(t, "missing index", "plan must use %s:\n%s", indexName, plan)
+	return 0
 }
 
 func postgresDSNWithSearchPath(t *testing.T, dsn, schemaName string) string {
