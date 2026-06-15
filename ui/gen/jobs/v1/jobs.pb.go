@@ -344,6 +344,9 @@ type QueueStats struct {
 	Paused          int64                  `protobuf:"varint,6,opt,name=paused,proto3" json:"paused,omitempty"`
 	IsPaused        bool                   `protobuf:"varint,7,opt,name=is_paused,json=isPaused,proto3" json:"is_paused,omitempty"`
 	OldestPendingAt *timestamppb.Timestamp `protobuf:"bytes,8,opt,name=oldest_pending_at,json=oldestPendingAt,proto3" json:"oldest_pending_at,omitempty"`
+	Retrying        int64                  `protobuf:"varint,9,opt,name=retrying,proto3" json:"retrying,omitempty"`
+	Waiting         int64                  `protobuf:"varint,10,opt,name=waiting,proto3" json:"waiting,omitempty"`
+	Cancelled       int64                  `protobuf:"varint,11,opt,name=cancelled,proto3" json:"cancelled,omitempty"`
 	unknownFields   protoimpl.UnknownFields
 	sizeCache       protoimpl.SizeCache
 }
@@ -432,6 +435,27 @@ func (x *QueueStats) GetOldestPendingAt() *timestamppb.Timestamp {
 		return x.OldestPendingAt
 	}
 	return nil
+}
+
+func (x *QueueStats) GetRetrying() int64 {
+	if x != nil {
+		return x.Retrying
+	}
+	return 0
+}
+
+func (x *QueueStats) GetWaiting() int64 {
+	if x != nil {
+		return x.Waiting
+	}
+	return 0
+}
+
+func (x *QueueStats) GetCancelled() int64 {
+	if x != nil {
+		return x.Cancelled
+	}
+	return 0
 }
 
 type FanOut struct {
@@ -711,6 +735,9 @@ type GetStatsResponse struct {
 	TotalFailed    int64                  `protobuf:"varint,5,opt,name=total_failed,json=totalFailed,proto3" json:"total_failed,omitempty"`
 	ActiveWorkers  int32                  `protobuf:"varint,6,opt,name=active_workers,json=activeWorkers,proto3" json:"active_workers,omitempty"`
 	TotalPaused    int64                  `protobuf:"varint,7,opt,name=total_paused,json=totalPaused,proto3" json:"total_paused,omitempty"`
+	TotalRetrying  int64                  `protobuf:"varint,8,opt,name=total_retrying,json=totalRetrying,proto3" json:"total_retrying,omitempty"`
+	TotalWaiting   int64                  `protobuf:"varint,9,opt,name=total_waiting,json=totalWaiting,proto3" json:"total_waiting,omitempty"`
+	TotalCancelled int64                  `protobuf:"varint,10,opt,name=total_cancelled,json=totalCancelled,proto3" json:"total_cancelled,omitempty"`
 	unknownFields  protoimpl.UnknownFields
 	sizeCache      protoimpl.SizeCache
 }
@@ -790,6 +817,27 @@ func (x *GetStatsResponse) GetActiveWorkers() int32 {
 func (x *GetStatsResponse) GetTotalPaused() int64 {
 	if x != nil {
 		return x.TotalPaused
+	}
+	return 0
+}
+
+func (x *GetStatsResponse) GetTotalRetrying() int64 {
+	if x != nil {
+		return x.TotalRetrying
+	}
+	return 0
+}
+
+func (x *GetStatsResponse) GetTotalWaiting() int64 {
+	if x != nil {
+		return x.TotalWaiting
+	}
+	return 0
+}
+
+func (x *GetStatsResponse) GetTotalCancelled() int64 {
+	if x != nil {
+		return x.TotalCancelled
 	}
 	return 0
 }
@@ -2726,7 +2774,7 @@ const file_jobs_v1_jobs_proto_rawDesc = "" +
 	"\x06result\x18\x05 \x01(\fR\x06result\x12\x14\n" +
 	"\x05error\x18\x06 \x01(\tR\x05error\x129\n" +
 	"\n" +
-	"created_at\x18\a \x01(\v2\x1a.google.protobuf.TimestampR\tcreatedAt\"\x87\x02\n" +
+	"created_at\x18\a \x01(\v2\x1a.google.protobuf.TimestampR\tcreatedAt\"\xdb\x02\n" +
 	"\n" +
 	"QueueStats\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x18\n" +
@@ -2736,7 +2784,11 @@ const file_jobs_v1_jobs_proto_rawDesc = "" +
 	"\x06failed\x18\x05 \x01(\x03R\x06failed\x12\x16\n" +
 	"\x06paused\x18\x06 \x01(\x03R\x06paused\x12\x1b\n" +
 	"\tis_paused\x18\a \x01(\bR\bisPaused\x12F\n" +
-	"\x11oldest_pending_at\x18\b \x01(\v2\x1a.google.protobuf.TimestampR\x0foldestPendingAt\"\xfb\x03\n" +
+	"\x11oldest_pending_at\x18\b \x01(\v2\x1a.google.protobuf.TimestampR\x0foldestPendingAt\x12\x1a\n" +
+	"\bretrying\x18\t \x01(\x03R\bretrying\x12\x18\n" +
+	"\awaiting\x18\n" +
+	" \x01(\x03R\awaiting\x12\x1c\n" +
+	"\tcancelled\x18\v \x01(\x03R\tcancelled\"\xfb\x03\n" +
 	"\x06FanOut\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\"\n" +
 	"\rparent_job_id\x18\x02 \x01(\tR\vparentJobId\x12\x1f\n" +
@@ -2764,7 +2816,7 @@ const file_jobs_v1_jobs_proto_rawDesc = "" +
 	"\x06job_id\x18\x05 \x01(\tR\x05jobId\x12\x1b\n" +
 	"\tworker_id\x18\x06 \x01(\tR\bworkerId\x12\x16\n" +
 	"\x06reason\x18\a \x01(\tR\x06reason\"\x11\n" +
-	"\x0fGetStatsRequest\"\x9f\x02\n" +
+	"\x0fGetStatsRequest\"\x94\x03\n" +
 	"\x10GetStatsResponse\x12+\n" +
 	"\x06queues\x18\x01 \x03(\v2\x13.jobs.v1.QueueStatsR\x06queues\x12#\n" +
 	"\rtotal_pending\x18\x02 \x01(\x03R\ftotalPending\x12#\n" +
@@ -2772,7 +2824,11 @@ const file_jobs_v1_jobs_proto_rawDesc = "" +
 	"\x0ftotal_completed\x18\x04 \x01(\x03R\x0etotalCompleted\x12!\n" +
 	"\ftotal_failed\x18\x05 \x01(\x03R\vtotalFailed\x12%\n" +
 	"\x0eactive_workers\x18\x06 \x01(\x05R\ractiveWorkers\x12!\n" +
-	"\ftotal_paused\x18\a \x01(\x03R\vtotalPaused\"F\n" +
+	"\ftotal_paused\x18\a \x01(\x03R\vtotalPaused\x12%\n" +
+	"\x0etotal_retrying\x18\b \x01(\x03R\rtotalRetrying\x12#\n" +
+	"\rtotal_waiting\x18\t \x01(\x03R\ftotalWaiting\x12'\n" +
+	"\x0ftotal_cancelled\x18\n" +
+	" \x01(\x03R\x0etotalCancelled\"F\n" +
 	"\x16GetStatsHistoryRequest\x12\x16\n" +
 	"\x06period\x18\x01 \x01(\tR\x06period\x12\x14\n" +
 	"\x05queue\x18\x02 \x01(\tR\x05queue\"w\n" +

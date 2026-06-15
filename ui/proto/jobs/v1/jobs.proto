@@ -87,6 +87,9 @@ message QueueStats {
   int64 paused = 6;
   bool is_paused = 7;
   google.protobuf.Timestamp oldest_pending_at = 8;
+  int64 retrying = 9;
+  int64 waiting = 10;
+  int64 cancelled = 11;
 }
 
 message FanOut {
@@ -126,6 +129,9 @@ message GetStatsResponse {
   int64 total_failed = 5;
   int32 active_workers = 6;
   int64 total_paused = 7;
+  int64 total_retrying = 8;
+  int64 total_waiting = 9;
+  int64 total_cancelled = 10;
 }
 
 message GetStatsHistoryRequest {

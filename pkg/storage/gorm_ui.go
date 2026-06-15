@@ -61,6 +61,12 @@ func (s *GormStorage) GetQueueDepthStats(ctx context.Context) ([]*jobsv1.QueueSt
 			qs.Failed += r.Count
 		case core.StatusPaused:
 			qs.Paused += r.Count
+		case core.StatusRetrying:
+			qs.Retrying += r.Count
+		case core.StatusWaiting:
+			qs.Waiting += r.Count
+		case core.StatusCancelled:
+			qs.Cancelled += r.Count
 		}
 	}
 

@@ -29,9 +29,9 @@
 
   let snapshot = $derived(stats.value)
   let topQueues = $derived((snapshot?.queues ?? []).slice().sort(compareQueues).slice(0, 5))
-  let terminalTotal = $derived((snapshot?.totalCompleted ?? 0) + (snapshot?.totalFailed ?? 0))
+  let terminalTotal = $derived((snapshot?.totalCompleted ?? 0) + (snapshot?.totalFailed ?? 0) + (snapshot?.totalCancelled ?? 0))
   let failureRate = $derived(terminalTotal > 0 && snapshot ? (snapshot.totalFailed / terminalTotal) * 100 : 0)
-  let totalBacklog = $derived(snapshot ? snapshot.totalPending + snapshot.totalRunning + snapshot.totalPaused : 0)
+  let totalBacklog = $derived(snapshot ? snapshot.totalPending + snapshot.totalRunning + snapshot.totalPaused + snapshot.totalRetrying + snapshot.totalWaiting : 0)
   let throughputPerMin = $derived(terminalThroughputPerMinute(history, chartPeriod))
   let oldestPendingAt = $derived(oldestDate(Object.values(queueOldestPendingAt)))
 
@@ -68,8 +68,8 @@
   })
 
   function compareQueues(a: QueueStat, b: QueueStat): number {
-    const aBacklog = a.pending + a.running + a.paused
-    const bBacklog = b.pending + b.running + b.paused
+    const aBacklog = a.pending + a.running + a.paused + a.retrying + a.waiting
+    const bBacklog = b.pending + b.running + b.paused + b.retrying + b.waiting
     if (bBacklog !== aBacklog) return bBacklog - aBacklog
     if (b.failed !== a.failed) return b.failed - a.failed
     return a.name.localeCompare(b.name)
@@ -201,7 +201,10 @@
       <MetricCard label="Pending" value={formatNumber(snapshot.totalPending)} status="pending" href="#/jobs?status=pending" />
       <MetricCard label="Running" value={formatNumber(snapshot.totalRunning)} status="running" href="#/jobs?status=running" />
       <MetricCard label="Completed" value={formatNumber(snapshot.totalCompleted)} status="completed" href="#/jobs?status=completed" />
+      <MetricCard label="Retrying" value={formatNumber(snapshot.totalRetrying)} status="retrying" href="#/jobs?status=retrying" />
+      <MetricCard label="Waiting" value={formatNumber(snapshot.totalWaiting)} status="waiting" href="#/jobs?status=waiting" />
       <MetricCard label="Paused" value={formatNumber(snapshot.totalPaused)} status="paused" href="#/jobs?status=paused" />
+      <MetricCard label="Cancelled" value={formatNumber(snapshot.totalCancelled)} status="cancelled" href="#/jobs?status=cancelled" />
       <!-- Distinct workers currently holding running-job locks; idle workers are not counted. -->
       <MetricCard label="Active workers" value={formatNumber(snapshot.activeWorkers)} />
     </div>
@@ -275,7 +278,7 @@
           {#each topQueues as queue}
             <tr class="clickable" onclick={() => openQueue(queue.name)}>
               <td class="queue-name">{queue.name}</td>
-              <td class="num" use:deltaFlash={queue.pending + queue.running + queue.paused}>{formatNumber(queue.pending + queue.running + queue.paused)}</td>
+              <td class="num" use:deltaFlash={queue.pending + queue.running + queue.paused + queue.retrying + queue.waiting}>{formatNumber(queue.pending + queue.running + queue.paused + queue.retrying + queue.waiting)}</td>
               <td
                 class="num failed-cell"
                 class:has-failures={queue.failed > 0}
@@ -312,7 +315,7 @@
 
   .stats-grid {
     display: grid;
-    grid-template-columns: repeat(6, minmax(0, 1fr));
+    grid-template-columns: repeat(3, minmax(0, 1fr));
     gap: var(--sp-3);
   }
 
@@ -540,10 +543,6 @@
   }
 
   @media (max-width: 1180px) {
-    .stats-grid {
-      grid-template-columns: repeat(3, minmax(0, 1fr));
-    }
-
     .ops-row {
       grid-template-columns: repeat(2, minmax(0, 1fr));
     }
