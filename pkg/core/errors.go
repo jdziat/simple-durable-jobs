@@ -51,6 +51,11 @@ var (
 	ErrStorageNoUniqueLocks = errors.New("jobs: storage backend does not support windowed enqueue deduplication")
 	// ErrPayloadDecode wraps codec failures while reading stored payload bytes.
 	ErrPayloadDecode = errors.New("jobs: payload decode failed")
+	// ErrJobHasChildren is returned by DeleteJob when the target is a fan-out
+	// parent (it has sub-jobs). Deleting it directly would strand its children
+	// with dangling parent_job_id/root_job_id/fan_out_id references; use
+	// DeleteWorkflowSubtree to remove the whole workflow instead.
+	ErrJobHasChildren = errors.New("jobs: cannot delete a workflow parent with child jobs; delete the workflow subtree instead")
 )
 
 // WorkflowWaiter is implemented by control-flow errors that tell the worker a

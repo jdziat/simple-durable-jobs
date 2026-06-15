@@ -319,6 +319,133 @@ func TestPurgeJobs_DeletesCheckpoints(t *testing.T) {
 	assert.Equal(t, int64(0), checkpointCount)
 }
 
+// seedFanOutTree creates a fan-out parent with one FanOut row and the given
+// number of sub-jobs (each with parent_job_id/root_job_id/fan_out_id set), plus
+// a checkpoint and a signal on the parent. Returns the parent and sub-job ids.
+func seedFanOutTree(t *testing.T, store *GormStorage, queue string, status core.JobStatus, subCount int) (core.UUID, []core.UUID) {
+	t.Helper()
+	ctx := context.Background()
+	parentID := core.NewID()
+	require.NoError(t, store.Enqueue(ctx, &core.Job{
+		ID: parentID, Type: "workflow", Queue: queue, Status: status,
+		Args: []byte(`{}`), CreatedAt: time.Now(),
+	}))
+	require.NoError(t, store.SaveCheckpoint(ctx, &core.Checkpoint{
+		ID: core.NewID(), JobID: parentID, CallIndex: 0, CallType: "fanout",
+		Result: []byte(`"ok"`), CreatedAt: time.Now(),
+	}))
+	require.NoError(t, store.db.Create(&core.Signal{
+		ID: core.NewID(), JobID: parentID, Name: "go", CreatedAt: time.Now(),
+	}).Error)
+	fanOutID := core.NewID()
+	require.NoError(t, store.CreateFanOut(ctx, &core.FanOut{
+		ID: fanOutID, ParentJobID: parentID, TotalCount: subCount, Status: core.FanOutPending,
+	}))
+	subIDs := make([]core.UUID, 0, subCount)
+	for i := 0; i < subCount; i++ {
+		subID := core.NewID()
+		require.NoError(t, store.Enqueue(ctx, &core.Job{
+			ID: subID, Type: "step", Queue: queue, Status: core.StatusPending,
+			Args: []byte(`{}`), ParentJobID: &parentID, RootJobID: &parentID,
+			FanOutID: &fanOutID, FanOutIndex: i, CreatedAt: time.Now(),
+		}))
+		subIDs = append(subIDs, subID)
+	}
+	return parentID, subIDs
+}
+
+func jobExists(t *testing.T, store *GormStorage, id core.UUID) bool {
+	t.Helper()
+	var n int64
+	require.NoError(t, store.db.Model(&core.Job{}).Where("id = ?", id).Count(&n).Error)
+	return n > 0
+}
+
+// F-001: DeleteJob must refuse to delete a fan-out parent (which would strand its
+// children with dangling parent/root/fan_out refs), and DeleteWorkflowSubtree is
+// the explicit workflow-aware path that removes the whole tree.
+func TestDeleteJob_RejectsFanOutParent(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStorage(t)
+	parentID, subIDs := seedFanOutTree(t, store, "q", core.StatusCompleted, 3)
+
+	err := store.DeleteJob(ctx, parentID)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, core.ErrJobHasChildren)
+
+	// Nothing was deleted — parent and all children survive.
+	assert.True(t, jobExists(t, store, parentID), "parent must survive a rejected delete")
+	for _, id := range subIDs {
+		assert.True(t, jobExists(t, store, id), "child must survive a rejected parent delete")
+	}
+}
+
+func TestDeleteJob_AllowsLeaf(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStorage(t)
+	leaf := &core.Job{
+		ID: core.NewID(), Type: "work", Queue: "q", Status: core.StatusCompleted,
+		Args: []byte(`{}`), CreatedAt: time.Now(),
+	}
+	require.NoError(t, store.Enqueue(ctx, leaf))
+	require.NoError(t, store.DeleteJob(ctx, leaf.ID))
+	assert.False(t, jobExists(t, store, leaf.ID))
+}
+
+func TestDeleteWorkflowSubtree_RemovesWholeTree(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStorage(t)
+	parentID, subIDs := seedFanOutTree(t, store, "q", core.StatusCompleted, 3)
+
+	require.NoError(t, store.DeleteWorkflowSubtree(ctx, parentID))
+
+	assert.False(t, jobExists(t, store, parentID), "root removed")
+	for _, id := range subIDs {
+		assert.False(t, jobExists(t, store, id), "sub-job removed")
+	}
+	var fanOuts, checkpoints, signals int64
+	require.NoError(t, store.db.Model(&core.FanOut{}).Count(&fanOuts).Error)
+	require.NoError(t, store.db.Model(&core.Checkpoint{}).Count(&checkpoints).Error)
+	require.NoError(t, store.db.Model(&core.Signal{}).Count(&signals).Error)
+	assert.Equal(t, int64(0), fanOuts, "fan_outs removed")
+	assert.Equal(t, int64(0), checkpoints, "root + sub checkpoints removed")
+	assert.Equal(t, int64(0), signals, "root + sub signals removed")
+}
+
+// F-001: PurgeJobs must skip fan-out parents (so it can't strand children) while
+// still deleting matching leaf jobs along with their checkpoints AND signals.
+func TestPurgeJobs_SkipsFanOutParentsAndDeletesSignals(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStorage(t)
+
+	// A fan-out parent in the purged status+queue — must be skipped.
+	parentID, _ := seedFanOutTree(t, store, "q", core.StatusCompleted, 2)
+	// A standalone leaf in the same status+queue with a checkpoint + signal.
+	leaf := &core.Job{
+		ID: core.NewID(), Type: "work", Queue: "q", Status: core.StatusCompleted,
+		Args: []byte(`{}`), CreatedAt: time.Now(),
+	}
+	require.NoError(t, store.Enqueue(ctx, leaf))
+	require.NoError(t, store.SaveCheckpoint(ctx, &core.Checkpoint{
+		ID: core.NewID(), JobID: leaf.ID, CallIndex: 0, CallType: "t", Result: []byte(`"x"`), CreatedAt: time.Now(),
+	}))
+	require.NoError(t, store.db.Create(&core.Signal{
+		ID: core.NewID(), JobID: leaf.ID, Name: "s", CreatedAt: time.Now(),
+	}).Error)
+
+	deleted, err := store.PurgeJobs(ctx, "q", core.StatusCompleted)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), deleted, "only the standalone leaf is purged; the fan-out parent is skipped")
+
+	assert.True(t, jobExists(t, store, parentID), "fan-out parent must NOT be purged")
+	assert.False(t, jobExists(t, store, leaf.ID), "standalone leaf is purged")
+
+	// The leaf's signal must be gone (regression: purge previously left signals).
+	var leafSignals int64
+	require.NoError(t, store.db.Model(&core.Signal{}).Where("job_id = ?", leaf.ID).Count(&leafSignals).Error)
+	assert.Equal(t, int64(0), leafSignals, "purge must delete the leaf's signals")
+}
+
 func TestSearchJobs_ClampsOffsetAndLimit(t *testing.T) {
 	ctx := context.Background()
 	store := newUITestStorage(t)
