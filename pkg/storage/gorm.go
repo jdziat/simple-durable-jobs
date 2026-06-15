@@ -602,6 +602,14 @@ func (s *GormStorage) Dequeue(ctx context.Context, queues []string, workerID str
 				"locked_until": lockUntilExpr,
 				"started_at":   nowExpr,
 				"attempt":      job.Attempt + 1,
+				// Clear any prior run's heartbeat on claim. The stale-lock reaper
+				// anchors freshness on COALESCE(last_heartbeat_at, started_at,
+				// locked_until); without this reset a re-dequeued job (durable
+				// sleep/signal resume, or a retry across a gap > StaleLockAge)
+				// keeps the OLD heartbeat as its anchor and is reclaimed while
+				// actively running — a double-execution. NULL falls back to the
+				// freshly-set started_at (this claim), which is correct.
+				"last_heartbeat_at": gorm.Expr("NULL"),
 			}).Error; err != nil {
 			return err
 		}
@@ -661,6 +669,10 @@ func (s *GormStorage) dequeueSQLite(ctx context.Context, queues []string, worker
 				"locked_until": lockUntil,
 				"started_at":   now,
 				"attempt":      job.Attempt + 1,
+				// Clear the prior run's heartbeat on claim so the stale-lock reaper
+				// anchors on this claim's started_at, not a stale heartbeat (CD-01
+				// double-execution). See Dequeue.
+				"last_heartbeat_at": gorm.Expr("NULL"),
 			})
 
 		if updateResult.Error != nil {

@@ -962,6 +962,62 @@ func TestReleaseStaleLocks_NullHeartbeatAndStartedFallsBackToLockedUntil(t *test
 	assert.Equal(t, core.StatusPending, row.Status)
 }
 
+// TestReleaseStaleLocks_ReDequeueClearsPriorHeartbeat is the CD-01 regression:
+// a job that ran, heartbeat, then suspended (durable sleep / signal wait / fan-out)
+// or retried across a gap and was RE-dequeued must not be reclaimed by the
+// stale-lock reaper on account of the PRIOR run's heartbeat. Dequeue must clear
+// last_heartbeat_at on claim so the reaper's COALESCE(last_heartbeat_at,
+// started_at, locked_until) anchors on the fresh claim, not the stale heartbeat.
+// Without the fix this reaped an actively-running re-dequeued job (double-exec).
+func TestReleaseStaleLocks_ReDequeueClearsPriorHeartbeat(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	require.NoError(t, s.Enqueue(ctx, newTestJob("default", "task.run")))
+
+	// Claim 1: the job runs.
+	got, err := s.Dequeue(ctx, []string{"default"}, "worker-1")
+	require.NoError(t, err)
+	require.NotNil(t, got)
+
+	// Simulate "ran + heartbeat 2h ago, then suspended and became re-dequeueable"
+	// (durable Sleep / signal resume / long retry): a STALE prior-run heartbeat
+	// plus the job back to pending. started_at is left at claim 1's value.
+	staleHeartbeat := time.Now().Add(-2 * time.Hour)
+	require.NoError(t, s.db.Model(&core.Job{}).
+		Where("id = ?", got.ID).
+		Updates(map[string]any{
+			"status":            core.StatusPending,
+			"last_heartbeat_at": staleHeartbeat,
+			"locked_by":         "",
+			"locked_until":      nil,
+		}).Error)
+
+	// Claim 2: re-dequeue. The claim must reset last_heartbeat_at (CD-01 fix).
+	got2, err := s.Dequeue(ctx, []string{"default"}, "worker-2")
+	require.NoError(t, err)
+	require.NotNil(t, got2)
+	require.Equal(t, got.ID, got2.ID)
+	// Assert against the DB (the returned struct is stale on the sqlite path):
+	// the claim must have cleared the prior run's heartbeat.
+	reclaimed, err := s.GetJob(ctx, got.ID)
+	require.NoError(t, err)
+	require.Nil(t, reclaimed.LastHeartbeatAt, "re-dequeue must clear the prior run's last_heartbeat_at")
+
+	// The reaper, with a 1h staleness, must NOT reclaim this freshly re-claimed
+	// running job: its freshness anchor is now the claim-2 started_at, not the
+	// 2h-old heartbeat. Without the fix the stale heartbeat wins the COALESCE and
+	// the actively-running job is reclaimed (a double-execution).
+	released, err := s.ReleaseStaleLocks(ctx, time.Hour)
+	require.NoError(t, err)
+	require.NotContains(t, released, got.ID, "must not reclaim a freshly re-dequeued running job via the prior run's heartbeat")
+
+	row, err := s.GetJob(ctx, got.ID)
+	require.NoError(t, err)
+	assert.Equal(t, core.StatusRunning, row.Status, "job must stay running after the reaper pass")
+	assert.Equal(t, "worker-2", row.LockedBy)
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Checkpoints
 // ──────────────────────────────────────────────────────────────────────────────
