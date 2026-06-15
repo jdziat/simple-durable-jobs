@@ -301,6 +301,11 @@ var schemaMigrations = []schemaMigration{
 		Name:    "mysql_dequeue_eligibility_first",
 		Up:      migrateMySQLDequeueEligibilityFirst,
 	},
+	{
+		Version: 31,
+		Name:    "forbid_null_fan_out_counters",
+		Up:      migrateForbidNullFanOutCounters,
+	},
 }
 
 // applyPreMigrations runs every registered pre-AutoMigrate one-shot through a
@@ -1088,6 +1093,11 @@ func migrateIndexingQC1(ctx context.Context, db *gorm.DB, dialect string) error 
 			name string
 			sql  string
 		}{
+			// Keep idx_jobs_status_created: it serves the dashboard
+			// recent-jobs-by-status query (WHERE status=? ORDER BY created_at
+			// DESC) and is not redundant with idx_jobs_retention_terminal,
+			// which orders by completed_at. Do not drop without profiling that
+			// query cold.
 			{
 				name: "idx_jobs_status_created",
 				sql:  "CREATE INDEX idx_jobs_status_created ON jobs (status, created_at DESC)",
@@ -1139,6 +1149,11 @@ func migrateIndexingQC1(ctx context.Context, db *gorm.DB, dialect string) error 
 			name string
 			sql  string
 		}{
+			// Keep idx_jobs_status_created: it serves the dashboard
+			// recent-jobs-by-status query (WHERE status=? ORDER BY created_at
+			// DESC) and is not redundant with idx_jobs_retention_terminal,
+			// which orders by completed_at. Do not drop without profiling that
+			// query cold.
 			{
 				name: "idx_jobs_status_created",
 				sql:  "CREATE INDEX IF NOT EXISTS idx_jobs_status_created ON jobs (status, created_at DESC)",
@@ -1377,6 +1392,106 @@ func migrateForbidZeroUUIDRefs(ctx context.Context, db *gorm.DB, dialect string)
 	default:
 		// CHECK enforcement is on the production engines (Postgres/MySQL);
 		// SQLite dev tables rely on the Go UUID scanner.
+		return nil
+	}
+}
+
+// migrateForbidNullFanOutCounters is migration-only: no gorm check tags, so
+// AutoMigrate never flips these nullable-in-model columns. Postgres adds each
+// CHECK as NOT VALID and then validates it; MySQL applies the equivalent CHECK.
+// SQLite is a no-op because ALTER TABLE ADD CHECK is not supported there.
+func migrateForbidNullFanOutCounters(ctx context.Context, db *gorm.DB, dialect string) error {
+	type checkConstraint struct {
+		model     any
+		table     string
+		name      string
+		pgExpr    string
+		mysqlExpr string
+	}
+
+	constraints := []checkConstraint{
+		{
+			model:     &core.Job{},
+			table:     "jobs",
+			name:      "chk_jobs_fan_out_index_not_null",
+			pgExpr:    "fan_out_index IS NOT NULL",
+			mysqlExpr: "fan_out_index IS NOT NULL",
+		},
+		{
+			model:     &core.FanOut{},
+			table:     "fan_outs",
+			name:      "chk_fan_outs_counts_not_null",
+			pgExpr:    "completed_count IS NOT NULL AND failed_count IS NOT NULL AND cancelled_count IS NOT NULL",
+			mysqlExpr: "completed_count IS NOT NULL AND failed_count IS NOT NULL AND cancelled_count IS NOT NULL",
+		},
+	}
+
+	m := db.Migrator()
+	switch dialect {
+	case dialectPostgres:
+		if err := db.WithContext(ctx).Exec(
+			"UPDATE jobs SET fan_out_index = 0 WHERE fan_out_index IS NULL",
+		).Error; err != nil {
+			return fmt.Errorf("pre-clean jobs.fan_out_index NULLs: %w", err)
+		}
+		if err := db.WithContext(ctx).Exec(`
+			UPDATE fan_outs
+			SET completed_count = 0,
+			    failed_count = 0,
+			    cancelled_count = 0
+			WHERE completed_count IS NULL
+			   OR failed_count IS NULL
+			   OR cancelled_count IS NULL
+		`).Error; err != nil {
+			return fmt.Errorf("pre-clean fan_outs counter NULLs: %w", err)
+		}
+		for _, constraint := range constraints {
+			if m.HasConstraint(constraint.model, constraint.name) {
+				continue
+			}
+			if err := db.WithContext(ctx).Exec(
+				fmt.Sprintf("ALTER TABLE %s ADD CONSTRAINT %s CHECK (%s) NOT VALID", constraint.table, constraint.name, constraint.pgExpr),
+			).Error; err != nil {
+				return fmt.Errorf("add %s: %w", constraint.name, err)
+			}
+			if err := db.WithContext(ctx).Exec(
+				fmt.Sprintf("ALTER TABLE %s VALIDATE CONSTRAINT %s", constraint.table, constraint.name),
+			).Error; err != nil {
+				return fmt.Errorf("validate %s: %w", constraint.name, err)
+			}
+		}
+		return nil
+	case dialectMySQL:
+		if err := db.WithContext(ctx).Exec(
+			"UPDATE jobs SET fan_out_index = 0 WHERE fan_out_index IS NULL",
+		).Error; err != nil {
+			return fmt.Errorf("pre-clean jobs.fan_out_index NULLs: %w", err)
+		}
+		if err := db.WithContext(ctx).Exec(`
+			UPDATE fan_outs
+			SET completed_count = 0,
+			    failed_count = 0,
+			    cancelled_count = 0
+			WHERE completed_count IS NULL
+			   OR failed_count IS NULL
+			   OR cancelled_count IS NULL
+		`).Error; err != nil {
+			return fmt.Errorf("pre-clean fan_outs counter NULLs: %w", err)
+		}
+		for _, constraint := range constraints {
+			if m.HasConstraint(constraint.model, constraint.name) {
+				continue
+			}
+			if err := db.WithContext(ctx).Exec(
+				fmt.Sprintf("ALTER TABLE %s ADD CONSTRAINT %s CHECK (%s)", constraint.table, constraint.name, constraint.mysqlExpr),
+			).Error; err != nil && !isBenignDDLError(err) {
+				return fmt.Errorf("add %s: %w", constraint.name, err)
+			}
+		}
+		return nil
+	default:
+		// CHECK enforcement is on the production engines (Postgres/MySQL);
+		// SQLite dev tables rely on value-typed Go fields.
 		return nil
 	}
 }
@@ -1736,6 +1851,10 @@ func migrateDialectCorrectness(ctx context.Context, db *gorm.DB, dialect string)
 func migrateDLQMetadataIndex(ctx context.Context, db *gorm.DB, dialect string) error {
 	switch dialect {
 	case dialectPostgres:
+		// Intentionally non-partial: the general dashboard SearchJobs tag
+		// filter uses this GIN on non-DLQ jobs via
+		// (NULLIF(metadata,''))::jsonb @> ?, and NULLIF already excludes empty
+		// or NULL metadata rows.
 		if err := db.WithContext(ctx).Exec(
 			"CREATE INDEX IF NOT EXISTS idx_jobs_metadata_gin ON jobs USING GIN ((NULLIF(metadata, '')::jsonb) jsonb_path_ops)",
 		).Error; err != nil {
