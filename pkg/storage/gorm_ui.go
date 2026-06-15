@@ -377,9 +377,22 @@ func (s *GormStorage) RetryJob(ctx context.Context, jobID core.UUID) (*core.Job,
 	return &job, nil
 }
 
-// DeleteJob permanently removes a job from the database.
+// DeleteJob permanently removes a single job from the database. It refuses to
+// delete a fan-out parent (a job that has sub-jobs), returning
+// core.ErrJobHasChildren — deleting a parent directly would strand its children
+// with dangling parent_job_id/root_job_id/fan_out_id references (the FK cascade
+// only covers fan_outs.parent_job_id, not the job self-references, and SQLite has
+// no FKs at all). Use DeleteWorkflowSubtree to remove a whole workflow.
 func (s *GormStorage) DeleteJob(ctx context.Context, jobID core.UUID) error {
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var childFanOuts int64
+		if err := tx.Model(&core.FanOut{}).Where("parent_job_id = ?", jobID).Count(&childFanOuts).Error; err != nil {
+			return err
+		}
+		if childFanOuts > 0 {
+			return fmt.Errorf("%w (job %s)", core.ErrJobHasChildren, jobID)
+		}
+
 		// Delete checkpoints and any buffered signals first
 		if err := tx.Where("job_id = ?", jobID).Delete(&core.Checkpoint{}).Error; err != nil {
 			return err
@@ -391,18 +404,62 @@ func (s *GormStorage) DeleteJob(ctx context.Context, jobID core.UUID) error {
 	})
 }
 
-// PurgeJobs deletes all jobs in a queue matching the given status.
+// DeleteWorkflowSubtree permanently removes the job at rootJobID together with
+// its entire fan-out subtree: every fan-out it spawned at any depth, all of those
+// sub-jobs, and all of their checkpoints/signals. This is the explicit,
+// workflow-aware counterpart to DeleteJob (which refuses to delete a parent), so
+// an operator can remove a whole workflow without orphaning rows. rootJobID may
+// be any node in a workflow; everything at or below it is removed.
+func (s *GormStorage) DeleteWorkflowSubtree(ctx context.Context, rootJobID core.UUID) error {
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// deleteFanOutSubtree removes every descendant (sub-jobs + their
+		// checkpoints/signals) and every fan_outs row whose parent is at or below
+		// rootJobID — including rootJobID's own fan_outs — but it does NOT touch
+		// the root job row itself or the root's own checkpoints/signals.
+		if err := s.deleteFanOutSubtree(tx, rootJobID); err != nil {
+			return err
+		}
+		if err := tx.Where("job_id = ?", rootJobID).Delete(&core.Checkpoint{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("job_id = ?", rootJobID).Delete(&core.Signal{}).Error; err != nil {
+			return err
+		}
+		return tx.Where("id = ?", rootJobID).Delete(&core.Job{}).Error
+	})
+}
+
+// PurgeJobs deletes all jobs in a queue matching the given status, EXCLUDING
+// fan-out parents. A parent is skipped (not deleted) so a bulk purge can never
+// strand its children — a paused/terminal parent may still have children in
+// other states, and the FK cascade does not reach the sub-jobs. Parents must be
+// removed via DeleteWorkflowSubtree. Checkpoints AND signals for the purged
+// (leaf) jobs are deleted too; the returned count is the number of job rows
+// actually removed.
 func (s *GormStorage) PurgeJobs(ctx context.Context, queue string, status core.JobStatus) (int64, error) {
 	var deleted int64
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		matchingJobs := tx.Model(&core.Job{}).Select("id").Where("status = ?", status)
-		deleteJobs := tx.Where("status = ?", status)
+		// Uncorrelated set of all fan-out parent job ids. Matched jobs whose id is
+		// in this set are skipped to avoid orphaning their children.
+		parentIDs := tx.Model(&core.FanOut{}).
+			Distinct("parent_job_id").
+			Where("parent_job_id IS NOT NULL")
+
+		matchingJobs := tx.Model(&core.Job{}).Select("id").
+			Where("status = ?", status).
+			Where("id NOT IN (?)", parentIDs)
+		deleteJobs := tx.Model(&core.Job{}).
+			Where("status = ?", status).
+			Where("id NOT IN (?)", parentIDs)
 		if queue != "" {
 			matchingJobs = matchingJobs.Where("queue = ?", queue)
 			deleteJobs = deleteJobs.Where("queue = ?", queue)
 		}
 
 		if err := tx.Where("job_id IN (?)", matchingJobs).Delete(&core.Checkpoint{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("job_id IN (?)", matchingJobs).Delete(&core.Signal{}).Error; err != nil {
 			return err
 		}
 

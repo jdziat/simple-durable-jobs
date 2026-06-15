@@ -239,6 +239,12 @@ func (s *jobsService) RetryJob(ctx context.Context, req *connect.Request[jobsv1.
 // DeleteJob removes a job.
 func (s *jobsService) DeleteJob(ctx context.Context, req *connect.Request[jobsv1.DeleteJobRequest]) (*connect.Response[jobsv1.DeleteJobResponse], error) {
 	if err := s.deleteJob(ctx, req.Msg.Id); err != nil {
+		// A workflow parent cannot be deleted directly — surface it as a
+		// precondition failure with the actionable message rather than an opaque
+		// internal error.
+		if errors.Is(err, core.ErrJobHasChildren) {
+			return nil, connect.NewError(connect.CodeFailedPrecondition, err)
+		}
 		return nil, connect.NewError(connect.CodeInternal, err)
 	}
 	return connect.NewResponse(&jobsv1.DeleteJobResponse{}), nil
