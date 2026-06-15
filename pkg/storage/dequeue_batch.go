@@ -141,6 +141,10 @@ func (s *GormStorage) dequeueBatchLocked(ctx context.Context, queues []string, w
 							"locked_until": lockUntilExpr,
 							"started_at":   nowExpr,
 							"attempt":      gorm.Expr("attempt + 1"),
+							// Clear the prior run's heartbeat on claim so the stale-lock
+							// reaper anchors on this claim's started_at, not a stale
+							// heartbeat (CD-01 double-execution). See Dequeue.
+							"last_heartbeat_at": gorm.Expr("NULL"),
 						}).Error; err != nil {
 						return err
 					}
@@ -277,6 +281,10 @@ func (s *GormStorage) dequeueBatchSQLite(ctx context.Context, queues []string, w
 						"locked_until": lockUntil,
 						"started_at":   now,
 						"attempt":      job.Attempt + 1,
+						// Clear the prior run's heartbeat on claim so the stale-lock
+						// reaper anchors on this claim's started_at, not a stale
+						// heartbeat (CD-01 double-execution). See Dequeue.
+						"last_heartbeat_at": gorm.Expr("NULL"),
 					})
 				if updateResult.Error != nil {
 					return updateResult.Error
