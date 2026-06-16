@@ -509,11 +509,30 @@ func TestWorkerOptionFunc_ImplementsInterface(t *testing.T) {
 	assert.Equal(t, "custom-id", config.WorkerID)
 }
 
-func TestWorker_Pause(t *testing.T) {
-	// Create a minimal queue for testing
-	db, _ := gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{
+// newInMemoryDB opens a private in-memory SQLite database for ONE test. Each
+// test gets a UNIQUELY-named shared-cache instance, so pooled connections within
+// the test share one schema while different tests never collide on the single
+// process-global "file::memory:?cache=shared" database — which previously let
+// these worker tests read each other's rows (conv F1). The pinned connection is
+// closed on cleanup, dropping the in-memory DB with it.
+func newInMemoryDB(t *testing.T) *gorm.DB {
+	t.Helper()
+	dsn := fmt.Sprintf("file:wt_%s?mode=memory&cache=shared", strings.ReplaceAll(t.Name(), "/", "_"))
+	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{
 		Logger: logger.Default.LogMode(logger.Silent),
 	})
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		if sqlDB, err := db.DB(); err == nil {
+			_ = sqlDB.Close()
+		}
+	})
+	return db
+}
+
+func TestWorker_Pause(t *testing.T) {
+	// Create a minimal queue for testing
+	db := newInMemoryDB(t)
 	store := storage.NewGormStorage(db)
 	_ = store.Migrate(context.Background())
 	q := queue.New(store)
@@ -533,9 +552,7 @@ func TestWorker_Pause(t *testing.T) {
 }
 
 func TestWorker_PauseMode(t *testing.T) {
-	db, _ := gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{
-		Logger: logger.Default.LogMode(logger.Silent),
-	})
+	db := newInMemoryDB(t)
 	store := storage.NewGormStorage(db)
 	_ = store.Migrate(context.Background())
 	q := queue.New(store)
@@ -552,9 +569,7 @@ func TestWorker_PauseMode(t *testing.T) {
 }
 
 func TestWorker_PausedDoesNotDequeue(t *testing.T) {
-	db, _ := gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{
-		Logger: logger.Default.LogMode(logger.Silent),
-	})
+	db := newInMemoryDB(t)
 	store := storage.NewGormStorage(db)
 	_ = store.Migrate(context.Background())
 	q := queue.New(store)
@@ -590,9 +605,7 @@ func TestWorker_PausedDoesNotDequeue(t *testing.T) {
 }
 
 func TestWorker_AggressivePauseCancelsRunningJobs(t *testing.T) {
-	db, _ := gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{
-		Logger: logger.Default.LogMode(logger.Silent),
-	})
+	db := newInMemoryDB(t)
 	store := storage.NewGormStorage(db)
 	_ = store.Migrate(context.Background())
 	q := queue.New(store)
@@ -637,9 +650,7 @@ func TestWorker_AggressivePauseCancelsRunningJobs(t *testing.T) {
 }
 
 func TestWorker_PauseJobAggressivePreservesCancelledStatus(t *testing.T) {
-	db, _ := gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{
-		Logger: logger.Default.LogMode(logger.Silent),
-	})
+	db := newInMemoryDB(t)
 	store := storage.NewGormStorage(db)
 	_ = store.Migrate(context.Background())
 	q := queue.New(store)
@@ -678,10 +689,7 @@ func TestWorker_PauseJobAggressivePreservesCancelledStatus(t *testing.T) {
 }
 
 func TestWorker_CancelJobCancelsRunningJob(t *testing.T) {
-	db, err := gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{
-		Logger: logger.Default.LogMode(logger.Silent),
-	})
-	require.NoError(t, err)
+	db := newInMemoryDB(t)
 	store := storage.NewGormStorage(db)
 	require.NoError(t, store.Migrate(context.Background()))
 	q := queue.New(store)
@@ -4567,10 +4575,7 @@ func TestOwnershipAudit_CancelsOrphanedLocalHandlers(t *testing.T) {
 // handler — turning the WaitingError into a context.Canceled failure and
 // replaying the whole handler. The audit must leave a self-suspended job alone.
 func TestOwnershipAudit_DoesNotCancelSelfSuspendedJob(t *testing.T) {
-	db, err := gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{
-		Logger: logger.Default.LogMode(logger.Silent),
-	})
-	require.NoError(t, err)
+	db := newInMemoryDB(t)
 	store := storage.NewGormStorage(db)
 	require.NoError(t, store.Migrate(context.Background()))
 	q := queue.New(store)

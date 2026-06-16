@@ -32,7 +32,7 @@ func TestDequeue_PostgreSQL_ForUpdateSkipLocked(t *testing.T) {
 	skipIfNotPostgres(t)
 
 	ctx := context.Background()
-	s := newTestStorage(t)
+	s := newPostgresTestStorage(t)
 
 	// Enqueue two jobs on the same queue.
 	job1 := newTestJob("work", "task")
@@ -81,7 +81,7 @@ func TestDequeue_PostgreSQL_NoPendingJobs(t *testing.T) {
 	skipIfNotPostgres(t)
 
 	ctx := context.Background()
-	s := newTestStorage(t)
+	s := newPostgresTestStorage(t)
 
 	job, err := s.Dequeue(ctx, []string{"empty-queue"}, "worker")
 	assert.NoError(t, err)
@@ -92,7 +92,7 @@ func TestDequeue_PostgreSQL_RespectsQueuePause(t *testing.T) {
 	skipIfNotPostgres(t)
 
 	ctx := context.Background()
-	s := newTestStorage(t)
+	s := newPostgresTestStorage(t)
 
 	j := newTestJob("paused-q", "task")
 	require.NoError(t, s.Enqueue(ctx, j))
@@ -107,7 +107,7 @@ func TestDequeue_PostgreSQL_SkipsLockedJobs(t *testing.T) {
 	skipIfNotPostgres(t)
 
 	ctx := context.Background()
-	s := newTestStorage(t)
+	s := newPostgresTestStorage(t)
 
 	// Enqueue one job and dequeue it to lock it.
 	j := newTestJob("lock-q", "task")
@@ -127,7 +127,7 @@ func TestDequeue_PostgreSQL_PriorityOrdering(t *testing.T) {
 	skipIfNotPostgres(t)
 
 	ctx := context.Background()
-	s := newTestStorage(t)
+	s := newPostgresTestStorage(t)
 
 	low := newTestJob("prio-q", "low-prio")
 	low.Priority = 1
@@ -147,7 +147,7 @@ func TestCancelSubJobs_PostgreSQL_ConcurrentCompletionKeepsFanOutCountsConsisten
 	skipIfNotPostgres(t)
 
 	ctx := context.Background()
-	s := newTestStorage(t)
+	s := newPostgresTestStorage(t)
 
 	const subQueue = "cancel-race-q"
 	seedTestJob(t, ctx, s, testUUID("parent"), core.StatusWaiting)
@@ -259,7 +259,7 @@ func TestCompleteWithResult_PostgreSQL_ConcurrentTerminalCountsPostCommit(t *tes
 	skipIfNotPostgres(t)
 
 	ctx := context.Background()
-	s := newTestStorage(t)
+	s := newPostgresTestStorage(t)
 
 	fo := createP2BFanOut(t, ctx, s, core.FanOutPending)
 	sub1 := createRunningP2BJob(t, ctx, s, &fo.ID, "worker-1")
@@ -371,7 +371,7 @@ func TestEnqueueUnique_PostgreSQL_ForUpdate(t *testing.T) {
 	skipIfNotPostgres(t)
 
 	ctx := context.Background()
-	s := newTestStorage(t)
+	s := newPostgresTestStorage(t)
 
 	// Run concurrent unique enqueues with the same key — exactly one should succeed.
 	const concurrency = 5
@@ -414,7 +414,7 @@ func TestEnqueueUnique_PostgreSQL_Concurrent_NoDuplicates(t *testing.T) {
 	skipIfNotPostgres(t)
 
 	ctx := context.Background()
-	s := newTestStorage(t)
+	s := newPostgresTestStorage(t)
 
 	const concurrency = 20
 	const key = "unique-key-pg-concurrent"
@@ -464,7 +464,7 @@ func TestEnqueueUnique_PostgreSQL_AllowsAfterCompletion(t *testing.T) {
 	skipIfNotPostgres(t)
 
 	ctx := context.Background()
-	s := newTestStorage(t)
+	s := newPostgresTestStorage(t)
 
 	// Enqueue a unique job and complete it.
 	job1 := newTestJob("unique-q", "unique-reuse")
@@ -488,7 +488,6 @@ func TestEnqueueUnique_PostgreSQL_AllowsAfterCompletion(t *testing.T) {
 func TestNewGormStorage_IsNotSQLite_PostgreSQL(t *testing.T) {
 	skipIfNotPostgres(t)
 
-	db := openTestDB(t)
-	s := NewGormStorage(db)
+	s := newPostgresTestStorage(t)
 	assert.False(t, s.IsSQLite(), "PostgreSQL connection should not be detected as SQLite")
 }

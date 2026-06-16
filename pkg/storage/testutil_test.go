@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"context"
 	"os"
 	"testing"
 
@@ -69,6 +70,42 @@ func openTestDB(t testing.TB) *gorm.DB {
 	})
 	require.NoError(t, err, "open in-memory sqlite")
 	return db
+}
+
+// newPostgresTestStorage opens a Postgres-backed, migrated store DIRECTLY from
+// TEST_DATABASE_URL, ignoring TEST_MYSQL_URL. PostgreSQL-specific tests must use
+// this instead of newTestStorage: openTestDB prefers TEST_MYSQL_URL, so with
+// BOTH live DSNs set (the documented "both DBs available" dev setup) a PG-only
+// test would otherwise silently run against MySQL and mis-exercise or skip the
+// Postgres branch (codex F-005). Skips when TEST_DATABASE_URL is unset, and
+// asserts the resolved dialect is Postgres so future helper drift fails loudly
+// at setup rather than as a misleading behavior failure.
+func newPostgresTestStorage(t *testing.T) *GormStorage {
+	t.Helper()
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL not set — skipping PostgreSQL-specific test")
+	}
+	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{
+		Logger: logger.Default.LogMode(logger.Silent),
+	})
+	require.NoError(t, err, "open postgres test db")
+
+	sqlDB, err := db.DB()
+	require.NoError(t, err, "get underlying sql.DB")
+	sqlDB.SetMaxOpenConns(2)
+	sqlDB.SetMaxIdleConns(1)
+
+	cleanupExternalDB(t, db)
+	t.Cleanup(func() {
+		cleanupExternalDB(t, db)
+		_ = sqlDB.Close()
+	})
+
+	s := NewGormStorage(db)
+	require.NoError(t, s.Migrate(context.Background()), "migrate schema")
+	require.Equal(t, dialectPostgres, s.dialect(), "postgres-specific test must run on postgres")
+	return s
 }
 
 // cleanupExternalDB deletes all rows from tables after each test
