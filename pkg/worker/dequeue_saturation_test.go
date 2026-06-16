@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -40,10 +41,15 @@ type soakStorage struct {
 	mu    sync.Mutex
 	order []*core.Job // stable claim order; jobs cycle pending<->running
 
-	allow        atomic.Bool // TryConsumeRate verdict: false = saturated
+	allow        atomic.Bool // TryConsumeRate verdict (unkeyed): false = saturated
 	dequeueCalls atomic.Int64
 	rateChecks   atomic.Int64
 	rateAllowed  atomic.Int64
+
+	// keyDeny, when set, decides TryConsumeRate per EFFECTIVE limit name
+	// ("<name>:<key>") — modeling a KEYED fleet limit where only some buckets
+	// are saturated. Overrides allow.
+	keyDeny func(limitName string) bool
 }
 
 // newSoakStorage seeds n PENDING jobs (Attempt 0) that the dispatch path will
@@ -67,6 +73,62 @@ func newSoakStorage(n int) *soakStorage {
 		s.order = append(s.order, j)
 	}
 	return s
+}
+
+// newKeyedSoakStorage models a KEYED fleet limit: perKey pending jobs for the
+// saturated hotKey tenant plus perKey for each cold (has-headroom) tenant.
+// keyDeny denies only the hot key's effective limit name ("<name>:<hotKey>"),
+// so cold-key jobs admit and hot-key jobs bounce — the per-tenant-rate-limit
+// shape where one tenant runs hot while others have headroom.
+func newKeyedSoakStorage(perKey int, hotKey string, coldKeys []string) *soakStorage {
+	rs := &releaseStateStorage{
+		mockStorage: &mockStorage{},
+		jobs:        make(map[string]*core.Job),
+	}
+	s := &soakStorage{releaseStateStorage: rs}
+	add := func(tenant string) {
+		for i := 0; i < perKey; i++ {
+			j := &core.Job{
+				ID:      core.UUID(fmt.Sprintf("soak-%s-%05d", tenant, i)),
+				Type:    "work",
+				Queue:   "default",
+				Tenant:  tenant,
+				Status:  core.StatusPending,
+				Attempt: 0,
+			}
+			rs.jobs[string(j.ID)] = j
+			s.order = append(s.order, j)
+		}
+	}
+	add(hotKey)
+	for _, k := range coldKeys {
+		add(k)
+	}
+	s.keyDeny = func(limitName string) bool { return strings.HasSuffix(limitName, ":"+hotKey) }
+	return s
+}
+
+// tenantStats returns, for jobs of the given tenant, the pending/running counts
+// and the max Attempt seen — for asserting cold-key dispatch (running) and
+// hot-key refund (pending, attempt 0) after a keyed soak.
+func (s *soakStorage) tenantStats(tenant string) (pending, running, maxAttempt int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, j := range s.order {
+		if j.Tenant != tenant {
+			continue
+		}
+		switch j.Status {
+		case core.StatusPending:
+			pending++
+		case core.StatusRunning:
+			running++
+		}
+		if j.Attempt > maxAttempt {
+			maxAttempt = j.Attempt
+		}
+	}
+	return pending, running, maxAttempt
 }
 
 // claimLocked transitions a pending job to running (caller holds s.mu),
@@ -113,13 +175,17 @@ func (s *soakStorage) DequeueBatch(_ context.Context, _ []string, workerID strin
 	return out, nil
 }
 
-func (s *soakStorage) TryConsumeRate(_ context.Context, _ string, _ float64, _ time.Duration, _ time.Time) (bool, error) {
+func (s *soakStorage) TryConsumeRate(_ context.Context, limitName string, _ float64, _ time.Duration, _ time.Time) (bool, error) {
 	s.rateChecks.Add(1)
-	if s.allow.Load() {
-		s.rateAllowed.Add(1)
-		return true, nil
+	denied := !s.allow.Load()
+	if s.keyDeny != nil {
+		denied = s.keyDeny(limitName)
 	}
-	return false, nil
+	if denied {
+		return false, nil
+	}
+	s.rateAllowed.Add(1)
+	return true, nil
 }
 
 // pendingCount reports how many seeded jobs are currently back at pending.
@@ -356,4 +422,53 @@ func TestSaturatedDispatch_ChurnMetricsRecorded(t *testing.T) {
 	assert.Zero(t, released["queue_cap"], "no per-queue cap bounces in this scenario")
 	assert.Zero(t, released["queue_rate"], "no queue-rate bounces in this scenario")
 	assert.Greater(t, suppressed, int64(0), "suppressed ticks must be recorded once the throttle engages")
+}
+
+// TestKeyedSaturation_ChurnBaseline records the PRE-fix KEYED-limit churn — the
+// gap v1 leaves, because a keyed limit disables the unkeyed throttle — and locks
+// the invariants the Phase-1 cooldown (P1b) must preserve: hot-key jobs churn
+// (claim->bounce->release) and never dispatch, COLD-key jobs DO dispatch (no
+// starvation of healthy keys), and bounced hot-key jobs are refunded to pending
+// at attempt 0. P1b will collapse the hot key's rateChecks (the DB locked-tx
+// churn) while these invariants — and cold-key dispatch — stay put.
+func TestKeyedSaturation_ChurnBaseline(t *testing.T) {
+	const perKey = 6
+	const concurrency = 16
+	const ticks = 20
+	coldKeys := []string{"cold-1", "cold-2"}
+	store := newKeyedSoakStorage(perKey, "hot", coldKeys)
+	w := NewWorker(queue.New(store),
+		WorkerQueue("default", Concurrency(concurrency)),
+		RateLimit("fleet", 1_000_000, RateLimitKey(func(j *core.Job) string { return j.Tenant })),
+		WithDequeueBatchSize(concurrency),
+		DisableRetry(),
+	)
+	w.config.WorkerID = "worker-soak"
+	require.False(t, w.allRateLimitsUnkeyed, "a keyed limit disables the v1 unkeyed throttle")
+
+	res := runSaturationSoak(t, w, store, concurrency, ticks)
+
+	// Cold keys dispatch — no starvation of healthy keys (the property P1b must keep).
+	for _, ck := range coldKeys {
+		pending, running, _ := store.tenantStats(ck)
+		assert.Equal(t, perKey, running, "all %q jobs must dispatch (no starvation of a healthy key)", ck)
+		assert.Equal(t, 0, pending, "no %q job left pending", ck)
+	}
+	assert.Equal(t, perKey*len(coldKeys), res.dispatched, "exactly the cold-key jobs dispatch")
+
+	// Hot key churns: bounced repeatedly, ends pending and attempt-neutral.
+	pending, running, maxAttempt := store.tenantStats("hot")
+	assert.Equal(t, perKey, pending, "hot-key jobs end pending (bounced, never dispatched)")
+	assert.Equal(t, 0, running, "no hot-key job left running")
+	assert.Equal(t, 0, maxAttempt, "hot-key bounces are attempt-neutral (refunded)")
+
+	// churn-1 (claim->release row churn) is asserted here because it survives P1b
+	// (the per-key cooldown removes only the DB rate check, churn-2); churn-1 only
+	// goes away in the optional Phase 2. rateChecks is the churn-2 BASELINE P1b
+	// collapses, so it is only LOGGED here (a hard lower bound would not survive
+	// P1b) — the collapse assertion lives in P1b, and the real-DB baseline is
+	// recorded in benchmarks/ratelimit_churn_bench_test.go.
+	assert.Greater(t, res.releases, int64(concurrency), "hot key churns claim->release every tick (churn-1, survives P1b)")
+	t.Logf("cto-F2 KEYED BASELINE over %d ticks: dispatched=%d releases=%d rateChecks=%d (hot churns, cold dispatched; P1b collapses rateChecks)",
+		ticks, res.dispatched, res.releases, res.rateChecks)
 }

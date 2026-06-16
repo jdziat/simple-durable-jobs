@@ -101,6 +101,31 @@ const (
 //
 // Throughput (completed) holds at the fleet ceiling; churn collapses ~80-87%.
 func BenchmarkSaturatedRateLimitChurn(b *testing.B) {
+	runChurnSoak(b, false)
+}
+
+// BenchmarkSaturatedKeyedRateLimitChurn is the KEYED counterpart: a fleet limit
+// keyed by tenant with all backlog on one hot tenant. v1's throttle is disabled
+// for keyed configs, so this records the keyed baseline churn the Phase-1 per-key
+// cooldown (P1b) must reduce (it collapses rateChecks; releases stay until the
+// optional Phase 2).
+//
+// RECORDED KEYED BASELINE (unfixed dispatch loop, 2026-06-16, this harness):
+//
+//	Postgres : completed=30 dequeues=280 releases=250 rateChecks=275 => 26.8 wasteOps/completed
+//	MySQL    : completed=30 dequeues=190 releases=160 rateChecks=190 => 18.0 wasteOps/completed
+//
+// P1b must collapse rateChecks (churn-2) for the hot key while completed holds and
+// releases (churn-1) stay ~baseline (churn-1 only drops in the optional P2).
+func BenchmarkSaturatedKeyedRateLimitChurn(b *testing.B) {
+	runChurnSoak(b, true)
+}
+
+// runChurnSoak runs the fleet-rate-saturated dispatch soak and reports churn vs
+// completed throughput. keyed=true keys the limit by tenant and puts the whole
+// backlog on one hot tenant (the per-tenant-rate-limit hot-key shape).
+func runChurnSoak(b *testing.B, keyed bool) {
+	b.Helper()
 	if os.Getenv("TEST_DATABASE_URL") == "" && os.Getenv("TEST_MYSQL_URL") == "" {
 		b.Skip("cto-F2 churn benchmark targets PG/MySQL (sqlite single-writer masks lock contention); set TEST_DATABASE_URL or TEST_MYSQL_URL")
 	}
@@ -118,15 +143,23 @@ func BenchmarkSaturatedRateLimitChurn(b *testing.B) {
 
 		ctx := context.Background()
 		for j := 0; j < churnBacklog; j++ {
-			if _, err := q.Enqueue(ctx, "churn.work", noopArgs{N: j}, jobs.QueueOpt(benchQueue)); err != nil {
+			opts := []jobs.Option{jobs.QueueOpt(benchQueue)}
+			if keyed {
+				opts = append(opts, jobs.WithTenant("hot"))
+			}
+			if _, err := q.Enqueue(ctx, "churn.work", noopArgs{N: j}, opts...); err != nil {
 				b.Fatal(err)
 			}
 		}
 
+		rateLimit := jobs.RateLimit("fleet", churnFleetPerSecond) // unkeyed; default 1s window
+		if keyed {
+			rateLimit = jobs.RateLimit("fleet", churnFleetPerSecond, jobs.RateLimitKey(func(j *jobs.Job) string { return j.Tenant }))
+		}
 		worker := jobs.NewWorker(q,
 			jobs.WorkerQueue(benchQueue, jobs.Concurrency(churnConcurrency)),
 			jobs.WithPollInterval(benchPollInterval),
-			jobs.RateLimit("fleet", churnFleetPerSecond), // default 1s window
+			rateLimit,
 			jobs.WithDrainTimeout(2*time.Second),
 		)
 
@@ -151,7 +184,11 @@ func BenchmarkSaturatedRateLimitChurn(b *testing.B) {
 			// write-amplification: claim+release+rate-check work per completed job.
 			b.ReportMetric(float64(deq+rel+rc)/float64(done), "wasteOps/completed")
 		}
-		b.Logf("cto-F2 churn soak (%s, concurrency=%d, fleet=%.0f/s): completed=%d dequeues=%d releases=%d rateChecks=%d rateAllowed=%d",
-			churnSoakDuration, churnConcurrency, churnFleetPerSecond, done, deq, rel, rc, store.rateAllowed.Load())
+		kind := "unkeyed"
+		if keyed {
+			kind = "keyed(tenant=hot)"
+		}
+		b.Logf("cto-F2 churn soak [%s] (%s, concurrency=%d, fleet=%.0f/s): completed=%d dequeues=%d releases=%d rateChecks=%d rateAllowed=%d",
+			kind, churnSoakDuration, churnConcurrency, churnFleetPerSecond, done, deq, rel, rc, store.rateAllowed.Load())
 	}
 }
