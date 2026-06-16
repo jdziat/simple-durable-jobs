@@ -374,15 +374,20 @@ func NewWorker(q *queue.Queue, opts ...WorkerOption) *Worker {
 		config.OwnershipAuditInterval = 5 * time.Second
 	}
 
-	// The cto-F2 saturation throttle only applies when EVERY configured fleet
-	// RateLimit is unkeyed — a keyed limit's effective name needs the held job,
-	// so it can't be pre-gated before a claim (see rateSaturatedUntil).
+	// The cto-F2 whole-fleet dequeue suppression only applies when EVERY
+	// configured fleet RateLimit is unkeyed — a keyed limit's effective name needs
+	// the held job, so it can't be pre-gated before a claim (see dequeueSlots).
+	// The per-key cooldown (markRateSaturated/keyedRateSaturated) applies to keyed
+	// limits too; it only removes the DB rate-check, never suppresses the claim.
 	allRateLimitsUnkeyed := len(config.RateLimits) > 0
 	for _, limit := range config.RateLimits {
 		if limit.Key != nil {
 			allRateLimitsUnkeyed = false
 			break
 		}
+	}
+	if config.rateSaturationCap <= 0 {
+		config.rateSaturationCap = defaultRateSaturationCap
 	}
 
 	return &Worker{
@@ -1166,6 +1171,21 @@ func (w *Worker) tryConsumeRateLimits(ctx context.Context, job *core.Job) bool {
 			window = defaultRateLimitWindow
 		}
 		limitName := w.rateLimitName(limit, job)
+		// cto-F2 per-key cooldown (KEYED limits only — the gap v1 left): if this
+		// exact bucket was denied by the DB this window, skip the locked
+		// TryConsumeRate transaction and bounce — the DB fixed window would only
+		// deny again (count only rises within a window). Correctness-neutral: the
+		// cache is written only from a real DB denial, so a hit means the DB
+		// already said no this window; after the window rolls keyedRateSaturated
+		// prunes the entry and the DB gate decides again.
+		//
+		// Scoped to keyed limits deliberately: for an all-unkeyed config dequeueSlots
+		// already suppresses CLAIMING during saturation, so a job only reaches here
+		// on the probe tick, which MUST consult the DB to detect headroom returning
+		// — short-circuiting it would change v1's proven unkeyed behavior.
+		if limit.Key != nil && w.keyedRateSaturated(limitName, time.Now()) {
+			return false
+		}
 		allowed, err := storage.TryConsumeRate(ctx, limitName, limit.PerSecond, window, time.Time{})
 		if err != nil {
 			w.logger.Warn("failed to consume rate limit; releasing dequeued job",
@@ -1175,8 +1195,10 @@ func (w *Worker) tryConsumeRateLimits(ctx context.Context, job *core.Job) bool {
 			return false
 		}
 		if !allowed {
-			// cto-F2: remember this limit has no headroom until its window rolls,
-			// so dequeueSlots stops claiming jobs that would only be bounced.
+			// cto-F2: remember this bucket has no headroom until its window rolls.
+			// For an all-unkeyed config dequeueSlots reads this to stop CLAIMING
+			// (removes both churns); for a keyed bucket the pre-tx fast path above
+			// reads it to skip the next DB rate tx (removes the denied-tx churn).
 			w.markRateSaturated(limitName, window)
 			return false
 		}
@@ -1191,21 +1213,52 @@ func (w *Worker) tryConsumeRateLimits(ctx context.Context, job *core.Job) bool {
 // admission authority — the unchanged TryConsumeRate DB gate still decides every
 // admission — so bounded worker/DB clock skew only shifts the next probe by the
 // skew, never over- or under-admits.
+// defaultRateSaturationCap bounds the saturated-bucket cooldown cache when the
+// caller does not set WithRateSaturationCacheSize.
+const defaultRateSaturationCap = 4096
+
 func (w *Worker) markRateSaturated(limitName string, window time.Duration) {
-	// Only arm the cache when it can actually be consulted. With any keyed limit
-	// (allRateLimitsUnkeyed=false) dequeueSlots never reads it, so arming would
-	// just accumulate one never-pruned entry per distinct keyed name that ever
-	// denied — an unbounded-growth path under a high-cardinality key. Skip it.
-	if !w.allRateLimitsUnkeyed {
-		return
-	}
 	if window <= 0 {
 		window = defaultRateLimitWindow
 	}
 	until := time.Now().Truncate(window).Add(window)
 	w.rateSaturationMu.Lock()
+	defer w.rateSaturationMu.Unlock()
+	// Refreshing an existing bucket never grows the map. A NEW bucket at the cap
+	// triggers a prune of expired entries; if still full, refuse to insert — that
+	// bucket simply pays the DB rate tx, exactly as before the cooldown (graceful
+	// degrade). We never evict a still-live entry, so a hot key is never dropped.
+	// This bounds memory at cap entries regardless of RateLimitKey cardinality.
+	if _, exists := w.rateSaturatedUntil[limitName]; !exists && len(w.rateSaturatedUntil) >= w.config.rateSaturationCap {
+		now := time.Now()
+		for name, u := range w.rateSaturatedUntil {
+			if !now.Before(u) {
+				delete(w.rateSaturatedUntil, name)
+			}
+		}
+		if len(w.rateSaturatedUntil) >= w.config.rateSaturationCap {
+			return
+		}
+	}
 	w.rateSaturatedUntil[limitName] = until
-	w.rateSaturationMu.Unlock()
+}
+
+// keyedRateSaturated reports whether the specific effective limit bucket is
+// known saturated within its current window, pruning the entry on read once its
+// window has rolled. Used by the pre-tx fast path in tryConsumeRateLimits to skip
+// the DB rate transaction for a bucket the DB already denied this window.
+func (w *Worker) keyedRateSaturated(limitName string, now time.Time) bool {
+	w.rateSaturationMu.Lock()
+	defer w.rateSaturationMu.Unlock()
+	until, ok := w.rateSaturatedUntil[limitName]
+	if !ok {
+		return false
+	}
+	if now.Before(until) {
+		return true
+	}
+	delete(w.rateSaturatedUntil, limitName)
+	return false
 }
 
 // unkeyedRateLimitsSaturated reports whether any fleet RateLimit was last seen
