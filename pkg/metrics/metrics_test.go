@@ -207,6 +207,28 @@ func TestInstrumentQueueSaturation_RecordsWorkerGauge(t *testing.T) {
 	})
 }
 
+func TestInstrumentWorkerDequeue_RecordsChurnCounters(t *testing.T) {
+	ctx := context.Background()
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	defer func() { _ = mp.Shutdown(ctx) }()
+
+	InstrumentWorkerDequeue("worker-1",
+		func() map[string]int64 { return map[string]int64{"fleet_rate": 8, "queue_cap": 0} },
+		func() int64 { return 29 },
+		WithMeterProvider(mp))
+
+	rm := collectMetrics(t, reader)
+	assertCounterPoint(t, rm, metricDequeueReleased, 8, map[string]string{
+		attrWorkerID: "worker-1",
+		attrReason:   "fleet_rate",
+	})
+	assertCounterPoint(t, rm, metricDequeueSuppressedTicks, 29, map[string]string{
+		attrWorkerID: "worker-1",
+		attrReason:   "fleet_rate_saturated",
+	})
+}
+
 func TestInstrument_SkipsQueueDepthGaugeWithoutCapability(t *testing.T) {
 	ctx := context.Background()
 	reader := sdkmetric.NewManualReader()

@@ -45,6 +45,9 @@ const (
 	metricQueueSaturation  = "jobs.queue.saturation"
 	metricLeasesReclaimed  = "jobs.leases.reclaimed"
 
+	metricDequeueReleased        = "jobs.dequeue.released"
+	metricDequeueSuppressedTicks = "jobs.dequeue.suppressed_ticks"
+
 	attrQueue    = "queue"
 	attrJobType  = "job.type"
 	attrOutcome  = "outcome"
@@ -306,6 +309,67 @@ func InstrumentQueueSaturation(workerID string, capacities map[string]int, runni
 		}))
 	if err != nil {
 		slog.Default().Warn("queue saturation gauge disabled", "error", err)
+	}
+}
+
+// InstrumentWorkerDequeue registers the cto-F2 dispatch-churn observability for
+// a worker: jobs.dequeue.released{worker.id,reason} (jobs claimed then released
+// back to pending, by reason) and jobs.dequeue.suppressed_ticks{worker.id}
+// (poll ticks the rate-saturation throttle skipped claiming). Both are
+// monotonic observable counters read from the worker's own atomic snapshots, so
+// pkg/metrics stays decoupled from pkg/worker (pass worker.DequeueReleasedByReason
+// and worker.DequeueSuppressedTicks as the func values).
+//
+// A healthy throttled worker shows suppressed_ticks rising while
+// released{reason="fleet_rate"} stays low (one probe batch per rate window) —
+// the throttle collapsing the claim->release churn, not a stuck worker.
+func InstrumentWorkerDequeue(workerID string, releasedByReason func() map[string]int64, suppressedTicks func() int64, opts ...InstrumentOption) {
+	if releasedByReason == nil && suppressedTicks == nil {
+		slog.Default().Warn("worker dequeue metrics disabled", "error", "no snapshot sources")
+		return
+	}
+
+	cfg := &instrumentConfig{}
+	for _, opt := range opts {
+		opt(cfg)
+	}
+	if cfg.meterProvider == nil {
+		cfg.meterProvider = otel.GetMeterProvider()
+	}
+	meter := cfg.meterProvider.Meter(instrumentationName)
+
+	if releasedByReason != nil {
+		_, err := meter.Int64ObservableCounter(metricDequeueReleased,
+			metric.WithUnit("{job}"),
+			metric.WithDescription("Dequeued jobs released back to pending without running, by reason."),
+			metric.WithInt64Callback(func(_ context.Context, observer metric.Int64Observer) error {
+				for reason, count := range releasedByReason() {
+					observer.Observe(count, metric.WithAttributes(
+						attribute.String(attrWorkerID, workerID),
+						attribute.String(attrReason, reason),
+					))
+				}
+				return nil
+			}))
+		if err != nil {
+			slog.Default().Warn("dequeue released counter disabled", "error", err)
+		}
+	}
+
+	if suppressedTicks != nil {
+		_, err := meter.Int64ObservableCounter(metricDequeueSuppressedTicks,
+			metric.WithUnit("{tick}"),
+			metric.WithDescription("Poll ticks the rate-saturation throttle skipped claiming jobs."),
+			metric.WithInt64Callback(func(_ context.Context, observer metric.Int64Observer) error {
+				observer.Observe(suppressedTicks(), metric.WithAttributes(
+					attribute.String(attrWorkerID, workerID),
+					attribute.String(attrReason, "fleet_rate_saturated"),
+				))
+				return nil
+			}))
+		if err != nil {
+			slog.Default().Warn("dequeue suppressed-ticks counter disabled", "error", err)
+		}
 	}
 }
 

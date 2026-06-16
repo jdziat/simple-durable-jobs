@@ -71,6 +71,14 @@ type Worker struct {
 	rateSaturatedUntil   map[string]time.Time
 	allRateLimitsUnkeyed bool
 
+	// dequeueChurn counts dispatch bounces by reason and rate-saturation
+	// suppressed ticks — the observability signals for the cto-F2 claim->release
+	// churn (a healthy throttled worker shows suppressedTicks rising while
+	// released{fleet_rate} stays low: one probe batch per window). Exposed via
+	// DequeueReleasedByReason/DequeueSuppressedTicks and wired into OTel by
+	// pkg/metrics.InstrumentWorkerDequeue.
+	dequeueChurn dequeueChurnCounters
+
 	rateLimitStorageMissingLogged     atomic.Bool
 	retentionStorageMissingLogged     atomic.Bool
 	retentionUnconfiguredLogged       atomic.Bool
@@ -605,6 +613,15 @@ func (w *Worker) dequeueSlots(availableQueues []string, totalConcurrency int) in
 	// ever REDUCES claims (the unchanged TryConsumeRate gate is still the sole
 	// admission authority), and never fires for keyed/mixed configs.
 	if w.allRateLimitsUnkeyed && w.unkeyedRateLimitsSaturated(time.Now()) {
+		// Count one suppressed tick. dequeueSlots runs up to three times per
+		// drainDequeuedJobs (top-of-drain budget, in-loop, and via
+		// dequeueAvailableJobs), but a fully-saturated tick increments this
+		// exactly once: the top-of-drain call returns a 0 budget and
+		// drainDequeuedJobs returns before the loop's calls run. (A tick that
+		// only turns saturated mid-loop is armed by tryConsumeRateLimits after
+		// those calls, so it still counts at most once.) The drain loop is
+		// single-goroutine, so there is no cross-tick double count.
+		w.dequeueChurn.suppressedTicks.Add(1)
 		return 0
 	}
 	return slots
@@ -691,28 +708,33 @@ func (w *Worker) dispatchDequeuedJobs(ctx context.Context, jobsChan chan<- *core
 			continue
 		}
 		if !w.tryTrackQueueJob(job.ID, job.Queue) {
+			w.recordBounce(bounceQueueCap)
 			w.releaseDequeuedJobOnShutdown(ctx, job)
 			released++
 			continue
 		}
 		if !w.tryConsumeQueueRateLimit(job.Queue) {
+			w.recordBounce(bounceQueueRate)
 			w.releaseDequeuedJobOnShutdown(ctx, job)
 			released++
 			continue
 		}
 		if ok := w.tryAcquireConcurrencySlots(ctx, job); !ok {
+			w.recordBounce(bounceConcurrency)
 			w.refundQueueRateLimit(job.Queue)
 			w.releaseDequeuedJobOnShutdown(ctx, job)
 			released++
 			continue
 		}
 		if ctx.Err() != nil {
+			w.recordBounce(bounceShutdown)
 			w.refundQueueRateLimit(job.Queue)
 			w.releaseDequeuedJobOnShutdown(ctx, job)
 			released++
 			continue
 		}
 		if ok := w.tryConsumeRateLimits(ctx, job); !ok {
+			w.recordBounce(bounceFleetRate)
 			w.refundQueueRateLimit(job.Queue)
 			w.releaseDequeuedJobOnShutdown(ctx, job)
 			released++
@@ -723,6 +745,7 @@ func (w *Worker) dispatchDequeuedJobs(ctx context.Context, jobsChan chan<- *core
 		case jobsChan <- job:
 			dispatched++
 		case <-ctx.Done():
+			w.recordBounce(bounceShutdown)
 			w.refundQueueRateLimit(job.Queue)
 			w.releaseDequeuedJobOnShutdown(ctx, job)
 			released++
@@ -1204,6 +1227,69 @@ func (w *Worker) unkeyedRateLimitsSaturated(now time.Time) bool {
 		}
 	}
 	return saturated
+}
+
+// bounceReason labels why dispatchDequeuedJobs released a just-claimed job back
+// to pending instead of running it. Each value is a low-cardinality metric label
+// (jobs.dequeue.released{reason}).
+type bounceReason string
+
+const (
+	bounceQueueCap    bounceReason = "queue_cap"   // per-queue concurrency cap full
+	bounceQueueRate   bounceReason = "queue_rate"  // in-memory queue rate limiter
+	bounceConcurrency bounceReason = "concurrency" // fleet concurrency slot unavailable
+	bounceFleetRate   bounceReason = "fleet_rate"  // fleet (DB) rate limit saturated
+	bounceShutdown    bounceReason = "shutdown"    // ctx cancelled mid-dispatch
+)
+
+// dequeueChurnCounters holds cumulative dispatch-churn counts. All fields are
+// atomic; the struct is embedded by value in the pointer-only Worker.
+type dequeueChurnCounters struct {
+	queueCap        atomic.Int64
+	queueRate       atomic.Int64
+	concurrency     atomic.Int64
+	fleetRate       atomic.Int64
+	shutdown        atomic.Int64
+	suppressedTicks atomic.Int64
+}
+
+func (w *Worker) recordBounce(r bounceReason) {
+	switch r {
+	case bounceQueueCap:
+		w.dequeueChurn.queueCap.Add(1)
+	case bounceQueueRate:
+		w.dequeueChurn.queueRate.Add(1)
+	case bounceConcurrency:
+		w.dequeueChurn.concurrency.Add(1)
+	case bounceFleetRate:
+		w.dequeueChurn.fleetRate.Add(1)
+	case bounceShutdown:
+		w.dequeueChurn.shutdown.Add(1)
+	}
+}
+
+// DequeueReleasedByReason returns the cumulative count of dequeued jobs the
+// dispatcher released back to pending (a "bounce"), keyed by reason. Under the
+// cto-F2 saturation throttle a steady-state-saturated fleet limit shows only a
+// small, slowly-growing fleet_rate count (one probe batch per rate window)
+// rather than a count that climbs every poll tick. Safe to call concurrently.
+func (w *Worker) DequeueReleasedByReason() map[string]int64 {
+	return map[string]int64{
+		string(bounceQueueCap):    w.dequeueChurn.queueCap.Load(),
+		string(bounceQueueRate):   w.dequeueChurn.queueRate.Load(),
+		string(bounceConcurrency): w.dequeueChurn.concurrency.Load(),
+		string(bounceFleetRate):   w.dequeueChurn.fleetRate.Load(),
+		string(bounceShutdown):    w.dequeueChurn.shutdown.Load(),
+	}
+}
+
+// DequeueSuppressedTicks returns the cumulative number of poll ticks on which
+// the cto-F2 throttle skipped claiming because an all-unkeyed fleet rate limit
+// was saturated. A rising value alongside a flat DequeueReleasedByReason
+// fleet_rate count is the throttle working as intended (not a stuck worker).
+// Safe to call concurrently.
+func (w *Worker) DequeueSuppressedTicks() int64 {
+	return w.dequeueChurn.suppressedTicks.Load()
 }
 
 func (w *Worker) tryAcquireConcurrencySlots(ctx context.Context, job *core.Job) bool {
