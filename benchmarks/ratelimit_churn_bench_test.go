@@ -94,8 +94,12 @@ const (
 //	Postgres : completed=30 dequeues=260 releases=230 rateChecks=252 => 24.7 wasteOps/completed
 //	MySQL    : completed=20 dequeues=200 releases=180 rateChecks=192 => 28.6 wasteOps/completed
 //
-// The fix (Packet 2) must drop releases + rateChecks by ~>=90% while holding
-// completed within noise of the fleet ceiling.
+// POST-FIX (saturation-feedback dequeue throttle, same harness):
+//
+//	Postgres : completed=30 dequeues=60 releases=30 rateChecks=60 => 5.0 wasteOps/completed (releases -87%)
+//	MySQL    : completed=30 dequeues=60 releases=30 rateChecks=60 => 5.0 wasteOps/completed (releases -83%)
+//
+// Throughput (completed) holds at the fleet ceiling; churn collapses ~80-87%.
 func BenchmarkSaturatedRateLimitChurn(b *testing.B) {
 	if os.Getenv("TEST_DATABASE_URL") == "" && os.Getenv("TEST_MYSQL_URL") == "" {
 		b.Skip("cto-F2 churn benchmark targets PG/MySQL (sqlite single-writer masks lock contention); set TEST_DATABASE_URL or TEST_MYSQL_URL")

@@ -308,6 +308,16 @@ func ConcurrencyCap(name string, limit int, opts ...CapOption) WorkerOption {
 // backend supports DB-backed rate windows. Without RateLimitKey, the limit is
 // fleet-wide under name. With RateLimitKey, the same rate applies independently
 // to each derived key.
+//
+// Claim-rate throttle: when EVERY configured RateLimit is unkeyed, a worker that
+// hits a saturated limit stops claiming jobs until that limit's rate window
+// rolls over, instead of repeatedly claiming and bouncing them back to pending
+// (which wastes DB writes and rate-limit transactions). This only reduces wasted
+// claims — the DB rate window remains the sole admission authority — so it never
+// over-admits. Trade-off: a just-recovered limit can take up to one rate window
+// before this worker probes it again. If ANY configured RateLimit is keyed
+// (RateLimitKey), the throttle is disabled (a keyed limit's window cannot be
+// checked before a job is held), and behavior is unchanged.
 func RateLimit(name string, perSecond float64, opts ...RateLimitOption) WorkerOption {
 	return workerOptionFunc(func(c *WorkerConfig) {
 		if name == "" || perSecond <= 0 {
