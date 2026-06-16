@@ -999,17 +999,22 @@ func (x *DataPoint) GetValue() int64 {
 }
 
 type ListJobsRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Status        string                 `protobuf:"bytes,1,opt,name=status,proto3" json:"status,omitempty"`
-	Queue         string                 `protobuf:"bytes,2,opt,name=queue,proto3" json:"queue,omitempty"`
-	Type          string                 `protobuf:"bytes,3,opt,name=type,proto3" json:"type,omitempty"`
-	Search        string                 `protobuf:"bytes,4,opt,name=search,proto3" json:"search,omitempty"`
-	Since         *timestamppb.Timestamp `protobuf:"bytes,5,opt,name=since,proto3" json:"since,omitempty"`
-	Until         *timestamppb.Timestamp `protobuf:"bytes,6,opt,name=until,proto3" json:"until,omitempty"`
-	Page          int32                  `protobuf:"varint,7,opt,name=page,proto3" json:"page,omitempty"`
-	Limit         int32                  `protobuf:"varint,8,opt,name=limit,proto3" json:"limit,omitempty"`
-	Tenant        string                 `protobuf:"bytes,9,opt,name=tenant,proto3" json:"tenant,omitempty"`
-	MetaContains  map[string]string      `protobuf:"bytes,10,rep,name=meta_contains,json=metaContains,proto3" json:"meta_contains,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	state        protoimpl.MessageState `protogen:"open.v1"`
+	Status       string                 `protobuf:"bytes,1,opt,name=status,proto3" json:"status,omitempty"`
+	Queue        string                 `protobuf:"bytes,2,opt,name=queue,proto3" json:"queue,omitempty"`
+	Type         string                 `protobuf:"bytes,3,opt,name=type,proto3" json:"type,omitempty"`
+	Search       string                 `protobuf:"bytes,4,opt,name=search,proto3" json:"search,omitempty"`
+	Since        *timestamppb.Timestamp `protobuf:"bytes,5,opt,name=since,proto3" json:"since,omitempty"`
+	Until        *timestamppb.Timestamp `protobuf:"bytes,6,opt,name=until,proto3" json:"until,omitempty"`
+	Page         int32                  `protobuf:"varint,7,opt,name=page,proto3" json:"page,omitempty"`
+	Limit        int32                  `protobuf:"varint,8,opt,name=limit,proto3" json:"limit,omitempty"`
+	Tenant       string                 `protobuf:"bytes,9,opt,name=tenant,proto3" json:"tenant,omitempty"`
+	MetaContains map[string]string      `protobuf:"bytes,10,rep,name=meta_contains,json=metaContains,proto3" json:"meta_contains,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	// sort_key selects the column to order by across the full result set (not just
+	// the current page). Server-validated against a whitelist; unknown values fall
+	// back to the default (created_at). sort_dir is "asc" or "desc" (default desc).
+	SortKey       string `protobuf:"bytes,11,opt,name=sort_key,json=sortKey,proto3" json:"sort_key,omitempty"`
+	SortDir       string `protobuf:"bytes,12,opt,name=sort_dir,json=sortDir,proto3" json:"sort_dir,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1112,6 +1117,20 @@ func (x *ListJobsRequest) GetMetaContains() map[string]string {
 		return x.MetaContains
 	}
 	return nil
+}
+
+func (x *ListJobsRequest) GetSortKey() string {
+	if x != nil {
+		return x.SortKey
+	}
+	return ""
+}
+
+func (x *ListJobsRequest) GetSortDir() string {
+	if x != nil {
+		return x.SortDir
+	}
+	return ""
 }
 
 type ListJobsResponse struct {
@@ -2837,7 +2856,7 @@ const file_jobs_v1_jobs_proto_rawDesc = "" +
 	"\x06failed\x18\x02 \x03(\v2\x12.jobs.v1.DataPointR\x06failed\"[\n" +
 	"\tDataPoint\x128\n" +
 	"\ttimestamp\x18\x01 \x01(\v2\x1a.google.protobuf.TimestampR\ttimestamp\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\x03R\x05value\"\xa3\x03\n" +
+	"\x05value\x18\x02 \x01(\x03R\x05value\"\xd9\x03\n" +
 	"\x0fListJobsRequest\x12\x16\n" +
 	"\x06status\x18\x01 \x01(\tR\x06status\x12\x14\n" +
 	"\x05queue\x18\x02 \x01(\tR\x05queue\x12\x12\n" +
@@ -2849,7 +2868,9 @@ const file_jobs_v1_jobs_proto_rawDesc = "" +
 	"\x05limit\x18\b \x01(\x05R\x05limit\x12\x16\n" +
 	"\x06tenant\x18\t \x01(\tR\x06tenant\x12O\n" +
 	"\rmeta_contains\x18\n" +
-	" \x03(\v2*.jobs.v1.ListJobsRequest.MetaContainsEntryR\fmetaContains\x1a?\n" +
+	" \x03(\v2*.jobs.v1.ListJobsRequest.MetaContainsEntryR\fmetaContains\x12\x19\n" +
+	"\bsort_key\x18\v \x01(\tR\asortKey\x12\x19\n" +
+	"\bsort_dir\x18\f \x01(\tR\asortDir\x1a?\n" +
 	"\x11MetaContainsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"^\n" +

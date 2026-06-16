@@ -101,6 +101,16 @@
       <text class="axis-label end" x={width - right} y={height - 14}>{values[values.length - 1].label}</text>
     {/if}
   </svg>
+  <div class="legend">
+    <span class="legend-item">
+      <span class="swatch swatch-completed" aria-hidden="true"></span>
+      Completed
+    </span>
+    <span class="legend-item">
+      <span class="swatch swatch-failed" aria-hidden="true"></span>
+      Failed
+    </span>
+  </div>
   <div class="caption">last updated {updated}</div>
   <table class="visually-hidden">
     <caption>Chart data</caption>
@@ -180,6 +190,45 @@
   .failed-dot {
     stroke: var(--sig-danger);
     fill: var(--sig-danger);
+  }
+
+  /* WCAG 1.4.1: the failed series is also dashed so completed vs failed is
+     distinguishable without relying on the green/red color difference. */
+  .failed-line {
+    stroke-dasharray: 5 3;
+  }
+
+  .legend {
+    display: flex;
+    gap: var(--sp-4);
+    justify-content: center;
+    font-family: var(--font-mono);
+    font-size: var(--fs-micro);
+    color: var(--fg-secondary);
+  }
+
+  .legend-item {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--sp-2);
+  }
+
+  /* CSS-drawn line swatches (a bordered span, NOT an <svg>) so the chart keeps a
+     single <svg> for `.area-chart svg` selectors, and they don't reuse the
+     .completed-line/.failed-line classes the chart paths own. Solid vs dashed
+     mirrors the chart so the legend itself carries the non-color cue. */
+  .swatch {
+    display: inline-block;
+    width: 24px;
+    height: 0;
+  }
+
+  .swatch-completed {
+    border-top: 2px solid var(--sig-ok);
+  }
+
+  .swatch-failed {
+    border-top: 2px dashed var(--sig-danger);
   }
 
   .caption {

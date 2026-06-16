@@ -174,7 +174,7 @@ func (s *GormStorage) SearchJobs(ctx context.Context, filter core.JobFilter) ([]
 
 	var jobs []*core.Job
 	limit, offset := clampUIPagination(filter.Limit, filter.Offset)
-	err := q.Order("created_at DESC").
+	err := q.Order(jobSortOrder(filter)).
 		Offset(offset).
 		Limit(limit).
 		Find(&jobs).Error
@@ -266,6 +266,41 @@ func metadataTextExpression(s *GormStorage) string {
 	default:
 		return "CAST(metadata AS CHAR)"
 	}
+}
+
+// jobSortColumns whitelists the columns SearchJobs may ORDER BY. The client's
+// sort key is looked up here and mapped to a fixed column literal — the raw key
+// is NEVER interpolated into SQL — so server-side sort cannot be an injection
+// vector regardless of what the dashboard sends.
+var jobSortColumns = map[string]string{
+	"created_at":   "created_at",
+	"run_at":       "run_at",
+	"started_at":   "started_at",
+	"completed_at": "completed_at",
+	"priority":     "priority",
+	"status":       "status",
+	"queue":        "queue",
+	"type":         "type",
+	"attempt":      "attempt",
+}
+
+// jobSortOrder builds a safe, deterministic ORDER BY clause from a JobFilter.
+// An empty/unknown SortKey falls back to created_at; SortDir is asc or desc
+// (default desc). A created_at,id tiebreak keeps paging stable when the chosen
+// column has ties.
+func jobSortOrder(filter core.JobFilter) string {
+	col, ok := jobSortColumns[filter.SortKey]
+	if !ok {
+		col = "created_at"
+	}
+	dir := "DESC"
+	if strings.EqualFold(filter.SortDir, "asc") {
+		dir = "ASC"
+	}
+	if col == "created_at" {
+		return "created_at " + dir + ", id DESC"
+	}
+	return col + " " + dir + ", created_at DESC, id DESC"
 }
 
 // applyJobSearch applies the dashboard/dead-letter search term to a jobs query.

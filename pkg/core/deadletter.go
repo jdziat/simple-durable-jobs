@@ -11,4 +11,9 @@ type DeadLetterFilter struct {
 	Search       string
 	Limit        int
 	Offset       int
+	// SortKey/SortDir select a whitelisted order column (see GormStorage). When
+	// SortKey is empty the default dead-letter order (dead_lettered_at DESC) is
+	// kept so the most-recently-dead jobs surface first.
+	SortKey string
+	SortDir string
 }

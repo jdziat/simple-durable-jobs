@@ -158,6 +158,11 @@ message ListJobsRequest {
   int32 limit = 8;
   string tenant = 9;
   map<string, string> meta_contains = 10;
+  // sort_key selects the column to order by across the full result set (not just
+  // the current page). Server-validated against a whitelist; unknown values fall
+  // back to the default (created_at). sort_dir is "asc" or "desc" (default desc).
+  string sort_key = 11;
+  string sort_dir = 12;
 }
 message ListJobsResponse {
   repeated Job jobs = 1;

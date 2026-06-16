@@ -896,6 +896,8 @@ export const mockJobsClient = {
       metaContains?: Record<string, string>
       page?: number
       limit?: number
+      sortKey?: string
+      sortDir?: string
     },
   ): Promise<ListJobsResponse> {
     ensureSimulation()
@@ -928,8 +930,29 @@ export const mockJobsClient = {
       )
     }
 
-    // Sort newest first
-    filtered.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())
+    // Server-side sort parity: honor the same whitelisted sort_key/sort_dir the
+    // real backend applies (default created_at desc) so the published demo
+    // doesn't reintroduce the misleading "page-local" sort affordance.
+    const dir = req.sortDir === 'asc' ? 1 : -1
+    const sortVal = (j: (typeof filtered)[number]): string | number => {
+      switch (req.sortKey) {
+        case 'priority': return j.priority ?? 0
+        case 'attempt': return j.attempt ?? 0
+        case 'type': return j.type
+        case 'queue': return j.queue
+        case 'status': return j.status
+        default: return j.createdAt.getTime() // created_at + unknown/empty fallback
+      }
+    }
+    filtered.sort((a, b) => {
+      const av = sortVal(a)
+      const bv = sortVal(b)
+      let cmp: number
+      if (typeof av === 'string' && typeof bv === 'string') cmp = av.localeCompare(bv)
+      else cmp = Number(av) - Number(bv)
+      if (cmp !== 0) return cmp * dir
+      return b.createdAt.getTime() - a.createdAt.getTime() // stable created_at tiebreak
+    })
 
     const total = filtered.length
     const page = req.page ?? 1

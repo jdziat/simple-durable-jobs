@@ -141,4 +141,10 @@ type JobFilter struct {
 	Until        time.Time
 	Limit        int
 	Offset       int
+	// SortKey selects the order column across the full result set. It is
+	// validated against a storage-side whitelist; an empty or unknown value
+	// falls back to the default (created_at). SortDir is "asc" or "desc"
+	// (default desc). Never interpolated raw — see GormStorage.SearchJobs.
+	SortKey string
+	SortDir string
 }
