@@ -236,6 +236,10 @@ type WorkerConfig struct {
 	// dequeue.
 	DequeueBatchSize int
 
+	// rateSaturationCap bounds the per-worker saturated-bucket cooldown cache (see
+	// WithRateSaturationCacheSize). Default applied in NewWorker.
+	rateSaturationCap int
+
 	// Retention configures optional automatic garbage collection for terminal
 	// jobs and consumed signals. If unset, NewWorker applies generous safe
 	// defaults; use RetentionDisabled to opt out. Zero windows in an explicit
@@ -698,6 +702,30 @@ func WithDequeueBatchSize(n int) WorkerOption {
 			n = maxDequeueBatch
 		}
 		c.DequeueBatchSize = n
+	})
+}
+
+// WithRateSaturationCacheSize bounds the per-worker cache of saturated rate-limit
+// buckets used to skip the DB rate-limit transaction for a bucket already known
+// saturated this window (the cto-F2 per-key cooldown). It guards against
+// unbounded growth under a high-cardinality RateLimitKey: when the cache is full,
+// a newly-saturated bucket is simply not cached (it pays the DB denial
+// transaction, exactly as before), and existing entries still prune at window
+// rollover. Default 4096; n <= 0 keeps the default. Per-worker, so fleet memory
+// is roughly N_workers * n small entries.
+//
+// The cache is per-worker and populated only by buckets THIS worker denied, so
+// the saving is locality-dependent: with a few hot keys (or sticky routing) it
+// elides most of the contended rate-limit transactions, but under a uniform
+// key-spray across many workers each worker still pays the first
+// per-(key, window) denial. It only ever reduces the DB rate transaction, never
+// the claim/release the worker does before that gate (that is removed only by a
+// dequeue-side key exclusion, not by this cache).
+func WithRateSaturationCacheSize(n int) WorkerOption {
+	return workerOptionFunc(func(c *WorkerConfig) {
+		if n > 0 {
+			c.rateSaturationCap = n
+		}
 	})
 }
 

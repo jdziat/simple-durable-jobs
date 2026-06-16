@@ -472,3 +472,81 @@ func TestKeyedSaturation_ChurnBaseline(t *testing.T) {
 	t.Logf("cto-F2 KEYED BASELINE over %d ticks: dispatched=%d releases=%d rateChecks=%d (hot churns, cold dispatched; P1b collapses rateChecks)",
 		ticks, res.dispatched, res.releases, res.rateChecks)
 }
+
+// rateSaturationCacheLen reads the saturated-bucket cache size (test-only,
+// same-package) for the cap-bound assertion.
+func rateSaturationCacheLen(w *Worker) int {
+	w.rateSaturationMu.Lock()
+	defer w.rateSaturationMu.Unlock()
+	return len(w.rateSaturatedUntil)
+}
+
+// TestKeyedSaturation_CooldownCollapsesRateChecks is the P1b proof: the per-key
+// cooldown skips the DB rate transaction for a hot keyed bucket already denied
+// this window, so rateChecks (churn-2) collapse far below releases — while the
+// invariants P1a locked still hold (cold-key dispatch unchanged, churn-1 stays,
+// attempt-neutral). The whole run is within one wall-clock rate window, so the
+// hot key pays ~one DB check total.
+func TestKeyedSaturation_CooldownCollapsesRateChecks(t *testing.T) {
+	const perKey = 6
+	const concurrency = 16
+	const ticks = 30
+	coldKeys := []string{"cold-1", "cold-2"}
+	store := newKeyedSoakStorage(perKey, "hot", coldKeys)
+	w := NewWorker(queue.New(store),
+		WorkerQueue("default", Concurrency(concurrency)),
+		RateLimit("fleet", 1_000_000, RateLimitKey(func(j *core.Job) string { return j.Tenant })),
+		WithDequeueBatchSize(concurrency),
+		DisableRetry(),
+	)
+	w.config.WorkerID = "worker-soak"
+
+	res := runSaturationSoak(t, w, store, concurrency, ticks)
+
+	// Cold keys still dispatch (no starvation) and churn-1 still persists...
+	assert.Equal(t, perKey*len(coldKeys), res.dispatched, "cold-key dispatch unchanged by the cooldown")
+	assert.Greater(t, res.releases, int64(concurrency), "hot key still churns claim->release (churn-1 untouched)")
+	// ...but churn-2 has collapsed: the hot key pays ~one DB check for the whole
+	// window, so total rateChecks (cold + ~1 hot probe) is far below releases and
+	// bounded by cold checks plus at most one hot probe batch.
+	assert.Less(t, res.rateChecks, res.releases/2, "cooldown collapses the DB rate churn far below the claim/release churn")
+	assert.LessOrEqual(t, res.rateChecks, int64(perKey*(len(coldKeys)+1)), "rateChecks ~= cold checks + one hot probe")
+	t.Logf("cto-F2 KEYED P1b over %d ticks: dispatched=%d releases=%d rateChecks=%d (rateChecks collapsed, churn-1 retained)",
+		ticks, res.dispatched, res.releases, res.rateChecks)
+}
+
+// TestKeyedSaturation_CacheCapBoundsAndDegrades proves the bounded-memory
+// guarantee: with cap=1 and TWO saturated hot keys, the cache holds at most one,
+// and the second (uncached) hot key gracefully degrades to paying the DB rate
+// transaction on every bounce — so the map never grows past the cap regardless
+// of key cardinality.
+func TestKeyedSaturation_CacheCapBoundsAndDegrades(t *testing.T) {
+	const perKey = 4
+	const concurrency = 16
+	const ticks = 20
+	// Two hot keys, both saturated; cap of 1 can cache only one of them.
+	store := newKeyedSoakStorage(perKey, "hot-a", []string{"hot-b"})
+	store.keyDeny = func(limitName string) bool {
+		return strings.HasSuffix(limitName, ":hot-a") || strings.HasSuffix(limitName, ":hot-b")
+	}
+	w := NewWorker(queue.New(store),
+		WorkerQueue("default", Concurrency(concurrency)),
+		RateLimit("fleet", 1_000_000, RateLimitKey(func(j *core.Job) string { return j.Tenant })),
+		WithDequeueBatchSize(concurrency),
+		WithRateSaturationCacheSize(1),
+		DisableRetry(),
+	)
+	w.config.WorkerID = "worker-soak"
+	require.Equal(t, 1, w.config.rateSaturationCap)
+
+	res := runSaturationSoak(t, w, store, concurrency, ticks)
+
+	assert.Equal(t, 0, res.dispatched, "both keys saturated -> nothing dispatches")
+	assert.LessOrEqual(t, rateSaturationCacheLen(w), 1, "the saturation cache must never exceed the configured cap")
+	// The uncached hot key keeps paying the DB tx every bounce, so rateChecks stay
+	// high (graceful degrade to v1-keyed behavior for the over-cap bucket) — far
+	// above the single-cached-key collapse.
+	assert.Greater(t, res.rateChecks, int64(ticks), "the over-cap hot key degrades to paying the DB rate tx every tick")
+	t.Logf("cto-F2 KEYED cap=1 over %d ticks: releases=%d rateChecks=%d cacheLen=%d",
+		ticks, res.releases, res.rateChecks, rateSaturationCacheLen(w))
+}

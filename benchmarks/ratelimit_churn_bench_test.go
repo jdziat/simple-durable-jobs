@@ -110,13 +110,24 @@ func BenchmarkSaturatedRateLimitChurn(b *testing.B) {
 // cooldown (P1b) must reduce (it collapses rateChecks; releases stay until the
 // optional Phase 2).
 //
-// RECORDED KEYED BASELINE (unfixed dispatch loop, 2026-06-16, this harness):
+// RECORDED KEYED BASELINE vs P1b (per-key cooldown), 2026-06-16, live, this harness:
 //
-//	Postgres : completed=30 dequeues=280 releases=250 rateChecks=275 => 26.8 wasteOps/completed
-//	MySQL    : completed=30 dequeues=190 releases=160 rateChecks=190 => 18.0 wasteOps/completed
+//	            completed  dequeues  releases  rateChecks
+//	PG baseline    30        280       250        275
+//	PG + P1b       30        410       380         33   <- rateChecks -88%
+//	MySQL baseline 30        190       160        190
+//	MySQL + P1b    20        250       230         22   <- rateChecks -88%
 //
-// P1b must collapse rateChecks (churn-2) for the hot key while completed holds and
-// releases (churn-1) stay ~baseline (churn-1 only drops in the optional P2).
+// The HEADLINE metric is rateChecks: the cooldown collapses the contended,
+// serialization-retried TryConsumeRate locked transaction (the saturation
+// scaling bottleneck — every worker fighting the same window row's FOR UPDATE
+// lock) by ~88% while completed holds at the per-tenant ceiling. releases
+// (churn-1) RISE because each bounce is now a cheap single-row UPDATE instead of
+// a locked tx, so the dispatch loop bounces faster — this all-hot-tenant soak is
+// the worst case for that (a realistic mix has cold tenants doing real work
+// instead of spinning). churn-1 is only removed by the optional Phase-2 dequeue
+// pushdown. So wasteOps/completed (which weights a locked tx == an UPDATE) is the
+// WRONG summary here; rateChecks is the metric that matters.
 func BenchmarkSaturatedKeyedRateLimitChurn(b *testing.B) {
 	runChurnSoak(b, true)
 }
