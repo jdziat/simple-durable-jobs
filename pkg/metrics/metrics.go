@@ -45,8 +45,9 @@ const (
 	metricQueueSaturation  = "jobs.queue.saturation"
 	metricLeasesReclaimed  = "jobs.leases.reclaimed"
 
-	metricDequeueReleased        = "jobs.dequeue.released"
-	metricDequeueSuppressedTicks = "jobs.dequeue.suppressed_ticks"
+	metricDequeueReleased         = "jobs.dequeue.released"
+	metricDequeueSuppressedTicks  = "jobs.dequeue.suppressed_ticks"
+	metricRateSaturationCacheSize = "jobs.dequeue.rate_saturation_cache_size"
 
 	attrQueue    = "queue"
 	attrJobType  = "job.type"
@@ -370,6 +371,37 @@ func InstrumentWorkerDequeue(workerID string, releasedByReason func() map[string
 		if err != nil {
 			slog.Default().Warn("dequeue suppressed-ticks counter disabled", "error", err)
 		}
+	}
+}
+
+// InstrumentWorkerRateSaturation registers jobs.dequeue.rate_saturation_cache_size
+// {worker.id} — the current number of saturated rate-limit buckets a worker is
+// caching for the cto-F2 per-key cooldown. When this sits at the configured cap
+// (WithRateSaturationCacheSize) the cooldown is shedding new buckets to the DB
+// (a high-cardinality-RateLimitKey signal). Pass worker.DequeueRateSaturationCacheSize
+// directly (it returns int64). Decoupled from pkg/worker via a plain func value.
+func InstrumentWorkerRateSaturation(workerID string, cacheSize func() int64, opts ...InstrumentOption) {
+	if cacheSize == nil {
+		slog.Default().Warn("worker rate-saturation gauge disabled", "error", "no cache-size source")
+		return
+	}
+	cfg := &instrumentConfig{}
+	for _, opt := range opts {
+		opt(cfg)
+	}
+	if cfg.meterProvider == nil {
+		cfg.meterProvider = otel.GetMeterProvider()
+	}
+	meter := cfg.meterProvider.Meter(instrumentationName)
+	_, err := meter.Int64ObservableGauge(metricRateSaturationCacheSize,
+		metric.WithUnit("{bucket}"),
+		metric.WithDescription("Saturated rate-limit buckets cached by the per-key cooldown; at the cap means new buckets fall back to the DB rate transaction."),
+		metric.WithInt64Callback(func(_ context.Context, observer metric.Int64Observer) error {
+			observer.Observe(cacheSize(), metric.WithAttributes(attribute.String(attrWorkerID, workerID)))
+			return nil
+		}))
+	if err != nil {
+		slog.Default().Warn("worker rate-saturation gauge disabled", "error", err)
 	}
 }
 
