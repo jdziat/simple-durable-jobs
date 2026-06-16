@@ -330,4 +330,30 @@ func TestSaturatedDispatch_KeyedLimitNotSuppressed(t *testing.T) {
 	// before the throttle. (~concurrency bounces/tick.)
 	assert.Greater(t, res.releases, int64(concurrency),
 		"keyed config must NOT be throttled — churn continues unchanged")
+	// And it records no suppressed ticks (the throttle never fires for keyed).
+	assert.Equal(t, int64(0), w.DequeueSuppressedTicks(), "keyed config records no suppressed ticks")
+}
+
+// TestSaturatedDispatch_ChurnMetricsRecorded verifies the cto-F2 observability
+// counters: a saturated unkeyed fleet limit records fleet_rate bounces AND
+// suppressed ticks, and the counts reflect the collapse (a single probe batch
+// of fleet_rate bounces, then many suppressed ticks).
+func TestSaturatedDispatch_ChurnMetricsRecorded(t *testing.T) {
+	const concurrency = 8
+	const ticks = 30
+	store := newSoakStorage(concurrency * 4)
+	store.allow.Store(false)
+	w := newSaturationWorker(store, concurrency)
+
+	runSaturationSoak(t, w, store, concurrency, ticks)
+
+	released := w.DequeueReleasedByReason()
+	suppressed := w.DequeueSuppressedTicks()
+	t.Logf("released=%v suppressedTicks=%d", released, suppressed)
+
+	assert.Greater(t, released["fleet_rate"], int64(0), "the saturated fleet limit must record fleet_rate bounces")
+	assert.LessOrEqual(t, released["fleet_rate"], int64(concurrency), "only one probe batch of fleet_rate bounces under the throttle")
+	assert.Zero(t, released["queue_cap"], "no per-queue cap bounces in this scenario")
+	assert.Zero(t, released["queue_rate"], "no queue-rate bounces in this scenario")
+	assert.Greater(t, suppressed, int64(0), "suppressed ticks must be recorded once the throttle engages")
 }

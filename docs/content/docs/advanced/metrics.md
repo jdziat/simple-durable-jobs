@@ -75,6 +75,8 @@ Without `WithMeterProvider`, instrumentation uses `otel.GetMeterProvider()`.
 | `jobs.dead_letter.depth` | `Int64ObservableGauge` | `{job}` | `queue` | Current dead-lettered job depth by queue. |
 | `jobs.queue.saturation` | `Float64ObservableGauge` | `1` | `queue`, `worker.id` | Worker-local running jobs divided by configured capacity by queue. |
 | `jobs.leases.reclaimed` | `Int64Counter` | `{job}` | `reason=stale_lock\|ownership_audit` | Job leases reclaimed from a presumed-dead owner or observed reclaimed by a peer. |
+| `jobs.dequeue.released` | `Int64ObservableCounter` | `{job}` | `worker.id`, `reason=queue_cap\|queue_rate\|concurrency\|fleet_rate\|shutdown` | Dequeued jobs released back to pending without running, by reason. |
+| `jobs.dequeue.suppressed_ticks` | `Int64ObservableCounter` | `{tick}` | `worker.id`, `reason=fleet_rate_saturated` | Poll ticks the rate-saturation throttle skipped claiming jobs. |
 
 The throughput, latency, depth, backlog-age, dead-letter-depth, and reclaimed
 metrics are wired automatically by `Instrument`; `jobs.leases.reclaimed`
@@ -101,6 +103,35 @@ carries `worker.id`. Alert with `avg by (queue)`, not `sum`, so two workers at
 
 ```promql
 avg by (queue) (jobs_queue_saturation) > 0.9
+```
+
+### Dequeue churn (rate-limit saturation throttle)
+
+`jobs.dequeue.released` and `jobs.dequeue.suppressed_ticks` are worker-side
+counters that surface dispatch churn. They are registered per worker with
+`InstrumentWorkerDequeue(workerID, worker.DequeueReleasedByReason, worker.DequeueSuppressedTicks, ...)`
+and both carry `worker.id`.
+
+A worker dequeues (claims) a job before the final admission gates run; if a gate
+denies, the job is released back to pending — a "bounce" counted under
+`jobs.dequeue.released` by `reason`. When **every** configured fleet `RateLimit`
+is unkeyed, a saturated limit engages a claim-rate throttle: the worker stops
+claiming until the limit's rate window rolls over, rather than bouncing the full
+concurrency budget every poll tick. Each suppressed tick increments
+`jobs.dequeue.suppressed_ticks`.
+
+The healthy steady state under a saturated fleet limit is `suppressed_ticks`
+rising while `released{reason="fleet_rate"}` stays low (one probe batch per rate
+window) — the throttle collapsing the claim/release write amplification, not a
+stuck worker. A `released{reason="fleet_rate"}` rate that climbs every tick means
+the throttle is **not** engaging — most often because a *keyed* `RateLimit` is
+configured (the throttle only applies to all-unkeyed configs, since a keyed
+limit's window can't be checked before a job is claimed). Trade-off: a
+just-recovered limit can wait up to one rate window before this worker probes it
+again.
+
+```promql
+rate(jobs_dequeue_released_total{reason="fleet_rate"}[5m])
 ```
 
 See [Production Operations]({{< relref "/docs/production-ops" >}}) for the full
