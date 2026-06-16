@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync/atomic"
 	"time"
 
 	"connectrpc.com/connect"
 	"google.golang.org/protobuf/types/known/timestamppb"
+	"gorm.io/gorm"
 
 	"github.com/jdziat/simple-durable-jobs/v3/pkg/core"
 	"github.com/jdziat/simple-durable-jobs/v3/pkg/queue"
@@ -49,7 +51,7 @@ func newJobsService(storage core.Storage, q *queue.Queue, statsStorage StatsStor
 func (s *jobsService) GetStats(ctx context.Context, req *connect.Request[jobsv1.GetStatsRequest]) (*connect.Response[jobsv1.GetStatsResponse], error) {
 	stats, err := s.getQueueStats(ctx)
 	if err != nil {
-		return nil, connect.NewError(connect.CodeInternal, err)
+		return nil, errToConnect(err)
 	}
 
 	resp := &jobsv1.GetStatsResponse{
@@ -70,7 +72,7 @@ func (s *jobsService) GetStats(ctx context.Context, req *connect.Request[jobsv1.
 	if active, ok := s.storage.(activeWorkersStorage); ok {
 		count, err := active.CountActiveWorkers(ctx)
 		if err != nil {
-			return nil, connect.NewError(connect.CodeInternal, err)
+			return nil, errToConnect(err)
 		}
 		if count > maxInt32Value {
 			resp.ActiveWorkers = int32(maxInt32Value)
@@ -92,7 +94,7 @@ func (s *jobsService) GetStatsHistory(ctx context.Context, req *connect.Request[
 
 	stats, err := s.statsStorage.GetStatsHistory(ctx, req.Msg.Queue, since, until)
 	if err != nil {
-		return nil, connect.NewError(connect.CodeInternal, err)
+		return nil, errToConnect(err)
 	}
 
 	// Bucket the raw per-minute rows into a fixed, evenly-spaced grid that spans
@@ -172,11 +174,7 @@ func (s *jobsService) ListJobs(ctx context.Context, req *connect.Request[jobsv1.
 
 	jobs, total, err := s.searchJobs(ctx, req.Msg, limit, page)
 	if err != nil {
-		var connectErr *connect.Error
-		if errors.As(err, &connectErr) {
-			return nil, connectErr
-		}
-		return nil, connect.NewError(connect.CodeInternal, err)
+		return nil, errToConnect(err)
 	}
 
 	pbJobs := make([]*jobsv1.Job, len(jobs))
@@ -199,7 +197,7 @@ func (s *jobsService) GetJob(ctx context.Context, req *connect.Request[jobsv1.Ge
 	}
 	job, err := s.storage.GetJob(ctx, id)
 	if err != nil {
-		return nil, connect.NewError(connect.CodeInternal, err)
+		return nil, errToConnect(err)
 	}
 	if job == nil {
 		return nil, connect.NewError(connect.CodeNotFound, nil)
@@ -207,7 +205,7 @@ func (s *jobsService) GetJob(ctx context.Context, req *connect.Request[jobsv1.Ge
 
 	checkpoints, err := s.storage.GetCheckpoints(ctx, job.ID)
 	if err != nil {
-		return nil, connect.NewError(connect.CodeInternal, err)
+		return nil, errToConnect(err)
 	}
 
 	pbCheckpoints := make([]*jobsv1.Checkpoint, len(checkpoints))
@@ -225,7 +223,7 @@ func (s *jobsService) GetJob(ctx context.Context, req *connect.Request[jobsv1.Ge
 func (s *jobsService) RetryJob(ctx context.Context, req *connect.Request[jobsv1.RetryJobRequest]) (*connect.Response[jobsv1.RetryJobResponse], error) {
 	job, err := s.retryJob(ctx, req.Msg.Id)
 	if err != nil {
-		return nil, connect.NewError(connect.CodeInternal, err)
+		return nil, errToConnect(err)
 	}
 	if job == nil {
 		return nil, connect.NewError(connect.CodeNotFound, nil)
@@ -242,53 +240,78 @@ func (s *jobsService) DeleteJob(ctx context.Context, req *connect.Request[jobsv1
 	// whole fan-out subtree); otherwise deleting a workflow parent is refused.
 	if req.Msg.DeleteSubtree {
 		if err := s.deleteWorkflowSubtree(ctx, req.Msg.Id); err != nil {
-			return nil, connect.NewError(connect.CodeInternal, err)
+			return nil, errToConnect(err)
 		}
 		return connect.NewResponse(&jobsv1.DeleteJobResponse{}), nil
 	}
 	if err := s.deleteJob(ctx, req.Msg.Id); err != nil {
-		// A workflow parent cannot be deleted directly — surface it as a
-		// precondition failure with the actionable message rather than an opaque
-		// internal error.
-		if errors.Is(err, core.ErrJobHasChildren) {
-			return nil, connect.NewError(connect.CodeFailedPrecondition, err)
-		}
-		return nil, connect.NewError(connect.CodeInternal, err)
+		// errToConnect maps ErrJobHasChildren -> FailedPrecondition (the actionable
+		// "delete the workflow instead") and everything else appropriately.
+		return nil, errToConnect(err)
 	}
 	return connect.NewResponse(&jobsv1.DeleteJobResponse{}), nil
 }
 
-// BulkRetryJobs retries multiple jobs.
-func (s *jobsService) BulkRetryJobs(ctx context.Context, req *connect.Request[jobsv1.BulkRetryJobsRequest]) (*connect.Response[jobsv1.BulkRetryJobsResponse], error) {
-	if len(req.Msg.Ids) > maxBulkJobIDs {
+// validateBulkIDs enforces the batch-size cap and rejects the whole request with
+// InvalidArgument if ANY id is malformed, before any mutation runs — so a bad id
+// can't masquerade as a benign "skipped" miss. Returns the parsed ids in order.
+func validateBulkIDs(ids []string) ([]core.UUID, error) {
+	if len(ids) > maxBulkJobIDs {
 		return nil, connect.NewError(connect.CodeInvalidArgument, fmt.Errorf("too many job IDs: max %d", maxBulkJobIDs))
+	}
+	parsed := make([]core.UUID, len(ids))
+	for i, id := range ids {
+		uid, err := core.ParseUUID(id)
+		if err != nil {
+			return nil, connect.NewError(connect.CodeInvalidArgument, fmt.Errorf("invalid job id %q: %w", id, err))
+		}
+		parsed[i] = uid
+	}
+	return parsed, nil
+}
+
+// BulkRetryJobs retries multiple jobs. count is the number retried; every id NOT
+// retried is reported in skipped with a reason, so a reduced count is no longer
+// the only (ambiguous) signal of loss (F-003).
+func (s *jobsService) BulkRetryJobs(ctx context.Context, req *connect.Request[jobsv1.BulkRetryJobsRequest]) (*connect.Response[jobsv1.BulkRetryJobsResponse], error) {
+	if _, err := validateBulkIDs(req.Msg.Ids); err != nil {
+		return nil, err
 	}
 
 	count := 0
+	var skipped []*jobsv1.BulkSkip
 	for _, id := range req.Msg.Ids {
-		if _, err := s.retryJob(ctx, id); err == nil {
-			count++
+		if _, err := s.retryJob(ctx, id); err != nil {
+			skipped = append(skipped, &jobsv1.BulkSkip{Id: id, Reason: bulkSkipReason(err)})
+			continue
 		}
+		count++
 	}
 	return connect.NewResponse(&jobsv1.BulkRetryJobsResponse{
-		Count: int32(count),
+		Count:   int32(count),
+		Skipped: skipped,
 	}), nil
 }
 
-// BulkDeleteJobs deletes multiple jobs.
+// BulkDeleteJobs deletes multiple jobs. See BulkRetryJobs for the count/skipped
+// contract (F-003).
 func (s *jobsService) BulkDeleteJobs(ctx context.Context, req *connect.Request[jobsv1.BulkDeleteJobsRequest]) (*connect.Response[jobsv1.BulkDeleteJobsResponse], error) {
-	if len(req.Msg.Ids) > maxBulkJobIDs {
-		return nil, connect.NewError(connect.CodeInvalidArgument, fmt.Errorf("too many job IDs: max %d", maxBulkJobIDs))
+	if _, err := validateBulkIDs(req.Msg.Ids); err != nil {
+		return nil, err
 	}
 
 	count := 0
+	var skipped []*jobsv1.BulkSkip
 	for _, id := range req.Msg.Ids {
-		if err := s.deleteJob(ctx, id); err == nil {
-			count++
+		if err := s.deleteJob(ctx, id); err != nil {
+			skipped = append(skipped, &jobsv1.BulkSkip{Id: id, Reason: bulkSkipReason(err)})
+			continue
 		}
+		count++
 	}
 	return connect.NewResponse(&jobsv1.BulkDeleteJobsResponse{
-		Count: int32(count),
+		Count:   int32(count),
+		Skipped: skipped,
 	}), nil
 }
 
@@ -302,11 +325,11 @@ func (s *jobsService) PauseJob(ctx context.Context, req *connect.Request[jobsv1.
 		return nil, connect.NewError(connect.CodeInvalidArgument, err)
 	}
 	if err := s.queue.PauseJob(ctx, id); err != nil {
-		return nil, connect.NewError(connect.CodeInternal, err)
+		return nil, errToConnect(err)
 	}
 	job, err := s.storage.GetJob(ctx, id)
 	if err != nil {
-		return nil, connect.NewError(connect.CodeInternal, err)
+		return nil, errToConnect(err)
 	}
 	if job == nil {
 		return nil, connect.NewError(connect.CodeNotFound, nil)
@@ -324,11 +347,11 @@ func (s *jobsService) CancelJob(ctx context.Context, req *connect.Request[jobsv1
 		return nil, connect.NewError(connect.CodeInvalidArgument, err)
 	}
 	if err := s.queue.CancelJob(ctx, id); err != nil {
-		return nil, connect.NewError(connect.CodeInternal, err)
+		return nil, errToConnect(err)
 	}
 	job, err := s.storage.GetJob(ctx, id)
 	if err != nil {
-		return nil, connect.NewError(connect.CodeInternal, err)
+		return nil, errToConnect(err)
 	}
 	if job == nil {
 		return nil, connect.NewError(connect.CodeNotFound, nil)
@@ -346,11 +369,11 @@ func (s *jobsService) ResumeJob(ctx context.Context, req *connect.Request[jobsv1
 		return nil, connect.NewError(connect.CodeInvalidArgument, err)
 	}
 	if err := s.queue.ResumeJob(ctx, id); err != nil {
-		return nil, connect.NewError(connect.CodeInternal, err)
+		return nil, errToConnect(err)
 	}
 	job, err := s.storage.GetJob(ctx, id)
 	if err != nil {
-		return nil, connect.NewError(connect.CodeInternal, err)
+		return nil, errToConnect(err)
 	}
 	if job == nil {
 		return nil, connect.NewError(connect.CodeNotFound, nil)
@@ -364,7 +387,7 @@ func (s *jobsService) PauseQueue(ctx context.Context, req *connect.Request[jobsv
 		return nil, connect.NewError(connect.CodeUnimplemented, nil)
 	}
 	if err := s.queue.PauseQueue(ctx, req.Msg.Name); err != nil {
-		return nil, connect.NewError(connect.CodeInternal, err)
+		return nil, errToConnect(err)
 	}
 	return connect.NewResponse(&jobsv1.PauseQueueResponse{}), nil
 }
@@ -375,7 +398,7 @@ func (s *jobsService) ResumeQueue(ctx context.Context, req *connect.Request[jobs
 		return nil, connect.NewError(connect.CodeUnimplemented, nil)
 	}
 	if err := s.queue.ResumeQueue(ctx, req.Msg.Name); err != nil {
-		return nil, connect.NewError(connect.CodeInternal, err)
+		return nil, errToConnect(err)
 	}
 	return connect.NewResponse(&jobsv1.ResumeQueueResponse{}), nil
 }
@@ -384,7 +407,7 @@ func (s *jobsService) ResumeQueue(ctx context.Context, req *connect.Request[jobs
 func (s *jobsService) ListQueues(ctx context.Context, req *connect.Request[jobsv1.ListQueuesRequest]) (*connect.Response[jobsv1.ListQueuesResponse], error) {
 	stats, err := s.getQueueStats(ctx)
 	if err != nil {
-		return nil, connect.NewError(connect.CodeInternal, err)
+		return nil, errToConnect(err)
 	}
 	return connect.NewResponse(&jobsv1.ListQueuesResponse{
 		Queues: stats,
@@ -402,7 +425,7 @@ func (s *jobsService) PurgeQueue(ctx context.Context, req *connect.Request[jobsv
 
 	deleted, err := s.purgeQueue(ctx, req.Msg.Name, req.Msg.Status)
 	if err != nil {
-		return nil, connect.NewError(connect.CodeInternal, err)
+		return nil, errToConnect(err)
 	}
 	return connect.NewResponse(&jobsv1.PurgeQueueResponse{
 		Deleted: deleted,
@@ -419,7 +442,7 @@ func (s *jobsService) ListScheduledJobs(ctx context.Context, req *connect.Reques
 			var err error
 			lastRuns, err = fireTimes.GetScheduledFireTimes(ctx)
 			if err != nil {
-				return nil, connect.NewError(connect.CodeInternal, err)
+				return nil, errToConnect(err)
 			}
 		}
 
@@ -464,7 +487,7 @@ func (s *jobsService) GetWorkflow(ctx context.Context, req *connect.Request[jobs
 	}
 	job, err := s.storage.GetJob(ctx, id)
 	if err != nil {
-		return nil, connect.NewError(connect.CodeInternal, err)
+		return nil, errToConnect(err)
 	}
 	if job == nil {
 		return nil, connect.NewError(connect.CodeNotFound, nil)
@@ -476,7 +499,7 @@ func (s *jobsService) GetWorkflow(ctx context.Context, req *connect.Request[jobs
 	for i := 0; i < 100 && root.ParentJobID != nil; i++ {
 		parent, err := s.storage.GetJob(ctx, *root.ParentJobID)
 		if err != nil {
-			return nil, connect.NewError(connect.CodeInternal, err)
+			return nil, errToConnect(err)
 		}
 		if parent == nil {
 			// Parent no longer exists; treat current node as root.
@@ -487,7 +510,7 @@ func (s *jobsService) GetWorkflow(ctx context.Context, req *connect.Request[jobs
 
 	allFanOuts, allChildren, err := s.collectWorkflowTree(ctx, root)
 	if err != nil {
-		return nil, connect.NewError(connect.CodeInternal, err)
+		return nil, errToConnect(err)
 	}
 
 	return connect.NewResponse(&jobsv1.GetWorkflowResponse{
@@ -518,12 +541,12 @@ func (s *jobsService) ListWorkflows(ctx context.Context, req *connect.Request[jo
 
 	roots, total, err := ui.GetWorkflowRoots(ctx, req.Msg.Status, limit, offset)
 	if err != nil {
-		return nil, connect.NewError(connect.CodeInternal, err)
+		return nil, errToConnect(err)
 	}
 
 	fanOutsByParent, err := s.getFanOutsForParents(ctx, roots)
 	if err != nil {
-		return nil, connect.NewError(connect.CodeInternal, err)
+		return nil, errToConnect(err)
 	}
 
 	summaries := make([]*jobsv1.WorkflowSummary, 0, len(roots))
@@ -919,6 +942,74 @@ func (s *jobsService) deleteWorkflowSubtree(ctx context.Context, id string) erro
 		return d.DeleteWorkflowSubtree(ctx, jobID)
 	}
 	return connect.NewError(connect.CodeUnimplemented, nil)
+}
+
+// errToConnect maps a storage/queue error to a connect.Error with an accurate,
+// non-leaky code. It is the single funnel every dashboard handler uses for errors
+// returned by storage/queue calls, replacing the old blanket
+// connect.NewError(CodeInternal, err):
+//
+//   - An existing *connect.Error is returned unchanged, so codes set by inner
+//     helpers (CodeInvalidArgument for a bad UUID, CodeUnimplemented for a
+//     non-UI storage) survive instead of collapsing to Internal (F-002).
+//   - Known, user-actionable sentinels map to their semantic code, preserving
+//     their safe descriptive message (these carry no backend internals).
+//   - Anything else is logged in full server-side and returned as a generic
+//     Internal, so raw backend/SQL error text never reaches the dashboard
+//     client (SEC-3).
+func errToConnect(err error) error {
+	if err == nil {
+		return nil
+	}
+	var ce *connect.Error
+	if errors.As(err, &ce) {
+		return ce
+	}
+	switch {
+	case errors.Is(err, core.ErrJobNotFound), errors.Is(err, gorm.ErrRecordNotFound):
+		return connect.NewError(connect.CodeNotFound, errors.New("job not found"))
+	case errors.Is(err, core.ErrJobHasChildren),
+		errors.Is(err, core.ErrJobAlreadyPaused),
+		errors.Is(err, core.ErrJobNotPaused),
+		errors.Is(err, core.ErrCannotPauseStatus),
+		errors.Is(err, core.ErrQueueAlreadyPaused),
+		errors.Is(err, core.ErrQueueNotPaused),
+		errors.Is(err, core.ErrCannotRequeueSubJob):
+		// User-actionable state errors; their sentinel text is safe to surface.
+		return connect.NewError(connect.CodeFailedPrecondition, err)
+	}
+	slog.Default().Error("dashboard rpc storage error", "error", err)
+	return connect.NewError(connect.CodeInternal, errors.New("internal error"))
+}
+
+// bulkSkipReason classifies a per-item bulk-mutation error (the ORIGINAL error
+// from retryJob/deleteJob) into a short, non-leaky reason for BulkSkip.reason.
+// It never echoes raw backend text; an unclassified error is logged server-side
+// (as errToConnect does for single calls) and reported generically.
+func bulkSkipReason(err error) string {
+	switch {
+	case errors.Is(err, core.ErrJobNotFound), errors.Is(err, gorm.ErrRecordNotFound):
+		return "not found"
+	case errors.Is(err, core.ErrJobHasChildren):
+		return "workflow parent (delete the workflow instead)"
+	case errors.Is(err, core.ErrCannotRequeueSubJob):
+		return "fan-out sub-job (retry its parent)"
+	}
+	var ce *connect.Error
+	if errors.As(err, &ce) {
+		switch ce.Code() {
+		case connect.CodeUnimplemented:
+			return "unsupported by storage"
+		case connect.CodeInvalidArgument:
+			return "invalid id"
+		case connect.CodeNotFound:
+			return "not found"
+		case connect.CodeFailedPrecondition:
+			return ce.Message() // our own safe sentinel text
+		}
+	}
+	slog.Default().Error("bulk mutation item failed", "error", err)
+	return "internal error"
 }
 
 func (s *jobsService) purgeQueue(ctx context.Context, queueName, status string) (int64, error) {
