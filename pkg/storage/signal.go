@@ -67,10 +67,14 @@ func (s *GormStorage) ConsumeSignal(ctx context.Context, jobID core.UUID, name s
 			if err != nil {
 				return err
 			}
+			// Write consumed_at on the DB clock (nowWriteValue) so it shares a
+			// clock with the DB-clock retention cutoff in
+			// DeleteConsumedSignalsOlderThan; now is the wall-clock approximation
+			// returned in the struct (no caller reads it for equality).
 			now := time.Now()
 			res := tx.Model(&core.Signal{}).
 				Where("id = ? AND consumed_at IS NULL", sig.ID).
-				Update("consumed_at", now)
+				Update("consumed_at", s.nowWriteValue())
 			if res.Error != nil {
 				return res.Error
 			}
@@ -106,6 +110,8 @@ func (s *GormStorage) DrainSignals(ctx context.Context, jobID core.UUID, name st
 			if len(sigs) == 0 {
 				return nil
 			}
+			// consumed_at on the DB clock (see ConsumeSignal); now is the
+			// wall-clock approximation surfaced in the returned structs.
 			now := time.Now()
 			ids := make([]core.UUID, len(sigs))
 			for i, sg := range sigs {
@@ -114,7 +120,7 @@ func (s *GormStorage) DrainSignals(ctx context.Context, jobID core.UUID, name st
 			}
 			if err := tx.Model(&core.Signal{}).
 				Where("id IN ?", ids).
-				Update("consumed_at", now).Error; err != nil {
+				Update("consumed_at", s.nowWriteValue()).Error; err != nil {
 				return err
 			}
 			if err := s.decodeSignalPayloads(sigs); err != nil {
@@ -162,10 +168,12 @@ func (s *GormStorage) ConsumeSignalTx(ctx context.Context, jobID core.UUID, name
 			if err != nil {
 				return err
 			}
+			// consumed_at on the DB clock (see ConsumeSignal); now is the
+			// wall-clock approximation surfaced in the returned struct.
 			now := time.Now()
 			res := tx.Model(&core.Signal{}).
 				Where("id = ? AND consumed_at IS NULL", sig.ID).
-				Update("consumed_at", now)
+				Update("consumed_at", s.nowWriteValue())
 			if res.Error != nil {
 				return res.Error
 			}
@@ -213,6 +221,8 @@ func (s *GormStorage) DrainSignalsTx(ctx context.Context, jobID core.UUID, name 
 				return err
 			}
 			if len(sigs) > 0 {
+				// consumed_at on the DB clock (see ConsumeSignal); now is the
+				// wall-clock approximation surfaced in the returned structs.
 				now := time.Now()
 				ids := make([]core.UUID, len(sigs))
 				for i, sg := range sigs {
@@ -221,7 +231,7 @@ func (s *GormStorage) DrainSignalsTx(ctx context.Context, jobID core.UUID, name 
 				}
 				if err := tx.Model(&core.Signal{}).
 					Where("id IN ?", ids).
-					Update("consumed_at", now).Error; err != nil {
+					Update("consumed_at", s.nowWriteValue()).Error; err != nil {
 					return err
 				}
 				if err := s.decodeSignalPayloads(sigs); err != nil {

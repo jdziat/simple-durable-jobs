@@ -204,6 +204,36 @@ func TestQueue_EnqueueBatch_BuildErrorPersistsNothing(t *testing.T) {
 	assert.Empty(t, store.jobs)
 }
 
+// F2: EnqueueBatch must reject IdempotencyKey/UniqueFor entries rather than
+// silently drop the windowed dedup (it has no batch unique-lock variant — only
+// the active-unique UniqueKey works in a batch).
+func TestQueue_EnqueueBatch_RejectsWindowedDedupOptions(t *testing.T) {
+	store := &batchCountingStorage{mockStorage: newMockStorage()}
+	q := New(store)
+
+	_, err := q.EnqueueBatch(context.Background(), []BatchEntry{
+		Batch("job.a", "a"),
+		Batch("job.b", "b", IdempotencyKey("k", time.Minute)),
+	})
+	require.ErrorIs(t, err, core.ErrBatchWindowedDedup)
+	assert.Zero(t, store.enqueueBatchCalls, "nothing persisted when an entry is rejected")
+	assert.Empty(t, store.batchJobs)
+
+	_, err = q.EnqueueBatch(context.Background(), []BatchEntry{
+		Batch("job.a", "a", UniqueFor(time.Minute)),
+	})
+	require.ErrorIs(t, err, core.ErrBatchWindowedDedup)
+	assert.Zero(t, store.enqueueBatchCalls)
+
+	// UniqueKey (active-unique) is still allowed within a batch.
+	ids, err := q.EnqueueBatch(context.Background(), []BatchEntry{
+		Batch("job.a", "a", Unique("uk-1")),
+	})
+	require.NoError(t, err)
+	require.Len(t, ids, 1)
+	assert.Equal(t, 1, store.enqueueBatchCalls)
+}
+
 func TestQueue_EnqueueBatch_ValidatesJobTypeName(t *testing.T) {
 	store := &batchCountingStorage{mockStorage: newMockStorage()}
 	q := New(store)
