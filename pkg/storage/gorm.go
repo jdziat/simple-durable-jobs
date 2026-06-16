@@ -1744,6 +1744,14 @@ func (s *GormStorage) CancelSubJob(ctx context.Context, jobID core.UUID) (*core.
 				return nil
 			}
 
+			// Release any fleet concurrency slots held by this now-cancelled
+			// (terminal) sub-job, atomically with the cancel write — mirrors the
+			// CancelSubJobs (plural) and terminal-completion paths so a worker that
+			// dies before its deferred release cannot orphan a live slot.
+			if err := tx.Where("job_id = ?", jobID).Delete(&core.ConcurrencySlot{}).Error; err != nil {
+				return err
+			}
+
 			if err := tx.First(&fanOut, "id = ?", *job.FanOutID).Error; err != nil {
 				return err
 			}
@@ -2259,6 +2267,16 @@ func (s *GormStorage) pauseJobAggressive(ctx context.Context, jobID core.UUID) e
 				return cancelResult.Error
 			}
 			if cancelResult.RowsAffected > 0 {
+				// The job was running and is now cancelled (terminal). Release any
+				// fleet concurrency slots it held, in this tx — the worker's
+				// deferred release won't run for a job cancelled out from under it,
+				// so without this the slot would orphan until its TTL (~45m),
+				// silently shrinking the cap. Mirrors CancelSubJobs / terminal
+				// completion (keyed by job_id; the per-slot-name sentinel job_id=''
+				// is never matched).
+				if err := tx.Where("job_id = ?", jobID).Delete(&core.ConcurrencySlot{}).Error; err != nil {
+					return err
+				}
 				return nil
 			}
 

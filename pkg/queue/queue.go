@@ -447,6 +447,13 @@ func (q *Queue) enqueueBatch(ctx context.Context, entries []BatchEntry, enqueueB
 		for _, opt := range entry.Options {
 			opt.Apply(options)
 		}
+		// IdempotencyKey/UniqueFor are backed by the per-row windowed unique-lock
+		// path, which has no batch variant — honoring only UniqueKey here would
+		// silently drop the requested dedup. Reject explicitly so the caller learns
+		// the limitation instead of getting un-deduplicated jobs.
+		if options.IdempotencyKey != "" || options.UniqueForTTL > 0 {
+			return nil, fmt.Errorf("%w (entry %d)", core.ErrBatchWindowedDedup, i)
+		}
 		job, err := q.buildJob(entry.Name, entry.Args, options)
 		if err != nil {
 			return nil, err

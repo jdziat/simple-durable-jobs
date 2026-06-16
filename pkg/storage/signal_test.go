@@ -55,6 +55,36 @@ func TestSendConsumeSignal_FIFO(t *testing.T) {
 	assert.Equal(t, `"x"`, string(other.Payload))
 }
 
+// ST-03: consumed_at is written on the DB clock so it shares a clock with
+// DeleteConsumedSignalsOlderThan's DB-clock retention cutoff. A freshly consumed
+// signal must read as recent to the GC (survives a generous age); once its
+// consumed_at predates the window it is collected.
+func TestDeleteConsumedSignals_ClockConsistentWithConsume(t *testing.T) {
+	s := newTestStorage(t)
+	ctx := context.Background()
+
+	sendTestSignal(t, ctx, s, "gc1", "ev", []byte(`"x"`))
+	got, err := s.ConsumeSignal(ctx, signalUUID("gc1"), "ev")
+	require.NoError(t, err)
+	require.NotNil(t, got)
+
+	// Freshly consumed: a generous (1h) cutoff must NOT collect it — the stored
+	// consumed_at is recent on the same clock the cutoff is computed from.
+	deleted, err := s.DeleteConsumedSignalsOlderThan(ctx, time.Hour, 100)
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), deleted, "recently consumed signal must survive an hour-old cutoff")
+
+	// Age it past the window; now the GC collects it.
+	old := time.Now().Add(-2 * time.Hour).UTC()
+	require.NoError(t, s.db.WithContext(ctx).
+		Model(&core.Signal{}).
+		Where("job_id = ?", signalUUID("gc1")).
+		Update("consumed_at", old).Error)
+	deleted, err = s.DeleteConsumedSignalsOlderThan(ctx, time.Hour, 100)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), deleted, "consumed signal older than the cutoff is collected")
+}
+
 func TestPeekSignal_DoesNotConsume(t *testing.T) {
 	s := newTestStorage(t)
 	ctx := context.Background()

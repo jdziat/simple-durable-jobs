@@ -65,6 +65,26 @@ func (s *GormStorage) nowExpr() clause.Expr {
 	return gorm.Expr("NOW()")
 }
 
+// nowWriteValue returns the value to store for a "now" timestamp column: the
+// database server clock (s.nowExpr()) on multi-worker backends, and the caller's
+// wall clock in UTC on single-clock SQLite. Use it for timestamps that one worker
+// writes and another worker (or a background sweep) later compares against —
+// e.g. signals' consumed_at, which DeleteConsumedSignalsOlderThan filters with a
+// cutoff (offsetExpr on Postgres/MySQL, time.Now().Add(-age).UTC() on SQLite).
+//
+// On Postgres/MySQL anchoring both ends to the one DB clock removes the
+// worker/DB skew that would otherwise GC consumed signals early or late. On
+// SQLite — which has no datetime type and compares timestamps as strings — the
+// .UTC() normalization is what makes the stored value lexically comparable with
+// the UTC cutoff; a local-offset string (e.g. "...-07:00") would mis-sort against
+// a UTC ("...Z") cutoff across the offset and delete recent rows / keep stale ones.
+func (s *GormStorage) nowWriteValue() any {
+	if s.useDBClock() {
+		return s.nowExpr()
+	}
+	return time.Now().UTC()
+}
+
 func (s *GormStorage) dequeueEligibleExpr() string {
 	if s.dialect() == dialectMySQL {
 		return "dq_eligible_at"

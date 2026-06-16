@@ -49,6 +49,13 @@ var (
 	// ErrStorageNoUniqueLocks is returned when the storage backend does not
 	// implement windowed enqueue deduplication.
 	ErrStorageNoUniqueLocks = errors.New("jobs: storage backend does not support windowed enqueue deduplication")
+	// ErrBatchWindowedDedup is returned by EnqueueBatch/EnqueueBatchTx when an
+	// entry carries IdempotencyKey or UniqueFor. Those options are backed by the
+	// per-row windowed unique-lock path (EnqueueWithUniqueLock), which has no
+	// batch variant; batch enqueue only honors the active-unique UniqueKey. The
+	// guard surfaces the limitation instead of silently dropping the dedup. Use
+	// single Enqueue for windowed deduplication, or UniqueKey within a batch.
+	ErrBatchWindowedDedup = errors.New("jobs: EnqueueBatch does not support IdempotencyKey/UniqueFor (windowed dedup); use single Enqueue or UniqueKey")
 	// ErrPayloadDecode wraps codec failures while reading stored payload bytes.
 	ErrPayloadDecode = errors.New("jobs: payload decode failed")
 	// ErrJobHasChildren is returned by DeleteJob when the target is a fan-out
