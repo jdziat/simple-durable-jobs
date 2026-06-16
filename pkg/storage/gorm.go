@@ -2114,6 +2114,49 @@ func (s *GormStorage) GetCompletablePendingFanOuts(ctx context.Context, olderTha
 	return fanOuts, nil
 }
 
+// CleanAbandonedFanOuts deletes pending fan_outs that were abandoned mid-creation
+// (crash between CreateFanOut and EnqueueBatch): the parent is already TERMINAL,
+// the fan_out has ZERO sub-jobs, and it is older than olderThan. Such a row can
+// never complete and blocks the terminal parent's retention forever (the
+// retention guard refuses to delete a parent with any pending fan_out). Restricting
+// to a TERMINAL parent makes deletion safe - a terminal parent never replays, so
+// removing its orphan fan_out cannot break fan-out replay; and ZERO sub-jobs means
+// the delete strands nothing. Bounded by maxResumeBatch per call. Returns the count
+// deleted.
+func (s *GormStorage) CleanAbandonedFanOuts(ctx context.Context, olderThan time.Time) (int64, error) {
+	var deleted int64
+	err := s.withSerializationRetry(ctx, func() error {
+		deleted = 0
+		silentDB := s.db.Session(&gorm.Session{Logger: s.db.Logger.LogMode(logger.Silent)})
+		return silentDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			var ids []core.UUID
+			if err := tx.Model(&core.FanOut{}).
+				Select("fan_outs.id").
+				Joins("INNER JOIN jobs j ON j.id = fan_outs.parent_job_id").
+				Where("fan_outs.status = ?", core.FanOutPending).
+				Where("j.status IN ?", core.TerminalJobStatuses).
+				Where("fan_outs.created_at < ?", olderThan).
+				Where("NOT EXISTS (SELECT 1 FROM jobs c WHERE c.fan_out_id = fan_outs.id)").
+				Limit(maxResumeBatch).
+				Pluck("fan_outs.id", &ids).Error; err != nil {
+				return err
+			}
+			if len(ids) == 0 {
+				return nil
+			}
+			result := tx.Where("id IN ?", ids).
+				Where("status = ?", core.FanOutPending).
+				Delete(&core.FanOut{})
+			if result.Error != nil {
+				return result.Error
+			}
+			deleted = result.RowsAffected
+			return nil
+		})
+	})
+	return deleted, err
+}
+
 // SaveJobResult stores the serialized result for a job.
 func (s *GormStorage) SaveJobResult(ctx context.Context, jobID core.UUID, workerID string, result []byte) error {
 	encoded, err := s.encodePayload("job result", string(jobID), result)

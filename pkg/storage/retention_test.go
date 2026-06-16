@@ -213,6 +213,99 @@ func TestDeleteTerminalJobsOlderThan_S04RegressionNoFanOutLeakOrStrandedLiveDesc
 	assert.Equal(t, int64(0), strandedLiveDescendants, "retention must not strand live descendants")
 }
 
+func TestCleanAbandonedFanOuts_UnblocksTerminalParentRetention(t *testing.T) {
+	s := newTestStorage(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	old := now.Add(-2 * time.Hour)
+	cutoff := now.Add(-1 * time.Minute)
+
+	seedRetentionJob(t, s, "abandoned-parent", core.StatusCompleted, old)
+	require.NoError(t, s.CreateFanOut(ctx, &core.FanOut{
+		ID:          retentionUUID("abandoned-fanout"),
+		ParentJobID: retentionUUID("abandoned-parent"),
+		TotalCount:  2,
+		Status:      core.FanOutPending,
+	}))
+	setFanOutCreatedAt(t, s, "abandoned-fanout", old)
+
+	deleted, err := s.DeleteTerminalJobsOlderThan(ctx, core.StatusCompleted, time.Hour, 100)
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), deleted, "pending abandoned fan-out should block parent retention before cleanup")
+	assertRetentionExists(t, s, "abandoned-parent")
+	assertRetentionFanOutExists(t, s, "abandoned-fanout")
+
+	cleaned, err := s.CleanAbandonedFanOuts(ctx, cutoff)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), cleaned)
+	assertRetentionFanOutMissing(t, s, "abandoned-fanout")
+
+	deleted, err = s.DeleteTerminalJobsOlderThan(ctx, core.StatusCompleted, time.Hour, 100)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), deleted)
+	assertRetentionMissing(t, s, "abandoned-parent")
+}
+
+func TestCleanAbandonedFanOuts_Guards(t *testing.T) {
+	s := newTestStorage(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	old := now.Add(-2 * time.Hour)
+	cutoff := now.Add(-1 * time.Minute)
+
+	seedRetentionJob(t, s, "guard-waiting-parent", core.StatusWaiting, old)
+	require.NoError(t, s.CreateFanOut(ctx, &core.FanOut{
+		ID:          retentionUUID("guard-waiting-fanout"),
+		ParentJobID: retentionUUID("guard-waiting-parent"),
+		TotalCount:  2,
+		Status:      core.FanOutPending,
+	}))
+	setFanOutCreatedAt(t, s, "guard-waiting-fanout", old)
+
+	seedRetentionJob(t, s, "guard-with-subjobs-parent", core.StatusCompleted, old)
+	require.NoError(t, s.CreateFanOut(ctx, &core.FanOut{
+		ID:          retentionUUID("guard-with-subjobs-fanout"),
+		ParentJobID: retentionUUID("guard-with-subjobs-parent"),
+		TotalCount:  2,
+		Status:      core.FanOutPending,
+	}))
+	setFanOutCreatedAt(t, s, "guard-with-subjobs-fanout", old)
+	fanOutID := retentionUUID("guard-with-subjobs-fanout")
+	require.NoError(t, s.EnqueueBatch(ctx, []*core.Job{{
+		ID:       retentionUUID("guard-subjob"),
+		Type:     "guard.sub",
+		Queue:    "default",
+		Status:   core.StatusPending,
+		FanOutID: &fanOutID,
+	}}))
+
+	seedRetentionJob(t, s, "guard-recent-parent", core.StatusCompleted, old)
+	require.NoError(t, s.CreateFanOut(ctx, &core.FanOut{
+		ID:          retentionUUID("guard-recent-fanout"),
+		ParentJobID: retentionUUID("guard-recent-parent"),
+		TotalCount:  2,
+		Status:      core.FanOutPending,
+	}))
+	setFanOutCreatedAt(t, s, "guard-recent-fanout", now)
+
+	seedRetentionJob(t, s, "guard-completed-parent", core.StatusCompleted, old)
+	require.NoError(t, s.CreateFanOut(ctx, &core.FanOut{
+		ID:          retentionUUID("guard-completed-fanout"),
+		ParentJobID: retentionUUID("guard-completed-parent"),
+		TotalCount:  2,
+		Status:      core.FanOutCompleted,
+	}))
+	setFanOutCreatedAt(t, s, "guard-completed-fanout", old)
+
+	cleaned, err := s.CleanAbandonedFanOuts(ctx, cutoff)
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), cleaned)
+	assertRetentionFanOutExists(t, s, "guard-waiting-fanout")
+	assertRetentionFanOutExists(t, s, "guard-with-subjobs-fanout")
+	assertRetentionFanOutExists(t, s, "guard-recent-fanout")
+	assertRetentionFanOutExists(t, s, "guard-completed-fanout")
+}
+
 func TestDeleteConsumedSignalsOlderThan_PrunesOnlyConsumedOlderThanWindow(t *testing.T) {
 	s := newTestStorage(t)
 	ctx := context.Background()
@@ -295,6 +388,13 @@ func seedRetentionSignal(t *testing.T, s *GormStorage, id, jobID, name string, c
 		Payload:    []byte(`"payload"`),
 		ConsumedAt: consumedAt,
 	}).Error)
+}
+
+func setFanOutCreatedAt(t *testing.T, s *GormStorage, id string, createdAt time.Time) {
+	t.Helper()
+	require.NoError(t, s.db.Model(&core.FanOut{}).
+		Where("id = ?", retentionUUID(id)).
+		Update("created_at", createdAt.UTC()).Error)
 }
 
 func ptrString(v string) *string {

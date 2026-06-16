@@ -103,6 +103,12 @@ type completablePendingFanOutStorage interface {
 	GetCompletablePendingFanOuts(ctx context.Context, olderThan time.Time) ([]*core.FanOut, error)
 }
 
+// abandonedFanOutStorage is implemented by backends that can reconcile pending
+// fan_outs abandoned mid-creation under an already-terminal parent.
+type abandonedFanOutStorage interface {
+	CleanAbandonedFanOuts(ctx context.Context, olderThan time.Time) (int64, error)
+}
+
 type failTerminalWithResultStorage interface {
 	FailTerminalWithResult(ctx context.Context, jobID core.UUID, workerID, errMsg string) (*core.FanOut, error)
 }
@@ -2158,6 +2164,24 @@ func (w *Worker) pollWaitingJobsOnce(ctx context.Context) {
 			} else {
 				w.logger.Info("rescued stranded pending fan-out via polling fallback", "fan_out_id", fo.ID)
 			}
+		}
+	}
+
+	if afs, ok := w.queue.Storage().(abandonedFanOutStorage); ok {
+		var cleaned int64
+		err = retryWithBackoff(ctx, *w.config.StorageRetry, func() error {
+			var qErr error
+			cleaned, qErr = afs.CleanAbandonedFanOuts(ctx, stalledCutoff)
+			return qErr
+		})
+		if err != nil {
+			if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+				w.logger.Error("failed to clean abandoned fan-outs after retries", "error", err)
+			}
+			return
+		}
+		if cleaned > 0 {
+			w.logger.Info("cleaned abandoned pending fan-outs", "count", cleaned)
 		}
 	}
 
