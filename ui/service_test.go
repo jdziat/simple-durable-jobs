@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -1559,7 +1560,9 @@ func TestRetryJob_FallbackWithoutUIStorage(t *testing.T) {
 	require.Error(t, err)
 	var connectErr *connect.Error
 	require.ErrorAs(t, err, &connectErr)
-	assert.Equal(t, connect.CodeInternal, connectErr.Code())
+	// F-002: a non-UI storage yields CodeUnimplemented from the helper, and that
+	// code now survives instead of being flattened to Internal.
+	assert.Equal(t, connect.CodeUnimplemented, connectErr.Code())
 }
 
 // ---------------------------------------------------------------------------
@@ -1582,7 +1585,7 @@ func TestDeleteJob_Success(t *testing.T) {
 func TestDeleteJob_StorageError(t *testing.T) {
 	store := &mockUIStorage{
 		deleteJobFn: func(_ context.Context, _ core.UUID) error {
-			return errors.New("db error")
+			return errors.New("db error: relation \"jobs\" does not exist")
 		},
 	}
 	svc := newServiceWithUIStorage(store)
@@ -1591,12 +1594,44 @@ func TestDeleteJob_StorageError(t *testing.T) {
 	var connectErr *connect.Error
 	require.ErrorAs(t, err, &connectErr)
 	assert.Equal(t, connect.CodeInternal, connectErr.Code())
+	// SEC-3: the raw backend error text must NOT reach the client.
+	assert.NotContains(t, connectErr.Message(), "relation")
+	assert.Equal(t, "internal error", connectErr.Message())
+}
+
+// F-002: a malformed UUID is a client error (InvalidArgument), not Internal.
+func TestDeleteJob_InvalidIDReturnsInvalidArgument(t *testing.T) {
+	store := &mockUIStorage{
+		deleteJobFn: func(_ context.Context, _ core.UUID) error {
+			t.Fatal("storage must not be called for a malformed id")
+			return nil
+		},
+	}
+	svc := newServiceWithUIStorage(store)
+	_, err := svc.DeleteJob(context.Background(), connect.NewRequest(&jobsv1.DeleteJobRequest{Id: "not-a-uuid"}))
+	require.Error(t, err)
+	assert.Equal(t, connect.CodeInvalidArgument, connect.CodeOf(err))
+}
+
+// A workflow parent surfaces as FailedPrecondition with its actionable message.
+func TestDeleteJob_WorkflowParentReturnsFailedPrecondition(t *testing.T) {
+	store := &mockUIStorage{
+		deleteJobFn: func(_ context.Context, _ core.UUID) error {
+			return fmt.Errorf("%w (job x)", core.ErrJobHasChildren)
+		},
+	}
+	svc := newServiceWithUIStorage(store)
+	_, err := svc.DeleteJob(context.Background(), connect.NewRequest(&jobsv1.DeleteJobRequest{Id: uiTestID("j1")}))
+	require.Error(t, err)
+	assert.Equal(t, connect.CodeFailedPrecondition, connect.CodeOf(err))
 }
 
 func TestDeleteJob_FallbackWithoutUIStorage(t *testing.T) {
 	svc := newServiceWithBaseStorage(&mockStorage{})
 	_, err := svc.DeleteJob(context.Background(), connect.NewRequest(&jobsv1.DeleteJobRequest{Id: uiTestID("j1")}))
 	require.Error(t, err)
+	// CodeUnimplemented survives instead of collapsing to Internal (F-002).
+	assert.Equal(t, connect.CodeUnimplemented, connect.CodeOf(err))
 }
 
 // ---------------------------------------------------------------------------
@@ -1634,8 +1669,30 @@ func TestBulkRetryJobs_PartialFailure(t *testing.T) {
 		Ids: []string{uiTestID("j1"), uiTestID("j2"), uiTestID("j3"), uiTestID("j4")},
 	}))
 	require.NoError(t, err)
-	// 4 calls: 1 ok, 2 fail, 3 ok, 4 fail → 2 successes
+	// 4 calls: 1 ok, 2 fail, 3 ok, 4 fail → 2 successes, 2 skipped (F-003: the
+	// failures are surfaced, not silently hidden behind a reduced count).
 	assert.Equal(t, int32(2), resp.Msg.Count)
+	require.Len(t, resp.Msg.Skipped, 2)
+	assert.Equal(t, uiTestID("j2"), resp.Msg.Skipped[0].Id)
+	assert.Equal(t, "internal error", resp.Msg.Skipped[0].Reason) // raw "db error" not leaked
+	assert.Equal(t, uiTestID("j4"), resp.Msg.Skipped[1].Id)
+}
+
+// F-003: a malformed id fails the whole bulk request with InvalidArgument before
+// any mutation runs — it must not masquerade as a benign skipped miss.
+func TestBulkRetryJobs_MalformedIDRejected(t *testing.T) {
+	store := &mockUIStorage{
+		retryJobFn: func(_ context.Context, _ core.UUID) (*core.Job, error) {
+			t.Fatal("no mutation must run when an id is malformed")
+			return nil, nil
+		},
+	}
+	svc := newServiceWithUIStorage(store)
+	_, err := svc.BulkRetryJobs(context.Background(), connect.NewRequest(&jobsv1.BulkRetryJobsRequest{
+		Ids: []string{uiTestID("j1"), "not-a-uuid"},
+	}))
+	require.Error(t, err)
+	assert.Equal(t, connect.CodeInvalidArgument, connect.CodeOf(err))
 }
 
 func TestBulkRetryJobs_EmptyList(t *testing.T) {
@@ -1687,6 +1744,55 @@ func TestBulkDeleteJobs_PartialFailure(t *testing.T) {
 	}))
 	require.NoError(t, err)
 	assert.Equal(t, int32(2), resp.Msg.Count)
+	// F-003: the failed id is surfaced with a (non-leaky) reason.
+	require.Len(t, resp.Msg.Skipped, 1)
+	assert.Equal(t, uiTestID("j2"), resp.Msg.Skipped[0].Id)
+	assert.Equal(t, "internal error", resp.Msg.Skipped[0].Reason)
+}
+
+// F-003: skipped reasons classify benign misses distinctly from failures, and
+// never echo raw backend text.
+func TestBulkDeleteJobs_SkippedReasonsClassified(t *testing.T) {
+	store := &mockUIStorage{
+		deleteJobFn: func(_ context.Context, id core.UUID) error {
+			switch id {
+			case uiTestUUID("parent"):
+				return fmt.Errorf("%w (job x)", core.ErrJobHasChildren)
+			case uiTestUUID("boom"):
+				return errors.New("pq: connection reset")
+			default:
+				return nil
+			}
+		},
+	}
+	svc := newServiceWithUIStorage(store)
+	resp, err := svc.BulkDeleteJobs(context.Background(), connect.NewRequest(&jobsv1.BulkDeleteJobsRequest{
+		Ids: []string{uiTestID("ok"), uiTestID("parent"), uiTestID("boom")},
+	}))
+	require.NoError(t, err)
+	assert.Equal(t, int32(1), resp.Msg.Count)
+	require.Len(t, resp.Msg.Skipped, 2)
+	reasons := map[string]string{}
+	for _, sk := range resp.Msg.Skipped {
+		reasons[sk.Id] = sk.Reason
+	}
+	assert.Equal(t, "workflow parent (delete the workflow instead)", reasons[uiTestID("parent")])
+	assert.Equal(t, "internal error", reasons[uiTestID("boom")]) // raw "pq:" text not leaked
+}
+
+func TestBulkDeleteJobs_MalformedIDRejected(t *testing.T) {
+	store := &mockUIStorage{
+		deleteJobFn: func(_ context.Context, _ core.UUID) error {
+			t.Fatal("no mutation must run when an id is malformed")
+			return nil
+		},
+	}
+	svc := newServiceWithUIStorage(store)
+	_, err := svc.BulkDeleteJobs(context.Background(), connect.NewRequest(&jobsv1.BulkDeleteJobsRequest{
+		Ids: []string{uiTestID("j1"), "not-a-uuid"},
+	}))
+	require.Error(t, err)
+	assert.Equal(t, connect.CodeInvalidArgument, connect.CodeOf(err))
 }
 
 func TestBulkDeleteJobs_EmptyList(t *testing.T) {
