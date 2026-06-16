@@ -75,8 +75,9 @@ Without `WithMeterProvider`, instrumentation uses `otel.GetMeterProvider()`.
 | `jobs.dead_letter.depth` | `Int64ObservableGauge` | `{job}` | `queue` | Current dead-lettered job depth by queue. |
 | `jobs.queue.saturation` | `Float64ObservableGauge` | `1` | `queue`, `worker.id` | Worker-local running jobs divided by configured capacity by queue. |
 | `jobs.leases.reclaimed` | `Int64Counter` | `{job}` | `reason=stale_lock\|ownership_audit` | Job leases reclaimed from a presumed-dead owner or observed reclaimed by a peer. |
-| `jobs.dequeue.released` | `Int64ObservableCounter` | `{job}` | `worker.id`, `reason=queue_cap\|queue_rate\|concurrency\|fleet_rate\|shutdown` | Dequeued jobs released back to pending without running, by reason. |
+| `jobs.dequeue.released` | `Int64ObservableCounter` | `{job}` | `worker.id`, `reason=queue_cap\|queue_rate\|concurrency\|fleet_rate\|fleet_rate_cached\|shutdown` | Dequeued jobs released back to pending without running, by reason. |
 | `jobs.dequeue.suppressed_ticks` | `Int64ObservableCounter` | `{tick}` | `worker.id`, `reason=fleet_rate_saturated` | Poll ticks the rate-saturation throttle skipped claiming jobs. |
+| `jobs.dequeue.rate_saturation_cache_size` | `Int64ObservableGauge` | `{bucket}` | `worker.id` | Saturated rate-limit buckets cached by the per-key cooldown; at the cap, new buckets fall back to the DB rate transaction. |
 
 The throughput, latency, depth, backlog-age, dead-letter-depth, and reclaimed
 metrics are wired automatically by `Instrument`; `jobs.leases.reclaimed`
@@ -120,18 +121,37 @@ claiming until the limit's rate window rolls over, rather than bouncing the full
 concurrency budget every poll tick. Each suppressed tick increments
 `jobs.dequeue.suppressed_ticks`.
 
-The healthy steady state under a saturated fleet limit is `suppressed_ticks`
-rising while `released{reason="fleet_rate"}` stays low (one probe batch per rate
-window) — the throttle collapsing the claim/release write amplification, not a
-stuck worker. A `released{reason="fleet_rate"}` rate that climbs every tick means
-the throttle is **not** engaging — most often because a *keyed* `RateLimit` is
-configured (the throttle only applies to all-unkeyed configs, since a keyed
-limit's window can't be checked before a job is claimed). Trade-off: a
-just-recovered limit can wait up to one rate window before this worker probes it
-again.
+The healthy steady state under a saturated **unkeyed** fleet limit is
+`suppressed_ticks` rising while `released{reason="fleet_rate"}` stays low (one
+probe batch per rate window) — the throttle collapsing the claim/release write
+amplification, not a stuck worker.
+
+For a **keyed** `RateLimit` the worker can't pre-check a bucket before claiming
+(the key needs the held job), so it does not whole-fleet suppress; instead a
+per-key cooldown skips the expensive DB rate transaction for a bucket already
+denied this window. Those skipped bounces are attributed to
+`released{reason="fleet_rate_cached"}`, distinct from `reason="fleet_rate"` (the
+bounces that actually paid the DB transaction). The healthy keyed signal is
+`fleet_rate_cached` dominating `fleet_rate` — the cooldown eliding the contended
+locked transaction. Register the cooldown's cache-size gauge with
+`InstrumentWorkerRateSaturation(workerID, worker.DequeueRateSaturationCacheSize, ...)`;
+when `jobs_dequeue_rate_saturation_cache_size` sits at the configured
+`WithRateSaturationCacheSize` cap, new saturated buckets are falling back to the
+DB transaction (a high-cardinality-`RateLimitKey` signal).
+
+Note the per-key cooldown removes the DB rate transaction but **not** the
+claim/release itself, so for keyed configs `released{reason="fleet_rate_cached"}`
+(and the underlying claim/release write volume) can stay high even when healthy —
+it is the DB-transaction count, not the release count, that the cooldown reduces.
+Trade-offs: a just-recovered limit can wait up to one rate window before this
+worker probes it again, and the keyed saving is per-worker and locality-dependent
+(a worker only caches buckets it personally denied).
 
 ```promql
-rate(jobs_dequeue_released_total{reason="fleet_rate"}[5m])
+# unkeyed throttle engaging
+rate(jobs_dequeue_suppressed_ticks_total[5m])
+# keyed cooldown eliding the DB rate tx (fleet_rate_cached should dominate fleet_rate)
+rate(jobs_dequeue_released_total{reason=~"fleet_rate.*"}[5m])
 ```
 
 See [Production Operations]({{< relref "/docs/production-ops" >}}) for the full

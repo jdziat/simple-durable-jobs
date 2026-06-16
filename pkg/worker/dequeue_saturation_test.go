@@ -511,8 +511,16 @@ func TestKeyedSaturation_CooldownCollapsesRateChecks(t *testing.T) {
 	// bounded by cold checks plus at most one hot probe batch.
 	assert.Less(t, res.rateChecks, res.releases/2, "cooldown collapses the DB rate churn far below the claim/release churn")
 	assert.LessOrEqual(t, res.rateChecks, int64(perKey*(len(coldKeys)+1)), "rateChecks ~= cold checks + one hot probe")
-	t.Logf("cto-F2 KEYED P1b over %d ticks: dispatched=%d releases=%d rateChecks=%d (rateChecks collapsed, churn-1 retained)",
-		ticks, res.dispatched, res.releases, res.rateChecks)
+
+	// P1c observability: the cooldown-skipped bounces are attributed to
+	// fleet_rate_cached, distinct from the (small) fleet_rate count of bounces
+	// that actually paid the DB tx; the hot key is in the saturation cache.
+	released := w.DequeueReleasedByReason()
+	assert.Greater(t, released["fleet_rate_cached"], int64(concurrency), "most hot-key bounces skip the DB tx -> attributed fleet_rate_cached")
+	assert.Greater(t, released["fleet_rate_cached"], released["fleet_rate"], "cooldown skips dominate the few real DB denials")
+	assert.GreaterOrEqual(t, w.DequeueRateSaturationCacheSize(), int64(1), "the saturated hot key is cached")
+	t.Logf("cto-F2 KEYED P1b/P1c over %d ticks: dispatched=%d releases=%d rateChecks=%d fleet_rate=%d fleet_rate_cached=%d cacheSize=%d",
+		ticks, res.dispatched, res.releases, res.rateChecks, released["fleet_rate"], released["fleet_rate_cached"], w.DequeueRateSaturationCacheSize())
 }
 
 // TestKeyedSaturation_CacheCapBoundsAndDegrades proves the bounded-memory

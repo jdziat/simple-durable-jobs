@@ -738,8 +738,8 @@ func (w *Worker) dispatchDequeuedJobs(ctx context.Context, jobsChan chan<- *core
 			released++
 			continue
 		}
-		if ok := w.tryConsumeRateLimits(ctx, job); !ok {
-			w.recordBounce(bounceFleetRate)
+		if ok, reason := w.tryConsumeRateLimits(ctx, job); !ok {
+			w.recordBounce(reason) // fleet_rate (paid the DB tx) or fleet_rate_cached (cooldown skip)
 			w.refundQueueRateLimit(job.Queue)
 			w.releaseDequeuedJobOnShutdown(ctx, job)
 			released++
@@ -1151,16 +1151,19 @@ func (w *Worker) rateLimitName(limit RateLimitConfig, job *core.Job) string {
 	return limit.Name + ":" + limit.Key(job)
 }
 
-func (w *Worker) tryConsumeRateLimits(ctx context.Context, job *core.Job) bool {
+// tryConsumeRateLimits returns (allowed, reason). reason is meaningful only when
+// allowed is false: bounceFleetRateCached when the per-key cooldown short-circuited
+// the DB transaction, bounceFleetRate when the DB itself denied (or errored).
+func (w *Worker) tryConsumeRateLimits(ctx context.Context, job *core.Job) (bool, bounceReason) {
 	if len(w.config.RateLimits) == 0 {
-		return true
+		return true, ""
 	}
 	storage, ok := w.queue.Storage().(rateLimiterStorage)
 	if !ok {
 		if w.rateLimitStorageMissingLogged.CompareAndSwap(false, true) {
 			w.logger.Warn("storage backend does not support fleet-wide rate limits; continuing without RateLimit enforcement")
 		}
-		return true
+		return true, ""
 	}
 	for _, limit := range w.config.RateLimits {
 		if limit.Name == "" || limit.PerSecond <= 0 {
@@ -1184,7 +1187,7 @@ func (w *Worker) tryConsumeRateLimits(ctx context.Context, job *core.Job) bool {
 		// on the probe tick, which MUST consult the DB to detect headroom returning
 		// — short-circuiting it would change v1's proven unkeyed behavior.
 		if limit.Key != nil && w.keyedRateSaturated(limitName, time.Now()) {
-			return false
+			return false, bounceFleetRateCached
 		}
 		allowed, err := storage.TryConsumeRate(ctx, limitName, limit.PerSecond, window, time.Time{})
 		if err != nil {
@@ -1192,7 +1195,7 @@ func (w *Worker) tryConsumeRateLimits(ctx context.Context, job *core.Job) bool {
 				"job_id", job.ID,
 				"limit", limitName,
 				"error", err)
-			return false
+			return false, bounceFleetRate
 		}
 		if !allowed {
 			// cto-F2: remember this bucket has no headroom until its window rolls.
@@ -1200,10 +1203,10 @@ func (w *Worker) tryConsumeRateLimits(ctx context.Context, job *core.Job) bool {
 			// (removes both churns); for a keyed bucket the pre-tx fast path above
 			// reads it to skip the next DB rate tx (removes the denied-tx churn).
 			w.markRateSaturated(limitName, window)
-			return false
+			return false, bounceFleetRate
 		}
 	}
-	return true
+	return true, ""
 }
 
 // markRateSaturated records that limitName has no headroom until the END of its
@@ -1288,11 +1291,12 @@ func (w *Worker) unkeyedRateLimitsSaturated(now time.Time) bool {
 type bounceReason string
 
 const (
-	bounceQueueCap    bounceReason = "queue_cap"   // per-queue concurrency cap full
-	bounceQueueRate   bounceReason = "queue_rate"  // in-memory queue rate limiter
-	bounceConcurrency bounceReason = "concurrency" // fleet concurrency slot unavailable
-	bounceFleetRate   bounceReason = "fleet_rate"  // fleet (DB) rate limit saturated
-	bounceShutdown    bounceReason = "shutdown"    // ctx cancelled mid-dispatch
+	bounceQueueCap        bounceReason = "queue_cap"         // per-queue concurrency cap full
+	bounceQueueRate       bounceReason = "queue_rate"        // in-memory queue rate limiter
+	bounceConcurrency     bounceReason = "concurrency"       // fleet concurrency slot unavailable
+	bounceFleetRate       bounceReason = "fleet_rate"        // fleet (DB) rate limit saturated — paid the locked tx
+	bounceFleetRateCached bounceReason = "fleet_rate_cached" // keyed bucket known saturated — skipped the locked tx (per-key cooldown)
+	bounceShutdown        bounceReason = "shutdown"          // ctx cancelled mid-dispatch
 )
 
 // dequeueChurnCounters holds cumulative dispatch-churn counts. All fields are
@@ -1302,6 +1306,7 @@ type dequeueChurnCounters struct {
 	queueRate       atomic.Int64
 	concurrency     atomic.Int64
 	fleetRate       atomic.Int64
+	fleetRateCached atomic.Int64
 	shutdown        atomic.Int64
 	suppressedTicks atomic.Int64
 }
@@ -1316,6 +1321,8 @@ func (w *Worker) recordBounce(r bounceReason) {
 		w.dequeueChurn.concurrency.Add(1)
 	case bounceFleetRate:
 		w.dequeueChurn.fleetRate.Add(1)
+	case bounceFleetRateCached:
+		w.dequeueChurn.fleetRateCached.Add(1)
 	case bounceShutdown:
 		w.dequeueChurn.shutdown.Add(1)
 	}
@@ -1328,11 +1335,12 @@ func (w *Worker) recordBounce(r bounceReason) {
 // rather than a count that climbs every poll tick. Safe to call concurrently.
 func (w *Worker) DequeueReleasedByReason() map[string]int64 {
 	return map[string]int64{
-		string(bounceQueueCap):    w.dequeueChurn.queueCap.Load(),
-		string(bounceQueueRate):   w.dequeueChurn.queueRate.Load(),
-		string(bounceConcurrency): w.dequeueChurn.concurrency.Load(),
-		string(bounceFleetRate):   w.dequeueChurn.fleetRate.Load(),
-		string(bounceShutdown):    w.dequeueChurn.shutdown.Load(),
+		string(bounceQueueCap):        w.dequeueChurn.queueCap.Load(),
+		string(bounceQueueRate):       w.dequeueChurn.queueRate.Load(),
+		string(bounceConcurrency):     w.dequeueChurn.concurrency.Load(),
+		string(bounceFleetRate):       w.dequeueChurn.fleetRate.Load(),
+		string(bounceFleetRateCached): w.dequeueChurn.fleetRateCached.Load(),
+		string(bounceShutdown):        w.dequeueChurn.shutdown.Load(),
 	}
 }
 
@@ -1343,6 +1351,18 @@ func (w *Worker) DequeueReleasedByReason() map[string]int64 {
 // Safe to call concurrently.
 func (w *Worker) DequeueSuppressedTicks() int64 {
 	return w.dequeueChurn.suppressedTicks.Load()
+}
+
+// DequeueRateSaturationCacheSize returns the current number of saturated rate
+// buckets cached by the per-key cooldown (see WithRateSaturationCacheSize). A
+// value at the configured cap means new saturated buckets are degrading to
+// paying the DB rate transaction — the high-cardinality-key signal. Returns
+// int64 so it passes directly as the metrics.InstrumentWorkerRateSaturation
+// snapshot (matching DequeueSuppressedTicks). Safe to call concurrently.
+func (w *Worker) DequeueRateSaturationCacheSize() int64 {
+	w.rateSaturationMu.Lock()
+	defer w.rateSaturationMu.Unlock()
+	return int64(len(w.rateSaturatedUntil))
 }
 
 func (w *Worker) tryAcquireConcurrencySlots(ctx context.Context, job *core.Job) bool {

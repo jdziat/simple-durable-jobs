@@ -214,7 +214,9 @@ func TestInstrumentWorkerDequeue_RecordsChurnCounters(t *testing.T) {
 	defer func() { _ = mp.Shutdown(ctx) }()
 
 	InstrumentWorkerDequeue("worker-1",
-		func() map[string]int64 { return map[string]int64{"fleet_rate": 8, "queue_cap": 0} },
+		func() map[string]int64 {
+			return map[string]int64{"fleet_rate": 8, "fleet_rate_cached": 191, "queue_cap": 0}
+		},
 		func() int64 { return 29 },
 		WithMeterProvider(mp))
 
@@ -223,9 +225,27 @@ func TestInstrumentWorkerDequeue_RecordsChurnCounters(t *testing.T) {
 		attrWorkerID: "worker-1",
 		attrReason:   "fleet_rate",
 	})
+	assertCounterPoint(t, rm, metricDequeueReleased, 191, map[string]string{
+		attrWorkerID: "worker-1",
+		attrReason:   "fleet_rate_cached",
+	})
 	assertCounterPoint(t, rm, metricDequeueSuppressedTicks, 29, map[string]string{
 		attrWorkerID: "worker-1",
 		attrReason:   "fleet_rate_saturated",
+	})
+}
+
+func TestInstrumentWorkerRateSaturation_RecordsGauge(t *testing.T) {
+	ctx := context.Background()
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	defer func() { _ = mp.Shutdown(ctx) }()
+
+	InstrumentWorkerRateSaturation("worker-1", func() int64 { return 7 }, WithMeterProvider(mp))
+
+	rm := collectMetrics(t, reader)
+	assertGaugePoint(t, rm, metricRateSaturationCacheSize, 7, map[string]string{
+		attrWorkerID: "worker-1",
 	})
 }
 
