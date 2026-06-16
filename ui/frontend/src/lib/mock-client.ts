@@ -1003,9 +1003,21 @@ export const mockJobsClient = {
   },
 
   async deleteJob(
-    req: { id: string },
+    req: { id: string; deleteSubtree?: boolean },
   ): Promise<DeleteJobResponse> {
     ensureSimulation()
+    if (req.deleteSubtree) {
+      // Workflow-aware delete: remove the root and its whole subtree (anything
+      // referencing it as parent or root), mirroring DeleteWorkflowSubtree.
+      const isSubtree = (j: { id: string; parentJobId?: string; rootJobId?: string }) =>
+        j.id === req.id || j.parentJobId === req.id || j.rootJobId === req.id
+      for (const arr of [jobs, workflowJobs]) {
+        for (let i = arr.length - 1; i >= 0; i--) {
+          if (isSubtree(arr[i])) arr.splice(i, 1)
+        }
+      }
+      return new DeleteJobResponse({})
+    }
     const idx = jobs.findIndex((job) => job.id === req.id)
     if (idx !== -1) {
       jobs.splice(idx, 1)

@@ -1,6 +1,8 @@
 <script lang="ts">
   import { onMount } from 'svelte'
   import { jobsClient } from '../lib/client'
+  import { toast } from '../lib/stores/toast.svelte'
+  import Button from '../lib/components/Button.svelte'
   import StatusBadge from '../lib/components/StatusBadge.svelte'
   import WaterfallChart from '../components/WaterfallChart.svelte'
   import type { Job, FanOut } from '../lib/gen/jobs/v1/jobs_pb'
@@ -12,6 +14,8 @@
   let children = $state<Job[]>([])
   let loading = $state(true)
   let error = $state<string | null>(null)
+  let confirming = $state(false)
+  let deleting = $state(false)
 
   async function loadWorkflow() {
     try {
@@ -35,6 +39,23 @@
     navigate(`#/jobs/${jobId}`)
   }
 
+  async function deleteWorkflow() {
+    // Delete the resolved true root (GetWorkflow walked up to it), not the route
+    // id — deleting a mid-tree node would strand the real root + its fan-out
+    // accounting. The button only renders inside {#if root}, so root is set.
+    const rootId = root?.id ?? id
+    deleting = true
+    try {
+      await jobsClient.deleteJob({ id: rootId, deleteSubtree: true })
+      toast.push({ kind: 'ok', msg: 'workflow deleted' })
+      navigate('#/workflows')
+    } catch (e) {
+      toast.push({ kind: 'err', msg: e instanceof Error ? e.message : 'Failed to delete workflow' })
+      deleting = false
+      confirming = false
+    }
+  }
+
   onMount(() => {
     void loadWorkflow()
     const interval = setInterval(() => void loadWorkflow(), 5000)
@@ -53,6 +74,17 @@
     <div class="header">
       <h2>{root.type}</h2>
       <StatusBadge status={root.status} size="md" />
+      <div class="workflow-actions">
+        {#if confirming}
+          <span class="confirm-prompt">Delete this workflow and its {children.length} child job{children.length === 1 ? '' : 's'}?</span>
+          <Button variant="destructive" size="sm" disabled={deleting} onclick={deleteWorkflow}>
+            {deleting ? 'Deleting…' : 'Delete'}
+          </Button>
+          <Button variant="ghost" size="sm" disabled={deleting} onclick={() => (confirming = false)}>Cancel</Button>
+        {:else}
+          <Button variant="destructive" size="sm" onclick={() => (confirming = true)}>Delete workflow</Button>
+        {/if}
+      </div>
     </div>
 
     <WaterfallChart {root} {fanOuts} {children} onJobClick={handleJobClick} />
@@ -95,6 +127,18 @@
     color: var(--fg-primary);
     font-size: var(--fs-title);
     line-height: var(--lh-dense);
+  }
+
+  .workflow-actions {
+    margin-left: auto;
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+  }
+
+  .confirm-prompt {
+    color: var(--fg-secondary);
+    font-size: var(--fs-small);
   }
 
   .loading {

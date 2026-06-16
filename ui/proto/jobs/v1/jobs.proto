@@ -187,6 +187,10 @@ message RetryJobResponse {
 
 message DeleteJobRequest {
   string id = 1;
+  // delete_subtree removes the whole workflow subtree rooted at id (the
+  // workflow-aware delete). When false, deleting a workflow parent is refused
+  // with FailedPrecondition. Additive field — older clients omit it (= false).
+  bool delete_subtree = 2;
 }
 message DeleteJobResponse {}
 

@@ -1097,6 +1097,15 @@ export class DeleteJobRequest extends Message<DeleteJobRequest> {
    */
   id = "";
 
+  /**
+   * delete_subtree removes the whole workflow subtree rooted at id (the
+   * workflow-aware delete). When false, deleting a workflow parent is refused
+   * with FailedPrecondition. Additive field — older clients omit it (= false).
+   *
+   * @generated from field: bool delete_subtree = 2;
+   */
+  deleteSubtree = false;
+
   constructor(data?: PartialMessage<DeleteJobRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -1106,6 +1115,7 @@ export class DeleteJobRequest extends Message<DeleteJobRequest> {
   static readonly typeName = "jobs.v1.DeleteJobRequest";
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "delete_subtree", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): DeleteJobRequest {
