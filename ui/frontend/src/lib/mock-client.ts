@@ -240,6 +240,28 @@ function seedJobs(): void {
     deadLetterReason: 'max retries exhausted: HTTP 503 Service Unavailable',
   }))
 
+  // A second dead-lettered job whose created_at/dead_lettered_at orderings
+  // DIFFER from the one above (newer created, but older dead-lettered). This
+  // makes the dead-letter view's "default = dead_lettered_at DESC" sort
+  // observably distinct from a created_at sort — and lets the mock-client unit
+  // test prove the per-view default rather than trivially pass on a single row.
+  const olderDeadLetteredAt = minutesAgo(40)
+  jobs.push(makeJob({
+    id: 'job_demo_dead_lettered_2',
+    type: 'reconcile-ledger',
+    queue: 'critical',
+    tenant: 'globex',
+    metadata: { region: 'eu-west', team: 'billing' },
+    status: 'failed',
+    attempt: 5,
+    maxRetries: 5,
+    createdAt: minutesAgo(6),
+    completedAt: olderDeadLetteredAt,
+    lastError: 'deadlock detected; serialization failure',
+    deadLetteredAt: olderDeadLetteredAt,
+    deadLetterReason: 'max retries exhausted: deadlock detected',
+  }))
+
   jobs.push(makeJob({
     id: 'job_demo_tenant_acme',
     type: 'charge-payment',
@@ -931,28 +953,38 @@ export const mockJobsClient = {
     }
 
     // Server-side sort parity: honor the same whitelisted sort_key/sort_dir the
-    // real backend applies (default created_at desc) so the published demo
-    // doesn't reintroduce the misleading "page-local" sort affordance.
-    const dir = req.sortDir === 'asc' ? 1 : -1
-    const sortVal = (j: (typeof filtered)[number]): string | number => {
-      switch (req.sortKey) {
-        case 'priority': return j.priority ?? 0
-        case 'attempt': return j.attempt ?? 0
-        case 'type': return j.type
-        case 'queue': return j.queue
-        case 'status': return j.status
-        default: return j.createdAt.getTime() // created_at + unknown/empty fallback
+    // real backend applies so the published demo doesn't reintroduce the
+    // misleading "page-local" sort affordance. An EMPTY sort_key means "use the
+    // server's per-view default": dead_lettered_at desc for the dead-letter view
+    // (most-recently-dead first), created_at desc everywhere else.
+    if (!req.sortKey) {
+      if (req.status === 'dead-lettered') {
+        filtered.sort((a, b) => (b.deadLetteredAt?.getTime() ?? 0) - (a.deadLetteredAt?.getTime() ?? 0))
+      } else {
+        filtered.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())
       }
+    } else {
+      const dir = req.sortDir === 'asc' ? 1 : -1
+      const sortVal = (j: (typeof filtered)[number]): string | number => {
+        switch (req.sortKey) {
+          case 'priority': return j.priority ?? 0
+          case 'attempt': return j.attempt ?? 0
+          case 'type': return j.type
+          case 'queue': return j.queue
+          case 'status': return j.status
+          default: return j.createdAt.getTime() // unknown key fallback
+        }
+      }
+      filtered.sort((a, b) => {
+        const av = sortVal(a)
+        const bv = sortVal(b)
+        let cmp: number
+        if (typeof av === 'string' && typeof bv === 'string') cmp = av.localeCompare(bv)
+        else cmp = Number(av) - Number(bv)
+        if (cmp !== 0) return cmp * dir
+        return b.createdAt.getTime() - a.createdAt.getTime() // stable created_at tiebreak
+      })
     }
-    filtered.sort((a, b) => {
-      const av = sortVal(a)
-      const bv = sortVal(b)
-      let cmp: number
-      if (typeof av === 'string' && typeof bv === 'string') cmp = av.localeCompare(bv)
-      else cmp = Number(av) - Number(bv)
-      if (cmp !== 0) return cmp * dir
-      return b.createdAt.getTime() - a.createdAt.getTime() // stable created_at tiebreak
-    })
 
     const total = filtered.length
     const page = req.page ?? 1

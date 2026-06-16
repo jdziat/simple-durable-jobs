@@ -76,6 +76,12 @@
   let searchQuery = $state('')
   let sortKey = $state('createdAt')
   let sortDir = $state<'asc' | 'desc'>('desc')
+  // Until the user clicks a column header, we send NO sort_key so the server
+  // applies its per-view default (dead_lettered_at DESC for the dead-letter view,
+  // created_at DESC elsewhere). Forcing created_at from the client would override
+  // the dead-letter default and hide the most-recently-dead jobs. Switching the
+  // status view resets this so each view starts at its own natural default.
+  let userSorted = $state(false)
   let filterTimer: ReturnType<typeof setTimeout> | null = null
   let transitionTimer: ReturnType<typeof setTimeout> | null = null
   let confirmState = $state<ConfirmState>(null)
@@ -134,6 +140,7 @@
 
   function handleSort(key: string) {
     if (!(key in SORT_KEY_MAP)) return // not a server-sortable column
+    userSorted = true
     if (sortKey === key) {
       sortDir = sortDir === 'asc' ? 'desc' : 'asc'
     } else {
@@ -179,7 +186,10 @@
   }
 
   function removeFilter(key: string) {
-    if (key === 'status') statusFilter = ''
+    if (key === 'status') {
+      statusFilter = ''
+      userSorted = false // back to the all-jobs default sort
+    }
     if (key === 'queue') queueFilter = ''
     if (key === 'tenant') tenantFilter = ''
     if (key === 'type') typeFilter = ''
@@ -193,6 +203,7 @@
     tenantFilter = ''
     typeFilter = ''
     searchQuery = ''
+    userSorted = false // reset to the per-view default sort
     page = 1
     if (filterTimer) clearTimeout(filterTimer)
     syncHash()
@@ -229,7 +240,9 @@
         search: searchQuery,
         page,
         limit,
-        sortKey: SORT_KEY_MAP[sortKey] ?? '',
+        // Send sort_key only after an explicit header click; otherwise leave it
+        // empty so the server applies its per-view default sort.
+        sortKey: userSorted ? (SORT_KEY_MAP[sortKey] ?? '') : '',
         sortDir,
       })
       const nextJobs = response.jobs.map(j => ({
@@ -370,11 +383,11 @@
     <input
       name="search"
       type="search"
-      placeholder="Search by ID..."
+      placeholder="Search by job ID or arguments…"
       bind:value={searchQuery}
       oninput={() => scheduleApply()}
     />
-    <select bind:value={statusFilter} onchange={() => scheduleApply()}>
+    <select bind:value={statusFilter} onchange={() => { userSorted = false; scheduleApply() }}>
       <option value="">All Statuses</option>
       {#each statusOptions as [value, label]}
         <option {value}>{label}</option>
