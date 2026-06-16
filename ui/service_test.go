@@ -208,6 +208,7 @@ type mockUIStorage struct {
 	countDeadLetteredFn func(ctx context.Context, f core.DeadLetterFilter) (int64, error)
 	retryJobFn          func(ctx context.Context, id core.UUID) (*core.Job, error)
 	deleteJobFn         func(ctx context.Context, id core.UUID) error
+	deleteWorkflowFn    func(ctx context.Context, id core.UUID) error
 	purgeJobsFn         func(ctx context.Context, queue string, status core.JobStatus) (int64, error)
 	getWorkflowRootsFn  func(ctx context.Context, status string, limit, offset int) ([]*core.Job, int64, error)
 }
@@ -250,6 +251,13 @@ func (m *mockUIStorage) RetryJob(ctx context.Context, id core.UUID) (*core.Job, 
 func (m *mockUIStorage) DeleteJob(ctx context.Context, id core.UUID) error {
 	if m.deleteJobFn != nil {
 		return m.deleteJobFn(ctx, id)
+	}
+	return nil
+}
+
+func (m *mockUIStorage) DeleteWorkflowSubtree(ctx context.Context, id core.UUID) error {
+	if m.deleteWorkflowFn != nil {
+		return m.deleteWorkflowFn(ctx, id)
 	}
 	return nil
 }
@@ -526,6 +534,30 @@ func TestHandler_CancelJobRPCAllowedWithInsecureOptIn(t *testing.T) {
 	require.NotNil(t, resp.Msg.Job)
 	assert.Equal(t, uiTestID("j1"), resp.Msg.Job.Id)
 	assert.True(t, called)
+}
+
+func TestDeleteJob_DeleteSubtreeRoutesToWorkflowDeleter(t *testing.T) {
+	var subtreeID core.UUID
+	deletedPlain := false
+	store := &mockUIStorage{
+		deleteWorkflowFn: func(_ context.Context, id core.UUID) error {
+			subtreeID = id
+			return nil
+		},
+		deleteJobFn: func(_ context.Context, _ core.UUID) error {
+			deletedPlain = true
+			return nil
+		},
+	}
+	server := httptest.NewServer(Handler(store, WithInsecureAllowUnauthenticated()))
+	defer server.Close()
+
+	client := jobsv1connect.NewJobsServiceClient(server.Client(), server.URL)
+	id := uiTestID("wf-root")
+	_, err := client.DeleteJob(context.Background(), connect.NewRequest(&jobsv1.DeleteJobRequest{Id: id, DeleteSubtree: true}))
+	require.NoError(t, err)
+	assert.Equal(t, id, subtreeID.String(), "delete_subtree=true must route to DeleteWorkflowSubtree")
+	assert.False(t, deletedPlain, "delete_subtree=true must not take the plain DeleteJob path")
 }
 
 func TestHandler_MiddlewareOnlyDeniesReadAndWrite(t *testing.T) {

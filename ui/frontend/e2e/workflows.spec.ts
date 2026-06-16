@@ -82,6 +82,22 @@ test.describe('Workflows Page', () => {
     await expect(page.locator(`.job-label:has(a[href="#/jobs/${JOBS.WORKFLOW_CHILD_3}"]) .status`)).toHaveText('pending')
   })
 
+  test('delete workflow shows confirm prompt and cancels (non-destructive)', async ({ page }) => {
+    await page.goto(`/#/workflows/${JOBS.WORKFLOW_ROOT}`)
+    await page.waitForSelector('.waterfall-chart', { timeout: 10000 })
+
+    const deleteBtn = page.getByRole('button', { name: 'Delete workflow' })
+    await expect(deleteBtn).toBeVisible()
+    await deleteBtn.click()
+
+    // Confirm prompt + Delete/Cancel appear; cancel leaves the workflow intact.
+    await expect(page.getByText(/Delete this workflow and its/i)).toBeVisible()
+    await expect(page.getByRole('button', { name: 'Delete', exact: true })).toBeVisible()
+    await page.getByRole('button', { name: 'Cancel' }).click()
+    await expect(deleteBtn).toBeVisible()
+    await expect(page).toHaveURL(new RegExp(`#/workflows/${JOBS.WORKFLOW_ROOT}`))
+  })
+
   test('waterfall svg fills resolve through signal tokens', async ({ page }) => {
     await page.addInitScript(() => localStorage.setItem('blackbox-theme', 'dark'))
     await page.goto(`/#/workflows/${JOBS.WORKFLOW_ROOT}`)

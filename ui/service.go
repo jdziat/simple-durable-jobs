@@ -238,6 +238,14 @@ func (s *jobsService) RetryJob(ctx context.Context, req *connect.Request[jobsv1.
 
 // DeleteJob removes a job.
 func (s *jobsService) DeleteJob(ctx context.Context, req *connect.Request[jobsv1.DeleteJobRequest]) (*connect.Response[jobsv1.DeleteJobResponse], error) {
+	// delete_subtree=true is the explicit workflow-aware delete (removes the
+	// whole fan-out subtree); otherwise deleting a workflow parent is refused.
+	if req.Msg.DeleteSubtree {
+		if err := s.deleteWorkflowSubtree(ctx, req.Msg.Id); err != nil {
+			return nil, connect.NewError(connect.CodeInternal, err)
+		}
+		return connect.NewResponse(&jobsv1.DeleteJobResponse{}), nil
+	}
 	if err := s.deleteJob(ctx, req.Msg.Id); err != nil {
 		// A workflow parent cannot be deleted directly — surface it as a
 		// precondition failure with the actionable message rather than an opaque
@@ -891,6 +899,24 @@ func (s *jobsService) deleteJob(ctx context.Context, id string) error {
 	}
 	if ui, ok := s.storage.(UIStorage); ok {
 		return ui.DeleteJob(ctx, jobID)
+	}
+	return connect.NewError(connect.CodeUnimplemented, nil)
+}
+
+// workflowSubtreeDeleter is an optional storage capability (asserted, not part of
+// the UIStorage interface, so the interface stays api-compatible) for the
+// workflow-aware delete-subtree path.
+type workflowSubtreeDeleter interface {
+	DeleteWorkflowSubtree(ctx context.Context, rootJobID core.UUID) error
+}
+
+func (s *jobsService) deleteWorkflowSubtree(ctx context.Context, id string) error {
+	jobID, err := core.ParseUUID(id)
+	if err != nil {
+		return connect.NewError(connect.CodeInvalidArgument, err)
+	}
+	if d, ok := s.storage.(workflowSubtreeDeleter); ok {
+		return d.DeleteWorkflowSubtree(ctx, jobID)
 	}
 	return connect.NewError(connect.CodeUnimplemented, nil)
 }

@@ -1378,8 +1378,12 @@ func (x *RetryJobResponse) GetJob() *Job {
 }
 
 type DeleteJobRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Id            string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Id    string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
+	// delete_subtree removes the whole workflow subtree rooted at id (the
+	// workflow-aware delete). When false, deleting a workflow parent is refused
+	// with FailedPrecondition. Additive field — older clients omit it (= false).
+	DeleteSubtree bool `protobuf:"varint,2,opt,name=delete_subtree,json=deleteSubtree,proto3" json:"delete_subtree,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1419,6 +1423,13 @@ func (x *DeleteJobRequest) GetId() string {
 		return x.Id
 	}
 	return ""
+}
+
+func (x *DeleteJobRequest) GetDeleteSubtree() bool {
+	if x != nil {
+		return x.DeleteSubtree
+	}
+	return false
 }
 
 type DeleteJobResponse struct {
@@ -2886,9 +2897,10 @@ const file_jobs_v1_jobs_proto_rawDesc = "" +
 	"\x0fRetryJobRequest\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\"2\n" +
 	"\x10RetryJobResponse\x12\x1e\n" +
-	"\x03job\x18\x01 \x01(\v2\f.jobs.v1.JobR\x03job\"\"\n" +
+	"\x03job\x18\x01 \x01(\v2\f.jobs.v1.JobR\x03job\"I\n" +
 	"\x10DeleteJobRequest\x12\x0e\n" +
-	"\x02id\x18\x01 \x01(\tR\x02id\"\x13\n" +
+	"\x02id\x18\x01 \x01(\tR\x02id\x12%\n" +
+	"\x0edelete_subtree\x18\x02 \x01(\bR\rdeleteSubtree\"\x13\n" +
 	"\x11DeleteJobResponse\"(\n" +
 	"\x14BulkRetryJobsRequest\x12\x10\n" +
 	"\x03ids\x18\x01 \x03(\tR\x03ids\"-\n" +
