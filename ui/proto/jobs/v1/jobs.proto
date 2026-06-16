@@ -198,14 +198,28 @@ message BulkRetryJobsRequest {
   repeated string ids = 1;
 }
 message BulkRetryJobsResponse {
+  // count is the number of jobs successfully retried. skipped lists every id
+  // that was NOT retried, with a human-readable reason (e.g. "not found",
+  // "workflow parent"), so callers can distinguish benign misses from failures
+  // instead of inferring loss from a reduced count. Additive field.
   int32 count = 1;
+  repeated BulkSkip skipped = 2;
 }
 
 message BulkDeleteJobsRequest {
   repeated string ids = 1;
 }
 message BulkDeleteJobsResponse {
+  // count is the number of jobs successfully deleted; skipped lists every id
+  // that was NOT deleted, with a reason. Additive field. See BulkRetryJobsResponse.
   int32 count = 1;
+  repeated BulkSkip skipped = 2;
+}
+
+// BulkSkip reports one id that a bulk mutation did not apply, and why.
+message BulkSkip {
+  string id = 1;
+  string reason = 2;
 }
 
 message PauseJobRequest {

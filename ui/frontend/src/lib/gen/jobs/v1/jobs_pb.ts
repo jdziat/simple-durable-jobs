@@ -1208,9 +1208,19 @@ export class BulkRetryJobsRequest extends Message<BulkRetryJobsRequest> {
  */
 export class BulkRetryJobsResponse extends Message<BulkRetryJobsResponse> {
   /**
+   * count is the number of jobs successfully retried. skipped lists every id
+   * that was NOT retried, with a human-readable reason (e.g. "not found",
+   * "workflow parent"), so callers can distinguish benign misses from failures
+   * instead of inferring loss from a reduced count. Additive field.
+   *
    * @generated from field: int32 count = 1;
    */
   count = 0;
+
+  /**
+   * @generated from field: repeated jobs.v1.BulkSkip skipped = 2;
+   */
+  skipped: BulkSkip[] = [];
 
   constructor(data?: PartialMessage<BulkRetryJobsResponse>) {
     super();
@@ -1221,6 +1231,7 @@ export class BulkRetryJobsResponse extends Message<BulkRetryJobsResponse> {
   static readonly typeName = "jobs.v1.BulkRetryJobsResponse";
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "count", kind: "scalar", T: 5 /* ScalarType.INT32 */ },
+    { no: 2, name: "skipped", kind: "message", T: BulkSkip, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): BulkRetryJobsResponse {
@@ -1282,9 +1293,17 @@ export class BulkDeleteJobsRequest extends Message<BulkDeleteJobsRequest> {
  */
 export class BulkDeleteJobsResponse extends Message<BulkDeleteJobsResponse> {
   /**
+   * count is the number of jobs successfully deleted; skipped lists every id
+   * that was NOT deleted, with a reason. Additive field. See BulkRetryJobsResponse.
+   *
    * @generated from field: int32 count = 1;
    */
   count = 0;
+
+  /**
+   * @generated from field: repeated jobs.v1.BulkSkip skipped = 2;
+   */
+  skipped: BulkSkip[] = [];
 
   constructor(data?: PartialMessage<BulkDeleteJobsResponse>) {
     super();
@@ -1295,6 +1314,7 @@ export class BulkDeleteJobsResponse extends Message<BulkDeleteJobsResponse> {
   static readonly typeName = "jobs.v1.BulkDeleteJobsResponse";
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "count", kind: "scalar", T: 5 /* ScalarType.INT32 */ },
+    { no: 2, name: "skipped", kind: "message", T: BulkSkip, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): BulkDeleteJobsResponse {
@@ -1311,6 +1331,51 @@ export class BulkDeleteJobsResponse extends Message<BulkDeleteJobsResponse> {
 
   static equals(a: BulkDeleteJobsResponse | PlainMessage<BulkDeleteJobsResponse> | undefined, b: BulkDeleteJobsResponse | PlainMessage<BulkDeleteJobsResponse> | undefined): boolean {
     return proto3.util.equals(BulkDeleteJobsResponse, a, b);
+  }
+}
+
+/**
+ * BulkSkip reports one id that a bulk mutation did not apply, and why.
+ *
+ * @generated from message jobs.v1.BulkSkip
+ */
+export class BulkSkip extends Message<BulkSkip> {
+  /**
+   * @generated from field: string id = 1;
+   */
+  id = "";
+
+  /**
+   * @generated from field: string reason = 2;
+   */
+  reason = "";
+
+  constructor(data?: PartialMessage<BulkSkip>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "jobs.v1.BulkSkip";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "reason", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): BulkSkip {
+    return new BulkSkip().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): BulkSkip {
+    return new BulkSkip().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): BulkSkip {
+    return new BulkSkip().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: BulkSkip | PlainMessage<BulkSkip> | undefined, b: BulkSkip | PlainMessage<BulkSkip> | undefined): boolean {
+    return proto3.util.equals(BulkSkip, a, b);
   }
 }
 

@@ -240,6 +240,28 @@ function seedJobs(): void {
     deadLetterReason: 'max retries exhausted: HTTP 503 Service Unavailable',
   }))
 
+  // A second dead-lettered job whose created_at/dead_lettered_at orderings
+  // DIFFER from the one above (newer created, but older dead-lettered). This
+  // makes the dead-letter view's "default = dead_lettered_at DESC" sort
+  // observably distinct from a created_at sort — and lets the mock-client unit
+  // test prove the per-view default rather than trivially pass on a single row.
+  const olderDeadLetteredAt = minutesAgo(40)
+  jobs.push(makeJob({
+    id: 'job_demo_dead_lettered_2',
+    type: 'reconcile-ledger',
+    queue: 'critical',
+    tenant: 'globex',
+    metadata: { region: 'eu-west', team: 'billing' },
+    status: 'failed',
+    attempt: 5,
+    maxRetries: 5,
+    createdAt: minutesAgo(6),
+    completedAt: olderDeadLetteredAt,
+    lastError: 'deadlock detected; serialization failure',
+    deadLetteredAt: olderDeadLetteredAt,
+    deadLetterReason: 'max retries exhausted: deadlock detected',
+  }))
+
   jobs.push(makeJob({
     id: 'job_demo_tenant_acme',
     type: 'charge-payment',
