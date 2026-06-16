@@ -687,6 +687,8 @@ func (s *jobsService) searchJobs(ctx context.Context, req *jobsv1.ListJobsReques
 			Search:       req.Search,
 			Limit:        limit,
 			Offset:       (page - 1) * limit,
+			SortKey:      req.SortKey,
+			SortDir:      req.SortDir,
 		}
 		jobs, err := deadLettered.ListDeadLettered(ctx, filter)
 		if err != nil {
@@ -710,6 +712,8 @@ func (s *jobsService) searchJobs(ctx context.Context, req *jobsv1.ListJobsReques
 			Search:       req.Search,
 			Limit:        limit,
 			Offset:       (page - 1) * limit,
+			SortKey:      req.SortKey,
+			SortDir:      req.SortDir,
 		})
 	}
 

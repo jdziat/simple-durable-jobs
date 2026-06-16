@@ -492,3 +492,45 @@ func TestSearchJobs_ClampsOffsetAndLimit(t *testing.T) {
 	assert.Equal(t, int64(maxUIQueryLimit+25), workflowTotal)
 	assert.Len(t, roots, maxUIQueryLimit)
 }
+
+// UI-01: SearchJobs sorts server-side over the full result set by a whitelisted
+// column, and an unknown/hostile sort key falls back to the default (no SQL
+// injection, no error).
+func TestSearchJobs_ServerSideSortWhitelist(t *testing.T) {
+	ctx := context.Background()
+	store := newUITestStorage(t)
+	now := time.Now()
+	// Three jobs: priorities 1,3,2 enqueued oldest→newest.
+	for i, p := range []int{1, 3, 2} {
+		require.NoError(t, store.Enqueue(ctx, &core.Job{
+			ID: core.NewID(), Type: "work", Queue: "default", Status: core.StatusPending,
+			Priority: p, Args: []byte(`{}`), CreatedAt: now.Add(time.Duration(i) * time.Second),
+		}))
+	}
+
+	// priority ASC → 1,2,3
+	jobs, total, err := store.SearchJobs(ctx, core.JobFilter{SortKey: "priority", SortDir: "asc", Limit: 10})
+	require.NoError(t, err)
+	assert.EqualValues(t, 3, total)
+	require.Len(t, jobs, 3)
+	assert.Equal(t, []int{1, 2, 3}, []int{jobs[0].Priority, jobs[1].Priority, jobs[2].Priority})
+
+	// priority DESC → 3,2,1
+	jobs, _, err = store.SearchJobs(ctx, core.JobFilter{SortKey: "priority", SortDir: "desc", Limit: 10})
+	require.NoError(t, err)
+	require.Len(t, jobs, 3)
+	assert.Equal(t, []int{3, 2, 1}, []int{jobs[0].Priority, jobs[1].Priority, jobs[2].Priority})
+
+	// Hostile/unknown sort key → falls back to the default order, no error, no
+	// injection (table intact, all rows returned, same order as the default).
+	hostile, total, err := store.SearchJobs(ctx, core.JobFilter{SortKey: "priority; DROP TABLE jobs;--", SortDir: "asc", Limit: 10})
+	require.NoError(t, err, "unknown sort key must fall back, never error/inject")
+	assert.EqualValues(t, 3, total, "table intact, all rows returned")
+	require.Len(t, hostile, 3)
+	// Fallback maps the unknown key to created_at but honors the requested dir,
+	// so it must match an explicit created_at+asc sort (not error, not inject).
+	baseline, _, err := store.SearchJobs(ctx, core.JobFilter{SortKey: "created_at", SortDir: "asc", Limit: 10})
+	require.NoError(t, err)
+	require.Len(t, baseline, 3)
+	assert.Equal(t, jobIDs(baseline), jobIDs(hostile), "hostile sort key falls back to created_at, dir honored")
+}

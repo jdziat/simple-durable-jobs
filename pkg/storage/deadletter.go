@@ -21,7 +21,14 @@ func (s *GormStorage) ListDeadLettered(ctx context.Context, filter core.DeadLett
 
 	var jobs []*core.Job
 	limit, offset := clampDeadLetterPagination(filter.Limit, filter.Offset)
-	if err := q.Order("dead_lettered_at DESC, id DESC").
+	// Default to most-recently-dead first; honor an explicit (whitelisted) sort
+	// when the dashboard requests one so the dead-letter view's sortable headers
+	// aren't a no-op.
+	order := "dead_lettered_at DESC, id DESC"
+	if filter.SortKey != "" {
+		order = jobSortOrder(core.JobFilter{SortKey: filter.SortKey, SortDir: filter.SortDir})
+	}
+	if err := q.Order(order).
 		Offset(offset).
 		Limit(limit).
 		Find(&jobs).Error; err != nil {

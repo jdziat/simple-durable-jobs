@@ -832,6 +832,20 @@ export class ListJobsRequest extends Message<ListJobsRequest> {
    */
   metaContains: { [key: string]: string } = {};
 
+  /**
+   * sort_key selects the column to order by across the full result set (not just
+   * the current page). Server-validated against a whitelist; unknown values fall
+   * back to the default (created_at). sort_dir is "asc" or "desc" (default desc).
+   *
+   * @generated from field: string sort_key = 11;
+   */
+  sortKey = "";
+
+  /**
+   * @generated from field: string sort_dir = 12;
+   */
+  sortDir = "";
+
   constructor(data?: PartialMessage<ListJobsRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -850,6 +864,8 @@ export class ListJobsRequest extends Message<ListJobsRequest> {
     { no: 8, name: "limit", kind: "scalar", T: 5 /* ScalarType.INT32 */ },
     { no: 9, name: "tenant", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 10, name: "meta_contains", kind: "map", K: 9 /* ScalarType.STRING */, V: {kind: "scalar", T: 9 /* ScalarType.STRING */} },
+    { no: 11, name: "sort_key", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 12, name: "sort_dir", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListJobsRequest {

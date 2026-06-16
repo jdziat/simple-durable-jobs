@@ -77,8 +77,8 @@ test.describe('Jobs Page', () => {
     await expect(pagination).toContainText('of')
   })
 
-  test('page-local sort label is visible', async ({ page }) => {
-    await expect(page.getByText(/sorted within this page only/i)).toBeVisible()
+  test('server-side sort caption is visible', async ({ page }) => {
+    await expect(page.getByText(/sort the full result set/i)).toBeVisible()
   })
 
   test('failed jobs show error peek and copy action works', async ({ page, context }) => {

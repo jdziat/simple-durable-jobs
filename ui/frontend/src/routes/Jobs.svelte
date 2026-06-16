@@ -56,8 +56,10 @@
     { key: 'queue', label: 'Queue', sortable: true },
     { key: 'status', label: 'Status', sortable: true },
     { key: 'attempt', label: 'Attempts', align: 'right', sortable: true },
-    { key: 'duration', label: 'Duration', align: 'right', sortable: true },
-    { key: 'age', label: 'Age', align: 'right', sortable: true },
+    // duration/age are computed (no single DB column), so they are not
+    // server-sortable; the Created column gives the same age ordering.
+    { key: 'duration', label: 'Duration', align: 'right' },
+    { key: 'age', label: 'Age', align: 'right' },
     { key: 'createdAt', label: 'Created', sortable: true },
     { key: 'actions', label: 'Actions' },
   ]
@@ -81,9 +83,18 @@
   let transitionIds = $state<Set<string>>(new Set())
   let previousStatuses = new Map<string, string>()
 
-  let sortedJobs = $derived(
-    jobs.slice().sort((a, b) => compareValue(sortValue(a, sortKey), sortValue(b, sortKey)))
-  )
+  // Jobs arrive already sorted by the server (full-dataset sort, not page-local).
+  let sortedJobs = $derived(jobs)
+
+  // Maps a sortable table column to its server sort_key. Columns absent here
+  // (id, computed duration/age, actions) are not server-sortable.
+  const SORT_KEY_MAP: Record<string, string> = {
+    type: 'type',
+    queue: 'queue',
+    status: 'status',
+    attempt: 'attempt',
+    createdAt: 'created_at',
+  }
 
   let rangeStart = $derived(total === 0 ? 0 : Math.min((page - 1) * limit + 1, total))
   let rangeEnd = $derived(Math.min(page * limit, total))
@@ -121,33 +132,18 @@
     return (job.completedAt?.getTime() ?? Date.now()) - job.startedAt.getTime()
   }
 
-  function sortValue(job: JobItem, key: string): string | number | null {
-    if (key === 'status') return displayStatus(job)
-    if (key === 'duration') return durationMs(job)
-    if (key === 'age') return job.createdAt ? Date.now() - job.createdAt.getTime() : null
-    if (key === 'createdAt') return job.createdAt?.getTime() ?? null
-    const value = job[key as keyof JobItem]
-    if (value instanceof Date) return value.getTime()
-    if (typeof value === 'string' || typeof value === 'number') return value
-    return null
-  }
-
-  function compareValue(aVal: string | number | null, bVal: string | number | null): number {
-    if (aVal === null) return sortDir === 'asc' ? -1 : 1
-    if (bVal === null) return sortDir === 'asc' ? 1 : -1
-    if (typeof aVal === 'string' && typeof bVal === 'string') {
-      return sortDir === 'asc' ? aVal.localeCompare(bVal) : bVal.localeCompare(aVal)
-    }
-    return sortDir === 'asc' ? Number(aVal) - Number(bVal) : Number(bVal) - Number(aVal)
-  }
-
   function handleSort(key: string) {
+    if (!(key in SORT_KEY_MAP)) return // not a server-sortable column
     if (sortKey === key) {
       sortDir = sortDir === 'asc' ? 'desc' : 'asc'
     } else {
       sortKey = key
-      sortDir = key === 'createdAt' || key === 'age' || key === 'duration' ? 'desc' : 'asc'
+      sortDir = key === 'createdAt' ? 'desc' : 'asc'
     }
+    // Server-side sort applies across the whole result set, so re-query from
+    // page 1 rather than re-ordering the current page in the browser.
+    page = 1
+    void loadJobs()
   }
 
   function syncHash() {
@@ -233,6 +229,8 @@
         search: searchQuery,
         page,
         limit,
+        sortKey: SORT_KEY_MAP[sortKey] ?? '',
+        sortDir,
       })
       const nextJobs = response.jobs.map(j => ({
         id: j.id,
@@ -415,7 +413,7 @@
   {/if}
 
   <div class="table-meta">
-    <span>Page-local sort: sorted within this page only.</span>
+    <span>Sortable columns sort the full result set (Duration and Age are computed and not sortable).</span>
   </div>
 
   {#if error}
