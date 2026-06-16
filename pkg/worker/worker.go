@@ -53,6 +53,24 @@ type Worker struct {
 	// with WithQueueRateLimit.
 	queueRateBuckets map[string]*tokenBucket
 
+	// cto-F2 saturation-feedback throttle. When a fleet RateLimit denies a job
+	// (tryConsumeRateLimits), the dispatch loop would otherwise keep CLAIMING
+	// jobs every poll tick only to bounce+Release them — write amplification with
+	// no progress. markRateSaturated records, per effective limit name, the time
+	// the limit's current window rolls over; dequeueSlots consults it and claims
+	// nothing while a binding limit is saturated, collapsing the churn to one
+	// probe batch per window. This is a CLAIM-RATE damper only: the unchanged
+	// TryConsumeRate DB gate remains the sole admission authority, so it can only
+	// ever cause FEWER claims, never an extra admit.
+	//
+	// allRateLimitsUnkeyed is precomputed: suppression fires ONLY when every
+	// configured RateLimit is unkeyed, because a keyed limit's effective name
+	// needs the held job (RateLimitKey), so it cannot be pre-gated before a claim.
+	// With any keyed limit, behavior is identical to before this throttle.
+	rateSaturationMu     sync.Mutex
+	rateSaturatedUntil   map[string]time.Time
+	allRateLimitsUnkeyed bool
+
 	rateLimitStorageMissingLogged     atomic.Bool
 	retentionStorageMissingLogged     atomic.Bool
 	retentionUnconfiguredLogged       atomic.Bool
@@ -348,6 +366,17 @@ func NewWorker(q *queue.Queue, opts ...WorkerOption) *Worker {
 		config.OwnershipAuditInterval = 5 * time.Second
 	}
 
+	// The cto-F2 saturation throttle only applies when EVERY configured fleet
+	// RateLimit is unkeyed — a keyed limit's effective name needs the held job,
+	// so it can't be pre-gated before a claim (see rateSaturatedUntil).
+	allRateLimitsUnkeyed := len(config.RateLimits) > 0
+	for _, limit := range config.RateLimits {
+		if limit.Key != nil {
+			allRateLimitsUnkeyed = false
+			break
+		}
+	}
+
 	return &Worker{
 		queue:                   q,
 		config:                  config,
@@ -357,6 +386,8 @@ func NewWorker(q *queue.Queue, opts ...WorkerOption) *Worker {
 		queueJobID:              make(map[core.UUID]string),
 		slotJobID:               make(map[core.UUID][]string),
 		queueRateBuckets:        queueRateBuckets,
+		rateSaturatedUntil:      make(map[string]time.Time),
+		allRateLimitsUnkeyed:    allRateLimitsUnkeyed,
 		futureSleepSuppressions: make(map[core.UUID]int64),
 		heartbeatInterval:       hbInterval,
 	}
@@ -563,6 +594,17 @@ func (w *Worker) dequeueSlots(availableQueues []string, totalConcurrency int) in
 		slots = queueCapacity
 	}
 	if slots < 0 {
+		return 0
+	}
+	// cto-F2: if every configured fleet RateLimit is unkeyed and at least one is
+	// currently saturated, claiming is futile — a claimed job would pass the
+	// cheap in-memory gates, be denied by the DB rate gate, and be Released
+	// straight back to pending (write amplification, no progress). Skip the claim
+	// this tick; markRateSaturated set the suppress-until to the window rollover,
+	// so a probe batch re-fires precisely when headroom can return. This only
+	// ever REDUCES claims (the unchanged TryConsumeRate gate is still the sole
+	// admission authority), and never fires for keyed/mixed configs.
+	if w.allRateLimitsUnkeyed && w.unkeyedRateLimitsSaturated(time.Now()) {
 		return 0
 	}
 	return slots
@@ -1110,10 +1152,58 @@ func (w *Worker) tryConsumeRateLimits(ctx context.Context, job *core.Job) bool {
 			return false
 		}
 		if !allowed {
+			// cto-F2: remember this limit has no headroom until its window rolls,
+			// so dequeueSlots stops claiming jobs that would only be bounced.
+			w.markRateSaturated(limitName, window)
 			return false
 		}
 	}
 	return true
+}
+
+// markRateSaturated records that limitName has no headroom until the END of its
+// current fixed window (now.Truncate(window).Add(window), matching
+// TryConsumeRate's own windowStart math), so the probe re-fires exactly when the
+// gated window can roll. It is a worker-local heuristic damper, never an
+// admission authority — the unchanged TryConsumeRate DB gate still decides every
+// admission — so bounded worker/DB clock skew only shifts the next probe by the
+// skew, never over- or under-admits.
+func (w *Worker) markRateSaturated(limitName string, window time.Duration) {
+	// Only arm the cache when it can actually be consulted. With any keyed limit
+	// (allRateLimitsUnkeyed=false) dequeueSlots never reads it, so arming would
+	// just accumulate one never-pruned entry per distinct keyed name that ever
+	// denied — an unbounded-growth path under a high-cardinality key. Skip it.
+	if !w.allRateLimitsUnkeyed {
+		return
+	}
+	if window <= 0 {
+		window = defaultRateLimitWindow
+	}
+	until := time.Now().Truncate(window).Add(window)
+	w.rateSaturationMu.Lock()
+	w.rateSaturatedUntil[limitName] = until
+	w.rateSaturationMu.Unlock()
+}
+
+// unkeyedRateLimitsSaturated reports whether any fleet RateLimit was last seen
+// saturated within a window that has not yet rolled. Callers must guard on
+// w.allRateLimitsUnkeyed: a keyed limit's effective name is per-job, so its
+// saturation can't gate a pre-claim decision. Because every job is subject to
+// every configured fleet limit, any one saturated unkeyed limit means a freshly
+// claimed job would bounce — so claiming is futile until the window rolls.
+// Expired entries are pruned opportunistically.
+func (w *Worker) unkeyedRateLimitsSaturated(now time.Time) bool {
+	w.rateSaturationMu.Lock()
+	defer w.rateSaturationMu.Unlock()
+	saturated := false
+	for name, until := range w.rateSaturatedUntil {
+		if now.Before(until) {
+			saturated = true
+		} else {
+			delete(w.rateSaturatedUntil, name)
+		}
+	}
+	return saturated
 }
 
 func (w *Worker) tryAcquireConcurrencySlots(ctx context.Context, job *core.Job) bool {

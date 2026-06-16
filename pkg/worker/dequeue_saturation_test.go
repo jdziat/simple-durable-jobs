@@ -244,21 +244,90 @@ func TestSaturatedDispatch_ChurnBaseline(t *testing.T) {
 }
 
 // TestSaturatedDispatch_SelfHealsWhenHeadroomReturns proves the no-starvation
-// invariant: once the rate limit has headroom (allow flips true), the very next
-// tick dispatches work instead of bouncing it. This must hold pre- and post-fix
-// (the fix must not wedge a recovered limit).
+// invariant: a recovered rate limit dispatches work again, it is not wedged.
+//
+// For a FIXED-WINDOW limit, headroom genuinely returns only when the window
+// rolls (the count resets) — so the throttle suppresses until the window
+// boundary and the worker probes again then. We model the rollover by expiring
+// the suppression cache (what a real clock crossing the window boundary does),
+// then assert dispatch resumes. This is the documented "up to ~one window of
+// added latency on a just-recovered limit" behavior, not a wedge.
 func TestSaturatedDispatch_SelfHealsWhenHeadroomReturns(t *testing.T) {
 	const concurrency = 4
 	store := newSoakStorage(concurrency)
 	store.allow.Store(false)
 	w := newSaturationWorker(store, concurrency)
 
-	// A few saturated ticks: nothing dispatches.
+	// A few saturated ticks: nothing dispatches (the throttle suppresses after
+	// the first probe batch).
 	res := runSaturationSoak(t, w, store, concurrency, 5)
 	require.Equal(t, 0, res.dispatched, "saturated: no dispatch")
 
-	// Headroom returns.
+	// The fixed window rolls AND headroom returns.
 	store.allow.Store(true)
+	expireRateSuppression(w)
 	res2 := runSaturationSoak(t, w, store, concurrency, 3)
 	assert.Greater(t, res2.dispatched, 0, "a recovered rate limit must dispatch work, not starve it")
+}
+
+// expireRateSuppression simulates the rate-limit window rolling over: it clears
+// the worker's saturation cache so the next tick probes the (recovered) limit.
+func expireRateSuppression(w *Worker) {
+	w.rateSaturationMu.Lock()
+	for k := range w.rateSaturatedUntil {
+		delete(w.rateSaturatedUntil, k)
+	}
+	w.rateSaturationMu.Unlock()
+}
+
+// TestSaturatedDispatch_ThrottleCollapsesChurn is the post-fix proof: under a
+// permanently-saturated unkeyed fleet limit, the saturation-aware dequeueSlots
+// claims at most ONE probe batch and then suppresses, so total claims/bounces
+// across many ticks stay bounded by a single batch instead of growing
+// ~concurrency-per-tick (the pre-fix baseline this collapses).
+func TestSaturatedDispatch_ThrottleCollapsesChurn(t *testing.T) {
+	const concurrency = 8
+	const ticks = 50
+	store := newSoakStorage(concurrency * 4)
+	store.allow.Store(false)
+	w := newSaturationWorker(store, concurrency)
+
+	res := runSaturationSoak(t, w, store, concurrency, ticks)
+
+	assert.Equal(t, 0, res.dispatched, "still no dispatch while saturated")
+	// One probe batch (<= concurrency) instead of ~concurrency*ticks bounces.
+	// The whole 50-tick run claims/bounces no more than a single batch because
+	// the test runs within one wall-clock rate window (no rollover).
+	assert.LessOrEqual(t, res.releases, int64(concurrency),
+		"throttle must collapse churn to a single probe batch, not bounce every tick")
+	assert.LessOrEqual(t, res.rateChecks, int64(concurrency),
+		"a suppressed tick must not even reach the DB rate gate")
+	t.Logf("cto-F2 FIXED over %d ticks @ concurrency=%d: dequeues=%d releases=%d rateChecks=%d (was ~%d each pre-fix)",
+		ticks, concurrency, res.dequeues, res.releases, res.rateChecks, concurrency*ticks)
+}
+
+// TestSaturatedDispatch_KeyedLimitNotSuppressed proves the scope boundary: a
+// KEYED fleet limit cannot be pre-gated (its effective name needs the held
+// job), so allRateLimitsUnkeyed is false and dequeueSlots NEVER suppresses —
+// behavior is identical to the pre-throttle dispatch loop (continuous churn).
+func TestSaturatedDispatch_KeyedLimitNotSuppressed(t *testing.T) {
+	const concurrency = 8
+	const ticks = 10
+	store := newSoakStorage(concurrency * 4)
+	store.allow.Store(false)
+	w := NewWorker(queue.New(store),
+		WorkerQueue("default", Concurrency(concurrency)),
+		RateLimit("fleet", 1_000_000, RateLimitKey(func(*core.Job) string { return "k" })),
+		WithDequeueBatchSize(concurrency),
+		DisableRetry(),
+	)
+	w.config.WorkerID = "worker-soak"
+	require.False(t, w.allRateLimitsUnkeyed, "a keyed limit must disable the unkeyed throttle")
+
+	res := runSaturationSoak(t, w, store, concurrency, ticks)
+	assert.Equal(t, 0, res.dispatched)
+	// No suppression: the worker keeps claiming+bouncing every tick, exactly as
+	// before the throttle. (~concurrency bounces/tick.)
+	assert.Greater(t, res.releases, int64(concurrency),
+		"keyed config must NOT be throttled — churn continues unchanged")
 }
