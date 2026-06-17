@@ -1053,6 +1053,17 @@ func (s *GormStorage) DeleteCheckpoints(ctx context.Context, jobID core.UUID) er
 		Delete(&core.Checkpoint{}).Error
 }
 
+// DeleteCheckpointAtIndex removes every checkpoint row for a job at one call
+// index, regardless of call_type. It exists so a BestEffortReplay re-execution
+// can clear the prior-type checkpoint that would otherwise be orphaned at the
+// same index (the (job_id, call_index, call_type) unique key means a changed
+// type inserts a second row rather than replacing the first).
+func (s *GormStorage) DeleteCheckpointAtIndex(ctx context.Context, jobID core.UUID, callIndex int) error {
+	return s.db.WithContext(ctx).
+		Where("job_id = ? AND call_index = ?", jobID, callIndex).
+		Delete(&core.Checkpoint{}).Error
+}
+
 // GetDueJobs returns jobs ready to run.
 func (s *GormStorage) GetDueJobs(ctx context.Context, queues []string, limit int) ([]*core.Job, error) {
 	var jobList []*core.Job

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	"gorm.io/gorm"
 
@@ -23,6 +24,12 @@ const versionCheckpointPrefix = "jobs.version:"
 // ErrUnsupportedWorkflowVersion is returned when a recorded workflow-code
 // version falls outside the caller's supported range.
 var ErrUnsupportedWorkflowVersion = errors.New("jobs: unsupported workflow version")
+
+// ErrReservedPhaseName is returned by the phase-checkpoint APIs when the phase
+// name uses the reserved "jobs.version:" prefix. That prefix is owned by
+// GetVersion's workflow-version markers (stored at the same CallIndex -1), so a
+// phase sharing it would collide with and clobber a version marker.
+var ErrReservedPhaseName = fmt.Errorf("jobs: phase name uses the reserved %q prefix", versionCheckpointPrefix)
 
 // JobFromContext returns the current Job from context, or nil if not in a job handler.
 // Use this to get the job ID for logging or progress tracking.
@@ -109,11 +116,18 @@ func GetVersion(ctx context.Context, changeID string, minSupported, maxSupported
 
 // SavePhaseCheckpoint saves a phase result to the checkpoint store.
 // The phase name is used as the CallType for lookup on resume.
-// Returns nil if not running within a job handler.
+// Returns nil if not running within a job handler. Returns ErrReservedPhaseName
+// if phaseName uses the reserved "jobs.version:" prefix.
+//
+// On success the result is also reflected in the in-memory call state, so a
+// LoadPhaseCheckpoint later in the SAME run returns it (mirroring GetVersion).
 func SavePhaseCheckpoint(ctx context.Context, phaseName string, result any) error {
 	jc := intctx.GetJobContext(ctx)
 	if jc == nil {
 		return nil // Not in a job context, silently skip
+	}
+	if strings.HasPrefix(phaseName, versionCheckpointPrefix) {
+		return fmt.Errorf("%w: %q", ErrReservedPhaseName, phaseName)
 	}
 
 	resultBytes, err := json.Marshal(result)
@@ -129,17 +143,39 @@ func SavePhaseCheckpoint(ctx context.Context, phaseName string, result any) erro
 		Result:    resultBytes,
 	}
 
-	return jc.SaveCheckpoint(ctx, cp)
+	if err := jc.SaveCheckpoint(ctx, cp); err != nil {
+		return err
+	}
+
+	// Reflect the just-saved checkpoint in the in-memory call state so a same-run
+	// LoadPhaseCheckpoint returns it instead of (zero,false). GetVersion does the
+	// same write-back for its version markers.
+	if cs := intctx.GetCallState(ctx); cs != nil {
+		cs.Mu.Lock()
+		cs.Checkpoints[intctx.CheckpointKey{Index: -1, Type: phaseName}] = cp
+		cs.Mu.Unlock()
+	}
+	return nil
 }
 
 // SavePhaseCheckpointTx saves a phase result through a caller-owned GORM
 // transaction. Unlike SavePhaseCheckpoint, it returns an error outside a job
 // handler because silently skipping a transactional checkpoint would break the
-// caller's atomicity guarantee.
+// caller's atomicity guarantee. Returns ErrReservedPhaseName if phaseName uses
+// the reserved "jobs.version:" prefix.
+//
+// Unlike SavePhaseCheckpoint, it does NOT update the in-memory call state: the
+// write is bound to the caller's transaction, which may not be committed yet (or
+// may roll back), so caching it as visible would be unsound. A same-run
+// LoadPhaseCheckpoint therefore will not observe it; the value is read back on
+// the next replay after the caller commits.
 func SavePhaseCheckpointTx(ctx context.Context, tx *gorm.DB, phaseName string, result any) error {
 	jc := intctx.GetJobContext(ctx)
 	if jc == nil {
 		return fmt.Errorf("jobs.SavePhaseCheckpointTx: not in a job handler")
+	}
+	if strings.HasPrefix(phaseName, versionCheckpointPrefix) {
+		return fmt.Errorf("%w: %q", ErrReservedPhaseName, phaseName)
 	}
 
 	txCheckpointer, ok := jc.Storage.(storage.TxCheckpointer)
@@ -167,6 +203,12 @@ func SavePhaseCheckpointTx(ctx context.Context, tx *gorm.DB, phaseName string, r
 // Returns (result, true) if found, (zero, false) if not found or not in job context.
 func LoadPhaseCheckpoint[T any](ctx context.Context, phaseName string) (T, bool) {
 	var zero T
+
+	// A reserved-prefix name can never have been written by SavePhaseCheckpoint,
+	// so treat it as absent rather than aliasing a GetVersion marker.
+	if strings.HasPrefix(phaseName, versionCheckpointPrefix) {
+		return zero, false
+	}
 
 	jc := intctx.GetJobContext(ctx)
 	if jc == nil {
