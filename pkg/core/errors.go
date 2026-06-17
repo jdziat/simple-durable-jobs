@@ -56,6 +56,11 @@ var (
 	// guard surfaces the limitation instead of silently dropping the dedup. Use
 	// single Enqueue for windowed deduplication, or UniqueKey within a batch.
 	ErrBatchWindowedDedup = errors.New("jobs: EnqueueBatch does not support IdempotencyKey/UniqueFor (windowed dedup); use single Enqueue or UniqueKey")
+	// ErrInvalidWindowedDedup is returned by single enqueue when IdempotencyKey
+	// or UniqueFor is configured with values that would disable the requested
+	// windowed deduplication, such as an empty idempotency key or non-positive
+	// TTL.
+	ErrInvalidWindowedDedup = errors.New("jobs: invalid windowed deduplication options")
 	// ErrPayloadDecode wraps codec failures while reading stored payload bytes.
 	ErrPayloadDecode = errors.New("jobs: payload decode failed")
 	// ErrJobHasChildren is returned by DeleteJob when the target is a fan-out

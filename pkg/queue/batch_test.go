@@ -327,6 +327,54 @@ func TestQueue_EnqueueBatch_DuplicateUniqueKeyInOneBatchReturnsInputLengthAndIns
 	assert.EqualValues(t, 1, count)
 }
 
+func TestQueue_EnqueueBatch_CrossCallUniqueCollisionReturnsExistingID(t *testing.T) {
+	ctx := context.Background()
+	store := newQueueBatchTestStorage(t)
+	q := New(store)
+	q.Register("batch.seed", func(context.Context, string) error { return nil })
+
+	firstID, err := q.Enqueue(ctx, "batch.seed", "first", Unique("cross-call-key"))
+	require.NoError(t, err)
+
+	ids, err := q.EnqueueBatch(ctx, []BatchEntry{
+		Batch("batch.duplicate", "second", Unique("cross-call-key")),
+	})
+	require.NoError(t, err)
+	require.Len(t, ids, 1)
+	assert.Equal(t, firstID, ids[0])
+
+	status, err := q.LoadStatus(ctx, ids[0])
+	require.NoError(t, err)
+	assert.Equal(t, core.StatusPending, status)
+}
+
+func TestQueue_EnqueueBatch_UniqueKeyCompletedJobDoesNotDedup(t *testing.T) {
+	ctx := context.Background()
+	store := newQueueBatchTestStorage(t)
+	q := New(store)
+	q.Register("batch.seed.completed", func(context.Context, string) error { return nil })
+
+	firstID, err := q.Enqueue(ctx, "batch.seed.completed", "first", Unique("completed-key"))
+	require.NoError(t, err)
+	dequeued, err := store.Dequeue(ctx, []string{"default"}, "worker-1")
+	require.NoError(t, err)
+	require.NotNil(t, dequeued)
+	require.Equal(t, firstID, dequeued.ID)
+	require.NoError(t, store.Complete(ctx, dequeued.ID, "worker-1"))
+
+	ids, err := q.EnqueueBatch(ctx, []BatchEntry{
+		Batch("batch.after.completed", "second", Unique("completed-key")),
+	})
+	require.NoError(t, err)
+	require.Len(t, ids, 1)
+	assert.NotEqual(t, firstID, ids[0])
+
+	job, err := store.GetJob(ctx, ids[0])
+	require.NoError(t, err)
+	require.NotNil(t, job)
+	assert.Equal(t, core.StatusPending, job.Status)
+}
+
 func TestQueue_EnqueueBatchTx_ValidatesJobTypeName(t *testing.T) {
 	ctx := context.Background()
 	store := newQueueBatchTestStorage(t)

@@ -37,7 +37,7 @@ func (s *GormStorage) TryConsumeRate(ctx context.Context, limitName string, perS
 		windowStart := effectiveNow.Truncate(window)
 
 		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-			if err := s.deleteExpiredRateLimitWindows(tx, windowStart.Add(-2*window)); err != nil {
+			if err := s.deleteExpiredRateLimitWindows(tx, limitName, windowStart.Add(-2*window)); err != nil {
 				return err
 			}
 
@@ -78,8 +78,37 @@ func (s *GormStorage) TryConsumeRate(ctx context.Context, limitName string, perS
 	return allowed, nil
 }
 
-func (s *GormStorage) deleteExpiredRateLimitWindows(tx *gorm.DB, cutoff time.Time) error {
-	return tx.Where("window_start < ?", cutoff).Delete(&core.RateLimitWindow{}).Error
+// deleteExpiredRateLimitWindows GCs only THIS limit's expired windows. Scoping to
+// limit_name is both correct — a short-window limit's per-call GC must not delete a
+// coexisting long-window limit's still-live counter (teardown g4) — and efficient:
+// the (limit_name, window_start) primary key serves "limit_name = ? AND
+// window_start < ?" as an index range, where the previous bare "window_start < ?"
+// could not use the limit_name-leading PK and scanned the whole table each call.
+func (s *GormStorage) deleteExpiredRateLimitWindows(tx *gorm.DB, limitName string, cutoff time.Time) error {
+	return tx.Where("limit_name = ? AND window_start < ?", limitName, cutoff).Delete(&core.RateLimitWindow{}).Error
+}
+
+// ReleaseRate returns one previously-consumed unit to a fleet rate limit's current
+// window. The worker calls it to refund limits it already consumed when a LATER
+// fleet limit in the same admission denies the job (teardown g4): without the
+// refund, every multi-limit bounce permanently drains the earlier limits' windows
+// for a job that never runs, silently starving them. Guarded count > 0 so a refund
+// that races a window rollover can never drive a counter negative. It is an
+// optional storage capability used by the worker through type assertion.
+func (s *GormStorage) ReleaseRate(ctx context.Context, limitName string, window time.Duration) error {
+	if limitName == "" || window <= 0 {
+		return nil
+	}
+	return s.withSerializationRetry(ctx, func() error {
+		now, err := s.rateLimitNow(ctx, time.Time{})
+		if err != nil {
+			return err
+		}
+		windowStart := now.Truncate(window)
+		return s.db.WithContext(ctx).Model(&core.RateLimitWindow{}).
+			Where("limit_name = ? AND window_start = ? AND count > 0", limitName, windowStart).
+			Update("count", gorm.Expr("count - 1")).Error
+	})
 }
 
 func (s *GormStorage) rateLimitNow(ctx context.Context, fallback time.Time) (time.Time, error) {

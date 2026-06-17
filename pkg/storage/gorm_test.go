@@ -4729,11 +4729,10 @@ func TestEnqueueBatch_MixedReplayInsertsOnlyNewJobs(t *testing.T) {
 	assert.Equal(t, 1, byKey["fanout-xyz-2"])
 }
 
-// TestEnqueueBatch_SkipsDuplicatesAcrossTerminalStates verifies that the
-// idempotency filter considers pending, running, and completed jobs — not
-// just pending — so a replay does not re-create a sub-job that has already
-// executed.
-func TestEnqueueBatch_SkipsDuplicatesAcrossTerminalStates(t *testing.T) {
+// TestEnqueueBatch_DedupWindowExcludesCompleted verifies that active UniqueKey
+// deduplication matches single-enqueue semantics: pending/running rows block a
+// duplicate, but completed rows free the key for a new job.
+func TestEnqueueBatch_DedupWindowExcludesCompleted(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStorage(t)
 
@@ -4748,8 +4747,13 @@ func TestEnqueueBatch_SkipsDuplicatesAcrossTerminalStates(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, dequeued)
 	require.NoError(t, s.Complete(ctx, dequeued.ID, "worker-X"))
+	completedKey := dequeued.UniqueKey
+	pendingKey := "fanout-states-0"
+	if completedKey == pendingKey {
+		pendingKey = "fanout-states-1"
+	}
 
-	// Replay with the same UniqueKeys should skip both.
+	// Replay with the same UniqueKeys should recreate only the completed job.
 	replay := []*core.Job{
 		{Type: "sub.a", Queue: "default", UniqueKey: "fanout-states-0"},
 		{Type: "sub.b", Queue: "default", UniqueKey: "fanout-states-1"},
@@ -4761,7 +4765,15 @@ func TestEnqueueBatch_SkipsDuplicatesAcrossTerminalStates(t *testing.T) {
 	require.NoError(t, s.DB().Model(&core.Job{}).
 		Where("unique_key LIKE ?", "fanout-states-%").
 		Count(&total).Error)
-	assert.EqualValues(t, 2, total, "completed + pending siblings must not be duplicated on replay")
+	assert.EqualValues(t, 3, total, "completed keys should be reusable while pending keys still dedup")
+
+	var completedKeyCount int64
+	require.NoError(t, s.DB().Model(&core.Job{}).Where("unique_key = ?", completedKey).Count(&completedKeyCount).Error)
+	assert.EqualValues(t, 2, completedKeyCount)
+
+	var pendingKeyCount int64
+	require.NoError(t, s.DB().Model(&core.Job{}).Where("unique_key = ?", pendingKey).Count(&pendingKeyCount).Error)
+	assert.EqualValues(t, 1, pendingKeyCount)
 }
 
 // TestEnqueueBatch_ConcurrentUniqueKey_NoDuplicates probes the TOCTOU window
@@ -4976,6 +4988,56 @@ func TestFindOrphanedJobs_DoesNotFlagPaused(t *testing.T) {
 	require.NoError(t, err)
 	assert.NotContains(t, orphaned, job.ID,
 		"a paused job must not be reported as orphaned")
+}
+
+// TestFindOrphanedJobs_DoesNotFlagSelfCompleted is the regression test for
+// teardown g9: a job THIS worker completed (Complete clears locked_by to ” and
+// sets status=completed) used to be reported as orphaned, because locked_by=”
+// trips the "locked_by != workerID" branch. The ownership audit then fired a
+// spurious JobReclaimed/OnJobReclaimed for the worker's own completion during the
+// TOCTOU window before its deferred runningJobs unregister. A terminal row whose
+// lock was cleared to ” must NOT be reported.
+func TestFindOrphanedJobs_DoesNotFlagSelfCompleted(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	require.NoError(t, s.Enqueue(ctx, newTestJob("default", "t")))
+	job, err := s.Dequeue(ctx, []string{"default"}, "worker-A")
+	require.NoError(t, err)
+	require.NotNil(t, job)
+
+	// worker-A completes its own job (locked_by -> '', status -> completed).
+	require.NoError(t, s.Complete(ctx, job.ID, "worker-A"))
+
+	orphaned, err := s.FindOrphanedJobs(ctx, []core.UUID{job.ID}, "worker-A")
+	require.NoError(t, err)
+	assert.NotContains(t, orphaned, job.ID,
+		"a job this worker completed itself must not be reported as orphaned")
+}
+
+// TestFindOrphanedJobs_FlagsPeerCancelledStillLocked guards the OTHER side of
+// the g9 refinement: a peer that cancels our running sub-job via a fan-out
+// failure sets status=cancelled but leaves locked_by = this worker, and that
+// case MUST still be reported so the audit cancels our live handler.
+func TestFindOrphanedJobs_FlagsPeerCancelledStillLocked(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	require.NoError(t, s.Enqueue(ctx, newTestJob("default", "t")))
+	job, err := s.Dequeue(ctx, []string{"default"}, "worker-A")
+	require.NoError(t, err)
+	require.NotNil(t, job)
+
+	// A peer fan-out failure cancels the sub-job without touching locked_by
+	// (mirrors CancelSubJobs: status -> cancelled, locked_by stays worker-A).
+	require.NoError(t, s.db.Model(&core.Job{}).
+		Where("id = ?", job.ID).
+		Update("status", core.StatusCancelled).Error)
+
+	orphaned, err := s.FindOrphanedJobs(ctx, []core.UUID{job.ID}, "worker-A")
+	require.NoError(t, err)
+	assert.Contains(t, orphaned, job.ID,
+		"a still-locked job a peer cancelled must be reported so the live handler is stopped")
 }
 
 // TestIsSerializationFailure_RetryableErrors locks in the set of transient

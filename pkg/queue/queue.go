@@ -27,6 +27,9 @@ import (
 
 // EnqueueMiddleware wraps the enqueue operation.
 // next persists the job; middleware can modify the job or context before calling next.
+// Middleware must mutate the provided *core.Job in place; it must not replace it with a
+// different pointer, because enqueue (and especially EnqueueBatch) reports the persisted
+// ID back through that same pointer after dedup resolution.
 type EnqueueMiddleware func(ctx context.Context, job *core.Job, next func(context.Context, *core.Job) error) error
 
 // Queue manages job registration, enqueueing, and processing.
@@ -42,6 +45,7 @@ type Queue struct {
 	onComplete []func(context.Context, *core.Job)
 	onFail     []func(context.Context, *core.Job, error)
 	onRetry    []func(context.Context, *core.Job, int, error)
+	onWaiting  []func(context.Context, *core.Job)
 	onReclaim  []func(context.Context, core.UUID, string)
 
 	// Enqueue middleware chain
@@ -208,6 +212,70 @@ func (q *Queue) enqueue(ctx context.Context, name string, args any, opts ...Opti
 	return q.enqueueWithOptions(ctx, name, args, options)
 }
 
+// EnqueueScheduledFire atomically claims a schedule's fire boundary and enqueues
+// the fired job in a single transaction: if the enqueue fails, the boundary claim
+// is rolled back so it can be re-claimed, instead of advancing the durable cursor
+// and silently dropping a due run (at-least-once-per-boundary; teardown g8). The
+// returned claimed reports whether THIS call won the boundary (false = a peer
+// already claimed it). Falls back to the prior non-atomic claim-then-enqueue only
+// when the storage backend is not transactional (no GORM tx / TxEnqueuer). It is
+// the scheduler's enqueue path and runs the same options, dedup, and middleware as
+// EnqueueTx.
+func (q *Queue) EnqueueScheduledFire(ctx context.Context, scheduleName string, fireTime time.Time, jobName string, args any, opts ...Option) (claimed bool, id core.UUID, err error) {
+	txClaimer, claimerOK := q.storage.(storage.ScheduledFireTxClaimer)
+	_, enqOK := q.storage.(storage.TxEnqueuer)
+	dbp, dbOK := q.storage.(interface{ DB() *gorm.DB })
+
+	if claimerOK && enqOK && dbOK {
+		// The in-tx unique-key dedup (EnqueueUniqueTx/EnqueueWithUniqueLockTx) can
+		// hit a MySQL gap-lock deadlock (1213) / serialization failure, which the
+		// non-tx fallback (q.Enqueue) retried internally. Wrap the whole claim+enqueue
+		// in the storage's serialization-retry so a scheduled fire of a Unique/
+		// IdempotencyKey schedule under contention is retried rather than failing the
+		// tick. claimed/id are reset per attempt so a rolled-back attempt never leaks.
+		runTx := func() error {
+			claimed = false
+			id = core.NilUUID
+			return dbp.DB().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+				won, e := txClaimer.ClaimScheduledFireTx(ctx, tx, scheduleName, fireTime)
+				if e != nil {
+					return e
+				}
+				claimed = won
+				if !claimed {
+					return nil
+				}
+				jid, e := q.EnqueueTx(ctx, tx, jobName, args, opts...)
+				if e != nil {
+					return e // rolls back the claim so the boundary stays re-claimable
+				}
+				id = jid
+				return nil
+			})
+		}
+		var txErr error
+		if retrier, ok := q.storage.(interface {
+			WithSerializationRetry(context.Context, func() error) error
+		}); ok {
+			txErr = retrier.WithSerializationRetry(ctx, runTx)
+		} else {
+			txErr = runTx()
+		}
+		if txErr != nil {
+			return false, core.NilUUID, txErr
+		}
+		return claimed, id, nil
+	}
+
+	// Non-transactional backend: preserve the prior (non-atomic) behavior.
+	claimed, err = q.storage.ClaimScheduledFire(ctx, scheduleName, fireTime)
+	if err != nil || !claimed {
+		return claimed, core.NilUUID, err
+	}
+	id, err = q.Enqueue(ctx, jobName, args, opts...)
+	return claimed, id, err
+}
+
 func (q *Queue) enqueueTxWithOptions(ctx context.Context, tx *gorm.DB, name string, args any, options *Options) (core.UUID, error) {
 	txEnqueuer, ok := q.storage.(storage.TxEnqueuer)
 	if !ok {
@@ -316,6 +384,19 @@ func (q *Queue) buildJob(name string, args any, options *Options) (*core.Job, er
 	if options.IdempotencyKey != "" {
 		if err := security.ValidateUniqueKey(options.IdempotencyKey); err != nil {
 			return nil, err
+		}
+	}
+	switch options.windowedDedup {
+	case windowedDedupIdempotencyKey:
+		if options.IdempotencyKey == "" {
+			return nil, fmt.Errorf("%w: IdempotencyKey requires a non-empty key", core.ErrInvalidWindowedDedup)
+		}
+		if options.UniqueLockTTL <= 0 {
+			return nil, fmt.Errorf("%w: IdempotencyKey requires a positive TTL", core.ErrInvalidWindowedDedup)
+		}
+	case windowedDedupUniqueFor:
+		if options.UniqueLockTTL <= 0 || options.UniqueForTTL <= 0 {
+			return nil, fmt.Errorf("%w: UniqueFor requires a positive TTL", core.ErrInvalidWindowedDedup)
 		}
 	}
 	if len(options.Tenant) > security.MaxQueueNameLength {
@@ -451,7 +532,7 @@ func (q *Queue) enqueueBatch(ctx context.Context, entries []BatchEntry, enqueueB
 		// path, which has no batch variant — honoring only UniqueKey here would
 		// silently drop the requested dedup. Reject explicitly so the caller learns
 		// the limitation instead of getting un-deduplicated jobs.
-		if options.IdempotencyKey != "" || options.UniqueForTTL > 0 {
+		if options.windowedDedup != windowedDedupNone {
 			return nil, fmt.Errorf("%w (entry %d)", core.ErrBatchWindowedDedup, i)
 		}
 		job, err := q.buildJob(entry.Name, entry.Args, options)
@@ -488,6 +569,9 @@ func (q *Queue) enqueueBatch(ctx context.Context, entries []BatchEntry, enqueueB
 
 	if err := enqueueBatch(ctx, toPersist); err != nil {
 		return nil, fmt.Errorf("jobs: failed to enqueue batch: %w", err)
+	}
+	for i, job := range jobs {
+		ids[i] = job.ID
 	}
 	return ids, nil
 }
@@ -803,6 +887,17 @@ func (q *Queue) OnRetry(fn func(context.Context, *core.Job, int, error)) {
 	q.mu.Unlock()
 }
 
+// OnJobWaiting registers a callback for when a job self-suspends into
+// StatusWaiting (a fan-out or signal wait) and the handler yields. The attempt
+// is not failing or completing — it is parked until a resume re-dispatches it as
+// a fresh attempt. Observability integrations use this to close the per-attempt
+// span that would otherwise leak (it is neither completed nor failed).
+func (q *Queue) OnJobWaiting(fn func(context.Context, *core.Job)) {
+	q.mu.Lock()
+	q.onWaiting = append(q.onWaiting, fn)
+	q.mu.Unlock()
+}
+
 // OnJobReclaimed registers a callback for when a job lease is reclaimed from a
 // presumed-dead owner (stale-lock reaper) or observed reclaimed by a peer
 // (ownership audit). The callback receives the job ID and the reclaim reason
@@ -936,6 +1031,18 @@ func (q *Queue) CallRetryHooks(ctx context.Context, job *core.Job, attempt int, 
 
 	for _, fn := range hooks {
 		fn(ctx, job, attempt, err)
+	}
+}
+
+// CallWaitingHooks calls all registered waiting hooks.
+func (q *Queue) CallWaitingHooks(ctx context.Context, job *core.Job) {
+	q.mu.RLock()
+	hooks := make([]func(context.Context, *core.Job), len(q.onWaiting))
+	copy(hooks, q.onWaiting)
+	q.mu.RUnlock()
+
+	for _, fn := range hooks {
+		fn(ctx, job)
 	}
 }
 

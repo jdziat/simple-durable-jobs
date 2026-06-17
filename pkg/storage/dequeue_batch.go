@@ -102,11 +102,30 @@ func (s *GormStorage) dequeueBatchLocked(ctx context.Context, queues []string, w
 					claimedInTx[id] = struct{}{}
 				}
 				skippedIDs := make([]core.UUID, 0)
+				// Queues that have hit their per-queue budget this tx. Excluding them
+				// from subsequent scans — instead of fetching, SKIP-LOCK-locking, and
+				// skipping each of their rows — stops the loop from walking a
+				// budget-exhausted queue's entire backlog, an O(P) ordered-scan +
+				// O(P) held-lock cliff that pinned hot queues and starved other
+				// workers (teardown g3).
+				exhausted := make(map[string]bool)
 
 				for len(batchIDs) < remaining {
+					activeQueues := queues
+					if len(perQueueBudgets) > 0 && len(exhausted) > 0 {
+						activeQueues = make([]string, 0, len(queues))
+						for _, qn := range queues {
+							if !exhausted[qn] {
+								activeQueues = append(activeQueues, qn)
+							}
+						}
+						if len(activeQueues) == 0 {
+							break
+						}
+					}
 					var candidates []*core.Job
 					needed := remaining - len(batchIDs)
-					query := s.claimableCandidates(s.lockForUpdate(tx, true), queues, nowExpr)
+					query := s.claimableCandidates(s.lockForUpdate(tx, true), activeQueues, nowExpr)
 					if len(skippedIDs) > 0 {
 						query = query.Where("id NOT IN ?", skippedIDs)
 					}
@@ -138,12 +157,16 @@ func (s *GormStorage) dequeueBatchLocked(ctx context.Context, queues []string, w
 							return err
 						}
 						if budget, ok := perQueueBudgets[job.Queue]; ok && txClaimedPerQueue[job.Queue] >= budget {
+							exhausted[job.Queue] = true // stop scanning this queue's backlog
 							skippedIDs = append(skippedIDs, job.ID)
 							continue
 						}
 						claimIDs = append(claimIDs, job.ID)
 						claimQueues[job.Queue]++
 						txClaimedPerQueue[job.Queue]++
+						if budget, ok := perQueueBudgets[job.Queue]; ok && txClaimedPerQueue[job.Queue] >= budget {
+							exhausted[job.Queue] = true // just reached budget
+						}
 					}
 					if len(claimIDs) == 0 {
 						continue
@@ -219,10 +242,33 @@ func (s *GormStorage) dequeueBatchLocked(ctx context.Context, queues []string, w
 		Find(&jobs).Error; err != nil {
 		return nil, err
 	}
-	if err := s.decodeJobListPayloads(jobs); err != nil {
+	decoded, err := s.decodeClaimedBatch(ctx, jobs, workerID)
+	if err != nil {
 		return nil, err
 	}
-	return jobs, nil
+	return decoded, nil
+}
+
+// decodeClaimedBatch decodes each freshly-claimed job's payloads. A job whose
+// payload cannot be decoded (e.g. a custom codec failing on a poison row) is
+// RELEASED back to pending and EXCLUDED from the returned batch, rather than
+// failing the whole call and stranding EVERY claimed row (locked until the
+// stale-lock reaper, ~45m by default) on a single bad payload (teardown g3). The
+// successfully-decoded jobs are returned so good work is never blocked by a poison
+// sibling. The released poison row is re-claimable (and will re-fail decode) — a
+// visible, self-contained symptom of a misconfigured codec, not a fleet-wide stall.
+func (s *GormStorage) decodeClaimedBatch(ctx context.Context, jobs []*core.Job, workerID string) ([]*core.Job, error) {
+	out := jobs[:0]
+	for _, job := range jobs {
+		if err := s.decodeJobPayloads(job); err != nil {
+			if rerr := s.Release(ctx, job.ID, workerID); rerr != nil && !errors.Is(rerr, core.ErrJobNotOwned) {
+				return nil, rerr
+			}
+			continue
+		}
+		out = append(out, job)
+	}
+	return out, nil
 }
 
 func (s *GormStorage) hasClaimableBatchJob(ctx context.Context, queues []string) (bool, error) {
@@ -328,8 +374,9 @@ func (s *GormStorage) dequeueBatchSQLite(ctx context.Context, queues []string, w
 	if jobs == nil {
 		jobs = []*core.Job{}
 	}
-	if err := s.decodeJobListPayloads(jobs); err != nil {
+	decoded, err := s.decodeClaimedBatch(ctx, jobs, workerID)
+	if err != nil {
 		return nil, err
 	}
-	return jobs, nil
+	return decoded, nil
 }

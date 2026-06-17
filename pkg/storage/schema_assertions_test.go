@@ -175,11 +175,13 @@ func TestMySQLSchemaAssertions(t *testing.T) {
 	requireMySQLDeadLetteredAtPrecision(t, db, 3)
 	requireMySQLDQEligibleAtType(t, db, "datetime(3)")
 	requireMySQLQueueTenantCollations(t, db)
+	requireMySQLIdentifierColumnCollations(t, db)
 
 	require.NoError(t, s.Migrate(ctx), "second Migrate must not let AutoMigrate revert dead_lettered_at precision")
 	requireMySQLDeadLetteredAtPrecision(t, db, 3)
 	requireMySQLDQEligibleAtType(t, db, "datetime(3)")
 	requireMySQLQueueTenantCollations(t, db)
+	requireMySQLIdentifierColumnCollations(t, db)
 
 	var activeUniqueKeyCount int
 	require.NoError(t, db.Raw(`
@@ -268,6 +270,7 @@ func TestMySQLSchemaAssertions(t *testing.T) {
 	requireMySQLDispatcherColumnsNotNull(t, db)
 	requireMySQLUniqueKeyCollations(t, db)
 	requireMySQLQueueTenantCollations(t, db)
+	requireMySQLIdentifierColumnCollations(t, db)
 }
 
 func TestPostgresDequeuePlanUsesEligibleIndex(t *testing.T) {
@@ -579,6 +582,31 @@ func requireMySQLQueueTenantCollations(t *testing.T, db *gorm.DB) {
 		  AND COLLATION_NAME = 'utf8mb4_0900_as_cs'
 	`).Scan(&count).Error)
 	require.Equal(t, 2, count, "mysql queue and tenant columns must use utf8mb4_0900_as_cs")
+}
+
+func requireMySQLIdentifierColumnCollations(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	for _, column := range []struct {
+		table string
+		name  string
+	}{
+		{table: "checkpoints", name: "call_type"},
+		{table: "concurrency_slots", name: "slot_name"},
+		{table: "rate_limit_windows", name: "limit_name"},
+		{table: "scheduled_fires", name: "name"},
+		{table: "unique_locks", name: "scope_hash"},
+		{table: "signals", name: "name"},
+	} {
+		var collation string
+		require.NoError(t, db.Raw(`
+			SELECT COLLATION_NAME
+			FROM information_schema.COLUMNS
+			WHERE TABLE_SCHEMA = DATABASE()
+			  AND TABLE_NAME = ?
+			  AND COLUMN_NAME = ?
+		`, column.table, column.name).Scan(&collation).Error)
+		require.Equal(t, "utf8mb4_0900_as_cs", collation, "mysql %s.%s must use utf8mb4_0900_as_cs", column.table, column.name)
+	}
 }
 
 func requireMySQLCheckConstraints(t *testing.T, db *gorm.DB) {

@@ -50,9 +50,13 @@ type Storage interface {
 	// FindOrphanedJobs returns the subset of jobIDs that this worker thinks
 	// it owns but the database disagrees with — either because the lock
 	// changed hands (locked_by != workerID), the lock was released
-	// (locked_by IS NULL), or the job moved to a terminal status
-	// (cancelled/completed/failed). The caller is expected to cancel each
-	// orphaned job's local handler context via Worker.CancelJob.
+	// (locked_by IS NULL), or a PEER moved the job to a terminal status while
+	// this worker still held the lock (status terminal AND locked_by still set
+	// to a worker — e.g. a fan-out failure cancelling our running sub-job). A
+	// terminal row whose locked_by was cleared to '' is this worker's OWN
+	// completion and must NOT be reported (it has no live handler to stop;
+	// reporting it fires a spurious reclaim). The caller is expected to cancel
+	// each orphaned job's local handler context via Worker.CancelJob.
 	//
 	// Jobs in 'waiting' or 'paused' status are NEVER reported, even though
 	// they have a cleared locked_by: such a job has no running handler to

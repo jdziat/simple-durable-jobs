@@ -156,6 +156,48 @@ func TestWorkerConcurrencyCapReleasesOnCompletion(t *testing.T) {
 	assert.Equal(t, 0, store.slotCount("customer:a"))
 }
 
+func TestConcurrencySlotTTLFloorsToHeartbeatWindow(t *testing.T) {
+	store := newCapMockStorage(nil)
+
+	small := NewWorker(queue.New(store), WithLockDuration(5*time.Second))
+	require.Equal(t, 2*time.Minute, small.heartbeatInterval)
+	assert.Equal(t, 3*small.heartbeatInterval, small.concurrencySlotTTL())
+
+	largeTTL := 10 * time.Minute
+	large := NewWorker(queue.New(store), WithLockDuration(largeTTL))
+	assert.Equal(t, largeTTL, large.concurrencySlotTTL())
+}
+
+func TestWorkerConcurrencyCapPanickingKeyBouncesAndReleasesSlots(t *testing.T) {
+	job := runningJob("job-1", "a")
+	store := newCapMockStorage([]*core.Job{job})
+	w := NewWorker(queue.New(store),
+		WorkerQueue("default", Concurrency(1)),
+		ConcurrencyCap("customer", 1, CapKey(func(job *core.Job) string {
+			return job.UniqueKey
+		})),
+		ConcurrencyCap("panic-cap", 1, CapKey(func(*core.Job) string {
+			panic("bad cap key")
+		})),
+		DisableRetry(),
+	)
+	w.config.WorkerID = "worker-1"
+
+	jobsChan := make(chan *core.Job, 1)
+	assert.NotPanics(t, func() {
+		dispatched, released := w.dispatchDequeuedJobs(context.Background(), jobsChan, []*core.Job{job})
+		assert.Equal(t, 0, dispatched)
+		assert.Equal(t, 1, released)
+	})
+
+	assert.Empty(t, jobsChan, "job with panicking CapKey must be bounced, not dispatched")
+	assert.ElementsMatch(t, []core.UUID{job.ID}, store.getReleasedJobIDs())
+	assert.Equal(t, 0, store.slotCount("customer:a"), "already-acquired slots must be released after CapKey panic")
+	assert.Equal(t, 0, store.slotCount("panic-cap"), "panicking cap must not leak a slot")
+	assert.Equal(t, core.StatusPending, job.Status)
+	assert.Empty(t, job.LockedBy)
+}
+
 // TestRenewConcurrencySlots covers the heartbeat-driven renewal path:
 // renewConcurrencySlots must renew (never recreate) every slot a live job
 // holds, and skip cleanly when the job holds none.

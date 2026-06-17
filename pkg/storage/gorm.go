@@ -740,13 +740,12 @@ func (s *GormStorage) dequeueSQLite(ctx context.Context, queues []string, worker
 // deleted only when SetDeleteCheckpointsOnComplete(true) was set; the default
 // keeps them for the dashboard. A not-owned Complete deletes nothing.
 func (s *GormStorage) Complete(ctx context.Context, jobID core.UUID, workerID string) error {
-	now := time.Now()
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		result := tx.Model(&core.Job{}).
 			Where("id = ? AND locked_by = ? AND status = ?", jobID, workerID, core.StatusRunning).
 			Updates(map[string]any{
 				"status":       core.StatusCompleted,
-				"completed_at": now,
+				"completed_at": s.nowWriteValue(),
 				"locked_by":    "",
 				"locked_until": nil,
 			})
@@ -816,7 +815,7 @@ func (s *GormStorage) Fail(ctx context.Context, jobID core.UUID, workerID string
 		updates["dq_ready"] = !retryAt.After(now)
 	} else {
 		updates["status"] = core.StatusFailed
-		updates["completed_at"] = now
+		updates["completed_at"] = s.nowWriteValue()
 		updates["dead_lettered_at"] = now
 		// Label stays plaintext (fixed, non-PII); only the error suffix is
 		// encrypted, preserving the attempt>=max_retries CASE in SQL.
@@ -916,7 +915,7 @@ func (s *GormStorage) accountTerminalWithFanOut(ctx context.Context, jobID core.
 				}
 				updates[key] = value
 			}
-			updates["completed_at"] = now
+			updates["completed_at"] = s.nowWriteValue()
 			if lastError, ok := jobUpdates[deadLetterReasonKey].(string); ok {
 				updates["dead_lettered_at"] = now
 				updates["dead_letter_reason"] = deadLetterReasonExpr(lastError)
@@ -1110,13 +1109,21 @@ func (s *GormStorage) GetDueJobs(ctx context.Context, queues []string, limit int
 // Exactly one caller can claim a given (name, fireTime) boundary; later
 // boundaries can claim again, while equal or earlier boundaries are refused.
 func (s *GormStorage) ClaimScheduledFire(ctx context.Context, name string, fireTime time.Time) (bool, error) {
-	err := s.db.WithContext(ctx).Clauses(clause.OnConflict{DoNothing: true}).
-		Create(&core.ScheduledFire{Name: name, LastFireAt: time.Unix(0, 0).UTC()}).Error
-	if err != nil {
+	return s.ClaimScheduledFireTx(ctx, s.db, name, fireTime)
+}
+
+// ClaimScheduledFireTx is ClaimScheduledFire performed within a caller-owned
+// transaction, so the boundary claim can be committed ATOMICALLY with the
+// enqueue of the fired job (and rolled back together on failure). Without this,
+// a claim that durably advanced last_fire_at followed by a failed enqueue would
+// silently drop a due scheduled run (teardown g8). See Queue.EnqueueScheduledFire.
+func (s *GormStorage) ClaimScheduledFireTx(ctx context.Context, tx *gorm.DB, name string, fireTime time.Time) (bool, error) {
+	if err := tx.WithContext(ctx).Clauses(clause.OnConflict{DoNothing: true}).
+		Create(&core.ScheduledFire{Name: name, LastFireAt: time.Unix(0, 0).UTC()}).Error; err != nil {
 		return false, err
 	}
 
-	result := s.db.WithContext(ctx).
+	result := tx.WithContext(ctx).
 		Model(&core.ScheduledFire{}).
 		Where("name = ? AND last_fire_at < ?", name, fireTime).
 		Updates(map[string]any{
@@ -1239,7 +1246,11 @@ func (s *GormStorage) Release(ctx context.Context, jobID core.UUID, workerID str
 // state AND any of these is true:
 //   - locked_by != workerID  (another worker took the lock)
 //   - locked_by IS NULL      (lock was released, no new owner)
-//   - status IN ('cancelled','completed','failed')  (job is done by some path)
+//   - status IN ('cancelled','completed','failed') AND still locked_by a real
+//     worker (locked_by <> ”) — a peer terminated it (e.g. fan-out cancel)
+//     while we held the lock. A terminal row whose locked_by was reset to ”
+//     is this worker's OWN completion and is NOT an orphan (it has no live
+//     handler to stop; flagging it fired a spurious reclaim — teardown g9).
 //
 // The status NOT IN ('waiting','paused') guard is essential: a parent that
 // calls FanOut/Call from inside its handler suspends ITSELF via MarkWaiting,
@@ -1269,6 +1280,22 @@ func (s *GormStorage) FindOrphanedJobs(ctx context.Context, jobIDs []core.UUID, 
 			s.db.Where("locked_by IS NULL").
 				Or("locked_by != ?", workerID).
 				Or("status IN ?", core.TerminalJobStatuses),
+		).
+		// Do NOT flag a job THIS worker terminated itself. Complete/Fail clear
+		// locked_by to '' and set a terminal status, which trips the
+		// locked_by != workerID branch above and would fire a spurious
+		// JobReclaimed/OnJobReclaimed for our own completion during the TOCTOU
+		// window before the deferred runningJobs unregister (teardown g9). A
+		// TERMINAL row is a genuine reclaim only if it is still locked by a real
+		// worker (locked_by <> ''): a peer that cancels our running sub-job via a
+		// fan-out failure (CancelSubJobs) sets status=cancelled but leaves
+		// locked_by = this worker, so that legitimate stop-the-handler case is
+		// preserved, while our own clean completion (locked_by reset to '') is
+		// excluded. Non-terminal orphans (reclaimed/released, still active) are
+		// unaffected by this clause.
+		Where(
+			s.db.Where("status NOT IN ?", core.TerminalJobStatuses).
+				Or("locked_by <> ?", ""),
 		).
 		Pluck("id", &orphaned).Error
 	if err != nil {
@@ -1677,7 +1704,7 @@ func (s *GormStorage) CancelSubJobs(ctx context.Context, fanOutID core.UUID) ([]
 				Where("status IN ?", []core.JobStatus{core.StatusPending, core.StatusRunning}).
 				Updates(map[string]any{
 					"status":       core.StatusCancelled,
-					"completed_at": now,
+					"completed_at": s.nowWriteValue(),
 					"updated_at":   now,
 				})
 			if result.Error != nil {
@@ -1732,7 +1759,7 @@ func (s *GormStorage) CancelSubJob(ctx context.Context, jobID core.UUID) (*core.
 				Where("id = ? AND status NOT IN ?", jobID, []core.JobStatus{core.StatusCompleted, core.StatusFailed, core.StatusCancelled}).
 				Updates(map[string]any{
 					"status":       core.StatusCancelled,
-					"completed_at": now,
+					"completed_at": s.nowWriteValue(),
 					"updated_at":   now,
 				})
 			if result.Error != nil {
@@ -2256,7 +2283,7 @@ func (s *GormStorage) pauseJobAggressive(ctx context.Context, jobID core.UUID) e
 				Where("id = ? AND status = ?", jobID, core.StatusRunning).
 				Updates(map[string]any{
 					"status":       core.StatusCancelled,
-					"completed_at": now,
+					"completed_at": s.nowWriteValue(),
 					"updated_at":   now,
 					// non-PII constant; intentionally stored plaintext
 					"last_error":   "cancelled by user",

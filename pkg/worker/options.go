@@ -330,13 +330,14 @@ func RateLimit(name string, perSecond float64, opts ...RateLimitOption) WorkerOp
 		cfg := RateLimitConfig{
 			Name:      name,
 			PerSecond: perSecond,
-			Window:    defaultRateLimitWindow,
+			// Window is intentionally left 0 ("derive") unless an option sets it,
+			// so resolveRateLimitWindow can pick an accurate window for a fractional
+			// PerSecond (< 1): forcing the 1s default here rounded the per-window
+			// ceiling up to 1 and over-admitted sub-1 rates ~10x (teardown g4).
+			// Whole-number rates still resolve to the 1s default.
 		}
 		for _, opt := range opts {
 			opt(&cfg)
-		}
-		if cfg.Window <= 0 {
-			cfg.Window = defaultRateLimitWindow
 		}
 		c.RateLimits = append(c.RateLimits, cfg)
 	})
@@ -666,6 +667,12 @@ func WithFanOutRecoveryStaleAge(d time.Duration) WorkerOption {
 // WithLockDuration sets how long a job is locked when dequeued or extended by
 // a heartbeat. The worker propagates this to the storage backend if the backend
 // implements SetLockDuration. Default is 45 minutes.
+//
+// Note: when fleet ConcurrencyCaps are configured, the per-slot TTL is floored at
+// 3×the heartbeat interval regardless of a smaller LockDuration, so a slot is
+// always renewed before it can expire mid-job (otherwise the cap would briefly
+// over-admit). A very small LockDuration therefore does not shorten the cap-slot
+// lease below that floor.
 func WithLockDuration(d time.Duration) WorkerOption {
 	return workerOptionFunc(func(c *WorkerConfig) {
 		c.LockDuration = d

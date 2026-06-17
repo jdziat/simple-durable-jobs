@@ -108,6 +108,102 @@ func TestEnqueueWithUniqueLockConcurrentSameKeyCreatesOneJobAndLock(t *testing.T
 	assert.EqualValues(t, 1, lockCount)
 }
 
+func TestEnqueueWithUniqueLockStealsWindowFromTerminalJob(t *testing.T) {
+	for _, terminal := range []core.JobStatus{core.StatusFailed, core.StatusCancelled} {
+		t.Run(string(terminal), func(t *testing.T) {
+			s := newTestStorage(t)
+			ctx := context.Background()
+			scope := "1111111111111111111111111111111111111111111111111111111111111111"
+
+			first := &core.Job{ID: core.NewID(), Type: "work", Queue: "default", Args: []byte(`{"n":1}`)}
+			firstID, err := s.EnqueueWithUniqueLock(ctx, first, scope, time.Hour)
+			require.NoError(t, err)
+			assert.Equal(t, first.ID, firstID)
+
+			// Drive the original job to a terminal status while the lock stays LIVE.
+			require.NoError(t, s.db.WithContext(ctx).Model(&core.Job{}).
+				Where("id = ?", first.ID).
+				Update("status", terminal).Error)
+
+			// Re-enqueue the same scope within the window: a terminally dead
+			// reference must NOT dedup; a fresh job must be admitted.
+			second := &core.Job{ID: core.NewID(), Type: "work", Queue: "default", Args: []byte(`{"n":2}`)}
+			secondID, err := s.EnqueueWithUniqueLock(ctx, second, scope, time.Hour)
+			require.NoError(t, err)
+			assert.Equal(t, second.ID, secondID, "steal must return the new job id, not the dead one")
+			assert.NotEqual(t, first.ID, secondID)
+
+			var newJob core.Job
+			require.NoError(t, s.db.WithContext(ctx).First(&newJob, "id = ?", second.ID).Error)
+			assert.Equal(t, core.StatusPending, newJob.Status)
+
+			// The lock now points at the new job.
+			var lock core.UniqueLock
+			require.NoError(t, s.db.WithContext(ctx).First(&lock, "scope_hash = ?", scope).Error)
+			assert.Equal(t, second.ID, lock.JobID)
+		})
+	}
+}
+
+func TestEnqueueWithUniqueLockStillDedupesLiveJob(t *testing.T) {
+	for _, live := range []core.JobStatus{core.StatusPending, core.StatusRunning, core.StatusWaiting, core.StatusCompleted, core.StatusPaused} {
+		t.Run(string(live), func(t *testing.T) {
+			s := newTestStorage(t)
+			ctx := context.Background()
+			scope := "2222222222222222222222222222222222222222222222222222222222222222"
+
+			first := &core.Job{ID: core.NewID(), Type: "work", Queue: "default", Args: []byte(`{"n":1}`)}
+			firstID, err := s.EnqueueWithUniqueLock(ctx, first, scope, time.Hour)
+			require.NoError(t, err)
+			assert.Equal(t, first.ID, firstID)
+
+			require.NoError(t, s.db.WithContext(ctx).Model(&core.Job{}).
+				Where("id = ?", first.ID).
+				Update("status", live).Error)
+
+			second := &core.Job{ID: core.NewID(), Type: "work", Queue: "default", Args: []byte(`{"n":2}`)}
+			secondID, err := s.EnqueueWithUniqueLock(ctx, second, scope, time.Hour)
+			require.NoError(t, err)
+			assert.Equal(t, first.ID, secondID, "a live reference must still dedup")
+
+			var jobCount int64
+			require.NoError(t, s.db.WithContext(ctx).Model(&core.Job{}).
+				Where("id IN ?", []core.UUID{first.ID, second.ID}).
+				Count(&jobCount).Error)
+			assert.EqualValues(t, 1, jobCount, "no new job should be created while deduping")
+		})
+	}
+}
+
+func TestEnqueueWithUniqueLockStealsWindowFromMissingJob(t *testing.T) {
+	s := newTestStorage(t)
+	ctx := context.Background()
+	scope := "3333333333333333333333333333333333333333333333333333333333333333"
+
+	first := &core.Job{ID: core.NewID(), Type: "work", Queue: "default", Args: []byte(`{"n":1}`)}
+	firstID, err := s.EnqueueWithUniqueLock(ctx, first, scope, time.Hour)
+	require.NoError(t, err)
+	assert.Equal(t, first.ID, firstID)
+
+	// Delete the job row directly (as retention would), leaving the live lock
+	// dangling at a job that no longer exists.
+	require.NoError(t, s.db.WithContext(ctx).Delete(&core.Job{}, "id = ?", first.ID).Error)
+
+	second := &core.Job{ID: core.NewID(), Type: "work", Queue: "default", Args: []byte(`{"n":2}`)}
+	secondID, err := s.EnqueueWithUniqueLock(ctx, second, scope, time.Hour)
+	require.NoError(t, err)
+	assert.Equal(t, second.ID, secondID, "a missing reference must steal the window")
+
+	var newJobCount int64
+	require.NoError(t, s.db.WithContext(ctx).Model(&core.Job{}).
+		Where("id = ?", second.ID).Count(&newJobCount).Error)
+	assert.EqualValues(t, 1, newJobCount, "the new job must exist after a steal-on-missing")
+
+	var lock core.UniqueLock
+	require.NoError(t, s.db.WithContext(ctx).First(&lock, "scope_hash = ?", scope).Error)
+	assert.Equal(t, second.ID, lock.JobID)
+}
+
 func TestDeleteExpiredUniqueLocks(t *testing.T) {
 	s := newTestStorage(t)
 	ctx := context.Background()

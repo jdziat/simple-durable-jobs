@@ -289,7 +289,11 @@ func NewWorker(q *queue.Queue, opts ...WorkerOption) *Worker {
 	if config.ReadyPromoteInterval <= 0 {
 		config.ReadyPromoteInterval = 100 * time.Millisecond
 	}
-	if config.StaleLockAge == 0 {
+	// Guard <= 0, not just == 0: a NEGATIVE StaleLockAge would invert the reaper
+	// cutoff into the future (now - negative = future), so the reaper would
+	// reclaim every running job each tick — wholesale double-execution from one
+	// config typo (teardown g9). Mirror FanOutRecoveryStaleAge's <= 0 guard.
+	if config.StaleLockAge <= 0 {
 		config.StaleLockAge = 45 * time.Minute
 	}
 	if config.FanOutRecoveryStaleAge <= 0 {
@@ -1131,24 +1135,63 @@ func (w *Worker) untrackQueueJob(jobID core.UUID) {
 }
 
 func (w *Worker) concurrencySlotTTL() time.Duration {
+	base := defaultConcurrencySlotTTL
 	if w.config.LockDuration > 0 {
-		return w.config.LockDuration
+		base = w.config.LockDuration
 	}
-	return defaultConcurrencySlotTTL
+	// Slot leases are renewed only on heartbeat ticks. Keep roughly three
+	// renewal opportunities inside the slot TTL, mirroring the stale-lock
+	// heartbeat reasoning without changing the job lock lease itself.
+	if w.heartbeatInterval > 0 {
+		minTTL := 3 * w.heartbeatInterval
+		if base < minTTL {
+			return minTTL
+		}
+	}
+	return base
 }
 
-func (w *Worker) capSlotName(cap ConcurrencyCapConfig, job *core.Job) string {
+func (w *Worker) capSlotName(cap ConcurrencyCapConfig, job *core.Job) (name string, ok bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			w.logger.Error("concurrency cap key panicked; releasing dequeued job",
+				"job_id", job.ID,
+				"cap", cap.Name,
+				"panic", r,
+				"stack", string(debug.Stack()))
+			name = ""
+			ok = false
+		}
+	}()
 	if cap.Key == nil {
-		return cap.Name
+		return cap.Name, true
 	}
-	return cap.Name + ":" + cap.Key(job)
+	return cap.Name + ":" + cap.Key(job), true
 }
 
-func (w *Worker) rateLimitName(limit RateLimitConfig, job *core.Job) string {
-	if limit.Key == nil {
-		return limit.Name
+func (w *Worker) rateLimitName(limit RateLimitConfig, job *core.Job) (name string, ok bool) {
+	ok = true
+	// Recover a panicking user RateLimitKey (parity with capSlotName): a panic
+	// here would otherwise crash the worker on the dispatch goroutine. Treat it as
+	// a derivation failure so the caller bounces the job instead.
+	defer func() {
+		if r := recover(); r != nil {
+			w.logger.Error("rate-limit key panicked; releasing dequeued job",
+				"job_id", job.ID,
+				"limit", limit.Name,
+				"panic", r,
+				"stack", string(debug.Stack()))
+			name = ""
+			ok = false
+		}
+	}()
+	n := limit.Name
+	if limit.Key != nil {
+		n = limit.Name + ":" + limit.Key(job)
 	}
-	return limit.Name + ":" + limit.Key(job)
+	// Bound the effective name to the limit_name column width: an unbounded
+	// RateLimitKey would otherwise overflow it and hot-loop the job (teardown g4).
+	return boundRateLimitName(n), true
 }
 
 // tryConsumeRateLimits returns (allowed, reason). reason is meaningful only when
@@ -1165,15 +1208,37 @@ func (w *Worker) tryConsumeRateLimits(ctx context.Context, job *core.Job) (bool,
 		}
 		return true, ""
 	}
+	// Refund support: when a LATER fleet limit denies, the units already consumed
+	// from EARLIER limits must be returned, or every multi-limit bounce permanently
+	// drains those windows for a job that never runs (teardown g4). Backends without
+	// ReleaseRate degrade to the prior no-refund behavior.
+	releaser, canRelease := w.queue.Storage().(rateReleaser)
+	type consumedRate struct {
+		name   string
+		window time.Duration
+	}
+	var consumed []consumedRate
+	refund := func() {
+		if !canRelease {
+			return
+		}
+		for _, c := range consumed {
+			if err := releaser.ReleaseRate(ctx, c.name, c.window); err != nil {
+				w.logger.Warn("failed to refund consumed rate limit after a later limit denied",
+					"job_id", job.ID, "limit", c.name, "error", err)
+			}
+		}
+	}
 	for _, limit := range w.config.RateLimits {
 		if limit.Name == "" || limit.PerSecond <= 0 {
 			continue
 		}
-		window := limit.Window
-		if window <= 0 {
-			window = defaultRateLimitWindow
+		window := w.resolveRateLimitWindow(limit)
+		limitName, nameOK := w.rateLimitName(limit, job)
+		if !nameOK {
+			refund()
+			return false, bounceFleetRate
 		}
-		limitName := w.rateLimitName(limit, job)
 		// cto-F2 per-key cooldown (KEYED limits only — the gap v1 left): if this
 		// exact bucket was denied by the DB this window, skip the locked
 		// TryConsumeRate transaction and bounce — the DB fixed window would only
@@ -1187,6 +1252,7 @@ func (w *Worker) tryConsumeRateLimits(ctx context.Context, job *core.Job) (bool,
 		// on the probe tick, which MUST consult the DB to detect headroom returning
 		// — short-circuiting it would change v1's proven unkeyed behavior.
 		if limit.Key != nil && w.keyedRateSaturated(limitName, time.Now()) {
+			refund()
 			return false, bounceFleetRateCached
 		}
 		allowed, err := storage.TryConsumeRate(ctx, limitName, limit.PerSecond, window, time.Time{})
@@ -1195,6 +1261,7 @@ func (w *Worker) tryConsumeRateLimits(ctx context.Context, job *core.Job) (bool,
 				"job_id", job.ID,
 				"limit", limitName,
 				"error", err)
+			refund()
 			return false, bounceFleetRate
 		}
 		if !allowed {
@@ -1203,8 +1270,10 @@ func (w *Worker) tryConsumeRateLimits(ctx context.Context, job *core.Job) (bool,
 			// (removes both churns); for a keyed bucket the pre-tx fast path above
 			// reads it to skip the next DB rate tx (removes the denied-tx churn).
 			w.markRateSaturated(limitName, window)
+			refund()
 			return false, bounceFleetRate
 		}
+		consumed = append(consumed, consumedRate{name: limitName, window: window})
 	}
 	return true, ""
 }
@@ -1376,7 +1445,11 @@ func (w *Worker) tryAcquireConcurrencySlots(ctx context.Context, job *core.Job) 
 	ttl := w.concurrencySlotTTL()
 	acquiredSlots := make([]string, 0, len(w.config.ConcurrencyCaps))
 	for _, cap := range w.config.ConcurrencyCaps {
-		slotName := w.capSlotName(cap, job)
+		slotName, ok := w.capSlotName(cap, job)
+		if !ok {
+			w.releaseSlotNames(ctx, job.ID, acquiredSlots)
+			return false
+		}
 		acquired, err := storage.TryAcquireConcurrencySlot(ctx, slotName, job.ID, w.config.WorkerID, cap.Limit, ttl)
 		if err != nil {
 			w.logger.Warn("failed to acquire concurrency slot; releasing dequeued job",
@@ -1596,6 +1669,12 @@ func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 		// (fan-out or signal wait) and returned. Not a failure: just stop.
 		if core.IsWaiting(err) {
 			w.logger.Info("job waiting", "job_id", job.ID)
+			// End the per-attempt span (OTel) before returning. Unlike
+			// complete/fail, a parked attempt fires neither hook, so without this
+			// its span would leak (never exported) until the resume starts a new
+			// attempt with a fresh span. Use jobCtx — it carries the span injected
+			// by CallStartCtxHooks, same as the complete/fail hooks below.
+			w.queue.CallWaitingHooks(jobCtx, job)
 			cancelHeartbeat()
 			// Job is already in StatusWaiting; just return
 			return
@@ -2238,16 +2317,11 @@ func (w *Worker) runScheduler(ctx context.Context) {
 				}
 				nextRun := sj.Schedule.Next(lastRun[name])
 				if now.After(nextRun) || now.Equal(nextRun) {
-					claimed, err := w.queue.Storage().ClaimScheduledFire(ctx, name, nextRun)
-					if err != nil {
-						w.logger.Error("failed to claim scheduled fire", "name", name, "fire_time", nextRun, "error", err)
-						continue
-					}
-					if !claimed {
-						lastRun[name] = nextRun
-						continue
-					}
-					lastRun[name] = nextRun
+					// Build the enqueue options first, then claim the fire boundary
+					// and enqueue the job ATOMICALLY via EnqueueScheduledFire: if the
+					// enqueue fails its transaction rolls back the claim, so the
+					// boundary stays re-claimable instead of advancing the durable
+					// cursor and silently dropping a due run (teardown g8).
 					opts := []queue.Option{
 						queue.QueueOpt(sj.Options.Queue),
 						queue.Priority(sj.Options.Priority),
@@ -2290,12 +2364,17 @@ func (w *Worker) runScheduler(ctx context.Context) {
 					} else if sj.Options.UniqueForTTL > 0 {
 						opts = append(opts, queue.UniqueFor(sj.Options.UniqueForTTL))
 					}
-					_, err = w.queue.Enqueue(ctx, sj.Name, sj.Args,
-						opts...,
-					)
-					if err != nil {
-						w.logger.Error("failed to enqueue scheduled job", "name", name, "error", err)
+					if _, _, err := w.queue.EnqueueScheduledFire(ctx, name, nextRun, sj.Name, sj.Args, opts...); err != nil {
+						// Claim+enqueue are atomic: this failure rolled back the
+						// claim, so the boundary stays re-claimable. Do NOT advance
+						// lastRun — retry it next tick instead of dropping the fire (g8).
+						w.logger.Error("failed to claim+enqueue scheduled fire; will retry boundary",
+							"name", name, "fire_time", nextRun, "error", err)
+						continue
 					}
+					// Either we claimed and enqueued, or a peer already claimed this
+					// boundary; in both cases this worker is done with it.
+					lastRun[name] = nextRun
 				}
 			}
 		}
@@ -2348,7 +2427,12 @@ func (w *Worker) pollWaitingJobsOnce(ctx context.Context) {
 		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 			w.logger.Error("failed to get waiting jobs after retries", "error", err)
 		}
-		return
+		// Do not return. Each recovery scan below guards its own (nil-on-error)
+		// result, and the signal/timer resume backstop at the end MUST run even
+		// when an earlier OPTIONAL scan fails: this whole function runs only on
+		// the single recovery-lease holder, so a recurring error in one scan
+		// returning early would freeze every durable timer/signal in the fleet
+		// (teardown g8). Log and fall through to the independent next block.
 	}
 	for _, job := range jobs {
 		resumeErr := retryWithBackoff(ctx, *w.config.StorageRetry, func() error {
@@ -2373,7 +2457,8 @@ func (w *Worker) pollWaitingJobsOnce(ctx context.Context) {
 		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 			w.logger.Error("failed to get stalled fan-out parents after retries", "error", err)
 		}
-		return
+		// Log-and-continue (see the GetWaitingJobsToResume block above): an
+		// optional fan-out scan failure must not skip the signal/timer backstop.
 	}
 	for _, job := range stalled {
 		resumeErr := retryWithBackoff(ctx, *w.config.StorageRetry, func() error {
@@ -2405,7 +2490,7 @@ func (w *Worker) pollWaitingJobsOnce(ctx context.Context) {
 			if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 				w.logger.Error("failed to get completable pending fan-outs after retries", "error", err)
 			}
-			return
+			// Log-and-continue: must not skip the signal/timer backstop below.
 		}
 		for _, fo := range completable {
 			if resumeErr := w.checkFanOutCompletion(ctx, fo); resumeErr != nil {
@@ -2427,7 +2512,7 @@ func (w *Worker) pollWaitingJobsOnce(ctx context.Context) {
 			if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 				w.logger.Error("failed to clean abandoned fan-outs after retries", "error", err)
 			}
-			return
+			// Log-and-continue: must not skip the signal/timer backstop below.
 		}
 		if cleaned > 0 {
 			w.logger.Info("cleaned abandoned pending fan-outs", "count", cleaned)

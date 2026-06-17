@@ -75,6 +75,9 @@ func (s *GormStorage) DeleteTerminalJobsOlderThan(ctx context.Context, status co
 			if err := tx.Where("job_id IN ?", ids).Delete(&core.Signal{}).Error; err != nil {
 				return err
 			}
+			if err := tx.Where("job_id IN ?", ids).Delete(&core.UniqueLock{}).Error; err != nil {
+				return err
+			}
 			result := tx.Where("id IN ?", ids).
 				Where("status = ?", status).
 				Where("completed_at IS NOT NULL").

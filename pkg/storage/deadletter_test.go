@@ -31,7 +31,11 @@ func TestDeadLetterMetadata_TerminalFailureOnlyAndRequeueClears(t *testing.T) {
 	assert.Contains(t, failed.DeadLetterReason, "max retries exhausted:")
 	assert.NotContains(t, failed.DeadLetterReason, "password=secret")
 	require.NotNil(t, failed.CompletedAt)
-	assert.WithinDuration(t, *failed.CompletedAt, *failed.DeadLetteredAt, time.Second)
+	// completed_at is now written on the DB clock (retention parity) while
+	// dead_lettered_at remains wall-clock; both are set in the same terminal
+	// UPDATE, so a generous tolerance absorbs any worker<->DB skew without
+	// asserting two distinct clocks agree to the second.
+	assert.WithinDuration(t, *failed.CompletedAt, *failed.DeadLetteredAt, time.Minute)
 
 	retryable := &core.Job{Type: "dlq.retryable", Queue: "critical", MaxRetries: 2}
 	require.NoError(t, s.Enqueue(ctx, retryable))

@@ -311,6 +311,16 @@ var schemaMigrations = []schemaMigration{
 		Name:    "dqready_column_index",
 		Up:      migrateDQReadyColumnIndex,
 	},
+	{
+		Version: 33,
+		Name:    "identifier_columns_collation_as_cs",
+		Up:      migrateIdentifierColumnsCollationAsCS,
+	},
+	{
+		Version: 34,
+		Name:    "unique_locks_job_id_index",
+		Up:      migrateUniqueLocksJobIDIndex,
+	},
 }
 
 // applyPreMigrations runs every registered pre-AutoMigrate one-shot through a
@@ -1573,6 +1583,69 @@ func migrateQueueStatesQueueCollation(ctx context.Context, db *gorm.DB, dialect 
 		return fmt.Errorf("modify queue_states.queue collation: %w", err)
 	}
 	return nil
+}
+
+func migrateIdentifierColumnsCollationAsCS(ctx context.Context, db *gorm.DB, dialect string) error {
+	if dialect != dialectMySQL {
+		return nil
+	}
+
+	const collation = "utf8mb4_0900_as_cs"
+	columns := []struct {
+		table string
+		name  string
+		size  int
+	}{
+		{table: "checkpoints", name: "call_type", size: 255},
+		{table: "concurrency_slots", name: "slot_name", size: 255},
+		{table: "rate_limit_windows", name: "limit_name", size: 255},
+		{table: "scheduled_fires", name: "name", size: 255},
+		{table: "unique_locks", name: "scope_hash", size: 64},
+		{table: "signals", name: "name", size: 255},
+	}
+	for _, column := range columns {
+		currentCollation, err := mysqlColumnCollationForTable(ctx, db, column.table, column.name)
+		if err != nil {
+			return fmt.Errorf("read %s.%s collation: %w", column.table, column.name, err)
+		}
+		if currentCollation == collation {
+			continue
+		}
+		if err := db.WithContext(ctx).Exec(
+			fmt.Sprintf(
+				"ALTER TABLE %s MODIFY %s VARCHAR(%d) COLLATE utf8mb4_0900_as_cs NOT NULL",
+				column.table,
+				column.name,
+				column.size,
+			),
+		).Error; err != nil && !isBenignDDLError(err) {
+			return fmt.Errorf("modify %s.%s collation: %w", column.table, column.name, err)
+		}
+	}
+	return nil
+}
+
+// migrateUniqueLocksJobIDIndex adds a secondary index on unique_locks(job_id).
+// The PK is scope_hash, so retention's job_id-scoped cleanup and the
+// steal-on-terminal acquire path would otherwise full-scan the table. Created
+// idempotently and cross-dialect, mirroring idx_unique_locks_expires_at.
+func migrateUniqueLocksJobIDIndex(ctx context.Context, db *gorm.DB, dialect string) error {
+	switch dialect {
+	case dialectMySQL:
+		m := db.Migrator()
+		if !m.HasIndex(&core.UniqueLock{}, "idx_unique_locks_job_id") {
+			if err := db.WithContext(ctx).Exec(
+				"CREATE INDEX idx_unique_locks_job_id ON unique_locks (job_id)",
+			).Error; err != nil && !isBenignDDLError(err) {
+				return fmt.Errorf("create idx_unique_locks_job_id: %w", err)
+			}
+		}
+		return nil
+	default:
+		return db.WithContext(ctx).Exec(
+			"CREATE INDEX IF NOT EXISTS idx_unique_locks_job_id ON unique_locks (job_id)",
+		).Error
+	}
 }
 
 func migrateDropRedundantSignalIndex(ctx context.Context, db *gorm.DB, dialect string) error {

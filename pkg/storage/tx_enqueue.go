@@ -26,8 +26,18 @@ type TxUniqueLockEnqueuer interface {
 	EnqueueWithUniqueLockTx(ctx context.Context, tx *gorm.DB, job *core.Job, scopeHash string, ttl time.Duration) (core.UUID, error)
 }
 
+// ScheduledFireTxClaimer claims a schedule's fire boundary within a caller-owned
+// transaction, so the durable claim can be committed atomically with the enqueue
+// of the fired job (rolling both back together on failure). Implemented by
+// GormStorage; consumed by Queue.EnqueueScheduledFire to avoid a silently dropped
+// scheduled run when the enqueue fails after the claim (teardown g8).
+type ScheduledFireTxClaimer interface {
+	ClaimScheduledFireTx(ctx context.Context, tx *gorm.DB, name string, fireTime time.Time) (bool, error)
+}
+
 var _ TxEnqueuer = (*GormStorage)(nil)
 var _ TxUniqueLockEnqueuer = (*GormStorage)(nil)
+var _ ScheduledFireTxClaimer = (*GormStorage)(nil)
 
 // EnqueueTx adds a job using the caller-supplied transaction handle.
 //
@@ -153,30 +163,34 @@ func (s *GormStorage) enqueueBatchWithDB(db *gorm.DB, jobs []*core.Job) error {
 		}
 	}
 
-	existing := make(map[string]struct{}, len(keys))
+	existing := make(map[string]core.UUID, len(keys))
 	if len(keys) > 0 {
 		query := db.Model(&core.Job{}).
-			Select("unique_key").
+			Select("id", "unique_key").
 			Where("unique_key IN ? AND status IN ?", keys,
-				[]core.JobStatus{core.StatusPending, core.StatusRunning, core.StatusCompleted})
+				[]core.JobStatus{core.StatusPending, core.StatusRunning})
 		query = s.lockForUpdate(query, false)
 
-		var found []string
-		if err := query.Pluck("unique_key", &found).Error; err != nil {
+		var found []struct {
+			ID        core.UUID
+			UniqueKey string
+		}
+		if err := query.Find(&found).Error; err != nil {
 			return err
 		}
-		for _, k := range found {
-			existing[k] = struct{}{}
+		for _, row := range found {
+			existing[row.UniqueKey] = row.ID
 		}
 	}
 
 	toCreate := make([]*core.Job, 0, len(jobs))
 	for _, job := range jobs {
 		if job.UniqueKey != "" {
-			if _, seen := existing[job.UniqueKey]; seen {
+			if existingID, seen := existing[job.UniqueKey]; seen {
+				job.ID = existingID
 				continue
 			}
-			existing[job.UniqueKey] = struct{}{}
+			existing[job.UniqueKey] = job.ID
 		}
 		toCreate = append(toCreate, job)
 	}

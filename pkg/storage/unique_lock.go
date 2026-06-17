@@ -46,9 +46,28 @@ func (s *GormStorage) enqueueWithUniqueLockDB(ctx context.Context, db *gorm.DB, 
 		return core.NilUUID, err
 	}
 	if !acquired {
+		// A live lock is held by existingID. If the referenced job is still
+		// making progress (pending/running/waiting/paused/completed) the lock
+		// must continue to dedup. But a terminally dead reference — failed,
+		// cancelled, or a row that no longer exists (deleted by retention) —
+		// means the deduped work will never run; in that case we steal the
+		// window so the re-enqueue admits fresh work.
+		stolen, stolenID, err := s.stealTerminalUniqueLock(ctx, db, job, scopeHash, existingID, ttl)
+		if err != nil {
+			return core.NilUUID, err
+		}
+		if stolen {
+			return stolenID, nil
+		}
 		return existingID, nil
 	}
 
+	return s.createUniqueLockedJob(ctx, db, job)
+}
+
+// createUniqueLockedJob inserts the job row (with the dq_ready restore path)
+// once a unique lock has been won, returning the new job's ID.
+func (s *GormStorage) createUniqueLockedJob(ctx context.Context, db *gorm.DB, job *core.Job) (core.UUID, error) {
 	row, err := s.encodedJobForCreate(job)
 	if err != nil {
 		return core.NilUUID, err
@@ -61,6 +80,71 @@ func (s *GormStorage) enqueueWithUniqueLockDB(ctx context.Context, db *gorm.DB, 
 		return core.NilUUID, err
 	}
 	return job.ID, nil
+}
+
+// stealTerminalUniqueLock inspects the job referenced by a live lock. If that
+// job is missing (deleted) or terminally dead (failed/cancelled), it attempts a
+// concurrency-safe steal of the window for job and, on winning, inserts the new
+// job. The steal is a single conditional UPDATE gated on the referenced job id
+// (WHERE scope_hash = ? AND job_id = existingID): at most one racer's UPDATE can
+// match, so exactly one re-enqueue wins the election; the losers re-read the
+// lock and dedup against whatever the winner installed (no loop).
+//
+// Returns (false, NilUUID, nil) when the reference is live and the caller must
+// keep deduping against existingID.
+func (s *GormStorage) stealTerminalUniqueLock(ctx context.Context, db *gorm.DB, job *core.Job, scopeHash string, existingID core.UUID, ttl time.Duration) (bool, core.UUID, error) {
+	if existingID == core.NilUUID {
+		return false, core.NilUUID, nil
+	}
+
+	var status core.JobStatus
+	err := db.WithContext(ctx).Model(&core.Job{}).
+		Select("status").
+		Where("id = ?", existingID).
+		Scan(&status).Error
+	if err != nil {
+		return false, core.NilUUID, err
+	}
+	missing := status == ""
+	// Only failed/cancelled/missing steals; pending/running/waiting/paused and
+	// completed all keep deduping.
+	if !missing && status != core.StatusFailed && status != core.StatusCancelled {
+		return false, core.NilUUID, nil
+	}
+
+	var nowVal, expiresVal any
+	if s.useDBClock() {
+		nowVal = s.nowExpr()
+		expiresVal = s.offsetExpr(ttl)
+	} else {
+		now := time.Now().UTC()
+		nowVal = now
+		expiresVal = now.Add(ttl)
+	}
+
+	// Conditional election: only the racer whose WHERE still sees job_id =
+	// existingID wins. RowsAffected == 1 means we won; 0 means a concurrent
+	// enqueue already rewrote the lock, so re-read and dedup against its winner.
+	result := db.WithContext(ctx).Exec(
+		"UPDATE unique_locks SET job_id = ?, expires_at = ?, created_at = ? WHERE scope_hash = ? AND job_id = ?",
+		job.ID, expiresVal, nowVal, scopeHash, existingID,
+	)
+	if result.Error != nil {
+		return false, core.NilUUID, result.Error
+	}
+	if result.RowsAffected == 1 {
+		newID, err := s.createUniqueLockedJob(ctx, db, job)
+		if err != nil {
+			return false, core.NilUUID, err
+		}
+		return true, newID, nil
+	}
+
+	var lock core.UniqueLock
+	if err := db.WithContext(ctx).First(&lock, "scope_hash = ?", scopeHash).Error; err != nil {
+		return false, core.NilUUID, err
+	}
+	return true, lock.JobID, nil
 }
 
 func (s *GormStorage) tryAcquireUniqueLock(ctx context.Context, db *gorm.DB, scopeHash string, jobID core.UUID, ttl time.Duration) (bool, core.UUID, error) {
