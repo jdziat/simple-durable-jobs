@@ -1166,6 +1166,17 @@ func (q *Queue) PauseJob(ctx context.Context, jobID core.UUID, opts ...PauseOpti
 // Pending or waiting jobs are paused by the underlying pause operation. Already
 // paused jobs, terminal jobs, and missing jobs return the same sentinel errors
 // as PauseJob, such as ErrJobAlreadyPaused, ErrCannotPauseStatus, or ErrJobNotFound.
+//
+// RACE / KNOWN BEHAVIOR: because cancel aliases aggressive pause, the outcome
+// depends on the job's status at the moment the storage write lands. A job that
+// is running when you call CancelJob but self-suspends to 'waiting' first (it
+// entered FanOut/Call/WaitForSignal and committed MarkWaiting just before the
+// cancel) is observed as waiting and therefore PAUSED (recoverable), not
+// CANCELLED (terminal). The job is not running and will not auto-resume, but it
+// can be unpaused. To force terminal cancellation regardless of this race, re-read
+// the status and call CancelJob again once the job has settled. A dedicated
+// cancel mode that maps waiting→cancelled is a deliberate cancellation-semantics
+// change tracked separately.
 func (q *Queue) CancelJob(ctx context.Context, jobID core.UUID) error {
 	return q.PauseJob(ctx, jobID, WithPauseMode(core.PauseModeAggressive))
 }

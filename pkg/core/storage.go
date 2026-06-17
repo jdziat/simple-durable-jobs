@@ -108,6 +108,9 @@ type Storage interface {
 	// waits for fan-out sub-jobs).
 	MarkWaiting(ctx context.Context, jobID UUID, workerID string) error
 	ResumeJob(ctx context.Context, jobID UUID) (bool, error)
+	// GetWaitingJobsToResume and GetStalledFanOutParents are recovery-scan helpers
+	// whose only consumer needs the job IDs, so the returned *Job values are
+	// populated with ID only (other fields are zero / payloads undecoded).
 	GetWaitingJobsToResume(ctx context.Context) ([]*Job, error)
 	GetStalledFanOutParents(ctx context.Context, olderThan time.Time) ([]*Job, error)
 

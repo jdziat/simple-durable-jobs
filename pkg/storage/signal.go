@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"gorm.io/gorm"
@@ -12,17 +13,37 @@ import (
 
 // SendSignal persists a named signal for a job. It is buffered: a signal sent
 // before the handler waits for it is not lost.
+//
+// On Postgres/MySQL the fk_signals_job foreign key rejects a signal for a
+// missing job. SQLite runs with foreign_keys=OFF, so the same insert would leave
+// a permanently-orphaned pending signal (e.g. when the job was retention-deleted
+// between a caller's existence check and this write). On SQLite the job's
+// existence is therefore re-checked inside the write transaction — where the
+// serialized writer makes check-then-insert atomic — returning core.ErrJobNotFound.
 func (s *GormStorage) SendSignal(ctx context.Context, jobID core.UUID, name string, payload []byte) error {
 	encoded, err := s.encodePayload("signal payload", string(jobID)+"/"+name, payload)
 	if err != nil {
 		return err
 	}
-	return s.db.WithContext(ctx).Create(&core.Signal{
+	sig := &core.Signal{
 		ID:      core.NewID(),
 		JobID:   jobID,
 		Name:    name,
 		Payload: encoded,
-	}).Error
+	}
+	if !s.isSQLite {
+		return s.db.WithContext(ctx).Create(sig).Error
+	}
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var count int64
+		if err := tx.Model(&core.Job{}).Where("id = ?", jobID).Count(&count).Error; err != nil {
+			return err
+		}
+		if count == 0 {
+			return fmt.Errorf("%w: %s", core.ErrJobNotFound, jobID)
+		}
+		return tx.Create(sig).Error
+	})
 }
 
 // PeekSignal returns the oldest pending (unconsumed) signal of name for the job
