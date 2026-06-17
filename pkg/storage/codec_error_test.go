@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"encoding/base64"
 	"strings"
 	"testing"
 
@@ -158,6 +159,38 @@ func TestErrorTextCoincidentalTagPassthrough(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, got)
 	assert.Equal(t, sanitized, got.LastError)
+}
+
+func TestErrorTextIdentityCodecValidBase64NotCorrupted(t *testing.T) {
+	// Regression (teardown g12): a genuine plaintext error that contains the tag
+	// followed by a VALID base64 token would, before the fix, be base64-decoded
+	// and run through codec.Decode under the identity codec — corrupting the
+	// message ("...sdjenc:YWJjZGVm" -> "...abcdef"). The identity codec never
+	// emits the tag, so such a value is always literal plaintext and must
+	// round-trip verbatim; decodeErrorText now skips the tag scan for it.
+	const errMsg = "boom sdjenc:YWJjZGVm"
+	sanitized := security.SanitizeErrorMessage(errMsg)
+
+	// Guard that this input actually exercises the dangerous decode path: the
+	// sanitized value must still carry the tag with a fully-valid base64 remainder
+	// (otherwise the older soft-passthrough branch would mask the bug anyway).
+	idx := strings.Index(sanitized, errTextTag)
+	require.GreaterOrEqual(t, idx, 0, "sanitized message must retain the tag")
+	token := sanitized[idx+len(errTextTag):]
+	_, decErr := base64.StdEncoding.DecodeString(token)
+	require.NoError(t, decErr, "token after tag must be valid base64 to exercise the decode path")
+
+	ctx := context.Background()
+	db := openCodecTestDBs(t)["sqlite"]
+	s := NewGormStorage(db)
+	require.NoError(t, s.Migrate(ctx))
+
+	id := failTerminally(t, ctx, s, errMsg)
+
+	got, err := s.GetJob(ctx, id)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, sanitized, got.LastError, "identity-codec error text must round-trip verbatim, not be decoded")
 }
 
 func TestErrorTextWrongCodecHardFails(t *testing.T) {

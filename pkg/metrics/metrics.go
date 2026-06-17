@@ -44,6 +44,7 @@ const (
 	metricDeadLetterDepth  = "jobs.dead_letter.depth"
 	metricQueueSaturation  = "jobs.queue.saturation"
 	metricLeasesReclaimed  = "jobs.leases.reclaimed"
+	metricClockSkewDropped = "jobs.clock_skew_dropped"
 
 	metricDequeueReleased         = "jobs.dequeue.released"
 	metricDequeueSuppressedTicks  = "jobs.dequeue.suppressed_ticks"
@@ -54,6 +55,7 @@ const (
 	attrOutcome  = "outcome"
 	attrReason   = "reason"
 	attrWorkerID = "worker.id"
+	attrMetric   = "metric"
 
 	outcomeStarted   = "started"
 	outcomeCompleted = "completed"
@@ -123,13 +125,14 @@ func NewPrometheusHandler(opts ...otelprometheus.Option) (http.Handler, *sdkmetr
 }
 
 type instruments struct {
-	started     metric.Int64Counter
-	completed   metric.Int64Counter
-	failed      metric.Int64Counter
-	retried     metric.Int64Counter
-	reclaimed   metric.Int64Counter
-	waitSeconds metric.Float64Histogram
-	runSeconds  metric.Float64Histogram
+	started          metric.Int64Counter
+	completed        metric.Int64Counter
+	failed           metric.Int64Counter
+	retried          metric.Int64Counter
+	reclaimed        metric.Int64Counter
+	waitSeconds      metric.Float64Histogram
+	runSeconds       metric.Float64Histogram
+	clockSkewDropped metric.Int64Counter
 }
 
 func newInstruments(meter metric.Meter) (*instruments, error) {
@@ -175,14 +178,21 @@ func newInstruments(meter metric.Meter) (*instruments, error) {
 	if err != nil {
 		return nil, err
 	}
+	clockSkewDropped, err := meter.Int64Counter(metricClockSkewDropped,
+		metric.WithUnit("{sample}"),
+		metric.WithDescription("Latency samples dropped because the computed duration was negative — a symptom of DB-clock vs worker-wall-clock skew. Labeled by the affected histogram (wait/run)."))
+	if err != nil {
+		return nil, err
+	}
 	return &instruments{
-		started:     started,
-		completed:   completed,
-		failed:      failed,
-		retried:     retried,
-		reclaimed:   reclaimed,
-		waitSeconds: waitSeconds,
-		runSeconds:  runSeconds,
+		started:          started,
+		completed:        completed,
+		failed:           failed,
+		retried:          retried,
+		reclaimed:        reclaimed,
+		waitSeconds:      waitSeconds,
+		runSeconds:       runSeconds,
+		clockSkewDropped: clockSkewDropped,
 	}, nil
 }
 
@@ -191,7 +201,7 @@ func startHook(inst *instruments) func(context.Context, *core.Job) {
 		attrs := jobAttributes(job, outcomeStarted)
 		inst.started.Add(ctx, 1, metric.WithAttributes(attrs...))
 		if job.StartedAt != nil && !job.CreatedAt.IsZero() {
-			recordDuration(ctx, inst.waitSeconds, job.StartedAt.Sub(job.CreatedAt), attrs)
+			recordDuration(ctx, inst, inst.waitSeconds, metricJobWaitDuration, job.StartedAt.Sub(job.CreatedAt), attrs)
 		}
 	}
 }
@@ -229,11 +239,22 @@ func recordRunDuration(ctx context.Context, inst *instruments, job *core.Job, at
 	if job.StartedAt == nil {
 		return
 	}
-	recordDuration(ctx, inst.runSeconds, time.Since(*job.StartedAt), attrs)
+	// NOTE: StartedAt is a DB-clock timestamp while time.Since reads the worker
+	// wall clock, so this run-duration endpoint pair can straddle two clocks. The
+	// wait histogram (StartedAt-CreatedAt) is DB-clock on both ends. recordDuration
+	// surfaces any resulting skew via the clockSkewDropped counter rather than
+	// dropping negative samples silently.
+	recordDuration(ctx, inst, inst.runSeconds, metricJobRunDuration, time.Since(*job.StartedAt), attrs)
 }
 
-func recordDuration(ctx context.Context, hist metric.Float64Histogram, d time.Duration, attrs []attribute.KeyValue) {
+// recordDuration records a latency sample, discarding physically-impossible
+// negative durations. A negative value means the two endpoints came from clocks
+// that disagree (DB clock vs worker wall clock under NTP skew); instead of
+// dropping it silently it is counted on clockSkewDropped, labeled by histogram,
+// so operators can observe skew directly instead of inferring it from a gap.
+func recordDuration(ctx context.Context, inst *instruments, hist metric.Float64Histogram, metricName string, d time.Duration, attrs []attribute.KeyValue) {
 	if d < 0 {
+		inst.clockSkewDropped.Add(ctx, 1, metric.WithAttributes(attribute.String(attrMetric, metricName)))
 		return
 	}
 	hist.Record(ctx, d.Seconds(), metric.WithAttributes(attrs...))

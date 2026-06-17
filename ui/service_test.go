@@ -2171,6 +2171,9 @@ func TestJobToProto_RedactsPayloadsWithoutTruncating(t *testing.T) {
 	job.Args = []byte(`{"token":"` + argsSecret + `"}`)
 	job.Result = []byte(strings.Repeat("r", 5000) + " " + resultSecret + " " + sentinel)
 	job.LastError = "request failed bearer abcdefghijklmnopqrstuvwxyz012345"
+	// DeadLetterReason must be re-redacted on read like LastError (teardown g12):
+	// it carries the raw handler error and is surfaced to the dashboard.
+	job.DeadLetterReason = "max retries exhausted: bearer abcdefghijklmnopqrstuvwxyz012345"
 
 	pb := jobToProto(job)
 
@@ -2182,6 +2185,8 @@ func TestJobToProto_RedactsPayloadsWithoutTruncating(t *testing.T) {
 	assert.Greater(t, len(pb.Result), 5000)
 	assert.NotContains(t, pb.LastError, "abcdefghijklmnopqrstuvwxyz012345")
 	assert.Contains(t, pb.LastError, "bearer [REDACTED]")
+	assert.NotContains(t, pb.DeadLetterReason, "abcdefghijklmnopqrstuvwxyz012345")
+	assert.Contains(t, pb.DeadLetterReason, "bearer [REDACTED]")
 }
 
 func TestJobToProto_RedactsMetadataValues(t *testing.T) {

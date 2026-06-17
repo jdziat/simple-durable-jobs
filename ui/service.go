@@ -1106,7 +1106,7 @@ func jobToProtoWithMetadataRedaction(j *core.Job, redactMetadata bool) *jobsv1.J
 	if j.DeadLetteredAt != nil {
 		pb.DeadLetteredAt = timestamppb.New(*j.DeadLetteredAt)
 	}
-	pb.DeadLetterReason = j.DeadLetterReason
+	pb.DeadLetterReason = security.SanitizeErrorMessage(j.DeadLetterReason)
 	return pb
 }
 

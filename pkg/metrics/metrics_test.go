@@ -69,6 +69,50 @@ func TestInstrument_RecordsLifecycleMetrics(t *testing.T) {
 	})
 }
 
+func TestInstrument_RecordsClockSkewDropped(t *testing.T) {
+	ctx := context.Background()
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	defer func() { _ = mp.Shutdown(ctx) }()
+
+	q := queue.New(noDepthStorage{})
+	Instrument(q, WithMeterProvider(mp))
+
+	// StartedAt in the future makes both latency endpoints invert: the wait
+	// histogram (StartedAt-CreatedAt with CreatedAt placed even later) and the run
+	// histogram (time.Since(StartedAt)) both go negative — exactly the DB-clock vs
+	// worker-wall-clock skew the counter exists to surface. Pre-fix these samples
+	// were dropped silently; now each lands on jobs.clock_skew_dropped, labeled by
+	// the affected histogram.
+	future := time.Now().Add(time.Hour)
+	job := &core.Job{
+		ID:        core.NewID(),
+		Type:      "email",
+		Queue:     "critical",
+		CreatedAt: future.Add(time.Minute), // later than StartedAt → negative wait
+		StartedAt: &future,                 // future → negative run via time.Since
+		Attempt:   1,
+	}
+
+	q.CallStartHooks(ctx, job)    // negative wait duration
+	q.CallCompleteHooks(ctx, job) // negative run duration
+
+	rm := collectMetrics(t, reader)
+
+	assertCounterPoint(t, rm, metricClockSkewDropped, 1, map[string]string{
+		attrMetric: metricJobWaitDuration,
+	})
+	assertCounterPoint(t, rm, metricClockSkewDropped, 1, map[string]string{
+		attrMetric: metricJobRunDuration,
+	})
+
+	// The skewed samples must not have polluted the latency histograms.
+	assert.Nil(t, findMetric(rm, metricJobWaitDuration),
+		"negative wait sample must be dropped, not recorded")
+	assert.Nil(t, findMetric(rm, metricJobRunDuration),
+		"negative run sample must be dropped, not recorded")
+}
+
 func TestInstrument_RecordsLeaseReclaimed(t *testing.T) {
 	ctx := context.Background()
 	reader := sdkmetric.NewManualReader()

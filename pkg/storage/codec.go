@@ -16,6 +16,16 @@ import (
 // so decode scans for it with strings.Index rather than HasPrefix.
 const errTextTag = "sdjenc:"
 
+// codecIsIdentity reports whether the configured codec is the pass-through
+// identity codec (or the unset default). Under it, payload bytes and error text
+// are stored verbatim and no errTextTag is ever emitted, so the text-decode path
+// must treat stored values as literal plaintext. A caller-supplied codec that
+// happens to be a different no-op type is not detected here — the same narrow
+// assumption argsSearchable already relies on.
+func (s *GormStorage) codecIsIdentity() bool {
+	return s.codec == nil || s.codec == core.IdentityCodec
+}
+
 func (s *GormStorage) encodePayload(kind, id string, b []byte) ([]byte, error) {
 	if len(b) == 0 {
 		return b, nil
@@ -67,7 +77,16 @@ func (s *GormStorage) encodeErrorText(kind, id, plaintext string) (string, error
 // token that the codec cannot open means wrong key / corruption and surfaces as
 // core.ErrPayloadDecode, mirroring decodePayload. The tag may follow a fixed
 // label, so any plaintext prefix before the tag is preserved.
+//
+// Under the identity codec encodeErrorText never emits the tag, so any stored
+// value containing the tag substring is literal plaintext. Decoding it would
+// corrupt a legitimate message that happens to read "...sdjenc:<valid-base64>"
+// (the base64 token would be decoded and returned as bytes), so the tag scan is
+// skipped entirely for a pass-through codec.
 func (s *GormStorage) decodeErrorText(kind, id, stored string) (string, error) {
+	if s.codecIsIdentity() {
+		return stored, nil
+	}
 	idx := strings.Index(stored, errTextTag)
 	if idx < 0 {
 		return stored, nil
