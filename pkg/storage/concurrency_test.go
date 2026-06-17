@@ -3,12 +3,15 @@ package storage
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
 
 	"github.com/jdziat/simple-durable-jobs/v3/pkg/core"
 )
@@ -184,4 +187,23 @@ func TestDeleteExpiredConcurrencySlotsPreservesLiveAndSentinel(t *testing.T) {
 	require.Len(t, remaining, 2)
 	assert.Equal(t, core.NilUUID, remaining[0].JobID, "sentinel row must not be deleted")
 	assert.Equal(t, testUUID("live-job"), remaining[1].JobID, "live held slot must not be deleted")
+}
+
+func TestDeleteExpiredConcurrencySlotsUsesDBClockOnDBBackends(t *testing.T) {
+	s := newTestStorage(t)
+	ctx := context.Background()
+	capture := &stmtCaptureLogger{Interface: logger.Default.LogMode(logger.Info)}
+	s.db = s.db.Session(&gorm.Session{DryRun: true, Logger: capture})
+	s.isSQLite = false
+
+	cutoff := time.Date(2099, time.January, 2, 3, 4, 5, 0, time.UTC)
+	_, err := s.DeleteExpiredConcurrencySlots(ctx, cutoff)
+	require.NoError(t, err)
+	require.NotEmpty(t, capture.stmts)
+
+	sql := strings.Join(capture.stmts, "\n")
+	// Match both Postgres NOW() and MySQL NOW(6) (s.nowExpr() renders the
+	// fractional form on MySQL); the point is the server clock, not the cutoff.
+	assert.Contains(t, sql, "expires_at < NOW(", "DB-clock sweep must compare against server time")
+	assert.NotContains(t, sql, "2099", "DB-clock sweep must ignore the caller cutoff")
 }

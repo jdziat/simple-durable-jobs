@@ -740,13 +740,12 @@ func (s *GormStorage) dequeueSQLite(ctx context.Context, queues []string, worker
 // deleted only when SetDeleteCheckpointsOnComplete(true) was set; the default
 // keeps them for the dashboard. A not-owned Complete deletes nothing.
 func (s *GormStorage) Complete(ctx context.Context, jobID core.UUID, workerID string) error {
-	now := time.Now()
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		result := tx.Model(&core.Job{}).
 			Where("id = ? AND locked_by = ? AND status = ?", jobID, workerID, core.StatusRunning).
 			Updates(map[string]any{
 				"status":       core.StatusCompleted,
-				"completed_at": now,
+				"completed_at": s.nowWriteValue(),
 				"locked_by":    "",
 				"locked_until": nil,
 			})
@@ -816,7 +815,7 @@ func (s *GormStorage) Fail(ctx context.Context, jobID core.UUID, workerID string
 		updates["dq_ready"] = !retryAt.After(now)
 	} else {
 		updates["status"] = core.StatusFailed
-		updates["completed_at"] = now
+		updates["completed_at"] = s.nowWriteValue()
 		updates["dead_lettered_at"] = now
 		// Label stays plaintext (fixed, non-PII); only the error suffix is
 		// encrypted, preserving the attempt>=max_retries CASE in SQL.
@@ -916,7 +915,7 @@ func (s *GormStorage) accountTerminalWithFanOut(ctx context.Context, jobID core.
 				}
 				updates[key] = value
 			}
-			updates["completed_at"] = now
+			updates["completed_at"] = s.nowWriteValue()
 			if lastError, ok := jobUpdates[deadLetterReasonKey].(string); ok {
 				updates["dead_lettered_at"] = now
 				updates["dead_letter_reason"] = deadLetterReasonExpr(lastError)
@@ -1677,7 +1676,7 @@ func (s *GormStorage) CancelSubJobs(ctx context.Context, fanOutID core.UUID) ([]
 				Where("status IN ?", []core.JobStatus{core.StatusPending, core.StatusRunning}).
 				Updates(map[string]any{
 					"status":       core.StatusCancelled,
-					"completed_at": now,
+					"completed_at": s.nowWriteValue(),
 					"updated_at":   now,
 				})
 			if result.Error != nil {
@@ -1732,7 +1731,7 @@ func (s *GormStorage) CancelSubJob(ctx context.Context, jobID core.UUID) (*core.
 				Where("id = ? AND status NOT IN ?", jobID, []core.JobStatus{core.StatusCompleted, core.StatusFailed, core.StatusCancelled}).
 				Updates(map[string]any{
 					"status":       core.StatusCancelled,
-					"completed_at": now,
+					"completed_at": s.nowWriteValue(),
 					"updated_at":   now,
 				})
 			if result.Error != nil {
@@ -2256,7 +2255,7 @@ func (s *GormStorage) pauseJobAggressive(ctx context.Context, jobID core.UUID) e
 				Where("id = ? AND status = ?", jobID, core.StatusRunning).
 				Updates(map[string]any{
 					"status":       core.StatusCancelled,
-					"completed_at": now,
+					"completed_at": s.nowWriteValue(),
 					"updated_at":   now,
 					// non-PII constant; intentionally stored plaintext
 					"last_error":   "cancelled by user",

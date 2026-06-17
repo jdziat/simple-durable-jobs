@@ -144,9 +144,17 @@ func (s *GormStorage) ReleaseConcurrencySlot(ctx context.Context, slotName strin
 
 // DeleteExpiredConcurrencySlots deletes expired held slots while preserving the
 // permanent per-slot sentinel row (job_id="") used to serialize admission.
+// The cutoff argument is honored only on SQLite; DB-clock backends use the
+// database server clock, mirroring DeleteExpiredUniqueLocks.
 func (s *GormStorage) DeleteExpiredConcurrencySlots(ctx context.Context, cutoff time.Time) (int64, error) {
+	var cutoffVal any
+	if s.useDBClock() {
+		cutoffVal = s.nowExpr()
+	} else {
+		cutoffVal = cutoff
+	}
 	result := s.db.WithContext(ctx).
-		Where("expires_at < ?", cutoff).
+		Where("expires_at < ?", cutoffVal).
 		Where("job_id <> ?", core.NilUUID).
 		Delete(&core.ConcurrencySlot{})
 	return result.RowsAffected, result.Error
