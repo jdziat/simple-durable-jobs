@@ -918,7 +918,9 @@ func DefaultBackoffPolicy() BackoffPolicy {
 
 // Schedule functions
 
-// Every creates a schedule that runs at fixed intervals.
+// Every creates a schedule that runs at fixed intervals. The interval must be
+// positive; like time.NewTicker, Every panics on a non-positive duration (a
+// zero/negative interval would otherwise drive a busy-loop in the scheduler).
 func Every(d time.Duration) Schedule {
 	return schedule.Every(d)
 }

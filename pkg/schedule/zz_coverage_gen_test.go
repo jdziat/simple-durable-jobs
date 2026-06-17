@@ -7,22 +7,24 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-// TestEvery_ZeroInterval_ReturnsFrom covers the s.interval <= 0 early-return
-// branch in everySchedule.Next, which the existing tests never exercise.
-func TestEvery_ZeroInterval_ReturnsFrom(t *testing.T) {
-	s := Every(0)
-	from := time.Date(2024, 3, 15, 8, 17, 42, 0, time.UTC)
-
-	assert.Equal(t, from, s.Next(from))
+// TestEvery_NonPositiveInterval_Panics covers the construction-time rejection of
+// a non-positive interval (teardown g8): a zero/negative interval would drive a
+// ~10Hz claim busy-loop, so Every panics rather than building such a schedule.
+func TestEvery_NonPositiveInterval_Panics(t *testing.T) {
+	assert.Panics(t, func() { Every(0) })
+	assert.Panics(t, func() { Every(-5 * time.Minute) })
 }
 
-// TestEvery_NegativeInterval_ReturnsFrom covers the same guard with a negative
-// duration.
-func TestEvery_NegativeInterval_ReturnsFrom(t *testing.T) {
-	s := Every(-5 * time.Minute)
+// TestEverySchedule_NonPositiveInterval_NextDoesNotBusyLoop covers the
+// defense-in-depth guard in Next for a directly-constructed everySchedule: it
+// must NOT return `from` (which would busy-loop the scheduler) but a far-future
+// time that effectively disables the schedule.
+func TestEverySchedule_NonPositiveInterval_NextDoesNotBusyLoop(t *testing.T) {
+	s := &everySchedule{interval: 0}
 	from := time.Date(2024, 3, 15, 8, 17, 42, 0, time.UTC)
 
-	assert.Equal(t, from, s.Next(from))
+	next := s.Next(from)
+	assert.True(t, next.After(from.AddDate(50, 0, 0)), "non-positive interval must not busy-loop; got %v", next)
 }
 
 // TestWeekly_TargetDayEarlierInWeek covers the daysUntil < 0 wrap-around branch
