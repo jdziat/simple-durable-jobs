@@ -82,7 +82,12 @@ func QueueOpt(name string) Option {
 	})
 }
 
-// WithTenant sets the tenant that owns the job.
+// WithTenant sets the tenant that owns the job. The tenant is a label and a
+// query/dequeue filter; it is validated for length only (unlike Queue, it is not
+// charset-validated or case-normalized, so callers requiring canonical forms must
+// normalize the value themselves). It does NOT scope deduplication: Unique and
+// IdempotencyKey keys are matched fleet-wide, so namespace them per tenant (e.g.
+// Unique("tenant:"+tenantID+":"+key)) if you need cross-tenant isolation.
 func WithTenant(t string) Option {
 	return optionFunc(func(o *Options) {
 		o.Tenant = t
@@ -165,7 +170,10 @@ func WithHandlerBackoff(p core.BackoffPolicy) Option {
 	})
 }
 
-// Unique ensures only one job with this key exists.
+// Unique ensures only one active job with this key exists. The key is matched
+// fleet-wide, NOT per-tenant — WithTenant does not scope it, so two tenants
+// enqueuing the same key collide and the second is suppressed. For per-tenant
+// isolation, namespace the key yourself, e.g. Unique("tenant:"+tenantID+":"+key).
 func Unique(key string) Option {
 	return optionFunc(func(o *Options) {
 		o.UniqueKey = key
@@ -175,6 +183,9 @@ func Unique(key string) Option {
 // IdempotencyKey deduplicates enqueue attempts with the same caller-supplied
 // key for ttl. A duplicate enqueue during the window returns the original job
 // ID without creating a second job.
+//
+// Like Unique, the key is matched fleet-wide, not per-tenant; namespace it (e.g.
+// "tenant:"+tenantID+":"+key) if you need per-tenant idempotency.
 func IdempotencyKey(key string, ttl time.Duration) Option {
 	return optionFunc(func(o *Options) {
 		o.IdempotencyKey = key
