@@ -67,15 +67,22 @@ func (s *GormStorage) TryAcquireConcurrencySlot(ctx context.Context, slotName st
 				return nil
 			}
 
-			live := tx.Model(&core.ConcurrencySlot{}).
+			// Admission is already serialized by the blocking sentinel lock
+			// above, so this transaction is the only contender that can count
+			// and insert for slotName. The live-holder check must therefore be
+			// a plain committed COUNT, not SELECT ... FOR UPDATE SKIP LOCKED:
+			// renewal/release paths do not take the sentinel, and SKIP LOCKED
+			// would omit a still-live row currently locked by one of those
+			// paths, undercounting and admitting past the cap. A row mid-release
+			// still being counted can only deny temporarily, which is safe.
+			var liveCount int64
+			if err := tx.Model(&core.ConcurrencySlot{}).
 				Where("slot_name = ? AND expires_at >= ?", slotName, nowVal).
-				Where("job_id <> ?", core.NilUUID)
-			live = s.lockForUpdate(live, true)
-			var liveSlots []core.ConcurrencySlot
-			if err := live.Find(&liveSlots).Error; err != nil {
+				Where("job_id <> ?", core.NilUUID).
+				Count(&liveCount).Error; err != nil {
 				return err
 			}
-			if len(liveSlots) >= limit {
+			if liveCount >= int64(limit) {
 				return nil
 			}
 

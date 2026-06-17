@@ -1131,17 +1131,38 @@ func (w *Worker) untrackQueueJob(jobID core.UUID) {
 }
 
 func (w *Worker) concurrencySlotTTL() time.Duration {
+	base := defaultConcurrencySlotTTL
 	if w.config.LockDuration > 0 {
-		return w.config.LockDuration
+		base = w.config.LockDuration
 	}
-	return defaultConcurrencySlotTTL
+	// Slot leases are renewed only on heartbeat ticks. Keep roughly three
+	// renewal opportunities inside the slot TTL, mirroring the stale-lock
+	// heartbeat reasoning without changing the job lock lease itself.
+	if w.heartbeatInterval > 0 {
+		minTTL := 3 * w.heartbeatInterval
+		if base < minTTL {
+			return minTTL
+		}
+	}
+	return base
 }
 
-func (w *Worker) capSlotName(cap ConcurrencyCapConfig, job *core.Job) string {
+func (w *Worker) capSlotName(cap ConcurrencyCapConfig, job *core.Job) (name string, ok bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			w.logger.Error("concurrency cap key panicked; releasing dequeued job",
+				"job_id", job.ID,
+				"cap", cap.Name,
+				"panic", r,
+				"stack", string(debug.Stack()))
+			name = ""
+			ok = false
+		}
+	}()
 	if cap.Key == nil {
-		return cap.Name
+		return cap.Name, true
 	}
-	return cap.Name + ":" + cap.Key(job)
+	return cap.Name + ":" + cap.Key(job), true
 }
 
 func (w *Worker) rateLimitName(limit RateLimitConfig, job *core.Job) string {
@@ -1376,7 +1397,11 @@ func (w *Worker) tryAcquireConcurrencySlots(ctx context.Context, job *core.Job) 
 	ttl := w.concurrencySlotTTL()
 	acquiredSlots := make([]string, 0, len(w.config.ConcurrencyCaps))
 	for _, cap := range w.config.ConcurrencyCaps {
-		slotName := w.capSlotName(cap, job)
+		slotName, ok := w.capSlotName(cap, job)
+		if !ok {
+			w.releaseSlotNames(ctx, job.ID, acquiredSlots)
+			return false
+		}
 		acquired, err := storage.TryAcquireConcurrencySlot(ctx, slotName, job.ID, w.config.WorkerID, cap.Limit, ttl)
 		if err != nil {
 			w.logger.Warn("failed to acquire concurrency slot; releasing dequeued job",
