@@ -304,6 +304,64 @@ func TestCallWithCachedCheckpoint(t *testing.T) {
 	})
 }
 
+func TestCallBestEffortReplayGCsOrphanCheckpoint(t *testing.T) {
+	// Regression (teardown g2): a BestEffortReplay type-mismatch re-execution
+	// saved the new call_type as a fresh row, leaving the prior-type checkpoint
+	// orphaned at the same index (the unique key includes call_type). The orphan
+	// must now be GC'd via the checkpointIndexCleaner capability, leaving exactly
+	// one checkpoint at the index — both in storage and in the in-memory state.
+	ctx := context.Background()
+	store := &testCheckpointStore{checkpoints: []core.Checkpoint{
+		{ID: "cp-old", JobID: "job-1", CallIndex: 0, CallType: "old-step", Result: []byte(`"old-result"`)},
+	}}
+
+	h, err := handler.NewHandler(func(ctx context.Context, args any) (string, error) {
+		return "new-result", nil
+	})
+	if err != nil {
+		t.Fatalf("failed to create handler: %v", err)
+	}
+
+	jobCtx := &intctx.JobContext{
+		Job:              &core.Job{ID: "job-1"},
+		Storage:          store,
+		BestEffortReplay: true,
+		HandlerLookup: func(name string) (any, bool) {
+			if name == "new-step" {
+				return h, true
+			}
+			return nil, false
+		},
+		SaveCheckpoint: store.SaveCheckpoint,
+	}
+	cctx := intctx.WithJobContext(ctx, jobCtx)
+	cctx = intctx.WithCallState(cctx, append([]core.Checkpoint(nil), store.checkpoints...))
+
+	result, err := Call[string](cctx, "new-step", "arg")
+	if err != nil {
+		t.Fatalf("best-effort Call returned error: %v", err)
+	}
+	if result != "new-result" {
+		t.Fatalf("result = %q, want new-result", result)
+	}
+
+	cps, _ := store.GetCheckpoints(ctx, "job-1")
+	if len(cps) != 1 {
+		t.Fatalf("expected 1 checkpoint after orphan GC, got %d: %+v", len(cps), cps)
+	}
+	if cps[0].CallType != "new-step" || cps[0].CallIndex != 0 {
+		t.Fatalf("sole checkpoint = {%s,%d}, want {new-step,0}", cps[0].CallType, cps[0].CallIndex)
+	}
+
+	cs := intctx.GetCallState(cctx)
+	cs.Mu.Lock()
+	_, orphanStillCached := cs.Checkpoints[intctx.CheckpointKey{Index: 0, Type: "old-step"}]
+	cs.Mu.Unlock()
+	if orphanStillCached {
+		t.Fatal("expected the in-memory orphan checkpoint to be cleared")
+	}
+}
+
 func TestCallWithMissingHandler(t *testing.T) {
 	t.Run("returns error when handler not registered", func(t *testing.T) {
 		// Arrange
@@ -1132,6 +1190,10 @@ func hasSubstring(s, substr string) bool {
 }
 
 type testCheckpointStore struct {
+	// Embedded nil core.Storage satisfies the interface for use as
+	// JobContext.Storage; only the explicitly-defined methods below are exercised
+	// (any other call would nil-panic, which no test triggers).
+	core.Storage
 	checkpoints []core.Checkpoint
 }
 
@@ -1149,4 +1211,18 @@ func (s *testCheckpointStore) GetCheckpoints(ctx context.Context, jobID core.UUI
 		}
 	}
 	return checkpoints, nil
+}
+
+// DeleteCheckpointAtIndex satisfies the checkpointIndexCleaner capability so the
+// BestEffort orphan-GC path can be exercised without a real DB.
+func (s *testCheckpointStore) DeleteCheckpointAtIndex(ctx context.Context, jobID core.UUID, callIndex int) error {
+	kept := s.checkpoints[:0]
+	for _, cp := range s.checkpoints {
+		if cp.JobID == jobID && cp.CallIndex == callIndex {
+			continue
+		}
+		kept = append(kept, cp)
+	}
+	s.checkpoints = kept
+	return nil
 }

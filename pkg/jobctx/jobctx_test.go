@@ -351,6 +351,50 @@ func TestSavePhaseCheckpoint(t *testing.T) {
 	})
 }
 
+func TestSavePhaseCheckpoint_WriteBackVisibleSameRun(t *testing.T) {
+	// Regression (teardown g2): SavePhaseCheckpoint saved to storage but never
+	// reflected the result in the in-memory call state, so a LoadPhaseCheckpoint
+	// in the SAME run returned (zero,false). It must now be visible immediately,
+	// like GetVersion's version markers.
+	ctx := newTestVersionContext("job-1", nil, nil)
+
+	_, ok := LoadPhaseCheckpoint[string](ctx, "phase1")
+	require.False(t, ok, "precondition: nothing saved yet")
+
+	require.NoError(t, SavePhaseCheckpoint(ctx, "phase1", "result-1"))
+
+	got, ok := LoadPhaseCheckpoint[string](ctx, "phase1")
+	require.True(t, ok, "same-run LoadPhaseCheckpoint must see the just-saved value")
+	assert.Equal(t, "result-1", got)
+}
+
+func TestPhaseCheckpoint_ReservedPrefixRejected(t *testing.T) {
+	reserved := versionCheckpointPrefix + "my-change"
+	ctx := newTestVersionContext("job-1", nil, nil)
+
+	t.Run("SavePhaseCheckpoint rejects", func(t *testing.T) {
+		err := SavePhaseCheckpoint(ctx, reserved, "x")
+		assert.ErrorIs(t, err, ErrReservedPhaseName)
+	})
+
+	t.Run("SavePhaseCheckpointTx rejects before touching storage", func(t *testing.T) {
+		// The prefix check runs before the TxCheckpointer assertion, so a nil tx
+		// and a storage-less context still surface ErrReservedPhaseName.
+		txCtx := intctx.WithJobContext(context.Background(), &intctx.JobContext{Job: &core.Job{ID: "job-1"}})
+		err := SavePhaseCheckpointTx(txCtx, nil, reserved, "x")
+		assert.ErrorIs(t, err, ErrReservedPhaseName)
+	})
+
+	t.Run("LoadPhaseCheckpoint treats reserved name as absent", func(t *testing.T) {
+		_, ok := LoadPhaseCheckpoint[int](ctx, reserved)
+		assert.False(t, ok)
+	})
+
+	t.Run("a normal phase name is unaffected", func(t *testing.T) {
+		assert.NoError(t, SavePhaseCheckpoint(ctx, "normal-phase", "ok"))
+	})
+}
+
 func newTestVersionContext(jobID core.UUID, checkpoints []core.Checkpoint, save func(context.Context, *core.Checkpoint) error) context.Context {
 	if save == nil {
 		save = func(context.Context, *core.Checkpoint) error { return nil }

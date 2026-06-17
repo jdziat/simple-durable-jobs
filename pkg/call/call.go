@@ -12,6 +12,14 @@ import (
 	"github.com/jdziat/simple-durable-jobs/v3/pkg/security"
 )
 
+// checkpointIndexCleaner is an optional storage capability used to clear an
+// orphaned prior-type checkpoint at one call index during a BestEffortReplay
+// type-mismatch re-execution. Storage backends that do not implement it simply
+// leave the (benign, GC'd-with-the-job) orphan in place.
+type checkpointIndexCleaner interface {
+	DeleteCheckpointAtIndex(ctx context.Context, jobID core.UUID, callIndex int) error
+}
+
 // Call executes a durable nested job call.
 //
 // Call assigns a monotonic call index and checkpoints by both index and name.
@@ -100,6 +108,30 @@ func CallWithCheckpointCtx[T any](execCtx, checkpointCtx context.Context, name s
 		if jc.Logger != nil {
 			jc.Logger.Warn("jobs.Call best-effort replay: checkpoint type mismatch, re-executing",
 				"index", callIndex, "checkpoint_type", mismatched.CallType, "requested", name, "job_id", jc.Job.ID)
+		}
+		// The new call_type will be saved as a fresh row at this index, leaving the
+		// mismatched prior-type row orphaned (the unique key includes call_type).
+		// Clear it so the index holds exactly one checkpoint. Cleanup is best-effort:
+		// the orphan is never read (the correct-type row shadows it on lookup) and is
+		// GC'd with the job, so a delete failure must not abort a working replay.
+		if cleaner, ok := jc.Storage.(checkpointIndexCleaner); ok {
+			if delErr := cleaner.DeleteCheckpointAtIndex(checkpointCtx, jc.Job.ID, callIndex); delErr != nil {
+				if jc.Logger != nil {
+					jc.Logger.Warn("jobs.Call best-effort replay: failed to clear orphaned checkpoint",
+						"index", callIndex, "job_id", jc.Job.ID, "error", delErr)
+				}
+			} else {
+				// Mirror the SQL delete (which clears every row at this index): drop
+				// all in-memory entries at callIndex so storage and the call state
+				// stay symmetric, not just the single mismatched type.
+				cs.Mu.Lock()
+				for k := range cs.Checkpoints {
+					if k.Index == callIndex {
+						delete(cs.Checkpoints, k)
+					}
+				}
+				cs.Mu.Unlock()
+			}
 		}
 	}
 

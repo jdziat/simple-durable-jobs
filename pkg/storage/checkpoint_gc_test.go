@@ -43,6 +43,40 @@ func runningJob(t *testing.T, ctx context.Context, s *GormStorage, workerID stri
 	return got
 }
 
+// TestDeleteCheckpointAtIndex proves the per-index delete removes every row at a
+// call index regardless of call_type — the operation BestEffort replay uses to
+// clear an orphaned prior-type checkpoint (teardown g2).
+func TestDeleteCheckpointAtIndex(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+	// Checkpoints have a FK to jobs(id) (enforced on PG/MySQL), so attach them to
+	// a real running job rather than a synthetic ID.
+	jobID := runningJob(t, ctx, s, "worker-1").ID
+
+	// Two checkpoints at index 0 with different types (the orphan scenario from a
+	// BestEffort type change) plus one at index 1.
+	for _, cp := range []*core.Checkpoint{
+		{JobID: jobID, CallIndex: 0, CallType: "old-step", Result: []byte(`"a"`)},
+		{JobID: jobID, CallIndex: 0, CallType: "new-step", Result: []byte(`"b"`)},
+		{JobID: jobID, CallIndex: 1, CallType: "call", Result: []byte(`"c"`)},
+	} {
+		require.NoError(t, s.SaveCheckpoint(ctx, cp))
+	}
+	require.Equal(t, 3, checkpointCount(t, ctx, s, jobID))
+
+	require.NoError(t, s.DeleteCheckpointAtIndex(ctx, jobID, 0))
+
+	cps, err := s.GetCheckpoints(ctx, jobID)
+	require.NoError(t, err)
+	require.Len(t, cps, 1, "both index-0 rows must be deleted regardless of call_type")
+	assert.Equal(t, 1, cps[0].CallIndex)
+	assert.Equal(t, "call", cps[0].CallType)
+
+	// Idempotent: deleting an index with no rows is a no-op, not an error.
+	require.NoError(t, s.DeleteCheckpointAtIndex(ctx, jobID, 0))
+	assert.Equal(t, 1, checkpointCount(t, ctx, s, jobID))
+}
+
 // TestComplete_DeletesCheckpointsOnSuccess proves the plain Complete path GCs
 // checkpoints transactionally when the opt-in is enabled.
 func TestComplete_DeletesCheckpointsOnSuccess(t *testing.T) {
