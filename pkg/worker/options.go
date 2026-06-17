@@ -330,13 +330,14 @@ func RateLimit(name string, perSecond float64, opts ...RateLimitOption) WorkerOp
 		cfg := RateLimitConfig{
 			Name:      name,
 			PerSecond: perSecond,
-			Window:    defaultRateLimitWindow,
+			// Window is intentionally left 0 ("derive") unless an option sets it,
+			// so resolveRateLimitWindow can pick an accurate window for a fractional
+			// PerSecond (< 1): forcing the 1s default here rounded the per-window
+			// ceiling up to 1 and over-admitted sub-1 rates ~10x (teardown g4).
+			// Whole-number rates still resolve to the 1s default.
 		}
 		for _, opt := range opts {
 			opt(&cfg)
-		}
-		if cfg.Window <= 0 {
-			cfg.Window = defaultRateLimitWindow
 		}
 		c.RateLimits = append(c.RateLimits, cfg)
 	})

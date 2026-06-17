@@ -1,11 +1,58 @@
 package worker
 
 import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"math"
 	"sync"
 	"time"
 )
 
 const defaultRateLimitWindow = time.Second
+
+// maxRateLimitNameLen bounds the effective fleet-rate-limit name. The
+// rate_limit_windows.limit_name column is varchar(255); an unbounded RateLimitKey
+// that overflowed it would error TryConsumeRate and hot-loop the job
+// (claim/deny/release forever) (teardown g4).
+const maxRateLimitNameLen = 255
+
+// rateReleaser is the optional storage capability for refunding one consumed fleet
+// rate-limit unit. The worker uses it to return units it already consumed when a
+// LATER fleet limit in the same admission denies the job (teardown g4). Backends
+// that do not implement it simply skip the refund (prior behavior).
+type rateReleaser interface {
+	ReleaseRate(ctx context.Context, limitName string, window time.Duration) error
+}
+
+// resolveRateLimitWindow chooses the fixed-window length for a fleet rate limit. An
+// explicit author-set Window is always honored. Otherwise, for a FRACTIONAL
+// PerSecond (< 1) the default 1s window rounds the per-window ceiling UP to 1
+// (ceil(0.1*1)=1), admitting ~1/sec instead of 0.1/sec — up to ~10x over the
+// configured rate (teardown g4). Derive a window large enough that
+// PerSecond*window >= 1 so the ceiling is exact (0.1/sec -> a 10s window, ceiling 1
+// per 10s). Whole-number rates keep the 1s default.
+func (w *Worker) resolveRateLimitWindow(limit RateLimitConfig) time.Duration {
+	if limit.Window > 0 {
+		return limit.Window
+	}
+	if limit.PerSecond > 0 && limit.PerSecond < 1 {
+		return time.Duration(math.Ceil(1/limit.PerSecond)) * time.Second
+	}
+	return defaultRateLimitWindow
+}
+
+// boundRateLimitName returns a name guaranteed to fit the limit_name column. Short
+// names pass through unchanged for readability; an over-long effective name (from
+// an unbounded RateLimitKey) is replaced by a stable hash so a long key buckets
+// consistently instead of overflowing the column and hot-looping the job.
+func boundRateLimitName(name string) string {
+	if len(name) <= maxRateLimitNameLen {
+		return name
+	}
+	sum := sha256.Sum256([]byte(name))
+	return "h:" + hex.EncodeToString(sum[:]) // 2 + 64 = 66 chars, always within 255
+}
 
 type queueRateLimitConfig struct {
 	PerSecond float64

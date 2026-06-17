@@ -1170,10 +1170,13 @@ func (w *Worker) capSlotName(cap ConcurrencyCapConfig, job *core.Job) (name stri
 }
 
 func (w *Worker) rateLimitName(limit RateLimitConfig, job *core.Job) string {
-	if limit.Key == nil {
-		return limit.Name
+	name := limit.Name
+	if limit.Key != nil {
+		name = limit.Name + ":" + limit.Key(job)
 	}
-	return limit.Name + ":" + limit.Key(job)
+	// Bound the effective name to the limit_name column width: an unbounded
+	// RateLimitKey would otherwise overflow it and hot-loop the job (teardown g4).
+	return boundRateLimitName(name)
 }
 
 // tryConsumeRateLimits returns (allowed, reason). reason is meaningful only when
@@ -1190,14 +1193,32 @@ func (w *Worker) tryConsumeRateLimits(ctx context.Context, job *core.Job) (bool,
 		}
 		return true, ""
 	}
+	// Refund support: when a LATER fleet limit denies, the units already consumed
+	// from EARLIER limits must be returned, or every multi-limit bounce permanently
+	// drains those windows for a job that never runs (teardown g4). Backends without
+	// ReleaseRate degrade to the prior no-refund behavior.
+	releaser, canRelease := w.queue.Storage().(rateReleaser)
+	type consumedRate struct {
+		name   string
+		window time.Duration
+	}
+	var consumed []consumedRate
+	refund := func() {
+		if !canRelease {
+			return
+		}
+		for _, c := range consumed {
+			if err := releaser.ReleaseRate(ctx, c.name, c.window); err != nil {
+				w.logger.Warn("failed to refund consumed rate limit after a later limit denied",
+					"job_id", job.ID, "limit", c.name, "error", err)
+			}
+		}
+	}
 	for _, limit := range w.config.RateLimits {
 		if limit.Name == "" || limit.PerSecond <= 0 {
 			continue
 		}
-		window := limit.Window
-		if window <= 0 {
-			window = defaultRateLimitWindow
-		}
+		window := w.resolveRateLimitWindow(limit)
 		limitName := w.rateLimitName(limit, job)
 		// cto-F2 per-key cooldown (KEYED limits only — the gap v1 left): if this
 		// exact bucket was denied by the DB this window, skip the locked
@@ -1212,6 +1233,7 @@ func (w *Worker) tryConsumeRateLimits(ctx context.Context, job *core.Job) (bool,
 		// on the probe tick, which MUST consult the DB to detect headroom returning
 		// — short-circuiting it would change v1's proven unkeyed behavior.
 		if limit.Key != nil && w.keyedRateSaturated(limitName, time.Now()) {
+			refund()
 			return false, bounceFleetRateCached
 		}
 		allowed, err := storage.TryConsumeRate(ctx, limitName, limit.PerSecond, window, time.Time{})
@@ -1220,6 +1242,7 @@ func (w *Worker) tryConsumeRateLimits(ctx context.Context, job *core.Job) (bool,
 				"job_id", job.ID,
 				"limit", limitName,
 				"error", err)
+			refund()
 			return false, bounceFleetRate
 		}
 		if !allowed {
@@ -1228,8 +1251,10 @@ func (w *Worker) tryConsumeRateLimits(ctx context.Context, job *core.Job) (bool,
 			// (removes both churns); for a keyed bucket the pre-tx fast path above
 			// reads it to skip the next DB rate tx (removes the denied-tx churn).
 			w.markRateSaturated(limitName, window)
+			refund()
 			return false, bounceFleetRate
 		}
+		consumed = append(consumed, consumedRate{name: limitName, window: window})
 	}
 	return true, ""
 }
