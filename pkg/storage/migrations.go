@@ -595,6 +595,12 @@ func migrateDeadLetterColumns(ctx context.Context, db *gorm.DB, dialect string) 
 			}
 		}
 		if !m.HasIndex(&core.Job{}, "idx_jobs_dead_lettered_at") {
+			// Plain (non-partial) index: unlike PostgreSQL/SQLite below, MySQL has
+			// no partial-index syntax and indexes NULLs in a secondary B-tree, so
+			// there is no way to index only the dead-lettered rows for a non-unique
+			// column. The NULL entries sort together and a `dead_lettered_at IS NOT
+			// NULL` scan range-skips them, so the dead-letter queries are still
+			// served; the extra NULL index entries are storage bounded by retention.
 			if err := db.Exec("CREATE INDEX idx_jobs_dead_lettered_at ON jobs (dead_lettered_at)").Error; err != nil && !isBenignDDLError(err) {
 				return fmt.Errorf("create idx_jobs_dead_lettered_at: %w", err)
 			}
@@ -706,6 +712,12 @@ func migrateDequeueOrderIndex(ctx context.Context, db *gorm.DB, dialect string) 
 	}
 }
 
+// migrateUniqueLocks creates the unique_locks table. job_id is declared here as
+// VARCHAR(36) to match the original string-UUID storage; the later UUID-binary
+// migration converts unique_locks.job_id (along with the other job-id columns) to
+// the 16-byte binary form the core.UUID codec writes, so the live column type
+// stays in sync with the codec. The VARCHAR(36) declaration is therefore the
+// transient pre-conversion shape, not the final schema.
 func migrateUniqueLocks(ctx context.Context, db *gorm.DB, dialect string) error {
 	m := db.Migrator()
 	if !m.HasTable(&core.UniqueLock{}) {

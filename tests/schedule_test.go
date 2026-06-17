@@ -27,13 +27,10 @@ func TestEvery_ShortInterval(t *testing.T) {
 }
 
 func TestEvery_ZeroDuration(t *testing.T) {
-	schedule := jobs.Every(0)
-	now := time.Date(2026, 2, 8, 10, 30, 0, 0, time.UTC)
-
-	next := schedule.Next(now)
-
-	// Should return immediate time for zero duration
-	assert.Equal(t, now, next)
+	// A non-positive interval is a configuration error: it is rejected at
+	// construction (panic), rather than silently driving a ~10Hz claim busy-loop.
+	assert.Panics(t, func() { jobs.Every(0) })
+	assert.Panics(t, func() { jobs.Every(-time.Second) })
 }
 
 func TestEvery_LongInterval(t *testing.T) {

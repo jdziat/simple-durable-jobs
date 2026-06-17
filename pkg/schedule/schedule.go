@@ -16,14 +16,23 @@ type everySchedule struct {
 	interval time.Duration
 }
 
-// Every creates a schedule that runs at fixed intervals.
+// Every creates a schedule that runs at fixed intervals. The interval must be
+// positive; like time.NewTicker, Every panics on a non-positive duration. A
+// zero or negative interval is a configuration error that would otherwise make
+// Next return its input unchanged, driving a ~10Hz ClaimScheduledFire busy-loop.
 func Every(d time.Duration) Schedule {
+	if d <= 0 {
+		panic("jobs: schedule.Every requires a positive interval")
+	}
 	return &everySchedule{interval: d}
 }
 
 func (s *everySchedule) Next(from time.Time) time.Time {
 	if s.interval <= 0 {
-		return from
+		// Defense in depth — Every rejects this at construction. Never return
+		// `from` (which busy-loops the scheduler); a non-positive interval here
+		// effectively disables the schedule.
+		return from.AddDate(100, 0, 0)
 	}
 	return from.Truncate(s.interval).Add(s.interval)
 }
@@ -35,7 +44,8 @@ type dailySchedule struct {
 	loc    *time.Location
 }
 
-// Daily creates a schedule that runs at a specific time each day.
+// Daily creates a schedule that runs at a specific time each day. The hour and
+// minute are interpreted in UTC, not the host's local timezone.
 func Daily(hour, minute int) Schedule {
 	return &dailySchedule{hour: hour, minute: minute, loc: time.UTC}
 }
@@ -57,7 +67,8 @@ type weeklySchedule struct {
 	loc    *time.Location
 }
 
-// Weekly creates a schedule that runs at a specific day and time each week.
+// Weekly creates a schedule that runs at a specific day and time each week. The
+// day, hour, and minute are interpreted in UTC, not the host's local timezone.
 func Weekly(day time.Weekday, hour, minute int) Schedule {
 	return &weeklySchedule{day: day, hour: hour, minute: minute, loc: time.UTC}
 }
@@ -82,7 +93,9 @@ type cronSchedule struct {
 	schedule cron.Schedule
 }
 
-// Cron creates a schedule from a cron expression.
+// Cron creates a schedule from a 5-field cron expression
+// (minute hour day-of-month month day-of-week). The expression is evaluated in
+// UTC, not the host's local timezone.
 func Cron(expr string) (Schedule, error) {
 	parser := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
 	schedule, err := parser.Parse(expr)
