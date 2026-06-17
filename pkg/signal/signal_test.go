@@ -33,6 +33,11 @@ type fakeSignalStore struct {
 	// rolls back the consume (the signal is restored). Wired by buildCtx to the
 	// same recorder that jc.SaveCheckpoint funnels into.
 	onCheckpoint func(*core.Checkpoint) error
+	// markWaitingErr, when set, is returned by SaveCheckpointAndMarkWaiting
+	// instead of recording the checkpoint + suspending. It models ownership loss
+	// (core.ErrJobNotOwned): the checkpoint MUST NOT be recorded (the tx rolled
+	// back), so onCheckpoint is not invoked and suspended is not incremented.
+	markWaitingErr error
 }
 
 func (f *fakeSignalStore) SendSignal(_ context.Context, _ core.UUID, name string, payload []byte) error {
@@ -129,6 +134,27 @@ func (f *fakeSignalStore) MarkWaiting(_ context.Context, _ core.UUID, _ string) 
 func (f *fakeSignalStore) MarkWaitingWithDeadline(_ context.Context, _ core.UUID, _ string, d time.Duration) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.suspended++
+	f.waitDur = d
+	return nil
+}
+
+// SaveCheckpointAndMarkWaiting models the atomic suspend primitive: it records
+// the (optional) checkpoint and marks the job waiting in one logical tx. When
+// markWaitingErr is set it models ownership loss — the whole tx rolls back, so
+// the checkpoint is NOT recorded and the job is NOT suspended. A nil cp means the
+// checkpoint is already durable (a replay), so only the suspend is recorded.
+func (f *fakeSignalStore) SaveCheckpointAndMarkWaiting(_ context.Context, cp *core.Checkpoint, _ core.UUID, _ string, d time.Duration) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.markWaitingErr != nil {
+		return f.markWaitingErr
+	}
+	if cp != nil && f.onCheckpoint != nil {
+		if err := f.onCheckpoint(cp); err != nil {
+			return err
+		}
+	}
 	f.suspended++
 	f.waitDur = d
 	return nil
@@ -496,6 +522,52 @@ func TestSleep_ReplayBeforeDeadlineKeepsOriginalDeadline(t *testing.T) {
 	require.True(t, core.IsWaiting(err))
 	assert.Less(t, store.waitDur, firstWait, "replay uses remaining time to the original deadline, not the new duration")
 	assert.Greater(t, store.waitDur, 59*time.Minute)
+}
+
+// TestSleep_SuspendCheckpointAndWaitAreAtomic proves the suspend path routes the
+// first-exec checkpoint THROUGH the combined SaveCheckpointAndMarkWaiting call
+// (one tx) rather than writing it separately first: the unresolved checkpoint is
+// recorded AND the job is marked waiting together.
+func TestSleep_SuspendCheckpointAndWaitAreAtomic(t *testing.T) {
+	store := &fakeSignalStore{}
+	rec := newRecorder()
+
+	err := signal.Sleep(buildCtx(store, rec, nil), time.Hour)
+	require.Error(t, err)
+	require.True(t, core.IsWaiting(err))
+	require.Equal(t, 1, store.suspended, "marked waiting via the combined call")
+
+	cps := rec.list()
+	require.Len(t, cps, 1, "the unresolved deadline checkpoint was persisted in the same combined call")
+	assert.Equal(t, signal.SleepCheckpointType, cps[0].CallType)
+}
+
+// TestSleep_OwnershipLossRollsBackSuspendCheckpoint proves the atomicity
+// guarantee end-to-end: when the combined suspend call fails on ownership loss
+// (ErrJobNotOwned), the deadline checkpoint must NOT be recorded — checkpoint and
+// status stay consistent (the old separate-write path could leave a checkpoint
+// behind).
+func TestSleep_OwnershipLossRollsBackSuspendCheckpoint(t *testing.T) {
+	store := &fakeSignalStore{markWaitingErr: core.ErrJobNotOwned}
+	rec := newRecorder()
+
+	err := signal.Sleep(buildCtx(store, rec, nil), time.Hour)
+	require.ErrorIs(t, err, core.ErrJobNotOwned)
+	assert.Equal(t, 0, store.suspended, "ownership loss → not suspended")
+	assert.Empty(t, rec.list(), "checkpoint rolled back with the failed status transition")
+}
+
+// TestWaitForSignalTimeout_OwnershipLossRollsBackSuspendCheckpoint is the
+// timeout-path analogue: a suspend that loses ownership writes no checkpoint.
+func TestWaitForSignalTimeout_OwnershipLossRollsBackSuspendCheckpoint(t *testing.T) {
+	store := &fakeSignalStore{markWaitingErr: core.ErrJobNotOwned}
+	rec := newRecorder()
+
+	_, ok, err := signal.WaitForSignalTimeout[string](buildCtx(store, rec, nil), "ctx", time.Hour)
+	require.ErrorIs(t, err, core.ErrJobNotOwned)
+	assert.False(t, ok)
+	assert.Equal(t, 0, store.suspended)
+	assert.Empty(t, rec.list(), "no deadline checkpoint when the combined suspend tx rolls back")
 }
 
 func TestWaitingOnFutureSleep_GuardRequiresInternalCallCheckpointWithDeadline(t *testing.T) {

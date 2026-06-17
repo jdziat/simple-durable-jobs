@@ -50,6 +50,13 @@ type signalStorage interface {
 	// always invoked, even for an empty batch).
 	DrainSignalsTx(ctx context.Context, jobID core.UUID, name string, buildCheckpoint func(sigs []*core.Signal) (*core.Checkpoint, error)) ([]*core.Signal, error)
 	MarkWaitingWithDeadline(ctx context.Context, jobID core.UUID, workerID string, d time.Duration) error
+	// SaveCheckpointAndMarkWaiting persists the (optional) deadline checkpoint AND
+	// marks the job waiting-with-deadline in ONE transaction. A nil cp means the
+	// checkpoint is already durable (a replay) and only the status transition is
+	// needed. It returns core.ErrJobNotOwned (rolling back the checkpoint write)
+	// when ownership was lost, keeping checkpoint and status consistent. Replaces
+	// the torn-write writeCheckpoint -> MarkWaitingWithDeadline suspend pair.
+	SaveCheckpointAndMarkWaiting(ctx context.Context, cp *core.Checkpoint, jobID core.UUID, workerID string, d time.Duration) error
 }
 
 // WaitingError signals the worker that the job has suspended itself into
@@ -316,13 +323,22 @@ func WaitForSignalTimeout[T any](ctx context.Context, name string, d time.Durati
 	// original d) means a spurious early resume — e.g. resumed by an unrelated
 	// signal, or by a worker whose clock lagged the deadline — re-suspends for
 	// what's left rather than restarting the full timeout.
+	//
+	// The checkpoint write and the waiting-status transition go in ONE storage
+	// transaction (SaveCheckpointAndMarkWaiting): a crash between them used to
+	// leave the job 'running' with the deadline checkpoint already written, so
+	// only the stale-lock reaper recovered it and the timer fired late. On replay
+	// (has) the checkpoint is already durable, so cp=nil and only the status
+	// transition runs.
+	var suspendCP *core.Checkpoint
 	if !has {
-		if err := writeCheckpointObj(ctx, jc, idx, ctype, tc); err != nil {
+		suspendCP, err = buildCheckpointObj(jc, idx, ctype, tc)
+		if err != nil {
 			return zero, false, err
 		}
 	}
 	remaining := max(time.Until(time.Unix(0, tc.DeadlineUnixNano)), 0)
-	if err := ss.MarkWaitingWithDeadline(ctx, jc.Job.ID, jc.WorkerID, remaining); err != nil {
+	if err := ss.SaveCheckpointAndMarkWaiting(ctx, suspendCP, jc.Job.ID, jc.WorkerID, remaining); err != nil {
 		return zero, false, fmt.Errorf("signal: suspend: %w", err)
 	}
 	return zero, false, &WaitingError{Name: name}
@@ -380,11 +396,12 @@ func sleepUntil(ctx context.Context, deadline time.Time, immediate bool) error {
 	} else {
 		sc.DeadlineUnixNano = deadline.UnixNano()
 		sc.Resolved = immediate
+		// Immediate (non-positive duration / past deadline): record the resolved
+		// checkpoint and return WITHOUT suspending. The unresolved first-exec
+		// checkpoint is NOT written here; it is written atomically with the
+		// waiting-status transition at the suspend point below.
 		if sc.Resolved {
 			return writeCheckpointObj(ctx, jc, idx, ctype, sc)
-		}
-		if err := writeCheckpointObj(ctx, jc, idx, ctype, sc); err != nil {
-			return err
 		}
 	}
 
@@ -397,8 +414,22 @@ func sleepUntil(ctx context.Context, deadline time.Time, immediate bool) error {
 		return writeCheckpointObj(ctx, jc, idx, ctype, sc)
 	}
 
+	// Suspend until the deadline. The (unresolved) checkpoint write and the
+	// waiting-status transition go in ONE storage transaction
+	// (SaveCheckpointAndMarkWaiting): a crash between them used to leave the job
+	// 'running' with the sleep checkpoint already written, so only the stale-lock
+	// reaper recovered it and the timer fired late. On first execution (!has) the
+	// checkpoint is built and persisted in that tx; on replay (has) it is already
+	// durable, so cp=nil and only the status transition runs.
+	var suspendCP *core.Checkpoint
+	if !has {
+		suspendCP, err = buildCheckpointObj(jc, idx, ctype, sc)
+		if err != nil {
+			return err
+		}
+	}
 	remaining := max(time.Until(time.Unix(0, sc.DeadlineUnixNano)), 0)
-	if err := ss.MarkWaitingWithDeadline(ctx, jc.Job.ID, jc.WorkerID, remaining); err != nil {
+	if err := ss.SaveCheckpointAndMarkWaiting(ctx, suspendCP, jc.Job.ID, jc.WorkerID, remaining); err != nil {
 		return fmt.Errorf("signal: sleep suspend: %w", err)
 	}
 	return &WaitingError{Name: SleepCheckpointType}
@@ -524,4 +555,22 @@ func writeCheckpointObj(ctx context.Context, jc *intctx.JobContext, idx int, cty
 		return fmt.Errorf("signal: marshal checkpoint: %w", err)
 	}
 	return writeCheckpoint(ctx, jc, idx, ctype, data)
+}
+
+// buildCheckpointObj marshals v into a *core.Checkpoint for (jc, idx, ctype),
+// mirroring the Result encoding that writeCheckpointObj/writeCheckpoint use. It
+// is used by the atomic suspend paths to hand the checkpoint to
+// SaveCheckpointAndMarkWaiting instead of writing it in a separate transaction.
+func buildCheckpointObj(jc *intctx.JobContext, idx int, ctype string, v any) (*core.Checkpoint, error) {
+	data, err := json.Marshal(v)
+	if err != nil {
+		return nil, fmt.Errorf("signal: marshal checkpoint: %w", err)
+	}
+	return &core.Checkpoint{
+		ID:        core.NewID(),
+		JobID:     jc.Job.ID,
+		CallIndex: idx,
+		CallType:  ctype,
+		Result:    data,
+	}, nil
 }

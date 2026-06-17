@@ -279,6 +279,137 @@ func TestMarkWaitingWithDeadline_NonRunningOwnedJobReturnsErrJobNotOwned(t *test
 	assert.Nil(t, after.RunAt)
 }
 
+// claimRunningJob enqueues a fresh job and dequeues it as workerID so it is
+// running+owned — the precondition for MarkWaitingWithDeadline /
+// SaveCheckpointAndMarkWaiting to succeed.
+func claimRunningJob(t *testing.T, ctx context.Context, s *GormStorage, workerID string) *core.Job {
+	t.Helper()
+	job := newTestJob("default", "signal.wait")
+	require.NoError(t, s.Enqueue(ctx, job))
+	got, err := s.Dequeue(ctx, []string{"default"}, workerID)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	require.Equal(t, core.StatusRunning, got.Status)
+	return got
+}
+
+// sleepCheckpointType is the on-disk CallType the durable-timer suspend writes
+// (pkg/signal.SleepCheckpointType). Duplicated as a literal here because storage
+// must not import pkg/signal (that would be an import cycle); the storage method
+// treats CallType as opaque, so any valid value exercises it.
+const sleepCheckpointType = "_sleep"
+
+func suspendCheckpoint(jobID core.UUID) *core.Checkpoint {
+	return &core.Checkpoint{
+		JobID:     jobID,
+		CallIndex: 0,
+		CallType:  sleepCheckpointType,
+		Result:    []byte(`{"deadline":1,"resolved":false}`),
+	}
+}
+
+// SaveCheckpointAndMarkWaiting on a running+owned job must, in one tx, write the
+// checkpoint AND advance the job to waiting with a future run_at — closing the
+// torn-write window where a crash between the two left the job running with the
+// checkpoint already committed (timer fires late, only the reaper recovers it).
+func TestSaveCheckpointAndMarkWaiting_AtomicCheckpointAndWaiting(t *testing.T) {
+	s := newTestStorage(t)
+	ctx := context.Background()
+
+	got := claimRunningJob(t, ctx, s, "w1")
+	cp := suspendCheckpoint(got.ID)
+
+	require.NoError(t, s.SaveCheckpointAndMarkWaiting(ctx, cp, got.ID, "w1", time.Minute))
+
+	after, err := s.GetJob(ctx, got.ID)
+	require.NoError(t, err)
+	require.NotNil(t, after)
+	assert.Equal(t, core.StatusWaiting, after.Status, "job advanced to waiting in the same tx")
+	assert.Empty(t, after.LockedBy)
+	assert.Nil(t, after.LockedUntil)
+	require.NotNil(t, after.RunAt)
+	assert.True(t, after.RunAt.After(time.Now()), "wake deadline in the future")
+
+	cps, err := s.GetCheckpoints(ctx, got.ID)
+	require.NoError(t, err)
+	require.Len(t, cps, 1, "checkpoint committed with the status transition")
+	assert.Equal(t, sleepCheckpointType, cps[0].CallType)
+}
+
+// A nil cp means "checkpoint already durable (a replay); just mark waiting" — no
+// checkpoint is written, only the status transition runs.
+func TestSaveCheckpointAndMarkWaiting_NilCheckpointOnlyMarksWaiting(t *testing.T) {
+	s := newTestStorage(t)
+	ctx := context.Background()
+
+	got := claimRunningJob(t, ctx, s, "w1")
+
+	require.NoError(t, s.SaveCheckpointAndMarkWaiting(ctx, nil, got.ID, "w1", time.Minute))
+
+	after, err := s.GetJob(ctx, got.ID)
+	require.NoError(t, err)
+	require.NotNil(t, after)
+	assert.Equal(t, core.StatusWaiting, after.Status)
+	require.NotNil(t, after.RunAt)
+	assert.True(t, after.RunAt.After(time.Now()))
+
+	cps, err := s.GetCheckpoints(ctx, got.ID)
+	require.NoError(t, err)
+	assert.Empty(t, cps, "nil cp writes no checkpoint")
+}
+
+// When ownership has been lost the status update affects 0 rows: the method must
+// return ErrJobNotOwned AND roll back the checkpoint write, so a checkpoint is
+// never left without its matching waiting status.
+func TestSaveCheckpointAndMarkWaiting_NotOwnedRollsBackCheckpoint(t *testing.T) {
+	s := newTestStorage(t)
+	ctx := context.Background()
+
+	got := claimRunningJob(t, ctx, s, "w1")
+	cp := suspendCheckpoint(got.ID)
+
+	// Wrong worker: the running row is owned by w1, not w2, so the status update
+	// matches 0 rows and the whole tx (including the checkpoint) must roll back.
+	err := s.SaveCheckpointAndMarkWaiting(ctx, cp, got.ID, "w2", time.Minute)
+	require.ErrorIs(t, err, core.ErrJobNotOwned)
+
+	after, err := s.GetJob(ctx, got.ID)
+	require.NoError(t, err)
+	require.NotNil(t, after)
+	assert.Equal(t, core.StatusRunning, after.Status, "job stays running when ownership check fails")
+	assert.Equal(t, "w1", after.LockedBy, "still owned by the original worker")
+
+	cps, err := s.GetCheckpoints(ctx, got.ID)
+	require.NoError(t, err)
+	assert.Empty(t, cps, "checkpoint rolled back with the failed status transition")
+}
+
+// Same rollback guarantee when the job is no longer running (e.g. completed):
+// no checkpoint may be persisted.
+func TestSaveCheckpointAndMarkWaiting_NonRunningRollsBackCheckpoint(t *testing.T) {
+	s := newTestStorage(t)
+	ctx := context.Background()
+
+	got := claimRunningJob(t, ctx, s, "w1")
+	require.NoError(t, s.db.WithContext(ctx).
+		Model(&core.Job{}).
+		Where("id = ?", got.ID).
+		Update("status", core.StatusCompleted).Error)
+
+	cp := suspendCheckpoint(got.ID)
+	err := s.SaveCheckpointAndMarkWaiting(ctx, cp, got.ID, "w1", time.Minute)
+	require.ErrorIs(t, err, core.ErrJobNotOwned)
+
+	after, err := s.GetJob(ctx, got.ID)
+	require.NoError(t, err)
+	require.NotNil(t, after)
+	assert.Equal(t, core.StatusCompleted, after.Status, "non-running job untouched")
+
+	cps, err := s.GetCheckpoints(ctx, got.ID)
+	require.NoError(t, err)
+	assert.Empty(t, cps, "checkpoint not persisted for a non-running job")
+}
+
 func TestGetPendingSignalName(t *testing.T) {
 	s := newTestStorage(t)
 	ctx := context.Background()

@@ -329,13 +329,31 @@ func (s *GormStorage) DeleteConsumedSignalsOlderThan(ctx context.Context, age ti
 // skew that would otherwise make the timeout fire early or late. SQLite is
 // single-clock, so it uses the caller's time.
 func (s *GormStorage) MarkWaitingWithDeadline(ctx context.Context, jobID core.UUID, workerID string, d time.Duration) error {
+	rowsAffected, err := s.markWaitingWithDeadlineTx(s.db.WithContext(ctx), jobID, workerID, d)
+	if err != nil {
+		return err
+	}
+	if rowsAffected == 0 {
+		return core.ErrJobNotOwned
+	}
+	return nil
+}
+
+// markWaitingWithDeadlineTx performs the StatusRunning->StatusWaiting transition
+// with a wake deadline on the caller-supplied handle (a *gorm.DB that may be a
+// transaction). It returns the rows affected so the caller can map 0 ->
+// core.ErrJobNotOwned and, inside a transaction, roll back any sibling writes
+// (e.g. a just-written checkpoint) when ownership was lost. run_at is computed on
+// the DB clock (offsetExpr) on multi-worker backends and the caller's clock on
+// SQLite, exactly as MarkWaitingWithDeadline documents.
+func (s *GormStorage) markWaitingWithDeadlineTx(tx *gorm.DB, jobID core.UUID, workerID string, d time.Duration) (int64, error) {
 	var runAt any
 	if s.useDBClock() {
 		runAt = s.offsetExpr(d)
 	} else {
 		runAt = time.Now().Add(d)
 	}
-	result := s.db.WithContext(ctx).
+	result := tx.
 		Model(&core.Job{}).
 		Where("id = ? AND locked_by = ? AND status = ?", jobID, workerID, core.StatusRunning).
 		Updates(map[string]any{
@@ -346,12 +364,48 @@ func (s *GormStorage) MarkWaitingWithDeadline(ctx context.Context, jobID core.UU
 			"updated_at":   time.Now(),
 		})
 	if result.Error != nil {
-		return result.Error
+		return 0, result.Error
 	}
-	if result.RowsAffected == 0 {
-		return core.ErrJobNotOwned
-	}
-	return nil
+	return result.RowsAffected, nil
+}
+
+// SaveCheckpointAndMarkWaiting atomically persists a replay checkpoint (when
+// cp != nil) AND advances an owned running job into StatusWaiting with a wake
+// deadline at (now + d), in ONE transaction. The combined write closes the
+// torn-write window that the old separate writeCheckpoint -> MarkWaitingWithDeadline
+// pair left open: a crash between the two committed the checkpoint but left the
+// job 'running', so only the stale-lock reaper recovered it and the timer fired
+// late by up to the lock TTL.
+//
+// When ownership has been lost (the row is not running+owned-by-workerID) the
+// status update affects 0 rows; this method then returns core.ErrJobNotOwned and
+// the transaction rolls back, so the checkpoint is NOT persisted either —
+// checkpoint and status stay consistent (never a checkpoint without the matching
+// waiting status).
+//
+// A nil cp means "the checkpoint was already persisted on a prior replay; just
+// mark waiting atomically" — no checkpoint write is attempted. The whole tx runs
+// under withSerializationRetry so a 40001/1213 retry re-runs both writes together.
+func (s *GormStorage) SaveCheckpointAndMarkWaiting(ctx context.Context, cp *core.Checkpoint, jobID core.UUID, workerID string, d time.Duration) error {
+	return s.withSerializationRetry(ctx, func() error {
+		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			if cp != nil {
+				if err := s.SaveCheckpointTx(ctx, tx, cp); err != nil {
+					return err
+				}
+			}
+			rowsAffected, err := s.markWaitingWithDeadlineTx(tx, jobID, workerID, d)
+			if err != nil {
+				return err
+			}
+			if rowsAffected == 0 {
+				// Ownership lost: return the sentinel so the checkpoint write
+				// (if any) rolls back with the failed status transition.
+				return core.ErrJobNotOwned
+			}
+			return nil
+		})
+	})
 }
 
 // GetSignalWaitingJobsToResume finds waiting jobs that should be resumed for a
