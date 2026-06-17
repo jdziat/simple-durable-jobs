@@ -75,3 +75,20 @@ func TestBoundRateLimitName(t *testing.T) {
 	assert.NotEqual(t, boundRateLimitName(long), boundRateLimitName(long+"y"),
 		"distinct over-long keys must bucket distinctly")
 }
+
+// TestTryConsumeRateLimits_PanickingKeyBouncesWithoutCrash covers the panic-safety
+// parity the P4 gate flagged: a panicking RateLimitKey must bounce the job, not
+// crash the worker on the dispatch goroutine (same class as the CapKey fix).
+func TestTryConsumeRateLimits_PanickingKeyBouncesWithoutCrash(t *testing.T) {
+	db := newInMemoryDB(t)
+	store := storage.NewGormStorage(db)
+	require.NoError(t, store.Migrate(context.Background()))
+	q := queue.New(store)
+	w := NewWorker(q, DisableRetry(),
+		RateLimit("A", 100, RateLimitKey(func(*core.Job) string { panic("rate key boom") })))
+	job := &core.Job{ID: core.NewID(), Type: "t", Queue: "default"}
+
+	ok, reason := w.tryConsumeRateLimits(context.Background(), job)
+	assert.False(t, ok, "a panicking RateLimitKey must bounce the job, not crash the worker")
+	assert.Equal(t, bounceFleetRate, reason)
+}

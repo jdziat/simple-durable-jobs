@@ -226,22 +226,40 @@ func (q *Queue) EnqueueScheduledFire(ctx context.Context, scheduleName string, f
 	dbp, dbOK := q.storage.(interface{ DB() *gorm.DB })
 
 	if claimerOK && enqOK && dbOK {
-		txErr := dbp.DB().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-			won, e := txClaimer.ClaimScheduledFireTx(ctx, tx, scheduleName, fireTime)
-			if e != nil {
-				return e
-			}
-			claimed = won
-			if !claimed {
+		// The in-tx unique-key dedup (EnqueueUniqueTx/EnqueueWithUniqueLockTx) can
+		// hit a MySQL gap-lock deadlock (1213) / serialization failure, which the
+		// non-tx fallback (q.Enqueue) retried internally. Wrap the whole claim+enqueue
+		// in the storage's serialization-retry so a scheduled fire of a Unique/
+		// IdempotencyKey schedule under contention is retried rather than failing the
+		// tick. claimed/id are reset per attempt so a rolled-back attempt never leaks.
+		runTx := func() error {
+			claimed = false
+			id = core.NilUUID
+			return dbp.DB().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+				won, e := txClaimer.ClaimScheduledFireTx(ctx, tx, scheduleName, fireTime)
+				if e != nil {
+					return e
+				}
+				claimed = won
+				if !claimed {
+					return nil
+				}
+				jid, e := q.EnqueueTx(ctx, tx, jobName, args, opts...)
+				if e != nil {
+					return e // rolls back the claim so the boundary stays re-claimable
+				}
+				id = jid
 				return nil
-			}
-			jid, e := q.EnqueueTx(ctx, tx, jobName, args, opts...)
-			if e != nil {
-				return e // rolls back the claim so the boundary stays re-claimable
-			}
-			id = jid
-			return nil
-		})
+			})
+		}
+		var txErr error
+		if retrier, ok := q.storage.(interface {
+			WithSerializationRetry(context.Context, func() error) error
+		}); ok {
+			txErr = retrier.WithSerializationRetry(ctx, runTx)
+		} else {
+			txErr = runTx()
+		}
 		if txErr != nil {
 			return false, core.NilUUID, txErr
 		}

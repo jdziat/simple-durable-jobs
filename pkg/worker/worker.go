@@ -1169,14 +1169,29 @@ func (w *Worker) capSlotName(cap ConcurrencyCapConfig, job *core.Job) (name stri
 	return cap.Name + ":" + cap.Key(job), true
 }
 
-func (w *Worker) rateLimitName(limit RateLimitConfig, job *core.Job) string {
-	name := limit.Name
+func (w *Worker) rateLimitName(limit RateLimitConfig, job *core.Job) (name string, ok bool) {
+	ok = true
+	// Recover a panicking user RateLimitKey (parity with capSlotName): a panic
+	// here would otherwise crash the worker on the dispatch goroutine. Treat it as
+	// a derivation failure so the caller bounces the job instead.
+	defer func() {
+		if r := recover(); r != nil {
+			w.logger.Error("rate-limit key panicked; releasing dequeued job",
+				"job_id", job.ID,
+				"limit", limit.Name,
+				"panic", r,
+				"stack", string(debug.Stack()))
+			name = ""
+			ok = false
+		}
+	}()
+	n := limit.Name
 	if limit.Key != nil {
-		name = limit.Name + ":" + limit.Key(job)
+		n = limit.Name + ":" + limit.Key(job)
 	}
 	// Bound the effective name to the limit_name column width: an unbounded
 	// RateLimitKey would otherwise overflow it and hot-loop the job (teardown g4).
-	return boundRateLimitName(name)
+	return boundRateLimitName(n), true
 }
 
 // tryConsumeRateLimits returns (allowed, reason). reason is meaningful only when
@@ -1219,7 +1234,11 @@ func (w *Worker) tryConsumeRateLimits(ctx context.Context, job *core.Job) (bool,
 			continue
 		}
 		window := w.resolveRateLimitWindow(limit)
-		limitName := w.rateLimitName(limit, job)
+		limitName, nameOK := w.rateLimitName(limit, job)
+		if !nameOK {
+			refund()
+			return false, bounceFleetRate
+		}
 		// cto-F2 per-key cooldown (KEYED limits only — the gap v1 left): if this
 		// exact bucket was denied by the DB this window, skip the locked
 		// TryConsumeRate transaction and bounce — the DB fixed window would only
