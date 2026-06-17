@@ -344,7 +344,7 @@ func applyJobSearch(s *GormStorage, q *gorm.DB, rawSearch string) *gorm.DB {
 // be safely LIKE-searched. True only for the identity (non-encrypting) codec; an
 // encrypting codec stores non-UTF8 ciphertext that breaks text search.
 func (s *GormStorage) argsSearchable() bool {
-	return s.codec == nil || s.codec == core.IdentityCodec
+	return s.codecIsIdentity()
 }
 
 func argsTextExpression(s *GormStorage) string {
