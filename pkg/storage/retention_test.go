@@ -306,6 +306,38 @@ func TestCleanAbandonedFanOuts_Guards(t *testing.T) {
 	assertRetentionFanOutExists(t, s, "guard-completed-fanout")
 }
 
+func TestDeleteTerminalJobsOlderThan_DeletesDanglingUniqueLock(t *testing.T) {
+	s := newTestStorage(t)
+	ctx := context.Background()
+	scope := "4444444444444444444444444444444444444444444444444444444444444444"
+
+	// Enqueue a job under a live unique lock, then drive it terminal and age it
+	// past the retention cutoff so it gets collected.
+	job := &core.Job{ID: core.NewID(), Type: "work", Queue: "default", Args: []byte(`{"n":1}`)}
+	jobID, err := s.EnqueueWithUniqueLock(ctx, job, scope, time.Hour)
+	require.NoError(t, err)
+	require.Equal(t, job.ID, jobID)
+
+	old := time.Now().Add(-2 * time.Hour).UTC()
+	require.NoError(t, s.db.WithContext(ctx).Model(&core.Job{}).
+		Where("id = ?", job.ID).
+		Updates(map[string]any{"status": core.StatusCompleted, "completed_at": old}).Error)
+
+	var lockBefore int64
+	require.NoError(t, s.db.WithContext(ctx).Model(&core.UniqueLock{}).
+		Where("job_id = ?", job.ID).Count(&lockBefore).Error)
+	require.EqualValues(t, 1, lockBefore, "lock should exist before retention")
+
+	deleted, err := s.DeleteTerminalJobsOlderThan(ctx, core.StatusCompleted, time.Hour, 100)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), deleted)
+
+	var lockAfter int64
+	require.NoError(t, s.db.WithContext(ctx).Model(&core.UniqueLock{}).
+		Where("job_id = ?", job.ID).Count(&lockAfter).Error)
+	assert.EqualValues(t, 0, lockAfter, "retention must delete the dangling unique_lock")
+}
+
 func TestDeleteConsumedSignalsOlderThan_PrunesOnlyConsumedOlderThanWindow(t *testing.T) {
 	s := newTestStorage(t)
 	ctx := context.Background()

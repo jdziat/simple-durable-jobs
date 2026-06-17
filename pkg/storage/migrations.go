@@ -316,6 +316,11 @@ var schemaMigrations = []schemaMigration{
 		Name:    "identifier_columns_collation_as_cs",
 		Up:      migrateIdentifierColumnsCollationAsCS,
 	},
+	{
+		Version: 34,
+		Name:    "unique_locks_job_id_index",
+		Up:      migrateUniqueLocksJobIDIndex,
+	},
 }
 
 // applyPreMigrations runs every registered pre-AutoMigrate one-shot through a
@@ -1618,6 +1623,29 @@ func migrateIdentifierColumnsCollationAsCS(ctx context.Context, db *gorm.DB, dia
 		}
 	}
 	return nil
+}
+
+// migrateUniqueLocksJobIDIndex adds a secondary index on unique_locks(job_id).
+// The PK is scope_hash, so retention's job_id-scoped cleanup and the
+// steal-on-terminal acquire path would otherwise full-scan the table. Created
+// idempotently and cross-dialect, mirroring idx_unique_locks_expires_at.
+func migrateUniqueLocksJobIDIndex(ctx context.Context, db *gorm.DB, dialect string) error {
+	switch dialect {
+	case dialectMySQL:
+		m := db.Migrator()
+		if !m.HasIndex(&core.UniqueLock{}, "idx_unique_locks_job_id") {
+			if err := db.WithContext(ctx).Exec(
+				"CREATE INDEX idx_unique_locks_job_id ON unique_locks (job_id)",
+			).Error; err != nil && !isBenignDDLError(err) {
+				return fmt.Errorf("create idx_unique_locks_job_id: %w", err)
+			}
+		}
+		return nil
+	default:
+		return db.WithContext(ctx).Exec(
+			"CREATE INDEX IF NOT EXISTS idx_unique_locks_job_id ON unique_locks (job_id)",
+		).Error
+	}
 }
 
 func migrateDropRedundantSignalIndex(ctx context.Context, db *gorm.DB, dialect string) error {
