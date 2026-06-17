@@ -311,6 +311,11 @@ var schemaMigrations = []schemaMigration{
 		Name:    "dqready_column_index",
 		Up:      migrateDQReadyColumnIndex,
 	},
+	{
+		Version: 33,
+		Name:    "identifier_columns_collation_as_cs",
+		Up:      migrateIdentifierColumnsCollationAsCS,
+	},
 }
 
 // applyPreMigrations runs every registered pre-AutoMigrate one-shot through a
@@ -1571,6 +1576,46 @@ func migrateQueueStatesQueueCollation(ctx context.Context, db *gorm.DB, dialect 
 		"ALTER TABLE queue_states MODIFY queue varchar(255) COLLATE utf8mb4_0900_as_cs NOT NULL",
 	).Error; err != nil && !isBenignDDLError(err) {
 		return fmt.Errorf("modify queue_states.queue collation: %w", err)
+	}
+	return nil
+}
+
+func migrateIdentifierColumnsCollationAsCS(ctx context.Context, db *gorm.DB, dialect string) error {
+	if dialect != dialectMySQL {
+		return nil
+	}
+
+	const collation = "utf8mb4_0900_as_cs"
+	columns := []struct {
+		table string
+		name  string
+		size  int
+	}{
+		{table: "checkpoints", name: "call_type", size: 255},
+		{table: "concurrency_slots", name: "slot_name", size: 255},
+		{table: "rate_limit_windows", name: "limit_name", size: 255},
+		{table: "scheduled_fires", name: "name", size: 255},
+		{table: "unique_locks", name: "scope_hash", size: 64},
+		{table: "signals", name: "name", size: 255},
+	}
+	for _, column := range columns {
+		currentCollation, err := mysqlColumnCollationForTable(ctx, db, column.table, column.name)
+		if err != nil {
+			return fmt.Errorf("read %s.%s collation: %w", column.table, column.name, err)
+		}
+		if currentCollation == collation {
+			continue
+		}
+		if err := db.WithContext(ctx).Exec(
+			fmt.Sprintf(
+				"ALTER TABLE %s MODIFY %s VARCHAR(%d) COLLATE utf8mb4_0900_as_cs NOT NULL",
+				column.table,
+				column.name,
+				column.size,
+			),
+		).Error; err != nil && !isBenignDDLError(err) {
+			return fmt.Errorf("modify %s.%s collation: %w", column.table, column.name, err)
+		}
 	}
 	return nil
 }
