@@ -500,6 +500,13 @@ func cloneOptionsMetadata(m *core.MetadataMap) map[string]string {
 // and enqueue middleware runs once per entry before persistence. Returned IDs
 // match input order. When Unique keys collide, storage deduplicates silently;
 // a returned ID for a deduped entry refers to the existing job.
+//
+// Note: the in-batch Unique dedup (collapsing two entries in this call that share
+// a key) is computed from each job's UniqueKey BEFORE enqueue middleware runs, so
+// a middleware that rewrites UniqueKey is not reflected in that in-slice
+// collapse. Enqueue middleware on the batch path must therefore not depend on
+// rewriting UniqueKey for dedup; the storage-level unique constraint still
+// applies to the final key.
 func (q *Queue) EnqueueBatch(ctx context.Context, entries []BatchEntry) ([]core.UUID, error) {
 	return q.enqueueBatch(ctx, entries, q.storage.EnqueueBatch)
 }
