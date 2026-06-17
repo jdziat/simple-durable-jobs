@@ -45,6 +45,7 @@ type Queue struct {
 	onComplete []func(context.Context, *core.Job)
 	onFail     []func(context.Context, *core.Job, error)
 	onRetry    []func(context.Context, *core.Job, int, error)
+	onWaiting  []func(context.Context, *core.Job)
 	onReclaim  []func(context.Context, core.UUID, string)
 
 	// Enqueue middleware chain
@@ -886,6 +887,17 @@ func (q *Queue) OnRetry(fn func(context.Context, *core.Job, int, error)) {
 	q.mu.Unlock()
 }
 
+// OnJobWaiting registers a callback for when a job self-suspends into
+// StatusWaiting (a fan-out or signal wait) and the handler yields. The attempt
+// is not failing or completing — it is parked until a resume re-dispatches it as
+// a fresh attempt. Observability integrations use this to close the per-attempt
+// span that would otherwise leak (it is neither completed nor failed).
+func (q *Queue) OnJobWaiting(fn func(context.Context, *core.Job)) {
+	q.mu.Lock()
+	q.onWaiting = append(q.onWaiting, fn)
+	q.mu.Unlock()
+}
+
 // OnJobReclaimed registers a callback for when a job lease is reclaimed from a
 // presumed-dead owner (stale-lock reaper) or observed reclaimed by a peer
 // (ownership audit). The callback receives the job ID and the reclaim reason
@@ -1019,6 +1031,18 @@ func (q *Queue) CallRetryHooks(ctx context.Context, job *core.Job, attempt int, 
 
 	for _, fn := range hooks {
 		fn(ctx, job, attempt, err)
+	}
+}
+
+// CallWaitingHooks calls all registered waiting hooks.
+func (q *Queue) CallWaitingHooks(ctx context.Context, job *core.Job) {
+	q.mu.RLock()
+	hooks := make([]func(context.Context, *core.Job), len(q.onWaiting))
+	copy(hooks, q.onWaiting)
+	q.mu.RUnlock()
+
+	for _, fn := range hooks {
+		fn(ctx, job)
 	}
 }
 

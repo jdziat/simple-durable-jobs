@@ -148,15 +148,39 @@ func (s *GormStorage) decodeJobListPayloads(jobs []*core.Job) error {
 }
 
 func (s *GormStorage) encodedCheckpointForSave(cp *core.Checkpoint) (*core.Checkpoint, error) {
-	encoded, err := s.encodePayload("checkpoint result", string(cp.ID), cp.Result)
+	// Result is binary (codec.Encode output) and rides the bytes column.
+	encodedResult, err := s.encodePayload("checkpoint result", string(cp.ID), cp.Result)
 	if err != nil {
 		return nil, err
 	}
-	if len(cp.Result) == 0 || bytes.Equal(encoded, cp.Result) {
+	resultChanged := len(cp.Result) != 0 && !bytes.Equal(encodedResult, cp.Result)
+
+	// Error / ErrorCause carry handler error text in TEXT columns, so they use the
+	// base64-tagged encodeErrorText path (same as job last_error/dead_letter_reason),
+	// not encodePayload. ErrorKind stays cleartext: it is a non-sensitive
+	// discriminator (no_retry/retry_after/sentinel-key) that rehydration relies on.
+	encodedErr, err := s.encodeErrorText("checkpoint error", string(cp.ID), cp.Error)
+	if err != nil {
+		return nil, err
+	}
+	encodedErrCause, err := s.encodeErrorText("checkpoint error_cause", string(cp.ID), cp.ErrorCause)
+	if err != nil {
+		return nil, err
+	}
+	errChanged := encodedErr != cp.Error
+	errCauseChanged := encodedErrCause != cp.ErrorCause
+
+	// Preserve the no-op-when-unchanged optimization: only allocate the out copy
+	// if at least one field actually changed under the codec.
+	if !resultChanged && !errChanged && !errCauseChanged {
 		return cp, nil
 	}
 	out := *cp
-	out.Result = encoded
+	if resultChanged {
+		out.Result = encodedResult
+	}
+	out.Error = encodedErr
+	out.ErrorCause = encodedErrCause
 	return &out, nil
 }
 
@@ -166,7 +190,17 @@ func (s *GormStorage) decodeCheckpointPayloads(cps []core.Checkpoint) error {
 		if err != nil {
 			return err
 		}
+		errText, err := s.decodeErrorText("checkpoint error", string(cps[i].ID), cps[i].Error)
+		if err != nil {
+			return err
+		}
+		errCause, err := s.decodeErrorText("checkpoint error_cause", string(cps[i].ID), cps[i].ErrorCause)
+		if err != nil {
+			return err
+		}
 		cps[i].Result = result
+		cps[i].Error = errText
+		cps[i].ErrorCause = errCause
 	}
 	return nil
 }

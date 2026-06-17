@@ -1669,6 +1669,12 @@ func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 		// (fan-out or signal wait) and returned. Not a failure: just stop.
 		if core.IsWaiting(err) {
 			w.logger.Info("job waiting", "job_id", job.ID)
+			// End the per-attempt span (OTel) before returning. Unlike
+			// complete/fail, a parked attempt fires neither hook, so without this
+			// its span would leak (never exported) until the resume starts a new
+			// attempt with a fresh span. Use jobCtx — it carries the span injected
+			// by CallStartCtxHooks, same as the complete/fail hooks below.
+			w.queue.CallWaitingHooks(jobCtx, job)
 			cancelHeartbeat()
 			// Job is already in StatusWaiting; just return
 			return

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -21,6 +22,7 @@ import (
 
 	"github.com/jdziat/simple-durable-jobs/v3/pkg/core"
 	"github.com/jdziat/simple-durable-jobs/v3/pkg/queue"
+	"github.com/jdziat/simple-durable-jobs/v3/pkg/signal"
 	"github.com/jdziat/simple-durable-jobs/v3/pkg/storage"
 	"github.com/jdziat/simple-durable-jobs/v3/pkg/worker"
 )
@@ -291,9 +293,11 @@ func TestRetryHook_AddsRetryEvent(t *testing.T) {
 
 	hook := retryHook()
 	retryErr := errors.New("temporary failure")
+	// The hook itself ends the span — no manual span.End() here, which is what
+	// proves the retrying attempt's span is not leaked.
 	hook(ctx, &core.Job{ID: "job-3"}, 2, retryErr)
 
-	span.End()
+	_ = span // span ended by the hook
 	_ = tp.ForceFlush(context.Background())
 	spans := exporter.GetSpans()
 
@@ -304,13 +308,90 @@ func TestRetryHook_AddsRetryEvent(t *testing.T) {
 			break
 		}
 	}
-	require.NotNil(t, processSpan)
+	require.NotNil(t, processSpan, "retry hook must end the span so it is exported (no leak)")
 	require.Len(t, processSpan.Events, 1)
 	assert.Equal(t, "job.retry", processSpan.Events[0].Name)
 
 	eventAttrs := spanAttrMap(processSpan.Events[0].Attributes)
 	assert.Equal(t, "2", eventAttrs["job.attempt"])
 	assert.Equal(t, "temporary failure", eventAttrs["job.error"])
+
+	// The retrying attempt is recorded as an error disposition.
+	assert.Equal(t, codes.Error, processSpan.Status.Code)
+	assert.Contains(t, processSpan.Status.Description, "temporary failure")
+}
+
+func TestRetryHook_EndsRecordingSpan(t *testing.T) {
+	recorder := tracetest.NewSpanRecorder()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(recorder))
+	defer func() { _ = tp.Shutdown(context.Background()) }()
+
+	tracer := tp.Tracer(instrumentationName)
+	ctx, _ := tracer.Start(context.Background(), "job.process flapping-job")
+
+	retryHook()(ctx, &core.Job{ID: "job-retry"}, 1, errors.New("flap"))
+
+	ended := recorder.Ended()
+	require.Len(t, ended, 1, "retry hook must end exactly one span")
+	assert.Equal(t, "job.process flapping-job", ended[0].Name())
+	assert.False(t, ended[0].EndTime().IsZero(), "span must be ended, not leaked")
+}
+
+func TestWaitingHook_EndsSpan(t *testing.T) {
+	tp, exporter := setupTracer()
+	defer func() { _ = tp.Shutdown(context.Background()) }()
+
+	tracer := tp.Tracer(instrumentationName)
+	ctx, _ := tracer.Start(context.Background(), "job.process waiting-job")
+
+	// The hook ends the span; no manual span.End().
+	waitingHook()(ctx, &core.Job{ID: "job-wait"})
+
+	_ = tp.ForceFlush(context.Background())
+	spans := exporter.GetSpans()
+
+	var processSpan *tracetest.SpanStub
+	for i := range spans {
+		if spans[i].Name == "job.process waiting-job" {
+			processSpan = &spans[i]
+			break
+		}
+	}
+	require.NotNil(t, processSpan, "waiting hook must end the span so it is exported (no leak)")
+	require.Len(t, processSpan.Events, 1)
+	assert.Equal(t, "job.waiting", processSpan.Events[0].Name)
+
+	// Waiting is neither success nor failure: status stays Unset.
+	assert.Equal(t, codes.Unset, processSpan.Status.Code)
+	attrMap := spanAttrMap(processSpan.Attributes)
+	assert.Equal(t, "waiting", attrMap["job.disposition"])
+}
+
+func TestWaitingHook_EndsRecordingSpan(t *testing.T) {
+	recorder := tracetest.NewSpanRecorder()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(recorder))
+	defer func() { _ = tp.Shutdown(context.Background()) }()
+
+	tracer := tp.Tracer(instrumentationName)
+	ctx, _ := tracer.Start(context.Background(), "job.process parked-job")
+
+	waitingHook()(ctx, &core.Job{ID: "job-parked"})
+
+	ended := recorder.Ended()
+	require.Len(t, ended, 1, "waiting hook must end exactly one span")
+	assert.Equal(t, "job.process parked-job", ended[0].Name())
+	assert.False(t, ended[0].EndTime().IsZero(), "span must be ended, not leaked")
+}
+
+func TestWaitingHook_NonRecordingSpanNoPanic(t *testing.T) {
+	// A non-recording (no active span) context must be a safe no-op, mirroring
+	// the guard in the complete/fail hooks.
+	require.NotPanics(t, func() {
+		waitingHook()(context.Background(), &core.Job{ID: "job-none"})
+	})
+	require.NotPanics(t, func() {
+		retryHook()(context.Background(), &core.Job{ID: "job-none"}, 1, errors.New("x"))
+	})
 }
 
 func TestJobAttributes(t *testing.T) {
@@ -416,6 +497,88 @@ func TestInstrumentedWorkerEndsProcessSpanOnComplete(t *testing.T) {
 	require.NotNil(t, processSpan)
 	assert.Equal(t, codes.Ok, processSpan.Status().Code)
 	assert.False(t, processSpan.EndTime().IsZero())
+}
+
+func TestInstrumentedWorkerEndsProcessSpanOnWaiting(t *testing.T) {
+	recorder := tracetest.NewSpanRecorder()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(recorder))
+	defer func() { _ = tp.Shutdown(context.Background()) }()
+
+	db, err := gorm.Open(sqlite.Open("file:"+t.Name()+"?mode=memory&cache=shared"), &gorm.Config{
+		Logger: logger.Default.LogMode(logger.Silent),
+	})
+	require.NoError(t, err)
+	if sqlDB, dbErr := db.DB(); dbErr == nil {
+		defer func() { _ = sqlDB.Close() }()
+	}
+
+	store := storage.NewGormStorage(db)
+	require.NoError(t, store.Migrate(context.Background()))
+
+	q := queue.New(store)
+	Instrument(q,
+		WithTracerProvider(tp),
+		WithPropagator(propagation.TraceContext{}),
+	)
+
+	// The handler self-suspends by waiting on a signal that is never delivered,
+	// which returns a *signal.WaitingError. The worker leaves the job in
+	// StatusWaiting and must fire the waiting hook to end the per-attempt span.
+	waited := make(chan struct{})
+	var waitedOnce sync.Once
+	q.Register("otel-waiting-job", func(ctx context.Context, _ struct{}) error {
+		_, err := signal.WaitForSignal[string](ctx, "go")
+		waitedOnce.Do(func() { close(waited) })
+		return err
+	})
+
+	jobID, err := q.Enqueue(context.Background(), "otel-waiting-job", struct{}{})
+	require.NoError(t, err)
+
+	w := worker.NewWorker(q, worker.WithPollInterval(50*time.Millisecond))
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	workerDone := make(chan struct{})
+	go func() {
+		defer close(workerDone)
+		_ = w.Start(ctx)
+	}()
+	defer func() {
+		cancel()
+		<-workerDone
+	}()
+
+	select {
+	case <-waited:
+	case <-time.After(2 * time.Second):
+		t.Fatal("instrumented job did not reach the signal wait")
+	}
+
+	// The job must be parked in StatusWaiting and its span ended by the hook.
+	require.Eventually(t, func() bool {
+		status, statusErr := q.LoadStatus(context.Background(), jobID)
+		if statusErr != nil || status != core.StatusWaiting {
+			return false
+		}
+		for _, span := range recorder.Ended() {
+			if span.Name() == "job.process otel-waiting-job" && !span.EndTime().IsZero() {
+				return true
+			}
+		}
+		return false
+	}, 2*time.Second, 10*time.Millisecond, "worker waiting path must end the job.process span")
+
+	var processSpan sdktrace.ReadOnlySpan
+	for _, span := range recorder.Ended() {
+		if span.Name() == "job.process otel-waiting-job" {
+			processSpan = span
+			break
+		}
+	}
+	require.NotNil(t, processSpan)
+	assert.False(t, processSpan.EndTime().IsZero())
+	// Waiting is neither OK nor Error.
+	assert.Equal(t, codes.Unset, processSpan.Status().Code)
 }
 
 // spanAttrMap converts a slice of KeyValues into a string map for easy assertion.

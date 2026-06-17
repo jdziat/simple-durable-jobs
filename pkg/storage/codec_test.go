@@ -279,6 +279,123 @@ func TestGormStorageSecretboxBypassesTenantAndMetadata(t *testing.T) {
 	}
 }
 
+// g12: checkpoint Error / ErrorCause must be encrypted at rest under a
+// non-identity codec (they previously rode cleartext while job-level
+// last_error/dead_letter_reason were encrypted). ErrorKind stays cleartext (it
+// is a non-sensitive rehydration discriminator).
+func TestGormStorageCodecEncryptsCheckpointError(t *testing.T) {
+	for name, db := range openCodecTestDBs(t) {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			s := NewGormStorage(db, WithCodec(markerXORCodec{}))
+			require.NoError(t, s.Migrate(ctx))
+			t.Cleanup(func() { cleanupCodecExternalDB(t, db) })
+
+			job := &core.Job{Type: "codec.cp.error", Args: []byte(`{"n":1}`)}
+			require.NoError(t, s.Enqueue(ctx, job))
+
+			const (
+				errText  = "sensitive: connection refused to 10.0.0.5:5432"
+				causeTxt = "dial tcp 10.0.0.5:5432: connect: connection refused"
+				kindTxt  = core.CheckpointErrorKindRetryAfter
+			)
+			cp := &core.Checkpoint{
+				JobID:      job.ID,
+				CallIndex:  1,
+				CallType:   "activity",
+				Error:      errText,
+				ErrorCause: causeTxt,
+				ErrorKind:  kindTxt,
+			}
+			require.NoError(t, s.SaveCheckpoint(ctx, cp))
+
+			// Raw columns must NOT contain the plaintext (encrypted at rest), and
+			// must carry the errTextTag the encrypting path applies.
+			rawErr := rawCheckpointColumn(t, db, cp.ID, "error")
+			rawCause := rawCheckpointColumn(t, db, cp.ID, "error_cause")
+			rawKind := rawCheckpointColumn(t, db, cp.ID, "error_kind")
+			assert.NotEqual(t, errText, rawErr)
+			assert.NotContains(t, rawErr, "connection refused")
+			assert.Contains(t, rawErr, errTextTag)
+			assert.NotEqual(t, causeTxt, rawCause)
+			assert.NotContains(t, rawCause, "connect")
+			assert.Contains(t, rawCause, errTextTag)
+			// ErrorKind is a non-sensitive discriminator and stays cleartext.
+			assert.Equal(t, kindTxt, rawKind)
+
+			// Normal decode path round-trips to the original plaintext.
+			checkpoints, err := s.GetCheckpoints(ctx, job.ID)
+			require.NoError(t, err)
+			require.Len(t, checkpoints, 1)
+			assert.Equal(t, errText, checkpoints[0].Error)
+			assert.Equal(t, causeTxt, checkpoints[0].ErrorCause)
+			assert.Equal(t, kindTxt, checkpoints[0].ErrorKind)
+		})
+	}
+}
+
+// Identity codec must not corrupt or tag the checkpoint error fields: they
+// round-trip unchanged and are stored verbatim (no errTextTag).
+func TestGormStorageIdentityCodecCheckpointErrorVerbatim(t *testing.T) {
+	for name, db := range openCodecTestDBs(t) {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			s := NewGormStorage(db) // identity / default codec
+			require.NoError(t, s.Migrate(ctx))
+			t.Cleanup(func() { cleanupCodecExternalDB(t, db) })
+
+			job := &core.Job{Type: "codec.cp.identity", Args: []byte(`{"n":2}`)}
+			require.NoError(t, s.Enqueue(ctx, job))
+
+			const (
+				errText  = "plain error text"
+				causeTxt = "plain cause text"
+				kindTxt  = core.CheckpointErrorKindNoRetry
+			)
+			cp := &core.Checkpoint{
+				JobID:      job.ID,
+				CallIndex:  1,
+				CallType:   "activity",
+				Error:      errText,
+				ErrorCause: causeTxt,
+				ErrorKind:  kindTxt,
+			}
+			require.NoError(t, s.SaveCheckpoint(ctx, cp))
+
+			// Stored verbatim, no tag.
+			assert.Equal(t, errText, rawCheckpointColumn(t, db, cp.ID, "error"))
+			assert.Equal(t, causeTxt, rawCheckpointColumn(t, db, cp.ID, "error_cause"))
+			assert.NotContains(t, rawCheckpointColumn(t, db, cp.ID, "error"), errTextTag)
+
+			// Round-trips unchanged.
+			checkpoints, err := s.GetCheckpoints(ctx, job.ID)
+			require.NoError(t, err)
+			require.Len(t, checkpoints, 1)
+			assert.Equal(t, errText, checkpoints[0].Error)
+			assert.Equal(t, causeTxt, checkpoints[0].ErrorCause)
+			assert.Equal(t, kindTxt, checkpoints[0].ErrorKind)
+		})
+	}
+}
+
+func rawCheckpointColumn(t *testing.T, db *gorm.DB, checkpointID core.UUID, column string) string {
+	t.Helper()
+	query := ""
+	switch column {
+	case "error":
+		query = "SELECT error FROM checkpoints WHERE id = ?"
+	case "error_cause":
+		query = "SELECT error_cause FROM checkpoints WHERE id = ?"
+	case "error_kind":
+		query = "SELECT error_kind FROM checkpoints WHERE id = ?"
+	default:
+		t.Fatalf("unsupported checkpoints string column %q", column)
+	}
+	var out string
+	require.NoError(t, db.Raw(query, checkpointID).Row().Scan(&out))
+	return out
+}
+
 func rawJobBytes(t *testing.T, db *gorm.DB, jobID core.UUID, column string) []byte {
 	t.Helper()
 	query := ""

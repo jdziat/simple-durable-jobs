@@ -83,8 +83,14 @@ func Instrument(q *queue.Queue, opts ...InstrumentOption) {
 	// Register fail hook to end span with error
 	q.OnJobFail(failHook())
 
-	// Register retry hook to add retry event to span
+	// Register retry hook to add retry event to span and end it (the next
+	// attempt gets a fresh span via startCtxHook).
 	q.OnRetry(retryHook())
+
+	// Register waiting hook to end the span when a job self-suspends into
+	// StatusWaiting (fan-out / signal wait). The resumed attempt later starts a
+	// brand-new span via startCtxHook.
+	q.OnJobWaiting(waitingHook())
 }
 
 // enqueueMiddleware returns middleware that serializes the current span context
@@ -167,7 +173,10 @@ func failHook() func(context.Context, *core.Job, error) {
 	}
 }
 
-// retryHook returns a hook that adds a retry event to the execution span.
+// retryHook returns a hook that records a retry event on the execution span and
+// ends it. Each attempt gets its own span (startCtxHook starts a fresh one on
+// the next dispatch), so the retrying attempt's span must be ended here —
+// otherwise every retried/flapping attempt leaks a span that is never exported.
 func retryHook() func(context.Context, *core.Job, int, error) {
 	return func(ctx context.Context, job *core.Job, attempt int, err error) {
 		span := trace.SpanFromContext(ctx)
@@ -178,6 +187,27 @@ func retryHook() func(context.Context, *core.Job, int, error) {
 			attribute.Int("job.attempt", attempt),
 			attribute.String("job.error", err.Error()),
 		))
+		span.SetStatus(codes.Error, "retry: "+err.Error())
+		span.End()
+	}
+}
+
+// waitingHook returns a hook that ends the execution span when a job
+// self-suspends into StatusWaiting (a fan-out or signal wait). The parked
+// attempt completes neither successfully nor with failure, so without this its
+// span would leak. The resumed attempt later starts a brand-new span via
+// startCtxHook, which correctly models resume as a separate attempt.
+func waitingHook() func(context.Context, *core.Job) {
+	return func(ctx context.Context, job *core.Job) {
+		span := trace.SpanFromContext(ctx)
+		if !span.IsRecording() {
+			return
+		}
+		span.AddEvent("job.waiting")
+		// Waiting is not an error and not a success — leave the status Unset and
+		// mark the disposition with an attribute for span consumers.
+		span.SetAttributes(attribute.String("job.disposition", "waiting"))
+		span.End()
 	}
 }
 
