@@ -1577,26 +1577,32 @@ func (s *GormStorage) getFanOutWithLiveCounts(ctx context.Context, fanOutID core
 func (s *GormStorage) UpdateFanOutStatus(ctx context.Context, fanOutID core.UUID, status core.FanOutStatus) (bool, error) {
 	var updated bool
 	err := s.withSerializationRetry(ctx, func() error {
-		completed, failed, cancelled, err := liveFanOutCounts(s.db.WithContext(ctx), fanOutID)
-		if err != nil {
-			return err
-		}
-		result := s.db.WithContext(ctx).
-			Model(&core.FanOut{}).
-			Where("id = ? AND status = ?", fanOutID, core.FanOutPending).
-			Updates(map[string]any{
-				"status":          status,
-				"completed_count": completed,
-				"failed_count":    failed,
-				"cancelled_count": cancelled,
-				"updated_at":      time.Now(),
-			})
-		if result.Error != nil {
-			return result.Error
-		}
-		// RowsAffected == 0 means another worker already completed this fan-out.
-		updated = result.RowsAffected > 0
-		return nil
+		// Snapshot the live counts and write status in ONE transaction so the
+		// persisted counts are consistent with the CAS status flip (otherwise the
+		// SELECT and UPDATE are separate autocommit statements and a concurrent
+		// sub-job terminal write between them could persist a stale count).
+		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			completed, failed, cancelled, err := liveFanOutCounts(tx, fanOutID)
+			if err != nil {
+				return err
+			}
+			result := tx.
+				Model(&core.FanOut{}).
+				Where("id = ? AND status = ?", fanOutID, core.FanOutPending).
+				Updates(map[string]any{
+					"status":          status,
+					"completed_count": completed,
+					"failed_count":    failed,
+					"cancelled_count": cancelled,
+					"updated_at":      time.Now(),
+				})
+			if result.Error != nil {
+				return result.Error
+			}
+			// RowsAffected == 0 means another worker already completed this fan-out.
+			updated = result.RowsAffected > 0
+			return nil
+		})
 	})
 	return updated, err
 }
@@ -2055,8 +2061,11 @@ func (s *GormStorage) deleteFanOutSubtree(tx *gorm.DB, rootJobID core.UUID) erro
 // result one-row-per-parent when there are multiple terminated fan-outs.
 func (s *GormStorage) GetWaitingJobsToResume(ctx context.Context) ([]*core.Job, error) {
 	var jobs []*core.Job
+	// Select only j.id: the recovery caller consumes nothing but job.ID, so
+	// SELECT DISTINCT j.* would needlessly DISTINCT-compare (and then codec-decode)
+	// every blob column. Scanning into *core.Job still applies the ID serializer.
 	err := s.db.WithContext(ctx).Raw(`
-		SELECT DISTINCT j.* FROM jobs j
+		SELECT DISTINCT j.id FROM jobs j
 		INNER JOIN fan_outs f ON j.id = f.parent_job_id
 		WHERE j.status = ?
 		AND f.status IN (?, ?)
@@ -2068,9 +2077,6 @@ func (s *GormStorage) GetWaitingJobsToResume(ctx context.Context) ([]*core.Job, 
 		LIMIT ?
 	`, core.StatusWaiting, core.FanOutCompleted, core.FanOutFailed, core.FanOutPending, maxResumeBatch).Scan(&jobs).Error
 	if err != nil {
-		return nil, err
-	}
-	if err := s.decodeJobListPayloads(jobs); err != nil {
 		return nil, err
 	}
 	return jobs, nil
@@ -2086,8 +2092,10 @@ func (s *GormStorage) GetWaitingJobsToResume(ctx context.Context) ([]*core.Job, 
 // needing a stable sort. maxResumeBatch matches GetWaitingJobsToResume.
 func (s *GormStorage) GetStalledFanOutParents(ctx context.Context, olderThan time.Time) ([]*core.Job, error) {
 	var jobs []*core.Job
+	// id-only for the same reason as GetWaitingJobsToResume: the caller uses only
+	// job.ID, so avoid DISTINCT-ing and decoding the blob columns.
 	err := s.db.WithContext(ctx).Raw(`
-		SELECT DISTINCT j.* FROM jobs j
+		SELECT DISTINCT j.id FROM jobs j
 		INNER JOIN fan_outs f ON j.id = f.parent_job_id
 		WHERE j.status = ?
 		AND f.status = ?
@@ -2099,9 +2107,6 @@ func (s *GormStorage) GetStalledFanOutParents(ctx context.Context, olderThan tim
 		LIMIT ?
 	`, core.StatusWaiting, core.FanOutPending, olderThan, maxResumeBatch).Scan(&jobs).Error
 	if err != nil {
-		return nil, err
-	}
-	if err := s.decodeJobListPayloads(jobs); err != nil {
 		return nil, err
 	}
 	return jobs, nil

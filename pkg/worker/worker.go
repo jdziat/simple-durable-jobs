@@ -2108,48 +2108,59 @@ func (w *Worker) completeFanOut(ctx context.Context, fo *core.FanOut, status cor
 		}
 	}
 
-	// Resume parent job — retry a few times because the parent might still be
-	// transitioning from running → waiting (MarkWaiting hasn't completed yet).
-	var resumed bool
-	for attempt := 0; attempt < 5; attempt++ {
-		resumed, err = w.queue.Storage().ResumeJob(ctx, fo.ParentJobID)
+	// Resume the parent. Try once inline — the common case is that the parent has
+	// already reached 'waiting', so this succeeds immediately. If it is not yet
+	// resumable (still transitioning running → waiting), hand the bounded retry to
+	// a tracked background goroutine so the processLoop is never blocked (it
+	// previously stalled up to ~1.5s here). ctx is the worker-lifetime handler
+	// context, so a shutdown cancels the retry; the pollWaitingJobs backstop is
+	// the ultimate safety net.
+	resumed, err := w.queue.Storage().ResumeJob(ctx, fo.ParentJobID)
+	if err != nil {
+		return fmt.Errorf("failed to resume parent job: %w", err)
+	}
+	if resumed {
+		w.logger.Info("resumed parent job after fan-out completion",
+			"parent_job_id", fo.ParentJobID, "fan_out_id", fo.ID, "status", status)
+		return nil
+	}
+
+	parentID, fanOutID := fo.ParentJobID, fo.ID
+	w.goTracked(func() { w.resumeParentWithRetry(ctx, parentID, fanOutID, status) })
+	return nil
+}
+
+// resumeParentWithRetry retries ResumeJob with bounded backoff for a parent that
+// has not yet reached a resumable status when its fan-out completed. It runs on a
+// tracked background goroutine off the processLoop; if every attempt finds the
+// parent not-yet-waiting, the pollWaitingJobs backstop heals it on a later tick.
+// ctx is a worker-lifetime context (the handler context on the live completion
+// path, the poll context on the backstop path), so worker shutdown cancels it and
+// w.wg (via goTracked) makes shutdown wait for it — it is never the per-job ctx.
+func (w *Worker) resumeParentWithRetry(ctx context.Context, parentID, fanOutID core.UUID, status core.FanOutStatus) {
+	for attempt := 0; attempt < 4; attempt++ {
+		delay := time.Duration(100*(1<<attempt)) * time.Millisecond // 100ms, 200ms, 400ms, 800ms
+		select {
+		case <-ctx.Done():
+			return // shutdown; the stalled-parent backstop heals it
+		case <-time.After(delay):
+		}
+		resumed, err := w.queue.Storage().ResumeJob(ctx, parentID)
 		if err != nil {
-			return fmt.Errorf("failed to resume parent job: %w", err)
+			if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+				w.logger.Error("background parent resume failed",
+					"parent_job_id", parentID, "fan_out_id", fanOutID, "error", err)
+			}
+			return
 		}
 		if resumed {
-			break
-		}
-		// Parent not in waiting/paused status yet — wait briefly and retry
-		if attempt < 4 {
-			w.logger.Debug("parent job not yet in resumable status, retrying",
-				"parent_job_id", fo.ParentJobID,
-				"attempt", attempt+1)
-			delay := time.Duration(100*(1<<attempt)) * time.Millisecond // 100ms, 200ms, 400ms, 800ms
-			select {
-			case <-ctx.Done():
-				// Abort the inline retry promptly on shutdown/cancellation (do
-				// not park the processLoop). The fan-out status was already
-				// CAS-advanced upstream; a parent left in 'waiting' is healed by
-				// the GetStalledFanOutParents backstop poll, so returning nil
-				// here is safe — it is not a completion failure.
-				return nil
-			case <-time.After(delay):
-			}
+			w.logger.Info("resumed parent job after fan-out completion (background)",
+				"parent_job_id", parentID, "fan_out_id", fanOutID, "status", status)
+			return
 		}
 	}
-	if !resumed {
-		w.logger.Error("CRITICAL: parent job could not be resumed after retries — may be stuck",
-			"parent_job_id", fo.ParentJobID,
-			"fan_out_id", fo.ID)
-	}
-
-	w.logger.Info("resumed parent job after fan-out completion",
-		"parent_job_id", fo.ParentJobID,
-		"fan_out_id", fo.ID,
-		"status", status,
-		"resumed", resumed)
-
-	return nil
+	w.logger.Warn("parent job not yet resumable after background retries; relying on the stalled-parent backstop",
+		"parent_job_id", parentID, "fan_out_id", fanOutID)
 }
 
 func (w *Worker) calculateBackoff(attempt int) time.Duration {

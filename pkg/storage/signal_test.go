@@ -26,6 +26,30 @@ func sendTestSignal(t *testing.T, ctx context.Context, s *GormStorage, jobID, na
 	require.NoError(t, s.SendSignal(ctx, id, name, payload))
 }
 
+func TestSendSignal_SQLiteRejectsMissingJob(t *testing.T) {
+	// Regression (teardown g10): on SQLite (foreign_keys=OFF, fk_signals_job not
+	// enforced) SendSignal to a missing job used to insert a permanently-orphaned
+	// pending signal. It must now return ErrJobNotFound and leave no row.
+	ctx := context.Background()
+	s := newTestStorage(t)
+	if !s.isSQLite {
+		t.Skip("SQLite-specific: PostgreSQL/MySQL enforce fk_signals_job instead")
+	}
+
+	missing := signalUUID("send-signal-missing-job")
+	err := s.SendSignal(ctx, missing, "go", []byte(`"x"`))
+	require.ErrorIs(t, err, core.ErrJobNotFound)
+
+	var count int64
+	require.NoError(t, s.db.WithContext(ctx).Model(&core.Signal{}).Where("job_id = ?", missing).Count(&count).Error)
+	assert.Zero(t, count, "no orphaned pending signal must be inserted for a missing job")
+
+	// A signal to a real job still succeeds.
+	real := signalUUID("send-signal-real-job")
+	seedTestJob(t, ctx, s, real, core.StatusWaiting)
+	require.NoError(t, s.SendSignal(ctx, real, "go", []byte(`"x"`)))
+}
+
 func TestSendConsumeSignal_FIFO(t *testing.T) {
 	s := newTestStorage(t)
 	ctx := context.Background()
