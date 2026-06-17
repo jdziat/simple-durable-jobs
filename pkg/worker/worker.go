@@ -2267,16 +2267,11 @@ func (w *Worker) runScheduler(ctx context.Context) {
 				}
 				nextRun := sj.Schedule.Next(lastRun[name])
 				if now.After(nextRun) || now.Equal(nextRun) {
-					claimed, err := w.queue.Storage().ClaimScheduledFire(ctx, name, nextRun)
-					if err != nil {
-						w.logger.Error("failed to claim scheduled fire", "name", name, "fire_time", nextRun, "error", err)
-						continue
-					}
-					if !claimed {
-						lastRun[name] = nextRun
-						continue
-					}
-					lastRun[name] = nextRun
+					// Build the enqueue options first, then claim the fire boundary
+					// and enqueue the job ATOMICALLY via EnqueueScheduledFire: if the
+					// enqueue fails its transaction rolls back the claim, so the
+					// boundary stays re-claimable instead of advancing the durable
+					// cursor and silently dropping a due run (teardown g8).
 					opts := []queue.Option{
 						queue.QueueOpt(sj.Options.Queue),
 						queue.Priority(sj.Options.Priority),
@@ -2319,12 +2314,17 @@ func (w *Worker) runScheduler(ctx context.Context) {
 					} else if sj.Options.UniqueForTTL > 0 {
 						opts = append(opts, queue.UniqueFor(sj.Options.UniqueForTTL))
 					}
-					_, err = w.queue.Enqueue(ctx, sj.Name, sj.Args,
-						opts...,
-					)
-					if err != nil {
-						w.logger.Error("failed to enqueue scheduled job", "name", name, "error", err)
+					if _, _, err := w.queue.EnqueueScheduledFire(ctx, name, nextRun, sj.Name, sj.Args, opts...); err != nil {
+						// Claim+enqueue are atomic: this failure rolled back the
+						// claim, so the boundary stays re-claimable. Do NOT advance
+						// lastRun — retry it next tick instead of dropping the fire (g8).
+						w.logger.Error("failed to claim+enqueue scheduled fire; will retry boundary",
+							"name", name, "fire_time", nextRun, "error", err)
+						continue
 					}
+					// Either we claimed and enqueued, or a peer already claimed this
+					// boundary; in both cases this worker is done with it.
+					lastRun[name] = nextRun
 				}
 			}
 		}

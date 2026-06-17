@@ -1109,13 +1109,21 @@ func (s *GormStorage) GetDueJobs(ctx context.Context, queues []string, limit int
 // Exactly one caller can claim a given (name, fireTime) boundary; later
 // boundaries can claim again, while equal or earlier boundaries are refused.
 func (s *GormStorage) ClaimScheduledFire(ctx context.Context, name string, fireTime time.Time) (bool, error) {
-	err := s.db.WithContext(ctx).Clauses(clause.OnConflict{DoNothing: true}).
-		Create(&core.ScheduledFire{Name: name, LastFireAt: time.Unix(0, 0).UTC()}).Error
-	if err != nil {
+	return s.ClaimScheduledFireTx(ctx, s.db, name, fireTime)
+}
+
+// ClaimScheduledFireTx is ClaimScheduledFire performed within a caller-owned
+// transaction, so the boundary claim can be committed ATOMICALLY with the
+// enqueue of the fired job (and rolled back together on failure). Without this,
+// a claim that durably advanced last_fire_at followed by a failed enqueue would
+// silently drop a due scheduled run (teardown g8). See Queue.EnqueueScheduledFire.
+func (s *GormStorage) ClaimScheduledFireTx(ctx context.Context, tx *gorm.DB, name string, fireTime time.Time) (bool, error) {
+	if err := tx.WithContext(ctx).Clauses(clause.OnConflict{DoNothing: true}).
+		Create(&core.ScheduledFire{Name: name, LastFireAt: time.Unix(0, 0).UTC()}).Error; err != nil {
 		return false, err
 	}
 
-	result := s.db.WithContext(ctx).
+	result := tx.WithContext(ctx).
 		Model(&core.ScheduledFire{}).
 		Where("name = ? AND last_fire_at < ?", name, fireTime).
 		Updates(map[string]any{

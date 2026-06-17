@@ -26,8 +26,18 @@ type TxUniqueLockEnqueuer interface {
 	EnqueueWithUniqueLockTx(ctx context.Context, tx *gorm.DB, job *core.Job, scopeHash string, ttl time.Duration) (core.UUID, error)
 }
 
+// ScheduledFireTxClaimer claims a schedule's fire boundary within a caller-owned
+// transaction, so the durable claim can be committed atomically with the enqueue
+// of the fired job (rolling both back together on failure). Implemented by
+// GormStorage; consumed by Queue.EnqueueScheduledFire to avoid a silently dropped
+// scheduled run when the enqueue fails after the claim (teardown g8).
+type ScheduledFireTxClaimer interface {
+	ClaimScheduledFireTx(ctx context.Context, tx *gorm.DB, name string, fireTime time.Time) (bool, error)
+}
+
 var _ TxEnqueuer = (*GormStorage)(nil)
 var _ TxUniqueLockEnqueuer = (*GormStorage)(nil)
+var _ ScheduledFireTxClaimer = (*GormStorage)(nil)
 
 // EnqueueTx adds a job using the caller-supplied transaction handle.
 //

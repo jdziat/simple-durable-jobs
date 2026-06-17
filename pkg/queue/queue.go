@@ -211,6 +211,52 @@ func (q *Queue) enqueue(ctx context.Context, name string, args any, opts ...Opti
 	return q.enqueueWithOptions(ctx, name, args, options)
 }
 
+// EnqueueScheduledFire atomically claims a schedule's fire boundary and enqueues
+// the fired job in a single transaction: if the enqueue fails, the boundary claim
+// is rolled back so it can be re-claimed, instead of advancing the durable cursor
+// and silently dropping a due run (at-least-once-per-boundary; teardown g8). The
+// returned claimed reports whether THIS call won the boundary (false = a peer
+// already claimed it). Falls back to the prior non-atomic claim-then-enqueue only
+// when the storage backend is not transactional (no GORM tx / TxEnqueuer). It is
+// the scheduler's enqueue path and runs the same options, dedup, and middleware as
+// EnqueueTx.
+func (q *Queue) EnqueueScheduledFire(ctx context.Context, scheduleName string, fireTime time.Time, jobName string, args any, opts ...Option) (claimed bool, id core.UUID, err error) {
+	txClaimer, claimerOK := q.storage.(storage.ScheduledFireTxClaimer)
+	_, enqOK := q.storage.(storage.TxEnqueuer)
+	dbp, dbOK := q.storage.(interface{ DB() *gorm.DB })
+
+	if claimerOK && enqOK && dbOK {
+		txErr := dbp.DB().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			won, e := txClaimer.ClaimScheduledFireTx(ctx, tx, scheduleName, fireTime)
+			if e != nil {
+				return e
+			}
+			claimed = won
+			if !claimed {
+				return nil
+			}
+			jid, e := q.EnqueueTx(ctx, tx, jobName, args, opts...)
+			if e != nil {
+				return e // rolls back the claim so the boundary stays re-claimable
+			}
+			id = jid
+			return nil
+		})
+		if txErr != nil {
+			return false, core.NilUUID, txErr
+		}
+		return claimed, id, nil
+	}
+
+	// Non-transactional backend: preserve the prior (non-atomic) behavior.
+	claimed, err = q.storage.ClaimScheduledFire(ctx, scheduleName, fireTime)
+	if err != nil || !claimed {
+		return claimed, core.NilUUID, err
+	}
+	id, err = q.Enqueue(ctx, jobName, args, opts...)
+	return claimed, id, err
+}
+
 func (q *Queue) enqueueTxWithOptions(ctx context.Context, tx *gorm.DB, name string, args any, options *Options) (core.UUID, error) {
 	txEnqueuer, ok := q.storage.(storage.TxEnqueuer)
 	if !ok {
