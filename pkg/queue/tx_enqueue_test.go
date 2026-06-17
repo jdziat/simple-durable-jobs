@@ -104,7 +104,7 @@ func TestQueue_EnqueueBatchTx_DedupesAndRunsMiddlewarePerEntry(t *testing.T) {
 
 	tx1 := store.DB().Begin()
 	require.NoError(t, tx1.Error)
-	_, err := q.EnqueueTx(ctx, tx1, "remote.seed", "seed", Unique("batch-existing"))
+	seedID, err := q.EnqueueTx(ctx, tx1, "remote.seed", "seed", Unique("batch-existing"))
 	require.NoError(t, err)
 	require.NoError(t, tx1.Commit().Error)
 	calls.Store(0)
@@ -118,9 +118,14 @@ func TestQueue_EnqueueBatchTx_DedupesAndRunsMiddlewarePerEntry(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.Len(t, ids, 3)
+	assert.Equal(t, seedID, ids[0])
 	assert.Equal(t, ids[1], ids[2])
 	assert.EqualValues(t, 3, calls.Load())
 	require.NoError(t, tx2.Commit().Error)
+
+	status, err := q.LoadStatus(ctx, ids[0])
+	require.NoError(t, err)
+	assert.Equal(t, core.StatusPending, status)
 
 	var count int64
 	require.NoError(t, store.DB().Model(&core.Job{}).Where("unique_key IN ?", []string{"batch-existing", "batch-new"}).Count(&count).Error)

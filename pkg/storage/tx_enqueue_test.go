@@ -133,7 +133,8 @@ func TestGormStorage_EnqueueBatchTx_DeduplicatesCommittedAndInBatchKeys(t *testi
 	ctx := context.Background()
 	s := newTxEnqueueTestStorage(t)
 
-	require.NoError(t, s.EnqueueBatch(ctx, []*core.Job{{Type: "seed", UniqueKey: "existing-key"}}))
+	seed := &core.Job{Type: "seed", UniqueKey: "existing-key"}
+	require.NoError(t, s.EnqueueBatch(ctx, []*core.Job{seed}))
 
 	tx := s.DB().Begin()
 	require.NoError(t, tx.Error)
@@ -144,6 +145,13 @@ func TestGormStorage_EnqueueBatchTx_DeduplicatesCommittedAndInBatchKeys(t *testi
 	}
 	require.NoError(t, s.EnqueueBatchTx(ctx, tx, jobs))
 	require.NoError(t, tx.Commit().Error)
+
+	assert.Equal(t, seed.ID, jobs[0].ID)
+	assert.Equal(t, jobs[1].ID, jobs[2].ID)
+
+	existing, err := s.GetJob(ctx, jobs[0].ID)
+	require.NoError(t, err)
+	require.NotNil(t, existing)
 
 	var total int64
 	require.NoError(t, s.DB().Model(&core.Job{}).Where("unique_key IN ?", []string{"existing-key", "new-key"}).Count(&total).Error)

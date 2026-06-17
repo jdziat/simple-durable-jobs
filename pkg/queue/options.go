@@ -27,6 +27,7 @@ type Options struct {
 	Determinism     DeterminismMode
 	determinismSet  bool
 	prioritySet     bool
+	windowedDedup   windowedDedupMode
 	// Timezone is reserved for future use and is currently ignored; schedules evaluate in UTC.
 	//
 	// Deprecated: never read; schedules evaluate in UTC. Will be removed in v3.
@@ -65,6 +66,14 @@ func Batch(name string, args any, opts ...Option) BatchEntry {
 type optionFunc func(*Options)
 
 func (f optionFunc) Apply(o *Options) { f(o) }
+
+type windowedDedupMode int
+
+const (
+	windowedDedupNone windowedDedupMode = iota
+	windowedDedupIdempotencyKey
+	windowedDedupUniqueFor
+)
 
 // QueueOpt sets the queue name.
 func QueueOpt(name string) Option {
@@ -171,6 +180,7 @@ func IdempotencyKey(key string, ttl time.Duration) Option {
 		o.IdempotencyKey = key
 		o.UniqueForTTL = 0
 		o.UniqueLockTTL = ttl
+		o.windowedDedup = windowedDedupIdempotencyKey
 	})
 }
 
@@ -182,6 +192,7 @@ func UniqueFor(ttl time.Duration) Option {
 		o.IdempotencyKey = ""
 		o.UniqueForTTL = ttl
 		o.UniqueLockTTL = ttl
+		o.windowedDedup = windowedDedupUniqueFor
 	})
 }
 

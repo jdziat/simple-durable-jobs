@@ -4729,11 +4729,10 @@ func TestEnqueueBatch_MixedReplayInsertsOnlyNewJobs(t *testing.T) {
 	assert.Equal(t, 1, byKey["fanout-xyz-2"])
 }
 
-// TestEnqueueBatch_SkipsDuplicatesAcrossTerminalStates verifies that the
-// idempotency filter considers pending, running, and completed jobs — not
-// just pending — so a replay does not re-create a sub-job that has already
-// executed.
-func TestEnqueueBatch_SkipsDuplicatesAcrossTerminalStates(t *testing.T) {
+// TestEnqueueBatch_DedupWindowExcludesCompleted verifies that active UniqueKey
+// deduplication matches single-enqueue semantics: pending/running rows block a
+// duplicate, but completed rows free the key for a new job.
+func TestEnqueueBatch_DedupWindowExcludesCompleted(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStorage(t)
 
@@ -4748,8 +4747,13 @@ func TestEnqueueBatch_SkipsDuplicatesAcrossTerminalStates(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, dequeued)
 	require.NoError(t, s.Complete(ctx, dequeued.ID, "worker-X"))
+	completedKey := dequeued.UniqueKey
+	pendingKey := "fanout-states-0"
+	if completedKey == pendingKey {
+		pendingKey = "fanout-states-1"
+	}
 
-	// Replay with the same UniqueKeys should skip both.
+	// Replay with the same UniqueKeys should recreate only the completed job.
 	replay := []*core.Job{
 		{Type: "sub.a", Queue: "default", UniqueKey: "fanout-states-0"},
 		{Type: "sub.b", Queue: "default", UniqueKey: "fanout-states-1"},
@@ -4761,7 +4765,15 @@ func TestEnqueueBatch_SkipsDuplicatesAcrossTerminalStates(t *testing.T) {
 	require.NoError(t, s.DB().Model(&core.Job{}).
 		Where("unique_key LIKE ?", "fanout-states-%").
 		Count(&total).Error)
-	assert.EqualValues(t, 2, total, "completed + pending siblings must not be duplicated on replay")
+	assert.EqualValues(t, 3, total, "completed keys should be reusable while pending keys still dedup")
+
+	var completedKeyCount int64
+	require.NoError(t, s.DB().Model(&core.Job{}).Where("unique_key = ?", completedKey).Count(&completedKeyCount).Error)
+	assert.EqualValues(t, 2, completedKeyCount)
+
+	var pendingKeyCount int64
+	require.NoError(t, s.DB().Model(&core.Job{}).Where("unique_key = ?", pendingKey).Count(&pendingKeyCount).Error)
+	assert.EqualValues(t, 1, pendingKeyCount)
 }
 
 // TestEnqueueBatch_ConcurrentUniqueKey_NoDuplicates probes the TOCTOU window

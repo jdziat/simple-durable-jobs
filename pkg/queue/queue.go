@@ -27,6 +27,9 @@ import (
 
 // EnqueueMiddleware wraps the enqueue operation.
 // next persists the job; middleware can modify the job or context before calling next.
+// Middleware must mutate the provided *core.Job in place; it must not replace it with a
+// different pointer, because enqueue (and especially EnqueueBatch) reports the persisted
+// ID back through that same pointer after dedup resolution.
 type EnqueueMiddleware func(ctx context.Context, job *core.Job, next func(context.Context, *core.Job) error) error
 
 // Queue manages job registration, enqueueing, and processing.
@@ -318,6 +321,19 @@ func (q *Queue) buildJob(name string, args any, options *Options) (*core.Job, er
 			return nil, err
 		}
 	}
+	switch options.windowedDedup {
+	case windowedDedupIdempotencyKey:
+		if options.IdempotencyKey == "" {
+			return nil, fmt.Errorf("%w: IdempotencyKey requires a non-empty key", core.ErrInvalidWindowedDedup)
+		}
+		if options.UniqueLockTTL <= 0 {
+			return nil, fmt.Errorf("%w: IdempotencyKey requires a positive TTL", core.ErrInvalidWindowedDedup)
+		}
+	case windowedDedupUniqueFor:
+		if options.UniqueLockTTL <= 0 || options.UniqueForTTL <= 0 {
+			return nil, fmt.Errorf("%w: UniqueFor requires a positive TTL", core.ErrInvalidWindowedDedup)
+		}
+	}
 	if len(options.Tenant) > security.MaxQueueNameLength {
 		return nil, fmt.Errorf("jobs: tenant exceeds maximum length")
 	}
@@ -451,7 +467,7 @@ func (q *Queue) enqueueBatch(ctx context.Context, entries []BatchEntry, enqueueB
 		// path, which has no batch variant — honoring only UniqueKey here would
 		// silently drop the requested dedup. Reject explicitly so the caller learns
 		// the limitation instead of getting un-deduplicated jobs.
-		if options.IdempotencyKey != "" || options.UniqueForTTL > 0 {
+		if options.windowedDedup != windowedDedupNone {
 			return nil, fmt.Errorf("%w (entry %d)", core.ErrBatchWindowedDedup, i)
 		}
 		job, err := q.buildJob(entry.Name, entry.Args, options)
@@ -488,6 +504,9 @@ func (q *Queue) enqueueBatch(ctx context.Context, entries []BatchEntry, enqueueB
 
 	if err := enqueueBatch(ctx, toPersist); err != nil {
 		return nil, fmt.Errorf("jobs: failed to enqueue batch: %w", err)
+	}
+	for i, job := range jobs {
+		ids[i] = job.ID
 	}
 	return ids, nil
 }
