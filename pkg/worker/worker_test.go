@@ -4649,6 +4649,49 @@ func TestOwnershipAudit_NoOpWhenNoOrphans(t *testing.T) {
 	assert.Equal(t, 0, cancelled, "no orphans → no cancellations")
 }
 
+// TestPollWaitingJobs_SignalBackstopRunsDespiteFanOutScanError is the regression
+// test for teardown g8: pollWaitingJobsOnce used to early-RETURN when an OPTIONAL
+// fan-out recovery scan errored, skipping the CORE signal/timer resume backstop
+// that runs last. Since this function runs only on the single recovery-lease
+// holder, a recurring fan-out-query error would freeze every durable timer/signal
+// in the fleet. The scans must now log-and-continue so the signal backstop always
+// runs.
+func TestPollWaitingJobs_SignalBackstopRunsDespiteFanOutScanError(t *testing.T) {
+	mock := &mockStorage{}
+	// An earlier OPTIONAL fan-out scan fails persistently.
+	mock.stalledJobsFunc = func(_ context.Context, _ time.Time) ([]*core.Job, error) {
+		return nil, errors.New("stalled fan-out scan boom")
+	}
+	// The CORE signal/timer resume backstop must still be reached. The mock
+	// implements the paged signalResumePager, so pollSignalWaitingJobs calls
+	// GetSignalWaitingJobsToResumeAfter — track that.
+	var signalScanCalled atomic.Int32
+	mock.signalWaitingAfterFunc = func(_ context.Context, _ core.UUID, _ int) ([]*core.Job, error) {
+		signalScanCalled.Add(1)
+		return nil, nil
+	}
+
+	q := queue.New(mock)
+	w := NewWorker(q, DisableRetry(), WithStorageRetry(RetryConfig{MaxAttempts: 1}))
+
+	w.pollWaitingJobsOnce(context.Background())
+
+	assert.GreaterOrEqual(t, signalScanCalled.Load(), int32(1),
+		"signal/timer resume backstop must run even when an earlier fan-out scan errors (g8)")
+}
+
+// TestWithStaleLockAge_NegativeDefaultsToStandard is the regression test for
+// teardown g9: NewWorker guarded the StaleLockAge default on == 0 only, so a
+// NEGATIVE value flowed through and inverted the reaper cutoff into the future,
+// making the reaper reclaim every running job each tick (wholesale double
+// execution). The guard is now <= 0.
+func TestWithStaleLockAge_NegativeDefaultsToStandard(t *testing.T) {
+	q := queue.New(&mockStorage{})
+	w := NewWorker(q, DisableRetry(), WithStaleLockAge(-5*time.Second))
+	assert.Equal(t, 45*time.Minute, w.config.StaleLockAge,
+		"a negative StaleLockAge must fall back to the 45m default, not invert the reaper cutoff")
+}
+
 // TestOwnershipAudit_SkipsQueryWhenNoRunningJobs is the cheapest-tick test:
 // when the worker has nothing in flight, the audit must not query at all.
 // Important for fleet-wide DB load when most workers are idle.

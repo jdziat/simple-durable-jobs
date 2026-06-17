@@ -4990,6 +4990,56 @@ func TestFindOrphanedJobs_DoesNotFlagPaused(t *testing.T) {
 		"a paused job must not be reported as orphaned")
 }
 
+// TestFindOrphanedJobs_DoesNotFlagSelfCompleted is the regression test for
+// teardown g9: a job THIS worker completed (Complete clears locked_by to ” and
+// sets status=completed) used to be reported as orphaned, because locked_by=”
+// trips the "locked_by != workerID" branch. The ownership audit then fired a
+// spurious JobReclaimed/OnJobReclaimed for the worker's own completion during the
+// TOCTOU window before its deferred runningJobs unregister. A terminal row whose
+// lock was cleared to ” must NOT be reported.
+func TestFindOrphanedJobs_DoesNotFlagSelfCompleted(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	require.NoError(t, s.Enqueue(ctx, newTestJob("default", "t")))
+	job, err := s.Dequeue(ctx, []string{"default"}, "worker-A")
+	require.NoError(t, err)
+	require.NotNil(t, job)
+
+	// worker-A completes its own job (locked_by -> '', status -> completed).
+	require.NoError(t, s.Complete(ctx, job.ID, "worker-A"))
+
+	orphaned, err := s.FindOrphanedJobs(ctx, []core.UUID{job.ID}, "worker-A")
+	require.NoError(t, err)
+	assert.NotContains(t, orphaned, job.ID,
+		"a job this worker completed itself must not be reported as orphaned")
+}
+
+// TestFindOrphanedJobs_FlagsPeerCancelledStillLocked guards the OTHER side of
+// the g9 refinement: a peer that cancels our running sub-job via a fan-out
+// failure sets status=cancelled but leaves locked_by = this worker, and that
+// case MUST still be reported so the audit cancels our live handler.
+func TestFindOrphanedJobs_FlagsPeerCancelledStillLocked(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	require.NoError(t, s.Enqueue(ctx, newTestJob("default", "t")))
+	job, err := s.Dequeue(ctx, []string{"default"}, "worker-A")
+	require.NoError(t, err)
+	require.NotNil(t, job)
+
+	// A peer fan-out failure cancels the sub-job without touching locked_by
+	// (mirrors CancelSubJobs: status -> cancelled, locked_by stays worker-A).
+	require.NoError(t, s.db.Model(&core.Job{}).
+		Where("id = ?", job.ID).
+		Update("status", core.StatusCancelled).Error)
+
+	orphaned, err := s.FindOrphanedJobs(ctx, []core.UUID{job.ID}, "worker-A")
+	require.NoError(t, err)
+	assert.Contains(t, orphaned, job.ID,
+		"a still-locked job a peer cancelled must be reported so the live handler is stopped")
+}
+
 // TestIsSerializationFailure_RetryableErrors locks in the set of transient
 // driver errors that withSerializationRetry must retry. The SQLite BUSY/LOCKED
 // cases are a regression guard: the P1 local-handler-cancel can wake sibling

@@ -36,20 +36,27 @@ func TestGen_IsRetryableError_JobNotOwnedIsNotRetryable(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestGen_PollWaitingJobsOnce_GetWaitingJobsError(t *testing.T) {
+	stalledRan := false
 	mock := &mockStorage{
 		waitingJobsFunc: func(_ context.Context) ([]*core.Job, error) {
 			return nil, errors.New("boom waiting")
 		},
 		stalledJobsFunc: func(_ context.Context, _ time.Time) ([]*core.Job, error) {
-			t.Fatal("stalled query should not run after waiting-jobs error")
+			stalledRan = true
 			return nil, nil
 		},
 	}
 	q := queue.New(mock)
 	w := NewWorker(q, WithStorageRetry(RetryConfig{MaxAttempts: 1}))
 
-	// Must return without panicking and without touching the stalled query.
+	// A GetWaitingJobsToResume error must NOT skip the later recovery scans:
+	// each block logs and continues so the signal/timer resume backstop always
+	// runs on the lone recovery-lease holder (teardown g8). Must not panic, and
+	// the stalled-fan-out scan must still be reached.
 	w.pollWaitingJobsOnce(context.Background())
+	if !stalledRan {
+		t.Error("stalled-fan-out scan must still run after a waiting-jobs error (log-and-continue, g8)")
+	}
 }
 
 func TestGen_PollWaitingJobsOnce_ResumesWaitingJobsAndHandlesResumeError(t *testing.T) {

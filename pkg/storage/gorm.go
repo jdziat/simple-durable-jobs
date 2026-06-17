@@ -1238,7 +1238,11 @@ func (s *GormStorage) Release(ctx context.Context, jobID core.UUID, workerID str
 // state AND any of these is true:
 //   - locked_by != workerID  (another worker took the lock)
 //   - locked_by IS NULL      (lock was released, no new owner)
-//   - status IN ('cancelled','completed','failed')  (job is done by some path)
+//   - status IN ('cancelled','completed','failed') AND still locked_by a real
+//     worker (locked_by <> ”) — a peer terminated it (e.g. fan-out cancel)
+//     while we held the lock. A terminal row whose locked_by was reset to ”
+//     is this worker's OWN completion and is NOT an orphan (it has no live
+//     handler to stop; flagging it fired a spurious reclaim — teardown g9).
 //
 // The status NOT IN ('waiting','paused') guard is essential: a parent that
 // calls FanOut/Call from inside its handler suspends ITSELF via MarkWaiting,
@@ -1268,6 +1272,22 @@ func (s *GormStorage) FindOrphanedJobs(ctx context.Context, jobIDs []core.UUID, 
 			s.db.Where("locked_by IS NULL").
 				Or("locked_by != ?", workerID).
 				Or("status IN ?", core.TerminalJobStatuses),
+		).
+		// Do NOT flag a job THIS worker terminated itself. Complete/Fail clear
+		// locked_by to '' and set a terminal status, which trips the
+		// locked_by != workerID branch above and would fire a spurious
+		// JobReclaimed/OnJobReclaimed for our own completion during the TOCTOU
+		// window before the deferred runningJobs unregister (teardown g9). A
+		// TERMINAL row is a genuine reclaim only if it is still locked by a real
+		// worker (locked_by <> ''): a peer that cancels our running sub-job via a
+		// fan-out failure (CancelSubJobs) sets status=cancelled but leaves
+		// locked_by = this worker, so that legitimate stop-the-handler case is
+		// preserved, while our own clean completion (locked_by reset to '') is
+		// excluded. Non-terminal orphans (reclaimed/released, still active) are
+		// unaffected by this clause.
+		Where(
+			s.db.Where("status NOT IN ?", core.TerminalJobStatuses).
+				Or("locked_by <> ?", ""),
 		).
 		Pluck("id", &orphaned).Error
 	if err != nil {

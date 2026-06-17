@@ -289,7 +289,11 @@ func NewWorker(q *queue.Queue, opts ...WorkerOption) *Worker {
 	if config.ReadyPromoteInterval <= 0 {
 		config.ReadyPromoteInterval = 100 * time.Millisecond
 	}
-	if config.StaleLockAge == 0 {
+	// Guard <= 0, not just == 0: a NEGATIVE StaleLockAge would invert the reaper
+	// cutoff into the future (now - negative = future), so the reaper would
+	// reclaim every running job each tick — wholesale double-execution from one
+	// config typo (teardown g9). Mirror FanOutRecoveryStaleAge's <= 0 guard.
+	if config.StaleLockAge <= 0 {
 		config.StaleLockAge = 45 * time.Minute
 	}
 	if config.FanOutRecoveryStaleAge <= 0 {
@@ -2373,7 +2377,12 @@ func (w *Worker) pollWaitingJobsOnce(ctx context.Context) {
 		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 			w.logger.Error("failed to get waiting jobs after retries", "error", err)
 		}
-		return
+		// Do not return. Each recovery scan below guards its own (nil-on-error)
+		// result, and the signal/timer resume backstop at the end MUST run even
+		// when an earlier OPTIONAL scan fails: this whole function runs only on
+		// the single recovery-lease holder, so a recurring error in one scan
+		// returning early would freeze every durable timer/signal in the fleet
+		// (teardown g8). Log and fall through to the independent next block.
 	}
 	for _, job := range jobs {
 		resumeErr := retryWithBackoff(ctx, *w.config.StorageRetry, func() error {
@@ -2398,7 +2407,8 @@ func (w *Worker) pollWaitingJobsOnce(ctx context.Context) {
 		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 			w.logger.Error("failed to get stalled fan-out parents after retries", "error", err)
 		}
-		return
+		// Log-and-continue (see the GetWaitingJobsToResume block above): an
+		// optional fan-out scan failure must not skip the signal/timer backstop.
 	}
 	for _, job := range stalled {
 		resumeErr := retryWithBackoff(ctx, *w.config.StorageRetry, func() error {
@@ -2430,7 +2440,7 @@ func (w *Worker) pollWaitingJobsOnce(ctx context.Context) {
 			if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 				w.logger.Error("failed to get completable pending fan-outs after retries", "error", err)
 			}
-			return
+			// Log-and-continue: must not skip the signal/timer backstop below.
 		}
 		for _, fo := range completable {
 			if resumeErr := w.checkFanOutCompletion(ctx, fo); resumeErr != nil {
@@ -2452,7 +2462,7 @@ func (w *Worker) pollWaitingJobsOnce(ctx context.Context) {
 			if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 				w.logger.Error("failed to clean abandoned fan-outs after retries", "error", err)
 			}
-			return
+			// Log-and-continue: must not skip the signal/timer backstop below.
 		}
 		if cleaned > 0 {
 			w.logger.Info("cleaned abandoned pending fan-outs", "count", cleaned)
