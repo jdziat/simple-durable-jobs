@@ -119,8 +119,8 @@ func TestDefaultBatchSizeDrainsRespectingQueueCap(t *testing.T) {
 	)
 
 	// (a) the new default actually took effect.
-	assert.Equal(t, 10, w.config.DequeueBatchSize,
-		"freshly constructed worker should use the batched default of 10")
+	assert.Equal(t, 50, w.config.DequeueBatchSize,
+		"freshly constructed worker should use the batched default of 50")
 
 	// (b)+(c) drive a real dispatch+drain until all 200 complete.
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
