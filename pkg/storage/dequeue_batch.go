@@ -3,9 +3,11 @@ package storage
 import (
 	"context"
 	"errors"
+	"sort"
 	"time"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 	"gorm.io/gorm/logger"
 
 	"github.com/jdziat/simple-durable-jobs/v3/pkg/core"
@@ -70,10 +72,144 @@ func (s *GormStorage) dequeueBatch(ctx context.Context, queues []string, workerI
 }
 
 func (s *GormStorage) dequeueBatchOnce(ctx context.Context, queues []string, workerID string, limit int, perQueueBudgets map[string]int) ([]*core.Job, error) {
-	if s.isSQLite {
-		return s.dequeueBatchSQLite(ctx, queues, workerID, limit, perQueueBudgets)
+	// MySQL has no RETURNING and cannot reference the UPDATE's target table in a
+	// subquery, so it keeps the candidate-SELECT -> UPDATE path. Postgres and
+	// SQLite (>= 3.35) claim with one UPDATE ... RETURNING per queue.
+	if s.dialect() == dialectMySQL {
+		return s.dequeueBatchLocked(ctx, queues, workerID, limit, perQueueBudgets)
 	}
-	return s.dequeueBatchLocked(ctx, queues, workerID, limit, perQueueBudgets)
+	return s.dequeueBatchReturning(ctx, queues, workerID, limit, perQueueBudgets)
+}
+
+// dequeueBatchReturning claims due jobs with a SINGLE atomic UPDATE ... RETURNING
+// per queue, on dialects that support RETURNING with an UPDATE whose subquery
+// reads the same table (Postgres, SQLite >= 3.35). It replaces dequeueBatchLocked's
+// candidate-SELECT -> per-candidate paused/budget loop -> UPDATE -> re-fetch
+// sequence with:
+//
+//	UPDATE jobs SET status='running', ... WHERE id IN (
+//	    SELECT id FROM jobs <claimableCandidates predicate> ORDER BY ... LIMIT n
+//	    FOR UPDATE SKIP LOCKED          -- a no-op on SQLite (single writer)
+//	) RETURNING *
+//
+// Correctness invariants preserved:
+//   - The paused-queue exclusion lives in claimableCandidates' uncorrelated
+//     subquery, evaluated within the single claim statement, so this path does not
+//     need dequeueBatchLocked's separate per-candidate First() paused re-check
+//     (which exists only because that path is multi-statement). This NARROWS the
+//     paused race — it does not close it: under READ COMMITTED the subquery is an
+//     InitPlan evaluated once at the statement's command snapshot, and PG's
+//     EvalPlanQual rechecks only the locked jobs row, not the queue_states
+//     subquery, so a PauseQueue that commits AFTER that snapshot can still admit a
+//     job from the just-paused queue. That residual window (one sub-millisecond
+//     autocommit statement) is inherent to READ COMMITTED and existed identically
+//     on the old path (its re-check also missed a pause committing after its own
+//     snapshot); a pause committed BEFORE the claim is always excluded. PauseQueue
+//     carries no atomic-fence contract (in-flight jobs keep running; it only stops
+//     new dispatch), so this is acceptable, not a regression.
+//   - Per-queue budgets are exact: each queue is claimed in its own statement with
+//     LIMIT = budget.
+//   - SKIP LOCKED still partitions concurrent claimers (no-op under SQLite's
+//     single writer). DB-clock leases (Postgres) / wall clock (SQLite) unchanged.
+//   - decodeClaimedBatch still releases+excludes poison rows.
+//
+// The single autocommit statement also removes the per-batch BEGIN/COMMIT.
+func (s *GormStorage) dequeueBatchReturning(ctx context.Context, queues []string, workerID string, limit int, perQueueBudgets map[string]int) ([]*core.Job, error) {
+	dur := time.Duration(s.lockDuration.Load())
+	var nowVal, lockUntilVal any
+	if s.useDBClock() {
+		nowVal = s.nowExpr()
+		lockUntilVal = s.offsetExpr(dur)
+	} else {
+		now := time.Now()
+		nowVal = now
+		lockUntilVal = now.Add(dur)
+	}
+	silentDB := s.db.Session(&gorm.Session{Logger: s.db.Logger.LogMode(logger.Silent)})
+
+	// One claim unit per queue when per-queue budgets apply (LIMIT = budget),
+	// otherwise a single flat claim over all queues with the global limit.
+	type claimUnit struct {
+		queues []string
+		limit  int
+	}
+	var units []claimUnit
+	if len(perQueueBudgets) > 0 {
+		units = make([]claimUnit, 0, len(queues))
+		for _, q := range queues {
+			if b := perQueueBudgets[q]; b > 0 {
+				units = append(units, claimUnit{queues: []string{q}, limit: b})
+			}
+		}
+	} else {
+		units = []claimUnit{{queues: queues, limit: limit}}
+	}
+
+	claimed := make([]*core.Job, 0, limit)
+	for _, u := range units {
+		if len(claimed) >= limit {
+			break
+		}
+		n := u.limit
+		if rem := limit - len(claimed); n > rem {
+			n = rem
+		}
+		var rows []*core.Job
+		err := s.withSerializationRetry(ctx, func() error {
+			rows = nil
+			sub := s.claimableCandidates(
+				s.lockForUpdate(silentDB.WithContext(ctx).Model(&core.Job{}).Select("id"), true),
+				u.queues, nowVal,
+			).Limit(n)
+			return silentDB.WithContext(ctx).
+				Model(&rows).
+				Clauses(clause.Returning{}).
+				Where("id IN (?)", sub).
+				Updates(map[string]any{
+					"status":       core.StatusRunning,
+					"locked_by":    workerID,
+					"locked_until": lockUntilVal,
+					"started_at":   nowVal,
+					"attempt":      gorm.Expr("attempt + 1"),
+					// Clear the prior run's heartbeat on claim so the stale-lock reaper
+					// anchors on this claim's started_at, not a stale heartbeat
+					// (CD-01 double-execution). See Dequeue.
+					"last_heartbeat_at": gorm.Expr("NULL"),
+				}).Error
+		})
+		if err != nil {
+			return nil, err
+		}
+		claimed = append(claimed, rows...)
+	}
+
+	if len(claimed) == 0 {
+		return []*core.Job{}, nil
+	}
+	// RETURNING gives no ordering guarantee; restore the dequeue priority order
+	// (claimed rows are status='running', so order by the always-defined
+	// COALESCE(run_at, created_at), matching dequeueBatchLocked's final sort).
+	sortClaimedBatch(claimed)
+	return s.decodeClaimedBatch(ctx, claimed, workerID)
+}
+
+// sortClaimedBatch orders a claimed batch by priority DESC, then
+// COALESCE(run_at, created_at) ASC — the same deterministic order Dequeue uses.
+func sortClaimedBatch(jobs []*core.Job) {
+	sort.SliceStable(jobs, func(i, k int) bool {
+		a, b := jobs[i], jobs[k]
+		if a.Priority != b.Priority {
+			return a.Priority > b.Priority
+		}
+		return claimOrderKey(a).Before(claimOrderKey(b))
+	})
+}
+
+func claimOrderKey(j *core.Job) time.Time {
+	if j.RunAt != nil {
+		return *j.RunAt
+	}
+	return j.CreatedAt
 }
 
 func (s *GormStorage) dequeueBatchLocked(ctx context.Context, queues []string, workerID string, limit int, perQueueBudgets map[string]int) ([]*core.Job, error) {
@@ -292,91 +428,4 @@ func sleepDequeueBatchRetry(ctx context.Context, d time.Duration) error {
 	case <-timer.C:
 		return nil
 	}
-}
-
-func (s *GormStorage) dequeueBatchSQLite(ctx context.Context, queues []string, workerID string, limit int, perQueueBudgets map[string]int) ([]*core.Job, error) {
-	now := time.Now()
-	lockUntil := now.Add(time.Duration(s.lockDuration.Load()))
-
-	var jobs []*core.Job
-	err := s.withSerializationRetry(ctx, func() error {
-		jobs = nil
-		claimedIDs := make(map[core.UUID]struct{}, limit)
-		claimedPerQueue := make(map[string]int, len(perQueueBudgets))
-		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-			for len(jobs) < limit {
-				var job core.Job
-				query := s.claimableCandidates(tx, queues, now)
-				if len(claimedIDs) > 0 {
-					ids := make([]core.UUID, 0, len(claimedIDs))
-					for id := range claimedIDs {
-						ids = append(ids, id)
-					}
-					query = query.Where("id NOT IN ?", ids)
-				}
-				result := query.First(&job)
-				if result.Error != nil {
-					if errors.Is(result.Error, gorm.ErrRecordNotFound) {
-						return nil
-					}
-					return result.Error
-				}
-
-				var queueState core.QueueState
-				if err := tx.First(&queueState, "queue = ?", job.Queue).Error; err == nil && queueState.Paused {
-					claimedIDs[job.ID] = struct{}{}
-					continue
-				} else if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
-					return err
-				}
-				if budget, ok := perQueueBudgets[job.Queue]; ok && claimedPerQueue[job.Queue] >= budget {
-					claimedIDs[job.ID] = struct{}{}
-					continue
-				}
-
-				updateResult := tx.Model(&core.Job{}).
-					Where("id = ?", job.ID).
-					Where("status = ?", core.StatusPending).
-					Updates(map[string]any{
-						"status":       core.StatusRunning,
-						"locked_by":    workerID,
-						"locked_until": lockUntil,
-						"started_at":   now,
-						"attempt":      job.Attempt + 1,
-						// Clear the prior run's heartbeat on claim so the stale-lock
-						// reaper anchors on this claim's started_at, not a stale
-						// heartbeat (CD-01 double-execution). See Dequeue.
-						"last_heartbeat_at": gorm.Expr("NULL"),
-					})
-				if updateResult.Error != nil {
-					return updateResult.Error
-				}
-				if updateResult.RowsAffected == 0 {
-					claimedIDs[job.ID] = struct{}{}
-					continue
-				}
-
-				job.Status = core.StatusRunning
-				job.LockedBy = workerID
-				job.LockedUntil = &lockUntil
-				job.StartedAt = &now
-				job.Attempt++
-				jobs = append(jobs, &job)
-				claimedIDs[job.ID] = struct{}{}
-				claimedPerQueue[job.Queue]++
-			}
-			return nil
-		})
-	})
-	if err != nil {
-		return nil, err
-	}
-	if jobs == nil {
-		jobs = []*core.Job{}
-	}
-	decoded, err := s.decodeClaimedBatch(ctx, jobs, workerID)
-	if err != nil {
-		return nil, err
-	}
-	return decoded, nil
 }

@@ -235,11 +235,17 @@ var signalResumePollBatchSize = 100
 // NewWorker creates a new worker for the given queue.
 func NewWorker(q *queue.Queue, opts ...WorkerOption) *Worker {
 	config := WorkerConfig{
-		Queues:           nil, // Will be set to default if no queue options provided
-		PollInterval:     100 * time.Millisecond,
-		WorkerID:         string(core.NewID()),
-		DrainTimeout:     30 * time.Second,
-		DequeueBatchSize: 10,
+		Queues:       nil, // Will be set to default if no queue options provided
+		PollInterval: 100 * time.Millisecond,
+		WorkerID:     string(core.NewID()),
+		DrainTimeout: 30 * time.Second,
+		// Claim up to this many jobs per dequeue round-trip. The claim is a single
+		// statement per queue (UPDATE ... RETURNING on PG/SQLite), so a larger batch
+		// amortizes round-trips without extra per-row cost. It never widens the
+		// claimed-not-running window: dequeueSlots caps the claim at the worker's
+		// free concurrency slots, so a worker at the default concurrency (10) is
+		// unaffected — only deployments that raise Concurrency() claim larger batches.
+		DequeueBatchSize: 50,
 	}
 
 	for _, opt := range opts {
