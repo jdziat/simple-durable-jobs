@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"strings"
 	"time"
@@ -10,6 +11,8 @@ import (
 
 	"github.com/jdziat/simple-durable-jobs/v3/pkg/core"
 )
+
+const batchCompleteChunkSize = 400
 
 // BatchCompleteItem is one leaf job to complete in a batch.
 type BatchCompleteItem struct {
@@ -32,10 +35,21 @@ type BatchCompleteItem struct {
 //
 // Fan-out sub-jobs MUST NOT be passed here: their parent-counter accounting is
 // per-job and order-sensitive. The caller routes them to CompleteWithResult.
-func (s *GormStorage) BatchComplete(ctx context.Context, workerID string, items []BatchCompleteItem, deleteCheckpoints bool) ([]core.UUID, error) {
+//
+// Unlike CompleteWithResult, which omits the result column when result is nil
+// and leaves any existing value untouched, BatchComplete always writes the
+// result column. An empty result is stored as an empty value, which may surface
+// as NULL on SQLite versus an empty blob on MySQL. This is acceptable for fresh
+// leaf completions.
+//
+// Checkpoint GC follows the same opt-in as CompleteWithResult
+// (SetDeleteCheckpointsOnComplete), read from storage so the worker capability
+// interface needs no extra argument.
+func (s *GormStorage) BatchComplete(ctx context.Context, workerID string, items []BatchCompleteItem) ([]core.UUID, error) {
 	if len(items) == 0 {
 		return nil, nil
 	}
+	deleteCheckpoints := s.deleteCheckpointsOnComplete.Load()
 	// Encode each result up front so codec errors surface here (on the caller's
 	// goroutine) before any DB write, never mid-flush.
 	encoded := make([][]byte, len(items))
@@ -51,9 +65,14 @@ func (s *GormStorage) BatchComplete(ctx context.Context, workerID string, items 
 	err := s.withSerializationRetry(ctx, func() error {
 		committed = nil
 		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-			ids, err := s.batchCompleteFlip(tx, workerID, items, encoded)
-			if err != nil {
-				return err
+			ids := make([]core.UUID, 0, len(items))
+			for start := 0; start < len(items); start += batchCompleteChunkSize {
+				end := min(start+batchCompleteChunkSize, len(items))
+				chunkIDs, err := s.batchCompleteFlip(tx, workerID, items[start:end], encoded[start:end])
+				if err != nil {
+					return err
+				}
+				ids = append(ids, chunkIDs...)
 			}
 			if len(ids) == 0 {
 				return nil
@@ -61,11 +80,11 @@ func (s *GormStorage) BatchComplete(ctx context.Context, workerID string, items 
 			// Crash-safe: release fleet concurrency slots and (opt-in) GC checkpoints
 			// for the jobs that actually completed, in the same tx as the status flip.
 			// Keyed by job_id, so the per-slot-name sentinel (job_id='') is never hit.
-			if err := tx.Where("job_id IN ?", ids).Delete(&core.ConcurrencySlot{}).Error; err != nil {
+			if err := batchCompleteDeleteByJobIDChunks(tx, ids, &core.ConcurrencySlot{}); err != nil {
 				return err
 			}
 			if deleteCheckpoints {
-				if err := tx.Where("job_id IN ?", ids).Delete(&core.Checkpoint{}).Error; err != nil {
+				if err := batchCompleteDeleteByJobIDChunks(tx, ids, &core.Checkpoint{}); err != nil {
 					return err
 				}
 			}
@@ -77,6 +96,16 @@ func (s *GormStorage) BatchComplete(ctx context.Context, workerID string, items 
 		return nil, err
 	}
 	return committed, nil
+}
+
+func batchCompleteDeleteByJobIDChunks(tx *gorm.DB, ids []core.UUID, model any) error {
+	for start := 0; start < len(ids); start += batchCompleteChunkSize {
+		end := min(start+batchCompleteChunkSize, len(ids))
+		if err := tx.Where("job_id IN ?", ids[start:end]).Delete(model).Error; err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // batchCompleteFlip runs the dialect-specific batched terminal UPDATE and returns
@@ -109,9 +138,9 @@ func (s *GormStorage) batchCompleteFlipPostgres(tx *gorm.DB, workerID string, it
 	}
 	args = append(args, workerID)
 	sql := `UPDATE jobs AS j SET status = 'completed', locked_by = '', locked_until = NULL, ` +
-		`result = v.result, completed_at = NOW() ` +
+		`result = v.result, completed_at = NOW(), updated_at = NOW() ` +
 		`FROM (VALUES ` + strings.Join(rows, ",") + `) AS v(id, result) ` +
-		`WHERE j.id = v.id AND j.locked_by = ? AND j.status = 'running' RETURNING j.id`
+		`WHERE j.id = v.id AND j.locked_by = ? AND j.status = 'running' AND j.fan_out_id IS NULL RETURNING j.id`
 	var committed []core.UUID
 	if err := tx.Raw(sql, args...).Scan(&committed).Error; err != nil {
 		return nil, err
@@ -125,9 +154,9 @@ func (s *GormStorage) batchCompleteFlipPostgres(tx *gorm.DB, workerID string, it
 // backend). Raw 16-byte blob ids match jobs.id directly (no cast).
 func (s *GormStorage) batchCompleteFlipSQLite(tx *gorm.DB, workerID string, items []BatchCompleteItem, encoded [][]byte) ([]core.UUID, error) {
 	selects := make([]string, len(items))
-	args := make([]any, 0, len(items)*2+2)
+	args := make([]any, 0, len(items)*2+3)
 	now := time.Now().UTC()
-	args = append(args, now) // leading completed_at bind
+	args = append(args, now, now) // leading completed_at and updated_at binds
 	for i, it := range items {
 		if i == 0 {
 			selects[i] = "SELECT ? AS id, ? AS result"
@@ -138,9 +167,9 @@ func (s *GormStorage) batchCompleteFlipSQLite(tx *gorm.DB, workerID string, item
 	}
 	args = append(args, workerID)
 	sql := `UPDATE jobs SET status = 'completed', locked_by = '', locked_until = NULL, ` +
-		`result = v.result, completed_at = ? ` +
+		`result = v.result, completed_at = ?, updated_at = ? ` +
 		`FROM (` + strings.Join(selects, " UNION ALL ") + `) AS v ` +
-		`WHERE jobs.id = v.id AND jobs.locked_by = ? AND jobs.status = 'running' RETURNING jobs.id`
+		`WHERE jobs.id = v.id AND jobs.locked_by = ? AND jobs.status = 'running' AND jobs.fan_out_id IS NULL RETURNING jobs.id`
 	var committed []core.UUID
 	if err := tx.Raw(sql, args...).Scan(&committed).Error; err != nil {
 		return nil, err
@@ -152,44 +181,49 @@ func (s *GormStorage) batchCompleteFlipSQLite(tx *gorm.DB, workerID string, item
 // table and learns the committed set from a scoped follow-up SELECT in the same
 // tx. CAST(? AS BINARY) per row is mandatory — otherwise the derived id column
 // types as utf8mb4 and silently never joins the binary(16) jobs.id. The follow-up
-// SELECT is anchored to a DB-clock batch-start so it cannot match jobs completed
-// by an earlier batch.
+// SELECT is anchored to a per-batch locked_by sentinel so it cannot match jobs
+// completed by an earlier batch.
 func (s *GormStorage) batchCompleteFlipMySQL(tx *gorm.DB, workerID string, items []BatchCompleteItem, encoded [][]byte) ([]core.UUID, error) {
-	var batchStart time.Time
-	if err := tx.Raw("SELECT NOW(6)").Scan(&batchStart).Error; err != nil {
-		return nil, err
-	}
-
+	token := "__bc:" + core.NewID().String()
 	selects := make([]string, len(items))
 	ids := make([]core.UUID, len(items))
-	args := make([]any, 0, len(items)*2+1)
+	args := make([]any, 0, len(items)*2+2)
 	for i, it := range items {
 		if i == 0 {
-			selects[i] = "SELECT CAST(? AS BINARY) AS id, ? AS result"
+			selects[i] = "SELECT CAST(? AS BINARY) AS id, UNHEX(?) AS result"
 		} else {
-			selects[i] = "SELECT CAST(? AS BINARY), ?"
+			selects[i] = "SELECT CAST(? AS BINARY), UNHEX(?)"
 		}
-		args = append(args, it.JobID, encoded[i])
+		args = append(args, it.JobID, hex.EncodeToString(encoded[i]))
 		ids[i] = it.JobID
 	}
-	args = append(args, workerID)
+	args = append(args, token, workerID)
 	sql := `UPDATE jobs j JOIN (` + strings.Join(selects, " UNION ALL ") + `) v ON j.id = v.id ` +
-		`SET j.status = 'completed', j.locked_by = '', j.locked_until = NULL, ` +
-		`j.result = v.result, j.completed_at = NOW(6) ` +
-		`WHERE j.locked_by = ? AND j.status = 'running'`
+		`SET j.status = 'completed', j.locked_by = ?, j.locked_until = NULL, ` +
+		`j.result = v.result, j.completed_at = NOW(6), j.updated_at = NOW(6) ` +
+		`WHERE j.locked_by = ? AND j.status = 'running' AND j.fan_out_id IS NULL`
 	if err := tx.Exec(sql, args...).Error; err != nil {
 		return nil, err
 	}
 
-	// Which of the requested ids did THIS batch commit? Tightened predicate so a
-	// job completed by a prior batch (already locked_by='', status='completed')
-	// is not double-counted: it must have completed at/after this batch started.
+	// Which of the requested ids did THIS batch commit? The transient token is
+	// unique to this flip and is cleared before the outer transaction commits.
 	var committed []core.UUID
 	if err := tx.Model(&core.Job{}).
-		Where("id IN ? AND status = ? AND locked_by = ? AND completed_at >= ?",
-			ids, core.StatusCompleted, "", batchStart).
+		Where("id IN ? AND locked_by = ?", ids, token).
 		Pluck("id", &committed).Error; err != nil {
 		return nil, err
+	}
+	// Clear the transient token back to '' (committed jobs end with locked_by='',
+	// matching the PG/SQLite paths). Scope by the committed ids so the clear is a
+	// PK range scan, not a full-table scan (locked_by is unindexed); skip entirely
+	// when nothing flipped. The committed set IS exactly the token-bearing set.
+	if len(committed) > 0 {
+		if err := tx.Model(&core.Job{}).
+			Where("id IN ? AND locked_by = ?", committed, token).
+			Update("locked_by", "").Error; err != nil {
+			return nil, err
+		}
 	}
 	return committed, nil
 }

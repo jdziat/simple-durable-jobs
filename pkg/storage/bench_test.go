@@ -95,3 +95,60 @@ func BenchmarkDequeueContended(b *testing.B) {
 		}
 	})
 }
+
+// BenchmarkBatchComplete compares per-job completion against one batched
+// completion for a fixed chunk of N leaf jobs. Seeding (enqueue+dequeue) is
+// excluded from the timer. Divide ns/op by N for per-job cost; the ratio between
+// the two sub-benchmarks is the batching speedup (dominated by fsync-per-commit
+// on a real backend, so run with TEST_DATABASE_URL set).
+func BenchmarkBatchComplete(b *testing.B) {
+	const N = 200
+	ctx := context.Background()
+
+	seed := func(b *testing.B, s *GormStorage) []BatchCompleteItem {
+		b.Helper()
+		items := make([]BatchCompleteItem, N)
+		for k := 0; k < N; k++ {
+			j := benchJob()
+			if err := s.Enqueue(ctx, j); err != nil {
+				b.Fatalf("seed enqueue: %v", err)
+			}
+			got, err := s.Dequeue(ctx, []string{"default"}, "w")
+			if err != nil || got == nil {
+				b.Fatalf("seed dequeue: %v (nil=%v)", err, got == nil)
+			}
+			items[k] = BatchCompleteItem{JobID: got.ID, Result: []byte(`{"ok":true}`)}
+		}
+		return items
+	}
+
+	b.Run("per_job_CompleteWithResult", func(b *testing.B) {
+		s := benchStorage(b)
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			b.StopTimer()
+			items := seed(b, s)
+			b.StartTimer()
+			for _, it := range items {
+				if _, err := s.CompleteWithResult(ctx, it.JobID, "w", it.Result); err != nil {
+					b.Fatalf("complete: %v", err)
+				}
+			}
+		}
+		b.ReportMetric(float64(N), "jobs/op")
+	})
+
+	b.Run("batched_BatchComplete", func(b *testing.B) {
+		s := benchStorage(b)
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			b.StopTimer()
+			items := seed(b, s)
+			b.StartTimer()
+			if _, err := s.BatchComplete(ctx, "w", items); err != nil {
+				b.Fatalf("batch complete: %v", err)
+			}
+		}
+		b.ReportMetric(float64(N), "jobs/op")
+	})
+}
