@@ -94,9 +94,19 @@ func (s *GormStorage) dequeueBatchOnce(ctx context.Context, queues []string, wor
 //
 // Correctness invariants preserved:
 //   - The paused-queue exclusion lives in claimableCandidates' uncorrelated
-//     subquery and is now evaluated ATOMICALLY at claim time, closing the
-//     SELECT->UPDATE race that the old per-candidate First() re-check narrowed —
-//     so that extra per-row re-check is unnecessary here, not merely dropped.
+//     subquery, evaluated within the single claim statement, so this path does not
+//     need dequeueBatchLocked's separate per-candidate First() paused re-check
+//     (which exists only because that path is multi-statement). This NARROWS the
+//     paused race — it does not close it: under READ COMMITTED the subquery is an
+//     InitPlan evaluated once at the statement's command snapshot, and PG's
+//     EvalPlanQual rechecks only the locked jobs row, not the queue_states
+//     subquery, so a PauseQueue that commits AFTER that snapshot can still admit a
+//     job from the just-paused queue. That residual window (one sub-millisecond
+//     autocommit statement) is inherent to READ COMMITTED and existed identically
+//     on the old path (its re-check also missed a pause committing after its own
+//     snapshot); a pause committed BEFORE the claim is always excluded. PauseQueue
+//     carries no atomic-fence contract (in-flight jobs keep running; it only stops
+//     new dispatch), so this is acceptable, not a regression.
 //   - Per-queue budgets are exact: each queue is claimed in its own statement with
 //     LIMIT = budget.
 //   - SKIP LOCKED still partitions concurrent claimers (no-op under SQLite's
