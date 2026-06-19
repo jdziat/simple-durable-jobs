@@ -1001,6 +1001,30 @@ func (s *GormStorage) accountTerminalWithFanOut(ctx context.Context, jobID core.
 			}
 			if res.RowsAffected == 1 {
 				fanOut.Status = termStatus
+			} else if completed+failed+cancelled == fanOut.TotalCount {
+				// The pending-guarded CAS above froze the persisted counts the instant
+				// the fan-out first went terminal — which, for a fail_fast/threshold
+				// fan-out that finished EARLY while siblings were still in-flight, is an
+				// under-count (completed+failed+cancelled < total_count). When
+				// CancelOnFail is set, CancelSubJobs reconciles those counts as it
+				// cancels the still-pending siblings; but with CancelOnFail=false the
+				// siblings finish NATURALLY and never route through CancelSubJobs, so
+				// nothing else ever corrects the frozen row and it stays permanently
+				// short at quiescence. Now that every child has settled
+				// (accounted == total_count) reconcile the persisted counts ungated by
+				// status (status is already terminal; we touch only the count columns).
+				// Bounded to the last-settling child, so this adds ~1 write per fan-out,
+				// not one per child; idempotent (re-derives the same live snapshot).
+				if err := db.Model(&core.FanOut{}).
+					Where("id = ?", fanOutID).
+					Updates(map[string]any{
+						"completed_count": completed,
+						"failed_count":    failed,
+						"cancelled_count": cancelled,
+						"updated_at":      time.Now(),
+					}).Error; err != nil {
+					return err
+				}
 			}
 		}
 		return nil
