@@ -176,12 +176,14 @@ func TestMySQLSchemaAssertions(t *testing.T) {
 	requireMySQLDQEligibleAtType(t, db, "datetime(3)")
 	requireMySQLQueueTenantCollations(t, db)
 	requireMySQLIdentifierColumnCollations(t, db)
+	requireMySQLTimestampPrecision(t, db, 3, "started_at", "last_heartbeat_at", "locked_until", "completed_at", "run_at", "created_at", "updated_at")
 
 	require.NoError(t, s.Migrate(ctx), "second Migrate must not let AutoMigrate revert dead_lettered_at precision")
 	requireMySQLDeadLetteredAtPrecision(t, db, 3)
 	requireMySQLDQEligibleAtType(t, db, "datetime(3)")
 	requireMySQLQueueTenantCollations(t, db)
 	requireMySQLIdentifierColumnCollations(t, db)
+	requireMySQLTimestampPrecision(t, db, 3, "started_at", "last_heartbeat_at", "locked_until", "completed_at", "run_at", "created_at", "updated_at")
 
 	var activeUniqueKeyCount int
 	require.NoError(t, db.Raw(`
@@ -555,6 +557,29 @@ func requireMySQLDeadLetteredAtPrecision(t *testing.T, db *gorm.DB, want int) {
 		  AND COLUMN_NAME = 'dead_lettered_at'
 	`).Scan(&precision).Error)
 	require.Equal(t, want, precision, "dead_lettered_at must be datetime(%d)", want)
+}
+
+// requireMySQLTimestampPrecision pins the datetime(N) precision of jobs timestamp
+// columns. started_at / last_heartbeat_at / locked_until back the stale-lock
+// reaper's COALESCE(last_heartbeat_at, started_at, locked_until) freshness anchor;
+// they (and their siblings) are AutoMigrate-created with NO precision tag, so
+// without this guard a future AutoMigrate/driver change to a coarser precision
+// (e.g. datetime(0) = 1s truncation) would silently widen the reaper's effective
+// staleness window with no test to catch it. All jobs timestamps are datetime(3)
+// by convention (P1b normalized dead_lettered_at 6->3 to match its siblings).
+func requireMySQLTimestampPrecision(t *testing.T, db *gorm.DB, want int, columns ...string) {
+	t.Helper()
+	for _, col := range columns {
+		var precision int
+		require.NoError(t, db.Raw(`
+			SELECT DATETIME_PRECISION
+			FROM information_schema.COLUMNS
+			WHERE TABLE_SCHEMA = DATABASE()
+			  AND TABLE_NAME = 'jobs'
+			  AND COLUMN_NAME = ?
+		`, col).Scan(&precision).Error)
+		require.Equalf(t, want, precision, "jobs.%s must be datetime(%d)", col, want)
+	}
 }
 
 func requireMySQLDQEligibleAtType(t *testing.T, db *gorm.DB, want string) {
