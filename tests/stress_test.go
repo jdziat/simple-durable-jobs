@@ -104,9 +104,20 @@ func TestStress_ThousandJobs(t *testing.T) {
 	// Verify all jobs completed
 	assert.Equal(t, int64(numJobs), totalProcessed)
 
-	// Check database state
-	completedJobs, err := store.GetJobsByStatus(context.Background(), jobs.StatusCompleted, numJobs+100)
-	require.NoError(t, err)
+	// Check database state. The in-memory `processed` counter is incremented INSIDE
+	// the handler, which returns before the worker persists the Completed row, so the
+	// last completion(s) can lag the counter by a few ms. Poll instead of asserting
+	// eagerly — an immediate query races (e.g. 999/1000) under load. The job is not
+	// lost, only mid-write.
+	var completedJobs []*jobs.Job
+	require.Eventually(t, func() bool {
+		got, err := store.GetJobsByStatus(context.Background(), jobs.StatusCompleted, numJobs+100)
+		if err != nil {
+			return false
+		}
+		completedJobs = got
+		return len(completedJobs) == numJobs
+	}, 30*time.Second, 100*time.Millisecond, "all %d jobs should be marked completed in DB", numJobs)
 	assert.Len(t, completedJobs, numJobs, "All jobs should be marked completed in DB")
 
 	// Report stats
