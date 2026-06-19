@@ -2980,6 +2980,72 @@ func TestCancelSubJobs_ReconcilesPersistedFanOutCountsAfterFailFast(t *testing.T
 	assert.Equal(t, 3, reconciled.CancelledCount)
 }
 
+// TestAccountTerminalWithFanOut_ReconcilesOnNaturalCompletionWhenNotCancelOnFail
+// guards the CancelOnFail=false counterpart of the reconcile above. A fail_fast
+// fan-out with CancelOnFail=false flips terminal on the first sub-job failure
+// while siblings are still running; those siblings then finish NATURALLY (never
+// through CancelSubJobs), so the only thing that can correct the frozen,
+// under-counted persisted snapshot is accountTerminalWithFanOut's last-settling
+// reconcile. Asserts the RAW persisted columns (not GetFanOut, which overlays live
+// counts and would mask the divergence). Without the reconcile the persisted sum
+// stays 1, not 4.
+func TestAccountTerminalWithFanOut_ReconcilesOnNaturalCompletionWhenNotCancelOnFail(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	parent := newTestJob("default", "workflow.run")
+	require.NoError(t, s.Enqueue(ctx, parent))
+
+	fanOut := &core.FanOut{
+		ParentJobID:  parent.ID,
+		TotalCount:   4,
+		Strategy:     core.StrategyFailFast,
+		CancelOnFail: false, // siblings finish naturally; CancelSubJobs never runs
+		Status:       core.FanOutPending,
+	}
+	require.NoError(t, s.CreateFanOut(ctx, fanOut))
+
+	lockUntil := time.Now().Add(time.Hour)
+	subs := make([]*core.Job, 4)
+	for i := range subs {
+		subs[i] = &core.Job{
+			ID: core.NewID(), Type: "sub", Queue: "default",
+			Status: core.StatusRunning, LockedBy: "worker-1", LockedUntil: &lockUntil,
+			FanOutID: &fanOut.ID, FanOutIndex: i,
+		}
+		require.NoError(t, s.Enqueue(ctx, subs[i]))
+	}
+
+	// Sub 0 fails -> fail_fast flips the fan-out to failed NOW, while subs 1-3 are
+	// still running, so the persisted snapshot under-counts them.
+	updated, err := s.FailTerminalWithResult(ctx, subs[0].ID, "worker-1", "boom")
+	require.NoError(t, err)
+	require.NotNil(t, updated)
+	require.Equal(t, core.FanOutFailed, updated.Status)
+
+	var frozen core.FanOut
+	require.NoError(t, s.DB().First(&frozen, "id = ?", fanOut.ID).Error)
+	require.Equal(t, core.FanOutFailed, frozen.Status)
+	require.Less(t, frozen.CompletedCount+frozen.FailedCount+frozen.CancelledCount, frozen.TotalCount,
+		"precondition: persisted counts under-count the still-running siblings before reconcile")
+
+	// Siblings complete NATURALLY (CancelOnFail=false). The last-settling completion
+	// must reconcile the frozen persisted counts to sum==total.
+	for _, sub := range subs[1:] {
+		_, err := s.CompleteWithResult(ctx, sub.ID, "worker-1", []byte(`1`))
+		require.NoError(t, err)
+	}
+
+	var reconciled core.FanOut
+	require.NoError(t, s.DB().First(&reconciled, "id = ?", fanOut.ID).Error)
+	assert.Equal(t, reconciled.TotalCount,
+		reconciled.CompletedCount+reconciled.FailedCount+reconciled.CancelledCount,
+		"persisted counts must reconcile to sum==total once all children settle naturally")
+	assert.Equal(t, 3, reconciled.CompletedCount)
+	assert.Equal(t, 1, reconciled.FailedCount)
+	assert.Equal(t, 0, reconciled.CancelledCount)
+}
+
 func TestCancelSubJob_NonSubJobReturnsNil(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStorage(t)
