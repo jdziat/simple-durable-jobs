@@ -1748,6 +1748,13 @@ func newSQLiteQueue(t *testing.T) (*queue.Queue, func()) {
 	// a fresh empty DB and any code path that lands on it fails with
 	// "no such table: jobs" (e.g. the scheduler goroutine in
 	// TestWorker_RunScheduler_EnqueuesDueJob).
+	//
+	// NOTE: adding _busy_timeout/_txlock=immediate here does NOT help and actually
+	// makes contention WORSE (measured 25% vs ~7.5% flake on a fan-out test): shared
+	// -cache contention surfaces as SQLITE_LOCKED, which busy_timeout does not retry,
+	// and BEGIN IMMEDIATE grabs the single writer lock up front. Tests that need
+	// concurrent reader+writer (fan-out / waiting handoffs) must use newWALFileQueue
+	// (a WAL FILE DB), not this shared-cache in-memory queue.
 	dsn := "file:" + t.Name() + "?mode=memory&cache=shared"
 	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{
 		Logger: logger.Default.LogMode(logger.Silent),
@@ -1835,7 +1842,14 @@ func TestWorker_PerJobTimeoutCancelsHandlerContext(t *testing.T) {
 }
 
 func TestWorker_SubJobTimeoutCancelsHandlerContext(t *testing.T) {
-	q, cleanup := newSQLiteQueue(t)
+	// Fan-out (parent -> child handoff) needs concurrent reader+writer connections;
+	// the shared-cache in-memory SQLite (newSQLiteQueue) has a global writer lock and
+	// no busy_timeout, so under -race the parent's FanOut write sequence stalls the
+	// worker's child-claim poll past this test's 1s budget (~7.5% flake, always
+	// "sub-job did not start"). The WAL file DB allows concurrent reader + one writer
+	// with a busy_timeout, eliminating the stall — the same fix the batched-completion
+	// fan-out tests adopted.
+	q, cleanup := newWALFileQueue(t)
 	defer cleanup()
 
 	const subTimeout = 60 * time.Millisecond

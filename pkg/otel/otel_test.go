@@ -426,18 +426,32 @@ func TestMapCarrier(t *testing.T) {
 	assert.ElementsMatch(t, []string{"traceparent", "tracestate"}, c.Keys())
 }
 
+// newWALFileDB returns a WAL file-backed SQLite DB for instrumented-worker tests
+// that exercise a waiting/complete write handoff. The shared-cache in-memory DSN
+// ("mode=memory&cache=shared") has a single global writer lock and surfaces
+// contention as SQLITE_LOCKED — which busy_timeout does NOT retry (adding it
+// measurably WORSENS contention) — so the worker's MarkWaiting/complete write can
+// stall a test's wall-clock budget under -race (the ~1% TestInstrumentedWorkerEnds
+// ProcessSpanOnWaiting flake). A WAL FILE DB allows concurrent readers + one writer
+// with a busy_timeout, eliminating the stall.
+func newWALFileDB(t *testing.T) *gorm.DB {
+	t.Helper()
+	dsn := "file:" + t.TempDir() + "/otel.db?_journal_mode=WAL&_busy_timeout=10000&_synchronous=NORMAL&_txlock=immediate"
+	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+	require.NoError(t, err)
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	sqlDB.SetMaxOpenConns(4)
+	t.Cleanup(func() { _ = sqlDB.Close() })
+	return db
+}
+
 func TestInstrumentedWorkerEndsProcessSpanOnComplete(t *testing.T) {
 	recorder := tracetest.NewSpanRecorder()
 	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(recorder))
 	defer func() { _ = tp.Shutdown(context.Background()) }()
 
-	db, err := gorm.Open(sqlite.Open("file:"+t.Name()+"?mode=memory&cache=shared"), &gorm.Config{
-		Logger: logger.Default.LogMode(logger.Silent),
-	})
-	require.NoError(t, err)
-	if sqlDB, dbErr := db.DB(); dbErr == nil {
-		defer func() { _ = sqlDB.Close() }()
-	}
+	db := newWALFileDB(t)
 
 	store := storage.NewGormStorage(db)
 	require.NoError(t, store.Migrate(context.Background()))
@@ -456,7 +470,7 @@ func TestInstrumentedWorkerEndsProcessSpanOnComplete(t *testing.T) {
 		close(completed)
 	})
 
-	_, err = q.Enqueue(context.Background(), "otel-complete-job", struct{}{})
+	_, err := q.Enqueue(context.Background(), "otel-complete-job", struct{}{})
 	require.NoError(t, err)
 
 	w := worker.NewWorker(q, worker.WithPollInterval(50*time.Millisecond))
@@ -504,13 +518,7 @@ func TestInstrumentedWorkerEndsProcessSpanOnWaiting(t *testing.T) {
 	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(recorder))
 	defer func() { _ = tp.Shutdown(context.Background()) }()
 
-	db, err := gorm.Open(sqlite.Open("file:"+t.Name()+"?mode=memory&cache=shared"), &gorm.Config{
-		Logger: logger.Default.LogMode(logger.Silent),
-	})
-	require.NoError(t, err)
-	if sqlDB, dbErr := db.DB(); dbErr == nil {
-		defer func() { _ = sqlDB.Close() }()
-	}
+	db := newWALFileDB(t)
 
 	store := storage.NewGormStorage(db)
 	require.NoError(t, store.Migrate(context.Background()))
