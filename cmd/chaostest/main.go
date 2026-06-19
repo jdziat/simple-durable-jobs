@@ -530,7 +530,7 @@ func runCheck(ctx context.Context, a *app) error {
 	}
 
 	results := []invariant{
-		checkExactlyOnce(ctx, a.db),
+		checkExactlyOnce(ctx, a.db, a.dialect),
 		checkAtLeastOnceWindow(ctx, a.db),
 		checkNoWedge(ctx, a.db),
 		checkReadyNoStuck(ctx, a.db),
@@ -587,27 +587,84 @@ func waitForDrain(ctx context.Context, db *gorm.DB, timeout, quietFor time.Durat
 	return fmt.Errorf("timeout waiting for 10s quiescence")
 }
 
-func checkExactlyOnce(ctx context.Context, db *gorm.DB) invariant {
-	var duplicateRows, reexecRows, windowCheckpointedRows int64
-	db.WithContext(ctx).Raw(`
+// scanCount runs a single scalar count query and SURFACES the error. A bare
+// .Scan(&x) that ignores .Error silently turns a failed query (e.g. a MySQL
+// "Illegal mix of collations" error) into a zero count, which makes a HARD
+// invariant pass vacuously — exactly the masking bug that hid the INV-EXACTLY-ONCE
+// window-checkpoint collation failure on MySQL. Every invariant count query must
+// go through this so a broken check fails LOUDLY rather than reporting a false PASS.
+func scanCount(ctx context.Context, db *gorm.DB, query string, args ...any) (int64, error) {
+	var n int64
+	if err := db.WithContext(ctx).Raw(query, args...).Scan(&n).Error; err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+// checkErr builds a failed invariant for when a check's OWN query errored, so the
+// broken check is reported as a HARD/INFO failure instead of masquerading as a pass.
+func checkErr(name, level string, err error) invariant {
+	return invariant{
+		name:   name,
+		level:  level,
+		pass:   false,
+		detail: fmt.Sprintf("check query error: %v", err),
+	}
+}
+
+func checkExactlyOnce(ctx context.Context, db *gorm.DB, dialect string) invariant {
+	const name = "INV-EXACTLY-ONCE"
+	duplicateRows, err := scanCount(ctx, db, `
 		SELECT count(*) FROM (
 			SELECT job_id, marker FROM chaos_effects GROUP BY job_id, marker HAVING count(*) > 1
-		) dup`).Scan(&duplicateRows)
-	db.WithContext(ctx).Raw(`SELECT count(*) FROM chaos_effects WHERE marker LIKE 'phase-reexec:%'`).Scan(&reexecRows)
-	db.WithContext(ctx).Raw(`
+		) dup`)
+	if err != nil {
+		return checkErr(name, "HARD", err)
+	}
+	reexecRows, err := scanCount(ctx, db, `SELECT count(*) FROM chaos_effects WHERE marker LIKE 'phase-reexec:%'`)
+	if err != nil {
+		return checkErr(name, "HARD", err)
+	}
+	// This window-checkpoint join has two cross-type hazards that the old
+	// error-swallowing .Scan() silently hid on BOTH backends (so the sub-check was
+	// effectively dead since the v3 binary-UUID migration):
+	//
+	//  (a) job_id: chaos_effects.job_id stores the canonical UUID STRING
+	//      (insertEffect writes string(jobID)), but checkpoints.job_id is the native
+	//      UUID PK — `uuid` on Postgres, `binary(16)` on MySQL. `cp.job_id = ce.job_id`
+	//      is "operator does not exist: uuid = text" on Postgres and never matches on
+	//      MySQL. Convert the NATIVE column to its canonical text form and compare
+	//      strings — converting the native side (not parsing ce.job_id) means a
+	//      malformed marker job_id just fails to match instead of raising a cast error.
+	//  (b) call_type: checkpoints.call_type is utf8mb4_0900_as_cs (case-sensitivity
+	//      hardening) vs SUBSTRING(ce.marker) at the ai_ci table default → MySQL
+	//      Error 1267; pin the SUBSTRING operand to as_cs.
+	//
+	// Postgres has neither the binary encoding nor "illegal mix of collations", so
+	// only the ::text cast is needed there.
+	cpJobID := "cp.job_id::text"
+	markerExpr := "SUBSTRING(ce.marker FROM 15)"
+	if dialect == "mysql" {
+		cpJobID = "BIN_TO_UUID(cp.job_id)"
+		markerExpr = "SUBSTRING(ce.marker FROM 15) COLLATE utf8mb4_0900_as_cs"
+	}
+	windowCheckpointedRows, err := scanCount(ctx, db, `
 		SELECT count(*)
 		FROM chaos_effects ce
 		WHERE ce.marker LIKE 'window-reexec:%'
 		  AND EXISTS (
 			SELECT 1
 			FROM checkpoints cp
-			WHERE cp.job_id = ce.job_id
+			WHERE `+cpJobID+` = ce.job_id
 			  AND cp.call_index = -1
-			  AND cp.call_type = SUBSTRING(ce.marker FROM 15)
-		  )`).Scan(&windowCheckpointedRows)
+			  AND cp.call_type = `+markerExpr+`
+		  )`)
+	if err != nil {
+		return checkErr(name, "HARD", err)
+	}
 	pass := duplicateRows == 0 && reexecRows == 0 && windowCheckpointedRows == 0
 	return invariant{
-		name:   "INV-EXACTLY-ONCE",
+		name:   name,
 		level:  "HARD",
 		pass:   pass,
 		detail: fmt.Sprintf("tx pipeline: duplicate_effect_groups=%d phase_reexec_markers=%d; window checkpointed_reexec_markers=%d", duplicateRows, reexecRows, windowCheckpointedRows),
@@ -615,10 +672,13 @@ func checkExactlyOnce(ctx context.Context, db *gorm.DB) invariant {
 }
 
 func checkAtLeastOnceWindow(ctx context.Context, db *gorm.DB) invariant {
-	var windowRows int64
-	db.WithContext(ctx).Raw(`SELECT count(*) FROM chaos_effects WHERE marker LIKE 'window-reexec:%'`).Scan(&windowRows)
+	const name = "INV-AT-LEAST-ONCE-WINDOW"
+	windowRows, err := scanCount(ctx, db, `SELECT count(*) FROM chaos_effects WHERE marker LIKE 'window-reexec:%'`)
+	if err != nil {
+		return checkErr(name, "INFO", err)
+	}
 	return invariant{
-		name:   "INV-AT-LEAST-ONCE-WINDOW",
+		name:   name,
 		level:  "INFO",
 		pass:   true,
 		detail: fmt.Sprintf("window_reexec_markers=%d expected at-least-once re-execution under SIGKILL; bounded by design", windowRows),
@@ -626,11 +686,17 @@ func checkAtLeastOnceWindow(ctx context.Context, db *gorm.DB) invariant {
 }
 
 func checkNoWedge(ctx context.Context, db *gorm.DB) invariant {
-	var waiting, running int64
-	db.WithContext(ctx).Raw(`SELECT count(*) FROM jobs WHERE status = 'waiting'`).Scan(&waiting)
-	db.WithContext(ctx).Raw(`SELECT count(*) FROM jobs WHERE status = 'running'`).Scan(&running)
+	const name = "INV-NO-WEDGE"
+	waiting, err := scanCount(ctx, db, `SELECT count(*) FROM jobs WHERE status = 'waiting'`)
+	if err != nil {
+		return checkErr(name, "HARD", err)
+	}
+	running, err := scanCount(ctx, db, `SELECT count(*) FROM jobs WHERE status = 'running'`)
+	if err != nil {
+		return checkErr(name, "HARD", err)
+	}
 	return invariant{
-		name:   "INV-NO-WEDGE",
+		name:   name,
 		level:  "HARD",
 		pass:   waiting == 0 && running == 0,
 		detail: fmt.Sprintf("waiting=%d running=%d", waiting, running),
@@ -642,12 +708,15 @@ func checkNoWedge(ctx context.Context, db *gorm.DB) invariant {
 // to Dequeue (which requires dq_ready=true) — a latent wedge the per-worker
 // promoter must heal. run_at IS NULL OR run_at <= now is the eligibility test.
 func checkReadyNoStuck(ctx context.Context, db *gorm.DB) invariant {
-	var stuck int64
-	db.WithContext(ctx).Raw(
+	const name = "INV-READY-NO-STUCK"
+	stuck, err := scanCount(ctx, db,
 		`SELECT count(*) FROM jobs WHERE status = 'pending' AND dq_ready = ? AND (run_at IS NULL OR run_at <= ?)`,
-		false, time.Now()).Scan(&stuck)
+		false, time.Now())
+	if err != nil {
+		return checkErr(name, "HARD", err)
+	}
 	return invariant{
-		name:   "INV-READY-NO-STUCK",
+		name:   name,
 		level:  "HARD",
 		pass:   stuck == 0,
 		detail: fmt.Sprintf("eligible_but_unready=%d", stuck),
@@ -655,13 +724,19 @@ func checkReadyNoStuck(ctx context.Context, db *gorm.DB) invariant {
 }
 
 func checkFanOutCounts(ctx context.Context, db *gorm.DB) invariant {
-	var bad, total int64
-	db.WithContext(ctx).Raw(`SELECT count(*) FROM fan_outs`).Scan(&total)
-	db.WithContext(ctx).Raw(`
+	const name = "INV-FANOUT-COUNTS"
+	total, err := scanCount(ctx, db, `SELECT count(*) FROM fan_outs`)
+	if err != nil {
+		return checkErr(name, "HARD", err)
+	}
+	bad, err := scanCount(ctx, db, `
 		SELECT count(*) FROM fan_outs
-		WHERE completed_count + failed_count + cancelled_count <> total_count`).Scan(&bad)
+		WHERE completed_count + failed_count + cancelled_count <> total_count`)
+	if err != nil {
+		return checkErr(name, "HARD", err)
+	}
 	return invariant{
-		name:   "INV-FANOUT-COUNTS",
+		name:   name,
 		level:  "HARD",
 		pass:   bad == 0,
 		detail: fmt.Sprintf("fan_out_rows=%d mismatched_counts=%d", total, bad),
@@ -669,10 +744,13 @@ func checkFanOutCounts(ctx context.Context, db *gorm.DB) invariant {
 }
 
 func checkUnique(ctx context.Context, db *gorm.DB) invariant {
-	var count int64
-	db.WithContext(ctx).Raw(`SELECT count(*) FROM jobs WHERE unique_key = 'dup-key-1'`).Scan(&count)
+	const name = "INV-UNIQUE"
+	count, err := scanCount(ctx, db, `SELECT count(*) FROM jobs WHERE unique_key = 'dup-key-1'`)
+	if err != nil {
+		return checkErr(name, "HARD", err)
+	}
 	return invariant{
-		name:   "INV-UNIQUE",
+		name:   name,
 		level:  "HARD",
 		pass:   count == 1,
 		detail: fmt.Sprintf("jobs_with_dup_key_1=%d", count),
@@ -680,10 +758,13 @@ func checkUnique(ctx context.Context, db *gorm.DB) invariant {
 }
 
 func checkUniqueWindowed(ctx context.Context, db *gorm.DB) invariant {
-	var count int64
-	db.WithContext(ctx).Raw(`SELECT count(*) FROM jobs WHERE type = 'chaos.unique_windowed'`).Scan(&count)
+	const name = "INV-UNIQUE-WINDOWED"
+	count, err := scanCount(ctx, db, `SELECT count(*) FROM jobs WHERE type = 'chaos.unique_windowed'`)
+	if err != nil {
+		return checkErr(name, "HARD", err)
+	}
 	return invariant{
-		name:   "INV-UNIQUE-WINDOWED",
+		name:   name,
 		level:  "HARD",
 		pass:   count == 1,
 		detail: fmt.Sprintf("jobs_with_windowed_dup_key_1=%d", count),
@@ -699,13 +780,18 @@ func checkSchedule(ctx context.Context, db *gorm.DB) invariant {
 	// since seed — avoids the earlier drain-time accounting error.
 	const window = 12 * time.Second
 	const period = 5 * time.Second
-	var before, after int64
-	db.WithContext(ctx).Raw(`SELECT count(*) FROM chaos_ticks`).Scan(&before)
+	before, err := scanCount(ctx, db, `SELECT count(*) FROM chaos_ticks`)
+	if err != nil {
+		return checkErr("INV-SCHED", "HARD", err)
+	}
 	select {
 	case <-ctx.Done():
 	case <-time.After(window):
 	}
-	db.WithContext(ctx).Raw(`SELECT count(*) FROM chaos_ticks`).Scan(&after)
+	after, err := scanCount(ctx, db, `SELECT count(*) FROM chaos_ticks`)
+	if err != nil {
+		return checkErr("INV-SCHED", "HARD", err)
+	}
 	got := after - before
 	// One logical scheduler: floor(window/period) boundaries, +2 slack for
 	// boundary alignment and a tick landing at each edge of the window.
@@ -728,14 +814,26 @@ func checkSchedule(ctx context.Context, db *gorm.DB) invariant {
 // downstream effect is idempotent by design and never fails this HARD check).
 // expected>0 guards against a vacuous PASS when seeding produced nothing.
 func checkSignalExactlyOnce(ctx context.Context, db *gorm.DB) invariant {
-	var expected, consumed, unfinished, reexec int64
-	db.WithContext(ctx).Raw(`SELECT COALESCE(SUM(sig_count),0) FROM chaos_signal_targets`).Scan(&expected)
-	db.WithContext(ctx).Raw(`SELECT count(*) FROM chaos_effects WHERE marker LIKE 'sig-consumed:%'`).Scan(&consumed)
-	db.WithContext(ctx).Raw(`SELECT count(*) FROM jobs WHERE type = 'chaos.signal_waiter' AND status <> 'completed'`).Scan(&unfinished)
-	db.WithContext(ctx).Raw(`SELECT count(*) FROM chaos_effects WHERE marker LIKE 'sig-reexec:%'`).Scan(&reexec)
+	const name = "INV-SIGNAL-EXACTLY-ONCE"
+	expected, err := scanCount(ctx, db, `SELECT COALESCE(SUM(sig_count),0) FROM chaos_signal_targets`)
+	if err != nil {
+		return checkErr(name, "HARD", err)
+	}
+	consumed, err := scanCount(ctx, db, `SELECT count(*) FROM chaos_effects WHERE marker LIKE 'sig-consumed:%'`)
+	if err != nil {
+		return checkErr(name, "HARD", err)
+	}
+	unfinished, err := scanCount(ctx, db, `SELECT count(*) FROM jobs WHERE type = 'chaos.signal_waiter' AND status <> 'completed'`)
+	if err != nil {
+		return checkErr(name, "HARD", err)
+	}
+	reexec, err := scanCount(ctx, db, `SELECT count(*) FROM chaos_effects WHERE marker LIKE 'sig-reexec:%'`)
+	if err != nil {
+		return checkErr(name, "HARD", err)
+	}
 	pass := expected > 0 && consumed == expected && unfinished == 0
 	return invariant{
-		name:   "INV-SIGNAL-EXACTLY-ONCE",
+		name:   name,
 		level:  "HARD",
 		pass:   pass,
 		detail: fmt.Sprintf("expected=%d consumed=%d unfinished_waiters=%d at_least_once_reexec=%d", expected, consumed, unfinished, reexec),
@@ -747,14 +845,26 @@ func checkSignalExactlyOnce(ctx context.Context, db *gorm.DB) invariant {
 // as fired<expected, a doubled effect as reexec>0 (or a duplicate timer-fired),
 // and a re-sleep/wedge as unfinished>0. expected>0 guards against a vacuous PASS.
 func checkTimerExactlyOnce(ctx context.Context, db *gorm.DB) invariant {
-	var expected, fired, reexec, unfinished int64
-	db.WithContext(ctx).Raw(`SELECT count(*) FROM jobs WHERE type = 'chaos.timer'`).Scan(&expected)
-	db.WithContext(ctx).Raw(`SELECT count(*) FROM chaos_effects WHERE marker = 'timer-fired'`).Scan(&fired)
-	db.WithContext(ctx).Raw(`SELECT count(*) FROM chaos_effects WHERE marker = 'timer-reexec'`).Scan(&reexec)
-	db.WithContext(ctx).Raw(`SELECT count(*) FROM jobs WHERE type = 'chaos.timer' AND status <> 'completed'`).Scan(&unfinished)
+	const name = "INV-TIMER-EXACTLY-ONCE"
+	expected, err := scanCount(ctx, db, `SELECT count(*) FROM jobs WHERE type = 'chaos.timer'`)
+	if err != nil {
+		return checkErr(name, "HARD", err)
+	}
+	fired, err := scanCount(ctx, db, `SELECT count(*) FROM chaos_effects WHERE marker = 'timer-fired'`)
+	if err != nil {
+		return checkErr(name, "HARD", err)
+	}
+	reexec, err := scanCount(ctx, db, `SELECT count(*) FROM chaos_effects WHERE marker = 'timer-reexec'`)
+	if err != nil {
+		return checkErr(name, "HARD", err)
+	}
+	unfinished, err := scanCount(ctx, db, `SELECT count(*) FROM jobs WHERE type = 'chaos.timer' AND status <> 'completed'`)
+	if err != nil {
+		return checkErr(name, "HARD", err)
+	}
 	pass := expected > 0 && fired == expected && reexec == 0 && unfinished == 0
 	return invariant{
-		name:   "INV-TIMER-EXACTLY-ONCE",
+		name:   name,
 		level:  "HARD",
 		pass:   pass,
 		detail: fmt.Sprintf("expected=%d fired=%d reexec=%d unfinished=%d", expected, fired, reexec, unfinished),
@@ -787,15 +897,21 @@ func checkSlotNoLeak(ctx context.Context, db *gorm.DB) invariant {
 }
 
 func checkRateWellFormed(ctx context.Context, db *gorm.DB, dialect string) invariant {
+	const name = "INV-RATE-WELLFORMED"
 	countColumn := `"count"`
 	if dialect == "mysql" {
 		countColumn = "`count`"
 	}
-	var negs, total int64
-	db.WithContext(ctx).Raw(`SELECT count(*) FROM rate_limit_windows WHERE ` + countColumn + ` < 0`).Scan(&negs)
-	db.WithContext(ctx).Raw(`SELECT count(*) FROM rate_limit_windows`).Scan(&total)
+	negs, err := scanCount(ctx, db, `SELECT count(*) FROM rate_limit_windows WHERE `+countColumn+` < 0`)
+	if err != nil {
+		return checkErr(name, "HARD", err)
+	}
+	total, err := scanCount(ctx, db, `SELECT count(*) FROM rate_limit_windows`)
+	if err != nil {
+		return checkErr(name, "HARD", err)
+	}
 	return invariant{
-		name:   "INV-RATE-WELLFORMED",
+		name:   name,
 		level:  "HARD",
 		pass:   negs == 0,
 		detail: fmt.Sprintf("negative_counts=%d total_windows=%d", negs, total),

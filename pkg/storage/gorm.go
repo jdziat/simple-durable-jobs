@@ -1711,27 +1711,54 @@ func (s *GormStorage) CancelSubJobs(ctx context.Context, fanOutID core.UUID) ([]
 			if err := query.Pluck("id", &cancelled).Error; err != nil {
 				return err
 			}
-			if len(cancelled) == 0 {
-				return nil
-			}
 
 			now := time.Now()
-			result := tx.Model(&core.Job{}).
-				Where("id IN ?", cancelled).
-				Where("status IN ?", []core.JobStatus{core.StatusPending, core.StatusRunning}).
-				Updates(map[string]any{
-					"status":       core.StatusCancelled,
-					"completed_at": s.nowWriteValue(),
-					"updated_at":   now,
-				})
-			if result.Error != nil {
-				return result.Error
+			if len(cancelled) > 0 {
+				result := tx.Model(&core.Job{}).
+					Where("id IN ?", cancelled).
+					Where("status IN ?", []core.JobStatus{core.StatusPending, core.StatusRunning}).
+					Updates(map[string]any{
+						"status":       core.StatusCancelled,
+						"completed_at": s.nowWriteValue(),
+						"updated_at":   now,
+					})
+				if result.Error != nil {
+					return result.Error
+				}
+
+				// Release any fleet concurrency slots held by the cancelled sub-jobs,
+				// atomically with the cancel write, so a worker that dies before its
+				// deferred release cannot orphan a live slot for a now-terminal job.
+				if err := tx.Where("job_id IN ?", cancelled).Delete(&core.ConcurrencySlot{}).Error; err != nil {
+					return err
+				}
 			}
 
-			// Release any fleet concurrency slots held by the cancelled sub-jobs,
-			// atomically with the cancel write, so a worker that dies before its
-			// deferred release cannot orphan a live slot for a now-terminal job.
-			if err := tx.Where("job_id IN ?", cancelled).Delete(&core.ConcurrencySlot{}).Error; err != nil {
+			// Reconcile the parent fan_outs persisted counters ATOMICALLY with the
+			// cancellation. accountTerminalWithFanOut froze the count snapshot and
+			// flipped fan_outs.status pending->terminal the instant TerminalStatus()
+			// reported done (e.g. fail_fast on the first sub-job failure) — while
+			// these siblings were still pending/running, hence uncounted. The only
+			// other count writers (the terminal CAS here and UpdateFanOutStatus) are
+			// guarded WHERE status='pending', so once the row is terminal they can
+			// never correct it: the persisted counts would stay permanently short
+			// (completed+failed+cancelled < total_count), which is exactly what the
+			// chaos INV-FANOUT-COUNTS invariant flags. Re-derive the live counts now
+			// that the cancellations are visible in THIS tx (read-your-writes) and
+			// persist them ungated by status, so the row reconciles to sum==total at
+			// quiescence. Idempotent: re-running yields the same live snapshot.
+			completedCount, failedCount, cancelledCount, err := liveFanOutCounts(tx, fanOutID)
+			if err != nil {
+				return err
+			}
+			if err := tx.Model(&core.FanOut{}).
+				Where("id = ?", fanOutID).
+				Updates(map[string]any{
+					"completed_count": completedCount,
+					"failed_count":    failedCount,
+					"cancelled_count": cancelledCount,
+					"updated_at":      now,
+				}).Error; err != nil {
 				return err
 			}
 			return nil
