@@ -625,14 +625,27 @@ func checkExactlyOnce(ctx context.Context, db *gorm.DB, dialect string) invarian
 	if err != nil {
 		return checkErr(name, "HARD", err)
 	}
-	// The window-checkpoint join compares checkpoints.call_type (migrated to
-	// utf8mb4_0900_as_cs by the case-sensitivity hardening) against
-	// SUBSTRING(chaos_effects.marker ...) (the table default utf8mb4_0900_ai_ci).
-	// On MySQL that mix raises Error 1267; pin the SUBSTRING operand to as_cs so the
-	// comparison is well-defined. Postgres has no such "illegal mix" error, so its
-	// query is left unchanged.
+	// This window-checkpoint join has two cross-type hazards that the old
+	// error-swallowing .Scan() silently hid on BOTH backends (so the sub-check was
+	// effectively dead since the v3 binary-UUID migration):
+	//
+	//  (a) job_id: chaos_effects.job_id stores the canonical UUID STRING
+	//      (insertEffect writes string(jobID)), but checkpoints.job_id is the native
+	//      UUID PK — `uuid` on Postgres, `binary(16)` on MySQL. `cp.job_id = ce.job_id`
+	//      is "operator does not exist: uuid = text" on Postgres and never matches on
+	//      MySQL. Convert the NATIVE column to its canonical text form and compare
+	//      strings — converting the native side (not parsing ce.job_id) means a
+	//      malformed marker job_id just fails to match instead of raising a cast error.
+	//  (b) call_type: checkpoints.call_type is utf8mb4_0900_as_cs (case-sensitivity
+	//      hardening) vs SUBSTRING(ce.marker) at the ai_ci table default → MySQL
+	//      Error 1267; pin the SUBSTRING operand to as_cs.
+	//
+	// Postgres has neither the binary encoding nor "illegal mix of collations", so
+	// only the ::text cast is needed there.
+	cpJobID := "cp.job_id::text"
 	markerExpr := "SUBSTRING(ce.marker FROM 15)"
 	if dialect == "mysql" {
+		cpJobID = "BIN_TO_UUID(cp.job_id)"
 		markerExpr = "SUBSTRING(ce.marker FROM 15) COLLATE utf8mb4_0900_as_cs"
 	}
 	windowCheckpointedRows, err := scanCount(ctx, db, `
@@ -642,7 +655,7 @@ func checkExactlyOnce(ctx context.Context, db *gorm.DB, dialect string) invarian
 		  AND EXISTS (
 			SELECT 1
 			FROM checkpoints cp
-			WHERE cp.job_id = ce.job_id
+			WHERE `+cpJobID+` = ce.job_id
 			  AND cp.call_index = -1
 			  AND cp.call_type = `+markerExpr+`
 		  )`)
