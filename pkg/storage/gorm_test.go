@@ -2906,6 +2906,80 @@ func TestCancelSubJob_NoDoubleCountWhenAlreadyTerminal(t *testing.T) {
 	assert.LessOrEqual(t, got.CompletedCount+got.FailedCount+got.CancelledCount, got.TotalCount)
 }
 
+// TestCancelSubJobs_ReconcilesPersistedFanOutCountsAfterFailFast is the regression
+// guard for the chaos INV-FANOUT-COUNTS HARD FAIL. When a fail_fast sub-job fails
+// while siblings are still in-flight, accountTerminalWithFanOut freezes an
+// under-counted PERSISTED snapshot and flips fan_outs.status pending->failed, so
+// the only other count writers (guarded WHERE status='pending') can never correct
+// it. CancelSubJobs must reconcile the persisted counters so
+// completed_count+failed_count+cancelled_count == total_count — the exact equality
+// the chaos harness checks via raw SQL on the fan_outs row.
+//
+// Assertions read the RAW persisted row (s.DB().First), NOT GetFanOut: GetFanOut
+// overlays LIVE counts and would mask the persisted divergence (see
+// TestCompleteWithResult_LivenessGuard_NoCountOnTerminalFanOut). Without the
+// reconcile in CancelSubJobs this test fails (persisted sum stays 1, not 4).
+func TestCancelSubJobs_ReconcilesPersistedFanOutCountsAfterFailFast(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	parent := newTestJob("default", "workflow.run")
+	require.NoError(t, s.Enqueue(ctx, parent))
+
+	fanOut := &core.FanOut{
+		ParentJobID:  parent.ID,
+		TotalCount:   4,
+		Strategy:     core.StrategyFailFast,
+		CancelOnFail: true,
+		Status:       core.FanOutPending,
+	}
+	require.NoError(t, s.CreateFanOut(ctx, fanOut))
+
+	// One running sub-job we will fail; three siblings left in-flight (pending).
+	lockUntil := time.Now().Add(time.Hour)
+	failing := &core.Job{
+		ID: core.NewID(), Type: "sub", Queue: "default",
+		Status: core.StatusRunning, LockedBy: "worker-1", LockedUntil: &lockUntil,
+		FanOutID: &fanOut.ID, FanOutIndex: 0,
+	}
+	require.NoError(t, s.Enqueue(ctx, failing))
+	siblings := []*core.Job{
+		{Type: "sub", Queue: "default", FanOutID: &fanOut.ID, FanOutIndex: 1},
+		{Type: "sub", Queue: "default", FanOutID: &fanOut.ID, FanOutIndex: 2},
+		{Type: "sub", Queue: "default", FanOutID: &fanOut.ID, FanOutIndex: 3},
+	}
+	require.NoError(t, s.EnqueueBatch(ctx, siblings))
+
+	// Fail the running sub-job. fail_fast => the fan-out flips to failed NOW, while
+	// siblings 1-3 are still pending, so the persisted snapshot under-counts them.
+	updated, err := s.FailTerminalWithResult(ctx, failing.ID, "worker-1", "boom")
+	require.NoError(t, err)
+	require.NotNil(t, updated)
+	require.Equal(t, core.FanOutFailed, updated.Status)
+
+	// Precondition (the bug the invariant catches): the terminal fan_outs row has
+	// under-counted PERSISTED counts (sum < total).
+	var frozen core.FanOut
+	require.NoError(t, s.DB().First(&frozen, "id = ?", fanOut.ID).Error)
+	require.Equal(t, core.FanOutFailed, frozen.Status)
+	require.Less(t, frozen.CompletedCount+frozen.FailedCount+frozen.CancelledCount, frozen.TotalCount,
+		"precondition: persisted counts under-count the in-flight siblings before reconcile")
+
+	// CancelSubJobs cancels the in-flight siblings AND reconciles the persisted counts.
+	cancelledIDs, err := s.CancelSubJobs(ctx, fanOut.ID)
+	require.NoError(t, err)
+	assert.Len(t, cancelledIDs, 3)
+
+	var reconciled core.FanOut
+	require.NoError(t, s.DB().First(&reconciled, "id = ?", fanOut.ID).Error)
+	assert.Equal(t, reconciled.TotalCount,
+		reconciled.CompletedCount+reconciled.FailedCount+reconciled.CancelledCount,
+		"persisted counts must reconcile to sum==total_count after cancellation")
+	assert.Equal(t, 0, reconciled.CompletedCount)
+	assert.Equal(t, 1, reconciled.FailedCount)
+	assert.Equal(t, 3, reconciled.CancelledCount)
+}
+
 func TestCancelSubJob_NonSubJobReturnsNil(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStorage(t)
