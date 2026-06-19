@@ -30,6 +30,8 @@ type Worker struct {
 	logger *slog.Logger
 	wg     sync.WaitGroup
 
+	batchCompleter *batchCompleter
+
 	// Pause state
 	started   atomic.Bool
 	paused    atomic.Bool
@@ -79,13 +81,14 @@ type Worker struct {
 	// pkg/metrics.InstrumentWorkerDequeue.
 	dequeueChurn dequeueChurnCounters
 
-	rateLimitStorageMissingLogged     atomic.Bool
-	retentionStorageMissingLogged     atomic.Bool
-	retentionUnconfiguredLogged       atomic.Bool
-	retentionConfiguredLogged         atomic.Bool
-	uniqueLockStorageMissingLogged    atomic.Bool
-	slotSweepStorageMissingLogged     atomic.Bool
-	readyPromoterStorageMissingLogged atomic.Bool
+	rateLimitStorageMissingLogged       atomic.Bool
+	retentionStorageMissingLogged       atomic.Bool
+	retentionUnconfiguredLogged         atomic.Bool
+	retentionConfiguredLogged           atomic.Bool
+	uniqueLockStorageMissingLogged      atomic.Bool
+	slotSweepStorageMissingLogged       atomic.Bool
+	readyPromoterStorageMissingLogged   atomic.Bool
+	batchCompletionStorageMissingLogged atomic.Bool
 
 	// futureSleepSuppressions memoizes (jobID -> run_at) for sleeping jobs the
 	// signal-resume backstop has already inspected, capping checkpoint lookups
@@ -118,6 +121,10 @@ type scheduledFireSeeder interface {
 
 type completeWithResultStorage interface {
 	CompleteWithResult(ctx context.Context, jobID core.UUID, workerID string, result []byte) (*core.FanOut, error)
+}
+
+type batchCompleteStorage interface {
+	BatchComplete(ctx context.Context, workerID string, items []storage.BatchCompleteItem) ([]core.UUID, error)
 }
 
 // completablePendingFanOutStorage is implemented by backends that can find
@@ -478,6 +485,17 @@ func (w *Worker) Start(ctx context.Context) error {
 		w.warnIfRetentionUnconfigured()
 	}
 
+	if w.config.BatchCompletion.Enabled {
+		if batchStorage, ok := w.queue.Storage().(batchCompleteStorage); ok {
+			cfg := w.config.BatchCompletion
+			w.batchCompleter = newBatchCompleter(context.WithoutCancel(ctx), batchStorage, w.config.WorkerID, cfg.MaxBatch, cfg.MaxDelay, *w.config.StorageRetry, w.logger)
+			w.goTracked(func() { w.batchCompleter.run() })
+		} else if w.batchCompletionStorageMissingLogged.CompareAndSwap(false, true) {
+			w.logger.Warn("storage backend does not support batch completion; falling back to per-job completion",
+				"storage", fmt.Sprintf("%T", w.queue.Storage()))
+		}
+	}
+
 	for i := 0; i < totalConcurrency; i++ {
 		w.wg.Add(1)
 		go w.processLoop(handlerBase, jobsChan)
@@ -490,6 +508,9 @@ func (w *Worker) Start(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			close(jobsChan)
+			if w.batchCompleter != nil {
+				w.batchCompleter.Close()
+			}
 			if w.config.DrainTimeout <= 0 {
 				cancelHandlers()
 				w.wg.Wait()
@@ -1695,6 +1716,32 @@ func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 		w.handleError(ctx, jobCtx, job, err)
 		cancelHeartbeat()
 	} else {
+		if w.config.BatchCompletion.Enabled && job.FanOutID == nil && w.batchCompleter != nil {
+			committed, completeErr := w.batchCompleter.Submit(job.ID, resultBytes)
+			if errors.Is(completeErr, errBatchCompletionClosed) {
+				w.logger.Debug("batch completion accumulator closed; falling back to per-job completion",
+					"job_id", job.ID)
+			} else {
+				if completeErr != nil {
+					cancelHeartbeat()
+					w.logger.Error("failed to complete job after batched retries", "job_id", job.ID, "error", completeErr)
+					w.releaseAfterTerminalWriteError(ctx, job.ID, "completion")
+					return
+				}
+				if !committed {
+					cancelHeartbeat()
+					w.logger.Warn("job no longer owned at completion; skipping completion handling",
+						"job_id", job.ID)
+					return
+				}
+
+				cancelHeartbeat()
+				w.queue.CallCompleteHooks(jobCtx, job)
+				w.queue.Emit(&core.JobCompleted{Job: job, Duration: time.Since(startTime), Timestamp: time.Now()})
+				return
+			}
+		}
+
 		completer, ok := w.queue.Storage().(completeWithResultStorage)
 		if !ok {
 			w.logger.Error("storage does not implement CompleteWithResult; cannot complete job", "job_id", job.ID)

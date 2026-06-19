@@ -20,6 +20,12 @@ const minPollInterval = 50 * time.Millisecond
 const maxDequeueBatch = 1000
 
 const (
+	minBatchCompletionDelay = time.Millisecond
+	maxBatchCompletionDelay = 5 * time.Second
+	maxBatchCompletionBatch = 4096
+)
+
+const (
 	defaultRetentionInterval  = time.Hour
 	minRetentionInterval      = 100 * time.Millisecond
 	defaultRetentionBatchSize = 1000
@@ -68,6 +74,14 @@ type UniqueLockSweepConfig struct {
 
 func (c UniqueLockSweepConfig) enabled() bool {
 	return !c.Disabled
+}
+
+// BatchCompletionConfig controls optional group-committed completion for
+// successful leaf jobs.
+type BatchCompletionConfig struct {
+	Enabled  bool
+	MaxBatch int
+	MaxDelay time.Duration
 }
 
 // ConcurrencyCapConfig describes a DB-backed concurrency cap. If Key is nil,
@@ -252,6 +266,10 @@ type WorkerConfig struct {
 	// IdempotencyKey/UniqueFor locks. It is enabled by default and independent
 	// from Retention so windowed enqueue deduplication self-bounds its table.
 	UniqueLockSweep UniqueLockSweepConfig
+
+	// BatchCompletion optionally groups successful leaf-job completion writes
+	// into BatchComplete calls. Zero value is disabled.
+	BatchCompletion BatchCompletionConfig
 }
 
 // Concurrency sets the concurrency for a queue.
@@ -709,6 +727,39 @@ func WithDequeueBatchSize(n int) WorkerOption {
 			n = maxDequeueBatch
 		}
 		c.DequeueBatchSize = n
+	})
+}
+
+// WithBatchCompletion enables group-committed successful completion for leaf
+// jobs when the storage backend supports BatchComplete. Fan-out sub-jobs always
+// use the per-job completion path because their parent accounting is per-job.
+//
+// Enabling this trades a small completion-latency window, up to maxDelay, for
+// fewer durable commits/fsyncs. A handler that has returned success is not
+// durably completed until its batch flushes; if the worker crashes in that
+// window, the leaf job can run again. Use it for idempotent leaf handlers that
+// can tolerate normal at-least-once execution.
+//
+// maxBatch is clamped to [1, 4096]. maxDelay is clamped to [1ms, 5s].
+func WithBatchCompletion(maxBatch int, maxDelay time.Duration) WorkerOption {
+	return workerOptionFunc(func(c *WorkerConfig) {
+		if maxBatch < 1 {
+			maxBatch = 1
+		}
+		if maxBatch > maxBatchCompletionBatch {
+			maxBatch = maxBatchCompletionBatch
+		}
+		if maxDelay < minBatchCompletionDelay {
+			maxDelay = minBatchCompletionDelay
+		}
+		if maxDelay > maxBatchCompletionDelay {
+			maxDelay = maxBatchCompletionDelay
+		}
+		c.BatchCompletion = BatchCompletionConfig{
+			Enabled:  true,
+			MaxBatch: maxBatch,
+			MaxDelay: maxDelay,
+		}
 	})
 }
 

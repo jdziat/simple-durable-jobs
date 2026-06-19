@@ -840,6 +840,18 @@ func WithDequeueBatchSize(n int) WorkerOption {
 	return worker.WithDequeueBatchSize(n)
 }
 
+// WithBatchCompletion enables group-committed completion of successful LEAF jobs:
+// up to maxBatch completions (or whatever accumulates within maxDelay) are written
+// in one transaction instead of one-per-job, trading a small completion-latency
+// window for far fewer fsyncs. Off by default; requires a storage backend that
+// implements batched completion (the built-in GormStorage does). Fan-out sub-jobs
+// always complete per-job. A handler that returned success is not durably committed
+// until the next flush, so on a worker crash within the window that job re-runs
+// (at-least-once) — safe for idempotent leaf handlers.
+func WithBatchCompletion(maxBatch int, maxDelay time.Duration) WorkerOption {
+	return worker.WithBatchCompletion(maxBatch, maxDelay)
+}
+
 // WithRetryAttempts sets the max retry attempts for storage operations.
 func WithRetryAttempts(attempts int) WorkerOption {
 	return worker.WithRetryAttempts(attempts)
