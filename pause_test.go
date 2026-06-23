@@ -6,7 +6,7 @@ import (
 	"sync/atomic"
 	"testing"
 
-	jobs "github.com/jdziat/simple-durable-jobs/v3"
+	jobs "github.com/jdziat/simple-durable-jobs/v4"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/driver/sqlite"

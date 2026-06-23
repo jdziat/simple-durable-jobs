@@ -7,7 +7,7 @@ weight: 7
 
 ```go
 import (
-	jobs "github.com/jdziat/simple-durable-jobs/v3"
+	jobs "github.com/jdziat/simple-durable-jobs/v4"
 )
 
 q := jobs.New(store)

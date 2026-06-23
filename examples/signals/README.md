@@ -71,4 +71,4 @@ The workflow re-enters after the wait, but the preparation step is not re-run be
 - [API Reference - Workflow Signals](https://jdziat.github.io/simple-durable-jobs/docs/api-reference/signals/)
 - [Advanced - Durable Timers](https://jdziat.github.io/simple-durable-jobs/docs/advanced/durable-timers/)
 - [API Reference - Durable Workflows](https://jdziat.github.io/simple-durable-jobs/docs/api-reference/workflows/)
-- [pkg.go.dev - simple-durable-jobs](https://pkg.go.dev/github.com/jdziat/simple-durable-jobs/v3)
+- [pkg.go.dev - simple-durable-jobs](https://pkg.go.dev/github.com/jdziat/simple-durable-jobs/v4)

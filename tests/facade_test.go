@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	jobs "github.com/jdziat/simple-durable-jobs/v3"
-	"github.com/jdziat/simple-durable-jobs/v3/pkg/queue"
+	jobs "github.com/jdziat/simple-durable-jobs/v4"
+	"github.com/jdziat/simple-durable-jobs/v4/pkg/queue"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

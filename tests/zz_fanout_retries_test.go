@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	jobs "github.com/jdziat/simple-durable-jobs/v3"
-	"github.com/jdziat/simple-durable-jobs/v3/pkg/fanout"
+	jobs "github.com/jdziat/simple-durable-jobs/v4"
+	"github.com/jdziat/simple-durable-jobs/v4/pkg/fanout"
 )
 
 // Reproduces the EXACT call shape the hivemind fix uses:

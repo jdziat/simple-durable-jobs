@@ -1,7 +1,7 @@
 syntax = "proto3";
 package jobs.v1;
 
-option go_package = "github.com/jdziat/simple-durable-jobs/v3/ui/gen/jobs/v1;jobsv1";
+option go_package = "github.com/jdziat/simple-durable-jobs/v4/ui/gen/jobs/v1;jobsv1";
 
 import "google/protobuf/timestamp.proto";
 

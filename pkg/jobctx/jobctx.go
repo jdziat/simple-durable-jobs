@@ -10,9 +10,9 @@ import (
 
 	"gorm.io/gorm"
 
-	"github.com/jdziat/simple-durable-jobs/v3/pkg/core"
-	intctx "github.com/jdziat/simple-durable-jobs/v3/pkg/internal/context"
-	"github.com/jdziat/simple-durable-jobs/v3/pkg/storage"
+	"github.com/jdziat/simple-durable-jobs/v4/pkg/core"
+	intctx "github.com/jdziat/simple-durable-jobs/v4/pkg/internal/context"
+	"github.com/jdziat/simple-durable-jobs/v4/pkg/storage"
 )
 
 // DefaultVersion is the sentinel version used for code paths that existed

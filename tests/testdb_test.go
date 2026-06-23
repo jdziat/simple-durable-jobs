@@ -14,7 +14,7 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 
-	"github.com/jdziat/simple-durable-jobs/v3"
+	"github.com/jdziat/simple-durable-jobs/v4"
 )
 
 var dbCounter atomic.Int64

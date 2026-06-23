@@ -6,6 +6,6 @@
 //   - Event types for queue monitoring
 //   - Error types for job processing
 //
-// Most users should import the root package github.com/jdziat/simple-durable-jobs/v3
+// Most users should import the root package github.com/jdziat/simple-durable-jobs/v4
 // instead of this package directly.
 package core
