@@ -108,6 +108,9 @@ type (
 	// JobRetrying is emitted when a job is retried.
 	JobRetrying = core.JobRetrying
 
+	// JobCancelled is emitted when a job is terminally cancelled.
+	JobCancelled = core.JobCancelled
+
 	// JobResumedBySignal is emitted when a signal wakes a waiting job.
 	JobResumedBySignal = core.JobResumedBySignal
 
@@ -328,6 +331,7 @@ var (
 	ErrUniqueKeyTooLong      = core.ErrUniqueKeyTooLong
 	ErrJobAlreadyPaused      = core.ErrJobAlreadyPaused
 	ErrJobNotPaused          = core.ErrJobNotPaused
+	ErrJobNotCancellable     = core.ErrJobNotCancellable
 	ErrQueueAlreadyPaused    = core.ErrQueueAlreadyPaused
 	ErrQueueNotPaused        = core.ErrQueueNotPaused
 	ErrCannotPauseStatus     = core.ErrCannotPauseStatus

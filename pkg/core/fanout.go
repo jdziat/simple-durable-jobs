@@ -25,11 +25,16 @@ const (
 	FanOutPending   FanOutStatus = "pending"
 	FanOutCompleted FanOutStatus = "completed"
 	FanOutFailed    FanOutStatus = "failed"
+	// FanOutCancelled is the terminal status for a fan-out whose parent job was
+	// terminally cancelled (CancelJobTerminal). It is set directly on the row,
+	// never returned by TerminalStatus, and distinguishes an operator cancel
+	// from a genuine failure.
+	FanOutCancelled FanOutStatus = "cancelled"
 )
 
 // AllFanOutStatuses is the single source of truth that the migration CHECK and
 // drift guard derive from.
-var AllFanOutStatuses = []FanOutStatus{FanOutPending, FanOutCompleted, FanOutFailed}
+var AllFanOutStatuses = []FanOutStatus{FanOutPending, FanOutCompleted, FanOutFailed, FanOutCancelled}
 
 // FanOut tracks a batch of sub-jobs spawned by a parent job.
 type FanOut struct {

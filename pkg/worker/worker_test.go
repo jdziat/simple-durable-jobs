@@ -331,7 +331,10 @@ func (m *mockStorage) SaveJobResult(_ context.Context, jobID core.UUID, _ string
 	return nil
 }
 
-func (m *mockStorage) PauseJob(_ context.Context, _ core.UUID) error   { return nil }
+func (m *mockStorage) PauseJob(_ context.Context, _ core.UUID) error { return nil }
+func (m *mockStorage) CancelJobTerminal(_ context.Context, _ core.UUID) error {
+	return nil
+}
 func (m *mockStorage) UnpauseJob(_ context.Context, _ core.UUID) error { return nil }
 func (m *mockStorage) GetPausedJobs(_ context.Context, _ string) ([]*core.Job, error) {
 	return nil, nil

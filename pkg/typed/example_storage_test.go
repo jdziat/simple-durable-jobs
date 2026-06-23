@@ -140,6 +140,8 @@ func (s *exampleStorage) SaveJobResult(context.Context, core.UUID, string, []byt
 
 func (s *exampleStorage) PauseJob(context.Context, core.UUID) error { return nil }
 
+func (s *exampleStorage) CancelJobTerminal(context.Context, core.UUID) error { return nil }
+
 func (s *exampleStorage) UnpauseJob(context.Context, core.UUID) error { return nil }
 
 func (s *exampleStorage) GetPausedJobs(context.Context, string) ([]*core.Job, error) {

@@ -29,12 +29,14 @@ func PauseJob(ctx context.Context, q *Queue, jobID UUID, opts ...PauseOption) er
 	return q.PauseJob(ctx, jobID, opts...)
 }
 
-// CancelJob cooperatively cancels a running job by aliasing aggressive pause.
-// It durably records cancellation and interrupts a running handler via context
-// cancellation; a handler that ignores ctx is not force-killed. Pending or
-// waiting jobs follow the underlying pause behavior. Already paused jobs,
-// terminal jobs, and missing jobs return the same sentinel errors as PauseJob,
-// such as ErrJobAlreadyPaused, ErrCannotPauseStatus, or ErrJobNotFound.
+// CancelJob terminally cancels a pending, waiting, or running job. The job
+// moves to a terminal cancelled state and is not resumable via ResumeJob; use
+// Requeue to replay a cancelled job from scratch. When the target is a fan-out
+// parent, its entire descendant fan-out subtree is terminally cancelled in the
+// same storage transaction. A locally-running handler's context is cancelled
+// after the durable write; a handler that ignores ctx is not force-killed.
+// Already-cancelled jobs are a no-op (nil); a job in a non-cancellable terminal
+// state returns ErrJobNotCancellable, and a missing job returns ErrJobNotFound.
 func CancelJob(ctx context.Context, q *Queue, jobID UUID) error {
 	return q.CancelJob(ctx, jobID)
 }

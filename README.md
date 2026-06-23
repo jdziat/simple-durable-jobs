@@ -66,7 +66,7 @@ backend support tiers, and crash-recovery tuning.
 - **Durable Timers** - Sleep and SleepUntil pause workflows without occupying worker slots
 - **Fan-Out/Fan-In** - Spawn parallel sub-jobs, wait for results, aggregate
 - **Crash Recovery** - Jobs resume from the last successful checkpoint
-- **Pause / Resume / Cancel** - Pause, resume, or cancel jobs, queues, or workers (graceful or aggressive); first-class cancel verb across facade, RPC, and dashboard
+- **Pause / Resume / Cancel** - Pause, resume, or terminally cancel jobs, queues, or workers (graceful or aggressive); cancel also terminates fan-out children
 - **Scheduled Jobs** - Cron, daily, weekly, and interval-based scheduling
 - **Priority Queues** - Higher priority jobs run first
 - **Transactional Enqueue** - Enqueue inside your own DB transaction (outbox pattern) so business rows and jobs commit together

@@ -196,7 +196,13 @@ func (s *minimalStorage) GetStalledFanOutParents(ctx context.Context, olderThan 
 func (s *minimalStorage) SaveJobResult(ctx context.Context, jobID core.UUID, workerID string, result []byte) error {
 	return nil
 }
-func (s *minimalStorage) PauseJob(ctx context.Context, jobID core.UUID) error   { return nil }
+func (s *minimalStorage) PauseJob(ctx context.Context, jobID core.UUID) error { return nil }
+func (s *minimalStorage) CancelJobTerminal(ctx context.Context, jobID core.UUID) error {
+	if job := s.jobs[string(jobID)]; job != nil {
+		job.Status = core.StatusCancelled
+	}
+	return nil
+}
 func (s *minimalStorage) UnpauseJob(ctx context.Context, jobID core.UUID) error { return nil }
 func (s *minimalStorage) IsJobPaused(ctx context.Context, jobID core.UUID) (bool, error) {
 	return false, nil

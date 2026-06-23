@@ -897,6 +897,23 @@ func (m *mockStorage) PauseJob(ctx context.Context, jobID core.UUID) error {
 	return m.PauseJobWithMode(ctx, jobID, core.PauseModeAggressive)
 }
 
+func (m *mockStorage) CancelJobTerminal(ctx context.Context, jobID core.UUID) error {
+	job, ok := m.jobs[string(jobID)]
+	if !ok {
+		return core.ErrJobNotFound
+	}
+	if job.Status == core.StatusCancelled {
+		return nil
+	}
+	switch job.Status {
+	case core.StatusPending, core.StatusWaiting, core.StatusRunning:
+		job.Status = core.StatusCancelled
+	default:
+		return core.ErrJobNotCancellable
+	}
+	return nil
+}
+
 func (m *mockStorage) PauseJobWithMode(ctx context.Context, jobID core.UUID, mode core.PauseMode) error {
 	job, ok := m.jobs[string(jobID)]
 	if !ok {
@@ -1544,6 +1561,29 @@ func TestQueue_CancelJob_RunningJobCancelsContext(t *testing.T) {
 	job, err := store.GetJob(ctx, jobID)
 	require.NoError(t, err)
 	assert.Equal(t, core.StatusCancelled, job.Status)
+}
+
+func TestQueue_CancelJob_EmitsJobCancelled(t *testing.T) {
+	store := newMockStorage()
+	q := New(store)
+	ctx := context.Background()
+	events := q.Events()
+	defer q.Unsubscribe(events)
+
+	q.Register("cancel-event-job", func(ctx context.Context, args struct{}) error { return nil })
+	jobID, err := q.Enqueue(ctx, "cancel-event-job", struct{}{})
+	require.NoError(t, err)
+
+	require.NoError(t, q.CancelJob(ctx, jobID))
+
+	select {
+	case event := <-events:
+		cancelled, ok := event.(*core.JobCancelled)
+		require.True(t, ok)
+		assert.Equal(t, jobID, cancelled.Job.ID)
+	default:
+		t.Fatal("expected job cancelled event")
+	}
 }
 
 func TestQueue_PauseJob_RunningGracefulReturnsError(t *testing.T) {

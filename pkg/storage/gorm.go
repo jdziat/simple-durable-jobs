@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"regexp"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -1322,8 +1323,9 @@ func (s *GormStorage) FindOrphanedJobs(ctx context.Context, jobIDs []core.UUID, 
 		// JobReclaimed/OnJobReclaimed for our own completion during the TOCTOU
 		// window before the deferred runningJobs unregister (teardown g9). A
 		// TERMINAL row is a genuine reclaim only if it is still locked by a real
-		// worker (locked_by <> ''): a peer that cancels our running sub-job via a
-		// fan-out failure (CancelSubJobs) sets status=cancelled but leaves
+		// worker (locked_by <> ''): a peer that cancels our running sub-job — via
+		// a fan-out failure (CancelSubJobs) or an operator terminal cancel
+		// (CancelJobTerminal) — sets status=cancelled but leaves
 		// locked_by = this worker, so that legitimate stop-the-handler case is
 		// preserved, while our own clean completion (locked_by reset to '') is
 		// excluded. Non-terminal orphans (reclaimed/released, still active) are
@@ -1725,71 +1727,93 @@ func (s *GormStorage) CancelSubJobs(ctx context.Context, fanOutID core.UUID) ([]
 	err := s.withSerializationRetry(ctx, func() error {
 		cancelled = nil
 		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-			// Capture the IDs of sub-jobs we're about to cancel. Done before
-			// the UPDATE so we get the in-flight set, not just rows that
-			// happen to remain pending after the update.
-			query := tx.Model(&core.Job{}).
-				Where("fan_out_id = ? AND status IN ?", fanOutID, []core.JobStatus{core.StatusPending, core.StatusRunning}).
-				Order("fan_out_index ASC")
-			query = s.lockForUpdate(query, false)
-			if err := query.Pluck("id", &cancelled).Error; err != nil {
-				return err
-			}
-
-			now := time.Now()
-			if len(cancelled) > 0 {
-				result := tx.Model(&core.Job{}).
-					Where("id IN ?", cancelled).
-					Where("status IN ?", []core.JobStatus{core.StatusPending, core.StatusRunning}).
-					Updates(map[string]any{
-						"status":       core.StatusCancelled,
-						"completed_at": s.nowWriteValue(),
-						"updated_at":   now,
-					})
-				if result.Error != nil {
-					return result.Error
-				}
-
-				// Release any fleet concurrency slots held by the cancelled sub-jobs,
-				// atomically with the cancel write, so a worker that dies before its
-				// deferred release cannot orphan a live slot for a now-terminal job.
-				if err := tx.Where("job_id IN ?", cancelled).Delete(&core.ConcurrencySlot{}).Error; err != nil {
-					return err
-				}
-			}
-
-			// Reconcile the parent fan_outs persisted counters ATOMICALLY with the
-			// cancellation. accountTerminalWithFanOut froze the count snapshot and
-			// flipped fan_outs.status pending->terminal the instant TerminalStatus()
-			// reported done (e.g. fail_fast on the first sub-job failure) — while
-			// these siblings were still pending/running, hence uncounted. The only
-			// other count writers (the terminal CAS here and UpdateFanOutStatus) are
-			// guarded WHERE status='pending', so once the row is terminal they can
-			// never correct it: the persisted counts would stay permanently short
-			// (completed+failed+cancelled < total_count), which is exactly what the
-			// chaos INV-FANOUT-COUNTS invariant flags. Re-derive the live counts now
-			// that the cancellations are visible in THIS tx (read-your-writes) and
-			// persist them ungated by status, so the row reconciles to sum==total at
-			// quiescence. Idempotent: re-running yields the same live snapshot.
-			completedCount, failedCount, cancelledCount, err := liveFanOutCounts(tx, fanOutID)
-			if err != nil {
-				return err
-			}
-			if err := tx.Model(&core.FanOut{}).
-				Where("id = ?", fanOutID).
-				Updates(map[string]any{
-					"completed_count": completedCount,
-					"failed_count":    failedCount,
-					"cancelled_count": cancelledCount,
-					"updated_at":      now,
-				}).Error; err != nil {
-				return err
-			}
-			return nil
+			var err error
+			// Empty reason: the original CancelSubJobs (CancelOnFail path) did not
+			// write last_error on peer-cancelled siblings; preserve that.
+			cancelled, err = s.cancelFanOutChildrenAndReconcile(tx, fanOutID, []core.JobStatus{core.StatusPending, core.StatusRunning}, true, nil, "")
+			return err
 		})
 	})
 	if err != nil {
 		return nil, err
+	}
+	return cancelled, nil
+}
+
+func (s *GormStorage) cancelFanOutChildrenAndReconcile(tx *gorm.DB, fanOutID core.UUID, cancellable []core.JobStatus, lockChildren bool, terminalStatus *core.FanOutStatus, cancelReason string) ([]core.UUID, error) {
+	// Capture the IDs of sub-jobs we're about to cancel. Done before the UPDATE
+	// so callers get the in-flight set, not just rows that happen to remain
+	// pending after the update.
+	query := tx.Model(&core.Job{}).
+		Where("fan_out_id = ? AND status IN ?", fanOutID, cancellable).
+		Order("fan_out_index ASC")
+	if lockChildren {
+		query = s.lockForUpdate(query, false)
+	}
+	var cancelled []core.UUID
+	if err := query.Pluck("id", &cancelled).Error; err != nil {
+		return nil, err
+	}
+
+	now := time.Now()
+	if len(cancelled) > 0 {
+		// IMPORTANT: do NOT clear locked_by/locked_until here. A running sub-job
+		// cancelled by a peer (this write) must keep locked_by = its owning
+		// worker so that worker's ~5s ownership audit (FindOrphanedJobs, which
+		// flags a terminal row only when locked_by <> '') short-circuits the
+		// live handler. Clearing locked_by would defer the handler stop to the
+		// ~minutes heartbeat fallback. This matches the original CancelSubJobs.
+		updates := map[string]any{
+			"status":       core.StatusCancelled,
+			"completed_at": s.nowWriteValue(),
+			"updated_at":   now,
+		}
+		if cancelReason != "" {
+			// non-PII constant; intentionally stored plaintext
+			updates["last_error"] = cancelReason
+		}
+		result := tx.Model(&core.Job{}).
+			Where("id IN ?", cancelled).
+			Where("status IN ?", cancellable).
+			Updates(updates)
+		if result.Error != nil {
+			return nil, result.Error
+		}
+
+		// Release any fleet concurrency slots held by the cancelled sub-jobs,
+		// atomically with the cancel write, so a worker that dies before its
+		// deferred release cannot orphan a live slot for a now-terminal job.
+		if err := tx.Where("job_id IN ?", cancelled).Delete(&core.ConcurrencySlot{}).Error; err != nil {
+			return nil, err
+		}
+	}
+
+	// Reconcile the parent fan_outs persisted counters ATOMICALLY with the
+	// cancellation. The snapshot is live-count based and ungated by status so
+	// pre-frozen fail_fast / threshold rows are corrected to sum==total.
+	completedCount, failedCount, cancelledCount, err := liveFanOutCounts(tx, fanOutID)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Model(&core.FanOut{}).
+		Where("id = ?", fanOutID).
+		Updates(map[string]any{
+			"completed_count": completedCount,
+			"failed_count":    failedCount,
+			"cancelled_count": cancelledCount,
+			"updated_at":      now,
+		}).Error; err != nil {
+		return nil, err
+	}
+	if terminalStatus != nil {
+		if err := tx.Model(&core.FanOut{}).
+			Where("id = ? AND status = ?", fanOutID, core.FanOutPending).
+			Updates(map[string]any{
+				"status":     *terminalStatus,
+				"updated_at": now,
+			}).Error; err != nil {
+			return nil, err
+		}
 	}
 	return cancelled, nil
 }
@@ -2294,6 +2318,132 @@ func (s *GormStorage) PauseJobWithMode(ctx context.Context, jobID core.UUID, mod
 		return s.pauseJobGraceful(ctx, jobID)
 	}
 	return s.pauseJobAggressive(ctx, jobID)
+}
+
+// CancelJobTerminal terminally cancels a pending, waiting, or running job. When
+// the job is a fan-out parent, its entire descendant fan-out subtree is
+// terminally cancelled in the same transaction.
+//
+// OPERATIONAL NOTE: cancelling a fan-out parent is an O(subtree) single-
+// transaction operation — every descendant sub-job is locked FOR UPDATE and
+// updated in one tx to guarantee no half-cancelled tree. Cancelling a very wide
+// fan-out parent therefore holds that many row locks for the tx duration and can
+// stall concurrent child-completers; size is bounded by the real subtree.
+func (s *GormStorage) CancelJobTerminal(ctx context.Context, jobID core.UUID) error {
+	return s.withSerializationRetry(ctx, func() error {
+		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			now := time.Now()
+			// Do NOT clear locked_by/locked_until: a running job cancelled here
+			// must keep locked_by = its owning worker so that worker's ownership
+			// audit (FindOrphanedJobs) short-circuits the live handler in ~5s
+			// rather than waiting for the ~minutes heartbeat fallback.
+			result := tx.Model(&core.Job{}).
+				Where("id = ? AND status IN ?", jobID, []core.JobStatus{core.StatusPending, core.StatusWaiting, core.StatusRunning}).
+				Updates(map[string]any{
+					"status":       core.StatusCancelled,
+					"completed_at": s.nowWriteValue(),
+					"updated_at":   now,
+					// non-PII constant; intentionally stored plaintext
+					"last_error": "cancelled by user",
+				})
+			if result.Error != nil {
+				return result.Error
+			}
+			if result.RowsAffected == 0 {
+				var job core.Job
+				if err := tx.Select("status").First(&job, "id = ?", jobID).Error; err != nil {
+					if errors.Is(err, gorm.ErrRecordNotFound) {
+						return core.ErrJobNotFound
+					}
+					return err
+				}
+				if job.Status == core.StatusCancelled {
+					return nil
+				}
+				return core.ErrJobNotCancellable
+			}
+
+			if err := tx.Where("job_id = ?", jobID).Delete(&core.ConcurrencySlot{}).Error; err != nil {
+				return err
+			}
+
+			fanOutIDs, subJobIDs, err := s.collectFanOutSubtree(tx, jobID)
+			if err != nil {
+				return err
+			}
+			if len(subJobIDs) > 0 {
+				sort.Slice(subJobIDs, func(i, j int) bool { return subJobIDs[i] < subJobIDs[j] })
+				var locked []core.UUID
+				query := tx.Model(&core.Job{}).
+					Where("id IN ?", subJobIDs).
+					Order("id ASC")
+				query = s.lockForUpdate(query, false)
+				if err := query.Pluck("id", &locked).Error; err != nil {
+					return err
+				}
+			}
+			sort.Slice(fanOutIDs, func(i, j int) bool { return fanOutIDs[i] < fanOutIDs[j] })
+			for _, fanOutID := range fanOutIDs {
+				status := core.FanOutCancelled
+				if _, err := s.cancelFanOutChildrenAndReconcile(tx, fanOutID, []core.JobStatus{core.StatusPending, core.StatusWaiting, core.StatusRunning}, false, &status, "cancelled by user"); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+	})
+}
+
+func (s *GormStorage) collectFanOutSubtree(tx *gorm.DB, rootJobID core.UUID) ([]core.UUID, []core.UUID, error) {
+	var allFanOutIDs, allSubJobIDs []core.UUID
+	seenFanOuts := make(map[core.UUID]struct{})
+	seenJobs := make(map[core.UUID]struct{})
+	frontier := []core.UUID{rootJobID}
+
+	for depth := 0; len(frontier) > 0 && depth < maxFanOutTreeDepth; depth++ {
+		var fanOutIDs []core.UUID
+		if err := tx.Model(&core.FanOut{}).
+			Where("parent_job_id IN ?", frontier).
+			Pluck("id", &fanOutIDs).Error; err != nil {
+			return nil, nil, err
+		}
+		if len(fanOutIDs) == 0 {
+			break
+		}
+
+		levelFanOutIDs := make([]core.UUID, 0, len(fanOutIDs))
+		for _, id := range fanOutIDs {
+			if _, ok := seenFanOuts[id]; ok {
+				continue
+			}
+			seenFanOuts[id] = struct{}{}
+			levelFanOutIDs = append(levelFanOutIDs, id)
+			allFanOutIDs = append(allFanOutIDs, id)
+		}
+		if len(levelFanOutIDs) == 0 {
+			break
+		}
+
+		var subJobIDs []core.UUID
+		if err := tx.Model(&core.Job{}).
+			Where("fan_out_id IN ?", levelFanOutIDs).
+			Pluck("id", &subJobIDs).Error; err != nil {
+			return nil, nil, err
+		}
+
+		nextFrontier := make([]core.UUID, 0, len(subJobIDs))
+		for _, id := range subJobIDs {
+			if _, ok := seenJobs[id]; ok {
+				continue
+			}
+			seenJobs[id] = struct{}{}
+			allSubJobIDs = append(allSubJobIDs, id)
+			nextFrontier = append(nextFrontier, id)
+		}
+		frontier = nextFrontier
+	}
+
+	return allFanOutIDs, allSubJobIDs, nil
 }
 
 func (s *GormStorage) pauseJobGraceful(ctx context.Context, jobID core.UUID) error {

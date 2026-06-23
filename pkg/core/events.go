@@ -63,6 +63,14 @@ type JobPaused struct {
 
 func (*JobPaused) eventMarker() {}
 
+// JobCancelled is emitted when a job is terminally cancelled.
+type JobCancelled struct {
+	Job       *Job
+	Timestamp time.Time
+}
+
+func (*JobCancelled) eventMarker() {}
+
 // JobResumed is emitted when a job is resumed.
 type JobResumed struct {
 	Job       *Job

@@ -337,7 +337,7 @@ func (s *jobsService) PauseJob(ctx context.Context, req *connect.Request[jobsv1.
 	return connect.NewResponse(&jobsv1.PauseJobResponse{Job: s.jobToProto(job)}), nil
 }
 
-// CancelJob cooperatively cancels a running job by aliasing aggressive pause.
+// CancelJob terminally cancels a job.
 func (s *jobsService) CancelJob(ctx context.Context, req *connect.Request[jobsv1.CancelJobRequest]) (*connect.Response[jobsv1.CancelJobResponse], error) {
 	if s.queue == nil {
 		return nil, connect.NewError(connect.CodeUnimplemented, nil)
@@ -971,6 +971,7 @@ func errToConnect(err error) error {
 	case errors.Is(err, core.ErrJobHasChildren),
 		errors.Is(err, core.ErrJobAlreadyPaused),
 		errors.Is(err, core.ErrJobNotPaused),
+		errors.Is(err, core.ErrJobNotCancellable),
 		errors.Is(err, core.ErrCannotPauseStatus),
 		errors.Is(err, core.ErrQueueAlreadyPaused),
 		errors.Is(err, core.ErrQueueNotPaused),
@@ -1199,6 +1200,12 @@ func coreEventToProto(e core.Event) *jobsv1.Event {
 	case *core.JobPaused:
 		return &jobsv1.Event{
 			Type:      "job.paused",
+			Job:       jobToProto(ev.Job),
+			Timestamp: timestamppb.New(ev.Timestamp),
+		}
+	case *core.JobCancelled:
+		return &jobsv1.Event{
+			Type:      "job.cancelled",
 			Job:       jobToProto(ev.Job),
 			Timestamp: timestamppb.New(ev.Timestamp),
 		}

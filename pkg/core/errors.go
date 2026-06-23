@@ -20,6 +20,7 @@ var (
 	ErrUniqueKeyTooLong   = errors.New("jobs: unique key exceeds maximum length")
 	ErrJobAlreadyPaused   = errors.New("jobs: job is already paused")
 	ErrJobNotPaused       = errors.New("jobs: job is not paused")
+	ErrJobNotCancellable  = errors.New("jobs: job is not cancellable")
 	ErrQueueAlreadyPaused = errors.New("jobs: queue is already paused")
 	ErrQueueNotPaused     = errors.New("jobs: queue is not paused")
 	ErrCannotPauseStatus  = errors.New("jobs: cannot pause job in current status")
@@ -146,6 +147,7 @@ var sentinelsByKey = map[string]error{
 	"ErrUniqueKeyTooLong":   ErrUniqueKeyTooLong,
 	"ErrJobAlreadyPaused":   ErrJobAlreadyPaused,
 	"ErrJobNotPaused":       ErrJobNotPaused,
+	"ErrJobNotCancellable":  ErrJobNotCancellable,
 	"ErrQueueAlreadyPaused": ErrQueueAlreadyPaused,
 	"ErrQueueNotPaused":     ErrQueueNotPaused,
 	"ErrCannotPauseStatus":  ErrCannotPauseStatus,
