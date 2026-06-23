@@ -27,6 +27,12 @@ type minimalStorage struct {
 	checkpoints     map[string][]*core.Checkpoint
 	suspended       map[string]bool
 	enqueueBatchErr error
+	// onEnqueueBatch, if set, runs inside EnqueueBatch — used to simulate a
+	// concurrent CancelJobTerminal landing mid-enqueue in the first-execution
+	// cancel-race test.
+	onEnqueueBatch func()
+	// cancelSubJobsCalls records the fan-out IDs passed to CancelSubJobs.
+	cancelSubJobsCalls []core.UUID
 }
 
 func newMinimalStorage() *minimalStorage {
@@ -65,6 +71,9 @@ func (s *minimalStorage) EnqueueBatch(ctx context.Context, jobs []*core.Job) err
 			}
 		}
 		s.jobs[string(j.ID)] = j
+	}
+	if s.onEnqueueBatch != nil {
+		s.onEnqueueBatch()
 	}
 	return nil
 }
@@ -174,6 +183,7 @@ func (s *minimalStorage) GetSubJobResults(ctx context.Context, fanOutID core.UUI
 	return out, nil
 }
 func (s *minimalStorage) CancelSubJobs(ctx context.Context, fanOutID core.UUID) ([]core.UUID, error) {
+	s.cancelSubJobsCalls = append(s.cancelSubJobsCalls, fanOutID)
 	return nil, nil
 }
 func (s *minimalStorage) CancelSubJob(ctx context.Context, jobID core.UUID) (*core.FanOut, error) {
@@ -326,6 +336,44 @@ func TestFanOut_FirstExecution_SuspendsAndReturnsError(t *testing.T) {
 		}
 	}
 	assert.Equal(t, 2, subJobCount)
+
+	// Happy path: the fan-out was not cancelled, so the cancel-race guard must
+	// NOT have cancelled the children.
+	assert.Empty(t, store.cancelSubJobsCalls)
+}
+
+// TestFanOut_FirstExecution_CancelRaceCancelsOrphanChildren exercises the
+// first-execution cancel-race guard: if a CancelJobTerminal(parent) lands during
+// the enqueue (flipping the fan-out to cancelled while its subtree walk saw zero
+// children), the just-enqueued children must be terminally cancelled so they do
+// not run as orphans against a cancelled fan-out.
+func TestFanOut_FirstExecution_CancelRaceCancelsOrphanChildren(t *testing.T) {
+	store := newMinimalStorage()
+	jc := makeJobCtx(store, "parent-cancel-race", "default")
+	ctx := buildCtx(jc, nil)
+
+	// Simulate the concurrent terminal cancel landing mid-enqueue.
+	store.onEnqueueBatch = func() {
+		for _, fo := range store.fanOuts {
+			fo.Status = core.FanOutCancelled
+		}
+	}
+
+	subs := []SubJob{
+		{Type: "do-work", Args: "a"},
+		{Type: "do-work", Args: "b"},
+	}
+	_, err := FanOut[string](ctx, subs)
+	require.Error(t, err)
+	assert.True(t, IsWaitingError(err), "expected WaitingError, got: %v", err)
+
+	// The guard must have detected the cancelled fan-out and cancelled the
+	// just-enqueued children exactly once, for the created fan-out.
+	require.Len(t, store.cancelSubJobsCalls, 1)
+	require.Len(t, store.fanOuts, 1)
+	for id := range store.fanOuts {
+		assert.Equal(t, core.UUID(id), store.cancelSubJobsCalls[0])
+	}
 }
 
 func TestFanOut_FirstExecution_InheritsTenantAndMetadata(t *testing.T) {

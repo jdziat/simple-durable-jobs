@@ -2367,9 +2367,16 @@ func (s *GormStorage) CancelJobTerminal(ctx context.Context, jobID core.UUID) er
 				return err
 			}
 
-			fanOutIDs, subJobIDs, err := s.collectFanOutSubtree(tx, jobID)
+			fanOutIDs, subJobIDs, truncated, err := s.collectFanOutSubtree(tx, jobID)
 			if err != nil {
 				return err
+			}
+			if truncated {
+				// The descendant fan-out tree is deeper than maxFanOutTreeDepth.
+				// Abort rather than silently cancel only part of it — a tree this
+				// deep indicates runaway recursive fan-out (or a cycle), which the
+				// operator needs to see, not a quietly partial cancel.
+				return fmt.Errorf("storage: fan-out subtree for job %s exceeds max depth %d; terminal cancel aborted to avoid a silent partial cancellation", jobID, maxFanOutTreeDepth)
 			}
 			if len(subJobIDs) > 0 {
 				sort.Slice(subJobIDs, func(i, j int) bool { return subJobIDs[i] < subJobIDs[j] })
@@ -2394,18 +2401,28 @@ func (s *GormStorage) CancelJobTerminal(ctx context.Context, jobID core.UUID) er
 	})
 }
 
-func (s *GormStorage) collectFanOutSubtree(tx *gorm.DB, rootJobID core.UUID) ([]core.UUID, []core.UUID, error) {
-	var allFanOutIDs, allSubJobIDs []core.UUID
+// collectFanOutSubtree walks the descendant fan-out tree rooted at rootJobID
+// breadth-first, deduping via the seen maps (which alone guarantee termination
+// for any finite graph, even a cyclic one). maxFanOutTreeDepth is a secondary
+// backstop; the returned truncated flag reports whether that bound was hit with
+// work still pending, so the caller can fail loudly rather than silently cancel
+// only part of the tree.
+func (s *GormStorage) collectFanOutSubtree(tx *gorm.DB, rootJobID core.UUID) (allFanOutIDs, allSubJobIDs []core.UUID, truncated bool, err error) {
 	seenFanOuts := make(map[core.UUID]struct{})
 	seenJobs := make(map[core.UUID]struct{})
 	frontier := []core.UUID{rootJobID}
 
-	for depth := 0; len(frontier) > 0 && depth < maxFanOutTreeDepth; depth++ {
+	for depth := 0; len(frontier) > 0; depth++ {
+		if depth >= maxFanOutTreeDepth {
+			// Bound hit with frontier still non-empty: deeper descendants remain.
+			truncated = true
+			break
+		}
 		var fanOutIDs []core.UUID
 		if err := tx.Model(&core.FanOut{}).
 			Where("parent_job_id IN ?", frontier).
 			Pluck("id", &fanOutIDs).Error; err != nil {
-			return nil, nil, err
+			return nil, nil, false, err
 		}
 		if len(fanOutIDs) == 0 {
 			break
@@ -2428,7 +2445,7 @@ func (s *GormStorage) collectFanOutSubtree(tx *gorm.DB, rootJobID core.UUID) ([]
 		if err := tx.Model(&core.Job{}).
 			Where("fan_out_id IN ?", levelFanOutIDs).
 			Pluck("id", &subJobIDs).Error; err != nil {
-			return nil, nil, err
+			return nil, nil, false, err
 		}
 
 		nextFrontier := make([]core.UUID, 0, len(subJobIDs))
@@ -2443,7 +2460,7 @@ func (s *GormStorage) collectFanOutSubtree(tx *gorm.DB, rootJobID core.UUID) ([]
 		frontier = nextFrontier
 	}
 
-	return allFanOutIDs, allSubJobIDs, nil
+	return allFanOutIDs, allSubJobIDs, truncated, nil
 }
 
 func (s *GormStorage) pauseJobGraceful(ctx context.Context, jobID core.UUID) error {
