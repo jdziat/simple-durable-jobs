@@ -3072,17 +3072,24 @@ func TestCancelJob_StorageError(t *testing.T) {
 	assert.Equal(t, connect.CodeInternal, connect.CodeOf(err))
 }
 
-func TestCancelJob_JobNotFoundAfterCancel(t *testing.T) {
+// TestCancelJob_RowGCdAfterCancelReturnsCancelled covers the post-cancel re-read
+// race: the cancel itself succeeds, but the row can't be read back (e.g. a
+// retention GC raced the re-read). The RPC must return a cancelled job, not a
+// misleading NotFound for an operation that did complete. (A genuinely missing
+// job is rejected earlier by the cancel itself, via ErrJobNotFound.)
+func TestCancelJob_RowGCdAfterCancelReturnsCancelled(t *testing.T) {
 	store := &mockStorage{
-		pauseJobFn: func(_ context.Context, _ core.UUID) error { return nil },
-		getJobFn:   func(_ context.Context, _ core.UUID) (*core.Job, error) { return nil, nil },
+		cancelJobTerminalFn: func(_ context.Context, _ core.UUID) error { return nil },
+		getJobFn:            func(_ context.Context, _ core.UUID) (*core.Job, error) { return nil, nil },
 	}
 	q := queue.New(store)
 	svc := newJobsService(store, q, nil)
 
-	_, err := svc.CancelJob(context.Background(), connect.NewRequest(&jobsv1.CancelJobRequest{Id: uiTestID("j1")}))
-	require.Error(t, err)
-	assert.Equal(t, connect.CodeNotFound, connect.CodeOf(err))
+	resp, err := svc.CancelJob(context.Background(), connect.NewRequest(&jobsv1.CancelJobRequest{Id: uiTestID("j1")}))
+	require.NoError(t, err)
+	require.NotNil(t, resp.Msg.Job)
+	assert.Equal(t, uiTestID("j1"), resp.Msg.Job.Id)
+	assert.Equal(t, string(core.StatusCancelled), resp.Msg.Job.Status)
 }
 
 // ---------------------------------------------------------------------------

@@ -354,7 +354,10 @@ func (s *jobsService) CancelJob(ctx context.Context, req *connect.Request[jobsv1
 		return nil, errToConnect(err)
 	}
 	if job == nil {
-		return nil, connect.NewError(connect.CodeNotFound, nil)
+		// The cancel already succeeded; the row just can't be read back (e.g. a
+		// retention GC raced the re-read). Return a minimal cancelled job rather
+		// than a misleading NotFound for an operation that did complete.
+		job = &core.Job{ID: id, Status: core.StatusCancelled}
 	}
 	return connect.NewResponse(&jobsv1.CancelJobResponse{Job: s.jobToProto(job)}), nil
 }

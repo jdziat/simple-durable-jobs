@@ -155,6 +155,29 @@ func FanOut[T any](ctx context.Context, subJobs []SubJob, opts ...Option) ([]Res
 		return nil, fmt.Errorf("failed to enqueue sub-jobs: %w", err)
 	}
 
+	// First-execution cancel-race guard. A CancelJobTerminal(parent) that landed
+	// after MarkWaiting but before this enqueue committed would have flipped the
+	// fan-out to cancelled while its subtree walk saw zero children — leaving the
+	// children we just enqueued to run as orphans against a cancelled fan-out.
+	// Re-read the fan-out; if it already reads cancelled, terminally cancel the
+	// children we just enqueued.
+	//
+	// This NARROWS, not closes, the window: this is a separate autocommit read,
+	// so a cancel that commits after it (invisible here under READ COMMITTED) can
+	// still leave already-dispatched children running — the inherent at-least-once
+	// behavior a cancel cannot undo for in-flight work. What IS guaranteed in every
+	// interleaving: the persisted fan-out counts reconcile to sum==total (here, or
+	// via the operator cancel's own subtree walk, or via natural completion), and
+	// the terminally-cancelled parent is never resumed (ResumeJob's CAS matches
+	// only waiting/paused).
+	if fo, foErr := jc.Storage.GetFanOut(ctx, fanOutID); foErr == nil && fo != nil && fo.Status == core.FanOutCancelled {
+		if _, cancelErr := jc.Storage.CancelSubJobs(ctx, fanOutID); cancelErr != nil {
+			// Best-effort cleanup: the operator cancel's own subtree reconcile and
+			// the natural-completion accounting still converge sum==total.
+			_ = cancelErr
+		}
+	}
+
 	// Signal to worker that this job should not continue
 	return nil, &WaitingError{FanOutID: fanOutID}
 }
