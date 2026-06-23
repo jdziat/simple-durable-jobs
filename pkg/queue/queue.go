@@ -1167,25 +1167,38 @@ func (q *Queue) PauseJob(ctx context.Context, jobID core.UUID, opts ...PauseOpti
 	return nil
 }
 
-// CancelJob cooperatively cancels a running job by aliasing aggressive pause.
-// It durably records cancellation through the storage pause path and cancels a
-// locally-running handler's context; handlers that ignore ctx are not force-killed.
-// Pending or waiting jobs are paused by the underlying pause operation. Already
-// paused jobs, terminal jobs, and missing jobs return the same sentinel errors
-// as PauseJob, such as ErrJobAlreadyPaused, ErrCannotPauseStatus, or ErrJobNotFound.
+// CancelJob terminally cancels a pending, waiting, or running job. Cancelled
+// jobs are not resumable via ResumeJob; use Requeue to replay a terminally
+// cancelled job from scratch. When the target is a fan-out parent, all direct
+// and nested fan-out children are terminally cancelled in the same storage
+// transaction.
 //
-// RACE / KNOWN BEHAVIOR: because cancel aliases aggressive pause, the outcome
-// depends on the job's status at the moment the storage write lands. A job that
-// is running when you call CancelJob but self-suspends to 'waiting' first (it
-// entered FanOut/Call/WaitForSignal and committed MarkWaiting just before the
-// cancel) is observed as waiting and therefore PAUSED (recoverable), not
-// CANCELLED (terminal). The job is not running and will not auto-resume, but it
-// can be unpaused. To force terminal cancellation regardless of this race, re-read
-// the status and call CancelJob again once the job has settled. A dedicated
-// cancel mode that maps waiting→cancelled is a deliberate cancellation-semantics
-// change tracked separately.
+// If the job is running in this process, CancelJob also cancels its handler
+// context after the durable terminal write succeeds. Running children on other
+// workers are cancelled durably immediately, but their handler goroutines stop
+// on the eventually-consistent ownership/heartbeat path; "terminal" means the
+// database state cannot resume, not that remote CPU is synchronously killed.
 func (q *Queue) CancelJob(ctx context.Context, jobID core.UUID) error {
-	return q.PauseJob(ctx, jobID, WithPauseMode(core.PauseModeAggressive))
+	q.runningJobsMu.Lock()
+	cancel, runningLocally := q.runningJobs[jobID]
+	q.runningJobsMu.Unlock()
+
+	if err := q.storage.CancelJobTerminal(ctx, jobID); err != nil {
+		return err
+	}
+	if runningLocally {
+		cancel()
+	}
+
+	// Re-read for the event payload. If the row can't be read back (e.g. a
+	// retention GC raced the cancel), still emit with a minimal job rather than
+	// silently dropping the event — the cancel itself already succeeded.
+	job, getErr := q.storage.GetJob(ctx, jobID)
+	if getErr != nil || job == nil {
+		job = &core.Job{ID: jobID, Status: core.StatusCancelled}
+	}
+	q.Emit(&core.JobCancelled{Job: job, Timestamp: time.Now()})
+	return nil
 }
 
 // ResumeJob resumes a paused job.

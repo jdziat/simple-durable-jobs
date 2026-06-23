@@ -59,8 +59,10 @@ func FanOut[T any](ctx context.Context, subJobs []SubJob, opts ...Option) ([]Res
 		if err != nil {
 			return nil, fmt.Errorf("failed to get fan-out: %w", err)
 		}
-		if fanOut != nil && (fanOut.Status == core.FanOutCompleted || fanOut.Status == core.FanOutFailed) {
-			// Fan-out is done, collect results
+		if fanOut != nil && (fanOut.Status == core.FanOutCompleted || fanOut.Status == core.FanOutFailed || fanOut.Status == core.FanOutCancelled) {
+			// Fan-out is terminal (completed, failed, or cancelled) — collect
+			// results rather than rebuild sub-jobs. CollectResults maps cancelled
+			// children to ErrSubJobCancelled.
 			return CollectResults[T](ctx, fanOutID)
 		}
 		if fanOut == nil {

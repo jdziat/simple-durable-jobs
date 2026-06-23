@@ -119,6 +119,10 @@ type Storage interface {
 
 	// Job pause operations
 	PauseJob(ctx context.Context, jobID UUID) error
+	// CancelJobTerminal terminally cancels a pending, waiting, or running job
+	// (not a pause: the job is not resumable) and terminally cancels the job's
+	// entire descendant fan-out subtree in the same transaction.
+	CancelJobTerminal(ctx context.Context, jobID UUID) error
 	UnpauseJob(ctx context.Context, jobID UUID) error
 	GetPausedJobs(ctx context.Context, queue string) ([]*Job, error)
 	IsJobPaused(ctx context.Context, jobID UUID) (bool, error)

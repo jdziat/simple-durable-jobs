@@ -40,6 +40,7 @@ type mockStorage struct {
 	getFanOutsByParentFn func(ctx context.Context, parentID core.UUID) ([]*core.FanOut, error)
 	getSubJobsFn         func(ctx context.Context, fanOutID core.UUID) ([]*core.Job, error)
 	pauseJobFn           func(ctx context.Context, id core.UUID) error
+	cancelJobTerminalFn  func(ctx context.Context, id core.UUID) error
 	unpauseJobFn         func(ctx context.Context, id core.UUID) error
 	isJobPausedFn        func(ctx context.Context, id core.UUID) (bool, error)
 	getPausedJobsFn      func(ctx context.Context, queue string) ([]*core.Job, error)
@@ -125,6 +126,15 @@ func (m *mockStorage) SaveJobResult(_ context.Context, _ core.UUID, _ string, _ 
 	return nil
 }
 func (m *mockStorage) PauseJob(ctx context.Context, id core.UUID) error {
+	if m.pauseJobFn != nil {
+		return m.pauseJobFn(ctx, id)
+	}
+	return nil
+}
+func (m *mockStorage) CancelJobTerminal(ctx context.Context, id core.UUID) error {
+	if m.cancelJobTerminalFn != nil {
+		return m.cancelJobTerminalFn(ctx, id)
+	}
 	if m.pauseJobFn != nil {
 		return m.pauseJobFn(ctx, id)
 	}

@@ -26,7 +26,7 @@ var migrateMu sync.Mutex
 var (
 	jobStatuses      = "'pending','running','completed','failed','retrying','waiting','cancelled','paused'"
 	fanOutStrategies = "'fail_fast','collect_all','threshold'"
-	fanOutStatuses   = "'pending','completed','failed'"
+	fanOutStatuses   = "'pending','completed','failed','cancelled'"
 )
 
 // migrateMinConns is the connection floor Migrate needs: one for the fleet lock
@@ -320,6 +320,11 @@ var schemaMigrations = []schemaMigration{
 		Version: 34,
 		Name:    "unique_locks_job_id_index",
 		Up:      migrateUniqueLocksJobIDIndex,
+	},
+	{
+		Version: 35,
+		Name:    "fan_outs_status_allow_cancelled",
+		Up:      migrateFanOutStatusAllowCancelled,
 	},
 }
 
@@ -1296,6 +1301,56 @@ func migrateCheckConstraints(ctx context.Context, db *gorm.DB, dialect string) e
 	default:
 		// CHECK enforcement is on the production engines (Postgres/MySQL);
 		// SQLite dev tables rely on the Go enum types.
+		return nil
+	}
+}
+
+// migrateFanOutStatusAllowCancelled widens the chk_fan_outs_status CHECK to
+// admit the 'cancelled' terminal status introduced by CancelJobTerminal.
+// migrateCheckConstraints (v22) only ADDS a missing constraint and skips one
+// that already exists, so an existing deployment keeps its old three-value
+// constraint and rejects the cancel write — this versioned step drops and
+// recreates the constraint with the widened set (fanOutStatuses now includes
+// 'cancelled'). Idempotent: DROP guards on existence and the recreated set is
+// a superset of every pre-existing row's status, so VALIDATE always passes.
+func migrateFanOutStatusAllowCancelled(ctx context.Context, db *gorm.DB, dialect string) error {
+	const name = "chk_fan_outs_status"
+	m := db.Migrator()
+	switch dialect {
+	case dialectPostgres:
+		if err := db.WithContext(ctx).Exec(
+			"ALTER TABLE fan_outs DROP CONSTRAINT IF EXISTS " + name,
+		).Error; err != nil {
+			return fmt.Errorf("drop %s: %w", name, err)
+		}
+		if err := db.WithContext(ctx).Exec(
+			fmt.Sprintf("ALTER TABLE fan_outs ADD CONSTRAINT %s CHECK (status IN (%s)) NOT VALID", name, fanOutStatuses),
+		).Error; err != nil {
+			return fmt.Errorf("add %s: %w", name, err)
+		}
+		if err := db.WithContext(ctx).Exec(
+			"ALTER TABLE fan_outs VALIDATE CONSTRAINT " + name,
+		).Error; err != nil {
+			return fmt.Errorf("validate %s: %w", name, err)
+		}
+		return nil
+	case dialectMySQL:
+		// MySQL has no DROP CHECK ... IF EXISTS; guard on existence instead.
+		if m.HasConstraint(&core.FanOut{}, name) {
+			if err := db.WithContext(ctx).Exec(
+				"ALTER TABLE fan_outs DROP CHECK " + name,
+			).Error; err != nil && !isBenignDDLError(err) {
+				return fmt.Errorf("drop %s: %w", name, err)
+			}
+		}
+		if err := db.WithContext(ctx).Exec(
+			fmt.Sprintf("ALTER TABLE fan_outs ADD CONSTRAINT %s CHECK (status COLLATE utf8mb4_0900_as_cs IN (%s))", name, fanOutStatuses),
+		).Error; err != nil && !isBenignDDLError(err) {
+			return fmt.Errorf("add %s: %w", name, err)
+		}
+		return nil
+	default:
+		// SQLite dev tables rely on the Go enum types; no CHECK to widen.
 		return nil
 	}
 }
