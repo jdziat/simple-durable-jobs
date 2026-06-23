@@ -8,7 +8,7 @@ import (
 	connect "connectrpc.com/connect"
 	context "context"
 	errors "errors"
-	v1 "github.com/jdziat/simple-durable-jobs/v3/ui/gen/jobs/v1"
+	v1 "github.com/jdziat/simple-durable-jobs/v4/ui/gen/jobs/v1"
 	http "net/http"
 	strings "strings"
 )

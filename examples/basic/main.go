@@ -10,7 +10,7 @@ import (
 	"syscall"
 	"time"
 
-	jobs "github.com/jdziat/simple-durable-jobs/v3"
+	jobs "github.com/jdziat/simple-durable-jobs/v4"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )

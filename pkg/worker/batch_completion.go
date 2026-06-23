@@ -8,8 +8,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/jdziat/simple-durable-jobs/v3/pkg/core"
-	"github.com/jdziat/simple-durable-jobs/v3/pkg/storage"
+	"github.com/jdziat/simple-durable-jobs/v4/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/v4/pkg/storage"
 )
 
 var errBatchCompletionClosed = errors.New("batch completion accumulator closed")

@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"time"
 
-	jobs "github.com/jdziat/simple-durable-jobs/v3"
-	typed "github.com/jdziat/simple-durable-jobs/v3/pkg/typed"
+	jobs "github.com/jdziat/simple-durable-jobs/v4"
+	typed "github.com/jdziat/simple-durable-jobs/v4/pkg/typed"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )

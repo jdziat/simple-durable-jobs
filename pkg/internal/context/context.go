@@ -5,7 +5,7 @@ import (
 	"log/slog"
 	"sync"
 
-	"github.com/jdziat/simple-durable-jobs/v3/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/v4/pkg/core"
 )
 
 // JobContextKey is the key for storing job context in context.Context.

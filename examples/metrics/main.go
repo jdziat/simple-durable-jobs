@@ -18,8 +18,8 @@ import (
 	"strings"
 	"time"
 
-	jobs "github.com/jdziat/simple-durable-jobs/v3"
-	jobsmetrics "github.com/jdziat/simple-durable-jobs/v3/pkg/metrics"
+	jobs "github.com/jdziat/simple-durable-jobs/v4"
+	jobsmetrics "github.com/jdziat/simple-durable-jobs/v4/pkg/metrics"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"

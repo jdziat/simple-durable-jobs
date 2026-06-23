@@ -10,7 +10,7 @@ weight: 11
 Creates an HTTP handler serving the dashboard and Connect-RPC API.
 
 ```go
-import "github.com/jdziat/simple-durable-jobs/v3/ui"
+import "github.com/jdziat/simple-durable-jobs/v4/ui"
 
 mux.Handle("/jobs/", http.StripPrefix("/jobs", ui.Handler(storage,
     ui.WithQueue(queue),

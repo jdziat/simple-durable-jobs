@@ -4,8 +4,8 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/jdziat/simple-durable-jobs/v3/pkg/core"
-	"github.com/jdziat/simple-durable-jobs/v3/pkg/queue"
+	"github.com/jdziat/simple-durable-jobs/v4/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/v4/pkg/queue"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

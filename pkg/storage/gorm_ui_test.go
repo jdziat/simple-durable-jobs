@@ -12,8 +12,8 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 
-	"github.com/jdziat/simple-durable-jobs/v3/pkg/core"
-	jobsv1 "github.com/jdziat/simple-durable-jobs/v3/ui/gen/jobs/v1"
+	"github.com/jdziat/simple-durable-jobs/v4/pkg/core"
+	jobsv1 "github.com/jdziat/simple-durable-jobs/v4/ui/gen/jobs/v1"
 )
 
 func newUITestStorage(t *testing.T) *GormStorage {

@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jdziat/simple-durable-jobs/v3/pkg/core"
-	"github.com/jdziat/simple-durable-jobs/v3/pkg/storage"
+	"github.com/jdziat/simple-durable-jobs/v4/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/v4/pkg/storage"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/driver/sqlite"

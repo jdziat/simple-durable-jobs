@@ -6,10 +6,10 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/jdziat/simple-durable-jobs/v3/pkg/core"
-	intctx "github.com/jdziat/simple-durable-jobs/v3/pkg/internal/context"
-	"github.com/jdziat/simple-durable-jobs/v3/pkg/internal/handler"
-	"github.com/jdziat/simple-durable-jobs/v3/pkg/security"
+	"github.com/jdziat/simple-durable-jobs/v4/pkg/core"
+	intctx "github.com/jdziat/simple-durable-jobs/v4/pkg/internal/context"
+	"github.com/jdziat/simple-durable-jobs/v4/pkg/internal/handler"
+	"github.com/jdziat/simple-durable-jobs/v4/pkg/security"
 )
 
 // checkpointIndexCleaner is an optional storage capability used to clear an

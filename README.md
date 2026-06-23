@@ -1,8 +1,8 @@
 # Simple Durable Jobs
 
-[![Go Reference](https://pkg.go.dev/badge/github.com/jdziat/simple-durable-jobs/v3.svg)](https://pkg.go.dev/github.com/jdziat/simple-durable-jobs/v3)
+[![Go Reference](https://pkg.go.dev/badge/github.com/jdziat/simple-durable-jobs/v4.svg)](https://pkg.go.dev/github.com/jdziat/simple-durable-jobs/v4)
 [![CI](https://github.com/jdziat/simple-durable-jobs/actions/workflows/ci.yml/badge.svg)](https://github.com/jdziat/simple-durable-jobs/actions/workflows/ci.yml)
-[![Go Report Card](https://goreportcard.com/badge/github.com/jdziat/simple-durable-jobs/v3)](https://goreportcard.com/report/github.com/jdziat/simple-durable-jobs/v3)
+[![Go Report Card](https://goreportcard.com/badge/github.com/jdziat/simple-durable-jobs/v4)](https://goreportcard.com/report/github.com/jdziat/simple-durable-jobs/v4)
 [![codecov](https://codecov.io/gh/jdziat/simple-durable-jobs/branch/main/graph/badge.svg)](https://codecov.io/gh/jdziat/simple-durable-jobs)
 
 A Go library for durable, checkpointed background jobs and workflows that runs
@@ -94,7 +94,7 @@ backend support tiers, and crash-recovery tuning.
 ## Installation
 
 ```bash
-go get github.com/jdziat/simple-durable-jobs/v3
+go get github.com/jdziat/simple-durable-jobs/v4
 ```
 
 Upgrading from v2? See the [v2 to v3 migration guide](https://jdziat.github.io/simple-durable-jobs/docs/migration-v2-to-v3/).
@@ -109,7 +109,7 @@ import (
     "fmt"
     "log"
 
-    jobs "github.com/jdziat/simple-durable-jobs/v3"
+    jobs "github.com/jdziat/simple-durable-jobs/v4"
     "gorm.io/driver/sqlite"
     "gorm.io/gorm"
 )
@@ -286,7 +286,7 @@ paused, _ = queue.IsQueuePaused(ctx, "emails")
 Mount a real-time monitoring dashboard into your existing HTTP server:
 
 ```go
-import "github.com/jdziat/simple-durable-jobs/v3/ui"
+import "github.com/jdziat/simple-durable-jobs/v4/ui"
 
 ctx, cancel := context.WithCancel(context.Background())
 defer cancel()
@@ -409,7 +409,7 @@ Optional distributed tracing via the `pkg/otel` sub-package. Trace context propa
 from enqueue to worker execution automatically.
 
 ```go
-import jobsotel "github.com/jdziat/simple-durable-jobs/v3/pkg/otel"
+import jobsotel "github.com/jdziat/simple-durable-jobs/v4/pkg/otel"
 
 // Instrument the queue (uses global TracerProvider by default)
 jobsotel.Instrument(queue)
@@ -529,7 +529,7 @@ simple-durable-jobs/
 Users should import the root package:
 
 ```go
-import jobs "github.com/jdziat/simple-durable-jobs/v3"
+import jobs "github.com/jdziat/simple-durable-jobs/v4"
 ```
 
 All public types and functions are re-exported through the facade for a clean API.

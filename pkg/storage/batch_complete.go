@@ -9,7 +9,7 @@ import (
 
 	"gorm.io/gorm"
 
-	"github.com/jdziat/simple-durable-jobs/v3/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/v4/pkg/core"
 )
 
 const batchCompleteChunkSize = 400

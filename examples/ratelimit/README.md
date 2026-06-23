@@ -92,4 +92,4 @@ Phase A is governed by admission pacing. Phase B is governed by shared in-flight
 - [Advanced - Rate Limiting](https://jdziat.github.io/simple-durable-jobs/docs/advanced/rate-limiting/)
 - [Advanced - Concurrency Caps](https://jdziat.github.io/simple-durable-jobs/docs/advanced/concurrency-caps/)
 - [API Reference - Worker Options](https://jdziat.github.io/simple-durable-jobs/docs/api-reference/worker/)
-- [pkg.go.dev - simple-durable-jobs](https://pkg.go.dev/github.com/jdziat/simple-durable-jobs/v3)
+- [pkg.go.dev - simple-durable-jobs](https://pkg.go.dev/github.com/jdziat/simple-durable-jobs/v4)

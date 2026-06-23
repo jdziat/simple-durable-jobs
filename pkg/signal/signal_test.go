@@ -11,9 +11,9 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/jdziat/simple-durable-jobs/v3/pkg/core"
-	intctx "github.com/jdziat/simple-durable-jobs/v3/pkg/internal/context"
-	"github.com/jdziat/simple-durable-jobs/v3/pkg/signal"
+	"github.com/jdziat/simple-durable-jobs/v4/pkg/core"
+	intctx "github.com/jdziat/simple-durable-jobs/v4/pkg/internal/context"
+	"github.com/jdziat/simple-durable-jobs/v4/pkg/signal"
 )
 
 // fakeSignalStore implements the (unexported) signalStorage capability plus the

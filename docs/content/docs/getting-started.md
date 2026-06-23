@@ -25,7 +25,7 @@ stateDiagram-v2
 ## Installation
 
 ```bash
-go get github.com/jdziat/simple-durable-jobs/v3
+go get github.com/jdziat/simple-durable-jobs/v4
 ```
 
 You'll also need a database driver. For development, SQLite works great:
@@ -50,7 +50,7 @@ package main
 import (
     "context"
 
-    jobs "github.com/jdziat/simple-durable-jobs/v3"
+    jobs "github.com/jdziat/simple-durable-jobs/v4"
     "gorm.io/driver/sqlite"
     "gorm.io/gorm"
 )
@@ -119,7 +119,7 @@ queue.Register("calculate", func(ctx context.Context, x int) (int, error) {
 The string-keyed `Register` path is still useful for remote producers, dynamic job names, and interoperability with non-Go systems. For compile-time checked producer code, use the typed API:
 
 ```go
-import typed "github.com/jdziat/simple-durable-jobs/v3/pkg/typed"
+import typed "github.com/jdziat/simple-durable-jobs/v4/pkg/typed"
 
 type SendEmailResult struct {
     MessageID string `json:"message_id"`
@@ -337,7 +337,7 @@ worker.Pause(jobs.PauseModeAggressive)
 Mount a monitoring dashboard into your HTTP server:
 
 ```go
-import "github.com/jdziat/simple-durable-jobs/v3/ui"
+import "github.com/jdziat/simple-durable-jobs/v4/ui"
 
 ctx, cancel := context.WithCancel(context.Background())
 defer cancel()

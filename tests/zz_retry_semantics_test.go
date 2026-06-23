@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	jobs "github.com/jdziat/simple-durable-jobs/v3"
+	jobs "github.com/jdziat/simple-durable-jobs/v4"
 )
 
 // Empirically determine: for jobs.Retries(N), how many TOTAL executions happen

@@ -15,8 +15,8 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 
-	payloadcodec "github.com/jdziat/simple-durable-jobs/v3/pkg/codec"
-	"github.com/jdziat/simple-durable-jobs/v3/pkg/core"
+	payloadcodec "github.com/jdziat/simple-durable-jobs/v4/pkg/codec"
+	"github.com/jdziat/simple-durable-jobs/v4/pkg/core"
 )
 
 type markerXORCodec struct{}

@@ -10,9 +10,9 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 
-	"github.com/jdziat/simple-durable-jobs/v3/pkg/core"
-	"github.com/jdziat/simple-durable-jobs/v3/pkg/queue"
-	"github.com/jdziat/simple-durable-jobs/v3/pkg/storage"
+	"github.com/jdziat/simple-durable-jobs/v4/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/v4/pkg/queue"
+	"github.com/jdziat/simple-durable-jobs/v4/pkg/storage"
 )
 
 // genSetupQueue builds a queue backed by an in-memory sqlite database with no

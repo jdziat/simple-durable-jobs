@@ -6,7 +6,7 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 
-	"github.com/jdziat/simple-durable-jobs/v3/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/v4/pkg/core"
 )
 
 // TxCheckpointer is the optional storage capability for persisting checkpoints

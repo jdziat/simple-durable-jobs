@@ -9,7 +9,7 @@ import (
 	"gorm.io/gorm/clause"
 	"gorm.io/gorm/logger"
 
-	"github.com/jdziat/simple-durable-jobs/v3/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/v4/pkg/core"
 )
 
 // Dialect names returned by GormStorage.dialect.

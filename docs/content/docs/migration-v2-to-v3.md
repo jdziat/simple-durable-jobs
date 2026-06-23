@@ -11,18 +11,18 @@ step deliberately before rolling v3 workers onto an existing v2 database.
 
 v2 and v3 are distinct module paths:
 `github.com/jdziat/simple-durable-jobs/v2` and
-`github.com/jdziat/simple-durable-jobs/v3`. You can depend on both at once while
+`github.com/jdziat/simple-durable-jobs/v4`. You can depend on both at once while
 you migrate package by package.
 
 ```sh
-go get github.com/jdziat/simple-durable-jobs/v3@v3.0.0
+go get github.com/jdziat/simple-durable-jobs/v4@v3.0.0
 ```
 
 Rewrite imports across your code:
 
 ```sh
 grep -rl 'github.com/jdziat/simple-durable-jobs/v2' --include='*.go' . \
-  | xargs perl -pi -e 's|github\.com/jdziat/simple-durable-jobs/v2|github.com/jdziat/simple-durable-jobs/v3|g'
+  | xargs perl -pi -e 's|github\.com/jdziat/simple-durable-jobs/v2|github.com/jdziat/simple-durable-jobs/v4|g'
 goimports -w .   # or: gofmt -w .
 go mod tidy
 ```

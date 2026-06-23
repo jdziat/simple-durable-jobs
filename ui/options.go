@@ -6,7 +6,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/jdziat/simple-durable-jobs/v3/pkg/queue"
+	"github.com/jdziat/simple-durable-jobs/v4/pkg/queue"
 )
 
 // Option configures the UI handler.

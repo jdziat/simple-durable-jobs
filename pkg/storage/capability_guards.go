@@ -1,6 +1,6 @@
 package storage
 
-import "github.com/jdziat/simple-durable-jobs/v3/pkg/core"
+import "github.com/jdziat/simple-durable-jobs/v4/pkg/core"
 
 var _ TxEnqueuer = (*GormStorage)(nil)
 var _ TxUniqueLockEnqueuer = (*GormStorage)(nil)

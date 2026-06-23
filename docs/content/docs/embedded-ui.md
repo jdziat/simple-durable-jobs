@@ -26,8 +26,8 @@ import (
     "net/http"
     "time"
 
-    jobs "github.com/jdziat/simple-durable-jobs/v3"
-    "github.com/jdziat/simple-durable-jobs/v3/ui"
+    jobs "github.com/jdziat/simple-durable-jobs/v4"
+    "github.com/jdziat/simple-durable-jobs/v4/ui"
     "gorm.io/driver/sqlite"
     "gorm.io/gorm"
 )

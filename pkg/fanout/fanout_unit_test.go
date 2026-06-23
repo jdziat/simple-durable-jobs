@@ -9,10 +9,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jdziat/simple-durable-jobs/v3/pkg/core"
-	intctx "github.com/jdziat/simple-durable-jobs/v3/pkg/internal/context"
-	"github.com/jdziat/simple-durable-jobs/v3/pkg/queue"
-	"github.com/jdziat/simple-durable-jobs/v3/pkg/security"
+	"github.com/jdziat/simple-durable-jobs/v4/pkg/core"
+	intctx "github.com/jdziat/simple-durable-jobs/v4/pkg/internal/context"
+	"github.com/jdziat/simple-durable-jobs/v4/pkg/queue"
+	"github.com/jdziat/simple-durable-jobs/v4/pkg/security"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

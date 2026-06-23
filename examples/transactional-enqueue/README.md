@@ -58,4 +58,4 @@ The committed business row and job become visible together. The rolled-back orde
 - [Advanced - Transactional Enqueue](https://jdziat.github.io/simple-durable-jobs/docs/advanced/transactional-enqueue/)
 - [API Reference - Job Options](https://jdziat.github.io/simple-durable-jobs/docs/api-reference/job-options/)
 - [Advanced - Guarantees](https://jdziat.github.io/simple-durable-jobs/docs/advanced/guarantees/)
-- [pkg.go.dev - simple-durable-jobs](https://pkg.go.dev/github.com/jdziat/simple-durable-jobs/v3)
+- [pkg.go.dev - simple-durable-jobs](https://pkg.go.dev/github.com/jdziat/simple-durable-jobs/v4)

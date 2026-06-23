@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/jdziat/simple-durable-jobs/v3/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/v4/pkg/core"
 )
 
 // errTextTag marks an encrypted-then-base64 segment inside a plaintext-bearing

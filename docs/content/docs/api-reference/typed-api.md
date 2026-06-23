@@ -6,7 +6,7 @@ weight: 4
 ## Package `typed`
 
 ```go
-import typed "github.com/jdziat/simple-durable-jobs/v3/pkg/typed"
+import typed "github.com/jdziat/simple-durable-jobs/v4/pkg/typed"
 ```
 
 The typed API adds compile-time checked handles over the existing string-keyed
@@ -188,8 +188,8 @@ import (
     "context"
     "fmt"
 
-    jobs "github.com/jdziat/simple-durable-jobs/v3"
-    typed "github.com/jdziat/simple-durable-jobs/v3/pkg/typed"
+    jobs "github.com/jdziat/simple-durable-jobs/v4"
+    typed "github.com/jdziat/simple-durable-jobs/v4/pkg/typed"
     "gorm.io/driver/sqlite"
     "gorm.io/gorm"
 )
