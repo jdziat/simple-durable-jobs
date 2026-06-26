@@ -25,6 +25,9 @@ help:
 	@echo "  bench-postgres    Run storage benchmarks against the compose Postgres service"
 	@echo "  chaos-test        Run the Postgres chaos harness"
 	@echo "  chaos-test-mysql  Run the MySQL chaos harness"
+	@echo "  torture           Torture test: thousands of complex jobs on Postgres (clean drain)"
+	@echo "  torture-chaos     Torture test on Postgres with random worker kills"
+	@echo "  torture-mysql     Torture test on MySQL (clean drain)"
 	@echo "  compose-up        Bring up Postgres and MySQL containers"
 	@echo "  compose-down      Stop and remove test containers and volumes"
 	@echo "  build             go build ./..."
@@ -68,6 +71,18 @@ chaos-test:
 .PHONY: chaos-test-mysql
 chaos-test-mysql:
 	bash scripts/chaos-test.sh mysql
+
+.PHONY: torture
+torture:
+	bash scripts/torture-test.sh postgres
+
+.PHONY: torture-chaos
+torture-chaos:
+	bash scripts/torture-test.sh postgres --chaos
+
+.PHONY: torture-mysql
+torture-mysql:
+	bash scripts/torture-test.sh mysql
 
 .PHONY: compose-up
 compose-up:

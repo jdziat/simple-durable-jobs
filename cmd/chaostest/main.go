@@ -172,6 +172,14 @@ func ensureLedger(ctx context.Context, db *gorm.DB, dialect string) error {
 }
 
 func registerHandlers(q *jobs.Queue, db *gorm.DB, dialect string) {
+	// Fan-out width for the chaos.megaflow nested fan-out (CHAOS_FANOUT_WIDTH,
+	// default 5). chaos.fanout keeps its own hardcoded width=5 because its
+	// index-4 deterministic failure is load-bearing for CancelOnParentFailure.
+	megaFanoutWidth := envInt("CHAOS_FANOUT_WIDTH", 5)
+	if megaFanoutWidth < 1 {
+		megaFanoutWidth = 1
+	}
+
 	q.Register("chaos.unit", func(ctx context.Context, _ struct{}) error {
 		return insertEffect(ctx, db, jobs.JobIDFromContext(ctx), "done")
 	})
@@ -263,6 +271,89 @@ func registerHandlers(q *jobs.Queue, db *gorm.DB, dialect string) {
 			return "", fmt.Errorf("deterministic sub-job failure at index 4")
 		}
 		return fmt.Sprintf("sub-%d", args.Index), nil
+	})
+
+	// chaos.mega_sub is the always-succeeding sub-job used by chaos.megaflow's
+	// fan-out (unlike chaos.sub, which fails at index 4 by design). Each sub is its
+	// own job, so (job_id, "mega-sub") is unique per sub; a duplicate on an
+	// at-least-once replay of the same sub is benign.
+	q.Register("chaos.mega_sub", func(ctx context.Context, args subArgs) (string, error) {
+		if err := insertEffect(ctx, db, jobs.JobIDFromContext(ctx), "mega-sub"); err != nil {
+			if isDuplicate(err) {
+				return fmt.Sprintf("mega-sub-%d", args.Index), nil
+			}
+			return "", err
+		}
+		return fmt.Sprintf("mega-sub-%d", args.Index), nil
+	})
+
+	// chaos.megaflow is the deeply-nested torture workflow: it drives the WHOLE
+	// durability stack in one job — an idempotent phase Call-chain, a nested
+	// fan-out (suspend/resume), a durable timer (suspend/resume), and a final
+	// transactional effect — every step keyed by a checkpoint so a SIGKILL at any
+	// point replays cleanly. Each effect is unique per (job_id, marker), so it
+	// rides the existing INV-EXACTLY-ONCE and INV-FANOUT-COUNTS invariants with no
+	// new check. Unlike chaos.fanout it is designed to COMPLETE, exercising the
+	// happy resume path end to end.
+	q.Register("chaos.megaflow", func(ctx context.Context, _ struct{}) error {
+		jobID := jobs.JobIDFromContext(ctx)
+
+		// 1. Idempotent phase Call-chain (atomic effect + checkpoint per phase).
+		for _, phase := range []string{"mega-extract", "mega-transform", "mega-load"} {
+			if _, ok := jobs.LoadPhaseCheckpoint[string](ctx, phase); ok {
+				continue
+			}
+			err := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+				if err := insertEffect(ctx, tx, jobID, "phase:"+phase); err != nil {
+					return err
+				}
+				return jobs.SavePhaseCheckpointTx(ctx, tx, phase, "ok")
+			})
+			if err != nil {
+				if isDuplicate(err) {
+					_ = insertEffectIgnoreDuplicate(ctx, db, dialect, jobID, "phase-reexec:"+phase)
+				}
+				return err
+			}
+		}
+
+		// 2. Nested fan-out of always-succeeding sub-jobs (suspend -> resume).
+		// FanOut is called UNCONDITIONALLY on every replay so its positional
+		// checkpoint stays aligned with the Sleep below; it is itself replay-safe
+		// (returns cached results, does not re-enqueue subs). Guarding it behind a
+		// phase checkpoint would skip it on the post-Sleep replay and desync the
+		// durable-call indices — the same rule chaos.fanout/chaos.timer follow.
+		subs := make([]jobs.SubJob, 0, megaFanoutWidth)
+		for i := 0; i < megaFanoutWidth; i++ {
+			subs = append(subs, jobs.Sub("chaos.mega_sub", subArgs{Index: i}, jobs.Retries(3)))
+		}
+		if _, err := jobs.FanOut[string](ctx, subs, jobs.WithFanOutRetries(0)); err != nil {
+			return err
+		}
+
+		// 3. Durable timer between fan-out completion and the final effect.
+		// Unconditional for the same call-index reason; Sleep is replay-safe.
+		if err := jobs.Sleep(ctx, time.Second); err != nil {
+			return err
+		}
+
+		// 4. Final transactional effect, idempotent on replay.
+		if _, done := jobs.LoadPhaseCheckpoint[string](ctx, "mega-done"); done {
+			return nil
+		}
+		err := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			if e := insertEffect(ctx, tx, jobID, "megaflow-done"); e != nil {
+				return e
+			}
+			return jobs.SavePhaseCheckpointTx(ctx, tx, "mega-done", "ok")
+		})
+		if err != nil {
+			if isDuplicate(err) {
+				_ = insertEffectIgnoreDuplicate(ctx, db, dialect, jobID, "mega-done-reexec")
+			}
+			return err
+		}
+		return nil
 	})
 
 	q.Register("chaos.slow", func(ctx context.Context, _ struct{}) error {
@@ -403,12 +494,17 @@ func runSeed(ctx context.Context, a *app) error {
 		return err
 	}
 
+	// Seed counts scale with CHAOS_SCALE (default 1.0 = baseline), with optional
+	// per-type CHAOS_SEED_<NAME> overrides. scripts/torture-test.sh raises these to
+	// drive thousands of complex jobs; unset they reproduce the original workload.
+	scale := envFloat("CHAOS_SCALE", 1.0)
 	counts := map[string]int{
-		"chaos.unit":            200,
-		"chaos.pipeline":        30,
-		"chaos.pipeline_window": 20,
-		"chaos.fanout":          20,
-		"chaos.slow":            10,
+		"chaos.unit":            scaledCount("CHAOS_SEED_UNIT", 200, scale),
+		"chaos.pipeline":        scaledCount("CHAOS_SEED_PIPELINE", 30, scale),
+		"chaos.pipeline_window": scaledCount("CHAOS_SEED_PIPELINE_WINDOW", 20, scale),
+		"chaos.fanout":          scaledCount("CHAOS_SEED_FANOUT", 20, scale),
+		"chaos.slow":            scaledCount("CHAOS_SEED_SLOW", 10, scale),
+		"chaos.megaflow":        scaledCount("CHAOS_SEED_MEGAFLOW", 15, scale),
 	}
 	for typ, n := range counts {
 		for i := 0; i < n; i++ {
@@ -418,10 +514,17 @@ func runSeed(ctx context.Context, a *app) error {
 		}
 	}
 
+	// The unique/windowed loops spawn one goroutine per attempt to create real
+	// concurrent contention on a single key; cap the attempt count so a high
+	// CHAOS_SCALE doesn't fan out into a pathological goroutine storm. They probe
+	// dedup correctness, not volume — the bulk jobs above carry the load.
+	uniqueAttempts := min(scaledCount("CHAOS_SEED_UNIQUE_ATTEMPTS", 50, scale), 500)
+	windowedAttempts := min(scaledCount("CHAOS_SEED_WINDOWED_ATTEMPTS", 50, scale), 500)
+
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	var uniqueOK, uniqueDup, uniqueErr int
-	for i := 0; i < 50; i++ {
+	for i := 0; i < uniqueAttempts; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -444,7 +547,7 @@ func runSeed(ctx context.Context, a *app) error {
 
 	var uniqueWindowedOK, uniqueWindowedErr int
 	windowedIDs := make(map[string]struct{})
-	for i := 0; i < 50; i++ {
+	for i := 0; i < windowedAttempts; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -466,11 +569,9 @@ func runSeed(ctx context.Context, a *app) error {
 	// Signal + timer durability scenarios (P6). Seed each waiter's target row
 	// BEFORE enqueueing the sender so the sender always finds its targets. The
 	// sender is enqueued AFTER all targets are recorded.
-	const (
-		signalWaiters    = 10
-		signalsPerWaiter = 3
-		timerJobs        = 15
-	)
+	signalsPerWaiter := 3
+	signalWaiters := scaledCount("CHAOS_SEED_SIGNAL_WAITERS", 10, scale)
+	timerJobs := scaledCount("CHAOS_SEED_TIMER", 15, scale)
 	for i := 0; i < signalWaiters; i++ {
 		id, err := a.q.Enqueue(ctx, "chaos.signal_waiter", waiterArgs{Count: signalsPerWaiter}, jobs.Retries(10))
 		if err != nil {
@@ -489,8 +590,15 @@ func runSeed(ctx context.Context, a *app) error {
 		}
 	}
 
-	fmt.Printf("seeded workload: unit=%d pipeline_tx=%d pipeline_window=%d fanout=%d slow=%d unique_attempts=50 unique_inserted=%d duplicate_rejected=%d unique_errors=%d windowed_unique_attempts=50 windowed_unique_ok=%d windowed_unique_returned_ids=%d windowed_unique_errors=%d signal_waiters=%d signals_per_waiter=%d timers=%d\n",
-		counts["chaos.unit"], counts["chaos.pipeline"], counts["chaos.pipeline_window"], counts["chaos.fanout"], counts["chaos.slow"], uniqueOK, uniqueDup, uniqueErr, uniqueWindowedOK, len(windowedIDs), uniqueWindowedErr, signalWaiters, signalsPerWaiter, timerJobs)
+	// seeded_roots is the count of root jobs enqueued (excludes fan-out sub-jobs,
+	// which each parent spawns at run time); scripts/torture-test.sh parses it to
+	// report throughput.
+	rootsTotal := counts["chaos.unit"] + counts["chaos.pipeline"] + counts["chaos.pipeline_window"] +
+		counts["chaos.fanout"] + counts["chaos.slow"] + counts["chaos.megaflow"] +
+		uniqueOK + uniqueWindowedOK + signalWaiters + 1 /*sender*/ + timerJobs
+
+	fmt.Printf("seeded workload: scale=%.3g seeded_roots=%d unit=%d pipeline_tx=%d pipeline_window=%d fanout=%d slow=%d megaflow=%d mega_fanout_width=%d unique_attempts=%d unique_inserted=%d duplicate_rejected=%d unique_errors=%d windowed_unique_attempts=%d windowed_unique_ok=%d windowed_unique_returned_ids=%d windowed_unique_errors=%d signal_waiters=%d signals_per_waiter=%d timers=%d\n",
+		scale, rootsTotal, counts["chaos.unit"], counts["chaos.pipeline"], counts["chaos.pipeline_window"], counts["chaos.fanout"], counts["chaos.slow"], counts["chaos.megaflow"], envInt("CHAOS_FANOUT_WIDTH", 5), uniqueAttempts, uniqueOK, uniqueDup, uniqueErr, windowedAttempts, uniqueWindowedOK, len(windowedIDs), uniqueWindowedErr, signalWaiters, signalsPerWaiter, timerJobs)
 	return nil
 }
 
@@ -516,7 +624,10 @@ func resetHarnessData(ctx context.Context, db *gorm.DB, dialect string) error {
 }
 
 func runCheck(ctx context.Context, a *app) error {
-	if err := waitForDrain(ctx, a.db, 120*time.Second, 10*time.Second); err != nil {
+	// Drain timeout scales with the workload; CHAOS_DRAIN_TIMEOUT (e.g. "25m")
+	// overrides the 120s baseline so large torture runs are not cut short.
+	drainTimeout := envDuration("CHAOS_DRAIN_TIMEOUT", 120*time.Second)
+	if err := waitForDrain(ctx, a.db, drainTimeout, 10*time.Second); err != nil {
 		fmt.Printf("drain wait: %v\n", err)
 		inv := checkNoWedge(ctx, a.db)
 		status := "PASS"
@@ -956,4 +1067,59 @@ func isDuplicate(err error) bool {
 func fatalf(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, format+"\n", args...)
 	os.Exit(2)
+}
+
+// --- env-configurable torture knobs -----------------------------------------
+//
+// All default to the pre-torture baseline so `chaos-test.sh` / CI behavior is
+// unchanged when these are unset (CHAOS_SCALE=1.0, baseline seed counts, 120s
+// drain). scripts/torture-test.sh sets them to drive thousands of jobs.
+
+func envFloat(key string, def float64) float64 {
+	if v := os.Getenv(key); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			return f
+		}
+		log.Printf("chaostest: ignoring invalid %s=%q, using %v", key, v, def)
+	}
+	return def
+}
+
+func envInt(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+		log.Printf("chaostest: ignoring invalid %s=%q, using %d", key, v, def)
+	}
+	return def
+}
+
+func envDuration(key string, def time.Duration) time.Duration {
+	if v := os.Getenv(key); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			return d
+		}
+		log.Printf("chaostest: ignoring invalid %s=%q, using %s", key, v, def)
+	}
+	return def
+}
+
+// scaledCount returns an explicit per-type override (CHAOS_SEED_<NAME>) when set,
+// otherwise round(base * CHAOS_SCALE). Never negative.
+func scaledCount(envKey string, base int, scale float64) int {
+	if v := os.Getenv(envKey); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			if n < 0 {
+				n = 0
+			}
+			return n
+		}
+		log.Printf("chaostest: ignoring invalid %s=%q, using scaled default", envKey, v)
+	}
+	n := int(float64(base)*scale + 0.5)
+	if n < 0 {
+		n = 0
+	}
+	return n
 }

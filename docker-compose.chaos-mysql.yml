@@ -5,6 +5,11 @@ services:
       dockerfile: chaostest.Dockerfile
     environment:
       TEST_MYSQL_URL: root:jobs@tcp(mysql:3306)/jobs_test?parseTime=true
+      # Torture knobs, inherited from the invoking shell (scripts/torture-test.sh).
+      # Defaults reproduce the baseline chaos workload, so chaos-test.sh is unaffected.
+      CHAOS_SCALE: ${CHAOS_SCALE:-1.0}
+      CHAOS_FANOUT_WIDTH: ${CHAOS_FANOUT_WIDTH:-5}
+      CHAOS_DRAIN_TIMEOUT: ${CHAOS_DRAIN_TIMEOUT:-120s}
     depends_on:
       mysql:
         condition: service_healthy
