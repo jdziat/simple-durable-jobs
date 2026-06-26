@@ -4,7 +4,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jdziat/simple-durable-jobs/v4/pkg/core"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -23,5 +22,4 @@ func TestWithHandlerBackoff_SetsPolicy(t *testing.T) {
 	if assert.NotNil(t, opts.Backoff) {
 		assert.Equal(t, 250*time.Millisecond, opts.Backoff.NextRetry(1, nil))
 	}
-	var _ core.BackoffPolicy = opts.Backoff
 }
