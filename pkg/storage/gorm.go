@@ -1453,6 +1453,24 @@ func (s *GormStorage) GetJobsByStatus(ctx context.Context, status core.JobStatus
 	return jobList, nil
 }
 
+// GetRunningJobsByWorker returns the jobs currently locked+running by a given
+// worker/pod identity (locked_by). It surfaces the pod→task ownership SDJ
+// already records on every running job, for operator visibility (which pod owns
+// which task) and graceful-handoff tooling.
+func (s *GormStorage) GetRunningJobsByWorker(ctx context.Context, workerID string) ([]*core.Job, error) {
+	var jobList []*core.Job
+	err := s.db.WithContext(ctx).
+		Where("locked_by = ? AND status = ?", workerID, core.StatusRunning).
+		Find(&jobList).Error
+	if err != nil {
+		return nil, err
+	}
+	if err := s.decodeJobListPayloads(jobList); err != nil {
+		return nil, err
+	}
+	return jobList, nil
+}
+
 // --- Fan-out operations ---
 
 // CreateFanOut creates a new fan-out record.
@@ -1914,6 +1932,64 @@ func (s *GormStorage) MarkWaiting(ctx context.Context, jobID core.UUID, workerID
 		return core.ErrJobNotOwned
 	}
 	return nil
+}
+
+// SuspendForFanOut atomically performs a fan-out parent's first-execution
+// suspend: it creates the fan-out record, writes the resume checkpoint, flips the
+// parent from running→waiting (ownership-checked), and enqueues the sub-jobs —
+// all in ONE transaction. Either every row commits (the fan-out proceeds and the
+// parent resumes via normal completion) or none does (the parent stays
+// running+locked and is reclaimed by the stale-lock reaper). This closes the
+// durability gap where a worker killed between MarkWaiting and EnqueueBatch left
+// a waiting parent pointing at a pending fan-out with zero persisted children,
+// which no recovery path reclaims promptly.
+//
+// The ownership-checked status flip (WHERE locked_by = workerID AND status =
+// running) makes a concurrent terminal-cancel or lease-reclaim abort the whole
+// suspend with ErrJobNotOwned, so no orphan fan-out/children are persisted.
+// Children become visible only at commit, by which point the parent is already
+// waiting — subsuming the legacy split-write's "mark waiting before children are
+// visible" ResumeJob race.
+func (s *GormStorage) SuspendForFanOut(ctx context.Context, parentID core.UUID, workerID string, fanOut *core.FanOut, checkpoint *core.Checkpoint, subJobs []*core.Job) error {
+	if fanOut.ID == "" {
+		fanOut.ID = core.NewID()
+	}
+	if checkpoint.ID == "" {
+		checkpoint.ID = core.NewID()
+	}
+	// Fill sub-job defaults (IDs/status/queue/dq_ready) once, OUTSIDE the retry
+	// loop, so a serialization retry of the transaction reuses stable IDs —
+	// mirroring EnqueueBatch.
+	for _, job := range subJobs {
+		fillEnqueueDefaults(job)
+	}
+	return s.withSerializationRetry(ctx, func() error {
+		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			if err := tx.Create(fanOut).Error; err != nil {
+				return err
+			}
+			if err := s.SaveCheckpointTx(ctx, tx, checkpoint); err != nil {
+				return err
+			}
+			res := tx.Model(&core.Job{}).
+				Where("id = ? AND locked_by = ? AND status = ?", parentID, workerID, core.StatusRunning).
+				Updates(map[string]any{
+					"status":       core.StatusWaiting,
+					"locked_by":    "",
+					"locked_until": nil,
+					"updated_at":   time.Now(),
+				})
+			if res.Error != nil {
+				return res.Error
+			}
+			if res.RowsAffected == 0 {
+				// Parent was cancelled/reclaimed concurrently — abort the whole
+				// suspend so no orphan fan-out or children persist.
+				return core.ErrJobNotOwned
+			}
+			return s.enqueueBatchWithDB(tx, subJobs)
+		})
+	})
 }
 
 // ResumeJob resumes a waiting (or paused) job to pending status.
