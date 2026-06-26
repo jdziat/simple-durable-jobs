@@ -5,6 +5,11 @@ services:
       dockerfile: chaostest.Dockerfile
     environment:
       TEST_DATABASE_URL: postgres://jobs:jobs@postgres:5432/jobs_test?sslmode=disable
+      # Torture knobs, inherited from the invoking shell (scripts/torture-test.sh).
+      # Defaults reproduce the baseline chaos workload, so chaos-test.sh is unaffected.
+      CHAOS_SCALE: ${CHAOS_SCALE:-1.0}
+      CHAOS_FANOUT_WIDTH: ${CHAOS_FANOUT_WIDTH:-5}
+      CHAOS_DRAIN_TIMEOUT: ${CHAOS_DRAIN_TIMEOUT:-120s}
     depends_on:
       postgres:
         condition: service_healthy

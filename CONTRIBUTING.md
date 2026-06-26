@@ -32,6 +32,24 @@ make chaos-test          # Postgres
 make chaos-test-mysql     # MySQL
 ```
 
+For load + durability at scale, the **torture test** drives thousands of complex
+jobs (Call pipelines, nested fan-out, signals, durable timers, and the
+`chaos.megaflow` mega-workflow) through the same invariant checks — a clean
+high-volume drain by default, or `--chaos` to add random worker kills:
+
+```bash
+make torture             # Postgres, clean high-volume drain
+make torture-chaos       # Postgres, thousands of jobs under random worker kills
+make torture-mysql       # MySQL
+
+# Tune scale/fleet directly via the script (e.g. a fast ~1-min smoke):
+CHAOS_SCALE=0.1 TORTURE_WORKERS=4 CHAOS_DRAIN_TIMEOUT=120s scripts/torture-test.sh postgres
+```
+
+`CHAOS_SCALE` multiplies the baseline seed counts (default 50 ≈ a ~20-minute
+run); `CHAOS_FANOUT_WIDTH`, `TORTURE_WORKERS`, `TORTURE_DURATION`, and
+`CHAOS_DRAIN_TIMEOUT` tune the rest. See `scripts/torture-test.sh` for all knobs.
+
 Benchmarks for the hot storage paths:
 
 ```bash
