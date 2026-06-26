@@ -11,6 +11,14 @@ import (
 	"github.com/jdziat/simple-durable-jobs/v4/pkg/security"
 )
 
+// fanOutSuspender is the optional storage capability that performs a fan-out
+// parent's first-execution suspend atomically (fan-out record + checkpoint +
+// parent→waiting + children, in one transaction). GormStorage implements it;
+// storages that don't are driven through the legacy split-write path.
+type fanOutSuspender interface {
+	SuspendForFanOut(ctx context.Context, parentID core.UUID, workerID string, fanOut *core.FanOut, checkpoint *core.Checkpoint, subJobs []*core.Job) error
+}
+
 // FanOut spawns sub-jobs in parallel and waits for all results.
 // Checkpoints progress - safe to retry if parent crashes.
 // When sub-jobs are created, the parent job is moved to StatusWaiting.
@@ -115,11 +123,8 @@ func FanOut[T any](ctx context.Context, subJobs []SubJob, opts ...Option) ([]Res
 		fanOut.TimeoutAt = &timeout
 	}
 
-	if err := jc.Storage.CreateFanOut(ctx, fanOut); err != nil {
-		return nil, fmt.Errorf("failed to create fan-out: %w", err)
-	}
-
-	// Save checkpoint BEFORE suspending
+	// Build the resume checkpoint (records the fan-out ID for this call index so
+	// a replay collects results instead of rebuilding sub-jobs).
 	cpData, _ := json.Marshal(core.FanOutCheckpoint{
 		FanOutID:  fanOutID,
 		CallIndex: callIndex,
@@ -130,6 +135,27 @@ func FanOut[T any](ctx context.Context, subJobs []SubJob, opts ...Option) ([]Res
 		CallIndex: callIndex,
 		CallType:  "fanout",
 		Result:    cpData,
+	}
+
+	// Preferred path: atomically create the fan-out, write the checkpoint, mark
+	// the parent waiting, and enqueue the children in a single transaction. A
+	// crash can then never strand a waiting parent with missing children — either
+	// all four land (the fan-out proceeds) or none do (the parent stays
+	// running+locked and the stale-lock reaper reclaims it). Children become
+	// visible only at commit, by which point the parent is already waiting, so the
+	// legacy "mark waiting before children are visible" ResumeJob race is moot.
+	if suspender, ok := jc.Storage.(fanOutSuspender); ok {
+		if err := suspender.SuspendForFanOut(ctx, jc.Job.ID, jc.WorkerID, fanOut, cp, jobs); err != nil {
+			return nil, fmt.Errorf("failed to suspend for fan-out: %w", err)
+		}
+		return nil, &WaitingError{FanOutID: fanOutID}
+	}
+
+	// Legacy fallback for storage backends without atomic suspend: the original
+	// four separate writes. This retains the documented crash window between
+	// MarkWaiting and EnqueueBatch; GormStorage implements the atomic path above.
+	if err := jc.Storage.CreateFanOut(ctx, fanOut); err != nil {
+		return nil, fmt.Errorf("failed to create fan-out: %w", err)
 	}
 	if err := jc.SaveCheckpoint(ctx, cp); err != nil {
 		return nil, fmt.Errorf("failed to save fan-out checkpoint: %w", err)

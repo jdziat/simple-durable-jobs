@@ -36,6 +36,10 @@ type Worker struct {
 	started   atomic.Bool
 	paused    atomic.Bool
 	pauseMode atomic.Value // stores core.PauseMode
+	// shuttingDown is set once the worker begins draining on ctx cancellation, so
+	// a handler cancelled by shutdown is released back to pending (clean handoff)
+	// rather than charged a retry attempt.
+	shuttingDown atomic.Bool
 
 	// Running job cancellation (for aggressive pause)
 	runningJobs   map[core.UUID]context.CancelFunc
@@ -507,6 +511,9 @@ func (w *Worker) Start(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
+			// Mark shutdown so any handler we cancel below is released back to
+			// pending for immediate reclaim, not failed-with-retry.
+			w.shuttingDown.Store(true)
 			close(jobsChan)
 			if w.batchCompleter != nil {
 				w.batchCompleter.Close()
@@ -1712,6 +1719,17 @@ func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 	}
 
 	if err != nil {
+		// Graceful shutdown: the handler was cancelled because the worker is
+		// stopping, not because the job failed. Release it back to pending
+		// (status→pending, lock cleared) so a surviving/new worker resumes it in
+		// seconds via its idempotent phases — instead of burning a retry attempt
+		// and a backoff delay. Only this worker's own shutdown-cancel qualifies;
+		// other context cancellations keep the normal retry path.
+		if w.shuttingDown.Load() && errors.Is(err, context.Canceled) {
+			w.releaseDequeuedJobOnShutdown(ctx, job)
+			cancelHeartbeat()
+			return
+		}
 		w.queue.CallErrorHandler(jobCtx, job, err)
 		w.handleError(ctx, jobCtx, job, err)
 		cancelHeartbeat()
