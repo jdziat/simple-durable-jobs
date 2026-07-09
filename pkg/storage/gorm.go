@@ -335,41 +335,59 @@ func backfillDispatcherNulls(ctx context.Context, db *gorm.DB, dialect string) e
 	if dialect != dialectPostgres && dialect != dialectMySQL {
 		return nil
 	}
-	if !db.Migrator().HasTable(&core.Job{}) {
+	m := db.Migrator()
+	if !m.HasTable(&core.Job{}) {
 		return nil
 	}
+	// Build the healed column set from columns that ACTUALLY EXIST on the live
+	// table. A v1.0.0–v1.2.1 baseline (D1) has no `timeout`/`determinism` column
+	// yet (both added in #16), so referencing them unconditionally in the probe or
+	// UPDATE errors (PG 42703 / MySQL 1054 undefined column) and crash-loops
+	// Migrate at boot on a supported upgrade path. AutoMigrate ADDs an absent
+	// column fresh as NOT NULL DEFAULT, so there are no NULLs to heal for it —
+	// skipping the absent column here is correct. Column names/defaults are
+	// hardcoded (never user input), so assembling the SQL from them is injection-safe.
+	type healCol struct{ name, def string }
+	candidates := []healCol{
+		{"status", "'pending'"},
+		{"queue", "'default'"},
+		{"priority", "0"},
+		{"attempt", "0"},
+		{"max_retries", "3"},
+		{"timeout", "0"},
+		{"determinism", "0"},
+	}
+	whereParts := make([]string, 0, len(candidates))
+	setParts := make([]string, 0, len(candidates))
+	for _, c := range candidates {
+		if !m.HasColumn(&core.Job{}, c.name) {
+			continue
+		}
+		whereParts = append(whereParts, c.name+" IS NULL")
+		setParts = append(setParts, fmt.Sprintf("%s = COALESCE(%s, %s)", c.name, c.name, c.def))
+	}
+	if len(whereParts) == 0 {
+		return nil
+	}
+	whereClause := strings.Join(whereParts, " OR ")
+
 	// Cheap EXISTS short-circuit: on a clean table (the overwhelmingly common
 	// case) this probe is sub-millisecond and avoids the full-table UPDATE on
 	// every startup (R25), while still letting the heal run BEFORE AutoMigrate's
 	// SET NOT NULL so a legacy nullable table that still holds NULLs is fixed
 	// before the constraint is enforced (preserves the schema-campaign ordering).
 	var hasNulls bool
-	if err := db.WithContext(ctx).Raw(`
-		SELECT EXISTS(
-			SELECT 1 FROM jobs
-			WHERE status IS NULL OR queue IS NULL OR priority IS NULL
-			   OR attempt IS NULL OR max_retries IS NULL OR timeout IS NULL
-			   OR determinism IS NULL
-		)
-	`).Scan(&hasNulls).Error; err != nil {
+	if err := db.WithContext(ctx).Raw(
+		"SELECT EXISTS(SELECT 1 FROM jobs WHERE " + whereClause + ")",
+	).Scan(&hasNulls).Error; err != nil {
 		return err
 	}
 	if !hasNulls {
 		return nil
 	}
-	return db.WithContext(ctx).Exec(`
-		UPDATE jobs
-		SET status = COALESCE(status, 'pending'),
-		    queue = COALESCE(queue, 'default'),
-		    priority = COALESCE(priority, 0),
-		    attempt = COALESCE(attempt, 0),
-		    max_retries = COALESCE(max_retries, 3),
-		    timeout = COALESCE(timeout, 0),
-		    determinism = COALESCE(determinism, 0)
-		WHERE status IS NULL OR queue IS NULL OR priority IS NULL
-		   OR attempt IS NULL OR max_retries IS NULL OR timeout IS NULL
-		   OR determinism IS NULL
-	`).Error
+	return db.WithContext(ctx).Exec(
+		"UPDATE jobs SET " + strings.Join(setParts, ", ") + " WHERE " + whereClause,
+	).Error
 }
 
 func requireMySQLUTCSession(ctx context.Context, db *gorm.DB) error {
