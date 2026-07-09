@@ -285,6 +285,11 @@ message GetWorkflowResponse {
   Job root = 1;
   repeated FanOut fan_outs = 2;
   repeated Job children = 3;
+  // truncated is set when the returned tree is INCOMPLETE: the parent chain
+  // exceeded the root-find hop cap (or contained a cycle), or the collected
+  // descendant set hit the per-request node cap. Consumers must not treat a
+  // truncated tree as the whole workflow.
+  bool truncated = 4;
 }
 
 message ListWorkflowsRequest {

@@ -2232,7 +2232,15 @@ func (s *GormStorage) Requeue(ctx context.Context, jobID core.UUID) (bool, error
 func (s *GormStorage) deleteFanOutSubtree(tx *gorm.DB, rootJobID core.UUID) error {
 	var allFanOutIDs, allSubJobIDs []core.UUID
 	frontier := []core.UUID{rootJobID}
-	for depth := 0; len(frontier) > 0 && depth < maxFanOutTreeDepth; depth++ {
+	for depth := 0; len(frontier) > 0; depth++ {
+		if depth >= maxFanOutTreeDepth {
+			// Bound hit with descendants still to visit (a pathologically deep or
+			// cyclically corrupt tree). Deleting only the collected prefix would
+			// strand the deeper sub-jobs — there is no FK on jobs.fan_out_id, so the
+			// cascade cannot reach them. Fail loud rather than silently orphan them
+			// (mirrors collectFanOutSubtree / the #95 fail-loud contract).
+			return fmt.Errorf("deleteFanOutSubtree: fan-out tree under %s exceeds max depth %d; aborting to avoid orphaning deeper sub-jobs", rootJobID, maxFanOutTreeDepth)
+		}
 		var fanOutIDs []core.UUID
 		if err := tx.Model(&core.FanOut{}).
 			Where("parent_job_id IN ?", frontier).

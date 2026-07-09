@@ -20,9 +20,13 @@ import (
 )
 
 const (
-	maxWatchStreams      = 50
-	maxBulkJobIDs        = 1000
-	maxWorkflowJobs      = 1000
+	maxWatchStreams = 50
+	maxBulkJobIDs   = 1000
+	maxWorkflowJobs = 1000
+	// maxRootHops bounds the parent-chain climb in GetWorkflow so corrupted or
+	// cyclic parent_job_id data cannot loop forever; hitting it marks the tree
+	// truncated rather than silently returning a non-root as the root.
+	maxRootHops          = 100
 	maxInt32Value        = int64(1<<31 - 1)
 	statusDeadLetteredUI = "dead-lettered"
 )
@@ -496,10 +500,22 @@ func (s *jobsService) GetWorkflow(ctx context.Context, req *connect.Request[jobs
 		return nil, connect.NewError(connect.CodeNotFound, nil)
 	}
 
-	// Walk up the parent chain to find the root (cap at 100 hops to avoid
-	// infinite loops from corrupted data).
+	// Walk up the parent chain to find the root. Bounded by maxRootHops AND a
+	// cycle-detecting seen-set so corrupted/cyclic parent_job_id data cannot loop
+	// forever; if we stop with a parent still pending (cap or cycle), the returned
+	// "root" is NOT the true root, so mark the tree truncated rather than lie.
 	root := job
-	for i := 0; i < 100 && root.ParentJobID != nil; i++ {
+	rootTruncated := false
+	seen := map[core.UUID]struct{}{root.ID: {}}
+	for hops := 0; root.ParentJobID != nil; hops++ {
+		if hops >= maxRootHops {
+			rootTruncated = true
+			break
+		}
+		if _, cycle := seen[*root.ParentJobID]; cycle {
+			rootTruncated = true
+			break
+		}
 		parent, err := s.storage.GetJob(ctx, *root.ParentJobID)
 		if err != nil {
 			return nil, errToConnect(err)
@@ -508,18 +524,20 @@ func (s *jobsService) GetWorkflow(ctx context.Context, req *connect.Request[jobs
 			// Parent no longer exists; treat current node as root.
 			break
 		}
+		seen[parent.ID] = struct{}{}
 		root = parent
 	}
 
-	allFanOuts, allChildren, err := s.collectWorkflowTree(ctx, root)
+	allFanOuts, allChildren, treeTruncated, err := s.collectWorkflowTree(ctx, root)
 	if err != nil {
 		return nil, errToConnect(err)
 	}
 
 	return connect.NewResponse(&jobsv1.GetWorkflowResponse{
-		Root:     s.jobToProto(root),
-		FanOuts:  allFanOuts,
-		Children: allChildren,
+		Root:      s.jobToProto(root),
+		FanOuts:   allFanOuts,
+		Children:  allChildren,
+		Truncated: rootTruncated || treeTruncated,
 	}), nil
 }
 
@@ -754,14 +772,18 @@ func (s *jobsService) searchJobs(ctx context.Context, req *jobsv1.ListJobsReques
 	return nil, 0, connect.NewError(connect.CodeUnimplemented, fmt.Errorf("ListJobs requires storage with UI search support"))
 }
 
-func (s *jobsService) collectWorkflowTree(ctx context.Context, root *core.Job) ([]*jobsv1.FanOut, []*jobsv1.Job, error) {
+// collectWorkflowTree returns the fan-outs and children of a workflow root. The
+// truncated return is true when the BFS stopped at maxWorkflowJobs with more of
+// the tree still unvisited — the caller must surface that so a partial tree is
+// never presented as complete.
+func (s *jobsService) collectWorkflowTree(ctx context.Context, root *core.Job) ([]*jobsv1.FanOut, []*jobsv1.Job, bool, error) {
 	if batch, ok := s.storage.(workflowBatchStorage); ok {
 		return s.collectWorkflowTreeBatched(ctx, root, batch)
 	}
 	return s.collectWorkflowTreeFallback(ctx, root)
 }
 
-func (s *jobsService) collectWorkflowTreeBatched(ctx context.Context, root *core.Job, batch workflowBatchStorage) ([]*jobsv1.FanOut, []*jobsv1.Job, error) {
+func (s *jobsService) collectWorkflowTreeBatched(ctx context.Context, root *core.Job, batch workflowBatchStorage) ([]*jobsv1.FanOut, []*jobsv1.Job, bool, error) {
 	var allFanOuts []*jobsv1.FanOut
 	var allChildren []*jobsv1.Job
 
@@ -775,7 +797,7 @@ func (s *jobsService) collectWorkflowTreeBatched(ctx context.Context, root *core
 
 		fanOuts, err := batch.GetFanOutsByParents(ctx, currentParents)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, false, err
 		}
 		fanOutsByParent := groupFanOutsByParent(fanOuts)
 
@@ -788,7 +810,7 @@ func (s *jobsService) collectWorkflowTreeBatched(ctx context.Context, root *core
 
 		subJobs, err := batch.GetSubJobsByFanOuts(ctx, fanOutIDs)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, false, err
 		}
 		subJobsByFanOut := groupSubJobsByFanOut(subJobs)
 
@@ -816,10 +838,11 @@ func (s *jobsService) collectWorkflowTreeBatched(ctx context.Context, root *core
 		}
 	}
 
-	return allFanOuts, allChildren, nil
+	// queue non-empty here means the BFS stopped at maxWorkflowJobs with tree left.
+	return allFanOuts, allChildren, len(queue) > 0, nil
 }
 
-func (s *jobsService) collectWorkflowTreeFallback(ctx context.Context, root *core.Job) ([]*jobsv1.FanOut, []*jobsv1.Job, error) {
+func (s *jobsService) collectWorkflowTreeFallback(ctx context.Context, root *core.Job) ([]*jobsv1.FanOut, []*jobsv1.Job, bool, error) {
 	var allFanOuts []*jobsv1.FanOut
 	var allChildren []*jobsv1.Job
 
@@ -833,14 +856,14 @@ func (s *jobsService) collectWorkflowTreeFallback(ctx context.Context, root *cor
 
 		fanOuts, err := s.storage.GetFanOutsByParent(ctx, current)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, false, err
 		}
 		for _, fo := range fanOuts {
 			allFanOuts = append(allFanOuts, fanOutToProto(fo))
 
 			subJobs, err := s.storage.GetSubJobs(ctx, fo.ID)
 			if err != nil {
-				return nil, nil, err
+				return nil, nil, false, err
 			}
 			for _, sj := range subJobs {
 				if _, seen := visited[sj.ID]; seen {
@@ -856,7 +879,8 @@ func (s *jobsService) collectWorkflowTreeFallback(ctx context.Context, root *cor
 		}
 	}
 
-	return allFanOuts, allChildren, nil
+	// queue non-empty here means the BFS stopped at maxWorkflowJobs with tree left.
+	return allFanOuts, allChildren, len(queue) > 0, nil
 }
 
 func (s *jobsService) getFanOutsForParents(ctx context.Context, roots []*core.Job) (map[core.UUID][]*core.FanOut, error) {
