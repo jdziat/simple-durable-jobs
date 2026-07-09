@@ -575,6 +575,11 @@ func (w *Worker) Start(ctx context.Context) error {
 
 func (w *Worker) validateConfiguredStorageCapabilities() error {
 	storage := w.queue.Storage()
+	if len(w.config.rateLimitOptionErrors) > 0 {
+		// A RateLimit(...) was configured with invalid args (empty name / non-positive
+		// rate). Fail loudly at Start rather than run with a silently-absent limit.
+		return fmt.Errorf("invalid RateLimit option(s): %w", errors.Join(w.config.rateLimitOptionErrors...))
+	}
 	if count := len(w.config.ConcurrencyCaps); count > 0 {
 		if _, ok := storage.(concurrencySlotStorage); !ok {
 			return fmt.Errorf("worker has %d ConcurrencyCap(s) configured but storage %T does not support DB-backed concurrency slots; the cap would be silently ignored", count, storage)

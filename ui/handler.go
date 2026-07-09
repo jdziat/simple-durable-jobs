@@ -205,7 +205,13 @@ func (i dashboardAuthInterceptor) WrapStreamingHandler(next connect.StreamingHan
 }
 
 func (i dashboardAuthInterceptor) authorize(ctx context.Context, procedure string) error {
-	action := actionForProcedure(procedure)
+	action, known := actionForProcedure(procedure)
+	if !known {
+		// Fail closed: an unmapped procedure is denied on EVERY path (before the
+		// authorizer and before the insecure-allow branch), so a forgotten
+		// classification can never grant access.
+		return connect.NewError(connect.CodePermissionDenied, errors.New("unmapped RPC procedure: authorization denied"))
+	}
 	if i.authorizer != nil {
 		if err := i.authorizer.Authorize(ctx, action); err != nil {
 			var connectErr *connect.Error
@@ -244,16 +250,19 @@ func (i dashboardAuthInterceptor) authorizeOrigin(req connect.AnyRequest) error 
 	return connect.NewError(connect.CodePermissionDenied, errors.New("origin not allowed; configure ui.WithAllowedOrigins"))
 }
 
-func actionForProcedure(procedure string) Action {
+// actionForProcedure returns the authorization Action for a procedure and whether
+// it is KNOWN. Callers MUST treat known==false as DENIED — an unmapped procedure
+// must never be authorized (a newly-added RPC that nobody classified must fail
+// closed, not silently inherit read access). TestActionForProcedure_Exhaustive
+// asserts every real JobsService procedure is classified.
+func actionForProcedure(procedure string) (Action, bool) {
 	if action, mutates := mutatingProcedures[procedure]; mutates {
-		return action
+		return action, true
 	}
 	if action, ok := readProcedures[procedure]; ok {
-		return action
+		return action, true
 	}
-	// Any read procedure not explicitly mapped is still authorized (fail-closed),
-	// just under the coarse ActionViewJobs — never treated as public.
-	return ActionViewJobs
+	return "", false
 }
 
 const placeholderHTML = `<!DOCTYPE html>
