@@ -652,12 +652,12 @@ func TestCallPropagatesHandlerErrors(t *testing.T) {
 			t.Errorf("expected zero value, got %q", result)
 		}
 
-		// Verify error was saved in checkpoint
-		if len(savedCheckpoints) != 1 {
-			t.Fatalf("expected 1 checkpoint, got %d", len(savedCheckpoints))
-		}
-		if savedCheckpoints[0].Error != "handler failed" {
-			t.Errorf("expected error in checkpoint, got %q", savedCheckpoints[0].Error)
+		// A plain (retryable) handler error must NOT be checkpointed: freezing it
+		// would replay the stale error on every outer-job retry instead of
+		// re-executing the nested handler. Only terminal (NoRetry) errors are
+		// checkpointed.
+		if len(savedCheckpoints) != 0 {
+			t.Fatalf("expected 0 checkpoints for a retryable nested-Call error, got %d", len(savedCheckpoints))
 		}
 	})
 
@@ -702,16 +702,23 @@ func TestCallPropagatesHandlerErrors(t *testing.T) {
 		}
 	})
 
-	t.Run("checkpointed typed errors preserve identity on replay", func(t *testing.T) {
+	// Nested-Call error checkpointing depends on retryability (PKT-03). A TERMINAL
+	// (NoRetry) error is checkpointed and replayed verbatim WITHOUT re-executing
+	// the handler (deterministic). A RETRYABLE error (RetryAfter or a plain
+	// sentinel) is NOT checkpointed, so the nested handler RE-EXECUTES when the
+	// outer job retries instead of replaying a frozen stale error.
+	t.Run("error checkpointing depends on retryability", func(t *testing.T) {
 		tests := []struct {
-			name   string
-			err    error
-			assert func(*testing.T, error)
+			name           string
+			err            error
+			wantCheckpoint bool
+			assertType     func(*testing.T, error)
 		}{
 			{
-				name: "no retry",
-				err:  core.NoRetry(errors.New("permanent failure")),
-				assert: func(t *testing.T, err error) {
+				name:           "no retry is checkpointed and frozen",
+				err:            core.NoRetry(errors.New("permanent failure")),
+				wantCheckpoint: true,
+				assertType: func(t *testing.T, err error) {
 					var noRetry *core.NoRetryError
 					if !errors.As(err, &noRetry) {
 						t.Fatalf("expected NoRetryError, got %T %v", err, err)
@@ -719,9 +726,10 @@ func TestCallPropagatesHandlerErrors(t *testing.T) {
 				},
 			},
 			{
-				name: "retry after",
-				err:  core.RetryAfter(2*time.Second, errors.New("temporary failure")),
-				assert: func(t *testing.T, err error) {
+				name:           "retry after is not checkpointed and re-executes",
+				err:            core.RetryAfter(2*time.Second, errors.New("temporary failure")),
+				wantCheckpoint: false,
+				assertType: func(t *testing.T, err error) {
 					var retryAfter *core.RetryAfterError
 					if !errors.As(err, &retryAfter) {
 						t.Fatalf("expected RetryAfterError, got %T %v", err, err)
@@ -732,9 +740,10 @@ func TestCallPropagatesHandlerErrors(t *testing.T) {
 				},
 			},
 			{
-				name: "sentinel",
-				err:  core.ErrInvalidQueueName,
-				assert: func(t *testing.T, err error) {
+				name:           "plain sentinel is not checkpointed and re-executes",
+				err:            core.ErrInvalidQueueName,
+				wantCheckpoint: false,
+				assertType: func(t *testing.T, err error) {
 					if !errors.Is(err, core.ErrInvalidQueueName) {
 						t.Fatalf("expected ErrInvalidQueueName identity, got %T %v", err, err)
 					}
@@ -744,7 +753,9 @@ func TestCallPropagatesHandlerErrors(t *testing.T) {
 
 		for _, tt := range tests {
 			t.Run(tt.name, func(t *testing.T) {
+				var execCount int
 				testHandler := func(ctx context.Context, args string) (string, error) {
+					execCount++
 					return "", tt.err
 				}
 				h, err := handler.NewHandler(testHandler)
@@ -772,24 +783,49 @@ func TestCallPropagatesHandlerErrors(t *testing.T) {
 				if err == nil {
 					t.Fatal("expected first-run error")
 				}
-				tt.assert(t, err)
-				if saved == nil {
-					t.Fatal("expected checkpoint to be saved")
-				}
-				if saved.ErrorKind == "" {
-					t.Fatal("expected checkpoint error kind")
+				tt.assertType(t, err)
+				if execCount != 1 {
+					t.Fatalf("expected handler to execute once on first run, got %d", execCount)
 				}
 
-				replayCtx := intctx.WithJobContext(context.Background(), jobCtx)
-				replayCtx = intctx.WithCallState(replayCtx, []core.Checkpoint{*saved})
-
-				_, replayErr := Call[string](replayCtx, "fail", "arg")
-				if replayErr == nil {
-					t.Fatal("expected replay error")
-				}
-				tt.assert(t, replayErr)
-				if replayErr.Error() != err.Error() {
-					t.Fatalf("expected replay error %q, got %q", err.Error(), replayErr.Error())
+				if tt.wantCheckpoint {
+					if saved == nil {
+						t.Fatal("expected a terminal error to be checkpointed for deterministic replay")
+					}
+					if saved.ErrorKind == "" {
+						t.Fatal("expected checkpoint error kind")
+					}
+					// Replay from the checkpoint: the frozen error is returned WITHOUT
+					// re-invoking the handler.
+					replayCtx := intctx.WithJobContext(context.Background(), jobCtx)
+					replayCtx = intctx.WithCallState(replayCtx, []core.Checkpoint{*saved})
+					_, replayErr := Call[string](replayCtx, "fail", "arg")
+					if replayErr == nil {
+						t.Fatal("expected replay error")
+					}
+					tt.assertType(t, replayErr)
+					if replayErr.Error() != err.Error() {
+						t.Fatalf("expected replay error %q, got %q", err.Error(), replayErr.Error())
+					}
+					if execCount != 1 {
+						t.Fatalf("a checkpointed terminal error must NOT re-execute the handler on replay, got execCount=%d", execCount)
+					}
+				} else {
+					if saved != nil {
+						t.Fatalf("a retryable nested-Call error must NOT be checkpointed, got %+v", saved)
+					}
+					// Simulate the outer job retrying: fresh call state (no checkpoint
+					// at this index) means the nested handler re-executes.
+					retryCtx := intctx.WithJobContext(context.Background(), jobCtx)
+					retryCtx = intctx.WithCallState(retryCtx, []core.Checkpoint{})
+					_, retryErr := Call[string](retryCtx, "fail", "arg")
+					if retryErr == nil {
+						t.Fatal("expected re-execution error on retry")
+					}
+					tt.assertType(t, retryErr)
+					if execCount != 2 {
+						t.Fatalf("a non-checkpointed retryable error must re-execute the nested handler on retry, got execCount=%d", execCount)
+					}
 				}
 			})
 		}

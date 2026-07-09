@@ -9,7 +9,7 @@ on:
 permissions:
   contents: write
 
-# CI pins Go to 1.25.11 (matches go.mod's `toolchain` directive) so setup-go
+# CI pins Go to 1.25.12 (matches go.mod's `toolchain` directive) so setup-go
 # installs it directly: no on-the-fly sum.golang.org toolchain download
 # (which flaked Lint) and CI runs the patched stdlib. Bump with go.mod.
 
@@ -75,7 +75,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
-          go-version: '1.25.11'
+          go-version: '1.25.12'
 
       - name: Download coverage artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
@@ -112,7 +112,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
-          go-version: '1.25.11'
+          go-version: '1.25.12'
 
       - name: Set up Node.js
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
@@ -151,7 +151,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
-          go-version: '1.25.11'
+          go-version: '1.25.12'
 
       - name: Set up Node.js
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
@@ -178,7 +178,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
-          go-version: '1.25.11'
+          go-version: '1.25.12'
 
       # Pinned for reproducibility. govulncheck still fetches the current
       # vulnerability database at runtime, so the pinned binary stays current on
@@ -201,7 +201,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
-          go-version: '1.25.11'
+          go-version: '1.25.12'
 
       # Enforces VERSIONING.md's v1 stability promise: incompatible changes fail
       # this gate, while additive minor changes are allowed and expected.
@@ -281,7 +281,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
-          go-version: '1.25.11'
+          go-version: '1.25.12'
 
       - name: Set up Node.js
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0

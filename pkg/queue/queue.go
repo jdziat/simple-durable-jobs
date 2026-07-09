@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"hash"
 	"log/slog"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -979,6 +980,24 @@ func (q *Queue) EmitCustomEvent(jobID core.UUID, kind string, data map[string]an
 	})
 }
 
+// safeUserCallback invokes a user-supplied callback (a lifecycle hook, the error
+// handler, or the IsFailure policy) and recovers any panic it raises so a buggy
+// callback degrades observability instead of crashing the worker process. The
+// panic is logged with a stack trace and execution continues. This mirrors the
+// panic recovery the worker already applies to handlers (executeHandler) and to
+// user ConcurrencyCapKey/RateLimitKey (capSlotName/rateLimitName).
+func safeUserCallback(kind string, jobID core.UUID, call func()) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Default().Error("recovered panic in user "+kind+"; continuing",
+				"job_id", jobID,
+				"panic", r,
+				"stack", string(debug.Stack()))
+		}
+	}()
+	call()
+}
+
 // CallStartHooks calls all registered start hooks.
 func (q *Queue) CallStartHooks(ctx context.Context, job *core.Job) {
 	q.mu.RLock()
@@ -987,7 +1006,7 @@ func (q *Queue) CallStartHooks(ctx context.Context, job *core.Job) {
 	q.mu.RUnlock()
 
 	for _, fn := range hooks {
-		fn(ctx, job)
+		safeUserCallback("OnStart hook", job.ID, func() { fn(ctx, job) })
 	}
 }
 
@@ -1000,7 +1019,9 @@ func (q *Queue) CallStartCtxHooks(ctx context.Context, job *core.Job) context.Co
 	q.mu.RUnlock()
 
 	for _, fn := range hooks {
-		ctx = fn(ctx, job)
+		// A panic leaves ctx at its pre-hook value: the assignment only runs if fn
+		// returns normally, so recovering here preserves the ctx-return contract.
+		safeUserCallback("OnStartCtx hook", job.ID, func() { ctx = fn(ctx, job) })
 	}
 	return ctx
 }
@@ -1013,7 +1034,7 @@ func (q *Queue) CallCompleteHooks(ctx context.Context, job *core.Job) {
 	q.mu.RUnlock()
 
 	for _, fn := range hooks {
-		fn(ctx, job)
+		safeUserCallback("OnComplete hook", job.ID, func() { fn(ctx, job) })
 	}
 }
 
@@ -1025,7 +1046,7 @@ func (q *Queue) CallFailHooks(ctx context.Context, job *core.Job, err error) {
 	q.mu.RUnlock()
 
 	for _, fn := range hooks {
-		fn(ctx, job, err)
+		safeUserCallback("OnFail hook", job.ID, func() { fn(ctx, job, err) })
 	}
 }
 
@@ -1037,7 +1058,7 @@ func (q *Queue) CallRetryHooks(ctx context.Context, job *core.Job, attempt int, 
 	q.mu.RUnlock()
 
 	for _, fn := range hooks {
-		fn(ctx, job, attempt, err)
+		safeUserCallback("OnRetry hook", job.ID, func() { fn(ctx, job, attempt, err) })
 	}
 }
 
@@ -1049,7 +1070,7 @@ func (q *Queue) CallWaitingHooks(ctx context.Context, job *core.Job) {
 	q.mu.RUnlock()
 
 	for _, fn := range hooks {
-		fn(ctx, job)
+		safeUserCallback("OnWaiting hook", job.ID, func() { fn(ctx, job) })
 	}
 }
 
@@ -1061,7 +1082,7 @@ func (q *Queue) CallJobReclaimedHooks(ctx context.Context, jobID core.UUID, reas
 	q.mu.RUnlock()
 
 	for _, fn := range hooks {
-		fn(ctx, jobID, reason)
+		safeUserCallback("OnJobReclaimed hook", jobID, func() { fn(ctx, jobID, reason) })
 	}
 }
 

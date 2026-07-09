@@ -3,6 +3,7 @@ package call
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -34,6 +35,26 @@ type checkpointIndexCleaner interface {
 // at-least-once: a crash after the nested handler runs and before SaveCheckpoint
 // succeeds will run the handler again on replay. Called handlers with side
 // effects must be idempotent.
+//
+// The returned value is always the result JSON-round-tripped into T (identical
+// first-run and on replay), so Call result types must be JSON-round-trip-stable.
+// An interface T such as Call[any] therefore yields a decoded generic value
+// (map[string]interface{} / float64), consistently on both paths — request a
+// concrete result type if the caller needs the handler's concrete Go type.
+//
+// Retry semantics: a successful result and a terminal (NoRetry) error are
+// checkpointed and replayed verbatim without re-invoking the handler. A
+// RETRYABLE error — a plain error or a RetryAfterError — is NOT checkpointed;
+// it propagates and the nested handler re-executes when the OUTER job retries.
+// Nested-Call retries are therefore governed by the outer job's MaxRetries;
+// there is no separate per-Call retry count (jobs.DefaultCallRetries is not
+// wired to any behavior). A handler that catches a retryable nested-Call error
+// and branches on it will re-run that Call on any later resume, so keep such
+// handlers deterministic and idempotent. A checkpoint matches by call index and
+// name only (not args): changing which Calls run, or their names/order, across a
+// replay fails loud with a determinism violation, but reissuing the SAME-named
+// Call at the same index with DIFFERENT args silently returns the prior cached
+// result — so branch the sequence/name of Calls, never just their args.
 //
 // Error-only handlers may be called only as Call[any] or Call[struct{}].
 // Requesting a concrete result type from an error-only handler returns a
@@ -169,25 +190,58 @@ func CallWithCheckpointCtx[T any](execCtx, checkpointCtx context.Context, name s
 	}
 
 	if err != nil {
+		// Only a TERMINAL (NoRetry) nested-Call error is checkpointed. A retryable
+		// error — a plain error or a RetryAfterError, both of which cause the outer
+		// job to retry — must NOT be frozen as a checkpoint: a checkpointed error is
+		// replayed verbatim on every outer-job retry WITHOUT re-invoking the nested
+		// handler (see the replay branch above), so freezing a transient failure
+		// would make the nested Call retry zero times and dead-letter the workflow
+		// on a stale error. Propagating it un-checkpointed lets the nested handler
+		// re-execute when the outer job retries; nested-Call retries are therefore
+		// governed by the outer job's MaxRetries. A self-suspension (waiting) error
+		// is likewise not a terminal outcome, so it too is left un-checkpointed.
+		var noRetry *core.NoRetryError
+		if !errors.As(err, &noRetry) {
+			return zero, err
+		}
 		message, cause, kind, delay := core.CheckpointErrorFields(err)
 		cp.Error = message
 		cp.ErrorCause = cause
 		cp.ErrorKind = kind
 		cp.ErrorDelayNanos = int64(delay)
-	} else {
-		resultBytes, marshalErr := json.Marshal(result)
-		if marshalErr != nil {
-			return zero, fmt.Errorf("failed to marshal result: %w", marshalErr)
+		if saveErr := jc.SaveCheckpoint(checkpointCtx, cp); saveErr != nil {
+			return zero, fmt.Errorf("failed to save checkpoint: %w", saveErr)
 		}
-		if len(resultBytes) > security.MaxResultSize {
-			return zero, core.NoRetry(fmt.Errorf("jobs: call %q result is %d bytes, limit is %d", name, len(resultBytes), security.MaxResultSize))
-		}
-		cp.Result = resultBytes
+		return zero, err
 	}
 
+	resultBytes, marshalErr := json.Marshal(result)
+	if marshalErr != nil {
+		return zero, fmt.Errorf("failed to marshal result: %w", marshalErr)
+	}
+	if len(resultBytes) > security.MaxResultSize {
+		return zero, core.NoRetry(fmt.Errorf("jobs: call %q result is %d bytes, limit is %d", name, len(resultBytes), security.MaxResultSize))
+	}
+	cp.Result = resultBytes
 	if saveErr := jc.SaveCheckpoint(checkpointCtx, cp); saveErr != nil {
 		return zero, fmt.Errorf("failed to save checkpoint: %w", saveErr)
 	}
 
-	return result, err
+	// Return the value obtained by unmarshaling the just-serialized bytes into T —
+	// the exact path replay uses (see the cached-checkpoint branch above) — rather
+	// than the handler's raw Go value. This makes the dynamic type a caller
+	// observes identical on the first run and on any replay. Without it, an
+	// interface T (Call[any], an interface-typed result, or an `any`-typed field)
+	// returns the handler's concrete type first-run but a decoded generic type
+	// (map[string]interface{} / []interface{} / float64) on replay, so a caller
+	// type-assertion that works pre-crash panics post-resume — a failure that only
+	// appears after a crash. Round-tripping here surfaces any such mismatch
+	// deterministically on the first run instead, and normalizes lossy concrete
+	// types (time.Time monotonic/location, large int64 boxed in `any`) the same
+	// way on both paths. Concrete pure-data structs are unaffected.
+	var roundTripped T
+	if err := json.Unmarshal(resultBytes, &roundTripped); err != nil {
+		return zero, fmt.Errorf("failed to round-trip call result: %w", err)
+	}
+	return roundTripped, nil
 }

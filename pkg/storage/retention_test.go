@@ -213,6 +213,53 @@ func TestDeleteTerminalJobsOlderThan_S04RegressionNoFanOutLeakOrStrandedLiveDesc
 	assert.Equal(t, int64(0), strandedLiveDescendants, "retention must not strand live descendants")
 }
 
+// TestDeleteTerminalJobsOlderThan_ProtectsCompletedSubJobOfNonTerminalParent is
+// the C1/D4 regression: a completed leaf sub-job whose fan_out is ALREADY
+// 'completed' but whose parent workflow job is still non-terminal (waiting to be
+// resumed to CollectResults) must NOT be GC'd. Guarding on the fan_out's own
+// status would miss this — the fan_out flips to 'completed' before the stranded
+// parent resumes — so the guard keys on the parent job's terminal status.
+func TestDeleteTerminalJobsOlderThan_ProtectsCompletedSubJobOfNonTerminalParent(t *testing.T) {
+	s := newTestStorage(t)
+	ctx := context.Background()
+	old := time.Now().Add(-2 * time.Hour).UTC()
+	rootID := "c1-root"
+
+	// Parent workflow job is stranded in `waiting` (backlogged/paused/outage) long
+	// after its children finished and the fan_out was marked completed.
+	seedRetentionJob(t, s, rootID, core.StatusWaiting, old)
+	require.NoError(t, s.CreateFanOut(ctx, &core.FanOut{
+		ID:          retentionUUID("c1-fanout"),
+		ParentJobID: retentionUUID(rootID),
+		TotalCount:  2,
+		Status:      core.FanOutCompleted, // already completed — parent has not yet collected
+	}))
+	fanOutID := "c1-fanout"
+	seedRetentionWorkflowJob(t, s, "c1-child-0", core.StatusCompleted, old, &rootID, &rootID, &fanOutID)
+	seedRetentionWorkflowJob(t, s, "c1-child-1", core.StatusCompleted, old, &rootID, &rootID, &fanOutID)
+
+	// Sweep: the completed children must survive because their fan_out's parent is
+	// still non-terminal. Deleting them would strand CollectResults.
+	deleted, err := s.DeleteTerminalJobsOlderThan(ctx, core.StatusCompleted, time.Hour, 100)
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), deleted, "completed sub-jobs of a non-terminal parent must be protected")
+	assertRetentionExists(t, s, "c1-child-0")
+	assertRetentionExists(t, s, "c1-child-1")
+
+	// Once the parent reaches a terminal status (it resumed, collected, completed),
+	// its children become reclaimable — no reclamation regression.
+	require.NoError(t, s.db.Model(&core.Job{}).
+		Where("id = ?", retentionUUID(rootID)).
+		Updates(map[string]any{"status": core.StatusCompleted, "completed_at": old}).Error)
+
+	deleted, err = s.DeleteTerminalJobsOlderThan(ctx, core.StatusCompleted, time.Hour, 100)
+	require.NoError(t, err)
+	assert.Equal(t, int64(3), deleted, "terminal parent + its children must all be reclaimable")
+	assertRetentionMissing(t, s, "c1-child-0")
+	assertRetentionMissing(t, s, "c1-child-1")
+	assertRetentionMissing(t, s, rootID)
+}
+
 func TestCleanAbandonedFanOuts_UnblocksTerminalParentRetention(t *testing.T) {
 	s := newTestStorage(t)
 	ctx := context.Background()

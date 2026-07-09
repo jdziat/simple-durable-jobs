@@ -2,6 +2,9 @@ package queue
 
 import (
 	"context"
+	"fmt"
+	"log/slog"
+	"runtime/debug"
 
 	"github.com/jdziat/simple-durable-jobs/v4/pkg/core"
 )
@@ -24,11 +27,32 @@ func (q *Queue) UseExecutionMiddleware(mw ExecutionMiddleware) {
 
 // RunExecutionMiddleware executes the handler-attempt middleware chain, ending
 // with invoke. The first registered middleware is the outermost wrapper.
-func (q *Queue) RunExecutionMiddleware(ctx context.Context, job *core.Job, invoke func(context.Context, *core.Job) ([]byte, error)) ([]byte, error) {
+//
+// A panic raised by user middleware in its own before/after code (as opposed to
+// a downstream handler panic, which executeHandler already recovers into an
+// error) is recovered at this outermost boundary and converted into a failed
+// attempt, so a buggy middleware fails the job rather than crashing the worker
+// process. Self-suspension (a waiting error) re-raised as a panic is preserved
+// as a waiting error, not turned into a failure.
+func (q *Queue) RunExecutionMiddleware(ctx context.Context, job *core.Job, invoke func(context.Context, *core.Job) ([]byte, error)) (result []byte, err error) {
 	q.mu.RLock()
 	mws := make([]ExecutionMiddleware, len(q.executionMiddleware))
 	copy(mws, q.executionMiddleware)
 	q.mu.RUnlock()
+
+	defer func() {
+		if r := recover(); r != nil {
+			if e, ok := r.(error); ok && core.IsWaiting(e) {
+				result, err = nil, e
+				return
+			}
+			slog.Default().Error("recovered panic in execution middleware; failing this attempt",
+				"job_id", job.ID,
+				"panic", r,
+				"stack", string(debug.Stack()))
+			result, err = nil, fmt.Errorf("panic in execution middleware: %v", r)
+		}
+	}()
 
 	next := invoke
 	for i := len(mws) - 1; i >= 0; i-- {
@@ -50,13 +74,14 @@ func (q *Queue) SetErrorHandler(fn func(context.Context, *core.Job, error)) {
 	q.mu.Unlock()
 }
 
-// CallErrorHandler invokes the registered execution error observer, if any.
+// CallErrorHandler invokes the registered execution error observer, if any. A
+// panic in the observer is recovered and logged so it cannot crash the worker.
 func (q *Queue) CallErrorHandler(ctx context.Context, job *core.Job, err error) {
 	q.mu.RLock()
 	fn := q.errorHandler
 	q.mu.RUnlock()
 	if fn != nil {
-		fn(ctx, job, err)
+		safeUserCallback("error handler", job.ID, func() { fn(ctx, job, err) })
 	}
 }
 
@@ -70,12 +95,25 @@ func (q *Queue) SetIsFailure(fn func(*core.Job, error) bool) {
 
 // IsFailure reports whether err should be handled as a job failure. Nil policy
 // preserves the default behavior: every non-nil, non-waiting error fails.
-func (q *Queue) IsFailure(job *core.Job, err error) bool {
+//
+// A panic in the user policy is recovered and the error is treated as a failure
+// (the safe, conservative default) so a buggy policy cannot crash the worker or
+// silently swallow a real failure.
+func (q *Queue) IsFailure(job *core.Job, err error) (isFailure bool) {
 	q.mu.RLock()
 	fn := q.isFailure
 	q.mu.RUnlock()
 	if fn == nil {
 		return true
 	}
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Default().Error("recovered panic in user IsFailure policy; treating error as failure",
+				"job_id", job.ID,
+				"panic", r,
+				"stack", string(debug.Stack()))
+			isFailure = true
+		}
+	}()
 	return fn(job, err)
 }

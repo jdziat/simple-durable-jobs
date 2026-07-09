@@ -2,7 +2,7 @@ module github.com/jdziat/simple-durable-jobs/v4
 
 go 1.25.5
 
-toolchain go1.25.11
+toolchain go1.25.12
 
 require (
 	connectrpc.com/connect v1.19.1

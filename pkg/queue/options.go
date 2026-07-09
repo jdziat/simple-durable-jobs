@@ -238,8 +238,17 @@ func Determinism(mode DeterminismMode) Option {
 
 // Default values.
 var (
-	DefaultJobRetries      = 2
-	DefaultCallRetries     = 3
+	DefaultJobRetries = 2
+
+	// DefaultCallRetries is retained for backward compatibility only. It is NOT
+	// wired to any behavior: nested jobs.Call has no separate per-call retry
+	// loop. A retryable error from a nested Call propagates un-checkpointed and
+	// the nested handler re-executes when the OUTER job retries, so nested-Call
+	// retries are governed by the outer job's retry budget (WithMaxRetries /
+	// DefaultJobRetries), not by this constant. It is a candidate for removal in
+	// a future major version.
+	DefaultCallRetries = 3
+
 	DefaultMaxMetadataSize = 64 << 10
 
 	ErrJobMetadataTooLarge = errors.New("jobs: job metadata exceeds size limit")

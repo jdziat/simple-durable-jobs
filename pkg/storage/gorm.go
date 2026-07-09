@@ -2067,6 +2067,51 @@ func (s *GormStorage) ResumeSignalWaitingJob(ctx context.Context, jobID core.UUI
 //
 // Returns true if a job was requeued, false if it was not found or not in a
 // requeuable (failed/cancelled) state.
+// applyRequeueResetTx performs the shared "replay from scratch" reset for a
+// requeue-eligible (failed/cancelled) job within tx: it rejects a sub-job
+// (ErrCannotRequeueSubJob), resets the row to pending, clears
+// result/run_at/locks/timestamps, deletes the job's checkpoints, and deletes its
+// entire fan-out subtree. Both Requeue and the dashboard RetryJob call it so a
+// programmatic requeue and a UI "Retry" perform identical cleanup — a UI retry
+// must not replay stale checkpoints/results or leave an orphaned fan-out subtree
+// behind. The caller loads the job and verifies it is in a requeuable state.
+func (s *GormStorage) applyRequeueResetTx(tx *gorm.DB, job *core.Job, now time.Time) error {
+	if job.FanOutID != nil && *job.FanOutID != "" {
+		// Requeuing a sub-job directly would re-run it and increment the parent's
+		// fan-out counter a second time. Replay via the parent.
+		return core.ErrCannotRequeueSubJob
+	}
+	if err := tx.Model(&core.Job{}).
+		Where("id = ?", job.ID).
+		Updates(map[string]any{
+			"status":             core.StatusPending,
+			"attempt":            0,
+			"last_error":         "",
+			"dead_lettered_at":   nil,
+			"dead_letter_reason": "",
+			"result":             nil,
+			"locked_by":          "",
+			"locked_until":       nil,
+			"started_at":         nil,
+			"completed_at":       nil,
+			"run_at":             nil,
+			"dq_ready":           true,
+			"updated_at":         now,
+		}).Error; err != nil {
+		return err
+	}
+	// Replay from scratch: drop checkpoints recorded by the prior run.
+	if err := tx.Where("job_id = ?", job.ID).Delete(&core.Checkpoint{}).Error; err != nil {
+		return err
+	}
+	// If this job is a fan-out parent, delete its entire fan-out subtree (records
+	// + sub-jobs + their checkpoints, at every depth) so the replay's FanOut()
+	// re-dispatches a fresh tree rather than leaving orphaned rows and stale
+	// counters — including under nested workflows where a sub-job is itself a
+	// fan-out parent.
+	return s.deleteFanOutSubtree(tx, job.ID)
+}
+
 func (s *GormStorage) Requeue(ctx context.Context, jobID core.UUID) (bool, error) {
 	var requeued bool
 	err := s.withSerializationRetry(ctx, func() error {
@@ -2082,45 +2127,11 @@ func (s *GormStorage) Requeue(ctx context.Context, jobID core.UUID) (bool, error
 			if job.Status != core.StatusFailed && job.Status != core.StatusCancelled {
 				return nil // not in a requeuable state
 			}
-			if job.FanOutID != nil && *job.FanOutID != "" {
-				// Requeuing a sub-job directly would re-run it and increment the
-				// parent's fan-out counter a second time. Replay via the parent.
-				return core.ErrCannotRequeueSubJob
-			}
-
-			result := tx.Model(&core.Job{}).
-				Where("id = ?", jobID).
-				Updates(map[string]any{
-					"status":             core.StatusPending,
-					"attempt":            0,
-					"last_error":         "",
-					"dead_lettered_at":   nil,
-					"dead_letter_reason": "",
-					"result":             nil,
-					"locked_by":          "",
-					"locked_until":       nil,
-					"started_at":         nil,
-					"completed_at":       nil,
-					"run_at":             nil,
-					"dq_ready":           true,
-					"updated_at":         time.Now(),
-				})
-			if result.Error != nil {
-				return result.Error
+			if err := s.applyRequeueResetTx(tx, &job, time.Now()); err != nil {
+				return err // ErrCannotRequeueSubJob or a real storage error
 			}
 			requeued = true
-
-			// Replay from scratch: drop checkpoints recorded by the prior run.
-			if err := tx.Where("job_id = ?", jobID).Delete(&core.Checkpoint{}).Error; err != nil {
-				return err
-			}
-
-			// If this job is a fan-out parent, delete its entire fan-out
-			// subtree (records + sub-jobs + their checkpoints, at every depth)
-			// so the replay's FanOut() re-dispatches a fresh tree rather than
-			// leaving orphaned rows and stale counters — including under nested
-			// workflows where a sub-job is itself a fan-out parent.
-			return s.deleteFanOutSubtree(tx, jobID)
+			return nil
 		})
 	})
 	if err != nil {
