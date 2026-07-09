@@ -1329,17 +1329,29 @@ func (w *Worker) tryConsumeRateLimits(ctx context.Context, job *core.Job) (bool,
 	// drains those windows for a job that never runs (teardown g4). Backends without
 	// ReleaseRate degrade to the prior no-refund behavior.
 	releaser, canRelease := w.queue.Storage().(rateReleaser)
+	// Precise consume+refund: when available (GormStorage, all dialects), refund the
+	// EXACT window the consume committed to, so a refund that races a window rollover
+	// can no longer decrement the wrong window and strand the consume's own. Falls
+	// back to the now-relative rateReleaser path for backends without it.
+	windowed, useWindowed := w.queue.Storage().(windowedRateLimiter)
 	type consumedRate struct {
-		name   string
-		window time.Duration
+		name        string
+		window      time.Duration
+		windowStart time.Time
 	}
 	var consumed []consumedRate
 	refund := func() {
-		if !canRelease {
+		if !useWindowed && !canRelease {
 			return
 		}
 		for _, c := range consumed {
-			if err := releaser.ReleaseRate(ctx, c.name, c.window); err != nil {
+			var err error
+			if useWindowed {
+				err = windowed.ReleaseRateAt(ctx, c.name, c.windowStart)
+			} else {
+				err = releaser.ReleaseRate(ctx, c.name, c.window)
+			}
+			if err != nil {
 				w.logger.Warn("failed to refund consumed rate limit after a later limit denied",
 					"job_id", job.ID, "limit", c.name, "error", err)
 			}
@@ -1371,7 +1383,14 @@ func (w *Worker) tryConsumeRateLimits(ctx context.Context, job *core.Job) (bool,
 			refund()
 			return false, bounceFleetRateCached
 		}
-		allowed, err := storage.TryConsumeRate(ctx, limitName, limit.PerSecond, window, time.Time{})
+		var allowed bool
+		var windowStart time.Time
+		var err error
+		if useWindowed {
+			allowed, windowStart, err = windowed.TryConsumeRateWindow(ctx, limitName, limit.PerSecond, window, time.Time{})
+		} else {
+			allowed, err = storage.TryConsumeRate(ctx, limitName, limit.PerSecond, window, time.Time{})
+		}
 		if err != nil {
 			w.logger.Warn("failed to consume rate limit; releasing dequeued job",
 				"job_id", job.ID,
@@ -1389,7 +1408,7 @@ func (w *Worker) tryConsumeRateLimits(ctx context.Context, job *core.Job) (bool,
 			refund()
 			return false, bounceFleetRate
 		}
-		consumed = append(consumed, consumedRate{name: limitName, window: window})
+		consumed = append(consumed, consumedRate{name: limitName, window: window, windowStart: windowStart})
 	}
 	return true, ""
 }

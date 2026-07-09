@@ -23,6 +23,7 @@ var _ batchDequeuer = (*storage.GormStorage)(nil)
 var _ perQueueDequeuer = (*storage.GormStorage)(nil)
 var _ concurrencySlotStorage = (*storage.GormStorage)(nil)
 var _ rateLimiterStorage = (*storage.GormStorage)(nil)
+var _ windowedRateLimiter = (*storage.GormStorage)(nil)
 var _ retentionStorage = (*storage.GormStorage)(nil)
 var _ uniqueLockSweepStorage = (*storage.GormStorage)(nil)
 var _ concurrencySlotSweepStorage = (*storage.GormStorage)(nil)
@@ -49,6 +50,7 @@ func TestGormStorageSatisfiesAllGuardedInterfaces(t *testing.T) {
 		{"perQueueDequeuer", implements[perQueueDequeuer](s)},
 		{"concurrencySlotStorage", implements[concurrencySlotStorage](s)},
 		{"rateLimiterStorage", implements[rateLimiterStorage](s)},
+		{"windowedRateLimiter", implements[windowedRateLimiter](s)},
 		{"retentionStorage", implements[retentionStorage](s)},
 		{"uniqueLockSweepStorage", implements[uniqueLockSweepStorage](s)},
 		{"concurrencySlotSweepStorage", implements[concurrencySlotSweepStorage](s)},
