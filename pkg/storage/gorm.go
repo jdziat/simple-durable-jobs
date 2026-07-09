@@ -1940,7 +1940,18 @@ func (s *GormStorage) MarkWaiting(ctx context.Context, jobID core.UUID, workerID
 			"status":       core.StatusWaiting,
 			"locked_by":    "",
 			"locked_until": nil,
-			"updated_at":   time.Now(),
+			// Clear run_at: this is an INDEFINITE wait (no wake deadline). A job
+			// reaching MarkWaiting was dequeued while running, so any residual
+			// run_at (from a delayed enqueue or a retry backoff) is necessarily
+			// <= now; left set, it spuriously matches the signal-resume poll's
+			// `run_at <= now` clause and burns one wasted re-dispatch (+ a fleet
+			// rate-limit token) before self-limiting. ResumeSignalWaitingJob and
+			// markWaitingWithDeadlineTx likewise manage run_at explicitly. The
+			// fan-out path also calls MarkWaiting; that resume is run_at-independent
+			// (it keys on the fan_outs join + status), so clearing run_at is safe
+			// there too.
+			"run_at":     nil,
+			"updated_at": time.Now(),
 		})
 	if result.Error != nil {
 		return result.Error
