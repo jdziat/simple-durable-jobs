@@ -408,6 +408,75 @@ func TestRequeue_ClearsCheckpoints(t *testing.T) {
 	assert.False(t, missing)
 }
 
+// TestRetryJob_ClearsCheckpointsResultRunAtAndFanOutSubtree is the A-01
+// regression: the dashboard RetryJob must perform the SAME replay-from-scratch
+// cleanup as storage Requeue — clear result/run_at, drop checkpoints, and delete
+// the fan-out subtree — instead of resetting only status/attempt and replaying
+// stale durable state. It must also reject retrying a sub-job directly.
+func TestRetryJob_ClearsCheckpointsResultRunAtAndFanOutSubtree(t *testing.T) {
+	s := newTestStorage(t)
+	ctx := context.Background()
+
+	future := time.Now().Add(time.Hour)
+	parentID := core.NewID()
+	foID := core.NewID()
+	subIDs := []core.UUID{core.NewID(), core.NewID()}
+
+	// Failed fan-out parent carrying a stale result + a future run_at + a
+	// checkpoint, plus a fan-out subtree with its own checkpoints.
+	require.NoError(t, s.db.WithContext(ctx).Create(&core.Job{
+		ID: parentID, Type: "wf", Queue: "default", Status: core.StatusFailed,
+		Attempt: 4, LastError: "boom", Result: []byte(`"stale"`), RunAt: &future,
+	}).Error)
+	require.NoError(t, s.SaveCheckpoint(ctx, &core.Checkpoint{
+		JobID: parentID, CallIndex: 0, CallType: "fanout", Result: []byte(`"cp"`),
+	}))
+	require.NoError(t, s.CreateFanOut(ctx, &core.FanOut{
+		ID: foID, ParentJobID: parentID, TotalCount: 2, CompletedCount: 1, FailedCount: 1,
+	}))
+	for i, st := range []core.JobStatus{core.StatusCompleted, core.StatusFailed} {
+		require.NoError(t, s.db.WithContext(ctx).Create(&core.Job{
+			ID: subIDs[i], Type: "wf.sub", Queue: "default",
+			Status: st, FanOutID: &foID, FanOutIndex: i,
+		}).Error)
+		require.NoError(t, s.SaveCheckpoint(ctx, &core.Checkpoint{
+			JobID: subIDs[i], CallIndex: 0, CallType: "s", Result: []byte(`"ok"`),
+		}))
+	}
+
+	// Retrying a sub-job directly (in a requeuable state) is rejected — replay via
+	// the parent. subIDs[1] is StatusFailed, so it passes the status guard and
+	// reaches the sub-job check.
+	_, err := s.RetryJob(ctx, subIDs[1])
+	require.ErrorIs(t, err, core.ErrCannotRequeueSubJob)
+
+	// Retrying the parent resets it and clears every trace of the prior run.
+	got, err := s.RetryJob(ctx, parentID)
+	require.NoError(t, err)
+	assert.Equal(t, core.StatusPending, got.Status)
+	assert.Equal(t, 0, got.Attempt)
+	assert.Empty(t, got.LastError)
+	assert.Nil(t, got.Result, "UI retry must clear the stale result")
+	assert.Nil(t, got.RunAt, "UI retry must clear a stale future run_at so it runs now")
+	assert.True(t, got.DQReady, "UI retry must mark the job dequeue-ready so it can actually re-run now")
+
+	cps, err := s.GetCheckpoints(ctx, parentID)
+	require.NoError(t, err)
+	assert.Empty(t, cps, "UI retry must drop the parent's checkpoints for a fresh replay")
+
+	fos, err := s.GetFanOutsByParent(ctx, parentID)
+	require.NoError(t, err)
+	assert.Empty(t, fos, "UI retry must delete the fan-out records")
+	subs, err := s.GetSubJobs(ctx, foID)
+	require.NoError(t, err)
+	assert.Empty(t, subs, "UI retry must delete the fan-out sub-jobs")
+	for i := range subIDs {
+		scps, err := s.GetCheckpoints(ctx, subIDs[i])
+		require.NoError(t, err)
+		assert.Empty(t, scps, "UI retry must delete sub-job checkpoints")
+	}
+}
+
 // TestEnqueue_UniqueKeyDedup_AllBackends verifies that a plain Enqueue with a
 // unique key dedupes identically on every backend. This is the MySQL parity fix
 // (M4): before the generated active_unique_key column, MySQL silently accepted a

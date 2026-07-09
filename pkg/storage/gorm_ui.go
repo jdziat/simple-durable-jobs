@@ -393,49 +393,41 @@ func escapeLikePattern(s string) string {
 
 // RetryJob resets a failed or cancelled job back to pending for re-execution.
 func (s *GormStorage) RetryJob(ctx context.Context, jobID core.UUID) (*core.Job, error) {
-	var job core.Job
-	err := s.db.WithContext(ctx).First(&job, "id = ?", jobID).Error
+	var out core.Job
+	err := s.withSerializationRetry(ctx, func() error {
+		// Reset per attempt: a serialization retry must scan into a zero-value
+		// struct so a NULLed column (result/run_at/completed_at) can't be masked by
+		// a prior attempt's non-nil pointer. now is likewise refreshed per attempt.
+		out = core.Job{}
+		now := time.Now()
+		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			var job core.Job
+			if err := tx.First(&job, "id = ?", jobID).Error; err != nil {
+				return err
+			}
+			if job.Status != core.StatusFailed && job.Status != core.StatusCancelled {
+				return fmt.Errorf("jobs: cannot retry job with status %q", job.Status)
+			}
+			// Route the dashboard "Retry" through the same replay-from-scratch reset
+			// as storage Requeue: clear result/run_at, delete checkpoints, and delete
+			// the fan-out subtree so a retried workflow parent re-dispatches a fresh
+			// fan-out instead of replaying stale checkpoints/results. Retrying a
+			// sub-job is rejected (ErrCannotRequeueSubJob) — replay via the parent.
+			if err := s.applyRequeueResetTx(tx, &job, now); err != nil {
+				return err
+			}
+			// Re-read the reset row (into a fresh struct so NULLed columns are not
+			// masked by the pre-reset values) to return the persisted state.
+			return tx.First(&out, "id = ?", jobID).Error
+		})
+	})
 	if err != nil {
 		return nil, err
 	}
-
-	if job.Status != core.StatusFailed && job.Status != core.StatusCancelled {
-		return nil, fmt.Errorf("jobs: cannot retry job with status %q", job.Status)
-	}
-
-	now := time.Now()
-	err = s.db.WithContext(ctx).Model(&job).Updates(map[string]any{
-		"status":             core.StatusPending,
-		"attempt":            0,
-		"last_error":         "",
-		"dead_lettered_at":   nil,
-		"dead_letter_reason": "",
-		"locked_by":          "",
-		"locked_until":       nil,
-		"started_at":         nil,
-		"completed_at":       nil,
-		"dq_ready":           s.dqReadyExpr(now),
-		"updated_at":         now,
-	}).Error
-	if err != nil {
+	if err := s.decodeJobPayloads(&out); err != nil {
 		return nil, err
 	}
-
-	job.Status = core.StatusPending
-	job.Attempt = 0
-	job.LastError = ""
-	job.DeadLetteredAt = nil
-	job.DeadLetterReason = ""
-	job.LockedBy = ""
-	job.LockedUntil = nil
-	job.StartedAt = nil
-	job.CompletedAt = nil
-	job.DQReady = job.RunAt == nil || !job.RunAt.After(now)
-	job.UpdatedAt = now
-	if err := s.decodeJobPayloads(&job); err != nil {
-		return nil, err
-	}
-	return &job, nil
+	return &out, nil
 }
 
 // DeleteJob permanently removes a single job from the database. It refuses to
