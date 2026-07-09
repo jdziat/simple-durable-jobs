@@ -255,6 +255,9 @@ func (s *GormStorage) Migrate(ctx context.Context) error {
 			if err := requireMySQLUTCSession(ctx, db); err != nil {
 				return err
 			}
+			if err := requireMySQLUTCDriverLoc(ctx, db); err != nil {
+				return err
+			}
 		}
 
 		// Heal pre-existing NULL dispatcher columns BEFORE AutoMigrate enforces
@@ -426,6 +429,35 @@ func requireMySQLUTCSession(ctx context.Context, db *gorm.DB) error {
 	}
 	if offsetSeconds != 0 {
 		return fmt.Errorf("storage: MySQL session clock is not UTC; NOW(6) drives DB-clock lock/lease writes; set time_zone='+00:00' or loc=UTC in the DSN")
+	}
+	return nil
+}
+
+// requireMySQLUTCDriverLoc fails Migrate when the MySQL driver's DSN `loc` is not
+// UTC. `loc` is CLIENT-side: the go-sql-driver converts every time.Time bind
+// parameter via v.In(cfg.Loc) before it hits the wire (the exact path GORM uses
+// to write RunAt/timestamps), so a non-UTC loc silently shifts every stored
+// instant. A naive time->time round-trip cannot detect this — it is loc-symmetric
+// (the same offset is applied on write and un-applied on read). Instead we send a
+// KNOWN UTC instant and read it back as a SERVER-rendered STRING (DATE_FORMAT),
+// bypassing the driver's read-side loc parse, so we observe the exact wall-clock
+// the driver put on the wire and compare it to the instant's UTC wall-clock.
+func requireMySQLUTCDriverLoc(ctx context.Context, db *gorm.DB) error {
+	probes := []time.Time{
+		time.Date(2026, time.January, 15, 12, 0, 0, 0, time.UTC), // winter (no DST)
+		time.Date(2026, time.July, 15, 12, 0, 0, 0, time.UTC),    // summer (DST-affected zones diverge)
+	}
+	for _, p := range probes {
+		var got string
+		if err := db.WithContext(ctx).Raw(
+			"SELECT DATE_FORMAT(?, '%Y-%m-%d %H:%i:%s')", p,
+		).Scan(&got).Error; err != nil {
+			return fmt.Errorf("storage: check MySQL driver loc: %w", err)
+		}
+		want := p.Format("2006-01-02 15:04:05")
+		if got != want {
+			return fmt.Errorf("storage: MySQL driver loc is not UTC (a UTC instant %s was written as %s); the DSN loc shifts every stored timestamp — set loc=UTC (and parseTime=true) in the DSN", want, got)
+		}
 	}
 	return nil
 }
@@ -2232,7 +2264,15 @@ func (s *GormStorage) Requeue(ctx context.Context, jobID core.UUID) (bool, error
 func (s *GormStorage) deleteFanOutSubtree(tx *gorm.DB, rootJobID core.UUID) error {
 	var allFanOutIDs, allSubJobIDs []core.UUID
 	frontier := []core.UUID{rootJobID}
-	for depth := 0; len(frontier) > 0 && depth < maxFanOutTreeDepth; depth++ {
+	for depth := 0; len(frontier) > 0; depth++ {
+		if depth >= maxFanOutTreeDepth {
+			// Bound hit with descendants still to visit (a pathologically deep or
+			// cyclically corrupt tree). Deleting only the collected prefix would
+			// strand the deeper sub-jobs — there is no FK on jobs.fan_out_id, so the
+			// cascade cannot reach them. Fail loud rather than silently orphan them
+			// (mirrors collectFanOutSubtree / the #95 fail-loud contract).
+			return fmt.Errorf("deleteFanOutSubtree: fan-out tree under %s exceeds max depth %d; aborting to avoid orphaning deeper sub-jobs", rootJobID, maxFanOutTreeDepth)
+		}
 		var fanOutIDs []core.UUID
 		if err := tx.Model(&core.FanOut{}).
 			Where("parent_job_id IN ?", frontier).

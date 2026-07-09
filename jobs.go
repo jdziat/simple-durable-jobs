@@ -574,9 +574,23 @@ func SavePhaseCheckpointTx(ctx context.Context, tx *gorm.DB, phaseName string, r
 
 // LoadPhaseCheckpoint loads a previously saved phase result from the checkpoint store.
 // Returns (result, true) if found, (zero, false) if not found or not in job context.
+// An undecodable checkpoint is reported as (zero, false) and re-runs the phase; use
+// LoadPhaseCheckpointErr to fail loud on a decode failure instead.
 func LoadPhaseCheckpoint[T any](ctx context.Context, phaseName string) (T, bool) {
 	return jobctx.LoadPhaseCheckpoint[T](ctx, phaseName)
 }
+
+// LoadPhaseCheckpointErr is like LoadPhaseCheckpoint but distinguishes a genuine
+// absence (zero, false, nil) from a checkpoint that EXISTS but did not decode into
+// T (zero, false, err wrapping ErrPhaseCheckpointDecode) — so a corrupt/mismatched
+// checkpoint fails loud rather than silently re-executing the phase.
+func LoadPhaseCheckpointErr[T any](ctx context.Context, phaseName string) (T, bool, error) {
+	return jobctx.LoadPhaseCheckpointErr[T](ctx, phaseName)
+}
+
+// ErrPhaseCheckpointDecode is returned (wrapped) by LoadPhaseCheckpointErr when a
+// phase checkpoint exists but cannot be decoded into the requested type.
+var ErrPhaseCheckpointDecode = jobctx.ErrPhaseCheckpointDecode
 
 // GetVersion records or replays a workflow-code version marker for changeID.
 // Use the returned version to branch around changes to Call, fan-out, and signal

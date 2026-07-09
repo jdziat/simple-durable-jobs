@@ -16,7 +16,10 @@ package otel
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log/slog"
+	"sync"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -26,6 +29,7 @@ import (
 
 	"github.com/jdziat/simple-durable-jobs/v4/pkg/core"
 	"github.com/jdziat/simple-durable-jobs/v4/pkg/queue"
+	"github.com/jdziat/simple-durable-jobs/v4/pkg/security"
 )
 
 const instrumentationName = "github.com/jdziat/simple-durable-jobs/v4/pkg/otel"
@@ -53,10 +57,22 @@ func WithPropagator(p propagation.TextMapPropagator) InstrumentOption {
 	}
 }
 
-// Instrument wires OpenTelemetry tracing into a Queue.
-// It registers enqueue middleware for trace context propagation and
-// lifecycle hooks for execution spans.
+// instrumentedQueues guards against double-instrumentation: each Instrument call
+// registers a fresh enqueue-middleware + lifecycle hooks, so calling it twice on
+// the same Queue would leak duplicate spans/middleware. Call Instrument at most
+// once per Queue.
+var instrumentedQueues sync.Map // *queue.Queue -> struct{}
+
+// Instrument wires OpenTelemetry tracing into a Queue. Call it AT MOST ONCE per
+// Queue: it registers enqueue middleware for trace-context propagation and
+// lifecycle hooks for execution spans, and a second call would double-register
+// them (leaking duplicate spans). A repeat call on the same Queue is a no-op and
+// logs a warning.
 func Instrument(q *queue.Queue, opts ...InstrumentOption) {
+	if _, loaded := instrumentedQueues.LoadOrStore(q, struct{}{}); loaded {
+		slog.Default().Warn("otel.Instrument called more than once for the same Queue; ignoring the repeat to avoid duplicate spans/middleware")
+		return
+	}
 	cfg := &instrumentConfig{}
 	for _, opt := range opts {
 		opt(cfg)
@@ -114,8 +130,7 @@ func enqueueMiddleware(tracer trace.Tracer, prop propagation.TextMapPropagator) 
 		}
 
 		if err := next(ctx, job); err != nil {
-			span.RecordError(err)
-			span.SetStatus(codes.Error, err.Error())
+			recordSanitizedError(span, err)
 			return err
 		}
 
@@ -167,8 +182,7 @@ func failHook() func(context.Context, *core.Job, error) {
 		if !span.IsRecording() {
 			return
 		}
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
+		recordSanitizedError(span, err)
 		span.End()
 	}
 }
@@ -183,11 +197,12 @@ func retryHook() func(context.Context, *core.Job, int, error) {
 		if !span.IsRecording() {
 			return
 		}
+		sanitized := security.SanitizeErrorMessage(err.Error())
 		span.AddEvent("job.retry", trace.WithAttributes(
 			attribute.Int("job.attempt", attempt),
-			attribute.String("job.error", err.Error()),
+			attribute.String("job.error", sanitized),
 		))
-		span.SetStatus(codes.Error, "retry: "+err.Error())
+		span.SetStatus(codes.Error, "retry: "+sanitized)
 		span.End()
 	}
 }
@@ -212,6 +227,23 @@ func waitingHook() func(context.Context, *core.Job) {
 }
 
 // jobAttributes returns common span attributes for a job.
+// recordSanitizedError records err on span with its message run through
+// security.SanitizeErrorMessage, so secrets/PII in raw error text (DSN passwords,
+// bearer tokens, pwd=... KVs) are redacted before reaching any span exporter. It
+// preserves the original error's dynamic type as an attribute (a compile-time
+// identifier, never sensitive) since wrapping in errors.New would otherwise lose
+// the exception.type RecordError derives.
+func recordSanitizedError(span trace.Span, err error) {
+	if err == nil {
+		return
+	}
+	msg := security.SanitizeErrorMessage(err.Error())
+	span.RecordError(errors.New(msg), trace.WithAttributes(
+		attribute.String("exception.original_type", fmt.Sprintf("%T", err)),
+	))
+	span.SetStatus(codes.Error, msg)
+}
+
 func jobAttributes(job *core.Job) []attribute.KeyValue {
 	attrs := []attribute.KeyValue{
 		attribute.String("job.type", job.Type),

@@ -770,8 +770,11 @@ func TestHandler_WatchEventsDeniedWithoutAuthAndAuthorizerAction(t *testing.T) {
 	assert.Equal(t, []Action{ActionWatchEvents}, actions)
 }
 
-func TestActionForProcedure_UnknownProcedureDefaultsToReadAction(t *testing.T) {
-	assert.Equal(t, ActionViewJobs, actionForProcedure("/jobs.v1.JobsService/FutureReadRPC"))
+func TestActionForProcedure_UnknownProcedureDenied(t *testing.T) {
+	// An unmapped procedure must be reported UNKNOWN (known==false) so authorize
+	// fails closed — never silently classified as a readable ActionViewJobs.
+	_, known := actionForProcedure("/jobs.v1.JobsService/FutureUnmappedRPC")
+	assert.False(t, known, "an unmapped procedure must be unknown (fail-closed), not defaulted to a read action")
 }
 
 func TestHandler_ReadOnlyRPCDeniedWithoutAuth(t *testing.T) {

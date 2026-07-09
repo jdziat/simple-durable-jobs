@@ -2520,10 +2520,15 @@ func (x *GetWorkflowRequest) GetJobId() string {
 }
 
 type GetWorkflowResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Root          *Job                   `protobuf:"bytes,1,opt,name=root,proto3" json:"root,omitempty"`
-	FanOuts       []*FanOut              `protobuf:"bytes,2,rep,name=fan_outs,json=fanOuts,proto3" json:"fan_outs,omitempty"`
-	Children      []*Job                 `protobuf:"bytes,3,rep,name=children,proto3" json:"children,omitempty"`
+	state    protoimpl.MessageState `protogen:"open.v1"`
+	Root     *Job                   `protobuf:"bytes,1,opt,name=root,proto3" json:"root,omitempty"`
+	FanOuts  []*FanOut              `protobuf:"bytes,2,rep,name=fan_outs,json=fanOuts,proto3" json:"fan_outs,omitempty"`
+	Children []*Job                 `protobuf:"bytes,3,rep,name=children,proto3" json:"children,omitempty"`
+	// truncated is set when the returned tree is INCOMPLETE: the parent chain
+	// exceeded the root-find hop cap (or contained a cycle), or the collected
+	// descendant set hit the per-request node cap. Consumers must not treat a
+	// truncated tree as the whole workflow.
+	Truncated     bool `protobuf:"varint,4,opt,name=truncated,proto3" json:"truncated,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2577,6 +2582,13 @@ func (x *GetWorkflowResponse) GetChildren() []*Job {
 		return x.Children
 	}
 	return nil
+}
+
+func (x *GetWorkflowResponse) GetTruncated() bool {
+	if x != nil {
+		return x.Truncated
+	}
+	return false
 }
 
 type ListWorkflowsRequest struct {
@@ -3026,11 +3038,12 @@ const file_jobs_v1_jobs_proto_rawDesc = "" +
 	"\bnext_run\x18\x04 \x01(\v2\x1a.google.protobuf.TimestampR\anextRun\x125\n" +
 	"\blast_run\x18\x05 \x01(\v2\x1a.google.protobuf.TimestampR\alastRun\"+\n" +
 	"\x12GetWorkflowRequest\x12\x15\n" +
-	"\x06job_id\x18\x01 \x01(\tR\x05jobId\"\x8d\x01\n" +
+	"\x06job_id\x18\x01 \x01(\tR\x05jobId\"\xab\x01\n" +
 	"\x13GetWorkflowResponse\x12 \n" +
 	"\x04root\x18\x01 \x01(\v2\f.jobs.v1.JobR\x04root\x12*\n" +
 	"\bfan_outs\x18\x02 \x03(\v2\x0f.jobs.v1.FanOutR\afanOuts\x12(\n" +
-	"\bchildren\x18\x03 \x03(\v2\f.jobs.v1.JobR\bchildren\"X\n" +
+	"\bchildren\x18\x03 \x03(\v2\f.jobs.v1.JobR\bchildren\x12\x1c\n" +
+	"\ttruncated\x18\x04 \x01(\bR\ttruncated\"X\n" +
 	"\x14ListWorkflowsRequest\x12\x12\n" +
 	"\x04page\x18\x01 \x01(\x05R\x04page\x12\x14\n" +
 	"\x05limit\x18\x02 \x01(\x05R\x05limit\x12\x16\n" +

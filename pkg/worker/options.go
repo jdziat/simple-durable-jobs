@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"fmt"
 	"time"
 
 	"github.com/jdziat/simple-durable-jobs/v4/pkg/core"
@@ -171,6 +172,12 @@ type WorkerConfig struct {
 	// storage backend implements the worker's optional rate limiter capability.
 	// Backends without that capability continue processing jobs unchanged.
 	RateLimits []RateLimitConfig
+
+	// rateLimitOptionErrors records RateLimit(...) calls made with invalid args
+	// (empty name or non-positive rate) so Start fails loudly instead of the option
+	// silently dropping them (an operator believing a limit is active when it is
+	// not). Kept out of RateLimits so the runtime slice never holds unusable entries.
+	rateLimitOptionErrors []error
 
 	// QueueRateLimits are per-worker token buckets applied before dequeue, keyed
 	// by queue name. They require no storage capability.
@@ -353,6 +360,10 @@ func ConcurrencyCap(name string, limit int, opts ...CapOption) WorkerOption {
 func RateLimit(name string, perSecond float64, opts ...RateLimitOption) WorkerOption {
 	return workerOptionFunc(func(c *WorkerConfig) {
 		if name == "" || perSecond <= 0 {
+			// Record instead of silently dropping: Start surfaces this so a typo'd
+			// limit can't leave the operator believing a cap is active.
+			c.rateLimitOptionErrors = append(c.rateLimitOptionErrors,
+				fmt.Errorf("RateLimit(%q, %g): name must be non-empty and rate must be positive", name, perSecond))
 			return
 		}
 		cfg := RateLimitConfig{

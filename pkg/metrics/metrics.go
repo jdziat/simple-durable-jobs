@@ -15,6 +15,7 @@ package metrics
 import (
 	"context"
 	"log/slog"
+	"math"
 	"net/http"
 	"time"
 
@@ -49,8 +50,11 @@ const (
 	// high-cardinality ConcurrencyCap/RateLimit Key is used.
 	metricConcurrencySlotCardinality = "jobs.concurrency.slot_cardinality"
 	metricRateLimitWindowCardinality = "jobs.ratelimit.window_cardinality"
-	metricLeasesReclaimed            = "jobs.leases.reclaimed"
-	metricClockSkewDropped           = "jobs.clock_skew_dropped"
+	// metricEventsDropped counts queue lifecycle-event deliveries dropped because a
+	// subscriber's Events() buffer was full (Queue.Emit's best-effort default).
+	metricEventsDropped    = "jobs.events.dropped"
+	metricLeasesReclaimed  = "jobs.leases.reclaimed"
+	metricClockSkewDropped = "jobs.clock_skew_dropped"
 
 	metricDequeueReleased         = "jobs.dequeue.released"
 	metricDequeueSuppressedTicks  = "jobs.dequeue.suppressed_ticks"
@@ -111,6 +115,7 @@ func Instrument(q *queue.Queue, opts ...InstrumentOption) {
 	registerDeadLetterDepthGauge(meter, q.Storage())
 	registerConcurrencySlotCardinalityGauge(meter, q.Storage())
 	registerRateLimitWindowCardinalityGauge(meter, q.Storage())
+	registerDroppedEventsCounter(meter, q.DroppedEventCount)
 
 	q.OnJobStart(startHook(inst))
 	q.OnJobComplete(completeHook(inst))
@@ -502,6 +507,29 @@ func registerBacklogOldestAgeGauge(meter metric.Meter, s core.Storage) {
 // scalar with NO per-slot attribute. Labeling by slot name would reproduce the
 // very unbounded-cardinality explosion in the metrics backend that this gauge
 // exists to detect.
+// registerDroppedEventsCounter emits jobs.events.dropped: the cumulative number
+// of queue lifecycle-event deliveries dropped because a subscriber's Events()
+// buffer was full (Queue.Emit's best-effort default branch). A single scalar with
+// NO attributes — subscribers are anonymous channels and the queue tracks one
+// process-wide total. It is an OBSERVABLE counter over an already-accumulating
+// monotonic atomic, so the SDK reads the current cumulative total at each scrape.
+func registerDroppedEventsCounter(meter metric.Meter, dropped func() uint64) {
+	_, err := meter.Int64ObservableCounter(metricEventsDropped,
+		metric.WithUnit("{event}"),
+		metric.WithDescription("Queue lifecycle events dropped because a subscriber's Events() buffer was full."),
+		metric.WithInt64Callback(func(_ context.Context, observer metric.Int64Observer) error {
+			n := dropped()
+			if n > math.MaxInt64 {
+				n = math.MaxInt64
+			}
+			observer.Observe(int64(n))
+			return nil
+		}))
+	if err != nil {
+		slog.Default().Warn("dropped-events counter disabled", "error", err)
+	}
+}
+
 func registerConcurrencySlotCardinalityGauge(meter metric.Meter, s core.Storage) {
 	source, ok := s.(concurrencySlotCardinalitySource)
 	if !ok {

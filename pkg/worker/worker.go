@@ -28,7 +28,15 @@ type Worker struct {
 	queue  *queue.Queue
 	config WorkerConfig
 	logger *slog.Logger
-	wg     sync.WaitGroup
+	// wg covers background goroutines (scheduler, reaper, sweeps, retention, ...).
+	wg sync.WaitGroup
+	// handlerWG covers ONLY in-flight job-handler goroutines (processLoop), so
+	// shutdown can drain handlers on a bounded timeout without waiting unbounded on
+	// a ctx-ignoring handler, and without conflating them with background loops.
+	handlerWG sync.WaitGroup
+	// forcedHandlerDrainGrace bounds the post-force-cancel drain wait; set from
+	// defaultForcedHandlerDrainGrace in NewWorker (tests may shrink it per-instance).
+	forcedHandlerDrainGrace time.Duration
 
 	batchCompleter *batchCompleter
 
@@ -241,6 +249,17 @@ const (
 	maxDrainIterations     = 1000
 )
 
+// defaultForcedHandlerDrainGrace bounds the wait AFTER handlers are force-cancelled
+// at shutdown, so a handler that ignores its context cannot hang shutdown forever.
+// The live value is a per-Worker field (Worker.forcedHandlerDrainGrace) so tests
+// can shrink it on their own instance without racing other workers.
+const defaultForcedHandlerDrainGrace = 5 * time.Second
+
+// ErrWorkerAlreadyStarted is returned by Start when a worker is already running.
+// Start admits exactly one live run; call it again only after the previous run's
+// context has been cancelled and Start has returned.
+var ErrWorkerAlreadyStarted = errors.New("jobs: worker already started")
+
 var signalResumePollBatchSize = 100
 
 // NewWorker creates a new worker for the given queue.
@@ -415,6 +434,7 @@ func NewWorker(q *queue.Queue, opts ...WorkerOption) *Worker {
 		queue:                   q,
 		config:                  config,
 		logger:                  slog.Default(),
+		forcedHandlerDrainGrace: defaultForcedHandlerDrainGrace,
 		runningJobs:             make(map[core.UUID]context.CancelFunc),
 		queueRunning:            queueRunning,
 		queueJobID:              make(map[core.UUID]string),
@@ -434,8 +454,18 @@ func NewWorker(q *queue.Queue, opts ...WorkerOption) *Worker {
 // DequeueBatchSize to 1 with a slow PollInterval approximates the legacy
 // once-per-tick dispatch behavior.
 func (w *Worker) Start(ctx context.Context) error {
-	w.started.Store(true)
+	// Real re-entry guard: reject a concurrent/overlapping Start so two run loops
+	// cannot race this worker's shared maps/counters. A CAS (not a plain Store)
+	// makes the check-and-set atomic.
+	if !w.started.CompareAndSwap(false, true) {
+		return ErrWorkerAlreadyStarted
+	}
 	defer w.started.Store(false)
+	// Reset the drain flag AFTER the CAS (so a rejected double-Start can't clear a
+	// live run's flag) so a restarted worker (Start → cancel → Start on a fresh
+	// ctx) begins clean — otherwise a stale shuttingDown=true would misroute a
+	// later non-shutdown context.Canceled (e.g. aggressive pause) to release.
+	w.shuttingDown.Store(false)
 
 	if err := w.validateConfiguredStorageCapabilities(); err != nil {
 		return err
@@ -501,7 +531,7 @@ func (w *Worker) Start(ctx context.Context) error {
 	}
 
 	for i := 0; i < totalConcurrency; i++ {
-		w.wg.Add(1)
+		w.handlerWG.Add(1)
 		go w.processLoop(handlerBase, jobsChan)
 	}
 
@@ -518,18 +548,24 @@ func (w *Worker) Start(ctx context.Context) error {
 			if w.batchCompleter != nil {
 				w.batchCompleter.Close()
 			}
-			if w.config.DrainTimeout <= 0 {
-				cancelHandlers()
-				w.wg.Wait()
-				return ctx.Err()
-			}
-			if !w.waitForDrain() {
+			// Phase 1: graceful drain of in-flight handlers (skipped when
+			// DrainTimeout<=0). A clean drain returns immediately.
+			if w.config.DrainTimeout > 0 && !w.waitHandlers(w.config.DrainTimeout) {
 				w.logger.Warn("worker drain timeout reached; cancelling in-flight handlers",
 					"in_flight", w.RunningJobCount(),
 					"drain_timeout", w.config.DrainTimeout)
-				cancelHandlers()
-				w.wg.Wait()
 			}
+			// Phase 2: force-cancel any still-running handlers, then BOUND the wait
+			// so a handler that ignores its context cannot hang shutdown forever.
+			cancelHandlers()
+			if !w.waitHandlers(w.forcedHandlerDrainGrace) {
+				w.logger.Error("in-flight handlers did not exit within the forced-drain grace; abandoning them",
+					"in_flight", w.RunningJobCount(),
+					"grace", w.forcedHandlerDrainGrace)
+			}
+			// Background goroutines all select on ctx.Done() (already fired); wait
+			// for them unbounded so none is abandoned mid-DB-write.
+			w.wg.Wait()
 			return ctx.Err()
 		case <-ticker.C:
 			w.drainDequeuedJobs(ctx, jobsChan, totalConcurrency)
@@ -539,6 +575,11 @@ func (w *Worker) Start(ctx context.Context) error {
 
 func (w *Worker) validateConfiguredStorageCapabilities() error {
 	storage := w.queue.Storage()
+	if len(w.config.rateLimitOptionErrors) > 0 {
+		// A RateLimit(...) was configured with invalid args (empty name / non-positive
+		// rate). Fail loudly at Start rather than run with a silently-absent limit.
+		return fmt.Errorf("invalid RateLimit option(s): %w", errors.Join(w.config.rateLimitOptionErrors...))
+	}
 	if count := len(w.config.ConcurrencyCaps); count > 0 {
 		if _, ok := storage.(concurrencySlotStorage); !ok {
 			return fmt.Errorf("worker has %d ConcurrencyCap(s) configured but storage %T does not support DB-backed concurrency slots; the cap would be silently ignored", count, storage)
@@ -549,7 +590,45 @@ func (w *Worker) validateConfiguredStorageCapabilities() error {
 			return fmt.Errorf("worker has %d RateLimit(s) configured but storage %T does not support DB-backed rate limiting; the rate limit would be silently ignored", count, storage)
 		}
 	}
+	w.warnDegradedStorageDurability(storage)
 	return nil
+}
+
+// fanOutSuspendStorage is the atomic fan-out suspend capability (mirrors
+// pkg/fanout's suspender). When a storage lacks it, FanOut() uses the legacy
+// non-atomic 4-write fallback with a wider crash window.
+type fanOutSuspendStorage interface {
+	SuspendForFanOut(ctx context.Context, parentID core.UUID, workerID string, fanOut *core.FanOut, checkpoint *core.Checkpoint, subJobs []*core.Job) error
+}
+
+// warnDegradedStorageDurability loudly warns at startup when a CUSTOM storage
+// lacks a durability-critical atomic capability that a used/usable feature
+// depends on. Unlike concurrency/rate caps (silently IGNORED → hard fail), these
+// fallbacks still function, just with a crash-durability penalty — so warn rather
+// than fail. GormStorage implements both atomic paths, so neither warning fires
+// for the default storage. See docs/content/docs/storage-durability.md.
+func (w *Worker) warnDegradedStorageDurability(storage core.Storage) {
+	// Scheduled fires: the non-atomic fallback can LOSE a fire on a crash between
+	// claiming the boundary and enqueuing the job. Only relevant when schedules
+	// are actually configured.
+	if len(w.queue.GetScheduledJobs()) > 0 && !w.queue.SupportsAtomicScheduledFire() {
+		w.logger.Warn("DEGRADED DURABILITY: scheduled jobs are configured but storage lacks atomic "+
+			"scheduled-fire enqueue (ScheduledFireTxClaimer + TxEnqueuer); a fire can be LOST if this "+
+			"worker crashes between claiming the fire boundary and enqueuing the job. Use GormStorage "+
+			"(or a TxEnqueuer-capable storage) for at-least-once scheduled fires.",
+			"storage", fmt.Sprintf("%T", storage))
+	}
+	// Fan-out: without atomic suspend, a crash mid-suspend leaves a running+locked
+	// parent until the stale-lock reaper reclaims it — recoverable, but a wider
+	// window than the atomic path. Fan-out is a runtime feature, so warn whenever
+	// the capability is absent (any handler may call FanOut).
+	if _, ok := storage.(fanOutSuspendStorage); !ok {
+		w.logger.Warn("DEGRADED DURABILITY: storage lacks atomic fan-out suspend (SuspendForFanOut); "+
+			"FanOut() uses the legacy non-atomic fallback with a wider crash window (a crash mid-suspend "+
+			"leaves a running+locked parent until the stale-lock reaper reclaims it — recoverable, but "+
+			"wider than the atomic path). Use GormStorage for atomic fan-out suspend.",
+			"storage", fmt.Sprintf("%T", storage))
+	}
 }
 
 func (w *Worker) drainDequeuedJobs(ctx context.Context, jobsChan chan<- *core.Job, totalConcurrency int) {
@@ -810,14 +889,17 @@ func (w *Worker) releaseDequeuedJobOnShutdown(ctx context.Context, job *core.Job
 	w.untrackQueueJob(job.ID)
 }
 
-func (w *Worker) waitForDrain() bool {
+// waitHandlers waits up to timeout for all in-flight job handlers to finish,
+// returning true if they drained and false on timeout. It waits ONLY on
+// handlerWG (job handlers), never on background goroutines.
+func (w *Worker) waitHandlers(timeout time.Duration) bool {
 	done := make(chan struct{})
 	go func() {
-		w.wg.Wait()
+		w.handlerWG.Wait()
 		close(done)
 	}()
 
-	timer := time.NewTimer(w.config.DrainTimeout)
+	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 
 	select {
@@ -1596,7 +1678,7 @@ func (w *Worker) dequeueBatchPerQueueWithRetry(ctx context.Context, storage perQ
 }
 
 func (w *Worker) processLoop(ctx context.Context, jobs <-chan *core.Job) {
-	defer w.wg.Done()
+	defer w.handlerWG.Done()
 
 	for job := range jobs {
 		w.processJob(ctx, job)
@@ -1741,23 +1823,25 @@ func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 			// Job is already in StatusWaiting; just return
 			return
 		}
+		// Graceful shutdown: the handler was cancelled because the worker is
+		// stopping, not because the job failed. Release it back to pending
+		// (status→pending, lock cleared) so a surviving/new worker resumes it in
+		// seconds via its idempotent phases — instead of burning a retry attempt
+		// and a backoff delay. This is evaluated BEFORE IsFailure so a custom
+		// IsFailure that treats context.Canceled as non-failure cannot zero err and
+		// silently mark a shutdown-interrupted job COMPLETED (dropping its
+		// unfinished phases). Only this worker's own shutdown-cancel qualifies.
+		if w.shuttingDown.Load() && errors.Is(err, context.Canceled) {
+			w.releaseDequeuedJobOnShutdown(ctx, job)
+			cancelHeartbeat()
+			return
+		}
 		if !w.queue.IsFailure(job, err) {
 			err = nil
 		}
 	}
 
 	if err != nil {
-		// Graceful shutdown: the handler was cancelled because the worker is
-		// stopping, not because the job failed. Release it back to pending
-		// (status→pending, lock cleared) so a surviving/new worker resumes it in
-		// seconds via its idempotent phases — instead of burning a retry attempt
-		// and a backoff delay. Only this worker's own shutdown-cancel qualifies;
-		// other context cancellations keep the normal retry path.
-		if w.shuttingDown.Load() && errors.Is(err, context.Canceled) {
-			w.releaseDequeuedJobOnShutdown(ctx, job)
-			cancelHeartbeat()
-			return
-		}
 		w.queue.CallErrorHandler(jobCtx, job, err)
 		w.handleError(ctx, jobCtx, job, err)
 		cancelHeartbeat()

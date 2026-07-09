@@ -43,6 +43,11 @@ func (w *Worker) logStorageCapabilities() {
 	if _, ok := s.(completablePendingFanOutStorage); !ok {
 		inactive = append(inactive, "fanout-pending-recovery")
 	}
+	if _, ok := s.(fanOutSuspendStorage); !ok {
+		// FanOut() falls back to the legacy non-atomic 4-write suspend; see the
+		// DEGRADED DURABILITY warning from validateConfiguredStorageCapabilities.
+		inactive = append(inactive, "atomic-fanout-suspend")
+	}
 	if _, ok := s.(failTerminalWithResultStorage); !ok {
 		inactive = append(inactive, "result-on-terminal-fail")
 	}

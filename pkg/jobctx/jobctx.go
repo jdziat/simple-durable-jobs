@@ -199,25 +199,47 @@ func SavePhaseCheckpointTx(ctx context.Context, tx *gorm.DB, phaseName string, r
 	return txCheckpointer.SaveCheckpointTx(ctx, tx, cp)
 }
 
+// ErrPhaseCheckpointDecode is returned by LoadPhaseCheckpointErr when a phase
+// checkpoint EXISTS but its stored result cannot be decoded into T — a corruption
+// or a T-type mismatch, NOT a legitimate absence.
+var ErrPhaseCheckpointDecode = errors.New("jobs: phase checkpoint decode failed")
+
 // LoadPhaseCheckpoint loads a previously saved phase result from the checkpoint store.
 // Returns (result, true) if found, (zero, false) if not found or not in job context.
+//
+// NOTE: an undecodable checkpoint (present but corrupt / wrong T) is reported as
+// (zero, false) here — i.e. treated as absent, so the phase RE-RUNS. Use
+// LoadPhaseCheckpointErr to distinguish a genuine absence from a decode failure
+// and fail loud instead of silently re-executing.
 func LoadPhaseCheckpoint[T any](ctx context.Context, phaseName string) (T, bool) {
+	result, ok, _ := LoadPhaseCheckpointErr[T](ctx, phaseName)
+	return result, ok
+}
+
+// LoadPhaseCheckpointErr is like LoadPhaseCheckpoint but surfaces a decode
+// failure. Three outcomes:
+//   - (result, true, nil):  checkpoint found and decoded — skip the phase.
+//   - (zero, false, nil):   legitimately absent (no context, not written) — run the phase.
+//   - (zero, false, err):   checkpoint EXISTS but did not decode into T (err wraps
+//     ErrPhaseCheckpointDecode) — do NOT treat as absent; fail loud rather than
+//     silently re-execute a phase whose result was actually persisted.
+func LoadPhaseCheckpointErr[T any](ctx context.Context, phaseName string) (T, bool, error) {
 	var zero T
 
 	// A reserved-prefix name can never have been written by SavePhaseCheckpoint,
 	// so treat it as absent rather than aliasing a GetVersion marker.
 	if strings.HasPrefix(phaseName, versionCheckpointPrefix) {
-		return zero, false
+		return zero, false, nil
 	}
 
 	jc := intctx.GetJobContext(ctx)
 	if jc == nil {
-		return zero, false
+		return zero, false, nil
 	}
 
 	cs := intctx.GetCallState(ctx)
 	if cs == nil {
-		return zero, false
+		return zero, false, nil
 	}
 
 	cs.Mu.Lock()
@@ -225,14 +247,14 @@ func LoadPhaseCheckpoint[T any](ctx context.Context, phaseName string) (T, bool)
 	cs.Mu.Unlock()
 
 	if !ok {
-		return zero, false
+		return zero, false, nil
 	}
 
 	var result T
 	if err := json.Unmarshal(cp.Result, &result); err != nil {
-		return zero, false
+		return zero, false, fmt.Errorf("%w: phase %q: %v", ErrPhaseCheckpointDecode, phaseName, err)
 	}
-	return result, true
+	return result, true, nil
 }
 
 func versionCheckpointType(changeID string) string {

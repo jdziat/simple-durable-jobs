@@ -222,6 +222,19 @@ func (q *Queue) enqueue(ctx context.Context, name string, args any, opts ...Opti
 // when the storage backend is not transactional (no GORM tx / TxEnqueuer). It is
 // the scheduler's enqueue path and runs the same options, dedup, and middleware as
 // EnqueueTx.
+// SupportsAtomicScheduledFire reports whether the storage backend can claim a
+// schedule's fire boundary AND enqueue its job in a single transaction. When it
+// returns false, EnqueueScheduledFire uses a non-atomic claim-then-enqueue
+// fallback that can LOSE a fire if the process crashes between recording the
+// claim and enqueuing the job. GormStorage returns true; the worker uses this to
+// warn loudly at startup when schedules are configured on a non-atomic storage.
+func (q *Queue) SupportsAtomicScheduledFire() bool {
+	_, claimerOK := q.storage.(storage.ScheduledFireTxClaimer)
+	_, enqOK := q.storage.(storage.TxEnqueuer)
+	_, dbOK := q.storage.(interface{ DB() *gorm.DB })
+	return claimerOK && enqOK && dbOK
+}
+
 func (q *Queue) EnqueueScheduledFire(ctx context.Context, scheduleName string, fireTime time.Time, jobName string, args any, opts ...Option) (claimed bool, id core.UUID, err error) {
 	txClaimer, claimerOK := q.storage.(storage.ScheduledFireTxClaimer)
 	_, enqOK := q.storage.(storage.TxEnqueuer)
