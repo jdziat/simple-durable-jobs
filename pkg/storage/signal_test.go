@@ -26,6 +26,17 @@ func sendTestSignal(t *testing.T, ctx context.Context, s *GormStorage, jobID, na
 	require.NoError(t, s.SendSignal(ctx, id, name, payload))
 }
 
+// ownJob transitions a job to the running+locked state a handler is in when it
+// calls ConsumeSignalTx, so the ownership gate (locked_by=workerID AND
+// status=running) admits the consume.
+func ownJob(t *testing.T, ctx context.Context, s *GormStorage, id core.UUID, worker string) {
+	t.Helper()
+	until := time.Now().Add(time.Minute)
+	require.NoError(t, s.db.WithContext(ctx).Model(&core.Job{}).
+		Where("id = ?", id).
+		Updates(map[string]any{"status": core.StatusRunning, "locked_by": worker, "locked_until": until}).Error)
+}
+
 func TestSendSignal_SQLiteRejectsMissingJob(t *testing.T) {
 	// Regression (teardown g10): on SQLite (foreign_keys=OFF, fk_signals_job not
 	// enforced) SendSignal to a missing job used to insert a permanently-orphaned
@@ -487,8 +498,9 @@ func TestConsumeSignalTx_AtomicConsumeAndCheckpoint(t *testing.T) {
 	s := newTestStorage(t)
 	ctx := context.Background()
 	sendTestSignal(t, ctx, s, "j1", "ctx", []byte(`"hi"`))
+	ownJob(t, ctx, s, signalUUID("j1"), "w1")
 
-	sig, err := s.ConsumeSignalTx(ctx, signalUUID("j1"), "ctx", func(sig *core.Signal) (*core.Checkpoint, error) {
+	sig, err := s.ConsumeSignalTxOwned(ctx, signalUUID("j1"), "w1", "ctx", func(sig *core.Signal) (*core.Checkpoint, error) {
 		return validCheckpoint(signalUUID("j1"), sig), nil
 	})
 	require.NoError(t, err)
@@ -512,12 +524,13 @@ func TestConsumeSignalTx_RollbackLeavesSignalAndNoCheckpoint(t *testing.T) {
 	s := newTestStorage(t)
 	ctx := context.Background()
 	sendTestSignal(t, ctx, s, "j1", "ctx", []byte(`"hi"`))
+	ownJob(t, ctx, s, signalUUID("j1"), "w1")
 
 	// The checkpoint-build closure fails: the whole consume+checkpoint must roll
 	// back. This is the crash/replay regression proof at the tx layer — the old
 	// two-tx design (consume commits, then checkpoint) cannot satisfy it. Runs on
 	// SQLite AND Postgres AND MySQL (the PG/MySQL FOR UPDATE SKIP LOCKED path).
-	_, err := s.ConsumeSignalTx(ctx, signalUUID("j1"), "ctx", func(*core.Signal) (*core.Checkpoint, error) {
+	_, err := s.ConsumeSignalTxOwned(ctx, signalUUID("j1"), "w1", "ctx", func(*core.Signal) (*core.Checkpoint, error) {
 		return nil, errors.New("boom")
 	})
 	require.Error(t, err)
@@ -535,8 +548,10 @@ func TestConsumeSignalTx_RollbackLeavesSignalAndNoCheckpoint(t *testing.T) {
 func TestConsumeSignalTx_NoPendingDoesNothing(t *testing.T) {
 	s := newTestStorage(t)
 	ctx := context.Background()
+	seedTestJob(t, ctx, s, signalUUID("j1"), core.StatusRunning)
+	ownJob(t, ctx, s, signalUUID("j1"), "w1")
 
-	sig, err := s.ConsumeSignalTx(ctx, signalUUID("j1"), "ctx", func(*core.Signal) (*core.Checkpoint, error) {
+	sig, err := s.ConsumeSignalTxOwned(ctx, signalUUID("j1"), "w1", "ctx", func(*core.Signal) (*core.Checkpoint, error) {
 		t.Fatal("buildCheckpoint must not be called when no signal is pending")
 		return nil, nil
 	})
@@ -562,8 +577,9 @@ func TestDrainSignalsTx_AlwaysCheckpointsAndRollsBack(t *testing.T) {
 		s := newTestStorage(t)
 		ctx := context.Background()
 		seedTestJob(t, ctx, s, signalUUID("j1"), core.StatusWaiting)
+		ownJob(t, ctx, s, signalUUID("j1"), "w1")
 		var called bool
-		sigs, err := s.DrainSignalsTx(ctx, signalUUID("j1"), "ctx", func(sigs []*core.Signal) (*core.Checkpoint, error) {
+		sigs, err := s.DrainSignalsTxOwned(ctx, signalUUID("j1"), "w1", "ctx", func(sigs []*core.Signal) (*core.Checkpoint, error) {
 			called = true
 			assert.Empty(t, sigs, "empty batch")
 			return drainCheckpoint(sigs), nil
@@ -582,7 +598,8 @@ func TestDrainSignalsTx_AlwaysCheckpointsAndRollsBack(t *testing.T) {
 		for _, p := range [][]byte{[]byte(`"a"`), []byte(`"b"`), []byte(`"c"`)} {
 			sendTestSignal(t, ctx, s, "j1", "ctx", p)
 		}
-		sigs, err := s.DrainSignalsTx(ctx, signalUUID("j1"), "ctx", func(sigs []*core.Signal) (*core.Checkpoint, error) {
+		ownJob(t, ctx, s, signalUUID("j1"), "w1")
+		sigs, err := s.DrainSignalsTxOwned(ctx, signalUUID("j1"), "w1", "ctx", func(sigs []*core.Signal) (*core.Checkpoint, error) {
 			return drainCheckpoint(sigs), nil
 		})
 		require.NoError(t, err)
@@ -601,7 +618,8 @@ func TestDrainSignalsTx_AlwaysCheckpointsAndRollsBack(t *testing.T) {
 		for _, p := range [][]byte{[]byte(`"a"`), []byte(`"b"`), []byte(`"c"`)} {
 			sendTestSignal(t, ctx, s, "j1", "ctx", p)
 		}
-		_, err := s.DrainSignalsTx(ctx, signalUUID("j1"), "ctx", func([]*core.Signal) (*core.Checkpoint, error) {
+		ownJob(t, ctx, s, signalUUID("j1"), "w1")
+		_, err := s.DrainSignalsTxOwned(ctx, signalUUID("j1"), "w1", "ctx", func([]*core.Signal) (*core.Checkpoint, error) {
 			return nil, errors.New("boom")
 		})
 		require.Error(t, err)
@@ -646,4 +664,92 @@ func TestConsumeSignal_ConcurrentDisjoint(t *testing.T) {
 	for id, c := range seen {
 		assert.Equalf(t, 1, c, "signal %s consumed more than once", id)
 	}
+}
+
+// TestConsumeSignalTx_NonOwnerDoesNotConsume is the E6-signal-loss regression:
+// under the at-least-once double-run edge, a NON-owner execution must not
+// consume a delivered signal (doing so makes the real owner find nothing pending
+// and take the timeout branch, silently losing the signal). The gate leaves the
+// signal pending for the owner.
+func TestConsumeSignalTx_NonOwnerDoesNotConsume(t *testing.T) {
+	s := newTestStorage(t)
+	ctx := context.Background()
+	sendTestSignal(t, ctx, s, "j1", "ctx", []byte(`"hi"`))
+	ownJob(t, ctx, s, signalUUID("j1"), "owner-w") // the legitimate owner
+
+	// A stale non-owner (its heartbeat lapsed; the job was reassigned) must NOT
+	// consume: buildCheckpoint is never called and the signal stays pending.
+	sig, err := s.ConsumeSignalTxOwned(ctx, signalUUID("j1"), "stale-w", "ctx", func(*core.Signal) (*core.Checkpoint, error) {
+		t.Fatal("a non-owner must not consume the signal / build a checkpoint")
+		return nil, nil
+	})
+	require.NoError(t, err)
+	assert.Nil(t, sig, "non-owner consumes nothing")
+
+	peek, err := s.PeekSignal(ctx, signalUUID("j1"), "ctx")
+	require.NoError(t, err)
+	require.NotNil(t, peek, "signal must remain pending for the real owner")
+	cps, err := s.GetCheckpoints(ctx, signalUUID("j1"))
+	require.NoError(t, err)
+	assert.Empty(t, cps, "no checkpoint written by a non-owner")
+
+	// The real owner consumes it.
+	sig, err = s.ConsumeSignalTxOwned(ctx, signalUUID("j1"), "owner-w", "ctx", func(sg *core.Signal) (*core.Checkpoint, error) {
+		return validCheckpoint(signalUUID("j1"), sg), nil
+	})
+	require.NoError(t, err)
+	require.NotNil(t, sig, "the owner consumes the delivered signal")
+	assert.Equal(t, `"hi"`, string(sig.Payload))
+}
+
+// TestMarkWaiting_ClearsRunAt is the E6-run_at regression: an indefinite wait
+// must NULL run_at so a stale past run_at (from a delayed enqueue or a retry
+// backoff) does not spuriously match the signal-resume poll and burn a wasted
+// re-dispatch.
+func TestMarkWaiting_ClearsRunAt(t *testing.T) {
+	s := newTestStorage(t)
+	ctx := context.Background()
+	const worker = "w1"
+	id := signalUUID("mw1")
+	past := time.Now().Add(-5 * time.Minute)
+	until := time.Now().Add(time.Minute)
+	require.NoError(t, s.db.WithContext(ctx).Create(&core.Job{
+		ID: id, Type: "wf", Queue: "default", Status: core.StatusRunning,
+		LockedBy: worker, LockedUntil: &until, RunAt: &past,
+	}).Error)
+
+	require.NoError(t, s.MarkWaiting(ctx, id, worker))
+
+	got, err := s.GetJob(ctx, id)
+	require.NoError(t, err)
+	assert.Equal(t, core.StatusWaiting, got.Status)
+	assert.Nil(t, got.RunAt, "MarkWaiting must clear a stale past run_at on an indefinite wait")
+}
+
+// TestDrainSignalsTxOwned_NonOwnerDoesNotDrain mirrors the consume gate for the
+// drain path (the symmetric, arguably more dangerous loss vector: a non-owner's
+// empty-batch checkpoint at the owner's call index would make the owner's replay
+// return [] and drop buffered signals). A non-owner drains nothing, writes no
+// checkpoint, and leaves the signals pending for the owner.
+func TestDrainSignalsTxOwned_NonOwnerDoesNotDrain(t *testing.T) {
+	s := newTestStorage(t)
+	ctx := context.Background()
+	for _, p := range [][]byte{[]byte(`"a"`), []byte(`"b"`)} {
+		sendTestSignal(t, ctx, s, "j1", "ctx", p)
+	}
+	ownJob(t, ctx, s, signalUUID("j1"), "owner-w")
+
+	sigs, err := s.DrainSignalsTxOwned(ctx, signalUUID("j1"), "stale-w", "ctx", func([]*core.Signal) (*core.Checkpoint, error) {
+		t.Fatal("a non-owner must not drain / build a checkpoint (even an empty-batch one)")
+		return nil, nil
+	})
+	require.NoError(t, err)
+	assert.Empty(t, sigs, "non-owner drains nothing")
+
+	cps, err := s.GetCheckpoints(ctx, signalUUID("j1"))
+	require.NoError(t, err)
+	assert.Empty(t, cps, "non-owner writes no checkpoint")
+	remaining, err := s.DrainSignals(ctx, signalUUID("j1"), "ctx")
+	require.NoError(t, err)
+	assert.Len(t, remaining, 2, "both signals remain pending for the real owner")
 }

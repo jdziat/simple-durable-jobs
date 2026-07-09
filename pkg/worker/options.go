@@ -107,6 +107,16 @@ type ConcurrencyCapConfig struct {
 // RateLimitConfig describes a DB-backed fixed-window rate limit. If Key is nil,
 // the limiter uses Name as the partition. If Key is set, the effective limit
 // name is Name + ":" + Key(job), allowing per-tenant or per-key partitions.
+//
+// Key must return values from a BOUNDED, enumerable set (e.g. a fixed set of
+// tenants, regions, or endpoints), for the same reason as ConcurrencyCapConfig
+// but via a different mechanism. Each distinct effective limit name accrues
+// fixed-window rows in rate_limit_windows; those rows self-GC only while that
+// limit name keeps being consumed (each consume prunes its own stale windows). A
+// high-cardinality Key — per-job IDs, UUIDs, or arbitrary user input — that stops
+// recurring leaves its final windows frozen with no further GC, growing
+// rate_limit_windows without bound. Partition on bounded dimensions. The
+// jobs.ratelimit.window_cardinality metric surfaces this growth.
 type RateLimitConfig struct {
 	Name      string
 	PerSecond float64

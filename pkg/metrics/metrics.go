@@ -43,8 +43,14 @@ const (
 	metricBacklogOldestAge = "jobs.queue.backlog.oldest_age"
 	metricDeadLetterDepth  = "jobs.dead_letter.depth"
 	metricQueueSaturation  = "jobs.queue.saturation"
-	metricLeasesReclaimed  = "jobs.leases.reclaimed"
-	metricClockSkewDropped = "jobs.clock_skew_dropped"
+	// metricConcurrencySlotCardinality / metricRateLimitWindowCardinality are
+	// single-scalar gauges (NO per-key attribute) that surface unbounded per-key
+	// growth of the concurrency_slots / rate_limit_windows tables when a
+	// high-cardinality ConcurrencyCap/RateLimit Key is used.
+	metricConcurrencySlotCardinality = "jobs.concurrency.slot_cardinality"
+	metricRateLimitWindowCardinality = "jobs.ratelimit.window_cardinality"
+	metricLeasesReclaimed            = "jobs.leases.reclaimed"
+	metricClockSkewDropped           = "jobs.clock_skew_dropped"
 
 	metricDequeueReleased         = "jobs.dequeue.released"
 	metricDequeueSuppressedTicks  = "jobs.dequeue.suppressed_ticks"
@@ -103,6 +109,8 @@ func Instrument(q *queue.Queue, opts ...InstrumentOption) {
 	registerQueueDepthGauge(meter, q.Storage())
 	registerBacklogOldestAgeGauge(meter, q.Storage())
 	registerDeadLetterDepthGauge(meter, q.Storage())
+	registerConcurrencySlotCardinalityGauge(meter, q.Storage())
+	registerRateLimitWindowCardinalityGauge(meter, q.Storage())
 
 	q.OnJobStart(startHook(inst))
 	q.OnJobComplete(completeHook(inst))
@@ -282,6 +290,14 @@ type queueOldestPendingAtSource interface {
 
 type queueDeadLetterCountSource interface {
 	QueueDeadLetterCounts(context.Context) (map[string]int, error)
+}
+
+type concurrencySlotCardinalitySource interface {
+	ConcurrencySlotCardinality(context.Context) (int64, error)
+}
+
+type rateLimitWindowCardinalitySource interface {
+	RateLimitWindowCardinality(context.Context) (int64, error)
 }
 
 // QueueRunningSnapshotFunc returns a point-in-time running job count by queue.
@@ -478,6 +494,60 @@ func registerBacklogOldestAgeGauge(meter metric.Meter, s core.Storage) {
 		}))
 	if err != nil {
 		slog.Default().Warn("backlog oldest age gauge disabled", "error", err)
+	}
+}
+
+// registerConcurrencySlotCardinalityGauge emits jobs.concurrency.slot_cardinality:
+// the number of distinct concurrency slot names (permanent sentinels), a single
+// scalar with NO per-slot attribute. Labeling by slot name would reproduce the
+// very unbounded-cardinality explosion in the metrics backend that this gauge
+// exists to detect.
+func registerConcurrencySlotCardinalityGauge(meter metric.Meter, s core.Storage) {
+	source, ok := s.(concurrencySlotCardinalitySource)
+	if !ok {
+		slog.Default().Warn("storage backend does not support concurrency slot cardinality metrics; gauge disabled")
+		return
+	}
+
+	_, err := meter.Int64ObservableGauge(metricConcurrencySlotCardinality,
+		metric.WithUnit("{slot}"),
+		metric.WithDescription("Distinct concurrency slot names tracked (unbounded-growth signal for a high-cardinality ConcurrencyCap Key)."),
+		metric.WithInt64Callback(func(ctx context.Context, observer metric.Int64Observer) error {
+			n, err := source.ConcurrencySlotCardinality(ctx)
+			if err != nil {
+				return err
+			}
+			observer.Observe(n)
+			return nil
+		}))
+	if err != nil {
+		slog.Default().Warn("concurrency slot cardinality gauge disabled", "error", err)
+	}
+}
+
+// registerRateLimitWindowCardinalityGauge emits jobs.ratelimit.window_cardinality:
+// the total rate-limit window row count, a single scalar with NO per-limit
+// attribute (same anti-explosion reasoning as the concurrency gauge).
+func registerRateLimitWindowCardinalityGauge(meter metric.Meter, s core.Storage) {
+	source, ok := s.(rateLimitWindowCardinalitySource)
+	if !ok {
+		slog.Default().Warn("storage backend does not support rate-limit window cardinality metrics; gauge disabled")
+		return
+	}
+
+	_, err := meter.Int64ObservableGauge(metricRateLimitWindowCardinality,
+		metric.WithUnit("{window}"),
+		metric.WithDescription("Total rate-limit window rows (unbounded-growth signal for a high-cardinality RateLimit Key)."),
+		metric.WithInt64Callback(func(ctx context.Context, observer metric.Int64Observer) error {
+			n, err := source.RateLimitWindowCardinality(ctx)
+			if err != nil {
+				return err
+			}
+			observer.Observe(n)
+			return nil
+		}))
+	if err != nil {
+		slog.Default().Warn("rate-limit window cardinality gauge disabled", "error", err)
 	}
 }
 

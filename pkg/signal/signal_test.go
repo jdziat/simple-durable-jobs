@@ -63,7 +63,7 @@ func (f *fakeSignalStore) PeekSignal(_ context.Context, _ core.UUID, name string
 // checkpoint via onCheckpoint. If either the build or the write fails, the signal
 // is restored at its original position (the tx rolled back) and the error is
 // returned, leaving nothing consumed and no checkpoint recorded.
-func (f *fakeSignalStore) ConsumeSignalTx(_ context.Context, _ core.UUID, name string, buildCheckpoint func(sig *core.Signal) (*core.Checkpoint, error)) (*core.Signal, error) {
+func (f *fakeSignalStore) ConsumeSignalTxOwned(_ context.Context, _ core.UUID, _ string, name string, buildCheckpoint func(sig *core.Signal) (*core.Checkpoint, error)) (*core.Signal, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	for i, s := range f.pending {
@@ -90,7 +90,7 @@ func (f *fakeSignalStore) ConsumeSignalTx(_ context.Context, _ core.UUID, name s
 // pending signals of name, ALWAYS invokes buildCheckpoint (even for an empty
 // batch), and writes the checkpoint via onCheckpoint. On any error the drained
 // signals are restored (the tx rolled back) and nothing is consumed.
-func (f *fakeSignalStore) DrainSignalsTx(_ context.Context, _ core.UUID, name string, buildCheckpoint func(sigs []*core.Signal) (*core.Checkpoint, error)) ([]*core.Signal, error) {
+func (f *fakeSignalStore) DrainSignalsTxOwned(_ context.Context, _ core.UUID, _ string, name string, buildCheckpoint func(sigs []*core.Signal) (*core.Checkpoint, error)) ([]*core.Signal, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	var out, rest []*core.Signal

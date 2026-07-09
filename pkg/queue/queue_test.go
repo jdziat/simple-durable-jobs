@@ -1721,3 +1721,75 @@ func TestQueue_LoadStatus_UnknownJob(t *testing.T) {
 	_, err := q.LoadStatus(context.Background(), "missing")
 	require.Error(t, err)
 }
+
+// cancelJobResumeStorage exercises Queue.CancelJob's inline resume of a cancelled
+// sub-job's OWNING fan-out (E3). CancelJobTerminal + the GetJob re-read run
+// against the embedded mock (the child is seeded with a FanOutID); GetFanOut
+// returns a terminal-by-count fan-out and UpdateFanOutStatus/ResumeJob record.
+type cancelJobResumeStorage struct {
+	*mockStorage
+	fanOut        *core.FanOut
+	updateCalled  bool
+	updatedStatus core.FanOutStatus
+	resumeCalled  bool
+	resumedID     core.UUID
+}
+
+func (c *cancelJobResumeStorage) GetFanOut(ctx context.Context, fanOutID core.UUID) (*core.FanOut, error) {
+	return c.fanOut, nil
+}
+
+func (c *cancelJobResumeStorage) UpdateFanOutStatus(ctx context.Context, fanOutID core.UUID, status core.FanOutStatus) (bool, error) {
+	c.updateCalled = true
+	c.updatedStatus = status
+	return true, nil
+}
+
+func (c *cancelJobResumeStorage) ResumeJob(ctx context.Context, jobID core.UUID) (bool, error) {
+	c.resumeCalled = true
+	c.resumedID = jobID
+	return true, nil
+}
+
+// TestQueue_CancelJob_SubJob_ResumesParentInline is the E3 regression: a
+// cross-API CancelJob on a fan-out CHILD must advance the owning fan-out to its
+// terminal status and resume the parent inline (mirroring CancelSubJob), rather
+// than stranding the parent until the ~2min recovery backstop.
+func TestQueue_CancelJob_SubJob_ResumesParentInline(t *testing.T) {
+	ctx := context.Background()
+	base := newMockStorage()
+	fanOutID := core.UUID("fo-e3")
+	parentID := core.UUID("parent-e3")
+	childID := core.UUID("child-e3")
+	require.NoError(t, base.Enqueue(ctx, &core.Job{
+		ID: childID, Type: "sub", Queue: "default", Status: core.StatusRunning, FanOutID: &fanOutID,
+	}))
+	fo := &core.FanOut{
+		ID: fanOutID, ParentJobID: parentID, TotalCount: 2,
+		CompletedCount: 1, CancelledCount: 1, Strategy: core.StrategyFailFast, Status: core.FanOutPending,
+	}
+	store := &cancelJobResumeStorage{mockStorage: base, fanOut: fo}
+	q := New(store)
+
+	require.NoError(t, q.CancelJob(ctx, childID))
+
+	assert.True(t, store.updateCalled, "owning fan-out must be advanced to its terminal status")
+	assert.Equal(t, core.FanOutFailed, store.updatedStatus)
+	assert.True(t, store.resumeCalled, "parent must be resumed inline, not via the recovery backstop")
+	assert.Equal(t, parentID, store.resumedID)
+}
+
+// TestQueue_CancelJob_NonSubJob_DoesNotResume ensures the inline resume only
+// fires for sub-jobs: cancelling a plain job must not attempt a fan-out resume.
+func TestQueue_CancelJob_NonSubJob_DoesNotResume(t *testing.T) {
+	ctx := context.Background()
+	base := newMockStorage()
+	jobID := core.UUID("plain-job")
+	require.NoError(t, base.Enqueue(ctx, &core.Job{ID: jobID, Type: "work", Queue: "default", Status: core.StatusRunning}))
+	store := &cancelJobResumeStorage{mockStorage: base}
+	q := New(store)
+
+	require.NoError(t, q.CancelJob(ctx, jobID))
+	assert.False(t, store.updateCalled)
+	assert.False(t, store.resumeCalled)
+}

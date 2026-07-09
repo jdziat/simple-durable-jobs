@@ -26,7 +26,11 @@ func newTestStorage(t *testing.T) *GormStorage {
 	t.Helper()
 	db := openTestDB(t)
 
-	s := NewGormStorage(db)
+	// Disable the hot-stats aggregate cache by default so tests observe exact
+	// post-mutation counts (enqueue -> read -> mutate -> read must not be served a
+	// stale cached snapshot). The cache itself is covered by dedicated tests that
+	// construct storage with an explicit nonzero TTL (see hot_stats_cache_test.go).
+	s := NewGormStorage(db, WithHotStatsCacheTTL(0))
 	require.NoError(t, s.Migrate(context.Background()), "migrate schema")
 	return s
 }
@@ -92,7 +96,7 @@ func newConcurrentTestStorage(t *testing.T) *GormStorage {
 	sqlDB.SetMaxOpenConns(4)
 	t.Cleanup(func() { _ = sqlDB.Close() })
 
-	s := NewGormStorage(db)
+	s := NewGormStorage(db, WithHotStatsCacheTTL(0))
 	require.NoError(t, s.Migrate(context.Background()))
 	return s
 }
@@ -1418,8 +1422,20 @@ func TestPauseJob_CancelsRunningJob(t *testing.T) {
 	assert.Equal(t, core.StatusCancelled, got.Status)
 	assert.Equal(t, "cancelled by user", got.LastError)
 	assert.NotNil(t, got.CompletedAt)
-	assert.Empty(t, got.LockedBy)
-	assert.Nil(t, got.LockedUntil)
+	// locked_by/locked_until are PRESERVED (not cleared) on the aggressive
+	// running->cancelled transition so FindOrphanedJobs' terminal-orphan clause
+	// (locked_by <> '') flags this row and the worker ownership audit interrupts
+	// the live handler in ~5s — mirroring CancelJobTerminal (E4a).
+	assert.Equal(t, "worker-1", got.LockedBy, "aggressive pause must preserve locked_by for the ~5s ownership audit")
+	assert.NotNil(t, got.LockedUntil, "aggressive pause must preserve locked_until")
+
+	// Consequence: the owning worker's ownership audit now flags this terminal-
+	// but-still-locked row (the (status NOT IN terminal OR locked_by <> '')
+	// clause), so it interrupts the live handler in ~5s instead of ~6min. With
+	// the old locked_by='' this returned empty.
+	orphaned, err := s.FindOrphanedJobs(ctx, []core.UUID{job.ID}, "worker-1")
+	require.NoError(t, err)
+	assert.Equal(t, []core.UUID{job.ID}, orphaned, "aggressive-paused running job must be flagged by the ownership audit")
 }
 
 func TestPauseJobWithMode(t *testing.T) {
@@ -2978,6 +2994,68 @@ func TestCancelSubJobs_ReconcilesPersistedFanOutCountsAfterFailFast(t *testing.T
 	assert.Equal(t, 0, reconciled.CompletedCount)
 	assert.Equal(t, 1, reconciled.FailedCount)
 	assert.Equal(t, 3, reconciled.CancelledCount)
+}
+
+// TestCancelSubJob_ReconcilesPersistedFanOutCountsAfterFailFast is the D5
+// regression for the SINGULAR path. When CancelSubJob terminates the last
+// in-flight child of an already-frozen fail_fast fan-out, the persisted fan_outs
+// row must reconcile to completed+failed+cancelled == total_count. Without the
+// persist inside CancelSubJob the frozen under-count stays diverged forever (no
+// later path revisits a terminal row). Reads the RAW persisted row, not
+// GetFanOut (which overlays live counts and would mask the divergence).
+func TestCancelSubJob_ReconcilesPersistedFanOutCountsAfterFailFast(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	parent := newTestJob("default", "workflow.run")
+	require.NoError(t, s.Enqueue(ctx, parent))
+
+	fanOut := &core.FanOut{
+		ParentJobID: parent.ID,
+		TotalCount:  2,
+		Strategy:    core.StrategyFailFast,
+		Status:      core.FanOutPending,
+	}
+	require.NoError(t, s.CreateFanOut(ctx, fanOut))
+
+	lockUntil := time.Now().Add(time.Hour)
+	failing := &core.Job{
+		ID: core.NewID(), Type: "sub", Queue: "default",
+		Status: core.StatusRunning, LockedBy: "worker-1", LockedUntil: &lockUntil,
+		FanOutID: &fanOut.ID, FanOutIndex: 0,
+	}
+	require.NoError(t, s.Enqueue(ctx, failing))
+	sibling := &core.Job{
+		ID: core.NewID(), Type: "sub", Queue: "default",
+		Status: core.StatusRunning, LockedBy: "worker-1", LockedUntil: &lockUntil,
+		FanOutID: &fanOut.ID, FanOutIndex: 1,
+	}
+	require.NoError(t, s.Enqueue(ctx, sibling))
+
+	// fail_fast: failing child 0 flips the fan-out to failed NOW while sibling 1 is
+	// still in-flight, so the persisted snapshot under-counts (sum=1 < total=2).
+	updated, err := s.FailTerminalWithResult(ctx, failing.ID, "worker-1", "boom")
+	require.NoError(t, err)
+	require.Equal(t, core.FanOutFailed, updated.Status)
+
+	var frozen core.FanOut
+	require.NoError(t, s.DB().First(&frozen, "id = ?", fanOut.ID).Error)
+	require.Less(t, frozen.CompletedCount+frozen.FailedCount+frozen.CancelledCount, frozen.TotalCount,
+		"precondition: persisted counts under-count the in-flight sibling before reconcile")
+
+	// CancelSubJob on the LAST in-flight child reconciles the persisted counts.
+	fo, err := s.CancelSubJob(ctx, sibling.ID)
+	require.NoError(t, err)
+	require.NotNil(t, fo)
+
+	var reconciled core.FanOut
+	require.NoError(t, s.DB().First(&reconciled, "id = ?", fanOut.ID).Error)
+	assert.Equal(t, reconciled.TotalCount,
+		reconciled.CompletedCount+reconciled.FailedCount+reconciled.CancelledCount,
+		"persisted counts must reconcile to sum==total_count after the singular cancel")
+	assert.Equal(t, 0, reconciled.CompletedCount)
+	assert.Equal(t, 1, reconciled.FailedCount)
+	assert.Equal(t, 1, reconciled.CancelledCount)
 }
 
 // TestAccountTerminalWithFanOut_ReconcilesOnNaturalCompletionWhenNotCancelOnFail

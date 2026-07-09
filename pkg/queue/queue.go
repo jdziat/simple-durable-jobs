@@ -1219,7 +1219,59 @@ func (q *Queue) CancelJob(ctx context.Context, jobID core.UUID) error {
 		job = &core.Job{ID: jobID, Status: core.StatusCancelled}
 	}
 	q.Emit(&core.JobCancelled{Job: job, Timestamp: time.Now()})
+
+	// If the cancelled job was a fan-out sub-job, drive its owning fan-out's
+	// terminal transition and resume its parent inline. CancelJobTerminal walks
+	// only the DESCENDANT subtree and fires no child-completion event for the
+	// target's OWN fan-out, so without this a fail_fast/threshold parent would sit
+	// in `waiting` until the ~2min recovery backstop. Storage already reconciled
+	// the owning fan-out's persisted counts; this drives the resume (mirrors
+	// CancelSubJob). Best-effort — the cancel already succeeded durably, and the
+	// recovery backstop heals anything that fails here.
+	if job.FanOutID != nil && *job.FanOutID != "" {
+		q.resumeOwningFanOutAfterChildTerminal(ctx, *job.FanOutID)
+	}
 	return nil
+}
+
+// resumeOwningFanOutAfterChildTerminal advances a fan-out to its terminal status
+// and resumes its parent when a child has just been terminated out-of-band (a
+// cross-API CancelJob on a sub-job). It reads live-overlaid counts, so the
+// TerminalStatus decision is correct even if the persisted counters lag. It is
+// best-effort and idempotent: UpdateFanOutStatus is CAS-gated on status='pending'
+// so only one caller drives the transition, and ResumeJob no-ops if already
+// resumed. Failures are logged, not returned — the cancel already succeeded
+// durably. The durable safety net differs by how far this got: if the status
+// flip did not land, GetCompletablePendingFanOuts heals it (after the stale-age
+// window); if the flip landed but ResumeJob failed, the fan-out is already
+// terminal, so the non-stale-gated GetWaitingJobsToResume (waiting parent +
+// terminal fan-out) resumes it on the next poll tick.
+func (q *Queue) resumeOwningFanOutAfterChildTerminal(ctx context.Context, fanOutID core.UUID) {
+	fo, err := q.storage.GetFanOut(ctx, fanOutID)
+	if err != nil {
+		slog.Default().Warn("cancel: could not read owning fan-out for inline resume; recovery backstop will heal",
+			"fan_out_id", fanOutID, "error", err)
+		return
+	}
+	if fo == nil {
+		return
+	}
+	done, status := fo.TerminalStatus()
+	if !done || fo.Status != core.FanOutPending {
+		return
+	}
+	updated, err := q.storage.UpdateFanOutStatus(ctx, fo.ID, status)
+	if err != nil {
+		slog.Default().Warn("cancel: could not advance owning fan-out after child cancel; recovery backstop will heal",
+			"fan_out_id", fanOutID, "error", err)
+		return
+	}
+	if updated {
+		if _, err := q.storage.ResumeJob(ctx, fo.ParentJobID); err != nil {
+			slog.Default().Warn("cancel: could not resume parent after child cancel; recovery backstop will heal",
+				"parent_job_id", fo.ParentJobID, "error", err)
+		}
+	}
 }
 
 // ResumeJob resumes a paused job.

@@ -44,11 +44,11 @@ type signalStorage interface {
 	// the replay checkpoint built from it in ONE transaction (atomic
 	// consume+checkpoint). Replaces the old ConsumeSignal+separate-writeCheckpoint
 	// torn-write pair.
-	ConsumeSignalTx(ctx context.Context, jobID core.UUID, name string, buildCheckpoint func(sig *core.Signal) (*core.Checkpoint, error)) (*core.Signal, error)
+	ConsumeSignalTxOwned(ctx context.Context, jobID core.UUID, workerID string, name string, buildCheckpoint func(sig *core.Signal) (*core.Checkpoint, error)) (*core.Signal, error)
 	// DrainSignalsTx consumes ALL pending signals of name AND persists a single
 	// replay checkpoint built from the batch in ONE transaction (the closure is
 	// always invoked, even for an empty batch).
-	DrainSignalsTx(ctx context.Context, jobID core.UUID, name string, buildCheckpoint func(sigs []*core.Signal) (*core.Checkpoint, error)) ([]*core.Signal, error)
+	DrainSignalsTxOwned(ctx context.Context, jobID core.UUID, workerID string, name string, buildCheckpoint func(sigs []*core.Signal) (*core.Checkpoint, error)) ([]*core.Signal, error)
 	MarkWaitingWithDeadline(ctx context.Context, jobID core.UUID, workerID string, d time.Duration) error
 	// SaveCheckpointAndMarkWaiting persists the (optional) deadline checkpoint AND
 	// marks the job waiting-with-deadline in ONE transaction. A nil cp means the
@@ -166,7 +166,7 @@ func WaitForSignal[T any](ctx context.Context, name string) (T, error) {
 	// between the two used to wedge the waiting job forever; the single tx makes
 	// rollback (signal stays pending) or commit (checkpoint present) the only
 	// outcomes.
-	sig, err := ss.ConsumeSignalTx(ctx, jc.Job.ID, name, func(s *core.Signal) (*core.Checkpoint, error) {
+	sig, err := ss.ConsumeSignalTxOwned(ctx, jc.Job.ID, jc.WorkerID, name, func(s *core.Signal) (*core.Checkpoint, error) {
 		return &core.Checkpoint{
 			ID:        core.NewID(),
 			JobID:     jc.Job.ID,
@@ -285,7 +285,7 @@ func WaitForSignalTimeout[T any](ctx context.Context, name string, d time.Durati
 	// one tx. The closure marshals the JSON-wrapped {resolved,payload} object as
 	// the checkpoint Result (NOT the raw signal payload), so replay reconstructs
 	// the timeout outcome.
-	sig, err := ss.ConsumeSignalTx(ctx, jc.Job.ID, name, func(s *core.Signal) (*core.Checkpoint, error) {
+	sig, err := ss.ConsumeSignalTxOwned(ctx, jc.Job.ID, jc.WorkerID, name, func(s *core.Signal) (*core.Checkpoint, error) {
 		tc.Resolved = true
 		tc.Payload = s.Payload
 		data, e := json.Marshal(tc)
@@ -510,7 +510,7 @@ func DrainSignals[T any](ctx context.Context, name string) ([]T, error) {
 	// Consume the whole batch and persist the single drain checkpoint atomically.
 	// The closure ALWAYS runs (even for an empty batch) so an empty drain records
 	// a deterministic checkpoint.
-	sigs, err := ss.DrainSignalsTx(ctx, jc.Job.ID, name, func(batch []*core.Signal) (*core.Checkpoint, error) {
+	sigs, err := ss.DrainSignalsTxOwned(ctx, jc.Job.ID, jc.WorkerID, name, func(batch []*core.Signal) (*core.Checkpoint, error) {
 		payloads := make([]json.RawMessage, len(batch))
 		for i, sg := range batch {
 			payloads[i] = sg.Payload

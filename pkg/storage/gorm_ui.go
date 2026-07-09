@@ -28,6 +28,13 @@ func (s *GormStorage) GetQueueStats(ctx context.Context) ([]*jobsv1.QueueStats, 
 // GetQueueDepthStats returns accurate per-queue depth counts using aggregate
 // queries instead of fetching job rows.
 func (s *GormStorage) GetQueueDepthStats(ctx context.Context) ([]*jobsv1.QueueStats, error) {
+	if s.hotStats == nil { // zero-value storage: bypass the cache
+		return s.getQueueDepthStats(ctx)
+	}
+	return s.hotStats.queueDepth.do(ctx, s.hotStatsTTLValue(), cloneQueueStatsSlice, s.getQueueDepthStats)
+}
+
+func (s *GormStorage) getQueueDepthStats(ctx context.Context) ([]*jobsv1.QueueStats, error) {
 	type row struct {
 		Queue  string
 		Status string
@@ -95,8 +102,14 @@ func (s *GormStorage) GetQueueDepthStats(ctx context.Context) ([]*jobsv1.QueueSt
 		}
 	}
 
-	// Check which queues are paused
-	pausedQueues, _ := s.GetPausedQueues(ctx)
+	// Check which queues are paused. Surface a failed pause-state read rather than
+	// silently rendering every queue as UNPAUSED — a paused/quarantined queue shown
+	// as draining is a safety-relevant lie on the dashboard. Both callers
+	// (GetStats, ListQueues) already propagate this error.
+	pausedQueues, err := s.GetPausedQueues(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("read paused queues: %w", err)
+	}
 	pausedSet := make(map[string]struct{}, len(pausedQueues))
 	for _, q := range pausedQueues {
 		pausedSet[q] = struct{}{}
@@ -486,9 +499,9 @@ func (s *GormStorage) DeleteWorkflowSubtree(ctx context.Context, rootJobID core.
 // fan-out parents. A parent is skipped (not deleted) so a bulk purge can never
 // strand its children — a paused/terminal parent may still have children in
 // other states, and the FK cascade does not reach the sub-jobs. Parents must be
-// removed via DeleteWorkflowSubtree. Checkpoints AND signals for the purged
-// (leaf) jobs are deleted too; the returned count is the number of job rows
-// actually removed.
+// removed via DeleteWorkflowSubtree. Checkpoints, signals, AND unique_locks for
+// the purged (leaf) jobs are deleted too; the returned count is the number of job
+// rows actually removed.
 func (s *GormStorage) PurgeJobs(ctx context.Context, queue string, status core.JobStatus) (int64, error) {
 	var deleted int64
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
@@ -513,6 +526,13 @@ func (s *GormStorage) PurgeJobs(ctx context.Context, queue string, status core.J
 			return err
 		}
 		if err := tx.Where("job_id IN (?)", matchingJobs).Delete(&core.Signal{}).Error; err != nil {
+			return err
+		}
+		// Delete the purged jobs' unique locks too (mirror the retention path):
+		// unique_locks.job_id has no FK cascade, so a purge that skipped them would
+		// strand a dangling lock — a still-live one keeps blocking re-enqueue of a
+		// dedup scope whose job is gone, and expired ones accumulate unbounded.
+		if err := tx.Where("job_id IN (?)", matchingJobs).Delete(&core.UniqueLock{}).Error; err != nil {
 			return err
 		}
 

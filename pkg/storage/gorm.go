@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"math/rand/v2"
@@ -42,6 +43,24 @@ func WithStorageLockDuration(d time.Duration) GormStorageOption {
 	return func(s *GormStorage) {
 		s.lockDuration.Store(int64(d))
 	}
+}
+
+// WithHotStatsCacheTTL sets the TTL for the in-process cache that coalesces the
+// dashboard/metrics hot-path aggregates (GetQueueDepthStats, QueueDeadLetterCounts,
+// QueueOldestPendingAt). Those aggregate over the whole jobs table with no history
+// bound, so caching bounds them to at most one aggregate per TTL per storage
+// instance regardless of how many dashboard tabs poll or how often Prometheus
+// scrapes. A TTL <= 0 disables the cache (every call hits the DB) — used by tests
+// that assert exact post-mutation counts. The default is 2s.
+func WithHotStatsCacheTTL(d time.Duration) GormStorageOption {
+	return func(s *GormStorage) {
+		s.hotStatsTTL.Store(int64(d))
+	}
+}
+
+// hotStatsTTLValue returns the configured hot-stats cache TTL.
+func (s *GormStorage) hotStatsTTLValue() time.Duration {
+	return time.Duration(s.hotStatsTTL.Load())
 }
 
 // WithCodec configures a payload codec for bytes stored in payload columns.
@@ -124,6 +143,14 @@ type GormStorage struct {
 	// SetDeleteCheckpointsOnComplete) to bound the checkpoints table. Never
 	// affects the failure path — retry replay reads checkpoints.
 	deleteCheckpointsOnComplete atomic.Bool
+
+	// hotStatsTTL is the TTL (nanoseconds) for the hot-path aggregate cache; <=0
+	// disables it. atomic (comparable) so WithHotStatsCacheTTL and tests can set
+	// it without breaking GormStorage comparability.
+	hotStatsTTL atomic.Int64
+	// hotStats holds the coalescing caches for the dashboard/metrics aggregates.
+	// Behind a pointer so GormStorage stays comparable (see hot_stats_cache.go).
+	hotStats *hotStatCaches
 }
 
 // NewGormStorage creates a new GORM-backed storage. For file-based SQLite under
@@ -157,8 +184,9 @@ func NewGormStorage(db *gorm.DB, opts ...GormStorageOption) *GormStorage {
 		dialector := db.Name()
 		isSQLite = strings.Contains(strings.ToLower(dialector), "sqlite")
 	}
-	s := &GormStorage{db: db, isSQLite: isSQLite, codec: core.IdentityCodec}
+	s := &GormStorage{db: db, isSQLite: isSQLite, codec: core.IdentityCodec, hotStats: &hotStatCaches{}}
 	s.lockDuration.Store(int64(defaultLockDuration))
+	s.hotStatsTTL.Store(int64(defaultHotStatsCacheTTL))
 	if s.isSQLite {
 		// NOTE: a one-shot PRAGMA only affects the single pooled connection it
 		// runs on; connections the pool opens later default to busy_timeout=0.
@@ -334,41 +362,59 @@ func backfillDispatcherNulls(ctx context.Context, db *gorm.DB, dialect string) e
 	if dialect != dialectPostgres && dialect != dialectMySQL {
 		return nil
 	}
-	if !db.Migrator().HasTable(&core.Job{}) {
+	m := db.Migrator()
+	if !m.HasTable(&core.Job{}) {
 		return nil
 	}
+	// Build the healed column set from columns that ACTUALLY EXIST on the live
+	// table. A v1.0.0–v1.2.1 baseline (D1) has no `timeout`/`determinism` column
+	// yet (both added in #16), so referencing them unconditionally in the probe or
+	// UPDATE errors (PG 42703 / MySQL 1054 undefined column) and crash-loops
+	// Migrate at boot on a supported upgrade path. AutoMigrate ADDs an absent
+	// column fresh as NOT NULL DEFAULT, so there are no NULLs to heal for it —
+	// skipping the absent column here is correct. Column names/defaults are
+	// hardcoded (never user input), so assembling the SQL from them is injection-safe.
+	type healCol struct{ name, def string }
+	candidates := []healCol{
+		{"status", "'pending'"},
+		{"queue", "'default'"},
+		{"priority", "0"},
+		{"attempt", "0"},
+		{"max_retries", "3"},
+		{"timeout", "0"},
+		{"determinism", "0"},
+	}
+	whereParts := make([]string, 0, len(candidates))
+	setParts := make([]string, 0, len(candidates))
+	for _, c := range candidates {
+		if !m.HasColumn(&core.Job{}, c.name) {
+			continue
+		}
+		whereParts = append(whereParts, c.name+" IS NULL")
+		setParts = append(setParts, fmt.Sprintf("%s = COALESCE(%s, %s)", c.name, c.name, c.def))
+	}
+	if len(whereParts) == 0 {
+		return nil
+	}
+	whereClause := strings.Join(whereParts, " OR ")
+
 	// Cheap EXISTS short-circuit: on a clean table (the overwhelmingly common
 	// case) this probe is sub-millisecond and avoids the full-table UPDATE on
 	// every startup (R25), while still letting the heal run BEFORE AutoMigrate's
 	// SET NOT NULL so a legacy nullable table that still holds NULLs is fixed
 	// before the constraint is enforced (preserves the schema-campaign ordering).
 	var hasNulls bool
-	if err := db.WithContext(ctx).Raw(`
-		SELECT EXISTS(
-			SELECT 1 FROM jobs
-			WHERE status IS NULL OR queue IS NULL OR priority IS NULL
-			   OR attempt IS NULL OR max_retries IS NULL OR timeout IS NULL
-			   OR determinism IS NULL
-		)
-	`).Scan(&hasNulls).Error; err != nil {
+	if err := db.WithContext(ctx).Raw(
+		"SELECT EXISTS(SELECT 1 FROM jobs WHERE " + whereClause + ")",
+	).Scan(&hasNulls).Error; err != nil {
 		return err
 	}
 	if !hasNulls {
 		return nil
 	}
-	return db.WithContext(ctx).Exec(`
-		UPDATE jobs
-		SET status = COALESCE(status, 'pending'),
-		    queue = COALESCE(queue, 'default'),
-		    priority = COALESCE(priority, 0),
-		    attempt = COALESCE(attempt, 0),
-		    max_retries = COALESCE(max_retries, 3),
-		    timeout = COALESCE(timeout, 0),
-		    determinism = COALESCE(determinism, 0)
-		WHERE status IS NULL OR queue IS NULL OR priority IS NULL
-		   OR attempt IS NULL OR max_retries IS NULL OR timeout IS NULL
-		   OR determinism IS NULL
-	`).Error
+	return db.WithContext(ctx).Exec(
+		"UPDATE jobs SET " + strings.Join(setParts, ", ") + " WHERE " + whereClause,
+	).Error
 }
 
 func requireMySQLUTCSession(ctx context.Context, db *gorm.DB) error {
@@ -1896,6 +1942,22 @@ func (s *GormStorage) CancelSubJob(ctx context.Context, jobID core.UUID) (*core.
 			if err != nil {
 				return err
 			}
+			// Persist the reconciled counts to the fan_outs row ATOMICALLY with the
+			// cancel, ungated by status (mirrors cancelFanOutChildrenAndReconcile). If
+			// this cancel terminates the last in-flight child of an already-frozen
+			// fail_fast/threshold fan-out, the pre-frozen under-count would otherwise
+			// stay diverged forever — no later path revisits a terminal row
+			// (INV-FANOUT-COUNTS).
+			if err := tx.Model(&core.FanOut{}).
+				Where("id = ?", *job.FanOutID).
+				Updates(map[string]any{
+					"completed_count": completed,
+					"failed_count":    failed,
+					"cancelled_count": cancelledCount,
+					"updated_at":      now,
+				}).Error; err != nil {
+				return err
+			}
 			overlayFanOutCounts(&fanOut, completed, failed, cancelledCount)
 			hasFanOut = true
 			return nil
@@ -1923,7 +1985,18 @@ func (s *GormStorage) MarkWaiting(ctx context.Context, jobID core.UUID, workerID
 			"status":       core.StatusWaiting,
 			"locked_by":    "",
 			"locked_until": nil,
-			"updated_at":   time.Now(),
+			// Clear run_at: this is an INDEFINITE wait (no wake deadline). A job
+			// reaching MarkWaiting was dequeued while running, so any residual
+			// run_at (from a delayed enqueue or a retry backoff) is necessarily
+			// <= now; left set, it spuriously matches the signal-resume poll's
+			// `run_at <= now` clause and burns one wasted re-dispatch (+ a fleet
+			// rate-limit token) before self-limiting. ResumeSignalWaitingJob and
+			// markWaitingWithDeadlineTx likewise manage run_at explicitly. The
+			// fan-out path also calls MarkWaiting; that resume is run_at-independent
+			// (it keys on the fan_outs join + status), so clearing run_at is safe
+			// there too.
+			"run_at":     nil,
+			"updated_at": time.Now(),
 		})
 	if result.Error != nil {
 		return result.Error
@@ -2407,6 +2480,26 @@ func (s *GormStorage) PauseJobWithMode(ctx context.Context, jobID core.UUID, mod
 	return s.pauseJobAggressive(ctx, jobID)
 }
 
+// reconcileFanOutCountsTx persists one fan-out's live completed/failed/cancelled
+// counts into its row, ungated by status, so a pre-frozen fail_fast/threshold row
+// is corrected to sum==total (INV-FANOUT-COUNTS). Mirrors the persist inside
+// cancelFanOutChildrenAndReconcile; used by the singular cancel paths that touch a
+// single child rather than a whole subtree.
+func (s *GormStorage) reconcileFanOutCountsTx(tx *gorm.DB, fanOutID core.UUID, now time.Time) error {
+	completed, failed, cancelledCount, err := liveFanOutCounts(tx, fanOutID)
+	if err != nil {
+		return err
+	}
+	return tx.Model(&core.FanOut{}).
+		Where("id = ?", fanOutID).
+		Updates(map[string]any{
+			"completed_count": completed,
+			"failed_count":    failed,
+			"cancelled_count": cancelledCount,
+			"updated_at":      now,
+		}).Error
+}
+
 // CancelJobTerminal terminally cancels a pending, waiting, or running job. When
 // the job is a fan-out parent, its entire descendant fan-out subtree is
 // terminally cancelled in the same transaction.
@@ -2417,6 +2510,21 @@ func (s *GormStorage) PauseJobWithMode(ctx context.Context, jobID core.UUID, mod
 // fan-out parent therefore holds that many row locks for the tx duration and can
 // stall concurrent child-completers; size is bounded by the real subtree.
 func (s *GormStorage) CancelJobTerminal(ctx context.Context, jobID core.UUID) error {
+	// Run at SERIALIZABLE on PG/MySQL to close the concurrent-suspend window: the
+	// subtree walk (collectFanOutSubtree) is a sequence of lock-free reads, so a
+	// descendant that calls SuspendForFanOut (inserting a fresh fan-out +
+	// grandchildren and going waiting) AFTER the BFS read its then-empty children
+	// level would otherwise leave those grandchildren uncancelled — running the
+	// side effects the operator cancelled and orphaning the new fan-out. Under
+	// SERIALIZABLE, PG's SSI aborts the phantom-read/insert conflict (40001,
+	// retried by withSerializationRetry) and MySQL's next-key locks block the
+	// insert. SQLite already serializes writers, so a concurrent suspend cannot
+	// interleave with this transaction there; leaving it at the default avoids
+	// driver-specific isolation handling.
+	var txOpts []*sql.TxOptions
+	if s.dialect() != dialectSQLite {
+		txOpts = append(txOpts, &sql.TxOptions{Isolation: sql.LevelSerializable})
+	}
 	return s.withSerializationRetry(ctx, func() error {
 		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 			now := time.Now()
@@ -2454,6 +2562,24 @@ func (s *GormStorage) CancelJobTerminal(ctx context.Context, jobID core.UUID) er
 				return err
 			}
 
+			// If the cancelled job is itself a fan-out CHILD, reconcile its OWNING
+			// fan-out's persisted counts inline. CancelJobTerminal otherwise only
+			// walks the DESCENDANT subtree (collectFanOutSubtree follows parent_job_id
+			// downward) and never touches the fan-out the target belongs to, leaving
+			// its counts frozen (INV-FANOUT-COUNTS) and — because no child-completion
+			// event fires — its parent stranded in `waiting` until the ~2min recovery
+			// backstop (E3/D5). The parent's inline resume is driven by the queue
+			// layer (Queue.CancelJob) off this reconciled row.
+			var target core.Job
+			if err := tx.Select("fan_out_id").First(&target, "id = ?", jobID).Error; err != nil {
+				return err
+			}
+			if target.FanOutID != nil && *target.FanOutID != "" {
+				if err := s.reconcileFanOutCountsTx(tx, *target.FanOutID, now); err != nil {
+					return err
+				}
+			}
+
 			fanOutIDs, subJobIDs, truncated, err := s.collectFanOutSubtree(tx, jobID)
 			if err != nil {
 				return err
@@ -2484,7 +2610,7 @@ func (s *GormStorage) CancelJobTerminal(ctx context.Context, jobID core.UUID) er
 				}
 			}
 			return nil
-		})
+		}, txOpts...)
 	})
 }
 
@@ -2607,9 +2733,13 @@ func (s *GormStorage) pauseJobAggressive(ctx context.Context, jobID core.UUID) e
 					"completed_at": s.nowWriteValue(),
 					"updated_at":   now,
 					// non-PII constant; intentionally stored plaintext
-					"last_error":   "cancelled by user",
-					"locked_by":    "",
-					"locked_until": nil,
+					"last_error": "cancelled by user",
+					// Do NOT clear locked_by/locked_until: mirror CancelJobTerminal so
+					// FindOrphanedJobs' terminal-orphan clause (locked_by <> '') flags
+					// this row and the worker ownership audit interrupts the live handler
+					// in ~5s. Clearing them made the terminal row invisible to the audit,
+					// leaving "aggressive" pause reliant on the ~6min heartbeat path. The
+					// slot cleanup below is keyed by job_id and does not need it cleared.
 				})
 			if cancelResult.Error != nil {
 				return cancelResult.Error

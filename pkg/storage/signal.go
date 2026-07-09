@@ -175,11 +175,42 @@ func (s *GormStorage) DrainSignals(ctx context.Context, jobID core.UUID, name st
 // Postgres/MySQL; SQLite's serialized writer provides equivalent protection).
 // withSerializationRetry wraps the whole consume+checkpoint so a 40001/1213
 // retry re-runs both atomically.
+// ConsumeSignalTx atomically consumes the oldest pending signal of name and
+// persists the replay checkpoint built from it, in ONE transaction. It performs
+// NO ownership check; the handler path uses ConsumeSignalTxOwned. Retained with
+// its original signature for v4 API compatibility.
 func (s *GormStorage) ConsumeSignalTx(ctx context.Context, jobID core.UUID, name string, buildCheckpoint func(sig *core.Signal) (*core.Checkpoint, error)) (*core.Signal, error) {
+	return s.consumeSignalTx(ctx, jobID, "", false, name, buildCheckpoint)
+}
+
+// ConsumeSignalTxOwned is ConsumeSignalTx gated on job ownership (locked_by =
+// workerID AND status = running). Under the documented at-least-once double-run
+// edge (a stale lock is reaped and a second worker replays concurrently), a
+// NON-OWNER execution must not consume the delivered signal — doing so sets
+// consumed_at and makes the real owner find nothing pending and take the timeout
+// branch, silently losing the signal (the consumed row cannot be re-delivered).
+// A non-owner consumes nothing and suspends; the owner delivers. This is the
+// method the signal handler path uses.
+func (s *GormStorage) ConsumeSignalTxOwned(ctx context.Context, jobID core.UUID, workerID string, name string, buildCheckpoint func(sig *core.Signal) (*core.Checkpoint, error)) (*core.Signal, error) {
+	return s.consumeSignalTx(ctx, jobID, workerID, true, name, buildCheckpoint)
+}
+
+func (s *GormStorage) consumeSignalTx(ctx context.Context, jobID core.UUID, workerID string, gate bool, name string, buildCheckpoint func(sig *core.Signal) (*core.Checkpoint, error)) (*core.Signal, error) {
 	var out *core.Signal
 	err := s.withSerializationRetry(ctx, func() error {
 		out = nil
 		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			if gate {
+				var owned int64
+				if err := tx.Model(&core.Job{}).
+					Where("id = ? AND locked_by = ? AND status = ?", jobID, workerID, core.StatusRunning).
+					Count(&owned).Error; err != nil {
+					return err
+				}
+				if owned == 0 {
+					return nil // not the current owner — do not consume; caller suspends
+				}
+			}
 			q := s.pendingSignalsLocked(tx, jobID, name)
 			var sig core.Signal
 			err := q.First(&sig).Error
@@ -232,10 +263,33 @@ func (s *GormStorage) ConsumeSignalTx(ctx context.Context, jobID core.UUID, name
 // empty drain is deterministic. The consume-all and the checkpoint commit or
 // roll back together.
 func (s *GormStorage) DrainSignalsTx(ctx context.Context, jobID core.UUID, name string, buildCheckpoint func(sigs []*core.Signal) (*core.Checkpoint, error)) ([]*core.Signal, error) {
+	return s.drainSignalsTx(ctx, jobID, "", false, name, buildCheckpoint)
+}
+
+// DrainSignalsTxOwned is DrainSignalsTx gated on job ownership (see
+// ConsumeSignalTxOwned) so a non-owner double-run execution cannot drain
+// delivered signals out from under the real owner. Used by the signal handler
+// path.
+func (s *GormStorage) DrainSignalsTxOwned(ctx context.Context, jobID core.UUID, workerID string, name string, buildCheckpoint func(sigs []*core.Signal) (*core.Checkpoint, error)) ([]*core.Signal, error) {
+	return s.drainSignalsTx(ctx, jobID, workerID, true, name, buildCheckpoint)
+}
+
+func (s *GormStorage) drainSignalsTx(ctx context.Context, jobID core.UUID, workerID string, gate bool, name string, buildCheckpoint func(sigs []*core.Signal) (*core.Checkpoint, error)) ([]*core.Signal, error) {
 	var out []*core.Signal
 	err := s.withSerializationRetry(ctx, func() error {
 		out = nil
 		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			if gate {
+				var owned int64
+				if err := tx.Model(&core.Job{}).
+					Where("id = ? AND locked_by = ? AND status = ?", jobID, workerID, core.StatusRunning).
+					Count(&owned).Error; err != nil {
+					return err
+				}
+				if owned == 0 {
+					return nil // not the current owner — do not drain; caller suspends
+				}
+			}
 			q := s.pendingSignalsLocked(tx, jobID, name)
 			var sigs []*core.Signal
 			if err := q.Find(&sigs).Error; err != nil {

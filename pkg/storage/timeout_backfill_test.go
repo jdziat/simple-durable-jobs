@@ -10,6 +10,8 @@ import (
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
+
+	"github.com/jdziat/simple-durable-jobs/v4/pkg/core"
 )
 
 // TestMigratePostgresBackfillsLegacyNullTimeoutAndDeterminism reproduces the
@@ -139,5 +141,94 @@ func TestMigrateMySQLBackfillsLegacyNullTimeoutAndDeterminism(t *testing.T) {
 			col,
 		).Scan(&isNullable).Error)
 		require.Equalf(t, "NO", isNullable, "%s NOT NULL reasserted after the heal", col)
+	}
+}
+
+// TestMigratePostgresBootsWhenTimeoutDeterminismColumnsMissing is the D1
+// regression: a v1.0.0–v1.2.1 baseline has NO jobs.timeout / jobs.determinism
+// column (both added in #16). backfillDispatcherNulls must build its probe/UPDATE
+// from only the columns that exist, so it does not reference the absent columns
+// (PG 42703 undefined_column) and crash-loop Migrate at boot. AutoMigrate then
+// re-adds them NOT NULL DEFAULT 0. Without the fix the re-Migrate errors on the
+// missing-column probe.
+func TestMigratePostgresBootsWhenTimeoutDeterminismColumnsMissing(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL not set")
+	}
+	schemaName := uniqueSchemaAssertionsName("missing_cols")
+	adminDB, err := gorm.Open(postgres.Open(dsn), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+	require.NoError(t, err, "open postgres admin db")
+	closeDBOnCleanup(t, adminDB)
+	require.NoError(t, adminDB.Exec("CREATE SCHEMA "+quotePostgresIdent(schemaName)).Error)
+	t.Cleanup(func() {
+		require.NoError(t, adminDB.Exec("DROP SCHEMA IF EXISTS "+quotePostgresIdent(schemaName)+" CASCADE").Error)
+	})
+
+	db, err := gorm.Open(postgres.Open(postgresDSNWithSearchPath(t, dsn, schemaName)), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+	require.NoError(t, err, "open isolated postgres schema")
+	closeDBOnCleanup(t, db)
+
+	ctx := context.Background()
+	s := NewGormStorage(db)
+	require.NoError(t, s.Migrate(ctx), "initial migrate")
+
+	// Recreate the pre-#16 baseline: the columns don't exist at all.
+	require.NoError(t, db.Exec("ALTER TABLE jobs DROP COLUMN timeout CASCADE").Error)
+	require.NoError(t, db.Exec("ALTER TABLE jobs DROP COLUMN determinism CASCADE").Error)
+	require.False(t, s.DB().Migrator().HasColumn(&core.Job{}, "timeout"))
+
+	// Re-migrate: the pre-AutoMigrate heal must NOT reference the absent columns.
+	require.NoError(t, s.Migrate(ctx), "re-migrate over a baseline missing timeout/determinism must succeed")
+
+	require.True(t, s.DB().Migrator().HasColumn(&core.Job{}, "timeout"), "AutoMigrate re-adds timeout")
+	require.True(t, s.DB().Migrator().HasColumn(&core.Job{}, "determinism"), "AutoMigrate re-adds determinism")
+	for _, col := range []string{"timeout", "determinism"} {
+		var isNullable string
+		require.NoError(t, db.Raw(
+			"SELECT is_nullable FROM information_schema.columns WHERE table_schema = current_schema() AND table_name='jobs' AND column_name=?", col,
+		).Scan(&isNullable).Error)
+		require.Equalf(t, "NO", isNullable, "%s re-added NOT NULL", col)
+	}
+}
+
+// TestMigrateMySQLBootsWhenTimeoutDeterminismColumnsMissing is the D1 regression
+// for MySQL (the absent-column reference errors 1054 there).
+func TestMigrateMySQLBootsWhenTimeoutDeterminismColumnsMissing(t *testing.T) {
+	dsn := os.Getenv("TEST_MYSQL_URL")
+	if dsn == "" {
+		t.Skip("TEST_MYSQL_URL not set")
+	}
+	databaseName := uniqueSchemaAssertionsName("missing_cols")
+	adminDB, err := gorm.Open(mysql.Open(dsn), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+	require.NoError(t, err, "open mysql admin db")
+	closeDBOnCleanup(t, adminDB)
+	require.NoError(t, adminDB.Exec("CREATE DATABASE "+quoteMySQLIdent(databaseName)).Error)
+	t.Cleanup(func() {
+		require.NoError(t, adminDB.Exec("DROP DATABASE IF EXISTS "+quoteMySQLIdent(databaseName)).Error)
+	})
+
+	db, err := gorm.Open(mysql.Open(mysqlDSNWithDatabase(t, dsn, databaseName)), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+	require.NoError(t, err, "open isolated mysql database")
+	closeDBOnCleanup(t, db)
+
+	ctx := context.Background()
+	s := NewGormStorage(db)
+	require.NoError(t, s.Migrate(ctx), "initial migrate")
+
+	require.NoError(t, db.Exec("ALTER TABLE jobs DROP COLUMN timeout").Error)
+	require.NoError(t, db.Exec("ALTER TABLE jobs DROP COLUMN determinism").Error)
+	require.False(t, s.DB().Migrator().HasColumn(&core.Job{}, "timeout"))
+
+	require.NoError(t, s.Migrate(ctx), "re-migrate over a baseline missing timeout/determinism must succeed")
+
+	require.True(t, s.DB().Migrator().HasColumn(&core.Job{}, "timeout"), "AutoMigrate re-adds timeout")
+	require.True(t, s.DB().Migrator().HasColumn(&core.Job{}, "determinism"), "AutoMigrate re-adds determinism")
+	for _, col := range []string{"timeout", "determinism"} {
+		var isNullable string
+		require.NoError(t, db.Raw(
+			"SELECT is_nullable FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name='jobs' AND column_name=?", col,
+		).Scan(&isNullable).Error)
+		require.Equalf(t, "NO", isNullable, "%s re-added NOT NULL", col)
 	}
 }
