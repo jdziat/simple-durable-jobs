@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"math/rand/v2"
@@ -2453,6 +2454,21 @@ func (s *GormStorage) reconcileFanOutCountsTx(tx *gorm.DB, fanOutID core.UUID, n
 // fan-out parent therefore holds that many row locks for the tx duration and can
 // stall concurrent child-completers; size is bounded by the real subtree.
 func (s *GormStorage) CancelJobTerminal(ctx context.Context, jobID core.UUID) error {
+	// Run at SERIALIZABLE on PG/MySQL to close the concurrent-suspend window: the
+	// subtree walk (collectFanOutSubtree) is a sequence of lock-free reads, so a
+	// descendant that calls SuspendForFanOut (inserting a fresh fan-out +
+	// grandchildren and going waiting) AFTER the BFS read its then-empty children
+	// level would otherwise leave those grandchildren uncancelled — running the
+	// side effects the operator cancelled and orphaning the new fan-out. Under
+	// SERIALIZABLE, PG's SSI aborts the phantom-read/insert conflict (40001,
+	// retried by withSerializationRetry) and MySQL's next-key locks block the
+	// insert. SQLite already serializes writers, so a concurrent suspend cannot
+	// interleave with this transaction there; leaving it at the default avoids
+	// driver-specific isolation handling.
+	var txOpts []*sql.TxOptions
+	if s.dialect() != dialectSQLite {
+		txOpts = append(txOpts, &sql.TxOptions{Isolation: sql.LevelSerializable})
+	}
 	return s.withSerializationRetry(ctx, func() error {
 		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 			now := time.Now()
@@ -2538,7 +2554,7 @@ func (s *GormStorage) CancelJobTerminal(ctx context.Context, jobID core.UUID) er
 				}
 			}
 			return nil
-		})
+		}, txOpts...)
 	})
 }
 
@@ -2661,9 +2677,13 @@ func (s *GormStorage) pauseJobAggressive(ctx context.Context, jobID core.UUID) e
 					"completed_at": s.nowWriteValue(),
 					"updated_at":   now,
 					// non-PII constant; intentionally stored plaintext
-					"last_error":   "cancelled by user",
-					"locked_by":    "",
-					"locked_until": nil,
+					"last_error": "cancelled by user",
+					// Do NOT clear locked_by/locked_until: mirror CancelJobTerminal so
+					// FindOrphanedJobs' terminal-orphan clause (locked_by <> '') flags
+					// this row and the worker ownership audit interrupts the live handler
+					// in ~5s. Clearing them made the terminal row invisible to the audit,
+					// leaving "aggressive" pause reliant on the ~6min heartbeat path. The
+					// slot cleanup below is keyed by job_id and does not need it cleared.
 				})
 			if cancelResult.Error != nil {
 				return cancelResult.Error

@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -107,4 +108,64 @@ func TestSuspendForFanOut_AbortsAtomicallyWhenParentNotOwned(t *testing.T) {
 	cps, err := s.GetCheckpoints(ctx, parentID)
 	require.NoError(t, err)
 	assert.Empty(t, cps, "checkpoint rolled back")
+}
+
+// TestCancelJobTerminal_ConcurrentDescendantSuspend_NoOrphanedGrandchildren is
+// the E4b regression: a descendant that calls SuspendForFanOut (creating a new
+// fan-out + grandchildren) concurrently with a subtree terminal-cancel must not
+// leave those grandchildren runnable under the cancelled root. SERIALIZABLE
+// isolation (PG SSI / MySQL next-key locks) closes the phantom-insert window.
+// Skipped on SQLite, which serializes writers so the interleaving cannot occur
+// (and in-memory SQLite does not model concurrent writers faithfully). Runs
+// several rounds to give the race a chance on PG/MySQL.
+func TestCancelJobTerminal_ConcurrentDescendantSuspend_NoOrphanedGrandchildren(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+	if s.dialect() == dialectSQLite {
+		t.Skip("concurrent-suspend race requires a real PG/MySQL backend")
+	}
+
+	for round := 0; round < 6; round++ {
+		const worker = "w-desc"
+		rootID := core.NewID()
+		require.NoError(t, s.db.WithContext(ctx).Create(&core.Job{
+			ID: rootID, Type: "wf.root", Queue: "default", Status: core.StatusWaiting,
+		}).Error)
+		fanAID := core.NewID()
+		require.NoError(t, s.CreateFanOut(ctx, &core.FanOut{ID: fanAID, ParentJobID: rootID, TotalCount: 1, Status: core.FanOutPending}))
+		until := time.Now().Add(time.Minute)
+		dID := core.NewID()
+		require.NoError(t, s.db.WithContext(ctx).Create(&core.Job{
+			ID: dID, Type: "wf.desc", Queue: "default", Status: core.StatusRunning,
+			LockedBy: worker, LockedUntil: &until, ParentJobID: &rootID, RootJobID: &rootID, FanOutID: &fanAID,
+		}).Error)
+
+		fanBID := core.NewID()
+		fanB := &core.FanOut{ID: fanBID, ParentJobID: dID, TotalCount: 1, Status: core.FanOutPending}
+		cp := &core.Checkpoint{JobID: dID, CallIndex: 0, CallType: "fanout", Result: []byte(`{"fan_out_id":"x"}`)}
+		grand := &core.Job{ID: core.NewID(), Type: "wf.grand", Queue: "default", ParentJobID: &dID, RootJobID: &rootID, FanOutID: &fanBID, FanOutIndex: 0}
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		// Both may error under contention (serialization abort / ErrJobNotOwned);
+		// the invariant below must hold regardless of who wins.
+		go func() { defer wg.Done(); _ = s.CancelJobTerminal(ctx, rootID) }()
+		go func() { defer wg.Done(); _ = s.SuspendForFanOut(ctx, dID, worker, fanB, cp, []*core.Job{grand}) }()
+		wg.Wait()
+
+		// The root is terminally cancelled (CancelJobTerminal retries to success).
+		gotRoot, err := s.GetJob(ctx, rootID)
+		require.NoError(t, err)
+		require.Equal(t, core.StatusCancelled, gotRoot.Status, "round %d", round)
+
+		// Invariant: no grandchild of the cancelled subtree survives runnable —
+		// either the suspend rolled back (fanB/grand never committed) or the
+		// cancel caught them (grand cancelled).
+		var liveGrand int64
+		require.NoError(t, s.DB().Model(&core.Job{}).
+			Where("fan_out_id = ?", fanBID).
+			Where("status NOT IN ?", []core.JobStatus{core.StatusCompleted, core.StatusFailed, core.StatusCancelled}).
+			Count(&liveGrand).Error)
+		assert.Zero(t, liveGrand, "round %d: a grandchild of the cancelled subtree survived runnable", round)
+	}
 }

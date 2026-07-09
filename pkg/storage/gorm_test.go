@@ -1418,8 +1418,20 @@ func TestPauseJob_CancelsRunningJob(t *testing.T) {
 	assert.Equal(t, core.StatusCancelled, got.Status)
 	assert.Equal(t, "cancelled by user", got.LastError)
 	assert.NotNil(t, got.CompletedAt)
-	assert.Empty(t, got.LockedBy)
-	assert.Nil(t, got.LockedUntil)
+	// locked_by/locked_until are PRESERVED (not cleared) on the aggressive
+	// running->cancelled transition so FindOrphanedJobs' terminal-orphan clause
+	// (locked_by <> '') flags this row and the worker ownership audit interrupts
+	// the live handler in ~5s — mirroring CancelJobTerminal (E4a).
+	assert.Equal(t, "worker-1", got.LockedBy, "aggressive pause must preserve locked_by for the ~5s ownership audit")
+	assert.NotNil(t, got.LockedUntil, "aggressive pause must preserve locked_until")
+
+	// Consequence: the owning worker's ownership audit now flags this terminal-
+	// but-still-locked row (the (status NOT IN terminal OR locked_by <> '')
+	// clause), so it interrupts the live handler in ~5s instead of ~6min. With
+	// the old locked_by='' this returned empty.
+	orphaned, err := s.FindOrphanedJobs(ctx, []core.UUID{job.ID}, "worker-1")
+	require.NoError(t, err)
+	assert.Equal(t, []core.UUID{job.ID}, orphaned, "aggressive-paused running job must be flagged by the ownership audit")
 }
 
 func TestPauseJobWithMode(t *testing.T) {
