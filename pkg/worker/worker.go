@@ -549,7 +549,45 @@ func (w *Worker) validateConfiguredStorageCapabilities() error {
 			return fmt.Errorf("worker has %d RateLimit(s) configured but storage %T does not support DB-backed rate limiting; the rate limit would be silently ignored", count, storage)
 		}
 	}
+	w.warnDegradedStorageDurability(storage)
 	return nil
+}
+
+// fanOutSuspendStorage is the atomic fan-out suspend capability (mirrors
+// pkg/fanout's suspender). When a storage lacks it, FanOut() uses the legacy
+// non-atomic 4-write fallback with a wider crash window.
+type fanOutSuspendStorage interface {
+	SuspendForFanOut(ctx context.Context, parentID core.UUID, workerID string, fanOut *core.FanOut, checkpoint *core.Checkpoint, subJobs []*core.Job) error
+}
+
+// warnDegradedStorageDurability loudly warns at startup when a CUSTOM storage
+// lacks a durability-critical atomic capability that a used/usable feature
+// depends on. Unlike concurrency/rate caps (silently IGNORED → hard fail), these
+// fallbacks still function, just with a crash-durability penalty — so warn rather
+// than fail. GormStorage implements both atomic paths, so neither warning fires
+// for the default storage. See docs/content/docs/storage-durability.md.
+func (w *Worker) warnDegradedStorageDurability(storage core.Storage) {
+	// Scheduled fires: the non-atomic fallback can LOSE a fire on a crash between
+	// claiming the boundary and enqueuing the job. Only relevant when schedules
+	// are actually configured.
+	if len(w.queue.GetScheduledJobs()) > 0 && !w.queue.SupportsAtomicScheduledFire() {
+		w.logger.Warn("DEGRADED DURABILITY: scheduled jobs are configured but storage lacks atomic "+
+			"scheduled-fire enqueue (ScheduledFireTxClaimer + TxEnqueuer); a fire can be LOST if this "+
+			"worker crashes between claiming the fire boundary and enqueuing the job. Use GormStorage "+
+			"(or a TxEnqueuer-capable storage) for at-least-once scheduled fires.",
+			"storage", fmt.Sprintf("%T", storage))
+	}
+	// Fan-out: without atomic suspend, a crash mid-suspend leaves a running+locked
+	// parent until the stale-lock reaper reclaims it — recoverable, but a wider
+	// window than the atomic path. Fan-out is a runtime feature, so warn whenever
+	// the capability is absent (any handler may call FanOut).
+	if _, ok := storage.(fanOutSuspendStorage); !ok {
+		w.logger.Warn("DEGRADED DURABILITY: storage lacks atomic fan-out suspend (SuspendForFanOut); "+
+			"FanOut() uses the legacy non-atomic fallback with a wider crash window (a crash mid-suspend "+
+			"leaves a running+locked parent until the stale-lock reaper reclaims it — recoverable, but "+
+			"wider than the atomic path). Use GormStorage for atomic fan-out suspend.",
+			"storage", fmt.Sprintf("%T", storage))
+	}
 }
 
 func (w *Worker) drainDequeuedJobs(ctx context.Context, jobsChan chan<- *core.Job, totalConcurrency int) {
