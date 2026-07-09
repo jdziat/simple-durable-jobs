@@ -354,7 +354,13 @@ var (
 
 // Default values
 var (
-	DefaultJobRetries  = queue.DefaultJobRetries
+	DefaultJobRetries = queue.DefaultJobRetries
+
+	// DefaultCallRetries is retained for backward compatibility only and is NOT
+	// wired to any behavior. Nested jobs.Call has no separate retry loop; a
+	// retryable nested-Call error re-executes when the outer job retries, so
+	// nested-Call retries are governed by the outer job's MaxRetries. See
+	// queue.DefaultCallRetries.
 	DefaultCallRetries = queue.DefaultCallRetries
 
 	IdentityCodec = core.IdentityCodec
