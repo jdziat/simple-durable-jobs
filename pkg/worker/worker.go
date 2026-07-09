@@ -1604,6 +1604,34 @@ func (w *Worker) processLoop(ctx context.Context, jobs <-chan *core.Job) {
 }
 
 func (w *Worker) processJob(ctx context.Context, job *core.Job) {
+	// Defense-in-depth: no panic may escape processJob and crash the processLoop
+	// goroutine (an unrecovered goroutine panic terminates the whole process).
+	// User callbacks are individually recovered (queue.safeUserCallback,
+	// RunExecutionMiddleware, IsFailure) and the handler is recovered in
+	// executeHandler; this outermost net catches any unexpected internal panic,
+	// logs it with a stack, and releases the job back to pending so it is
+	// reclaimed by a healthy worker instead of stranded locked. Registered first
+	// so it runs last during unwind, after the slot/counter cleanup defers below.
+	//
+	// Release is status='running'-guarded, so it cannot resurrect a job that
+	// already reached a terminal/waiting/paused state (a panic after a terminal
+	// write no-ops here). Note that release-to-pending does not burn a retry
+	// attempt, so a persistently-panicking LIBRARY-INTERNAL bug (as opposed to a
+	// user-callback panic, which is recovered upstream and never reaches here)
+	// reclaim-loops rather than dead-lettering. That is deliberate for a
+	// last-resort net — fleet-wide survival beats a single stuck job — and it is
+	// logged with a stack on every pass.
+	defer func() {
+		if r := recover(); r != nil {
+			w.logger.Error("recovered panic in processJob; releasing job",
+				"job_id", job.ID,
+				"job_type", job.Type,
+				"panic", r,
+				"stack", string(debug.Stack()))
+			w.releaseAfterTerminalWriteError(context.WithoutCancel(ctx), job.ID, "processJob panic")
+		}
+	}()
+
 	// Ensure per-queue concurrency counter is decremented when job finishes
 	defer w.untrackQueueJob(job.ID)
 	defer w.releaseConcurrencySlots(context.WithoutCancel(ctx), job.ID)
