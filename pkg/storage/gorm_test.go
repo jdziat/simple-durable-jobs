@@ -26,7 +26,11 @@ func newTestStorage(t *testing.T) *GormStorage {
 	t.Helper()
 	db := openTestDB(t)
 
-	s := NewGormStorage(db)
+	// Disable the hot-stats aggregate cache by default so tests observe exact
+	// post-mutation counts (enqueue -> read -> mutate -> read must not be served a
+	// stale cached snapshot). The cache itself is covered by dedicated tests that
+	// construct storage with an explicit nonzero TTL (see hot_stats_cache_test.go).
+	s := NewGormStorage(db, WithHotStatsCacheTTL(0))
 	require.NoError(t, s.Migrate(context.Background()), "migrate schema")
 	return s
 }
@@ -92,7 +96,7 @@ func newConcurrentTestStorage(t *testing.T) *GormStorage {
 	sqlDB.SetMaxOpenConns(4)
 	t.Cleanup(func() { _ = sqlDB.Close() })
 
-	s := NewGormStorage(db)
+	s := NewGormStorage(db, WithHotStatsCacheTTL(0))
 	require.NoError(t, s.Migrate(context.Background()))
 	return s
 }

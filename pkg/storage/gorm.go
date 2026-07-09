@@ -45,6 +45,24 @@ func WithStorageLockDuration(d time.Duration) GormStorageOption {
 	}
 }
 
+// WithHotStatsCacheTTL sets the TTL for the in-process cache that coalesces the
+// dashboard/metrics hot-path aggregates (GetQueueDepthStats, QueueDeadLetterCounts,
+// QueueOldestPendingAt). Those aggregate over the whole jobs table with no history
+// bound, so caching bounds them to at most one aggregate per TTL per storage
+// instance regardless of how many dashboard tabs poll or how often Prometheus
+// scrapes. A TTL <= 0 disables the cache (every call hits the DB) — used by tests
+// that assert exact post-mutation counts. The default is 2s.
+func WithHotStatsCacheTTL(d time.Duration) GormStorageOption {
+	return func(s *GormStorage) {
+		s.hotStatsTTL.Store(int64(d))
+	}
+}
+
+// hotStatsTTLValue returns the configured hot-stats cache TTL.
+func (s *GormStorage) hotStatsTTLValue() time.Duration {
+	return time.Duration(s.hotStatsTTL.Load())
+}
+
 // WithCodec configures a payload codec for bytes stored in payload columns.
 // Nil selects the default identity codec.
 func WithCodec(c core.PayloadCodec) GormStorageOption {
@@ -125,6 +143,14 @@ type GormStorage struct {
 	// SetDeleteCheckpointsOnComplete) to bound the checkpoints table. Never
 	// affects the failure path — retry replay reads checkpoints.
 	deleteCheckpointsOnComplete atomic.Bool
+
+	// hotStatsTTL is the TTL (nanoseconds) for the hot-path aggregate cache; <=0
+	// disables it. atomic (comparable) so WithHotStatsCacheTTL and tests can set
+	// it without breaking GormStorage comparability.
+	hotStatsTTL atomic.Int64
+	// hotStats holds the coalescing caches for the dashboard/metrics aggregates.
+	// Behind a pointer so GormStorage stays comparable (see hot_stats_cache.go).
+	hotStats *hotStatCaches
 }
 
 // NewGormStorage creates a new GORM-backed storage. For file-based SQLite under
@@ -158,8 +184,9 @@ func NewGormStorage(db *gorm.DB, opts ...GormStorageOption) *GormStorage {
 		dialector := db.Name()
 		isSQLite = strings.Contains(strings.ToLower(dialector), "sqlite")
 	}
-	s := &GormStorage{db: db, isSQLite: isSQLite, codec: core.IdentityCodec}
+	s := &GormStorage{db: db, isSQLite: isSQLite, codec: core.IdentityCodec, hotStats: &hotStatCaches{}}
 	s.lockDuration.Store(int64(defaultLockDuration))
+	s.hotStatsTTL.Store(int64(defaultHotStatsCacheTTL))
 	if s.isSQLite {
 		// NOTE: a one-shot PRAGMA only affects the single pooled connection it
 		// runs on; connections the pool opens later default to busy_timeout=0.

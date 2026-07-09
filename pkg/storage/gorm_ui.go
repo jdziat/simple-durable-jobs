@@ -28,6 +28,13 @@ func (s *GormStorage) GetQueueStats(ctx context.Context) ([]*jobsv1.QueueStats, 
 // GetQueueDepthStats returns accurate per-queue depth counts using aggregate
 // queries instead of fetching job rows.
 func (s *GormStorage) GetQueueDepthStats(ctx context.Context) ([]*jobsv1.QueueStats, error) {
+	if s.hotStats == nil { // zero-value storage: bypass the cache
+		return s.getQueueDepthStats(ctx)
+	}
+	return s.hotStats.queueDepth.do(ctx, s.hotStatsTTLValue(), cloneQueueStatsSlice, s.getQueueDepthStats)
+}
+
+func (s *GormStorage) getQueueDepthStats(ctx context.Context) ([]*jobsv1.QueueStats, error) {
 	type row struct {
 		Queue  string
 		Status string
@@ -95,8 +102,14 @@ func (s *GormStorage) GetQueueDepthStats(ctx context.Context) ([]*jobsv1.QueueSt
 		}
 	}
 
-	// Check which queues are paused
-	pausedQueues, _ := s.GetPausedQueues(ctx)
+	// Check which queues are paused. Surface a failed pause-state read rather than
+	// silently rendering every queue as UNPAUSED — a paused/quarantined queue shown
+	// as draining is a safety-relevant lie on the dashboard. Both callers
+	// (GetStats, ListQueues) already propagate this error.
+	pausedQueues, err := s.GetPausedQueues(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("read paused queues: %w", err)
+	}
 	pausedSet := make(map[string]struct{}, len(pausedQueues))
 	for _, q := range pausedQueues {
 		pausedSet[q] = struct{}{}

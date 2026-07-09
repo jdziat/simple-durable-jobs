@@ -11,6 +11,13 @@ import (
 // QueueDeadLetterCounts returns per-queue dead-letter job counts for optional
 // metrics instrumentation.
 func (s *GormStorage) QueueDeadLetterCounts(ctx context.Context) (map[string]int, error) {
+	if s.hotStats == nil { // zero-value storage: bypass the cache
+		return s.queueDeadLetterCounts(ctx)
+	}
+	return s.hotStats.deadLetter.do(ctx, s.hotStatsTTLValue(), cloneStringIntMap, s.queueDeadLetterCounts)
+}
+
+func (s *GormStorage) queueDeadLetterCounts(ctx context.Context) (map[string]int, error) {
 	type row struct {
 		Queue string
 		Count int
@@ -35,6 +42,13 @@ func (s *GormStorage) QueueDeadLetterCounts(ctx context.Context) (map[string]int
 // QueueOldestPendingAt returns the oldest pending job creation timestamp by
 // queue for optional metrics instrumentation.
 func (s *GormStorage) QueueOldestPendingAt(ctx context.Context) (map[string]time.Time, error) {
+	if s.hotStats == nil { // zero-value storage: bypass the cache
+		return s.queueOldestPendingAt(ctx)
+	}
+	return s.hotStats.oldestPending.do(ctx, s.hotStatsTTLValue(), cloneStringTimeMap, s.queueOldestPendingAt)
+}
+
+func (s *GormStorage) queueOldestPendingAt(ctx context.Context) (map[string]time.Time, error) {
 	type row struct {
 		Queue           string
 		OldestPendingAt sql.NullString
