@@ -116,7 +116,7 @@ func (s *GormStorage) lockForUpdate(q *gorm.DB, skipLocked bool) *gorm.DB {
 // ordering. Callers add locking, limits, exclusions, and read shape.
 func (s *GormStorage) claimableCandidates(q *gorm.DB, queues []string, now any) *gorm.DB {
 	eligExpr := s.dequeueEligibleExpr()
-	return q.
+	q = q.
 		Where("queue IN ?", queues).
 		// Exclude paused queues in-SQL (always fresh, no extra round-trip). Use an
 		// UNCORRELATED subquery, NOT a correlated `NOT EXISTS (... qs.queue =
@@ -127,8 +127,28 @@ func (s *GormStorage) claimableCandidates(q *gorm.DB, queues []string, now any) 
 		// preserves the ordered, LIMIT-bounded index scan. queue_states.queue is
 		// NOT NULL (PK), so the NOT IN never hits the NULL-elimination trap.
 		Where("queue NOT IN (SELECT queue FROM queue_states WHERE paused = ?)", true).
-		Where("status = ?", core.StatusPending).
-		Where("dq_ready = ?", true).
+		Where("status = ?", core.StatusPending)
+	// dq_ready is a MySQL-only dequeue predicate. On MySQL the dequeue rides
+	// idx_jobs_dq_ready (status, dq_ready, priority DESC, dq_eligible_at, queue):
+	// the leading (status, dq_ready) equality prefix keeps the scan priority-
+	// ordered, so DROPPING dq_ready there would force the eligibility-first
+	// idx_jobs_dequeue_eligible index and a priority filesort (the exact
+	// regression v30/v32/v34 fought) — MySQL MUST keep it.
+	//
+	// On Postgres/SQLite the dequeue index is the partial idx_jobs_dequeue_eligible
+	// (priority DESC, COALESCE(run_at, created_at), queue) WHERE status='pending',
+	// which does NOT contain dq_ready — so there the predicate is a pure redundant
+	// filter whose only effect is a dequeue-visibility LATENCY FLOOR: a delayed job
+	// that just became eligible (COALESCE(run_at,created_at) <= now) stays
+	// unclaimable until the promoter flips dq_ready=true. The eligExpr<=now gate
+	// below is the real correctness fence, so we omit dq_ready on PG/SQLite and a
+	// job is claimable the instant it is due. dqReadyExpr write-side maintenance,
+	// PromoteReadyJobs and the promoter loop stay in place (belt-and-suspenders,
+	// no longer load-bearing for PG/SQLite dequeue).
+	if s.dialect() == dialectMySQL {
+		q = q.Where("dq_ready = ?", true)
+	}
+	return q.
 		Where(eligExpr+" <= ?", now).
 		Where("(locked_until IS NULL OR locked_until < ?)", now).
 		Order("priority DESC, " + eligExpr + " ASC")
