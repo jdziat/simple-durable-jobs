@@ -36,6 +36,12 @@ type checkpointIndexCleaner interface {
 // succeeds will run the handler again on replay. Called handlers with side
 // effects must be idempotent.
 //
+// The returned value is always the result JSON-round-tripped into T (identical
+// first-run and on replay), so Call result types must be JSON-round-trip-stable.
+// An interface T such as Call[any] therefore yields a decoded generic value
+// (map[string]interface{} / float64), consistently on both paths — request a
+// concrete result type if the caller needs the handler's concrete Go type.
+//
 // Retry semantics: a successful result and a terminal (NoRetry) error are
 // checkpointed and replayed verbatim without re-invoking the handler. A
 // RETRYABLE error — a plain error or a RetryAfterError — is NOT checkpointed;
@@ -221,5 +227,21 @@ func CallWithCheckpointCtx[T any](execCtx, checkpointCtx context.Context, name s
 		return zero, fmt.Errorf("failed to save checkpoint: %w", saveErr)
 	}
 
-	return result, nil
+	// Return the value obtained by unmarshaling the just-serialized bytes into T —
+	// the exact path replay uses (see the cached-checkpoint branch above) — rather
+	// than the handler's raw Go value. This makes the dynamic type a caller
+	// observes identical on the first run and on any replay. Without it, an
+	// interface T (Call[any], an interface-typed result, or an `any`-typed field)
+	// returns the handler's concrete type first-run but a decoded generic type
+	// (map[string]interface{} / []interface{} / float64) on replay, so a caller
+	// type-assertion that works pre-crash panics post-resume — a failure that only
+	// appears after a crash. Round-tripping here surfaces any such mismatch
+	// deterministically on the first run instead, and normalizes lossy concrete
+	// types (time.Time monotonic/location, large int64 boxed in `any`) the same
+	// way on both paths. Concrete pure-data structs are unaffected.
+	var roundTripped T
+	if err := json.Unmarshal(resultBytes, &roundTripped); err != nil {
+		return zero, fmt.Errorf("failed to round-trip call result: %w", err)
+	}
+	return roundTripped, nil
 }
