@@ -293,3 +293,45 @@ func TestCancelSubJobs_PreservesLockedBy(t *testing.T) {
 	assert.Equal(t, "worker-remote", job.LockedBy, "CancelSubJobs must not clear locked_by")
 	assert.Empty(t, job.LastError, "CancelSubJobs preserves empty last_error on peer-cancelled siblings")
 }
+
+// TestCancelJobTerminal_ReconcilesOwningFanOutCounts is the E3 storage
+// regression: cross-API CancelJob on a fan-out CHILD (routed through
+// CancelJobTerminal) must reconcile the OWNING fan-out's persisted counts, not
+// just walk the descendant subtree. Otherwise the owning row's counters stay
+// frozen (INV-FANOUT-COUNTS) and its parent is stranded until the recovery
+// backstop.
+func TestCancelJobTerminal_ReconcilesOwningFanOutCounts(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	parent := &core.Job{ID: core.NewID(), Type: "wf", Queue: "default", Status: core.StatusWaiting}
+	require.NoError(t, s.Enqueue(ctx, parent))
+
+	fanOut := &core.FanOut{
+		ID: core.NewID(), ParentJobID: parent.ID, TotalCount: 2,
+		Strategy: core.StrategyFailFast, Status: core.FanOutPending,
+	}
+	require.NoError(t, s.CreateFanOut(ctx, fanOut))
+
+	// child 0 completed; the persisted fan_out reflects only that (completed=1).
+	completed := &core.Job{ID: core.NewID(), Type: "sub", Queue: "default", Status: core.StatusCompleted, FanOutID: &fanOut.ID, FanOutIndex: 0}
+	require.NoError(t, s.Enqueue(ctx, completed))
+	require.NoError(t, s.DB().Model(&core.FanOut{}).Where("id = ?", fanOut.ID).
+		Update("completed_count", 1).Error)
+
+	// child 1 running — the target of the cross-API cancel.
+	lockUntil := time.Now().Add(time.Hour)
+	running := &core.Job{ID: core.NewID(), Type: "sub", Queue: "default", Status: core.StatusRunning, LockedBy: "worker-1", LockedUntil: &lockUntil, FanOutID: &fanOut.ID, FanOutIndex: 1}
+	require.NoError(t, s.Enqueue(ctx, running))
+
+	require.NoError(t, s.CancelJobTerminal(ctx, running.ID))
+
+	var reconciled core.FanOut
+	require.NoError(t, s.DB().First(&reconciled, "id = ?", fanOut.ID).Error)
+	assert.Equal(t, 1, reconciled.CompletedCount)
+	assert.Equal(t, 0, reconciled.FailedCount)
+	assert.Equal(t, 1, reconciled.CancelledCount, "owning fan-out cancelled_count must reflect the cancelled child")
+	assert.Equal(t, reconciled.TotalCount,
+		reconciled.CompletedCount+reconciled.FailedCount+reconciled.CancelledCount,
+		"owning fan-out persisted counts must reconcile to sum==total after cross-API child cancel")
+}

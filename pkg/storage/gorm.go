@@ -1896,6 +1896,22 @@ func (s *GormStorage) CancelSubJob(ctx context.Context, jobID core.UUID) (*core.
 			if err != nil {
 				return err
 			}
+			// Persist the reconciled counts to the fan_outs row ATOMICALLY with the
+			// cancel, ungated by status (mirrors cancelFanOutChildrenAndReconcile). If
+			// this cancel terminates the last in-flight child of an already-frozen
+			// fail_fast/threshold fan-out, the pre-frozen under-count would otherwise
+			// stay diverged forever — no later path revisits a terminal row
+			// (INV-FANOUT-COUNTS).
+			if err := tx.Model(&core.FanOut{}).
+				Where("id = ?", *job.FanOutID).
+				Updates(map[string]any{
+					"completed_count": completed,
+					"failed_count":    failed,
+					"cancelled_count": cancelledCount,
+					"updated_at":      now,
+				}).Error; err != nil {
+				return err
+			}
 			overlayFanOutCounts(&fanOut, completed, failed, cancelledCount)
 			hasFanOut = true
 			return nil
@@ -2407,6 +2423,26 @@ func (s *GormStorage) PauseJobWithMode(ctx context.Context, jobID core.UUID, mod
 	return s.pauseJobAggressive(ctx, jobID)
 }
 
+// reconcileFanOutCountsTx persists one fan-out's live completed/failed/cancelled
+// counts into its row, ungated by status, so a pre-frozen fail_fast/threshold row
+// is corrected to sum==total (INV-FANOUT-COUNTS). Mirrors the persist inside
+// cancelFanOutChildrenAndReconcile; used by the singular cancel paths that touch a
+// single child rather than a whole subtree.
+func (s *GormStorage) reconcileFanOutCountsTx(tx *gorm.DB, fanOutID core.UUID, now time.Time) error {
+	completed, failed, cancelledCount, err := liveFanOutCounts(tx, fanOutID)
+	if err != nil {
+		return err
+	}
+	return tx.Model(&core.FanOut{}).
+		Where("id = ?", fanOutID).
+		Updates(map[string]any{
+			"completed_count": completed,
+			"failed_count":    failed,
+			"cancelled_count": cancelledCount,
+			"updated_at":      now,
+		}).Error
+}
+
 // CancelJobTerminal terminally cancels a pending, waiting, or running job. When
 // the job is a fan-out parent, its entire descendant fan-out subtree is
 // terminally cancelled in the same transaction.
@@ -2452,6 +2488,24 @@ func (s *GormStorage) CancelJobTerminal(ctx context.Context, jobID core.UUID) er
 
 			if err := tx.Where("job_id = ?", jobID).Delete(&core.ConcurrencySlot{}).Error; err != nil {
 				return err
+			}
+
+			// If the cancelled job is itself a fan-out CHILD, reconcile its OWNING
+			// fan-out's persisted counts inline. CancelJobTerminal otherwise only
+			// walks the DESCENDANT subtree (collectFanOutSubtree follows parent_job_id
+			// downward) and never touches the fan-out the target belongs to, leaving
+			// its counts frozen (INV-FANOUT-COUNTS) and — because no child-completion
+			// event fires — its parent stranded in `waiting` until the ~2min recovery
+			// backstop (E3/D5). The parent's inline resume is driven by the queue
+			// layer (Queue.CancelJob) off this reconciled row.
+			var target core.Job
+			if err := tx.Select("fan_out_id").First(&target, "id = ?", jobID).Error; err != nil {
+				return err
+			}
+			if target.FanOutID != nil && *target.FanOutID != "" {
+				if err := s.reconcileFanOutCountsTx(tx, *target.FanOutID, now); err != nil {
+					return err
+				}
 			}
 
 			fanOutIDs, subJobIDs, truncated, err := s.collectFanOutSubtree(tx, jobID)
