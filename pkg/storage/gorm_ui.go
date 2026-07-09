@@ -499,9 +499,9 @@ func (s *GormStorage) DeleteWorkflowSubtree(ctx context.Context, rootJobID core.
 // fan-out parents. A parent is skipped (not deleted) so a bulk purge can never
 // strand its children — a paused/terminal parent may still have children in
 // other states, and the FK cascade does not reach the sub-jobs. Parents must be
-// removed via DeleteWorkflowSubtree. Checkpoints AND signals for the purged
-// (leaf) jobs are deleted too; the returned count is the number of job rows
-// actually removed.
+// removed via DeleteWorkflowSubtree. Checkpoints, signals, AND unique_locks for
+// the purged (leaf) jobs are deleted too; the returned count is the number of job
+// rows actually removed.
 func (s *GormStorage) PurgeJobs(ctx context.Context, queue string, status core.JobStatus) (int64, error) {
 	var deleted int64
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
@@ -526,6 +526,13 @@ func (s *GormStorage) PurgeJobs(ctx context.Context, queue string, status core.J
 			return err
 		}
 		if err := tx.Where("job_id IN (?)", matchingJobs).Delete(&core.Signal{}).Error; err != nil {
+			return err
+		}
+		// Delete the purged jobs' unique locks too (mirror the retention path):
+		// unique_locks.job_id has no FK cascade, so a purge that skipped them would
+		// strand a dangling lock — a still-live one keeps blocking re-enqueue of a
+		// dedup scope whose job is gone, and expired ones accumulate unbounded.
+		if err := tx.Where("job_id IN (?)", matchingJobs).Delete(&core.UniqueLock{}).Error; err != nil {
 			return err
 		}
 
