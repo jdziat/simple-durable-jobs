@@ -45,6 +45,24 @@ func (s *GormStorage) DeleteTerminalJobsOlderThan(ctx context.Context, status co
 		rootChildGuard = "NOT EXISTS (SELECT 1 FROM jobs c WHERE c.pending_root_ref = jobs.id)"
 	}
 
+	// Never GC a completed leaf sub-job whose owning fan-out's PARENT job is not
+	// yet terminal. CollectResults (pkg/fanout) rebuilds its result slice from
+	// surviving sub-job rows and is only guaranteed to have run once the parent
+	// reaches a terminal status; deleting a completed child before then silently
+	// turns succeeded work into ErrSubJobIncomplete with no top-level error.
+	//
+	// Guarding on the fan_out's own status is insufficient: the fan_out flips to
+	// 'completed' the moment its last child finishes, which is BEFORE a stranded
+	// (paused / backlogged / outage-delayed) parent resumes to collect. We must
+	// therefore key on the parent job's terminal status, not the fan_out's. The
+	// two-hop join walks jobs.fan_out_id -> fan_outs.id (PK) -> fan_outs
+	// .parent_job_id -> jobs.id (PK); both hops are primary-key lookups evaluated
+	// only for the already status/age-limited candidate rows, so no MySQL gencol
+	// is required. It lives in the id-selection query only (never the DELETE), so
+	// the MySQL "can't self-reference the delete target" rule is not triggered.
+	fanOutParentGuard := "NOT EXISTS (SELECT 1 FROM fan_outs f JOIN jobs pp ON pp.id = f.parent_job_id " +
+		"WHERE f.id = jobs.fan_out_id AND pp.status NOT IN (" + terminalStatuses + "))"
+
 	var deleted int64
 	err := s.withSerializationRetry(ctx, func() error {
 		deleted = 0
@@ -57,6 +75,7 @@ func (s *GormStorage) DeleteTerminalJobsOlderThan(ctx context.Context, status co
 				Where(parentChildGuard).
 				Where(rootChildGuard).
 				Where("NOT EXISTS (SELECT 1 FROM fan_outs f WHERE f.parent_job_id = jobs.id AND f.status = 'pending')").
+				Where(fanOutParentGuard).
 				Order("completed_at ASC, id ASC").
 				Limit(limit)
 			query = s.lockForUpdate(query, true)
