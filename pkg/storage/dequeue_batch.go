@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"gorm.io/gorm"
-	"gorm.io/gorm/clause"
 	"gorm.io/gorm/logger"
 
 	"github.com/jdziat/simple-durable-jobs/v4/pkg/core"
@@ -83,16 +82,31 @@ func (s *GormStorage) dequeueBatchOnce(ctx context.Context, queues []string, wor
 
 // dequeueBatchReturning claims due jobs with a SINGLE atomic UPDATE ... RETURNING
 // per queue, on dialects that support RETURNING with an UPDATE whose subquery
-// reads the same table (Postgres, SQLite >= 3.35). It replaces dequeueBatchLocked's
+// reads the same table AND the AS MATERIALIZED CTE fence below (Postgres >= 12,
+// SQLite >= 3.35 — MATERIALIZED landed in both by those versions; SQLite < 3.35
+// also lacks RETURNING). It replaces dequeueBatchLocked's
 // candidate-SELECT -> per-candidate paused/budget loop -> UPDATE -> re-fetch
 // sequence with:
 //
-//	UPDATE jobs SET status='running', ... WHERE id IN (
+//	WITH claimed AS MATERIALIZED (
 //	    SELECT id FROM jobs <claimableCandidates predicate> ORDER BY ... LIMIT n
 //	    FOR UPDATE SKIP LOCKED          -- a no-op on SQLite (single writer)
-//	) RETURNING *
+//	)
+//	UPDATE jobs SET status='running', ... WHERE id IN (SELECT id FROM claimed)
+//	RETURNING *
 //
 // Correctness invariants preserved:
+//   - The locking candidate subquery MUST be fenced in a MATERIALIZED CTE, not
+//     inlined as `UPDATE ... WHERE id IN (SELECT ... FOR UPDATE SKIP LOCKED LIMIT
+//     n)`. Postgres is free to place a bare locking subquery on the INNER side of
+//     a nested-loop semi-join and RE-EVALUATE it per candidate row, applying LIMIT
+//     n each iteration; because every UPDATE writes a new row version, each
+//     re-execution locks a different row first and the LIMIT is effectively
+//     ignored — a runaway that claims far more than n (observed: 10 for LIMIT 5,
+//     so a worker over-dispatches its whole batch). MATERIALIZED is an
+//     optimization fence forcing single evaluation, so exactly n ids are locked
+//     and updated. See CYBERTEC, "How to do UPDATE ... LIMIT in PostgreSQL", and
+//     TestDequeueBatch_NeverOverDispatchesUnderChurn.
 //   - The paused-queue exclusion lives in claimableCandidates' uncorrelated
 //     subquery, evaluated within the single claim statement, so this path does not
 //     need dequeueBatchLocked's separate per-candidate First() paused re-check
@@ -157,25 +171,37 @@ func (s *GormStorage) dequeueBatchReturning(ctx context.Context, queues []string
 		var rows []*core.Job
 		err := s.withSerializationRetry(ctx, func() error {
 			rows = nil
+			// The claimable-candidate SELECT carries the LIMIT and, on Postgres,
+			// FOR UPDATE SKIP LOCKED.
 			sub := s.claimableCandidates(
 				s.lockForUpdate(silentDB.WithContext(ctx).Model(&core.Job{}).Select("id"), true),
 				u.queues, nowVal,
 			).Limit(n)
-			return silentDB.WithContext(ctx).
-				Model(&rows).
-				Clauses(clause.Returning{}).
-				Where("id IN (?)", sub).
-				Updates(map[string]any{
-					"status":       core.StatusRunning,
-					"locked_by":    workerID,
-					"locked_until": lockUntilVal,
-					"started_at":   nowVal,
-					"attempt":      gorm.Expr("attempt + 1"),
-					// Clear the prior run's heartbeat on claim so the stale-lock reaper
-					// anchors on this claim's started_at, not a stale heartbeat
-					// (CD-01 double-execution). See Dequeue.
-					"last_heartbeat_at": gorm.Expr("NULL"),
-				}).Error
+			// Wrap the locking subquery in a MATERIALIZED CTE so the planner
+			// evaluates it EXACTLY ONCE. A bare `UPDATE ... WHERE id IN (SELECT
+			// ... FOR UPDATE SKIP LOCKED LIMIT n)` lets Postgres place the locking
+			// subquery on the INNER side of a nested loop and re-evaluate it per
+			// candidate row, applying LIMIT n per iteration — a runaway that claims
+			// far more than n rows (observed: 10 rows for LIMIT 5, so a worker
+			// over-dispatches its whole batch). MATERIALIZED is an optimization
+			// fence that forces single evaluation, so exactly n ids are locked and
+			// updated. See CYBERTEC, "How to do UPDATE ... LIMIT in PostgreSQL".
+			// SQLite (>= 3.35, this path's floor) accepts AS MATERIALIZED too; it
+			// has no row locks (single writer), so the fence only pins the LIMIT
+			// there. The SET list matches the prior GORM .Updates(map) claim column
+			// for column, INCLUDING updated_at (Job.UpdatedAt is autoUpdateTime, so
+			// the map form bumped it implicitly; the raw statement bypasses that
+			// callback and must set it explicitly to stay consistent with every
+			// other claim path) and last_heartbeat_at=NULL (CD-01: clear the stale
+			// heartbeat so the reaper anchors on this claim's started_at).
+			return silentDB.WithContext(ctx).Raw(
+				"WITH claimed AS MATERIALIZED (?) "+
+					"UPDATE jobs SET status = ?, locked_by = ?, locked_until = ?, "+
+					"started_at = ?, updated_at = ?, attempt = attempt + 1, "+
+					"last_heartbeat_at = NULL "+
+					"WHERE id IN (SELECT id FROM claimed) RETURNING *",
+				sub, core.StatusRunning, workerID, lockUntilVal, nowVal, nowVal,
+			).Scan(&rows).Error
 		})
 		if err != nil {
 			return nil, err
