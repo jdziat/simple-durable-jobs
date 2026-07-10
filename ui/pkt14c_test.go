@@ -14,19 +14,27 @@ import (
 	"github.com/jdziat/simple-durable-jobs/v4/pkg/schedule"
 )
 
-// TestListScheduledJobs_NextRunAnchoredOnLastRun guards C-03: the UI's NextRun
-// must be computed from the persisted last run (Schedule.Next(lastRun)), the same
-// anchor the scheduler uses, not Schedule.Next(now). Anchoring on now makes the UI
-// disagree with when the job will actually fire for any schedule that has run.
-func TestListScheduledJobs_NextRunAnchoredOnLastRun(t *testing.T) {
+// TestListScheduledJobs_NextRunIsFutureAfterMissedBoundaries guards C-03: the
+// UI's NextRun must be the next FUTURE fire. It anchors on the persisted last run
+// like the scheduler, but a single Schedule.Next(lastRun) step returns a boundary
+// already in the PAST when the last run is more than one interval behind now
+// (worker down / schedule paused). The UI must walk forward past the missed
+// boundaries — mirroring the scheduler's seedLastRun catch-up — so an operator
+// viewing the dashboard during an outage never sees a stale past timestamp
+// labeled as the next run.
+func TestListScheduledJobs_NextRunIsFutureAfterMissedBoundaries(t *testing.T) {
 	ctx := context.Background()
 	svc, q := setupServiceWithQueue(t)
 	registerScheduledTestHandler(q, "hourly")
 	sched := schedule.Every(time.Hour)
 	require.NoError(t, q.Schedule("hourly", nil, sched))
 
-	// Claim a fire well in the past so lastRun is clearly distinct from now.
+	// Claim a fire 90m in the past: a single Next(lastRun) step lands on a
+	// boundary ~30m in the past — the missed-boundary case the old one-step code
+	// reported verbatim as "next".
 	lastRun := time.Now().UTC().Add(-90 * time.Minute).Truncate(time.Second)
+	require.False(t, sched.Next(lastRun).After(time.Now()),
+		"test premise: a single Next(lastRun) step must land in the past")
 	_, err := svc.storage.(interface {
 		SeedScheduledFire(context.Context, string, time.Time) (time.Time, error)
 	}).SeedScheduledFire(ctx, "hourly", lastRun.Add(-time.Hour))
@@ -35,20 +43,71 @@ func TestListScheduledJobs_NextRunAnchoredOnLastRun(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, claimed)
 
+	callTime := time.Now()
 	resp, err := svc.ListScheduledJobs(ctx, connect.NewRequest(&jobsv1.ListScheduledJobsRequest{}))
 	require.NoError(t, err)
 	require.Len(t, resp.Msg.Jobs, 1)
 	job := resp.Msg.Jobs[0]
-	require.NotNil(t, job.LastRun)
+	require.NotNil(t, job.LastRun, "LastRun must remain the persisted last fire")
+	assert.Equal(t, lastRun.Unix(), job.LastRun.AsTime().Unix())
 	require.NotNil(t, job.NextRun)
 
+	nextRun := job.NextRun.AsTime()
+	assert.True(t, nextRun.After(callTime),
+		"NextRun must be the next FUTURE fire, not a stale past boundary")
+	assert.LessOrEqual(t, nextRun.Sub(callTime), time.Hour+2*time.Second,
+		"NextRun must be the immediate next boundary (within one interval), not skipped ahead")
+}
+
+// phaseSchedule fires at a fixed offset relative to its anchor, WITHOUT epoch
+// truncation, so its Next depends on the anchor's phase. Anchoring on
+// max(lastRun, now) would shift that phase; a forward walk from lastRun preserves
+// it. It exists to lock in that the UI walks (matching the scheduler) rather than
+// re-phasing from now.
+type phaseSchedule struct{ interval time.Duration }
+
+func (p phaseSchedule) Next(from time.Time) time.Time { return from.Add(p.interval) }
+
+// TestListScheduledJobs_NextRunPreservesSchedulePhase guards that the forward walk
+// preserves the last-run phase for an anchor-relative schedule — the reason to
+// walk rather than anchor on max(lastRun, now).
+func TestListScheduledJobs_NextRunPreservesSchedulePhase(t *testing.T) {
+	ctx := context.Background()
+	svc, q := setupServiceWithQueue(t)
+	registerScheduledTestHandler(q, "phased")
+	sched := phaseSchedule{interval: time.Hour}
+	require.NoError(t, q.Schedule("phased", nil, sched))
+
+	// lastRun at an off-boundary phase 137m ago, so its boundaries (lastRun +
+	// k*1h) straddle now with clear margin (nearest ~43m ahead / ~17m behind) —
+	// no boundary sits within clock-skew of now.
+	lastRun := time.Now().UTC().Add(-137 * time.Minute).Truncate(time.Second)
+	_, err := svc.storage.(interface {
+		SeedScheduledFire(context.Context, string, time.Time) (time.Time, error)
+	}).SeedScheduledFire(ctx, "phased", lastRun.Add(-time.Hour))
+	require.NoError(t, err)
+	claimed, err := svc.storage.ClaimScheduledFire(ctx, "phased", lastRun)
+	require.NoError(t, err)
+	require.True(t, claimed)
+
+	callTime := time.Now()
+	resp, err := svc.ListScheduledJobs(ctx, connect.NewRequest(&jobsv1.ListScheduledJobsRequest{}))
+	require.NoError(t, err)
+	require.Len(t, resp.Msg.Jobs, 1)
+	require.NotNil(t, resp.Msg.Jobs[0].NextRun)
+	nextRun := resp.Msg.Jobs[0].NextRun.AsTime()
+
+	// Expected: the first lastRun + k*interval strictly after now — phase preserved.
 	want := sched.Next(lastRun)
-	assert.Equal(t, want.Unix(), job.NextRun.AsTime().Unix(),
-		"NextRun must be Schedule.Next(lastRun), matching the scheduler — not Schedule.Next(now)")
-	// Sanity: with a lastRun 90m ago and an hourly schedule, the now-anchored value
-	// the old code produced is a different instant, so this test is meaningful.
-	require.NotEqual(t, sched.Next(time.Now()).Unix(), want.Unix(),
-		"test setup must make lastRun-anchored and now-anchored NextRun differ")
+	for !want.After(callTime) {
+		want = sched.Next(want)
+	}
+	assert.Equal(t, want.Unix(), nextRun.Unix(),
+		"NextRun must preserve the last-run phase (lastRun + k*interval), not re-phase from now")
+	assert.True(t, nextRun.After(callTime), "NextRun must be in the future")
+	// max(lastRun, now) would give now+1h, a materially different instant, so this
+	// guards the walk against a future 'simplification' to Next(max(lastRun, now)).
+	assert.NotEqual(t, callTime.Add(time.Hour).Unix(), nextRun.Unix())
 }
 
 // TestAggregateStrategy guards C-04: a workflow whose fan-outs do not all share a
