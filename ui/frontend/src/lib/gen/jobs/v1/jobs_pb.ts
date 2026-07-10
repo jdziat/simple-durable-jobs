@@ -1982,6 +1982,21 @@ export class ScheduledJobInfo extends Message<ScheduledJobInfo> {
    */
   lastRun?: Timestamp;
 
+  /**
+   * @generated from field: bool overdue = 6;
+   */
+  overdue = false;
+
+  /**
+   * @generated from field: int64 missed_fires = 7;
+   */
+  missedFires = protoInt64.zero;
+
+  /**
+   * @generated from field: google.protobuf.Timestamp expected_last_run = 8;
+   */
+  expectedLastRun?: Timestamp;
+
   constructor(data?: PartialMessage<ScheduledJobInfo>) {
     super();
     proto3.util.initPartial(data, this);
@@ -1995,6 +2010,9 @@ export class ScheduledJobInfo extends Message<ScheduledJobInfo> {
     { no: 3, name: "queue", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 4, name: "next_run", kind: "message", T: Timestamp },
     { no: 5, name: "last_run", kind: "message", T: Timestamp },
+    { no: 6, name: "overdue", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 7, name: "missed_fires", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 8, name: "expected_last_run", kind: "message", T: Timestamp },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ScheduledJobInfo {
@@ -2070,6 +2088,16 @@ export class GetWorkflowResponse extends Message<GetWorkflowResponse> {
    */
   children: Job[] = [];
 
+  /**
+   * truncated is set when the returned tree is INCOMPLETE: the parent chain
+   * exceeded the root-find hop cap (or contained a cycle), or the collected
+   * descendant set hit the per-request node cap. Consumers must not treat a
+   * truncated tree as the whole workflow.
+   *
+   * @generated from field: bool truncated = 4;
+   */
+  truncated = false;
+
   constructor(data?: PartialMessage<GetWorkflowResponse>) {
     super();
     proto3.util.initPartial(data, this);
@@ -2081,6 +2109,7 @@ export class GetWorkflowResponse extends Message<GetWorkflowResponse> {
     { no: 1, name: "root", kind: "message", T: Job },
     { no: 2, name: "fan_outs", kind: "message", T: FanOut, repeated: true },
     { no: 3, name: "children", kind: "message", T: Job, repeated: true },
+    { no: 4, name: "truncated", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetWorkflowResponse {

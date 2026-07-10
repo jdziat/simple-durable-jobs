@@ -19,6 +19,9 @@
     queue: string
     nextRun: TimeValue
     lastRun: TimeValue
+    overdue: boolean
+    missedFires: number
+    expectedLastRun: TimeValue
   }
 
   const columns: Column[] = [
@@ -96,6 +99,9 @@
         queue: job.queue,
         nextRun: toDate(job.nextRun),
         lastRun: toDate(job.lastRun),
+        overdue: job.overdue,
+        missedFires: Number(job.missedFires),
+        expectedLastRun: toDate(job.expectedLastRun),
       }))
     } catch (e) {
       error = e instanceof Error ? e.message : 'Failed to load scheduled jobs'
@@ -109,6 +115,16 @@
     now
     if (!ts) return '—'
     return `${countdown(ts)} · ${absolute(ts)}`
+  }
+
+  function missedFireLabel(count: number): string {
+    return `${count} missed`
+  }
+
+  function healthTitle(job: ScheduledJob): string | undefined {
+    if (!job.overdue) return undefined
+    const expected = job.expectedLastRun ? `Expected ${absolute(job.expectedLastRun)} · ` : ''
+    return `${expected}${missedFireLabel(job.missedFires)} — worker may be down or the schedule paused`
   }
 
   onMount(() => {
@@ -176,7 +192,13 @@
         <span class="muted">—</span>
       {/if}
     {:else if column.key === 'health'}
-      <span class="data-gap" title="The scheduled-jobs RPC does not expose last-run health.">—</span>
+      {#if job.overdue}
+        <span class="health-badge health-overdue" title={healthTitle(job)}>
+          {job.missedFires > 0 ? `Overdue · ${missedFireLabel(job.missedFires)}` : 'Overdue'}
+        </span>
+      {:else}
+        <span class="health-badge health-ok">On track</span>
+      {/if}
     {/if}
   {/snippet}
 
@@ -249,7 +271,7 @@
   .mono,
   .time-cell,
   .muted,
-  .data-gap {
+  .health-badge {
     font-family: var(--font-mono);
     font-feature-settings: var(--num);
   }
@@ -266,13 +288,33 @@
 
   .cron-cell span,
   .muted,
-  .data-gap,
   .summary {
     color: var(--fg-secondary);
   }
 
   .time-cell {
     white-space: nowrap;
+  }
+
+  .health-badge {
+    display: inline-flex;
+    align-items: center;
+    min-height: 20px;
+    padding: 0 var(--sp-2);
+    border-radius: var(--radius-chip);
+    font-size: var(--fs-label);
+    line-height: 1;
+    white-space: nowrap;
+  }
+
+  .health-ok {
+    color: var(--fg-secondary);
+  }
+
+  .health-overdue {
+    border: 1px solid color-mix(in srgb, var(--sig-warn) 55%, transparent);
+    background: var(--sig-warn-bg);
+    color: var(--sig-warn);
   }
 
   .summary {
