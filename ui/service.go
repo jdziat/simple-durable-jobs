@@ -466,13 +466,23 @@ func (s *jobsService) ListScheduledJobs(ctx context.Context, req *connect.Reques
 				Schedule: schedStr,
 				Queue:    sj.Options.Queue,
 			}
+			// Anchor NextRun on the persisted last run so the UI matches the
+			// scheduler, which computes the next fire as Schedule.Next(lastRun)
+			// (worker.go). For a schedule that has fired, resolve LastRun first and
+			// advance from it; only a NEVER-fired schedule falls back to Next(now).
+			// The read-only UI deliberately does not replicate the scheduler's
+			// durable-anchor seeding (establishScheduleBase/SeedScheduledFire), so a
+			// never-fired interval schedule's NextRun here is a best-effort estimate
+			// that may be up to one interval off until the first real fire.
+			anchor := now
+			if lastRun, ok := lastRuns[name]; ok {
+				anchor = lastRun
+				info.LastRun = timestamppb.New(lastRun)
+			}
 			if sj.Schedule != nil {
-				if nextRun := sj.Schedule.Next(now); !nextRun.IsZero() {
+				if nextRun := sj.Schedule.Next(anchor); !nextRun.IsZero() {
 					info.NextRun = timestamppb.New(nextRun)
 				}
-			}
-			if lastRun, ok := lastRuns[name]; ok {
-				info.LastRun = timestamppb.New(lastRun)
 			}
 			jobsList = append(jobsList, info)
 		}
@@ -541,6 +551,26 @@ func (s *jobsService) GetWorkflow(ctx context.Context, req *connect.Request[jobs
 	}), nil
 }
 
+// strategyMixed is the display-only aggregate label for a workflow whose fan-outs
+// do not all share one strategy. It is intentionally NOT a core.FanOutStrategy and
+// NOT in core.AllFanOutStrategies (which the DB CHECK constraint enforces) — it
+// only ever appears in the read-only UI workflow summary.
+const strategyMixed = "mixed"
+
+// aggregateStrategy reports the single strategy shared by every fan-out in a
+// workflow, or strategyMixed when they differ (a workflow can hold multiple
+// fan-outs with different strategies; reporting only the first was misleading).
+// Callers pass a non-empty slice.
+func aggregateStrategy(fanOuts []*core.FanOut) string {
+	first := string(fanOuts[0].Strategy)
+	for _, fo := range fanOuts[1:] {
+		if string(fo.Strategy) != first {
+			return strategyMixed
+		}
+	}
+	return first
+}
+
 // ListWorkflows returns a paginated list of workflow root jobs.
 // It requires the storage to implement UIStorage with GetWorkflowRoots;
 // without that, it returns an unimplemented error.
@@ -578,8 +608,7 @@ func (s *jobsService) ListWorkflows(ctx context.Context, req *connect.Request[jo
 		fanOuts := fanOutsByParent[root.ID]
 
 		if len(fanOuts) > 0 {
-			// Use strategy from the first fan-out as representative.
-			summary.Strategy = string(fanOuts[0].Strategy)
+			summary.Strategy = aggregateStrategy(fanOuts)
 
 			var totalJobs, completedJobs, failedJobs, cancelledJobs int32
 			for _, fo := range fanOuts {
