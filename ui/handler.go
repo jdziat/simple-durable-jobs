@@ -35,8 +35,9 @@ var (
 //	mux.Handle("/jobs/", http.StripPrefix("/jobs", ui.Handler(storage)))
 func Handler(storage core.Storage, opts ...Option) http.Handler {
 	cfg := &config{
-		ctx:               context.Background(),
-		metadataRedaction: true,
+		ctx:                      context.Background(),
+		metadataRedaction:        true,
+		scheduleOverdueThreshold: DefaultScheduleOverdueThreshold,
 	}
 	for _, opt := range opts {
 		opt.apply(cfg)
@@ -69,6 +70,7 @@ func Handler(storage core.Storage, opts ...Option) http.Handler {
 	// Create the jobs service
 	svc := newJobsService(storage, cfg.queue, statsStorage)
 	svc.metadataRedaction = cfg.metadataRedaction
+	svc.scheduleOverdueThreshold = cfg.scheduleOverdueThreshold
 
 	// Register Connect-RPC handler
 	path, handler := jobsv1connect.NewJobsServiceHandler(

@@ -651,13 +651,18 @@ const scheduledJobs: ScheduledJobInfo[] = [
     queue: 'default',
     nextRun: ts(new Date(Date.now() + 6 * 3600_000)),
     lastRun: ts(minutesAgo(1440)),
+    overdue: false,
+    missedFires: i64(0),
   }),
   new ScheduledJobInfo({
     name: 'sync-inventory',
     schedule: '*/15 * * * *',
     queue: 'default',
-    nextRun: ts(new Date(Date.now() + 8 * 60_000)),
-    lastRun: ts(minutesAgo(7)),
+    nextRun: ts(new Date(Date.now() + 5 * 60_000)),
+    lastRun: ts(minutesAgo(55)),
+    overdue: true,
+    missedFires: i64(3),
+    expectedLastRun: ts(minutesAgo(10)),
   }),
   new ScheduledJobInfo({
     name: 'weekly-digest-emails',
@@ -665,6 +670,8 @@ const scheduledJobs: ScheduledJobInfo[] = [
     queue: 'emails',
     nextRun: ts(new Date(Date.now() + 3 * 86400_000)),
     lastRun: ts(new Date(Date.now() - 4 * 86400_000)),
+    overdue: false,
+    missedFires: i64(0),
   }),
   new ScheduledJobInfo({
     name: 'stale-lock-reaper',
@@ -672,6 +679,8 @@ const scheduledJobs: ScheduledJobInfo[] = [
     queue: 'critical',
     nextRun: ts(new Date(Date.now() + 2 * 60_000)),
     lastRun: ts(minutesAgo(3)),
+    overdue: false,
+    missedFires: i64(0),
   }),
 ]
 

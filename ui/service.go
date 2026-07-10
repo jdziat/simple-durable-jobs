@@ -40,14 +40,17 @@ type jobsService struct {
 
 	activeStreams     atomic.Int32
 	metadataRedaction bool
+
+	scheduleOverdueThreshold time.Duration
 }
 
 func newJobsService(storage core.Storage, q *queue.Queue, statsStorage StatsStorage) *jobsService {
 	return &jobsService{
-		storage:           storage,
-		queue:             q,
-		statsStorage:      statsStorage,
-		metadataRedaction: true,
+		storage:                  storage,
+		queue:                    q,
+		statsStorage:             statsStorage,
+		metadataRedaction:        true,
+		scheduleOverdueThreshold: DefaultScheduleOverdueThreshold,
 	}
 }
 
@@ -461,6 +464,7 @@ func (s *jobsService) ListScheduledJobs(ctx context.Context, req *connect.Reques
 
 		scheduled := s.queue.GetScheduledJobs()
 		now := time.Now()
+		graceCutoff := now.Add(-s.scheduleOverdueThreshold)
 		for name, sj := range scheduled {
 			// Format schedule - use type assertion or just store the name
 			schedStr := name // Fallback to name if no string method
@@ -487,11 +491,16 @@ func (s *jobsService) ListScheduledJobs(ctx context.Context, req *connect.Reques
 			// never-fired interval schedule's NextRun is a best-effort estimate
 			// until the first real fire.
 			anchor := now
+			hasLastRun := false
 			if lastRun, ok := lastRuns[name]; ok {
 				anchor = lastRun
 				info.LastRun = timestamppb.New(lastRun)
+				hasLastRun = true
 			}
 			if sj.Schedule != nil {
+				var expectedLastRun time.Time
+				missedFires := 0
+				trackOverdue := s.scheduleOverdueThreshold > 0 && hasLastRun
 				nextRun := sj.Schedule.Next(anchor)
 				for iter := 0; !nextRun.IsZero() && !nextRun.After(now); iter++ {
 					if iter >= nextRunCatchUpCap {
@@ -501,10 +510,25 @@ func (s *jobsService) ListScheduledJobs(ctx context.Context, req *connect.Reques
 						nextRun = sj.Schedule.Next(now)
 						break
 					}
+					if trackOverdue {
+						expectedLastRun = nextRun
+						if !nextRun.After(graceCutoff) {
+							missedFires++
+						}
+					}
 					nextRun = sj.Schedule.Next(nextRun)
 				}
 				if !nextRun.IsZero() {
 					info.NextRun = timestamppb.New(nextRun)
+				}
+				info.Overdue = missedFires > 0
+				info.MissedFires = int64(missedFires)
+				// expected_last_run is only meaningful for an OVERDUE schedule (the
+				// most-recent boundary that should have fired but did not). Leave it
+				// unset when healthy so an API consumer never reads it as a pending
+				// fire; the frontend only surfaces it in the overdue tooltip.
+				if info.Overdue && !expectedLastRun.IsZero() {
+					info.ExpectedLastRun = timestamppb.New(expectedLastRun)
 				}
 			}
 			jobsList = append(jobsList, info)

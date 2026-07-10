@@ -9,9 +9,9 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	jobsv1 "github.com/jdziat/simple-durable-jobs/v4/ui/gen/jobs/v1"
 	"github.com/jdziat/simple-durable-jobs/v4/pkg/core"
 	"github.com/jdziat/simple-durable-jobs/v4/pkg/schedule"
+	jobsv1 "github.com/jdziat/simple-durable-jobs/v4/ui/gen/jobs/v1"
 )
 
 // TestListScheduledJobs_NextRunIsFutureAfterMissedBoundaries guards C-03: the
@@ -108,6 +108,116 @@ func TestListScheduledJobs_NextRunPreservesSchedulePhase(t *testing.T) {
 	// max(lastRun, now) would give now+1h, a materially different instant, so this
 	// guards the walk against a future 'simplification' to Next(max(lastRun, now)).
 	assert.NotEqual(t, callTime.Add(time.Hour).Unix(), nextRun.Unix())
+}
+
+func TestListScheduledJobs_ScheduleHealth(t *testing.T) {
+	ctx := context.Background()
+	interval := 10 * time.Minute
+	now := time.Now().UTC()
+	boundary := now.Truncate(interval)
+	thresholdWithinCurrentBoundary := now.Sub(boundary) + interval/2
+
+	cases := []struct {
+		name             string
+		jobName          string
+		lastRun          *time.Time
+		threshold        time.Duration
+		wantOverdue      bool
+		wantMissedFires  int64
+		wantExpectedLast *time.Time
+		wantExpectedNil  bool
+	}{
+		{
+			name:            "healthy within grace",
+			jobName:         "healthyWithinGrace",
+			lastRun:         timePtr(boundary.Add(-interval)),
+			threshold:       thresholdWithinCurrentBoundary,
+			wantOverdue:     false,
+			wantMissedFires: 0,
+		},
+		{
+			name:             "overdue after three missed fires",
+			jobName:          "overdueAfterMissed",
+			lastRun:          timePtr(boundary.Add(-4 * interval)),
+			threshold:        thresholdWithinCurrentBoundary,
+			wantOverdue:      true,
+			wantMissedFires:  3,
+			wantExpectedLast: timePtr(boundary),
+		},
+		{
+			name:            "never fired",
+			jobName:         "neverFired",
+			threshold:       thresholdWithinCurrentBoundary,
+			wantOverdue:     false,
+			wantMissedFires: 0,
+			wantExpectedNil: true,
+		},
+		{
+			name:            "threshold disabled",
+			jobName:         "thresholdDisabled",
+			lastRun:         timePtr(boundary.Add(-4 * interval)),
+			threshold:       0,
+			wantOverdue:     false,
+			wantMissedFires: 0,
+			wantExpectedNil: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, q := setupServiceWithQueue(t)
+			svc.scheduleOverdueThreshold = tc.threshold
+			registerScheduledTestHandler(q, tc.jobName)
+			require.NoError(t, q.Schedule(tc.jobName, nil, schedule.Every(interval)))
+
+			if tc.lastRun != nil {
+				seedScheduledTestFire(t, ctx, svc, tc.jobName, tc.lastRun.Add(-interval))
+				claimed, err := svc.storage.ClaimScheduledFire(ctx, tc.jobName, *tc.lastRun)
+				require.NoError(t, err)
+				require.True(t, claimed)
+			}
+
+			callTime := time.Now()
+			resp, err := svc.ListScheduledJobs(ctx, connect.NewRequest(&jobsv1.ListScheduledJobsRequest{}))
+			require.NoError(t, err)
+			callTimeAfter := time.Now()
+			require.Len(t, resp.Msg.Jobs, 1)
+			job := resp.Msg.Jobs[0]
+
+			assert.Equal(t, tc.wantOverdue, job.Overdue)
+			assert.Equal(t, tc.wantMissedFires, job.MissedFires)
+			require.NotNil(t, job.NextRun)
+			assert.True(t, job.NextRun.AsTime().After(callTime), "NextRun must remain the next future boundary")
+
+			if tc.wantExpectedNil {
+				assert.Nil(t, job.ExpectedLastRun)
+			}
+			if tc.wantExpectedLast != nil {
+				require.NotNil(t, job.ExpectedLastRun)
+				// expected_last_run is the MOST-RECENT boundary that should have fired:
+				// after the last real fire, not in the future, and within one interval
+				// of now. Asserting this window (rather than an exact boundary captured
+				// before the DB setup) avoids a rare flake when the service's own `now`
+				// crosses an interval boundary between setup and the RPC call.
+				exp := job.ExpectedLastRun.AsTime()
+				assert.False(t, exp.After(callTimeAfter), "expected_last_run must not be in the future")
+				assert.True(t, exp.After(callTime.Add(-interval)), "expected_last_run must be the most-recent boundary (within one interval)")
+				assert.True(t, exp.After(*tc.lastRun), "expected_last_run must be after the last real fire")
+			}
+		})
+	}
+}
+
+func timePtr(t time.Time) *time.Time {
+	return &t
+}
+
+func seedScheduledTestFire(t *testing.T, ctx context.Context, svc *jobsService, name string, fireTime time.Time) {
+	t.Helper()
+	_, err := svc.storage.(interface {
+		SeedScheduledFire(context.Context, string, time.Time) (time.Time, error)
+	}).SeedScheduledFire(ctx, name, fireTime)
+	require.NoError(t, err)
 }
 
 // TestAggregateStrategy guards C-04: a workflow whose fan-outs do not all share a

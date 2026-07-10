@@ -2400,14 +2400,25 @@ func (x *ListScheduledJobsResponse) GetJobs() []*ScheduledJobInfo {
 }
 
 type ScheduledJobInfo struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Name          string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
-	Schedule      string                 `protobuf:"bytes,2,opt,name=schedule,proto3" json:"schedule,omitempty"`
-	Queue         string                 `protobuf:"bytes,3,opt,name=queue,proto3" json:"queue,omitempty"`
-	NextRun       *timestamppb.Timestamp `protobuf:"bytes,4,opt,name=next_run,json=nextRun,proto3" json:"next_run,omitempty"`
-	LastRun       *timestamppb.Timestamp `protobuf:"bytes,5,opt,name=last_run,json=lastRun,proto3" json:"last_run,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state    protoimpl.MessageState `protogen:"open.v1"`
+	Name     string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	Schedule string                 `protobuf:"bytes,2,opt,name=schedule,proto3" json:"schedule,omitempty"`
+	Queue    string                 `protobuf:"bytes,3,opt,name=queue,proto3" json:"queue,omitempty"`
+	NextRun  *timestamppb.Timestamp `protobuf:"bytes,4,opt,name=next_run,json=nextRun,proto3" json:"next_run,omitempty"`
+	LastRun  *timestamppb.Timestamp `protobuf:"bytes,5,opt,name=last_run,json=lastRun,proto3" json:"last_run,omitempty"`
+	// overdue is true when one or more schedule boundaries that should have fired
+	// have not, beyond the server's configured grace threshold — i.e. the
+	// scheduler/worker is not advancing this schedule. Never set for a schedule
+	// that has not yet fired.
+	Overdue bool `protobuf:"varint,6,opt,name=overdue,proto3" json:"overdue,omitempty"`
+	// missed_fires counts the boundaries older than the grace threshold that should
+	// have fired but did not (0 when healthy).
+	MissedFires int64 `protobuf:"varint,7,opt,name=missed_fires,json=missedFires,proto3" json:"missed_fires,omitempty"`
+	// expected_last_run is the most-recent boundary that should have fired but did
+	// not. Set only when overdue; unset when healthy or never-fired.
+	ExpectedLastRun *timestamppb.Timestamp `protobuf:"bytes,8,opt,name=expected_last_run,json=expectedLastRun,proto3" json:"expected_last_run,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *ScheduledJobInfo) Reset() {
@@ -2471,6 +2482,27 @@ func (x *ScheduledJobInfo) GetNextRun() *timestamppb.Timestamp {
 func (x *ScheduledJobInfo) GetLastRun() *timestamppb.Timestamp {
 	if x != nil {
 		return x.LastRun
+	}
+	return nil
+}
+
+func (x *ScheduledJobInfo) GetOverdue() bool {
+	if x != nil {
+		return x.Overdue
+	}
+	return false
+}
+
+func (x *ScheduledJobInfo) GetMissedFires() int64 {
+	if x != nil {
+		return x.MissedFires
+	}
+	return 0
+}
+
+func (x *ScheduledJobInfo) GetExpectedLastRun() *timestamppb.Timestamp {
+	if x != nil {
+		return x.ExpectedLastRun
 	}
 	return nil
 }
@@ -3030,13 +3062,16 @@ const file_jobs_v1_jobs_proto_rawDesc = "" +
 	"\adeleted\x18\x01 \x01(\x03R\adeleted\"\x1a\n" +
 	"\x18ListScheduledJobsRequest\"J\n" +
 	"\x19ListScheduledJobsResponse\x12-\n" +
-	"\x04jobs\x18\x01 \x03(\v2\x19.jobs.v1.ScheduledJobInfoR\x04jobs\"\xc6\x01\n" +
+	"\x04jobs\x18\x01 \x03(\v2\x19.jobs.v1.ScheduledJobInfoR\x04jobs\"\xcb\x02\n" +
 	"\x10ScheduledJobInfo\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x1a\n" +
 	"\bschedule\x18\x02 \x01(\tR\bschedule\x12\x14\n" +
 	"\x05queue\x18\x03 \x01(\tR\x05queue\x125\n" +
 	"\bnext_run\x18\x04 \x01(\v2\x1a.google.protobuf.TimestampR\anextRun\x125\n" +
-	"\blast_run\x18\x05 \x01(\v2\x1a.google.protobuf.TimestampR\alastRun\"+\n" +
+	"\blast_run\x18\x05 \x01(\v2\x1a.google.protobuf.TimestampR\alastRun\x12\x18\n" +
+	"\aoverdue\x18\x06 \x01(\bR\aoverdue\x12!\n" +
+	"\fmissed_fires\x18\a \x01(\x03R\vmissedFires\x12F\n" +
+	"\x11expected_last_run\x18\b \x01(\v2\x1a.google.protobuf.TimestampR\x0fexpectedLastRun\"+\n" +
 	"\x12GetWorkflowRequest\x12\x15\n" +
 	"\x06job_id\x18\x01 \x01(\tR\x05jobId\"\xab\x01\n" +
 	"\x13GetWorkflowResponse\x12 \n" +
@@ -3186,54 +3221,55 @@ var file_jobs_v1_jobs_proto_depIdxs = []int32{
 	39, // 30: jobs.v1.ListScheduledJobsResponse.jobs:type_name -> jobs.v1.ScheduledJobInfo
 	48, // 31: jobs.v1.ScheduledJobInfo.next_run:type_name -> google.protobuf.Timestamp
 	48, // 32: jobs.v1.ScheduledJobInfo.last_run:type_name -> google.protobuf.Timestamp
-	0,  // 33: jobs.v1.GetWorkflowResponse.root:type_name -> jobs.v1.Job
-	3,  // 34: jobs.v1.GetWorkflowResponse.fan_outs:type_name -> jobs.v1.FanOut
-	0,  // 35: jobs.v1.GetWorkflowResponse.children:type_name -> jobs.v1.Job
-	44, // 36: jobs.v1.ListWorkflowsResponse.workflows:type_name -> jobs.v1.WorkflowSummary
-	0,  // 37: jobs.v1.WorkflowSummary.root_job:type_name -> jobs.v1.Job
-	5,  // 38: jobs.v1.JobsService.GetStats:input_type -> jobs.v1.GetStatsRequest
-	7,  // 39: jobs.v1.JobsService.GetStatsHistory:input_type -> jobs.v1.GetStatsHistoryRequest
-	10, // 40: jobs.v1.JobsService.ListJobs:input_type -> jobs.v1.ListJobsRequest
-	12, // 41: jobs.v1.JobsService.GetJob:input_type -> jobs.v1.GetJobRequest
-	14, // 42: jobs.v1.JobsService.RetryJob:input_type -> jobs.v1.RetryJobRequest
-	16, // 43: jobs.v1.JobsService.DeleteJob:input_type -> jobs.v1.DeleteJobRequest
-	18, // 44: jobs.v1.JobsService.BulkRetryJobs:input_type -> jobs.v1.BulkRetryJobsRequest
-	20, // 45: jobs.v1.JobsService.BulkDeleteJobs:input_type -> jobs.v1.BulkDeleteJobsRequest
-	23, // 46: jobs.v1.JobsService.PauseJob:input_type -> jobs.v1.PauseJobRequest
-	25, // 47: jobs.v1.JobsService.CancelJob:input_type -> jobs.v1.CancelJobRequest
-	27, // 48: jobs.v1.JobsService.ResumeJob:input_type -> jobs.v1.ResumeJobRequest
-	29, // 49: jobs.v1.JobsService.PauseQueue:input_type -> jobs.v1.PauseQueueRequest
-	31, // 50: jobs.v1.JobsService.ResumeQueue:input_type -> jobs.v1.ResumeQueueRequest
-	33, // 51: jobs.v1.JobsService.ListQueues:input_type -> jobs.v1.ListQueuesRequest
-	35, // 52: jobs.v1.JobsService.PurgeQueue:input_type -> jobs.v1.PurgeQueueRequest
-	37, // 53: jobs.v1.JobsService.ListScheduledJobs:input_type -> jobs.v1.ListScheduledJobsRequest
-	40, // 54: jobs.v1.JobsService.GetWorkflow:input_type -> jobs.v1.GetWorkflowRequest
-	42, // 55: jobs.v1.JobsService.ListWorkflows:input_type -> jobs.v1.ListWorkflowsRequest
-	45, // 56: jobs.v1.JobsService.WatchEvents:input_type -> jobs.v1.WatchEventsRequest
-	6,  // 57: jobs.v1.JobsService.GetStats:output_type -> jobs.v1.GetStatsResponse
-	8,  // 58: jobs.v1.JobsService.GetStatsHistory:output_type -> jobs.v1.GetStatsHistoryResponse
-	11, // 59: jobs.v1.JobsService.ListJobs:output_type -> jobs.v1.ListJobsResponse
-	13, // 60: jobs.v1.JobsService.GetJob:output_type -> jobs.v1.GetJobResponse
-	15, // 61: jobs.v1.JobsService.RetryJob:output_type -> jobs.v1.RetryJobResponse
-	17, // 62: jobs.v1.JobsService.DeleteJob:output_type -> jobs.v1.DeleteJobResponse
-	19, // 63: jobs.v1.JobsService.BulkRetryJobs:output_type -> jobs.v1.BulkRetryJobsResponse
-	21, // 64: jobs.v1.JobsService.BulkDeleteJobs:output_type -> jobs.v1.BulkDeleteJobsResponse
-	24, // 65: jobs.v1.JobsService.PauseJob:output_type -> jobs.v1.PauseJobResponse
-	26, // 66: jobs.v1.JobsService.CancelJob:output_type -> jobs.v1.CancelJobResponse
-	28, // 67: jobs.v1.JobsService.ResumeJob:output_type -> jobs.v1.ResumeJobResponse
-	30, // 68: jobs.v1.JobsService.PauseQueue:output_type -> jobs.v1.PauseQueueResponse
-	32, // 69: jobs.v1.JobsService.ResumeQueue:output_type -> jobs.v1.ResumeQueueResponse
-	34, // 70: jobs.v1.JobsService.ListQueues:output_type -> jobs.v1.ListQueuesResponse
-	36, // 71: jobs.v1.JobsService.PurgeQueue:output_type -> jobs.v1.PurgeQueueResponse
-	38, // 72: jobs.v1.JobsService.ListScheduledJobs:output_type -> jobs.v1.ListScheduledJobsResponse
-	41, // 73: jobs.v1.JobsService.GetWorkflow:output_type -> jobs.v1.GetWorkflowResponse
-	43, // 74: jobs.v1.JobsService.ListWorkflows:output_type -> jobs.v1.ListWorkflowsResponse
-	4,  // 75: jobs.v1.JobsService.WatchEvents:output_type -> jobs.v1.Event
-	57, // [57:76] is the sub-list for method output_type
-	38, // [38:57] is the sub-list for method input_type
-	38, // [38:38] is the sub-list for extension type_name
-	38, // [38:38] is the sub-list for extension extendee
-	0,  // [0:38] is the sub-list for field type_name
+	48, // 33: jobs.v1.ScheduledJobInfo.expected_last_run:type_name -> google.protobuf.Timestamp
+	0,  // 34: jobs.v1.GetWorkflowResponse.root:type_name -> jobs.v1.Job
+	3,  // 35: jobs.v1.GetWorkflowResponse.fan_outs:type_name -> jobs.v1.FanOut
+	0,  // 36: jobs.v1.GetWorkflowResponse.children:type_name -> jobs.v1.Job
+	44, // 37: jobs.v1.ListWorkflowsResponse.workflows:type_name -> jobs.v1.WorkflowSummary
+	0,  // 38: jobs.v1.WorkflowSummary.root_job:type_name -> jobs.v1.Job
+	5,  // 39: jobs.v1.JobsService.GetStats:input_type -> jobs.v1.GetStatsRequest
+	7,  // 40: jobs.v1.JobsService.GetStatsHistory:input_type -> jobs.v1.GetStatsHistoryRequest
+	10, // 41: jobs.v1.JobsService.ListJobs:input_type -> jobs.v1.ListJobsRequest
+	12, // 42: jobs.v1.JobsService.GetJob:input_type -> jobs.v1.GetJobRequest
+	14, // 43: jobs.v1.JobsService.RetryJob:input_type -> jobs.v1.RetryJobRequest
+	16, // 44: jobs.v1.JobsService.DeleteJob:input_type -> jobs.v1.DeleteJobRequest
+	18, // 45: jobs.v1.JobsService.BulkRetryJobs:input_type -> jobs.v1.BulkRetryJobsRequest
+	20, // 46: jobs.v1.JobsService.BulkDeleteJobs:input_type -> jobs.v1.BulkDeleteJobsRequest
+	23, // 47: jobs.v1.JobsService.PauseJob:input_type -> jobs.v1.PauseJobRequest
+	25, // 48: jobs.v1.JobsService.CancelJob:input_type -> jobs.v1.CancelJobRequest
+	27, // 49: jobs.v1.JobsService.ResumeJob:input_type -> jobs.v1.ResumeJobRequest
+	29, // 50: jobs.v1.JobsService.PauseQueue:input_type -> jobs.v1.PauseQueueRequest
+	31, // 51: jobs.v1.JobsService.ResumeQueue:input_type -> jobs.v1.ResumeQueueRequest
+	33, // 52: jobs.v1.JobsService.ListQueues:input_type -> jobs.v1.ListQueuesRequest
+	35, // 53: jobs.v1.JobsService.PurgeQueue:input_type -> jobs.v1.PurgeQueueRequest
+	37, // 54: jobs.v1.JobsService.ListScheduledJobs:input_type -> jobs.v1.ListScheduledJobsRequest
+	40, // 55: jobs.v1.JobsService.GetWorkflow:input_type -> jobs.v1.GetWorkflowRequest
+	42, // 56: jobs.v1.JobsService.ListWorkflows:input_type -> jobs.v1.ListWorkflowsRequest
+	45, // 57: jobs.v1.JobsService.WatchEvents:input_type -> jobs.v1.WatchEventsRequest
+	6,  // 58: jobs.v1.JobsService.GetStats:output_type -> jobs.v1.GetStatsResponse
+	8,  // 59: jobs.v1.JobsService.GetStatsHistory:output_type -> jobs.v1.GetStatsHistoryResponse
+	11, // 60: jobs.v1.JobsService.ListJobs:output_type -> jobs.v1.ListJobsResponse
+	13, // 61: jobs.v1.JobsService.GetJob:output_type -> jobs.v1.GetJobResponse
+	15, // 62: jobs.v1.JobsService.RetryJob:output_type -> jobs.v1.RetryJobResponse
+	17, // 63: jobs.v1.JobsService.DeleteJob:output_type -> jobs.v1.DeleteJobResponse
+	19, // 64: jobs.v1.JobsService.BulkRetryJobs:output_type -> jobs.v1.BulkRetryJobsResponse
+	21, // 65: jobs.v1.JobsService.BulkDeleteJobs:output_type -> jobs.v1.BulkDeleteJobsResponse
+	24, // 66: jobs.v1.JobsService.PauseJob:output_type -> jobs.v1.PauseJobResponse
+	26, // 67: jobs.v1.JobsService.CancelJob:output_type -> jobs.v1.CancelJobResponse
+	28, // 68: jobs.v1.JobsService.ResumeJob:output_type -> jobs.v1.ResumeJobResponse
+	30, // 69: jobs.v1.JobsService.PauseQueue:output_type -> jobs.v1.PauseQueueResponse
+	32, // 70: jobs.v1.JobsService.ResumeQueue:output_type -> jobs.v1.ResumeQueueResponse
+	34, // 71: jobs.v1.JobsService.ListQueues:output_type -> jobs.v1.ListQueuesResponse
+	36, // 72: jobs.v1.JobsService.PurgeQueue:output_type -> jobs.v1.PurgeQueueResponse
+	38, // 73: jobs.v1.JobsService.ListScheduledJobs:output_type -> jobs.v1.ListScheduledJobsResponse
+	41, // 74: jobs.v1.JobsService.GetWorkflow:output_type -> jobs.v1.GetWorkflowResponse
+	43, // 75: jobs.v1.JobsService.ListWorkflows:output_type -> jobs.v1.ListWorkflowsResponse
+	4,  // 76: jobs.v1.JobsService.WatchEvents:output_type -> jobs.v1.Event
+	58, // [58:77] is the sub-list for method output_type
+	39, // [39:58] is the sub-list for method input_type
+	39, // [39:39] is the sub-list for extension type_name
+	39, // [39:39] is the sub-list for extension extendee
+	0,  // [0:39] is the sub-list for field type_name
 }
 
 func init() { file_jobs_v1_jobs_proto_init() }
