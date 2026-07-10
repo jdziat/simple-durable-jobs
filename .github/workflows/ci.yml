@@ -337,7 +337,30 @@ jobs:
             echo "::notice::major bump guard OK — breaking-change commit present for v${major}.0.0."
           fi
 
+      # Superseded-run guard. Re-running an OLD commit's Release job (e.g.
+      # `gh run rerun --failed` on a run that newer commits already descend from)
+      # makes go-semantic-release run on a non-tip commit; it then fails to find
+      # its last-release ancestor, re-scans history from root, and mints a bogus
+      # CROSS-MAJOR tag off accumulated `BREAKING CHANGE:` footers — invalid for a
+      # /vN module path (the v5.0.0/v5.0.1 incident, cut from a re-run of #106's
+      # Release job). If HEAD is not the current tip of origin/main, SKIP the
+      # release; the tip's own Release job releases the lineage. To re-release a
+      # failed tip, push a fresh commit rather than re-running the old job.
+      - name: Detect a superseded Release run
+        id: supersede
+        run: |
+          git fetch --quiet origin main
+          head="$(git rev-parse HEAD)"
+          tip="$(git rev-parse origin/main)"
+          if [ "$head" != "$tip" ]; then
+            echo "superseded=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::Skipping release — HEAD ${head} is not the tip of origin/main ${tip} (superseded commit / re-run of an old run). go-semantic-release could mint a bogus cross-major tag. Retrigger by pushing a fresh commit to main."
+          else
+            echo "superseded=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: go-semantic-release/action@2e9dc4247a6004f8377781bef4cb9dad273a741f # v1.24.1
+        if: steps.supersede.outputs.superseded != 'true'
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           changelog-generator-opt: "emojis=true"
