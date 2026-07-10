@@ -666,6 +666,19 @@ func (w *Worker) drainDequeuedJobs(ctx context.Context, jobsChan chan<- *core.Jo
 			return
 		}
 
+		// Re-check pause AFTER the dequeue round-trip. The top-of-iteration check
+		// (above) only sees a pause that landed BEFORE the iteration; a Pause() that
+		// lands DURING dequeueAvailableJobs — a window widened by network latency on
+		// Postgres/MySQL — would otherwise let this worker DISPATCH jobs it claimed
+		// after being told to pause (e.g. a job enqueued immediately after Pause()
+		// slips through). A graceful pause must stop new dispatch, so release the
+		// just-claimed batch back to pending (for resume, or another worker) and end
+		// the tick rather than dispatch it.
+		if w.IsPaused() {
+			w.releaseClaimedJobs(ctx, jobs)
+			return
+		}
+
 		dispatched, released := w.dispatchDequeuedJobs(ctx, jobsChan, jobs)
 		releasedThisTick += released
 		if dispatched == 0 {
@@ -874,6 +887,27 @@ func (w *Worker) dispatchDequeuedJobs(ctx context.Context, jobsChan chan<- *core
 		}
 	}
 	return dispatched, released
+}
+
+// releaseClaimedJobs releases a batch of jobs that were dequeued (claimed +
+// locked) but NOT yet admitted/dispatched — e.g. when a pause lands during the
+// dequeue round-trip. Unlike releaseDequeuedJobOnShutdown these jobs hold no
+// queue/concurrency tracking yet (that happens in dispatchDequeuedJobs), so a
+// plain storage Release back to pending is sufficient. Best-effort: a failed
+// release leaves the job locked until the stale-lock reaper reclaims it.
+func (w *Worker) releaseClaimedJobs(ctx context.Context, jobs []*core.Job) {
+	for _, job := range jobs {
+		if job == nil {
+			continue
+		}
+		w.recordBounce(bouncePaused)
+		releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		if err := w.queue.Storage().Release(releaseCtx, job.ID, w.config.WorkerID); err != nil && !errors.Is(err, core.ErrJobNotOwned) {
+			w.logger.Warn("failed to release job claimed while pausing",
+				"job_id", job.ID, "error", err)
+		}
+		cancel()
+	}
 }
 
 func (w *Worker) releaseDequeuedJobOnShutdown(ctx context.Context, job *core.Job) {
@@ -1501,6 +1535,7 @@ const (
 	bounceFleetRate       bounceReason = "fleet_rate"        // fleet (DB) rate limit saturated — paid the locked tx
 	bounceFleetRateCached bounceReason = "fleet_rate_cached" // keyed bucket known saturated — skipped the locked tx (per-key cooldown)
 	bounceShutdown        bounceReason = "shutdown"          // ctx cancelled mid-dispatch
+	bouncePaused          bounceReason = "paused"            // pause landed during the dequeue round-trip; claimed batch released
 )
 
 // dequeueChurnCounters holds cumulative dispatch-churn counts. All fields are
@@ -1512,6 +1547,7 @@ type dequeueChurnCounters struct {
 	fleetRate       atomic.Int64
 	fleetRateCached atomic.Int64
 	shutdown        atomic.Int64
+	paused          atomic.Int64
 	suppressedTicks atomic.Int64
 }
 
@@ -1529,6 +1565,8 @@ func (w *Worker) recordBounce(r bounceReason) {
 		w.dequeueChurn.fleetRateCached.Add(1)
 	case bounceShutdown:
 		w.dequeueChurn.shutdown.Add(1)
+	case bouncePaused:
+		w.dequeueChurn.paused.Add(1)
 	}
 }
 
@@ -1545,6 +1583,7 @@ func (w *Worker) DequeueReleasedByReason() map[string]int64 {
 		string(bounceFleetRate):       w.dequeueChurn.fleetRate.Load(),
 		string(bounceFleetRateCached): w.dequeueChurn.fleetRateCached.Load(),
 		string(bounceShutdown):        w.dequeueChurn.shutdown.Load(),
+		string(bouncePaused):          w.dequeueChurn.paused.Load(),
 	}
 }
 
