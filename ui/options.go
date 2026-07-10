@@ -9,6 +9,8 @@ import (
 	"github.com/jdziat/simple-durable-jobs/v4/pkg/queue"
 )
 
+const DefaultScheduleOverdueThreshold = 1 * time.Minute
+
 // Option configures the UI handler.
 type Option interface {
 	apply(*config)
@@ -27,6 +29,7 @@ type config struct {
 	authorizer                   Authorizer
 	allowedOrigins               map[string]struct{}
 	metadataRedaction            bool
+	scheduleOverdueThreshold     time.Duration
 }
 
 // WithMiddleware wraps the handler with middleware (auth, logging, etc.).
@@ -95,6 +98,14 @@ func WithAllowedOrigins(origins ...string) Option {
 func WithMetadataRedaction(enabled bool) Option {
 	return optionFunc(func(c *config) {
 		c.metadataRedaction = enabled
+	})
+}
+
+// WithScheduleOverdueThreshold sets the grace period before a scheduled job is
+// reported overdue. A non-positive duration disables overdue flagging.
+func WithScheduleOverdueThreshold(d time.Duration) Option {
+	return optionFunc(func(c *config) {
+		c.scheduleOverdueThreshold = d
 	})
 }
 

@@ -276,6 +276,9 @@ message ScheduledJobInfo {
   string queue = 3;
   google.protobuf.Timestamp next_run = 4;
   google.protobuf.Timestamp last_run = 5;
+  bool overdue = 6;
+  int64 missed_fires = 7;
+  google.protobuf.Timestamp expected_last_run = 8;
 }
 
 message GetWorkflowRequest {
