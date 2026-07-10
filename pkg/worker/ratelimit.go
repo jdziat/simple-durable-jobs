@@ -25,6 +25,18 @@ type rateReleaser interface {
 	ReleaseRate(ctx context.Context, limitName string, window time.Duration) error
 }
 
+// windowedRateLimiter is the precise consume+refund capability: consume returns
+// the window_start the increment committed to, and ReleaseRateAt refunds that
+// EXACT window. Backends that implement it (GormStorage, all dialects) get a
+// refund that targets the consume's own window even when a window rollover
+// happens between consume and refund — closing the off-by-one where the plain
+// rateReleaser path refunds "now"'s window instead. Backends without it fall back
+// to the rateReleaser path (documented as approximate across a rollover boundary).
+type windowedRateLimiter interface {
+	TryConsumeRateWindow(ctx context.Context, limitName string, perSecond float64, window time.Duration, now time.Time) (bool, time.Time, error)
+	ReleaseRateAt(ctx context.Context, limitName string, windowStart time.Time) error
+}
+
 // resolveRateLimitWindow chooses the fixed-window length for a fleet rate limit. An
 // explicit author-set Window is always honored. Otherwise, for a FRACTIONAL
 // PerSecond (< 1) the default 1s window rounds the per-window ceiling UP to 1

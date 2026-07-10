@@ -11,19 +11,24 @@ import (
 	"github.com/jdziat/simple-durable-jobs/v4/pkg/core"
 )
 
-// TryConsumeRate attempts to consume one unit from a named fixed-window rate
-// limit. It is an optional storage capability used by the worker through type
-// assertion; core.Storage is intentionally unchanged.
-func (s *GormStorage) TryConsumeRate(ctx context.Context, limitName string, perSecond float64, window time.Duration, now time.Time) (bool, error) {
+// TryConsumeRateWindow attempts to consume one unit from a named fixed-window
+// rate limit and additionally returns the window_start the increment committed
+// to, so a later refund (ReleaseRateAt) can target that exact window even after a
+// window rollover. It is an optional storage capability used by the worker through
+// type assertion; core.Storage is intentionally unchanged. On denial or a no-op
+// (empty name / non-positive rate) the returned window_start is the attempted
+// window (or zero) and the caller must not refund.
+func (s *GormStorage) TryConsumeRateWindow(ctx context.Context, limitName string, perSecond float64, window time.Duration, now time.Time) (bool, time.Time, error) {
 	if limitName == "" || perSecond <= 0 || window <= 0 {
-		return false, nil
+		return false, time.Time{}, nil
 	}
 	ceiling := int(math.Ceil(perSecond * window.Seconds()))
 	if ceiling <= 0 {
-		return false, nil
+		return false, time.Time{}, nil
 	}
 
 	var allowed bool
+	var committedWindowStart time.Time
 	err := s.withSerializationRetry(ctx, func() error {
 		allowed = false
 		effectiveNow := now
@@ -35,6 +40,7 @@ func (s *GormStorage) TryConsumeRate(ctx context.Context, limitName string, perS
 			}
 		}
 		windowStart := effectiveNow.Truncate(window)
+		committedWindowStart = windowStart
 
 		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 			if err := s.deleteExpiredRateLimitWindows(tx, limitName, windowStart.Add(-2*window)); err != nil {
@@ -73,9 +79,19 @@ func (s *GormStorage) TryConsumeRate(ctx context.Context, limitName string, perS
 		})
 	})
 	if err != nil {
-		return false, err
+		return false, time.Time{}, err
 	}
-	return allowed, nil
+	return allowed, committedWindowStart, nil
+}
+
+// TryConsumeRate attempts to consume one unit from a named fixed-window rate
+// limit. It is the historical API (frozen since v3.8.0) and a thin wrapper over
+// TryConsumeRateWindow for callers that do not need the committed window_start.
+// It is an optional storage capability used by the worker through type assertion;
+// core.Storage is intentionally unchanged.
+func (s *GormStorage) TryConsumeRate(ctx context.Context, limitName string, perSecond float64, window time.Duration, now time.Time) (bool, error) {
+	allowed, _, err := s.TryConsumeRateWindow(ctx, limitName, perSecond, window, now)
+	return allowed, err
 }
 
 // deleteExpiredRateLimitWindows GCs only THIS limit's expired windows. Scoping to
@@ -105,6 +121,27 @@ func (s *GormStorage) ReleaseRate(ctx context.Context, limitName string, window 
 			return err
 		}
 		windowStart := now.Truncate(window)
+		return s.db.WithContext(ctx).Model(&core.RateLimitWindow{}).
+			Where("limit_name = ? AND window_start = ? AND count > 0", limitName, windowStart).
+			Update("count", gorm.Expr("count - 1")).Error
+	})
+}
+
+// ReleaseRateAt refunds one previously-consumed unit to the EXACT window the
+// consume committed to (the window_start returned by TryConsumeRateWindow),
+// rather than recomputing "now"'s window. ReleaseRate's now-relative refund is
+// wrong across a window rollover: a consume in window W0 that is refunded after
+// the clock crosses into W1 decrements W1 (a window this job never consumed) and
+// permanently leaves W0's counter drained. Targeting the committed
+// (limit_name, window_start) primary-key row makes the refund exact regardless of
+// any rollover between consume and refund. Guarded count > 0 so a refund can never
+// drive a counter negative. Optional storage capability used by the worker through
+// type assertion.
+func (s *GormStorage) ReleaseRateAt(ctx context.Context, limitName string, windowStart time.Time) error {
+	if limitName == "" {
+		return nil
+	}
+	return s.withSerializationRetry(ctx, func() error {
 		return s.db.WithContext(ctx).Model(&core.RateLimitWindow{}).
 			Where("limit_name = ? AND window_start = ? AND count > 0", limitName, windowStart).
 			Update("count", gorm.Expr("count - 1")).Error
