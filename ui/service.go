@@ -439,6 +439,12 @@ func (s *jobsService) PurgeQueue(ctx context.Context, req *connect.Request[jobsv
 	}), nil
 }
 
+// nextRunCatchUpCap bounds the UI's forward walk over missed schedule boundaries
+// so a pathologically dense schedule over a long outage cannot spin a dashboard
+// request. It mirrors the scheduler's maxCatchUpIterations (worker.go); real
+// schedules are far coarser and exit in a handful of steps.
+const nextRunCatchUpCap = 100_000
+
 // ListScheduledJobs returns registered scheduled jobs.
 func (s *jobsService) ListScheduledJobs(ctx context.Context, req *connect.Request[jobsv1.ListScheduledJobsRequest]) (*connect.Response[jobsv1.ListScheduledJobsResponse], error) {
 	var jobsList []*jobsv1.ScheduledJobInfo
@@ -466,21 +472,38 @@ func (s *jobsService) ListScheduledJobs(ctx context.Context, req *connect.Reques
 				Schedule: schedStr,
 				Queue:    sj.Options.Queue,
 			}
-			// Anchor NextRun on the persisted last run so the UI matches the
-			// scheduler, which computes the next fire as Schedule.Next(lastRun)
-			// (worker.go). For a schedule that has fired, resolve LastRun first and
-			// advance from it; only a NEVER-fired schedule falls back to Next(now).
-			// The read-only UI deliberately does not replicate the scheduler's
-			// durable-anchor seeding (establishScheduleBase/SeedScheduledFire), so a
-			// never-fired interval schedule's NextRun here is a best-effort estimate
-			// that may be up to one interval off until the first real fire.
+			// Anchor NextRun on the persisted last run, then walk forward to the
+			// first fire still in the future. The scheduler computes the next fire
+			// from the last run (worker.go), but a single Schedule.Next(lastRun)
+			// step returns a boundary already in the PAST when the last run is more
+			// than one interval behind now (worker down / schedule paused). The
+			// scheduler resolves this with a catch-up walk (seedLastRun); the
+			// read-only UI mirrors just enough of it to show the next FUTURE fire,
+			// bounded identically so a pathological schedule cannot spin the
+			// request. Walking (rather than anchoring on max(lastRun, now))
+			// preserves the schedule's phase for anchor-relative schedules, exactly
+			// as the scheduler does. It still does not replicate the durable
+			// fleet-anchor seeding (establishScheduleBase/SeedScheduledFire), so a
+			// never-fired interval schedule's NextRun is a best-effort estimate
+			// until the first real fire.
 			anchor := now
 			if lastRun, ok := lastRuns[name]; ok {
 				anchor = lastRun
 				info.LastRun = timestamppb.New(lastRun)
 			}
 			if sj.Schedule != nil {
-				if nextRun := sj.Schedule.Next(anchor); !nextRun.IsZero() {
+				nextRun := sj.Schedule.Next(anchor)
+				for iter := 0; !nextRun.IsZero() && !nextRun.After(now); iter++ {
+					if iter >= nextRunCatchUpCap {
+						// Pathologically dense schedule over a long gap: resume from
+						// now (mirrors seedLastRun's capped fallback). Unreachable
+						// for real, coarser schedules.
+						nextRun = sj.Schedule.Next(now)
+						break
+					}
+					nextRun = sj.Schedule.Next(nextRun)
+				}
+				if !nextRun.IsZero() {
 					info.NextRun = timestamppb.New(nextRun)
 				}
 			}
