@@ -180,6 +180,7 @@ func TestListScheduledJobs_ScheduleHealth(t *testing.T) {
 			callTime := time.Now()
 			resp, err := svc.ListScheduledJobs(ctx, connect.NewRequest(&jobsv1.ListScheduledJobsRequest{}))
 			require.NoError(t, err)
+			callTimeAfter := time.Now()
 			require.Len(t, resp.Msg.Jobs, 1)
 			job := resp.Msg.Jobs[0]
 
@@ -193,7 +194,15 @@ func TestListScheduledJobs_ScheduleHealth(t *testing.T) {
 			}
 			if tc.wantExpectedLast != nil {
 				require.NotNil(t, job.ExpectedLastRun)
-				assert.Equal(t, tc.wantExpectedLast.Unix(), job.ExpectedLastRun.AsTime().Unix())
+				// expected_last_run is the MOST-RECENT boundary that should have fired:
+				// after the last real fire, not in the future, and within one interval
+				// of now. Asserting this window (rather than an exact boundary captured
+				// before the DB setup) avoids a rare flake when the service's own `now`
+				// crosses an interval boundary between setup and the RPC call.
+				exp := job.ExpectedLastRun.AsTime()
+				assert.False(t, exp.After(callTimeAfter), "expected_last_run must not be in the future")
+				assert.True(t, exp.After(callTime.Add(-interval)), "expected_last_run must be the most-recent boundary (within one interval)")
+				assert.True(t, exp.After(*tc.lastRun), "expected_last_run must be after the last real fire")
 			}
 		})
 	}

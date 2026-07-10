@@ -1983,16 +1983,27 @@ export class ScheduledJobInfo extends Message<ScheduledJobInfo> {
   lastRun?: Timestamp;
 
   /**
+   * overdue is true when one or more schedule boundaries that should have fired
+   * have not, beyond the server's configured grace threshold — i.e. the
+   * scheduler/worker is not advancing this schedule. Never set for a schedule
+   * that has not yet fired.
+   *
    * @generated from field: bool overdue = 6;
    */
   overdue = false;
 
   /**
+   * missed_fires counts the boundaries older than the grace threshold that should
+   * have fired but did not (0 when healthy).
+   *
    * @generated from field: int64 missed_fires = 7;
    */
   missedFires = protoInt64.zero;
 
   /**
+   * expected_last_run is the most-recent boundary that should have fired but did
+   * not. Set only when overdue; unset when healthy or never-fired.
+   *
    * @generated from field: google.protobuf.Timestamp expected_last_run = 8;
    */
   expectedLastRun?: Timestamp;

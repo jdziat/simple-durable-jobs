@@ -124,7 +124,7 @@
   function healthTitle(job: ScheduledJob): string | undefined {
     if (!job.overdue) return undefined
     const expected = job.expectedLastRun ? `Expected ${absolute(job.expectedLastRun)} · ` : ''
-    return `${expected}${missedFireLabel(job.missedFires)} — worker may be down or the schedule paused`
+    return `${expected}${missedFireLabel(job.missedFires)} — the scheduler/worker may not be running`
   }
 
   onMount(() => {
@@ -193,7 +193,7 @@
       {/if}
     {:else if column.key === 'health'}
       {#if job.overdue}
-        <span class="health-badge health-overdue" title={healthTitle(job)}>
+        <span class="health-badge health-overdue" title={healthTitle(job)} aria-label={healthTitle(job)}>
           {job.missedFires > 0 ? `Overdue · ${missedFireLabel(job.missedFires)}` : 'Overdue'}
         </span>
       {:else}

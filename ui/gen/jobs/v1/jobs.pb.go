@@ -2400,14 +2400,22 @@ func (x *ListScheduledJobsResponse) GetJobs() []*ScheduledJobInfo {
 }
 
 type ScheduledJobInfo struct {
-	state           protoimpl.MessageState `protogen:"open.v1"`
-	Name            string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
-	Schedule        string                 `protobuf:"bytes,2,opt,name=schedule,proto3" json:"schedule,omitempty"`
-	Queue           string                 `protobuf:"bytes,3,opt,name=queue,proto3" json:"queue,omitempty"`
-	NextRun         *timestamppb.Timestamp `protobuf:"bytes,4,opt,name=next_run,json=nextRun,proto3" json:"next_run,omitempty"`
-	LastRun         *timestamppb.Timestamp `protobuf:"bytes,5,opt,name=last_run,json=lastRun,proto3" json:"last_run,omitempty"`
-	Overdue         bool                   `protobuf:"varint,6,opt,name=overdue,proto3" json:"overdue,omitempty"`
-	MissedFires     int64                  `protobuf:"varint,7,opt,name=missed_fires,json=missedFires,proto3" json:"missed_fires,omitempty"`
+	state    protoimpl.MessageState `protogen:"open.v1"`
+	Name     string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	Schedule string                 `protobuf:"bytes,2,opt,name=schedule,proto3" json:"schedule,omitempty"`
+	Queue    string                 `protobuf:"bytes,3,opt,name=queue,proto3" json:"queue,omitempty"`
+	NextRun  *timestamppb.Timestamp `protobuf:"bytes,4,opt,name=next_run,json=nextRun,proto3" json:"next_run,omitempty"`
+	LastRun  *timestamppb.Timestamp `protobuf:"bytes,5,opt,name=last_run,json=lastRun,proto3" json:"last_run,omitempty"`
+	// overdue is true when one or more schedule boundaries that should have fired
+	// have not, beyond the server's configured grace threshold — i.e. the
+	// scheduler/worker is not advancing this schedule. Never set for a schedule
+	// that has not yet fired.
+	Overdue bool `protobuf:"varint,6,opt,name=overdue,proto3" json:"overdue,omitempty"`
+	// missed_fires counts the boundaries older than the grace threshold that should
+	// have fired but did not (0 when healthy).
+	MissedFires int64 `protobuf:"varint,7,opt,name=missed_fires,json=missedFires,proto3" json:"missed_fires,omitempty"`
+	// expected_last_run is the most-recent boundary that should have fired but did
+	// not. Set only when overdue; unset when healthy or never-fired.
 	ExpectedLastRun *timestamppb.Timestamp `protobuf:"bytes,8,opt,name=expected_last_run,json=expectedLastRun,proto3" json:"expected_last_run,omitempty"`
 	unknownFields   protoimpl.UnknownFields
 	sizeCache       protoimpl.SizeCache
