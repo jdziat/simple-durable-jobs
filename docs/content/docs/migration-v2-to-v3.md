@@ -1,21 +1,25 @@
 ---
-title: "Migrating from v2 to v3"
+title: "Migrating from v2 to v4"
 weight: 9
 ---
 
-v3.0.0 is a breaking release for the Go module path, a small set of Go APIs,
-and the SQL schema representation used by PostgreSQL and MySQL. Plan the schema
-step deliberately before rolling v3 workers onto an existing v2 database.
+v4 is the current major. The breaking changes below — the Go module path, a
+small set of Go APIs, and the SQL schema representation used by PostgreSQL and
+MySQL — span the v3.0.0 and v4.0.0 releases: v3.0.0 carried the schema break and
+most of the API moves, and v4.0.0 carried the `/v3` → `/v4` module-path change
+and made `CancelJob` terminal (see Go API Changes). A v2 → v4 upgrade applies all
+of them at once. Plan the schema step deliberately before rolling v4 workers onto
+an existing v2 database.
 
 ## Module Path
 
-v2 and v3 are distinct module paths:
+v2 and v4 are distinct module paths:
 `github.com/jdziat/simple-durable-jobs/v2` and
 `github.com/jdziat/simple-durable-jobs/v4`. You can depend on both at once while
 you migrate package by package.
 
 ```sh
-go get github.com/jdziat/simple-durable-jobs/v4@v3.0.0
+go get github.com/jdziat/simple-durable-jobs/v4@latest
 ```
 
 Rewrite imports across your code:
@@ -31,7 +35,7 @@ go mod tidy
 
 Four operational helpers moved onto `*Queue`:
 
-| v2 shape | v3 shape |
+| v2 shape | v4 shape |
 | --- | --- |
 | `Signal(ctx, q, id, name, payload)` | `q.Signal(ctx, id, name, payload)` |
 | `Requeue(ctx, q, id)` | `q.Requeue(ctx, id)` |
@@ -67,15 +71,22 @@ if err := q.Schedule("cleanup", nil, jobs.Every(5*time.Minute)); err != nil {
 `q.EnqueueRemote` now rejects malformed job names instead of accepting them for
 remote producers.
 
+`q.CancelJob` is now **terminal** (changed in v4.0.0). In v2 it aliased an
+aggressive pause, so a running job could be resumed afterward. In v4 a cancelled
+job is not resumable via `ResumeJob` — use `Requeue` to replay it from scratch —
+and cancelling a fan-out parent terminally cancels all of its direct and nested
+children in the same storage transaction. Audit any v2 code that relied on
+`CancelJob` being recoverable.
+
 ## Schema Conversion
 
 {{< callout type="warning" >}}
-Running v3 `Migrate()` against an existing v2 database performs a one-way,
+Running v4 `Migrate()` against an existing v2 database performs a one-way,
 in-place schema conversion. Take a backup first and run the upgrade during a
 maintenance window.
 {{< /callout >}}
 
-On PostgreSQL and MySQL, v3 converts all UUID columns from `varchar(36)` to the
+On PostgreSQL and MySQL, v4 converts all UUID columns from `varchar(36)` to the
 database-native representation: native `uuid` on PostgreSQL and `binary(16)` on
 MySQL. It also converts nine integer columns from `bigint` to `integer`.
 
@@ -89,4 +100,4 @@ still appear as canonical UUID strings. SQLite, used as the dev/test engine,
 rewrites the schema in place.
 
 After the migration completes, run your normal application build and test suite
-against the v3 module path before deploying workers broadly.
+against the v4 module path before deploying workers broadly.

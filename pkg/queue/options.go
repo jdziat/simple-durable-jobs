@@ -30,7 +30,8 @@ type Options struct {
 	windowedDedup   windowedDedupMode
 	// Timezone is reserved for future use and is currently ignored; schedules evaluate in UTC.
 	//
-	// Deprecated: never read; schedules evaluate in UTC. Will be removed in v3.
+	// Deprecated: never read; schedules evaluate in UTC. Slated for removal in a
+	// future major (it was not removed in v3 or v4).
 	Timezone *time.Location
 	Timeout  time.Duration // max wall time for handler execution; 0 means no limit
 	Backoff  core.BackoffPolicy
@@ -198,6 +199,14 @@ func IdempotencyKey(key string, ttl time.Duration) Option {
 // UniqueFor deduplicates enqueue attempts with the same queue, job name, and
 // canonical plaintext arguments for ttl. A duplicate enqueue during the window
 // returns the original job ID without creating a second job.
+//
+// The dedup scope is (queue, job name, canonical args) ONLY — it is fleet-wide
+// and tenant-EXCLUDED. Unlike Unique and IdempotencyKey, UniqueFor takes no key
+// argument, so there is nothing to namespace: two different tenants that enqueue
+// the same job name with the same arguments collide, and the second enqueue
+// returns the first tenant's job ID instead of running. To isolate per tenant,
+// fold the tenant into the arguments (which changes the canonical-args hash) or
+// give each tenant its own queue.
 func UniqueFor(ttl time.Duration) Option {
 	return optionFunc(func(o *Options) {
 		o.IdempotencyKey = ""

@@ -50,7 +50,7 @@ backend support tiers, and crash-recovery tuning.
 - [Benchmarks](https://jdziat.github.io/simple-durable-jobs/docs/benchmarks/) - Measured numbers, methodology, and throughput tuning
 - [Choosing a Job System](https://jdziat.github.io/simple-durable-jobs/docs/comparison/) - An honest comparison vs River, Temporal, and Asynq
 - [Migrating from River](https://jdziat.github.io/simple-durable-jobs/docs/migrating-from-river/) / [Migrating from Asynq](https://jdziat.github.io/simple-durable-jobs/docs/migrating-from-asynq/)
-- [Migrating from v2 to v3](https://jdziat.github.io/simple-durable-jobs/docs/migration-v2-to-v3/) - `/v3` import-path, API, and schema conversion notes
+- [Migrating from v2 to v4](https://jdziat.github.io/simple-durable-jobs/docs/migration-v2-to-v3/) - `/v4` import-path, API, and schema conversion notes
 - [Migrating from v1 to v2](https://jdziat.github.io/simple-durable-jobs/docs/migration-v1-to-v2/) - Mechanical `/v2` import-path migration and storage rename notes
 - [Embedded Web UI](https://jdziat.github.io/simple-durable-jobs/docs/embedded-ui/)
 - [Live Demo](https://jdziat.github.io/simple-durable-jobs/docs/live-demo/)
@@ -97,7 +97,7 @@ backend support tiers, and crash-recovery tuning.
 go get github.com/jdziat/simple-durable-jobs/v4
 ```
 
-Upgrading from v2? See the [v2 to v3 migration guide](https://jdziat.github.io/simple-durable-jobs/docs/migration-v2-to-v3/).
+Upgrading from v2? See the [v2 to v4 migration guide](https://jdziat.github.io/simple-durable-jobs/docs/migration-v2-to-v3/).
 
 ## Quick Start
 
