@@ -51,10 +51,17 @@ func (s *GormStorage) TryAcquireConcurrencySlot(ctx context.Context, slotName st
 				return err
 			}
 
-			// Idempotent renewal: an already-held row never consumes another
-			// slot, even if it is close to expiry.
+			// Idempotent renewal: a LIVE already-held row never consumes another
+			// slot, even if it is close to expiry. The expires_at >= now predicate
+			// is load-bearing — without it an EXPIRED self-row (left behind by a
+			// crashed/OOM-killed worker whose slot was never released) would be
+			// renewed unconditionally, skipping the cap check below and admitting a
+			// re-dispatched job on top of the replacement another worker already
+			// took for the freed slot (over-admission past the limit). An expired
+			// self-row must instead fall through to the cap check and be reclaimed
+			// on the create path only if there is room.
 			renew := tx.Model(&core.ConcurrencySlot{}).
-				Where("slot_name = ? AND job_id = ?", slotName, jobID).
+				Where("slot_name = ? AND job_id = ? AND expires_at >= ?", slotName, jobID, nowVal).
 				Updates(map[string]any{
 					"worker_id":  workerID,
 					"expires_at": expiresVal,
@@ -86,8 +93,17 @@ func (s *GormStorage) TryAcquireConcurrencySlot(ctx context.Context, slotName st
 				return nil
 			}
 
+			// Claim the slot. On conflict with THIS job's own leftover (expired) row
+			// — same (slot_name, job_id) primary key — upsert it to a fresh lease
+			// rather than DoNothing, which would deny a re-dispatched job forever on
+			// its own stale row now that the cap check has confirmed there is room.
+			// The conflict can only ever be the job's own row (a different job has a
+			// different job_id / PK), so this never steals another holder's slot.
 			create := tx.Model(&core.ConcurrencySlot{}).
-				Clauses(clause.OnConflict{DoNothing: true}).
+				Clauses(clause.OnConflict{
+					Columns:   []clause.Column{{Name: "slot_name"}, {Name: "job_id"}},
+					DoUpdates: clause.AssignmentColumns([]string{"worker_id", "expires_at"}),
+				}).
 				Create(map[string]any{
 					"slot_name":  slotName,
 					"job_id":     jobID,
@@ -97,7 +113,9 @@ func (s *GormStorage) TryAcquireConcurrencySlot(ctx context.Context, slotName st
 			if create.Error != nil {
 				return create.Error
 			}
-			acquired = create.RowsAffected == 1
+			// RowsAffected is 1 for a fresh insert and, on MySQL's upsert-update
+			// path, 2 — so treat any affected row as acquired rather than == 1.
+			acquired = create.RowsAffected > 0
 			return nil
 		})
 	})
