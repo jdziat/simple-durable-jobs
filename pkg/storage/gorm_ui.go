@@ -459,6 +459,22 @@ func (s *GormStorage) DeleteJob(ctx context.Context, jobID core.UUID) error {
 			return fmt.Errorf("%w (job %s)", core.ErrJobHasChildren, jobID)
 		}
 
+		// Refuse to delete a fan-out sub-job whose PARENT is not yet terminal: the
+		// parent rebuilds its results from surviving sub-job rows on resume, so
+		// deleting a (succeeded) child first silently corrupts the aggregation — the
+		// same hazard PurgeJobs and the retention path guard against. Allowed once
+		// the parent reaches a terminal status (or via DeleteWorkflowSubtree).
+		var livingParent int64
+		if err := tx.Raw("SELECT COUNT(*) FROM jobs c JOIN fan_outs f ON f.id = c.fan_out_id "+
+			"JOIN jobs pp ON pp.id = f.parent_job_id "+
+			"WHERE c.id = ? AND pp.status NOT IN ("+quotedTerminalJobStatuses()+")", jobID).
+			Scan(&livingParent).Error; err != nil {
+			return err
+		}
+		if livingParent > 0 {
+			return fmt.Errorf("%w (job %s)", core.ErrJobHasPendingParent, jobID)
+		}
+
 		// Delete checkpoints and any buffered signals first
 		if err := tx.Where("job_id = ?", jobID).Delete(&core.Checkpoint{}).Error; err != nil {
 			return err
@@ -504,6 +520,18 @@ func (s *GormStorage) DeleteWorkflowSubtree(ctx context.Context, rootJobID core.
 // rows actually removed.
 func (s *GormStorage) PurgeJobs(ctx context.Context, queue string, status core.JobStatus) (int64, error) {
 	var deleted int64
+	// Never purge a completed leaf sub-job whose owning fan-out's PARENT job is not
+	// yet terminal: the parent rebuilds its result slice from surviving sub-job rows
+	// when it resumes (pkg/fanout CollectResults), so deleting a succeeded child
+	// before then silently turns it into ErrSubJobIncomplete with no top-level error.
+	// Guarding on the fan_out's own status is insufficient — it flips 'completed' the
+	// moment the last child finishes, BEFORE a stranded/paused/backlogged parent
+	// resumes — so we key on the parent job's terminal status. This mirrors the
+	// automatic retention path's fanOutParentGuard (retention.go). It lives in the
+	// id-SELECT only (never the DELETE) so MySQL's "can't self-reference the delete
+	// target" rule is not triggered.
+	fanOutParentGuard := "NOT EXISTS (SELECT 1 FROM fan_outs f JOIN jobs pp ON pp.id = f.parent_job_id " +
+		"WHERE f.id = jobs.fan_out_id AND pp.status NOT IN (" + quotedTerminalJobStatuses() + "))"
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		// Uncorrelated set of all fan-out parent job ids. Matched jobs whose id is
 		// in this set are skipped to avoid orphaning their children.
@@ -511,32 +539,40 @@ func (s *GormStorage) PurgeJobs(ctx context.Context, queue string, status core.J
 			Distinct("parent_job_id").
 			Where("parent_job_id IS NOT NULL")
 
-		matchingJobs := tx.Model(&core.Job{}).Select("id").
+		// Resolve the purgeable ids ONCE (parents excluded + fan-out parent guard),
+		// then delete children rows and job rows by that id list. Materializing the
+		// ids (rather than reusing a jobs-referencing subquery inside the DELETE)
+		// keeps the guard's self-reference out of the DELETE, which MySQL rejects.
+		idQuery := tx.Model(&core.Job{}).Select("id").
 			Where("status = ?", status).
-			Where("id NOT IN (?)", parentIDs)
-		deleteJobs := tx.Model(&core.Job{}).
-			Where("status = ?", status).
-			Where("id NOT IN (?)", parentIDs)
+			Where("id NOT IN (?)", parentIDs).
+			Where(fanOutParentGuard)
 		if queue != "" {
-			matchingJobs = matchingJobs.Where("queue = ?", queue)
-			deleteJobs = deleteJobs.Where("queue = ?", queue)
+			idQuery = idQuery.Where("queue = ?", queue)
 		}
-
-		if err := tx.Where("job_id IN (?)", matchingJobs).Delete(&core.Checkpoint{}).Error; err != nil {
+		var ids []core.UUID
+		if err := idQuery.Pluck("id", &ids).Error; err != nil {
 			return err
 		}
-		if err := tx.Where("job_id IN (?)", matchingJobs).Delete(&core.Signal{}).Error; err != nil {
+		if len(ids) == 0 {
+			return nil
+		}
+
+		if err := tx.Where("job_id IN ?", ids).Delete(&core.Checkpoint{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("job_id IN ?", ids).Delete(&core.Signal{}).Error; err != nil {
 			return err
 		}
 		// Delete the purged jobs' unique locks too (mirror the retention path):
 		// unique_locks.job_id has no FK cascade, so a purge that skipped them would
 		// strand a dangling lock — a still-live one keeps blocking re-enqueue of a
 		// dedup scope whose job is gone, and expired ones accumulate unbounded.
-		if err := tx.Where("job_id IN (?)", matchingJobs).Delete(&core.UniqueLock{}).Error; err != nil {
+		if err := tx.Where("job_id IN ?", ids).Delete(&core.UniqueLock{}).Error; err != nil {
 			return err
 		}
 
-		result := deleteJobs.Delete(&core.Job{})
+		result := tx.Where("id IN ?", ids).Delete(&core.Job{})
 		deleted = result.RowsAffected
 		return result.Error
 	})

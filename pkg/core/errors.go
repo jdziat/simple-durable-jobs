@@ -69,6 +69,12 @@ var (
 	// with dangling parent_job_id/root_job_id/fan_out_id references; use
 	// DeleteWorkflowSubtree to remove the whole workflow instead.
 	ErrJobHasChildren = errors.New("jobs: cannot delete a workflow parent with child jobs; delete the workflow subtree instead")
+	// ErrJobHasPendingParent is returned by DeleteJob when the target is a fan-out
+	// sub-job whose parent job is not yet terminal. The parent rebuilds its result
+	// slice from surviving sub-job rows when it resumes, so deleting a (succeeded)
+	// child first silently turns it into ErrSubJobIncomplete. Delete once the parent
+	// is terminal, or remove the whole workflow via DeleteWorkflowSubtree.
+	ErrJobHasPendingParent = errors.New("jobs: cannot delete a sub-job while its fan-out parent is not terminal")
 )
 
 // WorkflowWaiter is implemented by control-flow errors that tell the worker a
