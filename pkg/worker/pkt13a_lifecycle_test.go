@@ -149,3 +149,61 @@ func TestWorker_Shutdown_ReleasesUnderNonFailureIsFailure(t *testing.T) {
 	require.Equal(t, core.StatusPending, j.Status, "shutdown-cancel must RELEASE (not complete) even under a non-failure IsFailure")
 	require.Empty(t, j.LockedBy, "released job must have its lock cleared")
 }
+
+// TestWorker_AggressivePause_DoesNotCompleteUnderNonFailureIsFailure guards F3: an
+// aggressive Pause (or CancelJob) that interrupts a running job must NOT be
+// silently turned into a COMPLETED job by a custom IsFailure that classifies
+// context.Canceled as non-failure — that would drop the job's unfinished work
+// (and count a fan-out sub-job as a success). The interrupted job must go through
+// fail-with-retry (re-runnable), exactly as the default IsFailure does. Unlike
+// shutdown, aggressive pause leaves the PARENT handler context alive, so without
+// the self-cancel guard the completion write succeeds and the job is COMPLETED.
+func TestWorker_AggressivePause_DoesNotCompleteUnderNonFailureIsFailure(t *testing.T) {
+	q, cleanup := newSQLiteQueue(t)
+	defer cleanup()
+	q.SetIsFailure(func(_ *core.Job, err error) bool { return !errors.Is(err, context.Canceled) })
+
+	running := make(chan struct{})
+	var once sync.Once
+	q.Register("cancellable", func(ctx context.Context, _ struct{}) error {
+		once.Do(func() { close(running) })
+		<-ctx.Done() // respect cancellation
+		return ctx.Err()
+	})
+	jobID, err := q.Enqueue(context.Background(), "cancellable", struct{}{})
+	require.NoError(t, err)
+
+	w := NewWorker(q, WithPollInterval(20*time.Millisecond), WithOwnershipAuditInterval(0))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ret := make(chan error, 1)
+	go func() { ret <- w.Start(ctx) }()
+
+	select {
+	case <-running:
+	case <-time.After(3 * time.Second):
+		t.Fatal("handler never started")
+	}
+
+	// Aggressive pause cancels the running job's context mid-execution.
+	w.Pause(core.PauseModeAggressive)
+
+	// The interrupted job must leave RUNNING and must NOT be silently completed.
+	require.Eventually(t, func() bool {
+		j, err := q.Storage().GetJob(context.Background(), jobID)
+		return err == nil && j != nil && j.Status != core.StatusRunning
+	}, 3*time.Second, 20*time.Millisecond, "job should leave running after aggressive pause")
+
+	j, err := q.Storage().GetJob(context.Background(), jobID)
+	require.NoError(t, err)
+	require.NotNil(t, j)
+	require.NotEqual(t, core.StatusCompleted, j.Status,
+		"aggressive-pause cancel must NOT complete the job under a non-failure IsFailure (its unfinished work must survive)")
+
+	cancel()
+	select {
+	case <-ret:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Start did not return after cancel")
+	}
+}
