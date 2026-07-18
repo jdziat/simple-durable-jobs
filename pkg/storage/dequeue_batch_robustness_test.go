@@ -4,11 +4,17 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/jdziat/simple-durable-jobs/v4/pkg/core"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/driver/sqlite"
+	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
 )
 
 // TestDequeueBatchPerQueue_ExhaustedQueueDoesNotStarveOthers guards the teardown g3
@@ -80,4 +86,86 @@ func TestDequeueBatch_PoisonPayloadReleasedNotStranded(t *testing.T) {
 	assert.Equal(t, core.StatusPending, poisonRow.Status,
 		"the undecodable row must be released to pending, not stranded as running")
 	assert.Empty(t, poisonRow.LockedBy, "the released row must not retain a lock owner")
+}
+
+// F4: on PG/SQLite the per-queue batch claim (dequeueBatchReturning) runs one
+// MATERIALIZED-CTE UPDATE per queue. A non-serialization DB error on a LATER
+// queue's statement must not strand the EARLIER queues' already-claimed rows
+// (status=running, locked_by=self, never dispatched or released) until the
+// stale-lock reaper. The multi-queue claim must be atomic so a mid-batch failure
+// rolls the earlier claims back to pending.
+func TestDequeueBatchPerQueue_MidBatchErrorDoesNotStrandEarlierClaims(t *testing.T) {
+	ctx := context.Background()
+	var s *GormStorage
+	switch {
+	case os.Getenv("TEST_DATABASE_URL") != "":
+		s = newPostgresTestStorage(t) // real PG tables — the primary target of this fix
+	case os.Getenv("TEST_MYSQL_URL") != "":
+		t.Skip("dequeueBatchReturning is the PG/SQLite path; MySQL uses the already-transactional locked path")
+	default:
+		// Temp-FILE sqlite (not :memory:) so a claim we deliberately fail below
+		// cannot surface a fresh, tableless pool connection to the later
+		// verification queries — file-backed tables persist across connections.
+		db, err := gorm.Open(sqlite.Open(filepath.Join(t.TempDir(), "f4.db")), &gorm.Config{
+			Logger: logger.Default.LogMode(logger.Silent),
+		})
+		require.NoError(t, err)
+		s = NewGormStorage(db, WithHotStatsCacheTTL(0))
+		require.NoError(t, s.Migrate(ctx))
+	}
+
+	// Two queues, each with a job and its own budget -> TWO claim statements.
+	require.NoError(t, s.Enqueue(ctx, newTestJob("qa", "t")))
+	require.NoError(t, s.Enqueue(ctx, newTestJob("qb", "t")))
+
+	// Fail from the SECOND per-queue claim onward (persistent, so a rolled-back
+	// retry cannot slip through), simulating a transient DB error mid-batch. A
+	// Raw(...).Scan claim can surface through the raw/row/query pipeline depending
+	// on GORM internals, so hook all three and dedup by the shared Statement so a
+	// single claim is counted exactly once.
+	var claims int
+	seen := map[*gorm.Statement]bool{}
+	inject := func(db *gorm.DB) {
+		sql := db.Statement.SQL.String()
+		if !strings.Contains(sql, "UPDATE jobs") || !strings.Contains(sql, "SELECT id FROM claimed") {
+			return
+		}
+		if seen[db.Statement] {
+			return
+		}
+		seen[db.Statement] = true
+		claims++
+		if claims >= 2 {
+			_ = db.AddError(errors.New("injected mid-batch failure"))
+		}
+	}
+	require.NoError(t, s.db.Callback().Raw().After("gorm:raw").Register("test:f4_raw", inject))
+	require.NoError(t, s.db.Callback().Row().After("gorm:row").Register("test:f4_row", inject))
+	require.NoError(t, s.db.Callback().Query().After("gorm:query").Register("test:f4_query", inject))
+	removeInjector := func() {
+		_ = s.db.Callback().Raw().Remove("test:f4_raw")
+		_ = s.db.Callback().Row().Remove("test:f4_row")
+		_ = s.db.Callback().Query().Remove("test:f4_query")
+	}
+	defer removeInjector()
+
+	_, err := s.DequeueBatchPerQueue(ctx, "w", map[string]int{"qa": 5, "qb": 5})
+	require.Error(t, err, "a mid-batch claim failure must surface")
+
+	// Remove the injector before the verification queries.
+	removeInjector()
+
+	// No job may be left claimed (running/locked) after the failed batch — the
+	// earlier queue's claim must have rolled back, not autocommitted-then-stranded.
+	var stranded int64
+	require.NoError(t, s.db.WithContext(ctx).Model(&core.Job{}).
+		Where("status = ? AND locked_by <> ?", core.StatusRunning, "").
+		Count(&stranded).Error)
+	assert.Equal(t, int64(0), stranded, "no job may be stranded running/locked after a mid-batch failure")
+
+	// Both jobs remain pending and re-claimable.
+	var pending int64
+	require.NoError(t, s.db.WithContext(ctx).Model(&core.Job{}).
+		Where("status = ?", core.StatusPending).Count(&pending).Error)
+	assert.Equal(t, int64(2), pending, "both jobs remain pending after the rolled-back batch")
 }

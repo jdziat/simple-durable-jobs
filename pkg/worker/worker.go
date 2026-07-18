@@ -1894,7 +1894,18 @@ func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 			cancelHeartbeat()
 			return
 		}
-		if !w.queue.IsFailure(job, err) {
+		// A worker-induced cancel (aggressive Pause / CancelJob on this owned,
+		// still-running job) surfaces as context.Canceled on jobCtx while the parent
+		// handler context is still alive (jobCtx.Err()!=nil, ctx.Err()==nil). It must
+		// NOT be zeroed by a custom IsFailure that treats context.Canceled as
+		// non-failure: zeroing falls through to the success branch and marks the
+		// interrupted job COMPLETED, dropping its unfinished phases (and counting a
+		// fan-out sub-job as a success). Route it through the normal fail-with-retry
+		// path instead — exactly what the default IsFailure does — so the job re-runs.
+		// Shutdown is handled above; a timeout yields DeadlineExceeded (not Canceled)
+		// so it is unaffected.
+		selfCancelled := errors.Is(err, context.Canceled) && ctx.Err() == nil && jobCtx.Err() != nil
+		if !selfCancelled && !w.queue.IsFailure(job, err) {
 			err = nil
 		}
 	}

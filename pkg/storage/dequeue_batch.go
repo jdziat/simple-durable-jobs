@@ -127,7 +127,11 @@ func (s *GormStorage) dequeueBatchOnce(ctx context.Context, queues []string, wor
 //     single writer). DB-clock leases (Postgres) / wall clock (SQLite) unchanged.
 //   - decodeClaimedBatch still releases+excludes poison rows.
 //
-// The single autocommit statement also removes the per-batch BEGIN/COMMIT.
+// A single-unit claim (the common global-limit path) runs as one autocommit
+// statement with no BEGIN/COMMIT. A multi-unit per-queue claim instead wraps its
+// statements in ONE transaction so a mid-batch error rolls back the earlier
+// queues' claims rather than stranding them (running/locked, undispatched) until
+// the stale-lock reaper — matching MySQL's single-transaction dequeueBatchLocked.
 func (s *GormStorage) dequeueBatchReturning(ctx context.Context, queues []string, workerID string, limit int, perQueueBudgets map[string]int) ([]*core.Job, error) {
 	dur := time.Duration(s.lockDuration.Load())
 	var nowVal, lockUntilVal any
@@ -160,53 +164,85 @@ func (s *GormStorage) dequeueBatchReturning(ctx context.Context, queues []string
 	}
 
 	claimed := make([]*core.Job, 0, limit)
-	for _, u := range units {
-		if len(claimed) >= limit {
-			break
-		}
+
+	// claimOne runs a single unit's claim against exec (either the autocommit
+	// session or a wrapping transaction) and appends the returned rows. The
+	// claimable-candidate SELECT carries the LIMIT and, on Postgres, FOR UPDATE
+	// SKIP LOCKED, and MUST be fenced in a MATERIALIZED CTE so the planner
+	// evaluates it EXACTLY ONCE. A bare `UPDATE ... WHERE id IN (SELECT ... FOR
+	// UPDATE SKIP LOCKED LIMIT n)` lets Postgres place the locking subquery on the
+	// INNER side of a nested loop and re-evaluate it per candidate row, applying
+	// LIMIT n per iteration — a runaway that over-dispatches (observed: 10 rows for
+	// LIMIT 5). MATERIALIZED forces single evaluation, so exactly n ids are locked
+	// and updated (SQLite >= 3.35 accepts it too; single-writer, so the fence only
+	// pins the LIMIT). The SET list matches every other claim path column for
+	// column, INCLUDING updated_at (Job.UpdatedAt is autoUpdateTime; the raw
+	// statement bypasses that callback and must set it explicitly) and
+	// last_heartbeat_at=NULL (CD-01: clear the stale heartbeat so the reaper anchors
+	// on this claim's started_at).
+	claimOne := func(exec *gorm.DB, u claimUnit) error {
 		n := u.limit
 		if rem := limit - len(claimed); n > rem {
 			n = rem
 		}
+		if n <= 0 {
+			return nil
+		}
 		var rows []*core.Job
-		err := s.withSerializationRetry(ctx, func() error {
-			rows = nil
-			// The claimable-candidate SELECT carries the LIMIT and, on Postgres,
-			// FOR UPDATE SKIP LOCKED.
-			sub := s.claimableCandidates(
-				s.lockForUpdate(silentDB.WithContext(ctx).Model(&core.Job{}).Select("id"), true),
-				u.queues, nowVal,
-			).Limit(n)
-			// Wrap the locking subquery in a MATERIALIZED CTE so the planner
-			// evaluates it EXACTLY ONCE. A bare `UPDATE ... WHERE id IN (SELECT
-			// ... FOR UPDATE SKIP LOCKED LIMIT n)` lets Postgres place the locking
-			// subquery on the INNER side of a nested loop and re-evaluate it per
-			// candidate row, applying LIMIT n per iteration — a runaway that claims
-			// far more than n rows (observed: 10 rows for LIMIT 5, so a worker
-			// over-dispatches its whole batch). MATERIALIZED is an optimization
-			// fence that forces single evaluation, so exactly n ids are locked and
-			// updated. See CYBERTEC, "How to do UPDATE ... LIMIT in PostgreSQL".
-			// SQLite (>= 3.35, this path's floor) accepts AS MATERIALIZED too; it
-			// has no row locks (single writer), so the fence only pins the LIMIT
-			// there. The SET list matches the prior GORM .Updates(map) claim column
-			// for column, INCLUDING updated_at (Job.UpdatedAt is autoUpdateTime, so
-			// the map form bumped it implicitly; the raw statement bypasses that
-			// callback and must set it explicitly to stay consistent with every
-			// other claim path) and last_heartbeat_at=NULL (CD-01: clear the stale
-			// heartbeat so the reaper anchors on this claim's started_at).
-			return silentDB.WithContext(ctx).Raw(
-				"WITH claimed AS MATERIALIZED (?) "+
-					"UPDATE jobs SET status = ?, locked_by = ?, locked_until = ?, "+
-					"started_at = ?, updated_at = ?, attempt = attempt + 1, "+
-					"last_heartbeat_at = NULL "+
-					"WHERE id IN (SELECT id FROM claimed) RETURNING *",
-				sub, core.StatusRunning, workerID, lockUntilVal, nowVal, nowVal,
-			).Scan(&rows).Error
-		})
-		if err != nil {
-			return nil, err
+		sub := s.claimableCandidates(
+			s.lockForUpdate(exec.Model(&core.Job{}).Select("id"), true),
+			u.queues, nowVal,
+		).Limit(n)
+		if err := exec.Raw(
+			"WITH claimed AS MATERIALIZED (?) "+
+				"UPDATE jobs SET status = ?, locked_by = ?, locked_until = ?, "+
+				"started_at = ?, updated_at = ?, attempt = attempt + 1, "+
+				"last_heartbeat_at = NULL "+
+				"WHERE id IN (SELECT id FROM claimed) RETURNING *",
+			sub, core.StatusRunning, workerID, lockUntilVal, nowVal, nowVal,
+		).Scan(&rows).Error; err != nil {
+			return err
 		}
 		claimed = append(claimed, rows...)
+		return nil
+	}
+
+	switch {
+	case len(units) == 0:
+		// Nothing eligible to claim (per-queue budgets with no positive budget).
+	case len(units) == 1:
+		// A single claim is one atomic autocommit statement, so no wrapping
+		// transaction is needed — the common global-limit hot path stays free of an
+		// extra BEGIN/COMMIT round-trip.
+		if err := s.withSerializationRetry(ctx, func() error {
+			claimed = claimed[:0]
+			return claimOne(silentDB.WithContext(ctx), units[0])
+		}); err != nil {
+			return nil, err
+		}
+	default:
+		// Multiple per-queue claim statements: wrap them in ONE transaction so a
+		// mid-loop DB error rolls back the earlier queues' already-claimed rows
+		// instead of stranding them (status=running, locked_by=self, undispatched)
+		// until the stale-lock reaper. Mirrors dequeueBatchLocked (MySQL), which is
+		// already single-transaction. The MATERIALIZED fence still prevents
+		// over-dispatch; the SKIP LOCKED row locks are simply held until commit.
+		if err := s.withSerializationRetry(ctx, func() error {
+			claimed = claimed[:0]
+			return silentDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+				for _, u := range units {
+					if len(claimed) >= limit {
+						break
+					}
+					if err := claimOne(tx, u); err != nil {
+						return err
+					}
+				}
+				return nil
+			})
+		}); err != nil {
+			return nil, err
+		}
 	}
 
 	if len(claimed) == 0 {

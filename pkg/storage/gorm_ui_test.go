@@ -446,6 +446,94 @@ func TestPurgeJobs_SkipsFanOutParentsAndDeletesSignals(t *testing.T) {
 	assert.Equal(t, int64(0), leafSignals, "purge must delete the leaf's signals")
 }
 
+// F1: PurgeJobs must NOT delete a completed leaf sub-job while its fan-out PARENT
+// is still non-terminal. The parent rebuilds its result slice from surviving
+// sub-jobs when it resumes (pkg/fanout CollectResults), so purging a succeeded
+// child first silently turns it into ErrSubJobIncomplete with no top-level error.
+// This mirrors the automatic retention fanOutParentGuard, which PurgeJobs
+// previously omitted despite its docstring claiming it "can never strand its
+// children."
+func TestPurgeJobs_SkipsCompletedSubJobOfNonTerminalParent(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStorage(t)
+
+	// Parent still WAITING (non-terminal); fan_out pending; 2 sub-jobs.
+	parentID, subIDs := seedFanOutTree(t, store, "q", core.StatusWaiting, 2)
+	// One sub-job finishes while the fan-out is still in flight.
+	require.NoError(t, store.db.Model(&core.Job{}).Where("id = ?", subIDs[0]).
+		Update("status", core.StatusCompleted).Error)
+
+	// A routine "purge completed jobs" must SKIP the completed sub-job.
+	deleted, err := store.PurgeJobs(ctx, "q", core.StatusCompleted)
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), deleted,
+		"the only completed job is a sub-job of a non-terminal parent; it must be skipped")
+	assert.True(t, jobExists(t, store, subIDs[0]),
+		"completed sub-job of a still-waiting parent must survive the purge")
+
+	// Once the parent reaches a terminal status, the completed sub-jobs ARE
+	// purgeable — the guard must not over-block.
+	require.NoError(t, store.db.Model(&core.Job{}).Where("id = ?", parentID).
+		Update("status", core.StatusCompleted).Error)
+	require.NoError(t, store.db.Model(&core.Job{}).Where("id = ?", subIDs[1]).
+		Update("status", core.StatusCompleted).Error)
+	deleted2, err := store.PurgeJobs(ctx, "q", core.StatusCompleted)
+	require.NoError(t, err)
+	assert.Equal(t, int64(2), deleted2,
+		"with a terminal parent both completed sub-jobs are purgeable (the parent itself is skipped as a fan-out parent)")
+	assert.False(t, jobExists(t, store, subIDs[0]))
+	assert.False(t, jobExists(t, store, subIDs[1]))
+	assert.True(t, jobExists(t, store, parentID), "PurgeJobs always skips fan-out parents")
+}
+
+// F1: DeleteJob (dashboard-exposed) must refuse to delete a fan-out sub-job while
+// its parent is not terminal — the same silent-corruption hazard PurgeJobs guards
+// against — and allow the delete once the parent is terminal.
+func TestDeleteJob_RefusesSubJobOfNonTerminalParent(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStorage(t)
+
+	parentID, subIDs := seedFanOutTree(t, store, "q", core.StatusWaiting, 2)
+	require.NoError(t, store.db.Model(&core.Job{}).Where("id = ?", subIDs[0]).
+		Update("status", core.StatusCompleted).Error)
+
+	err := store.DeleteJob(ctx, subIDs[0])
+	require.ErrorIs(t, err, core.ErrJobHasPendingParent)
+	assert.True(t, jobExists(t, store, subIDs[0]),
+		"a completed sub-job of a non-terminal parent must not be deletable")
+
+	// Once the parent reaches a terminal status, the sub-job is deletable.
+	require.NoError(t, store.db.Model(&core.Job{}).Where("id = ?", parentID).
+		Update("status", core.StatusCompleted).Error)
+	require.NoError(t, store.DeleteJob(ctx, subIDs[0]))
+	assert.False(t, jobExists(t, store, subIDs[0]))
+}
+
+// F1 (gate): PurgeJobs must handle a backlog larger than one internal batch — the
+// id list is bounded per batch (<= purgeBatchSize) so it can never exceed the
+// driver's per-statement bind-parameter ceiling, and the batched loop still purges
+// every matching row.
+func TestPurgeJobs_LargeBacklogPurgedInBatches(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStorage(t)
+
+	const n = 1000 + 25 // just over the internal 1000-row batch
+	for i := 0; i < n; i++ {
+		j := newTestJob("q", "t")
+		j.Status = core.StatusCompleted
+		require.NoError(t, store.Enqueue(ctx, j))
+	}
+
+	deleted, err := store.PurgeJobs(ctx, "q", core.StatusCompleted)
+	require.NoError(t, err, "a backlog larger than one internal batch must purge without a bind-parameter-ceiling error")
+	assert.Equal(t, int64(n), deleted, "every matching job is purged across batches")
+
+	var remaining int64
+	require.NoError(t, store.db.WithContext(ctx).Model(&core.Job{}).
+		Where("queue = ? AND status = ?", "q", core.StatusCompleted).Count(&remaining).Error)
+	assert.Equal(t, int64(0), remaining, "no matching job remains after the batched purge")
+}
+
 func TestSearchJobs_ClampsOffsetAndLimit(t *testing.T) {
 	ctx := context.Background()
 	store := newUITestStorage(t)

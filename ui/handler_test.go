@@ -297,6 +297,44 @@ func TestHandler_GormStorage_StartsSingleCollectorPerDB(t *testing.T) {
 	statsCollectorMu.Unlock()
 }
 
+// F5: the package-global stats-collector registry must self-prune when a Handler's
+// cancellable context is done, so a process that mounts a Handler per distinct
+// *gorm.DB (e.g. per-tenant) does not grow the map (and collector-goroutine set)
+// without bound.
+func TestHandler_StatsCollectorRegistry_PrunesOnContextCancel(t *testing.T) {
+	store := setupGormStorage(t)
+	q := queue.New(store)
+
+	statsCollectorMu.Lock()
+	originalCollectors := statsCollectorsByDB
+	originalStartFn := startStatsCollectorFn
+	statsCollectorsByDB = map[*gorm.DB]bool{}
+	startStatsCollectorFn = func(_ context.Context, _ *StatsCollector) {} // isolate the registry from the real poll loop
+	statsCollectorMu.Unlock()
+	defer func() {
+		statsCollectorMu.Lock()
+		statsCollectorsByDB = originalCollectors
+		startStatsCollectorFn = originalStartFn
+		statsCollectorMu.Unlock()
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	require.NotNil(t, Handler(store, WithContext(ctx), WithQueue(q)))
+
+	statsCollectorMu.Lock()
+	registered := statsCollectorsByDB[store.DB()]
+	statsCollectorMu.Unlock()
+	require.True(t, registered, "DB must be registered while the context is live")
+
+	// Cancelling the context must prune the entry (bounding the global map).
+	cancel()
+	require.Eventually(t, func() bool {
+		statsCollectorMu.Lock()
+		defer statsCollectorMu.Unlock()
+		return !statsCollectorsByDB[store.DB()]
+	}, 2*time.Second, 10*time.Millisecond, "registry entry must be pruned after context cancel")
+}
+
 func TestHandler_GormStorage_WithQueue_NoRetention(t *testing.T) {
 	// Exercises the collector opts path without statsRetention set.
 	store := setupGormStorage(t)

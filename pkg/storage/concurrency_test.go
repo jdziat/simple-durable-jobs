@@ -58,6 +58,57 @@ func TestConcurrencySlotLimitReleaseAndExpiry(t *testing.T) {
 	assert.True(t, ok, "expired slots must not count against the cap")
 }
 
+func liveSlotCount(t *testing.T, s *GormStorage, slot string) int64 {
+	t.Helper()
+	var n int64
+	require.NoError(t, s.db.Model(&core.ConcurrencySlot{}).
+		Where("slot_name = ? AND job_id <> ? AND expires_at >= ?", slot, core.NilUUID, time.Now()).
+		Count(&n).Error)
+	return n
+}
+
+// F2: an EXPIRED self-slot row (left behind by a crashed/OOM-killed worker) must
+// NOT be renewed past the cap. The renew is idempotent only for a LIVE holder; an
+// expired self-row must fall through to the cap check, and — once the cap has room
+// — be RECLAIMED via upsert, not denied forever by its own stale row.
+func TestTryAcquireConcurrencySlot_ExpiredSelfRowDoesNotBypassCap(t *testing.T) {
+	s := newTestStorage(t)
+	ctx := context.Background()
+	slot := uniqueSlotName(t)
+	jobX := testUUID("job-x")
+	jobY := testUUID("job-y")
+
+	// X holds the only slot (limit 1, used as a distributed mutex).
+	ok, err := s.TryAcquireConcurrencySlot(ctx, slot, jobX, "wA", 1, time.Hour)
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	// X crashes: its row is left behind but expires (simulate by backdating).
+	require.NoError(t, s.db.WithContext(ctx).Model(&core.ConcurrencySlot{}).
+		Where("slot_name = ? AND job_id = ?", slot, jobX).
+		Update("expires_at", time.Now().Add(-time.Hour)).Error)
+
+	// Y takes the slot freed by X's expiry.
+	ok, err = s.TryAcquireConcurrencySlot(ctx, slot, jobY, "wB", 1, time.Hour)
+	require.NoError(t, err)
+	require.True(t, ok, "Y takes the slot X freed by expiring")
+
+	// X is re-dispatched: its expired leftover row must NOT be renewed past the cap
+	// while Y holds the only slot (the over-admission bug).
+	ok, err = s.TryAcquireConcurrencySlot(ctx, slot, jobX, "wA", 1, time.Hour)
+	require.NoError(t, err)
+	assert.False(t, ok, "expired self-row must not bypass the limit-1 cap; X must wait for Y")
+	require.Equal(t, int64(1), liveSlotCount(t, s, slot), "exactly one live holder for a limit-1 cap")
+
+	// Once Y releases, X reclaims its (still-expired) leftover row via the
+	// create/upsert path — it must not be permanently denied by its own stale row.
+	require.NoError(t, s.ReleaseConcurrencySlot(ctx, slot, jobY))
+	ok, err = s.TryAcquireConcurrencySlot(ctx, slot, jobX, "wA", 1, time.Hour)
+	require.NoError(t, err)
+	assert.True(t, ok, "X reclaims its expired leftover row once the cap has room")
+	require.Equal(t, int64(1), liveSlotCount(t, s, slot))
+}
+
 func TestTryAcquireConcurrencySlotLiveCountUsesPlainCount(t *testing.T) {
 	s := newTestStorage(t)
 	ctx := context.Background()

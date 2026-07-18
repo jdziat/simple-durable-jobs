@@ -1072,6 +1072,7 @@ func errToConnect(err error) error {
 	case errors.Is(err, core.ErrJobNotFound), errors.Is(err, gorm.ErrRecordNotFound):
 		return connect.NewError(connect.CodeNotFound, errors.New("job not found"))
 	case errors.Is(err, core.ErrJobHasChildren),
+		errors.Is(err, core.ErrJobHasPendingParent),
 		errors.Is(err, core.ErrJobAlreadyPaused),
 		errors.Is(err, core.ErrJobNotPaused),
 		errors.Is(err, core.ErrJobNotCancellable),
@@ -1096,6 +1097,8 @@ func bulkSkipReason(err error) string {
 		return "not found"
 	case errors.Is(err, core.ErrJobHasChildren):
 		return "workflow parent (delete the workflow instead)"
+	case errors.Is(err, core.ErrJobHasPendingParent):
+		return "fan-out sub-job of a non-terminal parent (delete once the parent finishes)"
 	case errors.Is(err, core.ErrCannotRequeueSubJob):
 		return "fan-out sub-job (retry its parent)"
 	}
