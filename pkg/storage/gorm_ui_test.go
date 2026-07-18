@@ -509,6 +509,31 @@ func TestDeleteJob_RefusesSubJobOfNonTerminalParent(t *testing.T) {
 	assert.False(t, jobExists(t, store, subIDs[0]))
 }
 
+// F1 (gate): PurgeJobs must handle a backlog larger than one internal batch — the
+// id list is bounded per batch (<= purgeBatchSize) so it can never exceed the
+// driver's per-statement bind-parameter ceiling, and the batched loop still purges
+// every matching row.
+func TestPurgeJobs_LargeBacklogPurgedInBatches(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStorage(t)
+
+	const n = 1000 + 25 // just over the internal 1000-row batch
+	for i := 0; i < n; i++ {
+		j := newTestJob("q", "t")
+		j.Status = core.StatusCompleted
+		require.NoError(t, store.Enqueue(ctx, j))
+	}
+
+	deleted, err := store.PurgeJobs(ctx, "q", core.StatusCompleted)
+	require.NoError(t, err, "a backlog larger than one internal batch must purge without a bind-parameter-ceiling error")
+	assert.Equal(t, int64(n), deleted, "every matching job is purged across batches")
+
+	var remaining int64
+	require.NoError(t, store.db.WithContext(ctx).Model(&core.Job{}).
+		Where("queue = ? AND status = ?", "q", core.StatusCompleted).Count(&remaining).Error)
+	assert.Equal(t, int64(0), remaining, "no matching job remains after the batched purge")
+}
+
 func TestSearchJobs_ClampsOffsetAndLimit(t *testing.T) {
 	ctx := context.Background()
 	store := newUITestStorage(t)
