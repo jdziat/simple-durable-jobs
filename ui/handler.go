@@ -62,6 +62,22 @@ func Handler(storage core.Storage, opts ...Option) http.Handler {
 			}
 			collector := NewStatsCollector(cfg.queue, statsStorage, collectorOpts...)
 			startStatsCollectorFn(cfg.ctx, collector)
+			// Self-prune the package-global registry (the collector goroutine exits
+			// via its own ctx) when the caller's context is cancelled, so a process
+			// that mounts a Handler per distinct *gorm.DB over its lifetime (e.g.
+			// per-tenant DBs) does not leak a map entry + goroutine per mount. Only
+			// when the context is actually cancellable: the default is
+			// context.Background() (Done()==nil), for which a cleanup goroutine would
+			// block forever — a single long-lived mount intentionally keeps its one
+			// collector for the process lifetime, so we skip it and add no
+			// permanently-blocked goroutine.
+			if done := cfg.ctx.Done(); done != nil {
+				db := gs.DB()
+				go func() {
+					<-done
+					unregisterStatsCollector(db)
+				}()
+			}
 		}
 	}
 
@@ -136,6 +152,15 @@ func registerStatsCollector(db *gorm.DB) bool {
 	}
 	statsCollectorsByDB[db] = true
 	return true
+}
+
+// unregisterStatsCollector removes a DB's registry entry so a later re-mount of a
+// Handler for the same *gorm.DB starts a fresh collector. Called when a Handler's
+// cancellable context is done (see Handler); a no-op if the entry is already gone.
+func unregisterStatsCollector(db *gorm.DB) {
+	statsCollectorMu.Lock()
+	defer statsCollectorMu.Unlock()
+	delete(statsCollectorsByDB, db)
 }
 
 var mutatingProcedures = map[string]Action{
