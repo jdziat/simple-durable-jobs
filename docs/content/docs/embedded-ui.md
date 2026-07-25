@@ -123,6 +123,18 @@ The middleware runs **inside** the H2C handler, so it is invoked for the initial
 
 If you terminate HTTP/2 yourself (behind TLS, or via Go 1.24+'s `srv.Protocols.SetUnencryptedHTTP2(true)`), use [`ui.WithoutH2C()`](#withouth2c) to skip the built-in upgrade handler entirely.
 
+### WithoutH2C
+
+```go
+ui.WithoutH2C()
+```
+
+Disables the built-in cleartext-HTTP/2 (h2c) upgrade wrapper.
+
+The dashboard wraps its handler in h2c so Connect streaming works over plain HTTP. If you already terminate HTTP/2 yourself — behind TLS, or via Go 1.24+'s `srv.Protocols.SetUnencryptedHTTP2(true)` — the built-in wrapper is redundant, and disabling it means no connection is hijacked inside the library at all.
+
+Middleware supplied via [`WithMiddleware`](#withmiddleware) runs on every request either way; this option governs who owns protocol negotiation, not authentication.
+
 ## Dashboard Features
 
 The embedded Svelte SPA provides a browser-based interface for monitoring and managing jobs.

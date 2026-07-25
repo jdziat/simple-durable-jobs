@@ -26,6 +26,15 @@ permissions:
   contents: read
   issues: write
 
+# The tracking issue is a single shared resource, and the open/update/close logic
+# is read-then-write. Two overlapping runs (a schedule firing while someone is
+# dispatching manually) could each observe "no open issue" and each create one,
+# breaking the exactly-one-issue invariant this workflow is built on. Serialize
+# instead of cancelling: a cancelled run could drop a genuine finding.
+concurrency:
+  group: govulncheck-scheduled
+  cancel-in-progress: false
+
 jobs:
   scan:
     name: scan
@@ -72,8 +81,14 @@ jobs:
 
       # Keep exactly ONE open tracking issue. `gh issue create --label` errors on
       # an unknown label, so the label is ensured first.
+      # Issue mutations are gated on main. The scan itself still runs on a
+      # workflow_dispatch from any branch — that is useful for checking a fix
+      # before merging — but a branch run must not touch main's tracking issue:
+      # a clean feature branch would otherwise CLOSE a genuine open finding, and
+      # a branch carrying its own vulnerable dependency would overwrite the issue
+      # body with results that do not describe main.
       - name: Open or update the tracking issue
-        if: steps.scan.outputs.status == 'findings'
+        if: steps.scan.outputs.status == 'findings' && github.ref == 'refs/heads/main'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TITLE: 'govulncheck: reachable vulnerabilities on main'
@@ -105,7 +120,7 @@ jobs:
           fi
 
       - name: Close the tracking issue when clean
-        if: steps.scan.outputs.status == 'clean'
+        if: steps.scan.outputs.status == 'clean' && github.ref == 'refs/heads/main'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TITLE: 'govulncheck: reachable vulnerabilities on main'

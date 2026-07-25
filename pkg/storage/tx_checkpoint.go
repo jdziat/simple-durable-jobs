@@ -31,8 +31,7 @@ func (s *GormStorage) SaveCheckpointTx(ctx context.Context, tx *gorm.DB, cp *cor
 	return tx.WithContext(ctx).
 		Clauses(clause.OnConflict{
 			Columns:   []clause.Column{{Name: "job_id"}, {Name: "call_index"}, {Name: "call_type"}},
-			// span_end MUST be in this list — see the note on SaveCheckpoint.
-			DoUpdates: clause.AssignmentColumns([]string{"result", "error", "error_kind", "error_cause", "error_delay_nanos", "span_end"}),
+			DoUpdates: clause.AssignmentColumns(checkpointConflictColumns),
 		}).
 		Create(row).Error
 }
