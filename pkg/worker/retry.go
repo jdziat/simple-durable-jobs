@@ -49,7 +49,22 @@ func retryWithBackoff(ctx context.Context, config RetryConfig, operation func() 
 	var lastErr error
 	backoff := config.InitialBackoff
 
-	for attempt := 1; attempt <= config.MaxAttempts; attempt++ {
+	// A non-positive MaxAttempts must never mean "skip the operation and report
+	// success". Before this clamp, `attempt <= 0` skipped the loop body entirely
+	// and returned a nil lastErr, so every storage write routed through here
+	// (completion, fail, heartbeat, checkpoint/batch flush, dequeue — eleven call
+	// sites) silently became a no-op that its caller read as a successful write:
+	// completion hooks fired and JobCompleted was emitted for jobs still sitting
+	// 'running' in the database. NewWorker clamps the configs it owns, but this
+	// guard also covers a RetryConfig that never passes through it — a zero value
+	// built by hand and handed to a helper such as newBatchCompleter.
+	// 1 == "try once, do not retry", which is exactly what DisableRetry() means.
+	maxAttempts := config.MaxAttempts
+	if maxAttempts < 1 {
+		maxAttempts = 1
+	}
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		lastErr = operation()
 		if lastErr == nil {
 			return nil
@@ -65,7 +80,7 @@ func retryWithBackoff(ctx context.Context, config RetryConfig, operation func() 
 		}
 
 		// Check if we've exhausted attempts
-		if attempt >= config.MaxAttempts {
+		if attempt >= maxAttempts {
 			break
 		}
 
