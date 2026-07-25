@@ -117,7 +117,11 @@ ui.WithMiddleware(func(next http.Handler) http.Handler {
 })
 ```
 
-Wraps the entire handler (both API and frontend) with middleware. This is the recommended place to add authentication, CORS, request logging, or any other cross-cutting HTTP concerns. The middleware is applied as the outermost layer, after H2C setup.
+Wraps the entire handler (both API and frontend) with middleware. This is the recommended place to add authentication, CORS, request logging, or any other cross-cutting HTTP concerns.
+
+The middleware runs **inside** the H2C handler, so it is invoked for the initial request and for every HTTP/2 stream on an upgraded connection. This ordering is load-bearing for authentication: H2C hijacks the connection on an `Upgrade: h2c` request and then serves subsequent streams itself, so middleware applied *outside* it would be consulted only once — on the upgrade — and bypassed thereafter.
+
+If you terminate HTTP/2 yourself (behind TLS, or via Go 1.24+'s `srv.Protocols.SetUnencryptedHTTP2(true)`), use [`ui.WithoutH2C()`](#withouth2c) to skip the built-in upgrade handler entirely.
 
 ## Dashboard Features
 

@@ -132,15 +132,82 @@ func Handler(storage core.Storage, opts ...Option) http.Handler {
 		mux.ServeHTTP(w, r)
 	})
 
-	// Wrap with H2C for HTTP/2 over cleartext (needed for Connect streaming)
-	h2cHandler := h2c.NewHandler(withHostHeader, &http2.Server{})
-
-	// Apply middleware if configured
+	// The operator's middleware goes INSIDE h2c, not outside it.
+	//
+	// h2c.NewHandler hijacks the connection on an HTTP/1.1 `Upgrade: h2c` and
+	// then serves every subsequent HTTP/2 stream on that connection itself. A
+	// middleware wrapped AROUND the h2c handler is therefore invoked exactly once
+	// — on the upgrade request — and never again. Demonstrated end to end: one
+	// request to a middleware-permitted path (the SPA shell "/" in any real
+	// deployment) carrying the upgrade headers returns 101, after which stream 3
+	// on the same connection reaches a protected RPC with the middleware never
+	// consulted (middleware=1, inner=2).
+	//
+	// That matters because SECURITY.md instructs operators to use
+	// ui.WithMiddleware as THE authentication mechanism for the dashboard, so the
+	// documented deployment shape was bypassable. Wrapping the inner handler puts
+	// the middleware on the path of every stream (middleware=2, inner=1, with the
+	// protected stream refused).
+	//
+	// Note the prior-knowledge h2c path was NOT affected: its preface arrives as
+	// an HTTP/1.1-looking request that an outer middleware does see.
+	inner := http.Handler(withHostHeader)
 	if cfg.middleware != nil {
-		return cfg.middleware(h2cHandler)
+		inner = cfg.middleware(inner)
 	}
 
-	return h2cHandler
+	if cfg.disableH2C {
+		// No h2c: the caller is terminating HTTP/2 themselves (TLS, or Go 1.24+
+		// srv.Protocols.SetUnencryptedHTTP2). Nothing to hijack, so nothing to
+		// bypass.
+		return inner
+	}
+
+	h2cHandler := h2c.NewHandler(inner, &http2.Server{})
+
+	// Cap the body of an UPGRADE request specifically. x/net's h2c handler reads
+	// the whole request body into memory to replay it as the first stream, and
+	// moving the middleware inside makes that read strictly PRE-authentication —
+	// so this fix would otherwise widen an unauthenticated memory-exhaustion
+	// window. The cap is applied only to requests that actually carry the upgrade
+	// headers: a blanket http.MaxBytesHandler would silently truncate legitimate
+	// BulkDeleteJobs/BulkRetryJobs bodies, changing behaviour on a path that has
+	// no bug.
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if isH2CUpgrade(r) {
+			r.Body = http.MaxBytesReader(w, r.Body, maxH2CUpgradeBody)
+		}
+		h2cHandler.ServeHTTP(w, r)
+	})
+}
+
+// maxH2CUpgradeBody bounds the body x/net buffers while replaying an h2c upgrade
+// as the connection's first stream. Dashboard RPCs that legitimately carry large
+// bodies do not arrive as upgrade requests.
+const maxH2CUpgradeBody = 64 << 10
+
+// isH2CUpgrade reports whether r is an HTTP/1.1 cleartext-HTTP/2 upgrade — the
+// only request shape whose body x/net reads into memory before dispatch. Header
+// tokens are comma-separated and case-insensitive per RFC 9110.
+func isH2CUpgrade(r *http.Request) bool {
+	if r.ProtoMajor != 1 {
+		return false
+	}
+	if !headerHasToken(r.Header, "Upgrade", "h2c") {
+		return false
+	}
+	return headerHasToken(r.Header, "Connection", "upgrade")
+}
+
+func headerHasToken(h http.Header, key, token string) bool {
+	for _, v := range h.Values(key) {
+		for part := range strings.SplitSeq(v, ",") {
+			if strings.EqualFold(strings.TrimSpace(part), token) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func registerStatsCollector(db *gorm.DB) bool {
