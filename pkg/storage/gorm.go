@@ -730,7 +730,15 @@ func (s *GormStorage) dequeueOnce(ctx context.Context, queues []string, workerID
 		return nil, nil
 	}
 	if err := s.decodeJobPayloads(&job); err != nil {
-		return nil, err
+		// The claim is already COMMITTED here, so returning without releasing
+		// leaves the row status='running', locked_by=us and undispatched —
+		// invisible to any queue-depth alert (it reads as healthy work in
+		// progress) and reclaimable only by ReleaseStaleLocks, by default 45
+		// minutes later. The BATCH path has released poison rows since the
+		// teardown-g3 fix (decodeClaimedBatch); this single-job path was left
+		// behind. A misconfigured codec should produce a visible, self-contained
+		// symptom on one row, not a silently parked job.
+		return nil, s.releaseClaimedOnAbort([]core.UUID{job.ID}, workerID, err)
 	}
 	return &job, nil
 }
@@ -805,7 +813,15 @@ func (s *GormStorage) dequeueSQLite(ctx context.Context, queues []string, worker
 		return nil, nil
 	}
 	if err := s.decodeJobPayloads(&job); err != nil {
-		return nil, err
+		// The claim is already COMMITTED here, so returning without releasing
+		// leaves the row status='running', locked_by=us and undispatched —
+		// invisible to any queue-depth alert (it reads as healthy work in
+		// progress) and reclaimable only by ReleaseStaleLocks, by default 45
+		// minutes later. The BATCH path has released poison rows since the
+		// teardown-g3 fix (decodeClaimedBatch); this single-job path was left
+		// behind. A misconfigured codec should produce a visible, self-contained
+		// symptom on one row, not a silently parked job.
+		return nil, s.releaseClaimedOnAbort([]core.UUID{job.ID}, workerID, err)
 	}
 	return &job, nil
 }
