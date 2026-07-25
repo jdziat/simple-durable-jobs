@@ -1114,6 +1114,24 @@ func (s *GormStorage) accountTerminalWithFanOut(ctx context.Context, jobID core.
 	return &fanOut, nil
 }
 
+// checkpointConflictColumns is the single source of truth for which columns an
+// upsert refreshes when a checkpoint with the same (job_id, call_index,
+// call_type) already exists.
+//
+// It is shared by SaveCheckpoint and SaveCheckpointTx deliberately. Keeping two
+// hand-synced literals was how span_end came to be omitted in the first place,
+// and a missing column here does not fail loudly — it silently re-opens the
+// nested-call replay corruption on the re-save path only. One list cannot drift
+// from itself.
+var checkpointConflictColumns = []string{
+	"result",
+	"error",
+	"error_kind",
+	"error_cause",
+	"error_delay_nanos",
+	"span_end",
+}
+
 // SaveCheckpoint stores a checkpoint for a durable call.
 // If a checkpoint with the same (job_id, call_index, call_type) already exists,
 // the latest result and error fields are updated in place (upsert).
@@ -1128,7 +1146,7 @@ func (s *GormStorage) SaveCheckpoint(ctx context.Context, cp *core.Checkpoint) e
 	return s.db.WithContext(ctx).
 		Clauses(clause.OnConflict{
 			Columns:   []clause.Column{{Name: "job_id"}, {Name: "call_index"}, {Name: "call_type"}},
-			DoUpdates: clause.AssignmentColumns([]string{"result", "error", "error_kind", "error_cause", "error_delay_nanos"}),
+			DoUpdates: clause.AssignmentColumns(checkpointConflictColumns),
 		}).
 		Create(row).Error
 }

@@ -107,9 +107,27 @@ type Checkpoint struct {
 	// rebuilt without parsing the formatted prefix); for sentinel errors it is
 	// the stable sentinel key. Empty for checkpoints written before this column
 	// existed — RehydrateCheckpointError falls back to message parsing then.
-	ErrorCause      string    `gorm:"type:text"`
-	ErrorDelayNanos int64     `gorm:"default:0"`
-	CreatedAt       time.Time `gorm:"autoCreateTime"`
+	ErrorCause      string `gorm:"type:text"`
+	ErrorDelayNanos int64  `gorm:"default:0"`
+	// SpanEnd is the value of the handler's call counter immediately after the
+	// checkpointed call returned — i.e. one past the LAST index that call and
+	// everything nested beneath it consumed.
+	//
+	// It exists because Call indices come from a single flat counter shared with
+	// nested durable operations. On a first run, an outer Call that internally
+	// issues its own Call consumes two indices; on replay the outer call is
+	// served from its checkpoint WITHOUT re-invoking the handler, so the nested
+	// index is never consumed and every later call reads a checkpoint one slot
+	// too low — silently returning another call's cached result, or raising a
+	// bogus determinism violation when the types happen to differ.
+	//
+	// Replay therefore jumps the counter to SpanEnd rather than incrementing it.
+	// A checkpoint written before this column existed has SpanEnd == 0, which is
+	// less than callIndex+1 and so degrades to the historical +1 behaviour —
+	// making non-nested workflows bit-for-bit unchanged, and leaving workflows
+	// already in flight exactly as (in)correct as they were before the upgrade.
+	SpanEnd   int       `gorm:"type:integer;not null;default:0"`
+	CreatedAt time.Time `gorm:"autoCreateTime"`
 }
 
 // FanOutCheckpoint stores fan-out state for job replay.

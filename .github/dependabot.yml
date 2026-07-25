@@ -13,3 +13,40 @@ updates:
       github-actions:
         patterns:
           - "*"
+
+  # Keep Go module dependencies current. This exists because govulncheck is a
+  # RELEASE-BLOCKING gate (ci.yml's release job lists it in `needs`), and a
+  # failing gate manifests as a SKIPPED release rather than a failed one — so a
+  # newly-published advisory silently wedges the pipeline until someone notices.
+  # Bumping on a schedule keeps the floor current so the gate fires during
+  # routine maintenance instead of ambushing an unrelated hotfix.
+  #
+  # prefix "fix" is load-bearing: semantic-release cuts a PATCH from a `fix:`
+  # subject, which raises the dependency floor for consumers who do not pin.
+  # Both update classes are grouped to "*" so routine churn is capped at one PR
+  # (and therefore at most one patch tag) per week.
+  - package-ecosystem: "gomod"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "fix"
+      include: "scope"
+    open-pull-requests-limit: 5
+    ignore:
+      # golang.org/x/net v0.54+ deprecates x/net/http2/h2c, which ui/handler.go
+      # imports to serve Connect streaming over cleartext HTTP/2. A previous
+      # bump past this line had to be reverted. Remove this ignore only when
+      # ui/handler.go no longer imports h2c (tracked for v5); the guard test
+      # TestDependabotPinsXNetWhileH2CIsImported enforces the pairing.
+      - dependency-name: "golang.org/x/net"
+        versions: [">=0.54.0"]
+    groups:
+      gomod-security:
+        applies-to: security-updates
+        patterns:
+          - "*"
+      gomod:
+        applies-to: version-updates
+        patterns:
+          - "*"

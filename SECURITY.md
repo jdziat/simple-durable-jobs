@@ -2,8 +2,8 @@
 
 ## Supported versions
 
-Security fixes are applied to the latest `1.x` release line. Pin a released tag
-(`v1.x.y`) rather than tracking `main`.
+Security fixes are applied to the latest `4.x` release line. Pin a released tag
+(`v4.x.y`) rather than tracking `main`.
 
 CI runs `govulncheck` against the root module on every pull request and on
 pushes to `main`; the release job depends on it, so a finding blocks the tag.
@@ -33,5 +33,8 @@ are your responsibility, not vulnerabilities in the library:
 - **The embedded UI** mounts a dashboard and a Connect-RPC API. It does not add
   authentication — wrap it with your own auth middleware (`ui.WithMiddleware`)
   and never expose it unauthenticated, especially with write endpoints enabled.
+  Middleware supplied this way runs inside the H2C handler, so it is applied to
+  every HTTP/2 stream on an upgraded connection and not only to the request that
+  performed the upgrade.
 - **Database access.** The library is only as isolated as the database
   credentials and network you give it.

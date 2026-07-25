@@ -26,6 +26,7 @@ type config struct {
 	queue                        *queue.Queue
 	statsRetention               time.Duration
 	insecureAllowUnauthenticated bool
+	disableH2C                   bool
 	authorizer                   Authorizer
 	allowedOrigins               map[string]struct{}
 	metadataRedaction            bool
@@ -70,6 +71,22 @@ func WithInsecureAllowUnauthenticated() Option {
 // the unauthenticated surface includes reads (job payloads), not only writes.
 func WithInsecureAllowUnauthenticatedWrites() Option {
 	return WithInsecureAllowUnauthenticated()
+}
+
+// WithoutH2C disables the built-in cleartext-HTTP/2 (h2c) upgrade handler.
+//
+// The dashboard wraps its handler in h2c so Connect streaming works over plain
+// HTTP. If you already terminate HTTP/2 yourself — behind TLS, or via Go 1.24+'s
+// srv.Protocols.SetUnencryptedHTTP2(true) — the built-in wrapper is redundant,
+// and removing it means no connection is hijacked inside the library at all.
+//
+// Note that any middleware supplied via [WithMiddleware] runs on every stream
+// whether or not h2c is enabled. This option is about who owns protocol
+// negotiation, not about authentication.
+func WithoutH2C() Option {
+	return optionFunc(func(c *config) {
+		c.disableH2C = true
+	})
 }
 
 // WithAuthorizer configures per-action authorization for dashboard RPCs.

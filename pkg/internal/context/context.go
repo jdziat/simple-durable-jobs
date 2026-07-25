@@ -56,6 +56,40 @@ type CallState struct {
 	Mu          sync.Mutex
 	CallIndex   int
 	Checkpoints map[CheckpointKey]*core.Checkpoint
+	// LegacySpanWarned records that this execution has already warned about
+	// replaying pre-span checkpoints, so the warning fires once per run rather
+	// than once per call.
+	LegacySpanWarned bool
+}
+
+// HasLegacyCallSpans reports whether this job carries MORE THAN ONE Call
+// checkpoint written before span tracking existed (SpanEnd == 0).
+//
+// Such a job is a candidate for the pre-v4.6 nested-call defect: its indices were
+// assigned by the old flat counter, so if any of those calls nested, every later
+// call reads a checkpoint one or more slots too low and the workflow can complete
+// carrying another call's result.
+//
+// This is deliberately a conservative OVER-approximation. Nothing persisted tells
+// us whether a legacy call actually nested, so a purely flat workflow with two or
+// more calls is also reported. Flagging safe work is cheap; missing genuinely
+// corrupted work is not.
+func (cs *CallState) HasLegacyCallSpans() bool {
+	cs.Mu.Lock()
+	defer cs.Mu.Unlock()
+	legacy := 0
+	for key, cp := range cs.Checkpoints {
+		if key.Index < 0 || cp == nil {
+			continue // phase checkpoints use Index == -1
+		}
+		if cp.SpanEnd == 0 {
+			legacy++
+			if legacy > 1 {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // UnconsumedCallCheckpoints returns how many Call checkpoints (those with a

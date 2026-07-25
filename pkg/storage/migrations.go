@@ -326,6 +326,44 @@ var schemaMigrations = []schemaMigration{
 		Name:    "fan_outs_status_allow_cancelled",
 		Up:      migrateFanOutStatusAllowCancelled,
 	},
+	{
+		Version: 36,
+		Name:    "checkpoints_span_end_column",
+		Up:      migrateCheckpointsSpanEnd,
+	},
+}
+
+// migrateCheckpointsSpanEnd guarantees checkpoints.span_end exists and is
+// NOT NULL DEFAULT 0 on every dialect.
+//
+// AutoMigrate already adds the column from the model tag, but it runs AFTER the
+// versioned ledger and its failures are not ordered against it. Recording the
+// column here means the ledger tells the truth about when it appeared, and an
+// operator reading schema_migrations can see the boundary at which nested-Call
+// replay became span-aware.
+//
+// Idempotent by construction: it no-ops when the column is already present, so
+// it is safe on a fresh install (where AutoMigrate creates the table complete)
+// and on an upgrade (where it adds the column ahead of AutoMigrate). Existing
+// rows backfill to 0, which is exactly the legacy-degradation value — a
+// checkpoint written before this column existed must keep behaving as it did.
+func migrateCheckpointsSpanEnd(ctx context.Context, db *gorm.DB, dialect string) error {
+	m := db.Migrator()
+	if !m.HasTable(&core.Checkpoint{}) {
+		// Fresh install: AutoMigrate creates the table with the column already.
+		return nil
+	}
+	if m.HasColumn(&core.Checkpoint{}, "span_end") {
+		return nil
+	}
+	// Same DDL on all three dialects; spelled out rather than delegated to
+	// AutoMigrate so the ledger row corresponds to a statement we control.
+	if err := db.WithContext(ctx).Exec(
+		"ALTER TABLE checkpoints ADD COLUMN span_end INTEGER NOT NULL DEFAULT 0",
+	).Error; err != nil {
+		return fmt.Errorf("add checkpoints.span_end (%s): %w", dialect, err)
+	}
+	return nil
 }
 
 // applyPreMigrations runs every registered pre-AutoMigrate one-shot through a
@@ -426,12 +464,28 @@ func (s *GormStorage) applyPendingMigrations(ctx context.Context, db *gorm.DB) e
 		return fmt.Errorf("storage: read schema_migrations ledger: %w", err)
 	}
 	done := make(map[int]bool, len(applied))
+	appliedName := make(map[int]string, len(applied))
 	for _, m := range applied {
 		done[m.Version] = true
+		appliedName[m.Version] = m.Name
 	}
 
 	dialect := s.dialect()
 	for _, m := range schemaMigrations {
+		// The ledger is keyed on Version alone, so a version that was renumbered
+		// after shipping — two branches both claiming the next free slot, and one
+		// silently moving — would be skipped as "already applied" while its DDL
+		// never ran. That is unrecoverable in place: the row says done, so it can
+		// never re-run. Compare the recorded name and refuse instead.
+		//
+		// Empty recorded names are tolerated: rows written before this column was
+		// populated carry none, and failing on them would brick an upgrade.
+		if prior, ok := appliedName[m.Version]; ok && prior != "" && prior != m.Name {
+			return fmt.Errorf(
+				"storage: migration ledger mismatch at version %d: database recorded %q but this binary compiles %q; "+
+					"a migration version was renumbered after shipping. Do NOT renumber — add a new version instead",
+				m.Version, prior, m.Name)
+		}
 		if done[m.Version] {
 			continue
 		}
