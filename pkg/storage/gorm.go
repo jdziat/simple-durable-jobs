@@ -1128,7 +1128,11 @@ func (s *GormStorage) SaveCheckpoint(ctx context.Context, cp *core.Checkpoint) e
 	return s.db.WithContext(ctx).
 		Clauses(clause.OnConflict{
 			Columns:   []clause.Column{{Name: "job_id"}, {Name: "call_index"}, {Name: "call_type"}},
-			DoUpdates: clause.AssignmentColumns([]string{"result", "error", "error_kind", "error_cause", "error_delay_nanos"}),
+			// span_end MUST be in this list. A re-saved checkpoint that keeps a
+			// stale span silently re-opens the nested-call replay corruption on
+			// the upsert path, which is the one path a test that only ever
+			// INSERTs will never cover.
+			DoUpdates: clause.AssignmentColumns([]string{"result", "error", "error_kind", "error_cause", "error_delay_nanos", "span_end"}),
 		}).
 		Create(row).Error
 }
