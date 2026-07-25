@@ -1,0 +1,116 @@
+# govulncheck-scheduled.yml — daily reachability scan against the live
+# vulnerability database.
+#
+# WHY THIS EXISTS, SEPARATELY FROM ci.yml
+#
+# ci.yml's `govulncheck` job is RELEASE-BLOCKING (the `release` job lists it in
+# `needs`). That strictness is deliberate and is not relaxed here. But it only
+# runs on push and pull_request, so a newly-published advisory against an
+# unchanged dependency is invisible until the next push — at which point the
+# release is SKIPPED rather than failed, and the pipeline is wedged at the worst
+# possible moment: during an unrelated hotfix.
+#
+# This workflow pages a human on the advisory's own timeline instead. It is a
+# NEW file rather than an edit to ci.yml so the release-gating job stays
+# byte-identical and this never contends with a change to ci.yml.
+name: govulncheck (scheduled)
+
+on:
+  schedule:
+    # 05:23 UTC — deliberately off the hour, so this does not pile onto the
+    # top-of-hour spike that every other scheduled job in the world uses.
+    - cron: '23 5 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  scan:
+    name: scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: '1.25.12'
+
+      # Same pinned scanner as ci.yml. govulncheck still fetches the current
+      # vulnerability database at runtime, so the pinned binary stays current on
+      # advisories; bump the pin deliberately.
+      - name: Run govulncheck
+        id: scan
+        run: |
+          set +e
+          go run golang.org/x/vuln/cmd/govulncheck@v1.3.0 ./... > report.txt 2>&1
+          code=$?
+          set -e
+          cat report.txt
+
+          # Three-way discrimination is load-bearing. govulncheck exits 3 when it
+          # finds called vulnerabilities and 0 when clean; ANY other non-zero
+          # means the scanner itself failed (network, module resolution,
+          # toolchain). Collapsing "any non-zero" into "findings" would turn a
+          # broken scanner into a daily false alarm; collapsing "any non-3" into
+          # "clean" would turn it into a silent all-clear — which is exactly the
+          # failure mode this workflow exists to remove.
+          case "$code" in
+            0)
+              echo "status=clean" >> "$GITHUB_OUTPUT"
+              ;;
+            3)
+              echo "status=findings" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "::error::govulncheck failed to run (exit $code) — this is a scanner failure, not a clean result"
+              exit "$code"
+              ;;
+          esac
+
+      # Keep exactly ONE open tracking issue. `gh issue create --label` errors on
+      # an unknown label, so the label is ensured first.
+      - name: Open or update the tracking issue
+        if: steps.scan.outputs.status == 'findings'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TITLE: 'govulncheck: reachable vulnerabilities on main'
+        run: |
+          gh label create security-scan --color B60205 \
+            --description 'Automated govulncheck finding' --force
+
+          {
+            echo "The daily reachability scan found called vulnerabilities on \`main\`."
+            echo
+            echo "**This blocks releases** — \`govulncheck\` is in the \`release\` job's \`needs\`, so a"
+            echo "merge to main will be built and tested but will mint no tag until this is clear."
+            echo
+            echo "Scan of ${GITHUB_SHA} at $(date -u +%Y-%m-%dT%H:%M:%SZ):"
+            echo
+            echo '```'
+            cat report.txt
+            echo '```'
+          } > body.md
+
+          existing=$(gh issue list --state open --label security-scan \
+            --search "$TITLE in:title" --json number --jq '.[0].number // empty')
+
+          if [ -n "$existing" ]; then
+            gh issue edit "$existing" --body-file body.md
+            echo "updated issue #$existing"
+          else
+            gh issue create --title "$TITLE" --label security-scan --body-file body.md
+          fi
+
+      - name: Close the tracking issue when clean
+        if: steps.scan.outputs.status == 'clean'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TITLE: 'govulncheck: reachable vulnerabilities on main'
+        run: |
+          for n in $(gh issue list --state open --label security-scan \
+              --search "$TITLE in:title" --json number --jq '.[].number'); do
+            gh issue close "$n" --comment "Scan of ${GITHUB_SHA} is clean — no reachable vulnerabilities."
+          done

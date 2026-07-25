@@ -2,8 +2,8 @@
 
 ## Supported versions
 
-Security fixes are applied to the latest `1.x` release line. Pin a released tag
-(`v1.x.y`) rather than tracking `main`.
+Security fixes are applied to the latest `4.x` release line. Pin a released tag
+(`v4.x.y`) rather than tracking `main`.
 
 CI runs `govulncheck` against the root module on every pull request and on
 pushes to `main`; the release job depends on it, so a finding blocks the tag.
