@@ -154,6 +154,52 @@ flapping dependency is not hammered.
   catch nondeterministic handlers early.
 - **`BestEffort`** — logs mismatches and re-executes instead of erroring.
 
+### Nested durable operations and replay (upgrading to v4.6)
+
+`Call()` indices come from one counter shared with everything nested beneath a
+call. Before v4.6 an outer `Call` served from its checkpoint on replay did not
+account for the indices its nested operations had consumed, so a later `Call`
+could read the wrong checkpoint — returning another call's cached result, or
+raising a determinism violation against a handler that was in fact deterministic.
+
+From v4.6 each checkpoint records the index span its call consumed and replay
+skips that span, so nesting is safe to arbitrary depth.
+
+**This fix is forward-looking.** A checkpoint already on disk has no recorded
+span and deliberately keeps the old behaviour, so a workflow that was in flight
+across the upgrade is left exactly as it was rather than changing shape
+mid-replay. Two consequences:
+
+1. **Drain nested workflows before upgrading** where you can. Requeueing is the
+   only operation that clears checkpoints.
+2. **Find work that predates the fix** with `FindLegacyCallSpanJobs`:
+
+   ```go
+   suspect, err := storage.FindLegacyCallSpanJobs(ctx, 100)
+   for _, j := range suspect {
+       log.Printf("job %s (%s) has %d pre-span Call checkpoints", j.JobID, j.JobType, j.CallCheckpoints)
+   }
+   ```
+
+   or directly in SQL:
+
+   ```sql
+   SELECT j.id, j.type, count(c.id) AS call_checkpoints
+   FROM jobs j
+   INNER JOIN checkpoints c ON c.job_id = j.id
+   WHERE c.call_index >= 0 AND c.span_end = 0
+     AND j.status NOT IN ('completed', 'cancelled', 'failed')
+   GROUP BY j.id, j.type
+   HAVING count(c.id) > 1;
+   ```
+
+   The listing is a deliberate over-approximation: nothing recorded tells us
+   whether a legacy call actually nested, so flat workflows with two or more
+   calls appear too. Requeue anything you cannot rule out.
+
+A worker replaying pre-span checkpoints also logs one `WARN` per run naming the
+job, so this is visible without running the query.
+
 ## Schema migrations
 
 `Migrate()` runs GORM `AutoMigrate` (additive column/index creation) and then

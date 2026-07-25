@@ -113,6 +113,18 @@ func CallWithCheckpointCtx[T any](execCtx, checkpointCtx context.Context, name s
 		// behaviour untouched.
 		cs.CallIndex = checkpoint.SpanEnd
 	}
+	// Warn once per execution when this job is replaying checkpoints written
+	// before span tracking existed. Those indices came from the old flat counter,
+	// so if any of those calls nested, this replay can still return another
+	// call's cached result — the fix is forward-looking and cannot repair work
+	// already checkpointed. Requeue is the only path that clears checkpoints.
+	//
+	// WARN, not Debug: an operator who never sees this has no way to learn that
+	// in-flight work predates the fix.
+	warnLegacy := hasCheckpoint && !cs.LegacySpanWarned
+	if warnLegacy {
+		cs.LegacySpanWarned = true
+	}
 	var mismatched *core.Checkpoint
 	if !hasCheckpoint {
 		for cpKey, cp := range cs.Checkpoints {
@@ -123,6 +135,16 @@ func CallWithCheckpointCtx[T any](execCtx, checkpointCtx context.Context, name s
 		}
 	}
 	cs.Mu.Unlock()
+
+	// Emitted outside the critical section: HasLegacyCallSpans takes the same
+	// mutex, and the logger call is arbitrary user code that must not run under
+	// a lock the rest of the job's calls contend on.
+	if warnLegacy && jc.Logger != nil && cs.HasLegacyCallSpans() {
+		jc.Logger.Warn(
+			"jobs.Call replaying checkpoints written before span tracking; a nested durable op in this "+
+				"workflow may return another call's cached result. Requeue the job to clear its checkpoints",
+			"job_id", jc.Job.ID, "job_type", jc.Job.Type)
+	}
 
 	// If we have a checkpoint, return the cached result
 	if hasCheckpoint {
