@@ -378,6 +378,16 @@ func migrateJobStatsTimestampIndex(ctx context.Context, db *gorm.DB, dialect str
 	if err := db.WithContext(ctx).Exec(
 		"CREATE INDEX " + jobStatsTimestampIndex + " ON " + jobStatsTable + " (timestamp)",
 	).Error; err != nil {
+		// The HasIndex guard above is a check-then-act, and the mirror in
+		// ui.gormStatsStorage.MigrateStats runs WITHOUT the fleet lock this
+		// migration holds — so a dashboard mounting concurrently with Migrate()
+		// can create the index between our check and our CREATE. Losing that race
+		// must not abort the migration: re-check, and only fail if the index
+		// genuinely is not there. (CREATE INDEX IF NOT EXISTS would cover SQLite
+		// and Postgres but not MySQL, so the re-check is the portable form.)
+		if m.HasIndex(jobStatsTable, jobStatsTimestampIndex) {
+			return nil
+		}
 		return fmt.Errorf("create %s (%s): %w", jobStatsTimestampIndex, dialect, err)
 	}
 	return nil

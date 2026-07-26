@@ -140,7 +140,8 @@ func TestPause_AggressiveDoesNotStopTheHeartbeat(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	go w.processJob(ctx, job)
+	done := make(chan struct{})
+	go func() { defer close(done); w.processJob(ctx, job) }()
 	select {
 	case <-started:
 	case <-time.After(10 * time.Second):
@@ -154,5 +155,13 @@ func TestPause_AggressiveDoesNotStopTheHeartbeat(t *testing.T) {
 		"a still-running job must keep its lease through an aggressive pause; dropping it lets the "+
 			"stale-lock reaper hand the job to a peer while this handler is still executing it")
 
+	// Await processJob before the test returns. It keeps writing to the store and
+	// logging after the handler unblocks, and a goroutine outliving its test is a
+	// source of flaky -race reports and "log after test finished" panics.
 	close(release)
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("processJob never returned after the handler unblocked")
+	}
 }

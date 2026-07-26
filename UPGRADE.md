@@ -195,7 +195,9 @@ count on every child unconditionally, which made the fan-out default unreachable
 - **Hand-written `fanout.SubJob{}` literals** with no explicit `Retries` go from
   3 retries to 2. The fan-out default is now `queue.DefaultJobRetries`, matching
   what `Sub()`-built children already received — chosen so the common path does
-  not move. Set `Retries` explicitly if you relied on 3.
+  not move. Set `Retries` explicitly if you relied on 3. A literal that DOES set
+  `Retries` or `Priority` keeps its value; only an absent (zero) one takes the
+  fan-out default.
 - Passing a dedup option (`Unique`, `IdempotencyKey`, `UniqueFor`) to `Sub` logs
   one `WARN` per fan-out. Those are parent-level concepts and remain ignored:
   children carry a fan-out-owned unique key so parent replay stays idempotent.

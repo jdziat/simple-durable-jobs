@@ -244,17 +244,26 @@ func buildSubJobs(subJobs []SubJob, cfg *config, jc *intctx.JobContext, fanOutID
 			return nil, fmt.Errorf("invalid sub-job queue name %q: %w", queue, err)
 		}
 
+		// The fan-out default applies only when the field is BOTH unmarked and
+		// zero, which keeps two different callers working at once:
+		//
+		//   Sub("t", a, queue.Retries(0))  -> marked, value 0   -> stays 0
+		//   SubJob{Type: "t", Retries: 5}  -> unmarked, value 5 -> stays 5
+		//
+		// The *Set flags exist because Sub() cannot otherwise distinguish an
+		// explicit zero from an absence. But they are only set by the OPTION path,
+		// and SubJob is an exported struct with exported fields that callers build
+		// as a literal (the api-reference docs show the slice form, and the
+		// package's own tests use bare literals). Testing the flag ALONE would
+		// therefore discard a literal's explicit non-zero value in favour of the
+		// fan-out default — silently, since nothing reads back the child's config.
 		priority := sj.Priority
-		if !sj.PrioritySet {
+		if !sj.PrioritySet && priority == 0 {
 			priority = cfg.priority
 		}
 
-		// Determine retries with fallback, then clamp to security limits
-		// RetriesSet — not a zero test — decides "unset", so an explicit
-		// Retries(0) stays 0 instead of being overridden by the fan-out default.
-		// Mirrors the PrioritySet handling above.
 		retries := sj.Retries
-		if !sj.RetriesSet {
+		if !sj.RetriesSet && retries == 0 {
 			retries = cfg.retries
 		}
 		retries = security.ClampRetries(retries)
