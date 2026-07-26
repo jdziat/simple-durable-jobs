@@ -622,3 +622,47 @@ func TestSearchJobs_ServerSideSortWhitelist(t *testing.T) {
 	require.Len(t, baseline, 3)
 	assert.Equal(t, jobIDs(baseline), jobIDs(hostile), "hostile sort key falls back to created_at, dir honored")
 }
+
+// TestGetQueueDepthStats_OldestPendingAtIgnoresNotYetDueJobs is the dashboard
+// half of the same invariant — the metric and this card were two copies of one
+// query, so a fix to one alone would leave the dashboard lying.
+//
+// It uses newTestStorage, NOT the sqlite-only newUITestStorage, deliberately:
+// MySQL evaluates eligibility through the dq_eligible_at generated column rather
+// than COALESCE(run_at, created_at), so a sqlite-pinned harness would leave the
+// MySQL expression permanently unexecuted and still report green.
+func TestGetQueueDepthStats_OldestPendingAtIgnoresNotYetDueJobs(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStorage(t)
+	now := time.Now()
+	dueAt := now.Add(-30 * time.Minute)
+	createdLongAgo := now.Add(-5 * time.Hour)
+	notDueUntil := now.Add(24 * time.Hour)
+
+	jobs := []*core.Job{
+		{ID: testUUID("pkt18-ui-mixed-due"), Type: "work", Queue: "mixed", Status: core.StatusPending, Args: []byte(`{}`), CreatedAt: dueAt},
+		// Created EARLIER than the due job on purpose: under MIN(created_at) this
+		// row wins, which is exactly the false green a naive seeding order hides.
+		{ID: testUUID("pkt18-ui-mixed-scheduled"), Type: "work", Queue: "mixed", Status: core.StatusPending, Args: []byte(`{}`), CreatedAt: createdLongAgo, RunAt: &notDueUntil},
+		{ID: testUUID("pkt18-ui-future-only"), Type: "work", Queue: "scheduled-only", Status: core.StatusPending, Args: []byte(`{}`), CreatedAt: createdLongAgo, RunAt: &notDueUntil},
+	}
+	for _, job := range jobs {
+		require.NoError(t, store.Enqueue(ctx, job))
+	}
+
+	stats, err := store.GetQueueDepthStats(ctx)
+	require.NoError(t, err)
+	byQueue := queueStatsByName(stats)
+
+	require.NotNil(t, byQueue["mixed"])
+	require.NotNil(t, byQueue["mixed"].OldestPendingAt, "a queue holding a due job must show an age")
+	assert.WithinDuration(t, dueAt, byQueue["mixed"].OldestPendingAt.AsTime(), time.Second,
+		"dashboard age must track the oldest DUE job")
+
+	// The queue must still be LISTED with its depth — the fix suppresses the age,
+	// it does not hide the queue.
+	require.NotNil(t, byQueue["scheduled-only"], "the queue must still be listed with its depth")
+	assert.Equal(t, int64(1), byQueue["scheduled-only"].Pending)
+	assert.Nil(t, byQueue["scheduled-only"].OldestPendingAt,
+		"a queue holding only not-yet-due jobs must report no backlog age")
+}

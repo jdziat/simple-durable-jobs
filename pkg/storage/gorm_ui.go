@@ -2,7 +2,6 @@ package storage
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -77,29 +76,23 @@ func (s *GormStorage) getQueueDepthStats(ctx context.Context) ([]*jobsv1.QueueSt
 		}
 	}
 
-	type pendingRow struct {
-		Queue           string
-		OldestPendingAt sql.NullString
-	}
-	var pendingRows []pendingRow
-	if err := s.db.WithContext(ctx).
-		Model(&core.Job{}).
-		Select("queue, MIN(created_at) AS oldest_pending_at").
-		Where("status = ?", core.StatusPending).
-		Group("queue").
-		Find(&pendingRows).Error; err != nil {
+	// Share the metrics loader instead of repeating the aggregate here. The
+	// dashboard and the jobs.backlog.oldest_age gauge used to run two independent
+	// copies of the same MIN(created_at), and both copies carried the same defect:
+	// a scheduled job aged the backlog from when it was CREATED rather than from
+	// when it became due, so a single job due next month pinned this card at "a
+	// month old" forever. One loader means a fix cannot land in only one of them.
+	oldestByQueue, err := s.queueOldestPendingAt(ctx)
+	if err != nil {
 		return nil, err
 	}
-	for _, r := range pendingRows {
-		qs, ok := statsMap[r.Queue]
+	for queueName, oldestPendingAt := range oldestByQueue {
+		qs, ok := statsMap[queueName]
 		if !ok {
-			qs = &jobsv1.QueueStats{Name: r.Queue}
-			statsMap[r.Queue] = qs
+			qs = &jobsv1.QueueStats{Name: queueName}
+			statsMap[queueName] = qs
 		}
-		oldestPendingAt, ok := parseDBTimestamp(r.OldestPendingAt.String)
-		if r.OldestPendingAt.Valid && ok {
-			qs.OldestPendingAt = timestamppb.New(oldestPendingAt)
-		}
+		qs.OldestPendingAt = timestamppb.New(oldestPendingAt)
 	}
 
 	// Check which queues are paused. Surface a failed pause-state read rather than

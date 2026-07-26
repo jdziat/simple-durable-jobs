@@ -70,8 +70,10 @@ func (s *GormStorage) RateLimitWindowCardinality(ctx context.Context) (int64, er
 	return n, err
 }
 
-// QueueOldestPendingAt returns the oldest pending job creation timestamp by
-// queue for optional metrics instrumentation.
+// QueueOldestPendingAt returns, per queue, the eligibility timestamp of the
+// oldest pending job that is ALREADY DUE, for optional metrics instrumentation.
+// Queues whose pending jobs are all scheduled for the future are omitted: they
+// have nothing claimable, so they have no backlog age.
 func (s *GormStorage) QueueOldestPendingAt(ctx context.Context) (map[string]time.Time, error) {
 	if s.hotStats == nil { // zero-value storage: bypass the cache
 		return s.queueOldestPendingAt(ctx)
@@ -79,16 +81,48 @@ func (s *GormStorage) QueueOldestPendingAt(ctx context.Context) (map[string]time
 	return s.hotStats.oldestPending.do(ctx, s.hotStatsTTLValue(), cloneStringTimeMap, s.queueOldestPendingAt)
 }
 
+// queueOldestPendingAt is the single uncached loader behind every backlog-age
+// surface: the jobs.backlog.oldest_age gauge, the dashboard's per-queue
+// oldest_pending_at, and `sdj queues`' BACKLOG_AGE column. Two things here are
+// load-bearing and both were wrong:
+//
+//  1. The age is anchored to the DEQUEUE'S OWN eligibility expression, not to
+//     created_at. A job scheduled a month out is CREATED now and becomes
+//     claimable LATER; ageing it from created_at reports backlog the queue could
+//     not possibly have worked yet.
+//  2. Not-yet-due rows are excluded outright. Without that, a queue holding only
+//     future work reports a FUTURE timestamp — a negative age, which the metrics
+//     collector silently drops and the dashboard renders as a live backlog.
+//
+// Together these produced the reported symptom: one scheduled job pinned
+// backlog-age alerts at "hours old" forever, so operators muted the alert and
+// lost the signal entirely. Reusing dequeueEligibleExpr rather than re-deriving
+// the predicate is deliberate — the metric and the claim query can now only
+// disagree if the shared helper changes, which changes both.
 func (s *GormStorage) queueOldestPendingAt(ctx context.Context) (map[string]time.Time, error) {
 	type row struct {
 		Queue           string
 		OldestPendingAt sql.NullString
 	}
+
+	// Same clock discipline as the dequeue: the DB server clock on
+	// Postgres/MySQL so the metric cannot disagree with the claim query across
+	// worker skew, and the caller's LOCAL wall clock on single-process SQLite.
+	// Do NOT .UTC() the SQLite bind — SQLite stores timestamps as TEXT with
+	// whatever offset they arrive with and created_at is written in local time,
+	// so these comparisons are lexical and normalizing one side would mis-compare.
+	var now any = time.Now()
+	if s.useDBClock() {
+		now = s.nowExpr()
+	}
+
+	eligExpr := s.dequeueEligibleExpr()
 	var rows []row
 	if err := s.db.WithContext(ctx).
 		Model(&core.Job{}).
-		Select("queue, MIN(created_at) AS oldest_pending_at").
+		Select("queue, MIN("+eligExpr+") AS oldest_pending_at").
 		Where("status = ?", core.StatusPending).
+		Where(eligExpr+" <= ?", now).
 		Group("queue").
 		Find(&rows).Error; err != nil {
 		return nil, err
