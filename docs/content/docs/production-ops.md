@@ -232,6 +232,32 @@ index `idx_jobs_dq_unready`; MySQL uses the `(status, dq_ready)` prefix of
 ready backlog. The chaos suite's `INV-READY-NO-STUCK` invariant asserts no
 eligible job is ever left unready.
 
+### MySQL must default to utf8mb4
+
+The schema pins `utf8mb4_0900_*` collations, which exist only in **MySQL 8.0+**.
+A database still defaulting to `utf8mb3` — the MySQL 5.x-era default, and what an
+older `CREATE DATABASE` leaves behind — cannot carry them: the column would
+inherit `utf8mb3` while being handed a `utf8mb4` collation, and the server
+rejects it with `ER_COLLATION_CHARSET_MISMATCH`.
+
+`Migrate` checks this up front and refuses **before applying any DDL**, so a
+legacy database fails with a clear message instead of crashlooping half-migrated.
+The remedy:
+
+```sql
+ALTER DATABASE `your_db` CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+
+-- Existing tables keep their old charset until converted individually:
+ALTER TABLE `your_table` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+```
+
+Then re-run `Migrate`. A brand-new database created by MySQL 8.0 already defaults
+to `utf8mb4` and needs none of this.
+
+**MariaDB is not supported.** It has no `utf8mb4_0900_*` collations at all, so the
+same preflight refuses it by name rather than sending you after a character set
+that is already correct.
+
 ## Schema Migrations At Scale
 
 `sdj migrate` — and the automatic `Migrate` on worker startup — is idempotent and
