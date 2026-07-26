@@ -123,6 +123,36 @@ type (
 	// SignalDelivered is emitted when a signal is persisted for a job.
 	SignalDelivered = core.SignalDelivered
 
+	// The seven aliases below were missing until the 2026-07-24 teardown: the
+	// queue emitted all of these (pkg/queue/queue.go PauseJob/ResumeJob/
+	// PauseQueue/ResumeQueue/EmitCustomEvent, pkg/worker/worker.go Pause/Resume)
+	// and api-reference/events.md documented four of them, but a facade-only user
+	// could not name the types — so the README's own `case *jobs.JobPaused:` did
+	// not compile, and pause/resume were effectively unobservable without
+	// reaching past the facade into pkg/core, which the README says you never
+	// need to do.
+
+	// JobPaused is emitted when a job is paused.
+	JobPaused = core.JobPaused
+
+	// JobResumed is emitted when a paused job is resumed via Queue.ResumeJob.
+	JobResumed = core.JobResumed
+
+	// QueuePaused is emitted when a named queue is paused.
+	QueuePaused = core.QueuePaused
+
+	// QueueResumed is emitted when a named queue is resumed.
+	QueueResumed = core.QueueResumed
+
+	// WorkerPaused is emitted when a worker is paused.
+	WorkerPaused = core.WorkerPaused
+
+	// WorkerResumed is emitted when a worker is resumed.
+	WorkerResumed = core.WorkerResumed
+
+	// CustomEvent is the ephemeral event emitted by Queue.EmitCustomEvent.
+	CustomEvent = core.CustomEvent
+
 	// NoRetryError indicates an error that should not be retried.
 	NoRetryError = core.NoRetryError
 
@@ -508,6 +538,17 @@ func LowLatencyPoolConfig() PoolConfig {
 // ResourceConstrainedPoolConfig returns pool settings for limited database resources.
 func ResourceConstrainedPoolConfig() PoolConfig {
 	return storage.ResourceConstrainedPoolConfig()
+}
+
+// WithPoolConfig turns a PoolConfig — including the presets above — into a
+// PoolOption accepted by NewGormStorageWithPool and ConfigurePool.
+//
+// Without this, PoolOption was sealed by an unexported method and no exported
+// function took a PoolConfig, so the three presets were dead exported API and
+// the documented NewGormStorageWithPool(db, jobs.HighConcurrencyPoolConfig())
+// could not compile (2026-07-24 teardown).
+func WithPoolConfig(cfg PoolConfig) PoolOption {
+	return storage.WithPoolConfig(cfg)
 }
 
 // MaxOpenConns sets the maximum number of open database connections.

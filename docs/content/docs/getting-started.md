@@ -277,7 +277,13 @@ if err := queue.Schedule("backup", nil, jobs.Weekly(time.Sunday, 2, 0)); err != 
 }
 
 // Cron expression
-if err := queue.Schedule("hourly", nil, jobs.Cron("0 * * * *")); err != nil {
+// Cron parses eagerly and returns (Schedule, error), so a malformed expression
+// fails here rather than silently never firing.
+hourly, err := jobs.Cron("0 * * * *")
+if err != nil {
+    return err
+}
+if err := queue.Schedule("hourly", nil, hourly); err != nil {
     return err
 }
 
