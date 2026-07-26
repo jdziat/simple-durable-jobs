@@ -29,6 +29,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -52,10 +53,27 @@ func init() {
 	// Register the worker factory to enable queue.NewWorker()
 	queue.WorkerFactory = func(q *queue.Queue, opts ...any) core.Starter {
 		workerOpts := make([]worker.WorkerOption, 0, len(opts))
-		for _, opt := range opts {
+		for i, opt := range opts {
 			if wo, ok := opt.(worker.WorkerOption); ok {
 				workerOpts = append(workerOpts, wo)
+				continue
 			}
+			// Queue.NewWorker takes ...any because the facade cannot name
+			// worker.WorkerOption without an import cycle. That made every
+			// mistyped or misplaced argument a SILENT no-op: passing a
+			// queue.Option, a bare value, or an option from the wrong
+			// constructor left the worker running on defaults with no
+			// indication anything was ignored — the kind of misconfiguration
+			// that is only discovered from production behaviour.
+			//
+			// Logged rather than panicked in v4: turning a currently-working
+			// (if wrongly-configured) process into a startup crash on a patch
+			// upgrade would convert a latent bug into an outage. v5 replaces
+			// this with a typed signature, where the compiler catches it.
+			slog.Default().Error(
+				"jobs: ignoring argument to NewWorker that is not a jobs.WorkerOption; "+
+					"the worker is running WITHOUT it",
+				"index", i, "type", fmt.Sprintf("%T", opt))
 		}
 		return worker.NewWorker(q, workerOpts...)
 	}
