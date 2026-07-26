@@ -125,6 +125,31 @@ and a still-running job keeps its lease until the handler actually returns.
 around a pause. Alerting that counted those events will see them stop. Resume
 simply re-dispatches the job.
 
+### A blocked `Unique` schedule is skipped, not retried at 10 Hz
+
+**Before:** a scheduled job declared with `queue.Unique(key)` dedups against its
+own still-running previous fire. The scheduler treated that as a failure — logged
+an `ERROR`, did not advance the durable cursor, and retried 100 ms later — for the
+**entire runtime of the previous instance**. One transaction and one error log
+per tick.
+
+**After:** a unique-key dedup is a deliberate skip. The claim commits so the
+cursor advances and peers stop re-attempting the boundary, and it logs at `INFO`.
+Genuine failures now back off per schedule (100 ms doubling to 30 s) instead of
+retrying every tick, and a schedule that can never fire — an unsatisfiable cron
+such as `0 0 30 2 *` — is logged once and skipped rather than spinning forever.
+
+**What you may notice:** a boundary blocked by a long-running instance is now
+**skipped outright** rather than eventually firing late (and then producing a
+burst of overdue fires). That is the correct reading of `Unique`, and matches
+cron+flock and Quartz's DoNothing policy — but if you relied on the delayed fire
+arriving eventually, it no longer does.
+
+A skipped boundary advances the cursor but deliberately does **not** stamp the
+schedule's last-fire time, so the dashboard's overdue/health indicator still
+shows the schedule as not having run. A schedule blocked for hours reads as
+blocked, not as healthy.
+
 ### Fan-out sub-job options are honoured
 
 **Before:** `fanout.Sub` accepted the full `queue.Option` set and silently dropped

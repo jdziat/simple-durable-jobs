@@ -247,10 +247,30 @@ func (q *Queue) EnqueueScheduledFire(ctx context.Context, scheduleName string, f
 		// in the storage's serialization-retry so a scheduled fire of a Unique/
 		// IdempotencyKey schedule under contention is retried rather than failing the
 		// tick. claimed/id are reset per attempt so a rolled-back attempt never leaks.
+		deduped := false
 		runTx := func() error {
 			claimed = false
 			id = core.NilUUID
+			deduped = false
 			return dbp.DB().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+				// Capture the schedule's last REAL fire before claiming. The claim
+				// stamps last_fire_at (the cursor) and last_fired_at (the real-fire
+				// marker) together, but a deliberate skip must advance only the
+				// cursor: last_fired_at feeds the dashboard's per-schedule last-run
+				// and its overdue/health indicator, so stamping it on a skip would
+				// render a schedule blocked for hours by a stuck unique job as
+				// perfectly healthy. Restored below if the fire turns out to be a skip.
+				var priorFiredAt *time.Time
+				{
+					var prior core.ScheduledFire
+					if e := tx.WithContext(ctx).
+						Where("name = ?", scheduleName).
+						First(&prior).Error; e == nil {
+						priorFiredAt = prior.LastFiredAt
+					} else if !errors.Is(e, gorm.ErrRecordNotFound) {
+						return e
+					}
+				}
 				won, e := txClaimer.ClaimScheduledFireTx(ctx, tx, scheduleName, fireTime)
 				if e != nil {
 					return e
@@ -261,6 +281,27 @@ func (q *Queue) EnqueueScheduledFire(ctx context.Context, scheduleName string, f
 				}
 				jid, e := q.EnqueueTx(ctx, tx, jobName, args, opts...)
 				if e != nil {
+					if errors.Is(e, core.ErrDuplicateJob) {
+						// Deliberate SKIP, not a failure: the schedule declared
+						// queue.Unique and a previous fire is still live, so enqueuing a
+						// second instance is precisely what the author asked us not to
+						// do. COMMIT the claim (return nil) so the durable cursor
+						// advances past a boundary that was evaluated and intentionally
+						// not run, and peers stop re-attempting it. Rolling back instead
+						// left the boundary re-claimable, so a polling caller retried it
+						// every tick for the ENTIRE runtime of the previous instance —
+						// one transaction and one ERROR log per 100ms. Reported to the
+						// caller via the sentinel returned below.
+						// Advance the cursor but NOT the real-fire marker: nothing ran.
+						if e := tx.WithContext(ctx).
+							Model(&core.ScheduledFire{}).
+							Where("name = ?", scheduleName).
+							Update("last_fired_at", priorFiredAt).Error; e != nil {
+							return e
+						}
+						deduped = true
+						return nil
+					}
 					return e // rolls back the claim so the boundary stays re-claimable
 				}
 				id = jid
@@ -277,6 +318,13 @@ func (q *Queue) EnqueueScheduledFire(ctx context.Context, scheduleName string, f
 		}
 		if txErr != nil {
 			return false, core.NilUUID, txErr
+		}
+		if deduped {
+			// claimed=true with a nil id and this sentinel means "boundary consumed,
+			// deliberately not run" — distinct from both a peer's claim
+			// (claimed=false, nil error) and a genuine failure (non-nil error with
+			// the claim rolled back).
+			return claimed, core.NilUUID, core.ErrDuplicateJob
 		}
 		return claimed, id, nil
 	}

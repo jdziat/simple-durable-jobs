@@ -2709,11 +2709,46 @@ func (w *Worker) establishScheduleBase(ctx context.Context, name string, sched s
 	return now
 }
 
+// Per-schedule retry backoff for a GENUINE scheduled-fire failure. The scheduler
+// ticks at 10Hz; without a backoff every failing schedule costs one transaction
+// and one ERROR log per tick for as long as the failure lasts. The first retry is
+// still one tick later, so a transient blip recovers as fast as before.
+const (
+	scheduleFireRetryBase = 100 * time.Millisecond
+	scheduleFireRetryMax  = 30 * time.Second
+)
+
+// scheduleFireRetryDelay doubles from scheduleFireRetryBase and saturates at
+// scheduleFireRetryMax. Deliberately jitter-free: a fire claim is a single-row
+// transaction, the fleet-wide herd is bounded by the worker count, and
+// determinism keeps it testable.
+func scheduleFireRetryDelay(consecutiveFailures int) time.Duration {
+	if consecutiveFailures < 1 {
+		consecutiveFailures = 1
+	}
+	delay := scheduleFireRetryBase
+	for i := 1; i < consecutiveFailures; i++ {
+		if delay >= scheduleFireRetryMax {
+			break
+		}
+		delay *= 2
+	}
+	if delay > scheduleFireRetryMax {
+		return scheduleFireRetryMax
+	}
+	return delay
+}
+
 func (w *Worker) runScheduler(ctx context.Context) {
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 
 	lastRun := make(map[string]time.Time)
+	// Per-schedule backoff state for GENUINE fire failures, and a once-per-name
+	// latch for schedules that can never fire.
+	fireFailures := make(map[string]int)
+	fireRetryAt := make(map[string]time.Time)
+	neverFiresLogged := make(map[string]bool)
 
 	for {
 		select {
@@ -2728,6 +2763,13 @@ func (w *Worker) runScheduler(ctx context.Context) {
 
 			now := time.Now()
 			for name, sj := range scheduled {
+				// A schedule whose last attempt failed for a GENUINE reason is backing
+				// off. lastRun is not advanced while it does, so the due boundary is
+				// still due when the backoff expires — nothing is dropped, it is just
+				// not re-attempted at the tick rate.
+				if retryAt, backingOff := fireRetryAt[name]; backingOff && now.Before(retryAt) {
+					continue
+				}
 				if _, ok := lastRun[name]; !ok {
 					// First sight of this schedule: establish a fire-boundary base
 					// that every worker in the fleet agrees on, so skewed wall
@@ -2736,6 +2778,20 @@ func (w *Worker) runScheduler(ctx context.Context) {
 					lastRun[name] = w.establishScheduleBase(ctx, name, sj.Schedule, now)
 				}
 				nextRun := sj.Schedule.Next(lastRun[name])
+				if nextRun.IsZero() {
+					// The schedule has no future fire (an unsatisfiable cron such as
+					// "0 0 30 2 *"; cron.SpecSchedule.Next returns the zero time when
+					// nothing matches within five years). Next is pure in its input and
+					// lastRun is not advanced, so this is permanent. Without the guard
+					// the zero time is "due" — every instant is after it — and every
+					// tick runs a doomed claim transaction forever, silently.
+					if !neverFiresLogged[name] {
+						neverFiresLogged[name] = true
+						w.logger.Error("scheduled job never fires: its schedule has no future boundary, so it is skipped",
+							"name", name, "cursor", lastRun[name])
+					}
+					continue
+				}
 				if now.After(nextRun) || now.Equal(nextRun) {
 					// Build the enqueue options first, then claim the fire boundary
 					// and enqueue the job ATOMICALLY via EnqueueScheduledFire: if the
@@ -2784,17 +2840,40 @@ func (w *Worker) runScheduler(ctx context.Context) {
 					} else if sj.Options.UniqueForTTL > 0 {
 						opts = append(opts, queue.UniqueFor(sj.Options.UniqueForTTL))
 					}
-					if _, _, err := w.queue.EnqueueScheduledFire(ctx, name, nextRun, sj.Name, sj.Args, opts...); err != nil {
-						// Claim+enqueue are atomic: this failure rolled back the
-						// claim, so the boundary stays re-claimable. Do NOT advance
-						// lastRun — retry it next tick instead of dropping the fire (g8).
+					_, _, err := w.queue.EnqueueScheduledFire(ctx, name, nextRun, sj.Name, sj.Args, opts...)
+					switch {
+					case errors.Is(err, core.ErrDuplicateJob):
+						// DELIBERATE SKIP, not a failure: the schedule declared
+						// queue.Unique and a previous fire is still live, so running a
+						// second instance is exactly what the author asked us not to do.
+						// EnqueueScheduledFire COMMITTED the claim, so the durable cursor
+						// already advanced and peers will not re-attempt this boundary.
+						// Advance locally too, and log at Info — this is a normal
+						// outcome, not an error.
+						w.logger.Info("scheduled fire skipped: a job with this schedule's unique key is still active",
+							"name", name, "fire_time", nextRun)
+						delete(fireFailures, name)
+						delete(fireRetryAt, name)
+						lastRun[name] = nextRun
+					case err != nil:
+						// GENUINE failure. Claim+enqueue are atomic, so this rolled back
+						// the claim and the boundary stays re-claimable. Do NOT advance
+						// lastRun — retry the same boundary rather than drop the fire —
+						// but back off, so a persistent failure does not cost one
+						// transaction and one ERROR log every 100ms tick.
+						fireFailures[name]++
+						delay := scheduleFireRetryDelay(fireFailures[name])
+						fireRetryAt[name] = now.Add(delay)
 						w.logger.Error("failed to claim+enqueue scheduled fire; will retry boundary",
-							"name", name, "fire_time", nextRun, "error", err)
-						continue
+							"name", name, "fire_time", nextRun, "error", err,
+							"consecutive_failures", fireFailures[name], "retry_in", delay)
+					default:
+						// Either we claimed and enqueued, or a peer already claimed this
+						// boundary; in both cases this worker is done with it.
+						delete(fireFailures, name)
+						delete(fireRetryAt, name)
+						lastRun[name] = nextRun
 					}
-					// Either we claimed and enqueued, or a peer already claimed this
-					// boundary; in both cases this worker is done with it.
-					lastRun[name] = nextRun
 				}
 			}
 		}
