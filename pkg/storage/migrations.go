@@ -331,6 +331,43 @@ var schemaMigrations = []schemaMigration{
 		Name:    "checkpoints_span_end_column",
 		Up:      migrateCheckpointsSpanEnd,
 	},
+	{
+		Version: 37,
+		Name:    "concurrency_slots_job_id_index",
+		Up:      migrateConcurrencySlotsJobIDIndex,
+	},
+}
+
+// migrateConcurrencySlotsJobIDIndex adds the index every slot release needs.
+//
+// concurrency_slots is keyed on (slot_name, job_id) with no index on job_id
+// alone, yet the release path deletes by (slot_name, job_id) and the terminal
+// job write deletes by job_id — so each one scanned the whole table. On MySQL
+// under REPEATABLE READ an unindexed DELETE also takes a next-key lock across
+// the scanned range, which serializes releases against every other slot holder
+// rather than just the row's own.
+//
+// The table is deliberately unbounded (one live row per held slot plus a
+// permanent per-slot sentinel), so the scan cost grows with concurrency — worst
+// exactly when the caps are working hardest.
+//
+// Idempotent: skipped when the table is absent (fresh install, where AutoMigrate
+// creates it complete) or the index already exists.
+func migrateConcurrencySlotsJobIDIndex(ctx context.Context, db *gorm.DB, dialect string) error {
+	m := db.Migrator()
+	if !m.HasTable(&core.ConcurrencySlot{}) {
+		return nil
+	}
+	const idx = "idx_concurrency_slots_job_id"
+	if m.HasIndex(&core.ConcurrencySlot{}, idx) {
+		return nil
+	}
+	if err := db.WithContext(ctx).Exec(
+		"CREATE INDEX " + idx + " ON concurrency_slots (job_id)",
+	).Error; err != nil {
+		return fmt.Errorf("create %s (%s): %w", idx, dialect, err)
+	}
+	return nil
 }
 
 // migrateCheckpointsSpanEnd guarantees checkpoints.span_end exists and is

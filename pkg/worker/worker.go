@@ -171,6 +171,16 @@ type concurrencySlotStorage interface {
 	ReleaseConcurrencySlot(ctx context.Context, slotName string, jobID core.UUID) error
 }
 
+// concurrencySlotOwnedReleaser is the ownership-fenced release. It is a SEPARATE
+// optional capability rather than a change to concurrencySlotStorage because
+// external storage implementations satisfy these interfaces structurally, and
+// widening an existing method's signature would break them at compile time —
+// impossible inside v4. Storages that provide it get the fence; those that do
+// not keep the old unfenced behaviour.
+type concurrencySlotOwnedReleaser interface {
+	ReleaseConcurrencySlotOwned(ctx context.Context, slotName string, jobID core.UUID, workerID string) error
+}
+
 type concurrencySlotRenewer interface {
 	RenewConcurrencySlot(ctx context.Context, slotName string, jobID core.UUID, ttl time.Duration) (bool, error)
 }
@@ -1681,8 +1691,19 @@ func (w *Worker) releaseSlotNames(ctx context.Context, jobID core.UUID, slots []
 	if !ok {
 		return
 	}
+	// Prefer the ownership-fenced release. Without the worker_id predicate, a
+	// deferred release from a worker whose job was already reclaimed by the
+	// stale-lock reaper deletes the slot row the NEW holder is relying on,
+	// under-counting the cap and admitting an extra concurrent job.
+	owned, fenced := storage.(concurrencySlotOwnedReleaser)
 	for _, slot := range slots {
-		if err := storage.ReleaseConcurrencySlot(ctx, slot, jobID); err != nil {
+		var err error
+		if fenced {
+			err = owned.ReleaseConcurrencySlotOwned(ctx, slot, jobID, w.config.WorkerID)
+		} else {
+			err = storage.ReleaseConcurrencySlot(ctx, slot, jobID)
+		}
+		if err != nil {
 			w.logger.Warn("failed to release concurrency slot",
 				"job_id", jobID,
 				"slot", slot,

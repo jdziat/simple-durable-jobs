@@ -167,6 +167,30 @@ func (s *GormStorage) ReleaseConcurrencySlot(ctx context.Context, slotName strin
 		Delete(&core.ConcurrencySlot{}).Error
 }
 
+// ReleaseConcurrencySlotOwned releases a slot only if this worker still holds it.
+//
+// WHY THIS EXISTS
+//
+// worker_id is WRITTEN on every acquire and renew and was read in NO WHERE
+// clause anywhere in the package, so ReleaseConcurrencySlot keyed on
+// (slot_name, job_id) alone. That is not enough to identify a holder. After the
+// stale-lock reaper reclaims a job and a peer re-acquires the same slot for the
+// same job id, the ORIGINAL worker's deferred release — which still runs, and
+// cannot know it lost the job — deletes the PEER's live slot row. The cap is
+// then under-counted and admits an extra concurrent job, which is exactly the
+// invariant concurrency caps exist to hold.
+//
+// Delivered as a NEW method rather than a signature change: ReleaseConcurrency-
+// Slot is part of an optional storage capability that external implementations
+// satisfy structurally, so changing its parameters would break them at compile
+// time and cannot ship inside v4. Workers prefer this method when the storage
+// offers it and fall back to the unfenced one otherwise.
+func (s *GormStorage) ReleaseConcurrencySlotOwned(ctx context.Context, slotName string, jobID core.UUID, workerID string) error {
+	return s.db.WithContext(ctx).
+		Where("slot_name = ? AND job_id = ? AND worker_id = ?", slotName, jobID, workerID).
+		Delete(&core.ConcurrencySlot{}).Error
+}
+
 // DeleteExpiredConcurrencySlots deletes expired held slots while preserving the
 // permanent per-slot sentinel row (job_id="") used to serialize admission.
 // The cutoff argument is honored only on SQLite; DB-clock backends use the
