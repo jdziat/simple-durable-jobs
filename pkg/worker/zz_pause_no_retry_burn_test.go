@@ -93,9 +93,18 @@ func TestPause_AggressiveConsumesTheMarkExactlyOnce(t *testing.T) {
 		"the mark must be consumed — a surviving mark would mask a real failure on the job's next run")
 }
 
-// TestResume_ClearsUnconsumedPauseMarks covers the other leak path: a job that
-// finished before observing its cancellation leaves a mark nobody consumes.
-func TestResume_ClearsUnconsumedPauseMarks(t *testing.T) {
+// TestResume_DoesNotClearMarksForStillRunningJobs is the regression guard for a
+// gate finding: Resume used to bulk-clear every mark, which reintroduced the very
+// dead-lettering this packet exists to prevent. A handler blocked in I/O has not
+// yet surfaced its cancellation, so an operator resuming promptly wiped its mark,
+// and the context.Canceled arriving a moment later fell through to the ordinary
+// failure path — attempt burned, dead-lettered on the last one.
+//
+// FALSE-GREEN TRAP: asserting that Resume leaves the map alone tests an internal
+// detail and would pass even if the mark were never dropped at all, leaking into
+// a later run. The invariant is a PAIR — Resume must not clear it, and the job's
+// own completion must.
+func TestResume_DoesNotClearMarksForStillRunningJobs(t *testing.T) {
 	w := NewWorker(queue.New(&mockStorage{}))
 	id := core.NewID()
 
@@ -105,8 +114,35 @@ func TestResume_ClearsUnconsumedPauseMarks(t *testing.T) {
 
 	w.Resume()
 
-	assert.False(t, w.takePauseCancelled(id),
-		"Resume must clear stale marks so one cannot outlive its pause")
+	assert.True(t, w.takePauseCancelled(id),
+		"Resume must NOT clear the mark of a job still running: its handler may not have "+
+			"surfaced the cancellation yet, and losing the mark dead-letters it")
+}
+
+// TestProcessJob_DropsTheUnconsumedMarkOnCompletion is the other half. A handler
+// that finished WITHOUT ever surfacing its cancellation leaves a mark nobody
+// consumed; if it survived, a genuine failure on the job's next run would be
+// silently swallowed as "just a pause" and released forever.
+func TestProcessJob_DropsTheUnconsumedMarkOnCompletion(t *testing.T) {
+	q := queue.New(&mockStorage{})
+	q.Register("quick", func(context.Context, struct{}) error { return nil })
+
+	w := NewWorker(q)
+	job := &core.Job{ID: core.NewID(), Type: "quick", Queue: "default", Status: core.StatusRunning}
+
+	// Mark it as if an aggressive pause had cancelled it, then let it finish
+	// normally — the handler never observes the cancellation.
+	w.runningJobsMu.Lock()
+	w.pauseCancelled[job.ID] = struct{}{}
+	w.runningJobsMu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	w.processJob(ctx, job)
+
+	assert.False(t, w.takePauseCancelled(job.ID),
+		"a finished job must leave no mark behind, or a real failure on its next run is "+
+			"silently swallowed as a pause and released forever")
 }
 
 // TestPause_AggressiveDoesNotStopTheHeartbeat pins the lease. The heartbeat used
@@ -164,4 +200,68 @@ func TestPause_AggressiveDoesNotStopTheHeartbeat(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("processJob never returned after the handler unblocked")
 	}
+}
+
+// TestPause_ResumeBeforeHandlerSurfacesDoesNotDeadLetter is the end-to-end form
+// of the same defect, and the shape an operator actually produces: pause, notice
+// the queue is drained, resume — all while a handler is still blocked in I/O and
+// has not yet returned its cancellation.
+//
+// FALSE-GREEN TRAP: without the Resume in the middle this is just
+// TestPause_AggressiveReleasesInsteadOfFailing and passes with the bug fully
+// present. The Resume is the whole test.
+func TestPause_ResumeBeforeHandlerSurfacesDoesNotDeadLetter(t *testing.T) {
+	var failCalls atomic.Int64
+	store := &mockStorage{}
+	store.failFunc = func(context.Context, core.UUID, string, string, *time.Time) error {
+		failCalls.Add(1)
+		return nil
+	}
+
+	q := queue.New(store)
+	started := make(chan struct{})
+	surface := make(chan struct{})
+	q.Register("blocked-in-io", func(ctx context.Context, _ struct{}) error {
+		close(started)
+		<-ctx.Done() // cancellation arrives...
+		<-surface    // ...but the handler is mid-I/O and cannot return yet
+		return ctx.Err()
+	})
+
+	job := &core.Job{
+		ID: core.NewID(), Type: "blocked-in-io", Queue: "default",
+		Status: core.StatusRunning, Attempt: 1, MaxRetries: 2,
+	}
+
+	w := NewWorker(q)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() { defer close(done); w.processJob(ctx, job) }()
+
+	select {
+	case <-started:
+	case <-time.After(10 * time.Second):
+		t.Fatal("handler never started")
+	}
+
+	w.Pause(core.PauseModeAggressive)
+	w.Resume() // the operator resumes before the handler has surfaced
+	close(surface)
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("processJob never returned")
+	}
+
+	assert.Zero(t, failCalls.Load(),
+		"resuming before the handler surfaces its cancellation must not turn the pause back "+
+			"into a failure — that burns the attempt and dead-letters on the last one")
+
+	store.mu.Lock()
+	releasedIDs := append([]core.UUID(nil), store.releasedJobIDs...)
+	store.mu.Unlock()
+	assert.Contains(t, releasedIDs, job.ID, "the job must still be released for re-dispatch")
 }

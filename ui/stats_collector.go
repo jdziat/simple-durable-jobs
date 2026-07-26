@@ -182,9 +182,10 @@ func (sc *StatsCollector) snapshot(ctx context.Context) {
 		queueDepth map[string]*[2]int64
 		err        error
 	)
-	if agg, ok := storage.(queueDepthStatsStorage); ok {
+	if agg, ok := storage.(queueDepthOnlyStorage); ok {
 		// Do NOT fall back to the scan when the aggregate fails: it reads the same
-		// table the aggregate just failed on, only far more expensively.
+		// table (jobs, and only jobs) that the aggregate just failed on, only far
+		// more expensively.
 		queueDepth, err = sc.aggregateQueueDepth(ctx, agg)
 	} else {
 		queueDepth, err = sc.scanQueueDepth(ctx, storage)
@@ -214,19 +215,27 @@ func (sc *StatsCollector) snapshot(ctx context.Context) {
 // sample every minute, forever, for every queue that has ever run a job —
 // unbounded growth in job_stats and a behaviour change nobody asked for. This
 // packet is about the numbers being RIGHT, not about which queues appear.
-func (sc *StatsCollector) aggregateQueueDepth(ctx context.Context, agg queueDepthStatsStorage) (map[string]*[2]int64, error) {
-	stats, err := agg.GetQueueDepthStats(ctx)
+func (sc *StatsCollector) aggregateQueueDepth(ctx context.Context, agg queueDepthOnlyStorage) (map[string]*[2]int64, error) {
+	depth, err := agg.GetQueueDepthQueueOnly(ctx)
 	if err != nil {
 		return nil, err
 	}
-	queueDepth := make(map[string]*[2]int64, len(stats))
-	for _, qs := range stats {
-		if qs == nil || (qs.GetPending() == 0 && qs.GetRunning() == 0) {
+	queueDepth := make(map[string]*[2]int64, len(depth))
+	for name, d := range depth {
+		if d[0] == 0 && d[1] == 0 {
 			continue
 		}
-		queueDepth[qs.GetName()] = &[2]int64{qs.GetPending(), qs.GetRunning()}
+		queueDepth[name] = &[2]int64{d[0], d[1]}
 	}
 	return queueDepth, nil
+}
+
+// queueDepthOnlyStorage is the storage capability that counts PENDING and RUNNING
+// per queue with one aggregate. Deliberately not queueDepthStatsStorage: that one
+// groups over every status with no WHERE and additionally reads queue_states, so
+// it is unbounded in table size and fails a depth sample for an unrelated reason.
+type queueDepthOnlyStorage interface {
+	GetQueueDepthQueueOnly(ctx context.Context) (map[string][2]int64, error)
 }
 
 // scanQueueDepth is the fallback for a core.Storage with no aggregate

@@ -93,6 +93,11 @@ func TestDeriveRateLimitWindow_RejectsPathologicalRates(t *testing.T) {
 		"zero":         0,
 		"negative":     -5,
 		"denormal-ish": 1e-300,
+		// Reaches the UPPER clamp. Without it the clamp assertion below could not
+		// fail: NaN/Inf/0/-5 all return early, and 1e-300 overflows the
+		// float64->Duration conversion to MinInt64 and is caught by the LOWER
+		// clamp, returning 1s. Deleting the upper clamp entirely still passed.
+		"one-per-160-years": 2e-10,
 	} {
 		w := deriveRateLimitWindow(perSecond)
 		assert.Positive(t, w, "%s must not yield a non-positive window", name)
@@ -100,4 +105,17 @@ func TestDeriveRateLimitWindow_RejectsPathologicalRates(t *testing.T) {
 			"%s must be clamped: the storage GC computes windowStart.Add(-2*window), "+
 				"so a window past MaxInt64/2 wraps into the FUTURE and deletes live counters", name)
 	}
+}
+
+// TestDeriveRateLimitWindow_UpperClampIsReachable is the control for the clamp
+// assertion above: it names the exact input that lands ON the cap, so deleting
+// the clamp is a test failure rather than a silent pass.
+//
+// The band is narrow, which is why it was missed. Below ~1.1e-10 the
+// float64->Duration conversion has already overflowed and the LOWER clamp
+// returns the default window instead; above ~3.3e-10 the derived window is
+// naturally under the cap. 2e-10 — about one job per 160 years — sits inside it.
+func TestDeriveRateLimitWindow_UpperClampIsReachable(t *testing.T) {
+	assert.Equal(t, maxRateLimitWindow, deriveRateLimitWindow(2e-10),
+		"this input must exercise the upper clamp, or the bound above is untested")
 }

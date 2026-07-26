@@ -1882,6 +1882,12 @@ func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 	defer func() {
 		w.runningJobsMu.Lock()
 		delete(w.runningJobs, job.ID)
+		// Drop any unconsumed pause mark HERE, per job, rather than in Resume.
+		// The mark is consumed by takePauseCancelled on the error path; it survives
+		// only when the handler finished without ever surfacing the cancellation.
+		// This runs exactly when that job is done, so a mark can neither leak into
+		// a later run nor be cleared out from under a job that is still executing.
+		delete(w.pauseCancelled, job.ID)
 		w.runningJobsMu.Unlock()
 		w.queue.UnregisterRunningJob(job.ID)
 	}()
@@ -3337,15 +3343,17 @@ func (w *Worker) CancelJob(jobID core.UUID) bool {
 }
 
 // Resume resumes the worker.
-// Resume clears any pause-cancel marks that were never consumed — a job that
-// finished before observing the cancellation, say — so a mark cannot leak into a
-// later run and mask a real failure there.
+// Resume lifts the pause and lets the poll loop dispatch again.
+//
+// It deliberately does NOT clear the pause-cancel marks. It used to, and that
+// bulk clear reintroduced the very bug the marks exist to prevent: a handler
+// still blocked in I/O has not yet surfaced its cancellation, so an operator who
+// resumes promptly wiped its mark, and the context.Canceled that arrived a moment
+// later fell through to the ordinary failure path — attempt burned, and
+// dead-lettered on the last one. Marks are now dropped per job in processJob's
+// own cleanup, which is exact and covers the same leak.
 func (w *Worker) Resume() {
 	w.paused.Store(false)
-
-	w.runningJobsMu.Lock()
-	clear(w.pauseCancelled)
-	w.runningJobsMu.Unlock()
 
 	// Emit event
 	w.queue.Emit(&core.WorkerResumed{

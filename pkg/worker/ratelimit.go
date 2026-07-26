@@ -15,9 +15,14 @@ const defaultRateLimitWindow = time.Second
 // time.Duration counts nanoseconds (math.MaxInt64 is ~292 years), and the storage
 // GC computes windowStart.Add(-2*window) — so any window past MaxInt64/2 wraps
 // that expression into the FUTURE and deletes live counters. A century keeps
-// 2*window safely inside int64 and only binds below ~3.2e-10/sec (under one job
-// per century); such a rate is clamped to one unit per window, i.e. slightly
-// FASTER than configured — the safe direction.
+// 2*window safely inside int64 and only binds below ~3.2e-10/sec — under one job
+// per century, which no deployment configures. Such a rate is clamped and the
+// limiter then runs FASTER than configured; how much faster is UNBOUNDED, not
+// "slightly" (at PerSecond=1e-11 the float64→Duration conversion overflows
+// negative, the non-positive guard catches it, and the limiter falls back to the
+// default window — orders of magnitude above the requested rate). Erring fast
+// rather than deadlocking is the safe direction for an absurd input, but the
+// magnitude is not something to reason from.
 const maxRateLimitWindow = 100 * 365 * 24 * time.Hour
 
 // maxRateLimitNameLen bounds the effective fleet-rate-limit name. The

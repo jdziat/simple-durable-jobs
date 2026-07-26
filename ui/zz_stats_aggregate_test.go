@@ -101,7 +101,7 @@ func TestStatsCollector_SnapshotFallsBackWithoutTheAggregate(t *testing.T) {
 			return []*core.Job{{ID: core.NewID(), Queue: "fallback", Type: "work", Status: status}}, nil
 		},
 	}
-	_, isAggregator := core.Storage(scanOnly).(queueDepthStatsStorage)
+	_, isAggregator := core.Storage(scanOnly).(queueDepthOnlyStorage)
 	require.False(t, isAggregator, "this storage must NOT satisfy the aggregate capability")
 
 	collector := NewStatsCollector(queue.New(scanOnly), statsStore)

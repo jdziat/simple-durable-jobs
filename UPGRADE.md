@@ -121,9 +121,24 @@ while the original handler was still executing it.
 **After:** a pause-cancelled job is released to `pending` with its attempt intact,
 and a still-running job keeps its lease until the handler actually returns.
 
+This is keyed on the handler **returning the cancellation**: the release path
+requires an error satisfying `errors.Is(err, context.Canceled)`. A handler that
+swallows cancellation and returns some other error — a driver or HTTP stack that
+wraps it into a non-`Is`-able type, or one that maps it to a domain error — still
+travels the ordinary failure path and still burns the attempt. Return (or wrap)
+`ctx.Err()` if you want the pause treated as a pause.
+
 **What you may notice:** `JobFailed` and `JobRetrying` are no longer emitted
 around a pause. Alerting that counted those events will see them stop. Resume
 simply re-dispatches the job.
+
+The heartbeat change is **not** limited to pause. It is detached from the job's
+own context, so any cancellation that leaves a handler running — including
+`Worker.Stop()` in a process that stays alive — now keeps the lease renewed until
+the handler returns. That is the correct trade, since it is what prevents the
+reaper handing a still-executing job to a peer, but on graceful shutdown a
+handler that ignores cancellation will hold its lease indefinitely rather than
+letting it lapse.
 
 ### A blocked `Unique` schedule is skipped, not retried at 10 Hz
 
@@ -155,8 +170,9 @@ blocked, not as healthy.
 **Before:** `Cron` accepted a crontab-style `CRON_TZ=`/`TZ=` prefix, let the
 parser resolve it, and then **overwrote the result with UTC** — so a
 timezone-aware schedule fired hours off with no error.
-`Cron("CRON_TZ=America/New_York 0 9 * * *")` fired at 09:00 **UTC**, four hours
-late in summer and five in winter. A prefix with no schedule fields after it
+`Cron("CRON_TZ=America/New_York 0 9 * * *")` fired at 09:00 **UTC**, which is
+05:00 in New York in summer and 04:00 in winter — four and five hours **early**,
+not late. A prefix with no schedule fields after it
 (`Cron("CRON_TZ=America/New_York")`) **panicked** with a slice-bounds error, in a
 constructor that returns an error.
 
@@ -245,22 +261,19 @@ type.
 misconfigured. It is a log, not a panic — a patch upgrade should not turn a
 running process into a crash. v5 replaces this with a typed signature.
 
-### Schedules honour an explicit `CRON_TZ=` prefix
+### `EnqueueScheduledFire` reports a deliberate skip as an error value
 
-**Before:** `jobs.Cron` accepted robfig's `CRON_TZ=Area/City ` / `TZ=Area/City `
-prefix, parsed it, and then overwrote the parsed location with UTC. A schedule
-that asked for 09:00 New York fired at 09:00 **UTC** — 4 or 5 hours early —
-with no error. `Cron("CRON_TZ=America/New_York")` with no expression after the
-prefix **panicked**.
+**Before:** a scheduled fire blocked by an active `Unique` key was retried in a
+tight loop (see above).
 
-**After:** an explicit prefix is honoured, and the malformed form returns an
-error instead of panicking. Expressions with no prefix are unchanged: still UTC,
-still not the host's local zone.
+**After:** the claim is committed and the method returns
+`(claimed, uuid.Nil, core.ErrDuplicateJob)`.
 
-**What you may notice:** if you have a schedule carrying a `CRON_TZ=`/`TZ=`
-prefix today, it has been firing at the wrong hour and will now move to the hour
-you asked for. Nothing else moves. `CronIn`, `DailyIn` and `WeeklyIn` are new and
-take a `*time.Location` directly, which is clearer than the prefix.
+**What you may notice:** this is an exported method whose **error contract**
+changed. It is signature-compatible, but a caller that treats any non-nil error
+as a failure will start logging one per deduplicated fire. Test with
+`errors.Is(err, core.ErrDuplicateJob)` and treat it as success — the claim was
+committed and the schedule advanced.
 
 ### `run_at` is stored on one clock face
 
@@ -291,8 +304,18 @@ chart showed a number that was simply wrong, during exactly the backlog incident
 an operator opens the dashboard for.
 
 **After:** one `GROUP BY` per sample when the storage supports it (`GormStorage`
-does). A custom `core.Storage` without the aggregate still uses the row scan, and
-now **logs a warning** when it truncates rather than truncating in silence.
+does), restricted to the two statuses the sample actually reads. A custom
+`core.Storage` without the aggregate still uses the row scan, and now **logs a
+warning** when it truncates rather than truncating in silence.
+
+The `WHERE status IN ('pending','running')` is load-bearing, not tidiness. An
+aggregate over every status has no bound on table size — and the default
+retention keeps completed jobs for 30 days, so "a few pending, millions
+completed" is the normal shape. Measured on live databases at 300k rows,
+unfiltered is a parallel sequential scan on Postgres (4,935 buffers, 32 ms) and
+on MySQL a full scan of `idx_jobs_dequeue_eligible`, the index the claim path
+depends on; filtered is an index scan (609 buffers, 0.5 ms). Every 60 seconds, in
+every process that mounts the dashboard, whether or not anyone is looking at it.
 
 **What you may notice:** the depth chart's numbers change — upward — on any queue
 that was over the cap; they were an undercount. Which queues appear is

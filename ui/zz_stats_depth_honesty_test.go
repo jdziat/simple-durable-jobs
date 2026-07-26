@@ -75,7 +75,7 @@ func TestStatsCollector_SnapshotPersistsNothingOnPartialScanFailure(t *testing.T
 	_, statsStore, _ := setupCollectorTest(t)
 	ctx := context.Background()
 
-	_, isAggregator := core.Storage(halfBrokenStorage{}).(queueDepthStatsStorage)
+	_, isAggregator := core.Storage(halfBrokenStorage{}).(queueDepthOnlyStorage)
 	require.False(t, isAggregator, "this test must exercise the row-scan fallback")
 
 	NewStatsCollector(queue.New(halfBrokenStorage{}), statsStore,
