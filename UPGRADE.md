@@ -71,10 +71,12 @@ reachable in every default configuration) and **GO-2026-5506** (`go.opentelemetr
 
 ## Behaviour changes in v4.6.1
 
-Each of these was a defect. Each may still surprise a deployment that adapted to
-the old behaviour.
+> **This section describes only what is on this branch today.** Each remaining
+> behaviour change is added here by the packet that implements it — a release
+> note written ahead of the code is a release note that lies, which is the exact
+> defect class this campaign exists to remove.
 
-### 1. Cancelling a workflow now cancels paused and waiting descendants
+### Cancelling a workflow now cancels paused and waiting descendants
 
 **Before:** `CancelJob` on a fan-out parent skipped descendants in `paused` or
 `waiting`. A paused child survived its parent's terminal cancellation and stayed
@@ -84,94 +86,37 @@ cancelled — and the fan-out row permanently violated the documented
 
 **After:** cancellation reaches the whole subtree.
 
-**What you may notice:** jobs that previously lingered after a cancel now end
-`cancelled`. If you relied on pausing a child to *protect* it from a parent
-cancel, that never worked the way it appeared to — the child was only reachable
-by manual resume.
+**What you may notice:**
 
-`ResumeJob` is correspondingly narrowed: a fan-out completion no longer silently
-un-pauses a parent an operator deliberately paused.
+- Jobs that previously lingered after a cancel now end `cancelled`. If you relied
+  on pausing a child to *protect* it from a parent cancel, that never worked the
+  way it appeared to — the child was only reachable by manual resume.
+- `CancelJob` on a **directly paused job** (not part of a fan-out) now succeeds
+  and lands `cancelled`, where it previously returned an error. Cancelling a
+  paused job is no longer a two-step resume-then-cancel.
+- `ResumeJob` is correspondingly narrowed: a fan-out completion no longer
+  silently un-pauses a parent an operator deliberately paused. The dashboard's
+  own Resume is unaffected — it goes through `UnpauseJob`, which restores the
+  pre-pause status.
 
-### 2. Aggressive pause no longer burns a retry or dead-letters
+### `NewWorker` reports arguments it cannot use
 
-**Before:** `Worker.Pause(PauseModeAggressive)` cancelled in-flight handler
-contexts, and the resulting `context.Canceled` fell through the normal failure
-path — burning an attempt and, at the default `MaxRetries`, permanently
-dead-lettering a job that was merely *paused*. The heartbeat was also stopped for
-a job that was still running.
+**Before:** `Queue.NewWorker` takes `...any` (the facade cannot name
+`worker.WorkerOption` without an import cycle) and silently discarded anything
+that was not a `WorkerOption` — a `queue.Option`, an option from the wrong
+constructor, a bare value. The worker ran on defaults and said nothing.
 
-**After:** a pause-cancelled job is released to `pending` with its attempt
-intact, and a still-running job keeps its lease.
+**After:** one `ERROR` per discarded argument, naming its position and concrete
+type.
 
-**What you may notice:** `JobFailed` and `JobRetrying` are no longer emitted
-around a pause. Alerting that counted those events will see them stop.
-
-### 3. Fan-out sub-job options are honoured
-
-**Before:** `fanout.Sub` accepted the full option set and silently dropped
-`Determinism`, `Delay`, `RunAt` and `IdempotencyKey`; `Retries(0)` was overridden
-with the default; `WithFanOutRetries` was dead.
-
-**After:** all of these take effect.
-
-**What you may notice:** sub-jobs that were quietly retried three times now
-respect an explicit `Retries(0)`. Sub-jobs given a `Delay` now actually wait.
-Passing a dedup option (`Unique`, `IdempotencyKey`, `UniqueFor`) to `Sub` logs a
-`WARN` — those are parent-level concepts and remain ignored. It is a warning
-rather than an error in v4 deliberately: turning a silently-wrong call into a
-hard failure on upgrade would convert a latent bug into an outage. v5 makes it an
-error.
-
-### 4. Fractional rate limits are now accurate
-
-**Before:** `RateLimit` over-admitted by up to ~67% (and ~2x fleet-wide) for any
-`PerSecond` that was neither an integer nor `1/n`.
-
-**After:** the configured rate is enforced within 0.5%.
-
-**What you may notice:** throughput on fractional rates **drops** — by up to 49%
-in the worst case. That is the rate you configured; you were previously getting
-more than you asked for. If you tuned against the old behaviour, raise the limit
-deliberately.
-
-### 5. Backlog-age alerts stop firing on scheduled jobs
-
-**Before:** backlog age was `MIN(created_at)` over pending jobs with no due-ness
-predicate, so a single scheduled job pinned the age at "hours old" forever.
-
-**After:** the age reflects only jobs that are actually due; a queue holding only
-future work reports no age.
-
-**What you may notice:** an existing backlog-age alert that has been firing
-constantly will resolve, and the series may go stale for queues with nothing due.
-That is the metric becoming useful, but it will look like a monitoring change.
-Affects the `jobs.backlog.oldest_age` gauge, the dashboard card, and `sdj queues`.
-
----
-
-## Also in v4.6.1
-
-Non-behavioural, listed so the diff is not surprising:
-
-- **Timezone-aware schedules.** `Cron` honours an explicit `CRON_TZ=`/`TZ=`
-  prefix instead of silently forcing UTC, and `CronIn`/`DailyIn`/`WeeklyIn` take
-  a `*time.Location`. A schedule that relied on the prefix being ignored will now
-  fire at the hour it asked for.
-- **Scheduler no longer hot-loops** at 10 Hz when a `Unique` scheduled job
-  overruns its own previous fire.
-- **Dashboard stats** are computed with aggregates rather than by loading up to
-  20,000 job rows per minute, and no longer silently truncate. Adds migration
-  **v38** (`job_stats` timestamp index).
-- **Sub-path mounting works.** The dashboard now boots when mounted under a
-  prefix, which every doc prescribed and which previously produced a blank page.
-- **`Queue.NewWorker` logs an ERROR** naming any argument that is not a
-  `WorkerOption` instead of silently discarding it. v5 makes this a compile-time
-  signature.
+**What you may notice:** a new startup error on a worker that has been quietly
+misconfigured. It is a log, not a panic — a patch upgrade should not turn a
+running process into a crash. v5 replaces this with a typed signature.
 
 ## Rollback
 
-v4.6.x adds three forward-only migrations (v36 `checkpoints.span_end`, v37
-`idx_concurrency_slots_job_id`, v38 `job_stats` index). All three are additive —
-a new column with a default and two indexes — so an older binary runs correctly
-against the newer schema and rolling back the application is safe. No migration
-in this line rewrites data.
+v4.6.x so far adds two forward-only migrations: **v36** (`checkpoints.span_end`)
+and **v37** (`idx_concurrency_slots_job_id`). Both are additive — a new column
+with a default, and an index — so an older binary runs correctly against the
+newer schema and rolling back the application is safe. No migration in this line
+rewrites data. Any further migration is listed here by the packet that adds it.

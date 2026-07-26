@@ -112,3 +112,68 @@ func TestGetWaitingJobsToResume_IncludesCancelledFanOuts(t *testing.T) {
 		"a waiting parent whose fan-out ended CANCELLED has nothing left to wait for and must be "+
 			"picked up by the recovery backstop")
 }
+
+// TestCancelSubJobs_ReachesPausedAndWaitingSiblings covers the CancelOnFail
+// path, which the CancelJobTerminal test above does NOT exercise.
+//
+// The 10x gate proved this gap by reverting only the CancelSubJobs call site to
+// {pending, running} — every test in storage, queue, fanout and worker still
+// passed, including the three added with the fix. A change nothing fails on is
+// a change nothing protects.
+func TestCancelSubJobs_ReachesPausedAndWaitingSiblings(t *testing.T) {
+	s := newTestStorage(t)
+	ctx := context.Background()
+
+	parent := &core.Job{ID: core.NewID(), Type: "wf", Queue: "default", Status: core.StatusWaiting}
+	require.NoError(t, s.db.Create(parent).Error)
+	fo := &core.FanOut{ID: core.NewID(), ParentJobID: parent.ID, Status: core.FanOutPending, TotalCount: 4}
+	require.NoError(t, s.CreateFanOut(ctx, fo))
+
+	pending := seedChild(t, s, fo.ID, core.StatusPending)
+	running := seedChild(t, s, fo.ID, core.StatusRunning)
+	paused := seedChild(t, s, fo.ID, core.StatusPaused)   // discriminating
+	waiting := seedChild(t, s, fo.ID, core.StatusWaiting) // discriminating
+
+	cancelled, err := s.CancelSubJobs(ctx, fo.ID)
+	require.NoError(t, err)
+	assert.Len(t, cancelled, 4, "every live sibling must be reported as cancelled")
+
+	for name, id := range map[string]core.UUID{
+		"pending": pending, "running": running, "paused": paused, "waiting": waiting,
+	} {
+		var got core.Job
+		require.NoError(t, s.db.First(&got, "id = ?", id).Error)
+		assert.Equal(t, core.StatusCancelled, got.Status,
+			"%s sibling must be cancelled on the CancelOnFail path — a `waiting` child (durable Sleep, "+
+				"WaitForSignal, nested fan-out) wakes up later and runs otherwise", name)
+	}
+
+	var after core.FanOut
+	require.NoError(t, s.db.First(&after, "id = ?", fo.ID).Error)
+	assert.Equal(t, after.TotalCount,
+		after.CompletedCount+after.FailedCount+after.CancelledCount,
+		"INV-FANOUT-COUNTS must hold on the CancelOnFail path too")
+}
+
+// TestCancelJobTerminal_CancelsADirectlyPausedJob pins the top-level contract
+// change. Widening the target predicate means CancelJob on a paused job now
+// SUCCEEDS where it returned an error, which is user-visible and belongs in
+// UPGRADE.md — it is asserted here so it cannot change back unnoticed.
+//
+// FALSE-GREEN TRAP: asserting only the resulting status would pass under the old
+// behaviour if the job happened to be cancellable by another route. The
+// discriminating assertion is that the CALL returns nil.
+func TestCancelJobTerminal_CancelsADirectlyPausedJob(t *testing.T) {
+	s := newTestStorage(t)
+	ctx := context.Background()
+
+	j := &core.Job{ID: core.NewID(), Type: "solo", Queue: "default", Status: core.StatusPaused}
+	require.NoError(t, s.db.Create(j).Error)
+
+	require.NoError(t, s.CancelJobTerminal(ctx, j.ID),
+		"cancelling a paused job must succeed; it previously required resume-then-cancel")
+
+	var got core.Job
+	require.NoError(t, s.db.First(&got, "id = ?", j.ID).Error)
+	assert.Equal(t, core.StatusCancelled, got.Status)
+}

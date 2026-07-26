@@ -1839,18 +1839,13 @@ func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 			}
 			return
 		}
-		failErr := w.failWithRetry(ctx, job.ID, fmt.Sprintf("no handler for %s", job.Type), nil)
-		if errors.Is(failErr, core.ErrJobNotOwned) {
-			w.logger.Warn("job no longer owned after no-handler failure; skipping sub-job completion",
-				"job_id", job.ID)
-			return
-		}
-		// Same contract as the atomic branch above: the failure was not recorded,
-		// so don't run the (non-idempotent) fan-out accounting for it. Release for
-		// reclaim — the worker that picks it up may even have the handler
-		// registered.
-		if failErr != nil {
-			w.releaseAfterTerminalWriteError(ctx, job.ID, "no-handler failure")
+		// The failure must be RECORDED before the (non-idempotent) fan-out
+		// accounting runs for it. A worker that reclaims the job may even have
+		// the handler registered.
+		if !w.dispositionWriteLanded(ctx, job.ID,
+			w.failWithRetry(ctx, job.ID, fmt.Sprintf("no handler for %s", job.Type), nil),
+			"no-handler failure",
+			"job no longer owned after no-handler failure; skipping sub-job completion") {
 			return
 		}
 		if err := w.handleSubJobCompletion(ctx, job, false); err != nil {
@@ -2038,6 +2033,37 @@ func (w *Worker) failTerminalWithResult(ctx context.Context, storage failTermina
 		return failErr
 	})
 	return fo, err
+}
+
+// dispositionWriteLanded reports whether a disposition write (Fail, retry
+// scheduling, terminal failure) actually reached the database, and performs the
+// correct cleanup when it did not.
+//
+// It returns TRUE only when the caller may proceed to hooks, events and fan-out
+// accounting. It returns false in both failure shapes:
+//
+//   - ErrJobNotOwned: the job was reclaimed or cancelled by another path, which
+//     now owns the outcome. Nothing to clean up.
+//   - any other error: the write did NOT land, so the row is still 'running'
+//     under our lock and nothing re-dispatches it until the stale-lock reaper
+//     (45 minutes by default). Release for reclaim.
+//
+// This exists as ONE function because the contract was previously open-coded at
+// three call sites with subtly different shapes, and the two that got it wrong
+// went on to fire hooks and emit events describing a state the database never
+// entered. A contract repeated by hand is a contract that drifts — the same way
+// two hand-synced checkpoint column lists let span_end go missing.
+func (w *Worker) dispositionWriteLanded(ctx context.Context, jobID core.UUID, failErr error, action, notOwnedMsg string) bool {
+	if failErr == nil {
+		return true
+	}
+	if errors.Is(failErr, core.ErrJobNotOwned) {
+		w.logger.Warn(notOwnedMsg, "job_id", jobID)
+		return false
+	}
+	// failWithRetry already logged the underlying error; don't log it twice.
+	w.releaseAfterTerminalWriteError(ctx, jobID, action)
+	return false
 }
 
 func (w *Worker) releaseAfterTerminalWriteError(ctx context.Context, jobID core.UUID, action string) {
@@ -2250,25 +2276,16 @@ func (w *Worker) handleError(ctx context.Context, jobCtx context.Context, job *c
 		// Persist the retry first. If storage reports the job is no longer owned
 		// by this worker, it was reclaimed or cancelled by another path. The owner
 		// is now responsible for hooks, events, and fan-out accounting.
-		failErr := w.failWithRetry(ctx, job.ID, err.Error(), retryAt)
-		if errors.Is(failErr, core.ErrJobNotOwned) {
-			w.logger.Warn("job no longer owned by this worker; skipping failure handling",
-				"job_id", job.ID, "error", err)
-			return
-		}
-		// Any other write error means the retry was NOT scheduled: the row is
-		// still 'running' with our lock on it, and nothing re-dispatches it until
-		// the stale-lock reaper fires (StaleLockAge, 45 MINUTES by default).
-		// Firing the retry hooks and emitting JobRetrying here would describe a
-		// state the database never entered — downstream consumers act on a
-		// reschedule that does not exist. Release the lock instead so a healthy
-		// worker reclaims the job within a poll, and return BEFORE the hooks and
-		// the event: the same disposition-write contract the completion and
-		// atomic-terminal paths already follow. Release also decrements attempt,
-		// so the job still gets the retry it was owed — it just loses the backoff
-		// delay. failWithRetry already logged the error, so don't log it twice.
-		if failErr != nil {
-			w.releaseAfterTerminalWriteError(ctx, job.ID, "retry scheduling")
+		// If the retry was not scheduled, firing the retry hooks and emitting
+		// JobRetrying would describe a state the database never entered —
+		// downstream consumers would act on a reschedule that does not exist.
+		// Release instead: a healthy worker reclaims within a poll, and Release
+		// decrements attempt so the job still gets the retry it was owed, just
+		// without the backoff delay.
+		if !w.dispositionWriteLanded(ctx, job.ID,
+			w.failWithRetry(ctx, job.ID, err.Error(), retryAt),
+			"retry scheduling",
+			"job no longer owned by this worker; skipping failure handling") {
 			return
 		}
 		w.queue.CallRetryHooks(jobCtx, job, job.Attempt, err)
@@ -2298,20 +2315,13 @@ func (w *Worker) handleError(ctx context.Context, jobCtx context.Context, job *c
 
 	// Legacy storage path: terminal failures use the original split
 	// Fail+fan-out accounting sequence.
-	failErr := w.failWithRetry(ctx, job.ID, err.Error(), nil)
-	if errors.Is(failErr, core.ErrJobNotOwned) {
-		w.logger.Warn("job no longer owned by this worker; skipping failure handling",
-			"job_id", job.ID, "error", err)
-		return
-	}
-	// The terminal write did not land (failWithRetry already logged it), so the
-	// job is still 'running'. Running the fail hooks, emitting JobFailed and
-	// incrementing the fan-out failed counter would all record an outcome the
-	// database never took — and IncrementFanOutFailed is not idempotent, so the
-	// count would be double-charged once the reaper re-runs the job. Release for
-	// reclaim instead, matching the atomic branch above.
-	if failErr != nil {
-		w.releaseAfterTerminalWriteError(ctx, job.ID, "terminal failure")
+	// IncrementFanOutFailed is not idempotent, so running the accounting for a
+	// terminal write that did not land double-charges the count once the reaper
+	// re-runs the job.
+	if !w.dispositionWriteLanded(ctx, job.ID,
+		w.failWithRetry(ctx, job.ID, err.Error(), nil),
+		"terminal failure",
+		"job no longer owned by this worker; skipping failure handling") {
 		return
 	}
 
