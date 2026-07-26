@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"sync"
 	"testing"
 
 	"gorm.io/gorm"
@@ -62,4 +63,59 @@ func TestMigrateJobStatsTimestampIndex_NoOpsWithoutTheTable(t *testing.T) {
 
 	require.False(t, db.Migrator().HasTable(jobStatsTable))
 	require.NoError(t, migrateJobStatsTimestampIndex(ctx, db, db.Name()))
+}
+
+// TestMigrateJobStatsTimestampIndex_ToleratesAConcurrentCreator covers the race
+// this wave itself introduced by adding a SECOND creator of this index.
+//
+// ui.gormStatsStorage.MigrateStats runs on every dashboard mount and holds NO
+// fleet lock, so it can create the index between this migration's HasIndex check
+// and its CREATE. Losing that race must not fail Migrate() — a process booting a
+// moment after a peer mounted the dashboard would otherwise crash, and the
+// mount-UI-then-Migrate ordering is one the Handler godoc explicitly supports.
+//
+// FALSE-GREEN TRAP, HIT ON THE FIRST ATTEMPT AT THIS TEST: creating the index
+// BEFORE calling the migration does not test the recovery at all — the HasIndex
+// guard returns early and the CREATE never runs, so it passes with the recovery
+// deleted. The race has to be real, so this runs concurrent creators and lets them
+// collide. SQLite serialises transactions and cannot exhibit it; there the test
+// only asserts the migration stays correct.
+func TestMigrateJobStatsTimestampIndex_ToleratesAConcurrentCreator(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+	if db.Name() == "sqlite" {
+		// openTestDB gives SQLite a bare `:memory:` database, where every pooled
+		// connection gets its OWN private one — racing goroutines there fail with
+		// "no such table", which tests the harness, not the migration. Both
+		// external CI legs run this.
+		t.Skip("`:memory:` gives each pooled connection a private database; the pg/mysql legs cover this")
+	}
+	dropJobStats(t, db)
+
+	require.NoError(t, db.WithContext(ctx).Exec(
+		`CREATE TABLE job_stats (id integer primary key, queue varchar(255), timestamp timestamp)`,
+	).Error)
+
+	const racers = 16
+	errs := make(chan error, racers)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for range racers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start // release them together so the guards pass before any CREATE lands
+			errs <- migrateJobStatsTimestampIndex(ctx, db, db.Name())
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		require.NoError(t, err,
+			"losing the race to a concurrent creator must not fail the migration: the index is "+
+				"there, which is the only thing it wanted")
+	}
+	assert.True(t, db.Migrator().HasIndex(jobStatsTable, jobStatsTimestampIndex))
 }

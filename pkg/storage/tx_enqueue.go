@@ -174,8 +174,19 @@ func fillEnqueueDefaults(job *core.Job) {
 // rows on a clock face that every ALREADY-STORED row does not share — including
 // GORM's autoCreateTime created_at — so in a positive-offset zone a UTC-bound
 // comparison reads a locally-written created_at as still in the future, which
-// would strand every pre-existing pending job. Local keeps one clock face for
-// old rows, new rows and binds alike.
+// would strand every pre-existing pending job. Local keeps new rows on the same
+// face as old rows and as the binds.
+//
+// TWO RESIDUALS, both SQLite-only and both strictly smaller than the bug this
+// removes. (1) In a DST zone "local" is not ONE offset year-round: Go renders the
+// offset for the instant, so a job scheduled across a boundary is written -05:00
+// while the now-bind renders -04:00, and the lexical compare can still mis-order
+// inside that ~1h fold. (2) Across the upgrade a deployment that consistently
+// passed one foreign zone ends up with MIXED faces in run_at — old rows on the
+// foreign offset, new ones local — which perturbs the COALESCE(run_at,
+// created_at) FIFO ordering until the old rows drain. Neither makes eligibility
+// worse than it was; a full fix needs a stored ordering key, which is a v5
+// schema change.
 //
 // A no-op on Postgres (timestamptz stores the instant) and MySQL (the driver
 // re-renders in the DSN location), so no dialect gate is needed.

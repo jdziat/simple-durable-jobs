@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 
 	"github.com/jdziat/simple-durable-jobs/v4/pkg/core"
 	"github.com/jdziat/simple-durable-jobs/v4/pkg/internal/handler"
@@ -260,12 +261,29 @@ func (q *Queue) EnqueueScheduledFire(ctx context.Context, scheduleName string, f
 				// and its overdue/health indicator, so stamping it on a skip would
 				// render a schedule blocked for hours by a stuck unique job as
 				// perfectly healthy. Restored below if the fire turns out to be a skip.
+				// The read takes the SAME row lock the claim is about to take, rather
+				// than reading first and locking after. Without it this is a lock-free
+				// read-modify-write: a peer committing a real fire for an EARLIER
+				// boundary between our SELECT and our claim is invisible to us, our
+				// claim still succeeds (its cursor guard only rejects boundaries at or
+				// past ours), and the restore below then writes back a marker from
+				// before their fire — losing it. That errs pessimistic rather than
+				// dangerous, since the overdue indicator only ever reads older, but it
+				// is silent and avoidable. Locking here just starts the window a few
+				// microseconds earlier on the one row the claim already serialises on,
+				// so it introduces no new lock ordering.
+				//
+				// SQLite has no row locks; its transactions already serialise (the
+				// storage opens with _txlock=immediate), and FOR UPDATE is a syntax
+				// error there.
 				var priorFiredAt *time.Time
 				{
+					q := tx.WithContext(ctx).Where("name = ?", scheduleName)
+					if tx.Name() != "sqlite" {
+						q = q.Clauses(clause.Locking{Strength: "UPDATE"})
+					}
 					var prior core.ScheduledFire
-					if e := tx.WithContext(ctx).
-						Where("name = ?", scheduleName).
-						First(&prior).Error; e == nil {
+					if e := q.First(&prior).Error; e == nil {
 						priorFiredAt = prior.LastFiredAt
 					} else if !errors.Is(e, gorm.ErrRecordNotFound) {
 						return e

@@ -374,9 +374,16 @@ Two consequences worth knowing:
 
 ## Rollback
 
-This line adds three forward-only migrations: **v36** (`checkpoints.span_end`,
-shipped in v4.6.0), **v37** (`idx_concurrency_slots_job_id`, shipped in v4.7.0)
-and **v38** (`idx_job_stats_timestamp`, shipped in v4.8.0). All three are additive — a new column
-with a default, and two indexes — so an older binary runs correctly against the
-newer schema and rolling back the application is safe. No migration in this line
+Across the whole v4.6 → v4.8 line there are three forward-only migrations. Only
+the last is new in **v4.8.0**; the other two are already in the releases named:
+
+| Migration | Adds | First shipped in |
+| --- | --- | --- |
+| **v36** | `checkpoints.span_end` | v4.6.0 |
+| **v37** | `idx_concurrency_slots_job_id` | v4.7.0 |
+| **v38** | `idx_job_stats_timestamp` | v4.8.0 |
+
+All three are additive — one column with a default, and two indexes — so an older
+binary runs correctly against the newer schema and rolling back the application is
+safe. No migration in this line
 rewrites data. Any further migration is listed here by the packet that adds it.
