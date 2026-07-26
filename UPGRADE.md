@@ -1,6 +1,6 @@
 # Upgrading
 
-## Upgrading through the v4.6 / v4.7 line
+## Upgrading through the v4.6 / v4.7 / v4.8 line
 
 Three releases matter here.
 
@@ -11,9 +11,9 @@ Three releases matter here.
   dispositions reported but never written, backlog age counting not-yet-due jobs,
   a MySQL charset crashloop, and an unfenced concurrency-slot release. None of it
   changed behaviour you could have been relying on.
-- **The next release** (this document's subject) changes runtime behaviour in
-  several places, all of them cases where the old behaviour was wrong — but wrong
-  in ways a deployment may have been tuned around. Those are listed below.
+- **v4.8.0** (this document's subject) changes runtime behaviour in several
+  places, all of them cases where the old behaviour was wrong — but wrong in ways
+  a deployment may have been tuned around. Those are listed below.
 
 Nothing here is an API break. `gorelease` reports every change compatible; the
 only additions are new options, new event aliases and new storage methods.
@@ -77,7 +77,7 @@ reachable in every default configuration) and **GO-2026-5506** (`go.opentelemetr
 
 ---
 
-## Behaviour changes in the next release
+## Behaviour changes in v4.8.0
 
 > **This section describes only what has actually landed.** Each behaviour change
 > is added here by the commit that implements it — a release note written ahead of
@@ -349,7 +349,7 @@ Two consequences worth knowing:
 
 This line adds three forward-only migrations: **v36** (`checkpoints.span_end`,
 shipped in v4.6.0), **v37** (`idx_concurrency_slots_job_id`, shipped in v4.7.0)
-and **v38** (`idx_job_stats_timestamp`). All three are additive — a new column
+and **v38** (`idx_job_stats_timestamp`, shipped in v4.8.0). All three are additive — a new column
 with a default, and two indexes — so an older binary runs correctly against the
 newer schema and rolling back the application is safe. No migration in this line
 rewrites data. Any further migration is listed here by the packet that adds it.
