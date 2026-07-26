@@ -280,11 +280,39 @@ SQLite, in which case delayed jobs now fire when you asked rather than hours off
 No migration: existing rows were written by the driver on the local face already,
 and rewriting them is what made the original design of this fix dangerous.
 
+### The dashboard counts queue depth instead of paging job rows
+
+**Before:** every minute the stats collector fetched up to 10,000 **full job
+rows** per status — payload columns included, and codec-decoded — purely to count
+them, and then silently truncated at the cap. Past 10,000 pending jobs the depth
+chart showed a number that was simply wrong, during exactly the backlog incident
+an operator opens the dashboard for.
+
+**After:** one `GROUP BY` per sample when the storage supports it (`GormStorage`
+does). A custom `core.Storage` without the aggregate still uses the row scan, and
+now **logs a warning** when it truncates rather than truncating in silence.
+
+**What you may notice:** the depth chart's numbers change — upward — on any queue
+that was over the cap; they were an undercount. Which queues appear is
+deliberately unchanged: only queues with pending or running work are sampled, as
+before. Migration **v38** indexes `job_stats(timestamp)`, which the retention
+prune and the all-queues history read both scan by and could not previously use.
+
+### The throughput chart measures one process, and now says so
+
+No code change — a documentation fix for something the dashboard has always done.
+The completed/failed/retried series is fed by `Queue.Events`, an **in-process**
+bus, so under the multi-worker topology the docs recommend it reflects only the
+process serving the dashboard and under-reports the fleet. Queue **depth** is
+read from the database and is fleet-wide. See "What the throughput series does
+and does not measure" in the Embedded UI guide; for fleet-wide throughput use the
+OpenTelemetry metrics, which every process exports.
+
 ## Rollback
 
-This line adds two forward-only migrations: **v36** (`checkpoints.span_end`,
-shipped in v4.6.0) and **v37** (`idx_concurrency_slots_job_id`, shipped in
-v4.7.0). Both are additive — a new column
-with a default, and an index — so an older binary runs correctly against the
+This line adds three forward-only migrations: **v36** (`checkpoints.span_end`,
+shipped in v4.6.0), **v37** (`idx_concurrency_slots_job_id`, shipped in v4.7.0)
+and **v38** (`idx_job_stats_timestamp`). All three are additive — a new column
+with a default, and two indexes — so an older binary runs correctly against the
 newer schema and rolling back the application is safe. No migration in this line
 rewrites data. Any further migration is listed here by the packet that adds it.

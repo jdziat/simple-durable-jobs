@@ -336,7 +336,55 @@ var schemaMigrations = []schemaMigration{
 		Name:    "concurrency_slots_job_id_index",
 		Up:      migrateConcurrencySlotsJobIDIndex,
 	},
+	{
+		Version: 38,
+		Name:    "job_stats_timestamp_index",
+		Up:      migrateJobStatsTimestampIndex,
+	},
 }
+
+// jobStatsTimestampIndex is the index name shared by this migration and the UI's
+// own stats bootstrap. Both create it; whichever runs first wins and the other
+// no-ops.
+const jobStatsTimestampIndex = "idx_job_stats_timestamp"
+
+// migrateJobStatsTimestampIndex indexes job_stats(timestamp).
+//
+// job_stats carries one unique index, on (queue, timestamp). Its LEADING column
+// is queue, so neither of the two queries that scan by time alone can use it:
+// the retention prune (DELETE ... WHERE timestamp < ?) and the dashboard's
+// all-queues history read. Both therefore scanned the whole table, which grows
+// by one row per queue per minute and is only ever trimmed by the very prune
+// that cannot use an index.
+//
+// The table is owned by the ui package, which imports this one — so it is named
+// as a string here rather than by model. It is created by the UI's AutoMigrate
+// and does not exist at all in a process that never mounts the dashboard, hence
+// the HasTable guard.
+//
+// The mirror of this lives in ui.gormStatsStorage.MigrateStats, which covers the
+// case this cannot: a first-ever boot where Migrate() runs BEFORE the dashboard
+// is mounted, so the table does not yet exist here and this version is recorded
+// as applied. This one exists because it is the path that holds the fleet lock,
+// and because schema_migrations should record when the index appeared.
+func migrateJobStatsTimestampIndex(ctx context.Context, db *gorm.DB, dialect string) error {
+	m := db.Migrator()
+	if !m.HasTable(jobStatsTable) {
+		return nil
+	}
+	if m.HasIndex(jobStatsTable, jobStatsTimestampIndex) {
+		return nil
+	}
+	if err := db.WithContext(ctx).Exec(
+		"CREATE INDEX " + jobStatsTimestampIndex + " ON " + jobStatsTable + " (timestamp)",
+	).Error; err != nil {
+		return fmt.Errorf("create %s (%s): %w", jobStatsTimestampIndex, dialect, err)
+	}
+	return nil
+}
+
+// jobStatsTable is the dashboard stats table, owned by the ui package.
+const jobStatsTable = "job_stats"
 
 // migrateConcurrencySlotsJobIDIndex adds the index every slot release needs.
 //

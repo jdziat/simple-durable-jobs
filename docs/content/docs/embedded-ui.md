@@ -227,6 +227,16 @@ Every 1 minute, the collector performs three operations:
 
 On context cancellation (graceful shutdown), the collector flushes any remaining counters with a 5-second timeout before exiting.
 
+### What the throughput series does and does not measure
+
+The two series on the dashboard come from different places, and only one of them is fleet-wide.
+
+**Queue depth is fleet-wide.** The snapshot counts pending and running jobs with a `GROUP BY` against the database, so it sees every worker's work regardless of which process produced it.
+
+**Throughput is in-process only.** The completed/failed/retried counters are fed by `Queue.Events`, an in-memory bus: a queue only emits events for jobs *it* ran. Under the multi-process topology this guide recommends -- several worker processes against one database, one of them also serving the dashboard -- the throughput chart and the live event feed therefore reflect **only the process serving the dashboard**, and under-report the fleet by roughly the ratio of processes.
+
+This is a property of the event bus, not a bug in the collector, and it is not something the dashboard can detect and warn about. If you need fleet-wide throughput, read it from the OpenTelemetry metrics in `pkg/metrics` (see [Observability](../observability/)), which every process exports to your collector. Treat the dashboard's throughput chart as a view of one process.
+
 ### Stats Model
 
 Stats are stored in `JobStat` rows with the following fields:

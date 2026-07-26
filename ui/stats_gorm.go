@@ -20,7 +20,41 @@ func NewGormStatsStorage(db *gorm.DB) StatsStorage {
 }
 
 func (s *gormStatsStorage) MigrateStats(ctx context.Context) error {
-	return s.db.WithContext(ctx).AutoMigrate(&JobStat{})
+	if err := s.db.WithContext(ctx).AutoMigrate(&JobStat{}); err != nil {
+		return err
+	}
+	return s.ensureTimestampIndex(ctx)
+}
+
+// jobStatsTimestampIndex indexes job_stats(timestamp).
+//
+// The table's only index is unique on (queue, timestamp), whose LEADING column
+// is queue — so the retention prune (WHERE timestamp < ?) and the all-queues
+// history read cannot use it and scanned the whole table, which grows by a row
+// per queue per minute.
+//
+// pkg/storage carries the same index as versioned migration v38, which is the
+// copy that holds the fleet lock and the one schema_migrations records. This
+// copy exists for the case v38 structurally cannot cover: on a first-ever boot
+// Migrate() runs before the dashboard is mounted, so job_stats does not exist
+// yet, v38 correctly no-ops, and it is recorded as applied and never runs again.
+//
+// Racing creators are expected — this runs without the fleet lock — so a
+// concurrent creator winning is not an error worth failing the mount over.
+const jobStatsTimestampIndex = "idx_job_stats_timestamp"
+
+func (s *gormStatsStorage) ensureTimestampIndex(ctx context.Context) error {
+	m := s.db.Migrator()
+	if m.HasIndex(&JobStat{}, jobStatsTimestampIndex) {
+		return nil
+	}
+	err := s.db.WithContext(ctx).Exec(
+		"CREATE INDEX " + jobStatsTimestampIndex + " ON job_stats (timestamp)",
+	).Error
+	if err != nil && m.HasIndex(&JobStat{}, jobStatsTimestampIndex) {
+		return nil // lost the race to a peer; the index is there, which is all we wanted
+	}
+	return err
 }
 
 func (s *gormStatsStorage) UpsertStatCounters(ctx context.Context, queue string, ts time.Time, completed, failed, retried int64) error {
