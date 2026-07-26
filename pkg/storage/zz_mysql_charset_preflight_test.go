@@ -2,8 +2,10 @@ package storage
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -33,7 +35,10 @@ func TestMigrate_RefusesUTF8MB3DatabaseBeforeAnyDDL(t *testing.T) {
 	}
 
 	admin := openMySQLForCharsetTest(t, dsn)
-	const legacyDB = "sdj_charset_preflight_test"
+	// Unique per run: a fixed schema name collides when two jobs share one MySQL
+	// server (the CI matrix does), and the loser drops the winner's database
+	// mid-test.
+	legacyDB := fmt.Sprintf("sdj_charset_preflight_%d", time.Now().UnixNano())
 
 	require.NoError(t, admin.Exec("DROP DATABASE IF EXISTS "+legacyDB).Error)
 	require.NoError(t, admin.Exec(

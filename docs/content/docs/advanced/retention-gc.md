@@ -43,13 +43,13 @@ deletion yourself — the sweep does not ask, and the deletes are not recoverabl
 Retention announces itself once per worker at `Start`, so the effective policy is
 visible in every node's log:
 
-```
+```text
 INFO retention GC enabled completed_after=720h0m0s failed_after=2160h0m0s consumed_signals_after=168h0m0s disable_hint="disable with jobs.RetentionDisabled()"
 ```
 
 A worker whose retention is turned off logs one warning instead:
 
-```
+```text
 WARN retention is disabled; completed/failed/cancelled job rows and consumed signals accumulate forever
 ```
 

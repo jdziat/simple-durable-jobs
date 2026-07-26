@@ -540,7 +540,7 @@ func ResourceConstrainedPoolConfig() PoolConfig {
 	return storage.ResourceConstrainedPoolConfig()
 }
 
-// WithPoolConfig turns a PoolConfig — including the presets above — into a
+// WithPoolConfig turns a PoolConfig — including the four presets above — into a
 // PoolOption accepted by NewGormStorageWithPool and ConfigurePool.
 //
 // Without this, PoolOption was sealed by an unexported method and no exported

@@ -251,8 +251,10 @@ ALTER DATABASE `your_db` CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
 ALTER TABLE `your_table` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
 ```
 
-Then re-run `Migrate`. A brand-new database created by MySQL 8.0 already defaults
-to `utf8mb4` and needs none of this.
+Then re-run `Migrate`. A `CREATE DATABASE` with no explicit charset inherits the
+server's `character_set_server`, which is `utf8mb4` by default on MySQL 8.0 — so
+a new database on a stock 8.0 server needs none of this, but one created against
+a server whose `character_set_server` was set to `utf8mb3` still does.
 
 **MariaDB is not supported.** It has no `utf8mb4_0900_*` collations at all, so the
 same preflight refuses it by name rather than sending you after a character set
