@@ -1,11 +1,19 @@
 # Upgrading
 
-## v4.5.x → v4.6.x
+## Upgrading through the v4.6 / v4.7 line
 
-Two releases land in this line. **v4.6.0** fixed defects without changing any
-behaviour you could have been relying on. **v4.6.1** (this document's subject)
-changes runtime behaviour in five places, all of them cases where the old
-behaviour was wrong — but wrong in ways a deployment may have been tuned around.
+Three releases matter here.
+
+- **v4.6.0** closed a silent data-corruption bug in nested `Call()` replay and an
+  authentication bypass in the embedded dashboard, and cleared two reachable
+  advisories.
+- **v4.7.0** closed a set of durability defects — stranded dequeue claims,
+  dispositions reported but never written, backlog age counting not-yet-due jobs,
+  a MySQL charset crashloop, and an unfenced concurrency-slot release. None of it
+  changed behaviour you could have been relying on.
+- **The next release** (this document's subject) changes runtime behaviour in
+  several places, all of them cases where the old behaviour was wrong — but wrong
+  in ways a deployment may have been tuned around. Those are listed below.
 
 Nothing here is an API break. `gorelease` reports every change compatible; the
 only additions are new options, new event aliases and new storage methods.
@@ -69,12 +77,13 @@ reachable in every default configuration) and **GO-2026-5506** (`go.opentelemetr
 
 ---
 
-## Behaviour changes in v4.6.1
+## Behaviour changes in the next release
 
-> **This section describes only what is on this branch today.** Each remaining
-> behaviour change is added here by the packet that implements it — a release
-> note written ahead of the code is a release note that lies, which is the exact
-> defect class this campaign exists to remove.
+> **This section describes only what has actually landed.** Each behaviour change
+> is added here by the commit that implements it — a release note written ahead of
+> the code is a release note that lies, which is the exact defect class this work
+> exists to remove. An earlier draft of this file documented five changes that
+> did not exist yet; review caught it.
 
 ### Cancelling a workflow now cancels paused and waiting descendants
 
@@ -187,8 +196,9 @@ running process into a crash. v5 replaces this with a typed signature.
 
 ## Rollback
 
-v4.6.x so far adds two forward-only migrations: **v36** (`checkpoints.span_end`)
-and **v37** (`idx_concurrency_slots_job_id`). Both are additive — a new column
+This line adds two forward-only migrations: **v36** (`checkpoints.span_end`,
+shipped in v4.6.0) and **v37** (`idx_concurrency_slots_job_id`, shipped in
+v4.7.0). Both are additive — a new column
 with a default, and an index — so an older binary runs correctly against the
 newer schema and rolling back the application is safe. No migration in this line
 rewrites data. Any further migration is listed here by the packet that adds it.
