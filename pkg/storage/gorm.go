@@ -439,7 +439,7 @@ func requireMySQLUTCSession(ctx context.Context, db *gorm.DB) error {
 // requireMySQLUTF8MB4 refuses to migrate a MySQL database whose default
 // character set cannot carry the utf8mb4_0900_* collations the schema pins.
 //
-// WHY THIS IS A PREFLIGHT AND NOT A FIX
+// # WHY THIS IS A PREFLIGHT AND NOT A FIX
 //
 // Every collation-bearing migration writes `... COLLATE utf8mb4_0900_as_cs`
 // with NO accompanying CHARACTER SET. On a utf8mb4 database that is correct and
@@ -961,7 +961,11 @@ func (s *GormStorage) Fail(ctx context.Context, jobID core.UUID, workerID string
 
 	if retryAt != nil {
 		updates["status"] = core.StatusPending
-		updates["run_at"] = retryAt
+		// Same clock-face normalization as fillEnqueueDefaults: on SQLite run_at is
+		// compared as TEXT against a process-local bind, so a retryAt handed in from
+		// another zone would mis-order. A no-op on Postgres and MySQL.
+		localRetryAt := retryAt.In(time.Local)
+		updates["run_at"] = &localRetryAt
 		// retryAt is non-nil in this branch, so readiness is simply retryAt<=now.
 		// Compute it in Go: a bound "? IS NULL" parameter has no inferable type on
 		// Postgres (SQLSTATE 42P18), and a map Update writes an explicit bool fine.

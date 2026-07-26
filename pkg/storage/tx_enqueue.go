@@ -148,7 +148,43 @@ func fillEnqueueDefaults(job *core.Job) {
 	if job.Queue == "" {
 		job.Queue = "default"
 	}
+	normalizeRunAtZone(job)
 	setDQReadyForCreate(job, time.Now())
+}
+
+// normalizeRunAtZone re-points job.RunAt at the SAME INSTANT rendered in this
+// process's local zone. It changes no instant — only the clock face the instant
+// is written on.
+//
+// This exists for SQLite, which has no datetime type: mattn/go-sqlite3 binds
+// every time.Time as TEXT using "2006-01-02 15:04:05.999999999-07:00" (note the
+// trailing offset, and that a UTC value renders "+00:00", never "Z"), and SQLite
+// compares those strings LEXICALLY. Every "is this job due yet" predicate binds
+// this process's wall clock, carrying the LOCAL offset — so a run_at handed in
+// on a different clock face (queue.At with a UTC time, a parsed RFC 3339 "...Z",
+// a protobuf timestamp) is compared character-by-character against a
+// differently-offset string and mis-orders by the full delta between the zones,
+// up to 14 hours, in either direction.
+//
+// It REPOINTS rather than writing through the pointer: job.RunAt aliases the
+// *time.Time inside queue.At's Option, and mutating it would corrupt an Option
+// the caller may reuse across enqueues.
+//
+// time.Local, not UTC, is the target on purpose. UTC would put newly written
+// rows on a clock face that every ALREADY-STORED row does not share — including
+// GORM's autoCreateTime created_at — so in a positive-offset zone a UTC-bound
+// comparison reads a locally-written created_at as still in the future, which
+// would strand every pre-existing pending job. Local keeps one clock face for
+// old rows, new rows and binds alike.
+//
+// A no-op on Postgres (timestamptz stores the instant) and MySQL (the driver
+// re-renders in the DSN location), so no dialect gate is needed.
+func normalizeRunAtZone(job *core.Job) {
+	if job.RunAt == nil || job.RunAt.Location() == time.Local {
+		return
+	}
+	local := job.RunAt.In(time.Local)
+	job.RunAt = &local
 }
 
 func setDQReadyForCreate(job *core.Job, now time.Time) {

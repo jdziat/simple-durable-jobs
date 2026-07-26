@@ -243,6 +243,43 @@ type.
 misconfigured. It is a log, not a panic — a patch upgrade should not turn a
 running process into a crash. v5 replaces this with a typed signature.
 
+### Schedules honour an explicit `CRON_TZ=` prefix
+
+**Before:** `jobs.Cron` accepted robfig's `CRON_TZ=Area/City ` / `TZ=Area/City `
+prefix, parsed it, and then overwrote the parsed location with UTC. A schedule
+that asked for 09:00 New York fired at 09:00 **UTC** — 4 or 5 hours early —
+with no error. `Cron("CRON_TZ=America/New_York")` with no expression after the
+prefix **panicked**.
+
+**After:** an explicit prefix is honoured, and the malformed form returns an
+error instead of panicking. Expressions with no prefix are unchanged: still UTC,
+still not the host's local zone.
+
+**What you may notice:** if you have a schedule carrying a `CRON_TZ=`/`TZ=`
+prefix today, it has been firing at the wrong hour and will now move to the hour
+you asked for. Nothing else moves. `CronIn`, `DailyIn` and `WeeklyIn` are new and
+take a `*time.Location` directly, which is clearer than the prefix.
+
+### `run_at` is stored on one clock face
+
+**Before:** SQLite has no datetime type — the driver writes every timestamp as
+TEXT carrying its offset, and SQLite compares those strings **lexically**. Every
+"is this job due yet" predicate binds this process's wall clock with the local
+offset, so a `run_at` supplied on a different clock face (`jobs.At` with a UTC
+time, a parsed RFC 3339 `...Z`, a timestamp from another service) was compared
+character-by-character against a differently-offset string. The job became
+eligible early or late by the full delta between the two zones — up to 14 hours.
+
+**After:** `run_at` — from enqueue and from `Storage.Fail`'s `retryAt` — is
+re-pointed at the same instant on this process's local clock face before it is
+written. The instant never changes; only the rendering does. A no-op on
+Postgres and MySQL.
+
+**What you may notice:** nothing, unless you were passing a non-local `run_at` on
+SQLite, in which case delayed jobs now fire when you asked rather than hours off.
+No migration: existing rows were written by the driver on the local face already,
+and rewriting them is what made the original design of this fix dangerous.
+
 ## Rollback
 
 This line adds two forward-only migrations: **v36** (`checkpoints.span_end`,
