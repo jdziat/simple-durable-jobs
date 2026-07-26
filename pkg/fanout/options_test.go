@@ -1,6 +1,7 @@
 package fanout
 
 import (
+	"github.com/jdziat/simple-durable-jobs/v4/pkg/queue"
 	"testing"
 	"time"
 
@@ -61,7 +62,12 @@ func TestDefaultConfig(t *testing.T) {
 	cfg := defaultConfig()
 	assert.Equal(t, core.StrategyFailFast, cfg.strategy)
 	assert.Equal(t, 1.0, cfg.threshold)
-	assert.Equal(t, 3, cfg.retries)
+	// Aligned to queue.DefaultJobRetries. Sub() used to STAMP that value onto
+	// every child, so cfg.retries was unreachable for the common path and only
+	// applied to hand-written SubJob{} literals. Now that Sub() leaves it unset,
+	// cfg.retries governs both — and matching DefaultJobRetries keeps the
+	// effective retries for a Sub()-built child exactly what it was.
+	assert.Equal(t, queue.DefaultJobRetries, cfg.retries)
 	assert.False(t, cfg.cancelOnFailure)
 }
 

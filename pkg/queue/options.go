@@ -27,6 +27,7 @@ type Options struct {
 	Determinism     DeterminismMode
 	determinismSet  bool
 	prioritySet     bool
+	retriesSet      bool
 	windowedDedup   windowedDedupMode
 	// Timezone is reserved for future use and is currently ignored; schedules evaluate in UTC.
 	//
@@ -138,7 +139,19 @@ func (o *Options) PrioritySet() bool { return o.prioritySet }
 func Retries(n int) Option {
 	return optionFunc(func(o *Options) {
 		o.MaxRetries = security.ClampRetries(n)
+		o.retriesSet = true
 	})
+}
+
+// RetriesSet reports whether a Retries option was explicitly applied, so an
+// intentional Retries(0) can be told apart from "never set". Mirrors PrioritySet.
+func (o *Options) RetriesSet() bool { return o.retriesSet }
+
+// DedupRequested reports whether any enqueue-deduplication option (Unique,
+// IdempotencyKey or UniqueFor) was applied. It reads windowedDedup rather than
+// the TTL fields so a degenerate UniqueFor(0) is still detected.
+func (o *Options) DedupRequested() bool {
+	return o.UniqueKey != "" || o.windowedDedup != windowedDedupNone
 }
 
 // Delay schedules the job to run after a duration.

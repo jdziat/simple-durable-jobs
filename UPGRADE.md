@@ -116,6 +116,35 @@ and a still-running job keeps its lease until the handler actually returns.
 around a pause. Alerting that counted those events will see them stop. Resume
 simply re-dispatches the job.
 
+### Fan-out sub-job options are honoured
+
+**Before:** `fanout.Sub` accepted the full `queue.Option` set and silently dropped
+`Determinism`, `Delay`, `RunAt` and `IdempotencyKey`. It also stamped a retry
+count on every child unconditionally, which made the fan-out default unreachable
+— so `WithFanOutRetries(n)` was **completely dead** for anything built with
+`Sub()`, and an explicit `Retries(0)` was overridden with the default.
+
+**After:** all of these take effect.
+
+**What you may notice:**
+
+- A sub-job given `jobs.Retries(0)` now runs **once**, where it previously ran up
+  to four times. A deployment tuned around those extra attempts will see more
+  terminal failures — that is the option doing what it says.
+- `jobs.WithFanOutRetries(n)` starts working for `Sub()`-built children.
+- Sub-jobs given a `Delay` or `RunAt` now actually wait, and one asked to replay
+  deterministically now does.
+- **Hand-written `fanout.SubJob{}` literals** with no explicit `Retries` go from
+  3 retries to 2. The fan-out default is now `queue.DefaultJobRetries`, matching
+  what `Sub()`-built children already received — chosen so the common path does
+  not move. Set `Retries` explicitly if you relied on 3.
+- Passing a dedup option (`Unique`, `IdempotencyKey`, `UniqueFor`) to `Sub` logs
+  one `WARN` per fan-out. Those are parent-level concepts and remain ignored:
+  children carry a fan-out-owned unique key so parent replay stays idempotent.
+  It is a warning rather than an error in v4 deliberately — turning a
+  silently-wrong call into a hard failure on upgrade would convert a latent bug
+  into an outage. v5 makes it an error.
+
 ### Fractional rate limits are now accurate
 
 **Before:** the fleet rate limiter derived a window that only required

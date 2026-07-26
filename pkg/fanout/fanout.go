@@ -210,6 +210,8 @@ func FanOut[T any](ctx context.Context, subJobs []SubJob, opts ...Option) ([]Res
 
 func buildSubJobs(subJobs []SubJob, cfg *config, jc *intctx.JobContext, fanOutID core.UUID) ([]*core.Job, error) {
 	jobs := make([]*core.Job, len(subJobs))
+	now := time.Now()
+	var dedupIgnored []int
 	for i, sj := range subJobs {
 		if err := security.ValidateJobTypeName(sj.Type); err != nil {
 			return nil, fmt.Errorf("invalid sub-job type %q: %w", sj.Type, err)
@@ -248,11 +250,31 @@ func buildSubJobs(subJobs []SubJob, cfg *config, jc *intctx.JobContext, fanOutID
 		}
 
 		// Determine retries with fallback, then clamp to security limits
+		// RetriesSet — not a zero test — decides "unset", so an explicit
+		// Retries(0) stays 0 instead of being overridden by the fan-out default.
+		// Mirrors the PrioritySet handling above.
 		retries := sj.Retries
-		if retries == 0 {
+		if !sj.RetriesSet {
 			retries = cfg.retries
 		}
 		retries = security.ClampRetries(retries)
+
+		if sj.DedupOptionsIgnored {
+			dedupIgnored = append(dedupIgnored, i)
+		}
+
+		// Delay/RunAt precedence mirrors queue.buildJob: Delay first, then an
+		// absolute RunAt overrides it. The *time.Time is copied so the child never
+		// aliases the caller's SubJob.
+		var runAt *time.Time
+		if sj.Delay > 0 {
+			t := now.Add(sj.Delay)
+			runAt = &t
+		}
+		if sj.RunAt != nil {
+			t := *sj.RunAt
+			runAt = &t
+		}
 
 		parentID := jc.Job.ID
 		rootID := jc.Job.RootJobID
@@ -273,12 +295,23 @@ func buildSubJobs(subJobs []SubJob, cfg *config, jc *intctx.JobContext, fanOutID
 			Priority:    priority,
 			MaxRetries:  retries,
 			Timeout:     sj.Timeout,
+			Determinism: int(sj.Determinism),
+			RunAt:       runAt,
 			ParentJobID: &parentID,
 			RootJobID:   rootID,
 			FanOutID:    &fanOutID,
 			FanOutIndex: i,
 			UniqueKey:   fmt.Sprintf("fanout-%s-%d", fanOutID, i), // Prevent duplicate sub-jobs on replay
 		}
+	}
+	// Aggregated once per call, not per child: a 10k-wide fan-out must not emit
+	// 10k lines. Warn, never error — turning a silently-wrong call into a hard
+	// failure on upgrade would convert a latent bug into an outage. v5 errors.
+	if len(dedupIgnored) > 0 && jc.Logger != nil {
+		jc.Logger.Warn(
+			"fanout.Sub: enqueue-deduplication options (Unique/IdempotencyKey/UniqueFor) are ignored on "+
+				"fan-out sub-jobs; children carry a fan-out-owned UniqueKey so parent replay stays idempotent",
+			"job_id", jc.Job.ID, "fan_out_id", fanOutID, "sub_job_indexes", dedupIgnored)
 	}
 	return jobs, nil
 }
