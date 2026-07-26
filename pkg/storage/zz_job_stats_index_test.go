@@ -4,9 +4,27 @@ import (
 	"context"
 	"testing"
 
+	"gorm.io/gorm"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// dropJobStats removes the ad-hoc job_stats table these tests create, before the
+// test body and again after it.
+//
+// openTestDB's external-DB isolation (requireCleanStart / cleanupExternalDB) only
+// DELETEs rows from externalTestTables and never DROPs a table — and job_stats is
+// not one of them. So against the PERSISTENT Postgres and MySQL matrix databases
+// the table the first test creates survives into the second (whose
+// require.False(HasTable) then fails) and into the NEXT RUN (whose CREATE TABLE
+// then fails "already exists"). SQLite gets a fresh :memory: database per test, so
+// the defect is invisible on the default leg and reds only the two external legs.
+func dropJobStats(t testing.TB, db *gorm.DB) {
+	t.Helper()
+	require.NoError(t, db.Migrator().DropTable(jobStatsTable))
+	t.Cleanup(func() { _ = db.Migrator().DropTable(jobStatsTable) })
+}
 
 // Migration v38 indexes job_stats(timestamp). The table is owned by the ui
 // package, which imports this one, so it is named as a string and guarded by
@@ -19,6 +37,7 @@ import (
 func TestMigrateJobStatsTimestampIndex_OnAnExistingTable(t *testing.T) {
 	ctx := context.Background()
 	db := openTestDB(t)
+	dropJobStats(t, db)
 
 	require.NoError(t, db.WithContext(ctx).Exec(
 		`CREATE TABLE job_stats (id integer primary key, queue varchar(255), timestamp timestamp)`,
@@ -39,6 +58,7 @@ func TestMigrateJobStatsTimestampIndex_OnAnExistingTable(t *testing.T) {
 func TestMigrateJobStatsTimestampIndex_NoOpsWithoutTheTable(t *testing.T) {
 	ctx := context.Background()
 	db := openTestDB(t)
+	dropJobStats(t, db)
 
 	require.False(t, db.Migrator().HasTable(jobStatsTable))
 	require.NoError(t, migrateJobStatsTimestampIndex(ctx, db, db.Name()))

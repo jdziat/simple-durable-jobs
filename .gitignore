@@ -51,9 +51,12 @@ bin/
 ui/frontend/buf.yaml
 ui/frontend/proto
 
-# Hugo build output
-public/
-resources/
+# Hugo build output. Anchored to docs/ on purpose: a bare `public/` also matched
+# ui/frontend/public/, which is Vite's static-asset directory and IS source --
+# so the dashboard's favicon was silently excluded from the repo and reappeared
+# missing in every clean build.
+docs/public/
+docs/resources/
 .hugo_build.lock
 
 # Temporary files

@@ -33,6 +33,13 @@ var (
 // Usage:
 //
 //	mux.Handle("/jobs/", http.StripPrefix("/jobs", ui.Handler(storage)))
+//
+// The handler works at any mount path. Its assets and its RPC calls are
+// addressed relative to the document, so nothing needs to be told the prefix.
+// The one requirement is that the mount root is reachable with a TRAILING SLASH
+// (/jobs/, not /jobs) — net/http's ServeMux redirects the bare form for the
+// pattern above; a router that serves the shell at /jobs without redirecting
+// will not resolve the assets.
 func Handler(storage core.Storage, opts ...Option) http.Handler {
 	cfg := &config{
 		ctx:                      context.Background(),
@@ -114,9 +121,27 @@ func Handler(storage core.Storage, opts ...Option) http.Handler {
 	} else {
 		fileServer := http.FileServer(http.FS(staticFS))
 		mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-			// For SPA routing, serve index.html for non-file requests
+			// The SPA shell is served ONLY at the mount root; unknown
+			// extension-less paths are redirected there.
+			//
+			// The shell's script/stylesheet/font references are relative to the
+			// document, which is what lets this handler work under
+			// http.StripPrefix at any prefix. The flip side is that the shell is
+			// only correct when the document URL IS the mount root: served at
+			// /queues/detail the browser would resolve ./assets/index-*.js to
+			// /queues/assets/index-*.js and get a blank page. The app is
+			// hash-routed (/jobs/#/queues), so the mount root is the only URL it
+			// ever needs.
+			//
+			// The Location is deliberately RELATIVE and computed from the request
+			// depth. http.Redirect(w, r, "/", ...) would emit the POST-StripPrefix
+			// path and send the browser to the OPERATOR'S site root, outside the
+			// mount — this handler cannot know its own prefix, because
+			// StripPrefix already removed it.
 			if !strings.Contains(r.URL.Path, ".") && r.URL.Path != "/" {
-				r.URL.Path = "/"
+				w.Header().Set("Location", relativeMountRoot(r.URL.Path))
+				w.WriteHeader(http.StatusFound)
+				return
 			}
 			fileServer.ServeHTTP(w, r)
 		})
@@ -179,6 +204,25 @@ func Handler(storage core.Storage, opts ...Option) http.Handler {
 		}
 		h2cHandler.ServeHTTP(w, r)
 	})
+}
+
+// relativeMountRoot returns a relative URL that, resolved by a browser against a
+// request for p, addresses the mount root. p is the request path AFTER any
+// http.StripPrefix, so its DEPTH — not its text — is what matters:
+//
+// A browser resolves a relative reference against the request's DIRECTORY, so a
+// trailing slash counts as one more level:
+//
+//	"/queues" -> "./"     (base "/jobs/"     -> "/jobs/")
+//	"/a/b"    -> "../"    (base "/jobs/a/"   -> "/jobs/")
+//	"/a/b/"   -> "../../" (base "/jobs/a/b/" -> "/jobs/")
+//	"/a/b/c"  -> "../../" (base "/jobs/a/b/" -> "/jobs/")
+func relativeMountRoot(p string) string {
+	up := strings.Count(strings.TrimPrefix(p, "/"), "/")
+	if up == 0 {
+		return "./"
+	}
+	return strings.Repeat("../", up)
 }
 
 // maxH2CUpgradeBody bounds the body x/net buffers while replaying an h2c upgrade

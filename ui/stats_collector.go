@@ -2,13 +2,13 @@ package ui
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"sync"
 	"time"
 
 	"github.com/jdziat/simple-durable-jobs/v4/pkg/core"
 	"github.com/jdziat/simple-durable-jobs/v4/pkg/queue"
-	jobsv1 "github.com/jdziat/simple-durable-jobs/v4/ui/gen/jobs/v1"
 )
 
 // StatsCollector subscribes to queue events and periodically snapshots queue depth.
@@ -166,13 +166,6 @@ func (sc *StatsCollector) remergeCounters(queueName string, failed *statCounters
 	c.retried += failed.retried
 }
 
-// queueDepthAggregator is the storage capability that counts queue depth with a
-// GROUP BY instead of returning rows. *storage.GormStorage has it; a custom
-// core.Storage may not, so the scan below stays as the fallback.
-type queueDepthAggregator interface {
-	GetQueueDepthStats(ctx context.Context) ([]*jobsv1.QueueStats, error)
-}
-
 // snapshot records one per-queue depth sample per minute.
 //
 // NOTE ON WHAT THIS DOES *NOT* CAPTURE: the counters this collector folds in
@@ -185,18 +178,20 @@ func (sc *StatsCollector) snapshot(ctx context.Context) {
 	ts := time.Now().Truncate(time.Minute)
 	storage := sc.queue.Storage()
 
-	var queueDepth map[string]*[2]int64
-	if agg, ok := storage.(queueDepthAggregator); ok {
-		var err error
-		if queueDepth, err = sc.aggregateQueueDepth(ctx, agg); err != nil {
-			// Do NOT fall through to the scan: it reads the same table the
-			// aggregate just failed on, only far more expensively. Skip the
-			// sample, exactly as the scan path does on error.
-			sc.logger.Error("failed to aggregate queue depth for stats snapshot", "error", err)
-			return
-		}
+	var (
+		queueDepth map[string]*[2]int64
+		err        error
+	)
+	if agg, ok := storage.(queueDepthStatsStorage); ok {
+		// Do NOT fall back to the scan when the aggregate fails: it reads the same
+		// table the aggregate just failed on, only far more expensively.
+		queueDepth, err = sc.aggregateQueueDepth(ctx, agg)
 	} else {
-		queueDepth = sc.scanQueueDepth(ctx, storage)
+		queueDepth, err = sc.scanQueueDepth(ctx, storage)
+	}
+	if err != nil {
+		sc.logger.Error("failed to read queue depth for stats snapshot", "error", err)
+		return
 	}
 
 	for queueName, d := range queueDepth {
@@ -219,7 +214,7 @@ func (sc *StatsCollector) snapshot(ctx context.Context) {
 // sample every minute, forever, for every queue that has ever run a job —
 // unbounded growth in job_stats and a behaviour change nobody asked for. This
 // packet is about the numbers being RIGHT, not about which queues appear.
-func (sc *StatsCollector) aggregateQueueDepth(ctx context.Context, agg queueDepthAggregator) (map[string]*[2]int64, error) {
+func (sc *StatsCollector) aggregateQueueDepth(ctx context.Context, agg queueDepthStatsStorage) (map[string]*[2]int64, error) {
 	stats, err := agg.GetQueueDepthStats(ctx)
 	if err != nil {
 		return nil, err
@@ -241,15 +236,18 @@ func (sc *StatsCollector) aggregateQueueDepth(ctx context.Context, agg queueDept
 // truncated count is a wrong number on the dashboard during exactly the incident
 // an operator is looking at it for, so the truncation is now logged rather than
 // silent.
-func (sc *StatsCollector) scanQueueDepth(ctx context.Context, storage core.Storage) map[string]*[2]int64 {
+func (sc *StatsCollector) scanQueueDepth(ctx context.Context, storage core.Storage) (map[string]*[2]int64, error) {
 	const scanCap = 10000
 
 	queueDepth := make(map[string]*[2]int64) // [pending, running]
 	for _, status := range []core.JobStatus{core.StatusPending, core.StatusRunning} {
 		jobs, err := storage.GetJobsByStatus(ctx, status, scanCap)
 		if err != nil {
-			sc.logger.Error("failed to query jobs for stats snapshot", "status", status, "error", err)
-			continue
+			// Abort the whole sample rather than continue. Continuing persisted a row
+			// in which the FAILED half read as a hard zero — pending=0 when pending was
+			// merely unreadable — a fabricated number on the dashboard, which is the
+			// exact defect this packet exists to remove. A missing minute is honest.
+			return nil, fmt.Errorf("query %s jobs: %w", status, err)
 		}
 		if len(jobs) == scanCap {
 			sc.logger.Warn("queue-depth sample truncated; the dashboard depth chart is an UNDERCOUNT",
@@ -271,7 +269,7 @@ func (sc *StatsCollector) scanQueueDepth(ctx context.Context, storage core.Stora
 			}
 		}
 	}
-	return queueDepth
+	return queueDepth, nil
 }
 
 func (sc *StatsCollector) prune(ctx context.Context) {

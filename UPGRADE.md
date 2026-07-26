@@ -308,6 +308,43 @@ read from the database and is fleet-wide. See "What the throughput series does
 and does not measure" in the Embedded UI guide; for fleet-wide throughput use the
 OpenTelemetry metrics, which every process exports.
 
+### The dashboard boots under a sub-path mount
+
+**Before:** the bundled dashboard referenced its assets **root-absolutely**
+(`/assets/index-*.js`) and its RPC client built every call from
+`window.location.origin`. Mounted the way the `Handler` godoc, the README and six
+docs pages all prescribe —
+
+```go
+mux.Handle("/jobs/", http.StripPrefix("/jobs", ui.Handler(storage)))
+```
+
+— the browser then requested `/assets/index-*.js`, which is outside the
+`"/jobs/"` pattern, so the surrounding mux returned 404 and no script ever ran.
+The dashboard was a **blank page** at its own documented mount. `index.html` also
+referenced a `favicon.svg` that was not in the bundle at all, so that 404'd even
+at the root mount.
+
+**After:** assets and the RPC base are resolved relative to the URL the page was
+served from, so one build works at any mount point — sub-path or root — with
+nothing to configure. The favicon ships.
+
+**What you may notice:** if you mounted at a sub-path and worked around the blank
+page (proxy rewrites, an extra route for `/assets/`, or by mounting at the root
+instead), that workaround is no longer needed. Nothing breaks if you keep it.
+
+Two consequences worth knowing:
+
+- Register the pattern **with a trailing slash**, as every example does.
+  `ServeMux` redirects `/jobs` to `/jobs/` for a `"/jobs/"` pattern, and that
+  redirect is what makes the relative URLs resolve. A router that serves the
+  shell at `/jobs` without redirecting will not.
+- An unknown extension-less path under the mount now returns **302 to the mount
+  root** (with a relative `Location`) instead of 200 with the shell. Serving the
+  shell at `/jobs/a/b` would make the browser resolve `./assets/...` into a
+  directory that does not exist — a blank page. The app is hash-routed
+  (`/jobs/#/queues`), so no real route is affected.
+
 ## Rollback
 
 This line adds three forward-only migrations: **v36** (`checkpoints.span_end`,

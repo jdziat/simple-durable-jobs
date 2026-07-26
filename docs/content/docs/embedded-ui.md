@@ -69,6 +69,21 @@ func main() {
 }
 ```
 
+### Mount path
+
+`ui.Handler` works at any mount path. Its assets and its RPC calls are addressed relative to the document, so it does not need to be told the prefix:
+
+```go
+mux.Handle("/jobs/", http.StripPrefix("/jobs", ui.Handler(storage)))  // http://host/jobs/
+mux.Handle("/", ui.Handler(storage))                                  // http://host/
+```
+
+One requirement: **the mount root must be reachable with a trailing slash** (`/jobs/`, not `/jobs`). `http.ServeMux` redirects the bare form automatically for the `"/jobs/"` pattern above; if you use a router that serves the shell at `/jobs` with no redirect, add one, or the browser resolves the relative asset URLs one directory too high.
+
+Unknown extension-less paths under the mount redirect (302) to the mount root, with a **relative** `Location`. The app routes on the URL fragment (`/jobs/#/queues`), so the shell is only ever correct at the mount root itself. The redirect has to be relative because `http.StripPrefix` has already removed the prefix by the time the handler runs -- it cannot know what it is mounted under, and an absolute `/` would send the browser to *your* site root, outside the mount.
+
+A reverse proxy that strips the prefix (`proxy_pass http://app/;`) pairs with a root mount; a proxy that preserves it pairs with the `StripPrefix` form above.
+
 The `ui.Handler` function returns an `http.Handler` that serves both the Connect-RPC API and the embedded Svelte SPA frontend. It uses H2C (HTTP/2 over cleartext) internally to support Connect streaming without requiring TLS. If the frontend has not been built, a placeholder page is shown with instructions.
 
 ## Options
