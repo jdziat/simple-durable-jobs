@@ -50,8 +50,13 @@ type Worker struct {
 	shuttingDown atomic.Bool
 
 	// Running job cancellation (for aggressive pause)
-	runningJobs   map[core.UUID]context.CancelFunc
-	runningJobsMu sync.Mutex
+	runningJobs map[core.UUID]context.CancelFunc
+	// pauseCancelled marks jobs whose handler context was cancelled by
+	// Pause(PauseModeAggressive) rather than by a genuine failure or shutdown.
+	// Guarded by runningJobsMu, which already guards the cancel funcs the pause
+	// invokes, so the mark and the cancel cannot be observed out of order.
+	pauseCancelled map[core.UUID]struct{}
+	runningJobsMu  sync.Mutex
 
 	// Per-queue concurrency tracking
 	queueRunning map[string]*atomic.Int32 // queue name -> active count
@@ -466,6 +471,7 @@ func NewWorker(q *queue.Queue, opts ...WorkerOption) *Worker {
 		logger:                  slog.Default(),
 		forcedHandlerDrainGrace: defaultForcedHandlerDrainGrace,
 		runningJobs:             make(map[core.UUID]context.CancelFunc),
+		pauseCancelled:          make(map[core.UUID]struct{}),
 		queueRunning:            queueRunning,
 		queueJobID:              make(map[core.UUID]string),
 		slotJobID:               make(map[core.UUID][]string),
@@ -1889,8 +1895,21 @@ func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 	// Emit start event
 	w.queue.Emit(&core.JobStarted{Job: job, Timestamp: startTime})
 
-	// Create a cancellable context for the heartbeat goroutine
-	heartbeatCtx, cancelHeartbeat := context.WithCancel(jobCtx)
+	// The heartbeat is DETACHED from jobCtx on purpose.
+	//
+	// It used to be a child of it, so anything that cancelled the handler also
+	// killed the lease renewal — including an aggressive pause and a shutdown.
+	// But cancelling a handler does not stop it: a handler mid-I/O, or one that
+	// ignores ctx entirely, keeps running and keeps holding the job. With the
+	// lease no longer renewed it lapses, the stale-lock reaper hands the job to a
+	// peer, and the original handler is still executing it — cancellation causing
+	// DOUBLE EXECUTION, which is the one thing the lease exists to prevent.
+	//
+	// The lease must track whether the handler is still RUNNING, not whether it
+	// has been asked to stop. The deferred cancelHeartbeat below ends it when
+	// processJob actually returns, which is the moment we genuinely stop holding
+	// the job.
+	heartbeatCtx, cancelHeartbeat := context.WithCancel(context.WithoutCancel(jobCtx))
 	defer cancelHeartbeat()
 
 	// Start heartbeat goroutine to extend lock during long-running jobs
@@ -1911,6 +1930,9 @@ func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 		resultBytes = nil
 	}
 
+	// Declared outside the block: the pause-cancel branch below needs it to
+	// distinguish this worker's own cancellation from a genuine handler failure.
+	var selfCancelled bool
 	if err != nil {
 		// Self-suspension signal — the handler moved its job to StatusWaiting
 		// (fan-out or signal wait) and returned. Not a failure: just stop.
@@ -1949,13 +1971,57 @@ func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 		// path instead — exactly what the default IsFailure does — so the job re-runs.
 		// Shutdown is handled above; a timeout yields DeadlineExceeded (not Canceled)
 		// so it is unaffected.
-		selfCancelled := errors.Is(err, context.Canceled) && ctx.Err() == nil && jobCtx.Err() != nil
+		selfCancelled = errors.Is(err, context.Canceled) && ctx.Err() == nil && jobCtx.Err() != nil
 		if !selfCancelled && !w.queue.IsFailure(job, err) {
 			err = nil
 		}
 	}
 
-	if err != nil {
+	// The mark alone is NOT sufficient. Pause marks every id in runningJobs, and
+	// processJob only removes its own id in the deferred cleanup — so a handler
+	// that returns a GENUINE error at the instant a pause lands would also be
+	// marked. Releasing on that would drop a real failure on the floor: no Fail,
+	// no JobFailed, no attempt burned, error discarded. Require the error to
+	// actually BE this worker's self-cancel.
+	if err != nil && selfCancelled && w.takePauseCancelled(job.ID) {
+		// An aggressive pause cancelled this handler. That is an OPERATOR
+		// instruction to stop, not a job failure, so it must not travel the
+		// failure path: doing so burned an attempt and — at the default
+		// MaxRetries, with the attempt already advanced — permanently
+		// dead-lettered a job that the docs present as the reversible half of
+		// Pause/Resume. It also emitted JobFailed/JobRetrying for an outcome
+		// nobody chose.
+		//
+		// Release to pending with the attempt intact so Resume simply re-dispatches
+		// it. Released on a detached context because ctx is frequently already
+		// cancelled by the time we get here.
+		cancelHeartbeat()
+		releaseCtx, cancelRelease := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		// RETRIED, like every other disposition write in this function. A
+		// single-shot release loses to ordinary contention — most often this
+		// worker's OWN poll loop, which holds an open dequeue transaction while
+		// Pause fires from outside. On shared-cache SQLite that surfaces as
+		// SQLITE_LOCKED, which busy_timeout does not retry; on Postgres/MySQL the
+		// equivalents are a serialization failure and a lock-wait timeout.
+		//
+		// Losing it is expensive: Release is the ONLY write on this path, so the
+		// row stays 'running' with our lock and NOTHING re-dispatches it until the
+		// stale-lock reaper fires at StaleLockAge — 45 MINUTES by default. Resume()
+		// re-dispatches PENDING rows, so it does not help.
+		//
+		// retryWithBackoff gets releaseCtx, NOT ctx: it returns immediately on a
+		// context error, so handing it the frequently-already-cancelled parent
+		// would quietly collapse it back to a single attempt.
+		relErr := retryWithBackoff(releaseCtx, *w.config.StorageRetry, func() error {
+			return w.queue.Storage().Release(releaseCtx, job.ID, w.config.WorkerID)
+		})
+		cancelRelease()
+		if relErr != nil && !errors.Is(relErr, core.ErrJobNotOwned) {
+			w.logger.Error("failed to release job cancelled by aggressive pause after retries",
+				"job_id", job.ID, "error", relErr)
+		}
+		w.logger.Info("job released by aggressive pause; it will re-dispatch on resume", "job_id", job.ID)
+	} else if err != nil {
 		w.queue.CallErrorHandler(jobCtx, job, err)
 		w.handleError(ctx, jobCtx, job, err)
 		cancelHeartbeat()
@@ -2128,10 +2194,14 @@ func (w *Worker) runHeartbeat(ctx context.Context, job *core.Job) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			// Stop heartbeat if aggressively paused
-			if w.IsPaused() && w.PauseMode() == core.PauseModeAggressive {
-				return
-			}
+			// The heartbeat deliberately CONTINUES under an aggressive pause. It
+			// used to return here, which dropped the lease of a job that is still
+			// running — the handler may not observe cancellation for some time,
+			// and a handler that ignores ctx entirely never does. Once the lease
+			// lapses the stale-lock reaper hands the job to a peer while the
+			// original handler is still executing it: a pause that causes
+			// double-execution. Ownership is released explicitly when the
+			// pause-cancelled job returns, not by letting the lease rot.
 
 			err := retryWithBackoff(ctx, *w.config.StorageRetry, func() error {
 				return w.queue.Storage().Heartbeat(ctx, job.ID, w.config.WorkerID)
@@ -3131,15 +3201,37 @@ func (w *Worker) runOwnershipAudit(ctx context.Context) {
 	}
 }
 
+// takePauseCancelled reports whether this job's handler was cancelled by an
+// aggressive pause, clearing the mark so it is consumed exactly once.
+//
+// Consuming the mark matters: a job released by a pause is re-dispatched on
+// resume, and if the mark survived, a genuine failure on that later run would be
+// silently swallowed as "just a pause" and released forever.
+func (w *Worker) takePauseCancelled(jobID core.UUID) bool {
+	w.runningJobsMu.Lock()
+	defer w.runningJobsMu.Unlock()
+	if _, ok := w.pauseCancelled[jobID]; !ok {
+		return false
+	}
+	delete(w.pauseCancelled, jobID)
+	return true
+}
+
 // Pause pauses the worker.
 func (w *Worker) Pause(mode core.PauseMode) {
 	w.pauseMode.Store(mode)
 	w.paused.Store(true)
 
 	if mode == core.PauseModeAggressive {
-		// Cancel all running jobs
+		// Cancel every running handler, and MARK each one first. Without the mark
+		// the resulting context.Canceled is indistinguishable from a handler that
+		// failed, so it fell through the normal failure path: the attempt was
+		// burned and — at the default MaxRetries, with the attempt already
+		// advanced — the job was permanently DEAD-LETTERED by an operation
+		// documented as the reversible half of Pause/Resume.
 		w.runningJobsMu.Lock()
-		for _, cancel := range w.runningJobs {
+		for jobID, cancel := range w.runningJobs {
+			w.pauseCancelled[jobID] = struct{}{}
 			cancel()
 		}
 		w.runningJobsMu.Unlock()
@@ -3166,8 +3258,15 @@ func (w *Worker) CancelJob(jobID core.UUID) bool {
 }
 
 // Resume resumes the worker.
+// Resume clears any pause-cancel marks that were never consumed — a job that
+// finished before observing the cancellation, say — so a mark cannot leak into a
+// later run and mask a real failure there.
 func (w *Worker) Resume() {
 	w.paused.Store(false)
+
+	w.runningJobsMu.Lock()
+	clear(w.pauseCancelled)
+	w.runningJobsMu.Unlock()
 
 	// Emit event
 	w.queue.Emit(&core.WorkerResumed{

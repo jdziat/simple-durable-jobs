@@ -99,6 +99,23 @@ cancelled — and the fan-out row permanently violated the documented
   own Resume is unaffected — it goes through `UnpauseJob`, which restores the
   pre-pause status.
 
+### Aggressive pause no longer burns a retry or dead-letters
+
+**Before:** `Worker.Pause(PauseModeAggressive)` cancelled in-flight handler
+contexts and wrote nothing durable, so the resulting `context.Canceled` fell into
+the ordinary failure path — burning an attempt and, at the default `MaxRetries`
+with the attempt already advanced, permanently **dead-lettering** a job that was
+merely paused. The heartbeat also stopped for a job that was still running, so
+its lease could lapse and the stale-lock reaper could hand the job to a peer
+while the original handler was still executing it.
+
+**After:** a pause-cancelled job is released to `pending` with its attempt intact,
+and a still-running job keeps its lease until the handler actually returns.
+
+**What you may notice:** `JobFailed` and `JobRetrying` are no longer emitted
+around a pause. Alerting that counted those events will see them stop. Resume
+simply re-dispatches the job.
+
 ### `NewWorker` reports arguments it cannot use
 
 **Before:** `Queue.NewWorker` takes `...any` (the facade cannot name
