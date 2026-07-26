@@ -250,6 +250,8 @@ The two series on the dashboard come from different places, and only one of them
 
 **Throughput is in-process only.** The completed/failed/retried counters are fed by `Queue.Events`, an in-memory bus: a queue only emits events for jobs *it* ran. Under the multi-process topology this guide recommends -- several worker processes against one database, one of them also serving the dashboard -- the throughput chart and the live event feed therefore reflect **only the process serving the dashboard**, and under-report the fleet by roughly the ratio of processes.
 
+It can also under-report *within* that one process. Each subscriber gets a 100-event buffer and `Emit` **drops** rather than blocks when it is full, so a burst that outruns the collector is lost rather than queued. That is the right trade for an event bus -- a slow dashboard must never stall job execution -- but it means the chart is a sample, not a ledger.
+
 This is a property of the event bus, not a bug in the collector, and it is not something the dashboard can detect and warn about. If you need fleet-wide throughput, read it from the OpenTelemetry metrics in `pkg/metrics` (see [Observability](../observability/)), which every process exports to your collector. Treat the dashboard's throughput chart as a view of one process.
 
 ### Stats Model

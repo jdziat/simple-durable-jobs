@@ -328,8 +328,10 @@ prune and the all-queues history read both scan by and could not previously use.
 No code change — a documentation fix for something the dashboard has always done.
 The completed/failed/retried series is fed by `Queue.Events`, an **in-process**
 bus, so under the multi-worker topology the docs recommend it reflects only the
-process serving the dashboard and under-reports the fleet. Queue **depth** is
-read from the database and is fleet-wide. See "What the throughput series does
+process serving the dashboard and under-reports the fleet. It can under-report
+within that process too: subscribers get a 100-event buffer and `Emit` drops
+rather than blocks when it fills. Queue **depth** is read from the database and
+is fleet-wide. See "What the throughput series does
 and does not measure" in the Embedded UI guide; for fleet-wide throughput use the
 OpenTelemetry metrics, which every process exports.
 

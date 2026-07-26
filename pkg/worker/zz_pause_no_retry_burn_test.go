@@ -265,3 +265,31 @@ func TestPause_ResumeBeforeHandlerSurfacesDoesNotDeadLetter(t *testing.T) {
 	store.mu.Unlock()
 	assert.Contains(t, releasedIDs, job.ID, "the job must still be released for re-dispatch")
 }
+
+// TestProcessJob_DropsTheMarkEvenWhenTheHandlerPanics covers the defer-ordering
+// property the per-job cleanup depends on.
+//
+// processJob registers its panic-recovery defer BEFORE the runningJobs/mark
+// cleanup defer, and defers run LIFO — so the cleanup runs first and the mark is
+// dropped even on the panic path. If the two were ever reordered, a panicking job
+// would leave its mark behind and a genuine failure on its next run would be
+// silently swallowed as a pause.
+func TestProcessJob_DropsTheMarkEvenWhenTheHandlerPanics(t *testing.T) {
+	q := queue.New(&mockStorage{})
+	q.Register("boom", func(context.Context, struct{}) error { panic("handler exploded") })
+
+	w := NewWorker(q)
+	job := &core.Job{ID: core.NewID(), Type: "boom", Queue: "default", Status: core.StatusRunning, MaxRetries: 2}
+
+	w.runningJobsMu.Lock()
+	w.pauseCancelled[job.ID] = struct{}{}
+	w.runningJobsMu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	require.NotPanics(t, func() { w.processJob(ctx, job) }, "a handler panic must be recovered")
+
+	assert.False(t, w.takePauseCancelled(job.ID),
+		"the mark must be dropped on the panic path too — the cleanup defer is registered after "+
+			"the recovery defer and LIFO must keep it running first")
+}

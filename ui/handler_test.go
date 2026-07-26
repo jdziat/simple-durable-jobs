@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -31,35 +32,47 @@ func TestHandler_ReturnsHTTPHandler(t *testing.T) {
 	assert.NotNil(t, h)
 }
 
-func TestHandler_ServesPlaceholderRootPath(t *testing.T) {
-	// frontendFS is likely missing the dist directory in tests, so the
-	// placeholder branch is exercised.
-	store := &mockStorage{}
-	h := Handler(store)
+// The old form of this test accepted "200 OR 404", which cannot fail: it passes
+// whether the shell is served, the placeholder is served, or nothing is served at
+// all. ui/frontend/dist IS committed and CI rebuilds it before every Go job, so
+// the outcome is deterministic — assert it.
+func TestHandler_ServesTheSPAShellAtTheRoot(t *testing.T) {
+	h := Handler(&mockStorage{})
 
-	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	rw := httptest.NewRecorder()
-	h.ServeHTTP(rw, req)
+	h.ServeHTTP(rw, httptest.NewRequest(http.MethodGet, "/", nil))
 
-	// We expect either 200 (placeholder HTML) or a served file.
-	assert.True(t, rw.Code == http.StatusOK || rw.Code == http.StatusNotFound,
-		"unexpected status %d", rw.Code)
+	require.Equal(t, http.StatusOK, rw.Code)
+	body := rw.Body.String()
+	if strings.Contains(body, "Frontend Not Built") {
+		t.Skip("ui/frontend/dist is not built in this tree")
+	}
+	assert.Contains(t, body, `<div id="app">`, "the SPA shell must be what is served")
+	assert.Contains(t, body, "./assets/",
+		"asset references must be document-relative, or the dashboard cannot boot under a prefix")
 }
 
-func TestHandler_ServesPlaceholderIndexHTML(t *testing.T) {
-	store := &mockStorage{}
-	h := Handler(store)
+// Same tightening: "200 or 404 or 301" admitted every possible outcome.
+// net/http's FileServer canonicalises /index.html to "./", and that redirect must
+// stay RELATIVE — an absolute one would leave the mount under http.StripPrefix.
+func TestHandler_CanonicalisesIndexHTMLWithARelativeRedirect(t *testing.T) {
+	h := Handler(&mockStorage{})
 
-	req := httptest.NewRequest(http.MethodGet, "/index.html", nil)
+	probe := httptest.NewRecorder()
+	h.ServeHTTP(probe, httptest.NewRequest(http.MethodGet, "/", nil))
+	if strings.Contains(probe.Body.String(), "Frontend Not Built") {
+		t.Skip("ui/frontend/dist is not built in this tree")
+	}
+
 	rw := httptest.NewRecorder()
-	h.ServeHTTP(rw, req)
+	h.ServeHTTP(rw, httptest.NewRequest(http.MethodGet, "/index.html", nil))
 
-	// The file server may redirect /index.html → /, serve it directly (200),
-	// or return 404 if the frontend dist is not built.
-	acceptable := rw.Code == http.StatusOK ||
-		rw.Code == http.StatusNotFound ||
-		rw.Code == http.StatusMovedPermanently
-	assert.True(t, acceptable, "unexpected status %d", rw.Code)
+	require.Equal(t, http.StatusMovedPermanently, rw.Code)
+	loc := rw.Header().Get("Location")
+	assert.Equal(t, "./", loc)
+	assert.False(t, strings.HasPrefix(loc, "/"),
+		"the redirect must be relative: an absolute Location escapes the mount when the "+
+			"handler is served under http.StripPrefix")
 }
 
 func TestHandler_Returns404ForUnknownPath(t *testing.T) {
