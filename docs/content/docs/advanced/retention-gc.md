@@ -3,62 +3,91 @@ title: "Retention GC"
 weight: 10
 ---
 
-## Disabled by default
+## Enabled by default
 
-Completed, failed, and cancelled jobs, plus consumed signal rows, are kept
-forever unless you configure retention on a worker. With no retention options,
-no background retention goroutine starts and rows are never deleted
-automatically.
+Workers delete terminal job rows and consumed signal rows on their own. A worker
+built with no retention options starts a background retention loop using the
+stock windows below — there is nothing to switch on, and rows older than a window
+are deleted permanently.
 
 ```go
+// Prunes terminal rows with the stock windows below.
 w := jobs.NewWorker(q)
 ```
 
-### Startup warning
+### Default windows
 
-A worker started with no retention window logs one warning per process so the
-opt-in footgun is loud rather than silent:
+<!--
+The three window values in this table are pinned to the code constants by
+TestRetentionDocMatchesStockWindows (pkg/worker/retention_docs_test.go). Change a
+number here and in pkg/worker/options.go together or CI fails, on purpose: this
+page told operators retention was DISABLED by default while every worker was
+already deleting completed jobs at 30 days and dead-letter rows at 90 (teardown
+2026-07-24, PKT-02a). A manual that inverts the code costs someone their job
+history.
+-->
+
+| Rows deleted | Default window | Option that changes it |
+| --- | --- | --- |
+| Completed jobs | 30 days | `RetentionCompletedAfter` |
+| Terminal failed and cancelled jobs | 90 days | `RetentionFailedAfter` |
+| Consumed signal rows | 7 days | `RetentionConsumedSignalsAfter` |
+
+Pending (unconsumed) signal rows are workflow state and are never pruned. If an
+audit, compliance, or archival policy needs terminal job history for longer than
+these windows, widen them with `WithRetention` or turn retention off and manage
+deletion yourself — the sweep does not ask, and the deletes are not recoverable.
+
+### Startup log
+
+Retention announces itself once per worker at `Start`, so the effective policy is
+visible in every node's log:
 
 ```
-WARN retention is not configured; completed/failed/cancelled job rows and
-consumed signals accumulate forever — enable jobs.WithRetention(...) or
-jobs.DefaultRetention() to bound table growth (add
-jobs.RetentionDeleteCheckpointsOnComplete() to also prune successful jobs'
-checkpoints)
+INFO retention GC enabled completed_after=720h0m0s failed_after=2160h0m0s consumed_signals_after=168h0m0s disable_hint="disable with jobs.RetentionDisabled()"
 ```
 
-The warning fires once per worker process (deduplicated even across repeated
-`Start` calls). A fleet of N workers logs it N times — one per node — which is
-the intended "every node tells you once" behavior. Configuring any retention
-window silences it and starts the background sweep instead.
+A worker whose retention is turned off logs one warning instead:
 
-### A conservative opt-in preset
+```
+WARN retention is disabled; completed/failed/cancelled job rows and consumed signals accumulate forever
+```
 
-`jobs.DefaultRetention()` is an explicit opt-in preset (not a silent default)
-with conservative windows: completed jobs 7 days, terminal failed/cancelled jobs
-30 days, consumed signals 7 days. Tune individual windows by composing the
-`Retention*` options under `WithRetention` instead.
+Either line is emitted at most once per worker, deduplicated across repeated
+`Start` calls. A fleet of N workers logs it N times — one per node — which is the
+intended "every node tells you once" behavior.
+
+## Turning retention off
+
+`jobs.RetentionDisabled()` stops all automatic deletion of terminal jobs and
+consumed signals. Use it when retention is managed outside the worker (partition
+drop, an external archiver) or when rows must be kept indefinitely.
 
 ```go
-w := jobs.NewWorker(q, jobs.DefaultRetention())
+w := jobs.NewWorker(q, jobs.RetentionDisabled())
 ```
 
 ## Per-status windows
 
-Use `WithRetention` with one or both per-status windows. Completed jobs use the
-completed window. Failed retention covers both terminal failed jobs and
-cancelled jobs.
+Use `WithRetention` to set the windows yourself. Completed jobs use the completed
+window; the failed window covers both terminal failed jobs and cancelled jobs.
+
+`WithRetention` **replaces** the stock windows rather than merging with them. Any
+window you leave out of the call is `0`, and a `0` window keeps that status
+forever, so list every window you want enforced.
 
 ```go
 w := jobs.NewWorker(q,
 	jobs.WithRetention(
 		jobs.RetentionCompletedAfter(7*24*time.Hour),
 		jobs.RetentionFailedAfter(30*24*time.Hour),
+		// Consumed signal rows are now kept forever: this call REPLACES the
+		// stock windows, so the one it omits is 0.
 	),
 )
 ```
 
-A window of `0` means keep that status forever:
+Set a window to `0` deliberately to keep that status forever:
 
 ```go
 w := jobs.NewWorker(q,
@@ -69,28 +98,55 @@ w := jobs.NewWorker(q,
 )
 ```
 
+## The DefaultRetention preset
+
+`jobs.DefaultRetention()` is **not** what a default worker uses. It is an
+explicit preset whose windows are *tighter* than the stock ones — it deletes
+completed jobs after a week rather than a month:
+
+<!--
+Pinned to the option itself by TestRetentionDocMatchesDefaultRetentionPreset
+(pkg/worker/retention_docs_test.go).
+-->
+
+| Rows deleted | `DefaultRetention()` window |
+| --- | --- |
+| Completed jobs | 7 days |
+| Terminal failed and cancelled jobs | 30 days |
+| Consumed signal rows | 7 days |
+
+```go
+w := jobs.NewWorker(q, jobs.DefaultRetention())
+```
+
+It is an ordinary `WithRetention` preset, so the replace-not-merge rule above
+applies to it too. Compose the `Retention*` options under `WithRetention` when
+you want different windows.
+
 ## Consumed-signal window
 
 Signals are durable: pending/unconsumed signal rows are workflow state and are
-never pruned by retention. If your workflows consume many signals and keep job
-rows for a long time, add a consumed-signal window:
+never pruned by retention. Only rows with `consumed_at` set and older than the
+configured window are deleted.
 
 ```go
 w := jobs.NewWorker(q,
 	jobs.WithRetention(
-		jobs.RetentionConsumedSignalsAfter(7*24*time.Hour),
+		jobs.RetentionCompletedAfter(30*24*time.Hour),
+		jobs.RetentionFailedAfter(90*24*time.Hour),
+		jobs.RetentionConsumedSignalsAfter(14*24*time.Hour),
 	),
 )
 ```
 
-Only rows with `consumed_at` set and older than the configured window are
-deleted. A window of `0` keeps consumed signal rows forever.
+A window of `0` keeps consumed signal rows forever.
 
 ## Batch and interval tuning
 
-Retention runs as a worker background loop. Each tick deletes matching terminal
-job rows and consumed signal rows in bounded batches, then keeps looping until a
-pass deletes fewer rows than the batch size.
+Retention runs as a worker background loop. By default it wakes every hour and
+deletes up to 1000 rows per statement, and within a tick it keeps looping until a
+pass deletes fewer rows than the batch size, so a large backlog drains in one
+tick instead of one batch per hour.
 
 ```go
 w := jobs.NewWorker(q,
@@ -117,10 +173,11 @@ and the window expiry time. This table is separate from the active-job
 `Unique` guard, so it can keep deduplicating after the original job has already
 completed.
 
-Expired `unique_locks` rows are swept by a worker background loop. Unlike
-retention, this sweep is default-on so windowed enqueue deduplication bounds its
-own table even when terminal-job retention is not configured. By default, the
-sweep runs every hour and deletes up to 1000 expired locks per pass.
+Expired `unique_locks` rows are swept by their own worker background loop with
+their own options. Like retention, this sweep is on by default; unlike retention,
+it stays on even when terminal-job retention is disabled, so windowed enqueue
+deduplication always bounds its own table. By default, the sweep runs every hour
+and deletes up to 1000 expired locks per pass.
 
 Tune the cadence and batch size with `WithUniqueLockSweep`:
 
@@ -163,6 +220,9 @@ checkpoints table, opt in:
 ```go
 w := jobs.NewWorker(q,
 	jobs.WithRetention(
+		jobs.RetentionCompletedAfter(30*24*time.Hour),
+		jobs.RetentionFailedAfter(90*24*time.Hour),
+		jobs.RetentionConsumedSignalsAfter(7*24*time.Hour),
 		jobs.RetentionDeleteCheckpointsOnComplete(),
 	),
 )
@@ -175,9 +235,12 @@ completed job with orphaned checkpoints, and a lost-ownership completion deletes
 nothing. The trade-off is that completed jobs then show an empty checkpoints
 panel in the dashboard.
 
-This option requires no background sweep and works independently of the
-per-status windows — you can enable it with or without `WithRetention` windows.
-(It does not by itself start the retention goroutine.)
+The option needs no background sweep and is independent of the per-status
+windows — but it is a `Retention*` option, so it has to be passed inside
+`WithRetention`, and by the replace-not-merge rule that call drops the stock
+windows. Passing it *alone* therefore turns the terminal-row sweep off entirely
+and the worker logs the "retention is disabled" warning. Restate the windows you
+want alongside it, as the example above does.
 
 ### Checkpoints on failure are always kept
 
