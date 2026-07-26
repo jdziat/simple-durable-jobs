@@ -1031,6 +1031,28 @@ func Weekly(day time.Weekday, hour, minute int) Schedule {
 }
 
 // Cron creates a schedule from a cron expression.
+// CronIn is Cron with the evaluation location supplied separately, for callers
+// holding a *time.Location rather than a timezone name.
+func CronIn(loc *time.Location, expr string) (Schedule, error) {
+	return schedule.CronIn(loc, expr)
+}
+
+// MustCronIn is CronIn but panics on an invalid expression or location.
+func MustCronIn(loc *time.Location, expr string) Schedule {
+	return schedule.MustCronIn(loc, expr)
+}
+
+// DailyIn is Daily with the hour and minute interpreted in loc, honouring that
+// location's DST rules rather than a fixed UTC offset.
+func DailyIn(loc *time.Location, hour, minute int) Schedule {
+	return schedule.DailyIn(loc, hour, minute)
+}
+
+// WeeklyIn is Weekly with the day, hour and minute interpreted in loc.
+func WeeklyIn(loc *time.Location, day time.Weekday, hour, minute int) Schedule {
+	return schedule.WeeklyIn(loc, day, hour, minute)
+}
+
 func Cron(expr string) (Schedule, error) {
 	return schedule.Cron(expr)
 }

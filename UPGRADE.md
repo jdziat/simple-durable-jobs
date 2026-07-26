@@ -150,6 +150,30 @@ schedule's last-fire time, so the dashboard's overdue/health indicator still
 shows the schedule as not having run. A schedule blocked for hours reads as
 blocked, not as healthy.
 
+### Cron honours an explicit timezone prefix
+
+**Before:** `Cron` accepted a crontab-style `CRON_TZ=`/`TZ=` prefix, let the
+parser resolve it, and then **overwrote the result with UTC** — so a
+timezone-aware schedule fired hours off with no error.
+`Cron("CRON_TZ=America/New_York 0 9 * * *")` fired at 09:00 **UTC**, four hours
+late in summer and five in winter. A prefix with no schedule fields after it
+(`Cron("CRON_TZ=America/New_York")`) **panicked** with a slice-bounds error, in a
+constructor that returns an error.
+
+**After:** the prefix is honoured, an unresolvable timezone name is an error
+rather than a silent fallback, and no input panics.
+
+**What you may notice:** a schedule that carries a prefix **moves to the hour it
+asked for**. If you compensated for the old behaviour by shifting the expression,
+remove the compensation. Expressions without a prefix are unchanged and remain
+UTC — deliberately, since the underlying parser would otherwise default them to
+the host's timezone.
+
+Also adds `CronIn`, `DailyIn`, `WeeklyIn` (and `MustCronIn`) for callers holding a
+`*time.Location` rather than a name. `Daily`/`Weekly` now advance by rolling the
+calendar **day** rather than the instant, so in a DST zone they fire exactly once
+per day — the old form could fire twice on a spring-forward day.
+
 ### Fan-out sub-job options are honoured
 
 **Before:** `fanout.Sub` accepted the full `queue.Option` set and silently dropped
