@@ -26,7 +26,8 @@ func resumeUUID(t *testing.T, v string) core.UUID {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// ResumeJob — paused jobs are resumable
+// ResumeJob — WAITING only. `paused` is an operator's decision and this is the
+// automatic fan-out-completion path; it must not override a human.
 // ──────────────────────────────────────────────────────────────────────────────
 
 func TestResumeJob_ResumesPausedJob(t *testing.T) {
@@ -34,17 +35,20 @@ func TestResumeJob_ResumesPausedJob(t *testing.T) {
 	s := newTestStorage(t)
 	id := resumeUUID(t, "resume-paused")
 
-	// A paused job — e.g. a fan-out parent an operator paused mid-flight.
+	// A fan-out parent an operator paused mid-flight. Every caller of ResumeJob is
+	// an automatic fan-out-completion path, so resuming here would let an
+	// unrelated child finishing silently cancel the operator's pause.
 	seedTestJob(t, ctx, s, id, core.StatusPaused)
 
 	resumed, err := s.ResumeJob(ctx, id)
 	require.NoError(t, err)
-	assert.True(t, resumed, "a paused job must be resumable (fan-out completion path)")
+	assert.False(t, resumed, "an operator-paused job must NOT be auto-resumed by fan-out completion")
 
 	after, err := s.GetJob(ctx, id)
 	require.NoError(t, err)
 	require.NotNil(t, after)
-	assert.Equal(t, core.StatusPending, after.Status, "paused → pending on resume")
+	assert.Equal(t, core.StatusPaused, after.Status,
+		"the pause stands until the operator lifts it via UnpauseJob (what Queue.ResumeJob calls)")
 }
 
 func TestResumeJob_PausedResumeSetsDqReady(t *testing.T) {
@@ -59,6 +63,11 @@ func TestResumeJob_PausedResumeSetsDqReady(t *testing.T) {
 		Model(&core.Job{}).
 		Where("id = ?", id).
 		Update("dq_ready", false).Error)
+
+	// Waiting, not paused: this asserts the dq_ready hint on the path ResumeJob
+	// still serves.
+	require.NoError(t, s.db.WithContext(ctx).Model(&core.Job{}).
+		Where("id = ?", id).Update("status", core.StatusWaiting).Error)
 
 	resumed, err := s.ResumeJob(ctx, id)
 	require.NoError(t, err)
@@ -132,7 +141,11 @@ func TestResumeJob_PausedResumePreservesRunAt(t *testing.T) {
 		ID:     id,
 		Type:   "fixture.job",
 		Queue:  "default",
-		Status: core.StatusPaused,
+		// Waiting, not paused: ResumeJob no longer accepts paused (an operator's
+		// decision is not the fan-out completion path's to undo). run_at
+		// preservation is a property of ResumeJob itself and is asserted here on
+		// the status it still serves.
+		Status: core.StatusWaiting,
 		RunAt:  &future,
 	}).Error)
 

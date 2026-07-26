@@ -468,10 +468,12 @@ func TestResumeJob_PreservesRunAt(t *testing.T) {
 	s := newTestStorage(t)
 	ctx := context.Background()
 	future := time.Now().Add(time.Hour)
-	// A delayed job paused before its run_at; the general ResumeJob must NOT strip
-	// its schedule (only the signal-specific resume clears run_at).
+	// A delayed job suspended before its run_at; the general ResumeJob must NOT
+	// strip its schedule (only the signal-specific resume clears run_at).
+	// Waiting rather than paused: ResumeJob no longer accepts paused, since every
+	// caller is an automatic fan-out path and must not undo an operator's pause.
 	require.NoError(t, s.db.WithContext(ctx).Create(&core.Job{
-		ID: signalUUID("d"), Type: "x", Queue: "default", Status: core.StatusPaused, RunAt: &future,
+		ID: signalUUID("d"), Type: "x", Queue: "default", Status: core.StatusWaiting, RunAt: &future,
 	}).Error)
 
 	ok, err := s.ResumeJob(ctx, signalUUID("d"))

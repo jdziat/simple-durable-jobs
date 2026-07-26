@@ -1918,7 +1918,12 @@ func (s *GormStorage) CancelSubJobs(ctx context.Context, fanOutID core.UUID) ([]
 			var err error
 			// Empty reason: the original CancelSubJobs (CancelOnFail path) did not
 			// write last_error on peer-cancelled siblings; preserve that.
-			cancelled, err = s.cancelFanOutChildrenAndReconcile(tx, fanOutID, []core.JobStatus{core.StatusPending, core.StatusRunning}, true, nil, "")
+			// Waiting and Paused belong here. A sibling suspended in `waiting`
+			// (durable Sleep, WaitForSignal, or its own nested fan-out) and a
+			// sibling an operator paused are both LIVE, resumable work — skipping
+			// them left a cancelled fan-out with children that later woke up and
+			// ran, and left completed+failed+cancelled < total forever.
+			cancelled, err = s.cancelFanOutChildrenAndReconcile(tx, fanOutID, cancellableChildStatuses, true, nil, "")
 			return err
 		})
 	})
@@ -2196,15 +2201,30 @@ func (s *GormStorage) SuspendForFanOut(ctx context.Context, parentID core.UUID, 
 // and the job exhausts max_retries before completing.
 // Returns (true, nil) if resumed, (false, nil) if job was not in a resumable status.
 func (s *GormStorage) ResumeJob(ctx context.Context, jobID core.UUID) (bool, error) {
-	// Accept both waiting and paused status — paused jobs should also be
-	// resumable when their fan-out completes. run_at is deliberately left
-	// untouched so a delayed job that was paused before its run_at and then
-	// resumed still honors its original schedule. (Signal-waiting jobs use
-	// ResumeSignalWaitingJob instead, which clears the timeout wake deadline.)
+	// WAITING ONLY. This previously also accepted `paused`, on the reasoning that
+	// "paused jobs should also be resumable when their fan-out completes" — a
+	// deliberate decision, now overturned, because the two states mean different
+	// things and only one of them is this function's business.
+	//
+	// `waiting` is the machine's own suspension: a parent that called FanOut/Call
+	// and yielded. `paused` is an OPERATOR's instruction. Every caller of this
+	// method is an automatic fan-out-completion path
+	// (Queue.resumeOwningFanOutAfterChildTerminal, Queue.CancelSubJob,
+	// fanout completion, and the worker's recovery polls), so accepting `paused`
+	// meant a background event silently cancelled a human's decision: an operator
+	// paused a workflow parent, an unrelated child finished, and the parent ran.
+	//
+	// The operator's own Resume is unaffected — Queue.ResumeJob (what the
+	// dashboard calls) goes through UnpauseJob, not here.
+	//
+	// run_at is deliberately left untouched so a delayed job that was paused
+	// before its run_at and then resumed still honors its original schedule.
+	// (Signal-waiting jobs use ResumeSignalWaitingJob instead, which clears the
+	// timeout wake deadline.)
 	now := time.Now()
 	result := s.db.WithContext(ctx).
 		Model(&core.Job{}).
-		Where("id = ? AND status IN (?, ?)", jobID, core.StatusWaiting, core.StatusPaused).
+		Where("id = ? AND status = ?", jobID, core.StatusWaiting).
 		Updates(map[string]any{
 			"status":     core.StatusPending,
 			"attempt":    gorm.Expr("CASE WHEN attempt > 0 THEN attempt - 1 ELSE 0 END"),
@@ -2426,6 +2446,11 @@ func (s *GormStorage) deleteFanOutSubtree(tx *gorm.DB, rootJobID core.UUID) erro
 // The NOT EXISTS guard restricts the result to parents that have at least
 // one terminated fan-out AND no pending fan-outs. DISTINCT keeps the
 // result one-row-per-parent when there are multiple terminated fan-outs.
+// FanOutCancelled is in the terminal set deliberately. Cancellation now reaches
+// paused and waiting descendants, so a descendant fan-out can end `cancelled`
+// where before it could only complete or fail. A waiting parent of such a
+// fan-out has nothing left to wait for; omitting the status would leave it
+// suspended forever with no backstop, trading one stuck-job bug for another.
 func (s *GormStorage) GetWaitingJobsToResume(ctx context.Context) ([]*core.Job, error) {
 	var jobs []*core.Job
 	// Select only j.id: the recovery caller consumes nothing but job.ID, so
@@ -2435,14 +2460,14 @@ func (s *GormStorage) GetWaitingJobsToResume(ctx context.Context) ([]*core.Job, 
 		SELECT DISTINCT j.id FROM jobs j
 		INNER JOIN fan_outs f ON j.id = f.parent_job_id
 		WHERE j.status = ?
-		AND f.status IN (?, ?)
+		AND f.status IN (?, ?, ?)
 		AND NOT EXISTS (
 			SELECT 1 FROM fan_outs f2
 			WHERE f2.parent_job_id = j.id
 			AND f2.status = ?
 		)
 		LIMIT ?
-	`, core.StatusWaiting, core.FanOutCompleted, core.FanOutFailed, core.FanOutPending, maxResumeBatch).Scan(&jobs).Error
+	`, core.StatusWaiting, core.FanOutCompleted, core.FanOutFailed, core.FanOutCancelled, core.FanOutPending, maxResumeBatch).Scan(&jobs).Error
 	if err != nil {
 		return nil, err
 	}
@@ -2594,6 +2619,29 @@ func (s *GormStorage) SaveJobResult(ctx context.Context, jobID core.UUID, worker
 	return nil
 }
 
+// cancellableChildStatuses is the single definition of "not yet finished, so
+// still cancellable", shared by CancelJobTerminal's target predicate, its
+// descendant subtree walk, and CancelSubJobs.
+//
+// Paused and Waiting are in the set because both are LIVE, resumable states.
+// Leaving them out meant a terminal cancel skipped them: a paused child survived
+// its parent's cancellation and stayed resumable — the dashboard's Resume button
+// would run work an operator had explicitly cancelled — and a child suspended in
+// `waiting` (durable Sleep, WaitForSignal, or its own nested fan-out) woke up
+// later and ran. Both also froze the fan-out row below its total, permanently
+// violating the completed+failed+cancelled == total invariant that
+// docs/content/docs/advanced/cancel-job.md promises is restored.
+//
+// One definition rather than three literals: the three call sites had drifted
+// apart (CancelSubJobs was missing Waiting as well as Paused), which is how the
+// gap survived. A set cannot disagree with itself.
+var cancellableChildStatuses = []core.JobStatus{
+	core.StatusPending,
+	core.StatusWaiting,
+	core.StatusRunning,
+	core.StatusPaused,
+}
+
 // --- Job pause operations ---
 
 // PauseJob pauses a job, preventing it from being picked up.
@@ -2665,7 +2713,7 @@ func (s *GormStorage) CancelJobTerminal(ctx context.Context, jobID core.UUID) er
 			// audit (FindOrphanedJobs) short-circuits the live handler in ~5s
 			// rather than waiting for the ~minutes heartbeat fallback.
 			result := tx.Model(&core.Job{}).
-				Where("id = ? AND status IN ?", jobID, []core.JobStatus{core.StatusPending, core.StatusWaiting, core.StatusRunning}).
+				Where("id = ? AND status IN ?", jobID, cancellableChildStatuses).
 				Updates(map[string]any{
 					"status":       core.StatusCancelled,
 					"completed_at": s.nowWriteValue(),
@@ -2737,7 +2785,7 @@ func (s *GormStorage) CancelJobTerminal(ctx context.Context, jobID core.UUID) er
 			sort.Slice(fanOutIDs, func(i, j int) bool { return fanOutIDs[i] < fanOutIDs[j] })
 			for _, fanOutID := range fanOutIDs {
 				status := core.FanOutCancelled
-				if _, err := s.cancelFanOutChildrenAndReconcile(tx, fanOutID, []core.JobStatus{core.StatusPending, core.StatusWaiting, core.StatusRunning}, false, &status, "cancelled by user"); err != nil {
+				if _, err := s.cancelFanOutChildrenAndReconcile(tx, fanOutID, cancellableChildStatuses, false, &status, "cancelled by user"); err != nil {
 					return err
 				}
 			}
