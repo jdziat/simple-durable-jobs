@@ -148,6 +148,23 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
+      # A committed conflict marker had NO gate: `go build/vet/test ./...` covers
+      # only the root module, so docs/ (its own go.mod) is never compiled, and
+      # Hugo renders `<<<<<<< HEAD` as ordinary text without erroring — so
+      # pages.yml would have published it to the live docs site on merge. It
+      # happened: markers survived a release-branch merge into two published
+      # pages, and one of them put `return err` inside `func main()`.
+      #
+      # Anchored to line start so prose that merely mentions the markers, and
+      # this comment, do not trip it. dist/ is a generated bundle.
+      - name: No committed conflict markers
+        run: |
+          if git grep -nE '^(<{7}|={7}|>{7})( |$)' -- . ':!ui/frontend/dist' ':!.github/workflows/ci.yml'; then
+            echo "::error::unresolved merge-conflict markers are committed (listed above)"
+            exit 1
+          fi
+          echo "no conflict markers"
+
       - name: Set up Go
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:

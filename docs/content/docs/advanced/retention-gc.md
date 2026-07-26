@@ -26,26 +26,6 @@ already deleting completed jobs at 30 days and dead-letter rows at 90 (teardown
 2026-07-24, PKT-02a). A manual that inverts the code costs someone their job
 history.
 -->
-<<<<<<< HEAD
-
-| Rows deleted | Default window | Option that changes it |
-| --- | --- | --- |
-| Completed jobs | 30 days | `RetentionCompletedAfter` |
-| Terminal failed and cancelled jobs | 90 days | `RetentionFailedAfter` |
-| Consumed signal rows | 7 days | `RetentionConsumedSignalsAfter` |
-
-Pending (unconsumed) signal rows are workflow state and are never pruned. If an
-audit, compliance, or archival policy needs terminal job history for longer than
-these windows, widen them with `WithRetention` or turn retention off and manage
-deletion yourself — the sweep does not ask, and the deletes are not recoverable.
-
-### Startup log
-
-Retention announces itself once per worker at `Start`, so the effective policy is
-visible in every node's log:
-
-```
-=======
 
 | Rows deleted | Default window | Option that changes it |
 | --- | --- | --- |
@@ -64,17 +44,12 @@ Retention announces itself once per worker at `Start`, so the effective policy i
 visible in every node's log:
 
 ```text
->>>>>>> origin/main
 INFO retention GC enabled completed_after=720h0m0s failed_after=2160h0m0s consumed_signals_after=168h0m0s disable_hint="disable with jobs.RetentionDisabled()"
 ```
 
 A worker whose retention is turned off logs one warning instead:
 
-<<<<<<< HEAD
-```
-=======
 ```text
->>>>>>> origin/main
 WARN retention is disabled; completed/failed/cancelled job rows and consumed signals accumulate forever
 ```
 

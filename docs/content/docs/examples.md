@@ -366,11 +366,7 @@ func main() {
     // Cron returns (Schedule, error) so a malformed expression fails fast.
     hourly, err := jobs.Cron("0 * * * *")
     if err != nil {
-<<<<<<< HEAD
-        return err
-=======
         panic(err)
->>>>>>> origin/main
     }
     if err := queue.Schedule("hourly-task", nil, hourly); err != nil {
         panic(err)
