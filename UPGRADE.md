@@ -116,6 +116,32 @@ and a still-running job keeps its lease until the handler actually returns.
 around a pause. Alerting that counted those events will see them stop. Resume
 simply re-dispatches the job.
 
+### Fractional rate limits are now accurate
+
+**Before:** the fleet rate limiter derived a window that only required
+`PerSecond * window >= 1`, but the storage gate admits `ceil(PerSecond * window)`
+units per window — which is exact only when that product is a **whole number**.
+Every rate that was neither an integer nor `1/n` therefore ran fast. Measured
+against the real gate on SQLite, Postgres and MySQL:
+
+| Configured | Enforced (before) | Over |
+| --- | --- | --- |
+| 0.011 /s | 0.022 /s | **+99.8%** |
+| 0.3 /s | 0.5 /s | +66.7% |
+| 1.2 /s | 2 /s | +66.7% |
+| 2.5 /s | 3 /s | +20% |
+| 7.3 /s | 8 /s | +9.6% |
+
+**After:** the configured rate is honoured within 0.5%.
+
+**What you may notice:** throughput on fractional rates **drops** — by up to half
+in the worst case. That is the rate you configured; you were previously getting
+more than you asked for. If you tuned against the old behaviour, raise the limit
+deliberately.
+
+Rates that were already exact — whole numbers and `1/n` — derive the same window
+as before and do not move.
+
 ### `NewWorker` reports arguments it cannot use
 
 **Before:** `Queue.NewWorker` takes `...any` (the facade cannot name

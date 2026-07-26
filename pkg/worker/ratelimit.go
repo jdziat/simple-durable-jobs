@@ -11,6 +11,15 @@ import (
 
 const defaultRateLimitWindow = time.Second
 
+// maxRateLimitWindow bounds a DERIVED window. Two int64 limits meet here:
+// time.Duration counts nanoseconds (math.MaxInt64 is ~292 years), and the storage
+// GC computes windowStart.Add(-2*window) — so any window past MaxInt64/2 wraps
+// that expression into the FUTURE and deletes live counters. A century keeps
+// 2*window safely inside int64 and only binds below ~3.2e-10/sec (under one job
+// per century); such a rate is clamped to one unit per window, i.e. slightly
+// FASTER than configured — the safe direction.
+const maxRateLimitWindow = 100 * 365 * 24 * time.Hour
+
 // maxRateLimitNameLen bounds the effective fleet-rate-limit name. The
 // rate_limit_windows.limit_name column is varchar(255); an unbounded RateLimitKey
 // that overflowed it would error TryConsumeRate and hot-loop the job
@@ -37,21 +46,61 @@ type windowedRateLimiter interface {
 	ReleaseRateAt(ctx context.Context, limitName string, windowStart time.Time) error
 }
 
-// resolveRateLimitWindow chooses the fixed-window length for a fleet rate limit. An
-// explicit author-set Window is always honored. Otherwise, for a FRACTIONAL
-// PerSecond (< 1) the default 1s window rounds the per-window ceiling UP to 1
-// (ceil(0.1*1)=1), admitting ~1/sec instead of 0.1/sec — up to ~10x over the
-// configured rate (teardown g4). Derive a window large enough that
-// PerSecond*window >= 1 so the ceiling is exact (0.1/sec -> a 10s window, ceiling 1
-// per 10s). Whole-number rates keep the 1s default.
+// resolveRateLimitWindow chooses the fixed-window length for a fleet rate limit.
+// An explicit author-set Window is always honored; otherwise it is derived.
 func (w *Worker) resolveRateLimitWindow(limit RateLimitConfig) time.Duration {
 	if limit.Window > 0 {
 		return limit.Window
 	}
-	if limit.PerSecond > 0 && limit.PerSecond < 1 {
-		return time.Duration(math.Ceil(1/limit.PerSecond)) * time.Second
+	return deriveRateLimitWindow(limit.PerSecond)
+}
+
+// deriveRateLimitWindow picks the fixed window whose per-window ceiling expresses
+// PerSecond as closely as a whole number of admissions can.
+//
+// The storage gate admits ceil(PerSecond*window) units per window, so the enforced
+// rate is ceil(PerSecond*window)/window — exact only when PerSecond*window is a
+// WHOLE NUMBER, not merely >= 1 as this function previously assumed. That wrong
+// sufficient condition (stated in its own doc comment) is the whole bug: it left
+// the ceiling rounded up by nearly a full admission for every rate that was
+// neither an integer nor 1/n. Measured against the real storage gate on SQLite,
+// Postgres and MySQL: 1.2/sec ran at 2/sec (+67%), 7.3/sec at 8/sec (+9.6%),
+// 0.011/sec at 0.022/sec (+100%, the analytic worst case).
+//
+// Solve for the window instead: with units = ceil(PerSecond) admissions per
+// window, window = units/PerSecond makes PerSecond*window exactly units for ANY
+// rate. An integer rate still derives exactly the 1s default and a 1/n rate still
+// derives exactly n seconds, so configurations that were already exact do not
+// move; every window for a rate >= 1/sec stays inside [1s, 2s), so
+// rate_limit_windows sees no extra row churn.
+//
+// The window is floored to a whole MILLISECOND for two distinct reasons:
+//
+//   - Alignment. window_start is now.Truncate(window), and Truncate is relative to
+//     the zero time, so a millisecond-multiple window always yields a
+//     millisecond-aligned window_start. rate_limit_windows.window_start is
+//     datetime(3) on MySQL: a nanosecond-precision start is ROUNDED on write, the
+//     consume's own "WHERE window_start = ?" then matches nothing, and every
+//     rate-limited job bounces on ErrRecordNotFound forever.
+//   - Direction. Flooring never rounds up, so PerSecond*window stays at or below
+//     units — the ceiling cannot exceed what was configured.
+func deriveRateLimitWindow(perSecond float64) time.Duration {
+	// NaN/Inf cannot produce a sane window; fall back to the default rather than
+	// computing a negative or overflowing duration.
+	if math.IsNaN(perSecond) || math.IsInf(perSecond, 0) || perSecond <= 0 {
+		return defaultRateLimitWindow
 	}
-	return defaultRateLimitWindow
+	units := math.Ceil(perSecond)
+	seconds := units / perSecond
+	window := time.Duration(seconds * float64(time.Second))
+	window = window.Truncate(time.Millisecond)
+	if window < defaultRateLimitWindow {
+		window = defaultRateLimitWindow
+	}
+	if window > maxRateLimitWindow {
+		window = maxRateLimitWindow
+	}
+	return window
 }
 
 // boundRateLimitName returns a name guaranteed to fit the limit_name column. Short
