@@ -171,6 +171,16 @@ type concurrencySlotStorage interface {
 	ReleaseConcurrencySlot(ctx context.Context, slotName string, jobID core.UUID) error
 }
 
+// concurrencySlotOwnedReleaser is the ownership-fenced release. It is a SEPARATE
+// optional capability rather than a change to concurrencySlotStorage because
+// external storage implementations satisfy these interfaces structurally, and
+// widening an existing method's signature would break them at compile time —
+// impossible inside v4. Storages that provide it get the fence; those that do
+// not keep the old unfenced behaviour.
+type concurrencySlotOwnedReleaser interface {
+	ReleaseConcurrencySlotOwned(ctx context.Context, slotName string, jobID core.UUID, workerID string) error
+}
+
 type concurrencySlotRenewer interface {
 	RenewConcurrencySlot(ctx context.Context, slotName string, jobID core.UUID, ttl time.Duration) (bool, error)
 }
@@ -306,6 +316,26 @@ func NewWorker(q *queue.Queue, opts ...WorkerOption) *Worker {
 			JitterFraction:    0.2,
 		}
 		config.DequeueRetry = &dequeueCfg
+	}
+	// Clamp a non-positive attempt count to a single try. MaxAttempts COUNTS the
+	// initial attempt, so 0 — the zero value of a hand-built RetryConfig, and what
+	// WithRetryAttempts(0) used to install verbatim — meant "never call the
+	// operation": retryWithBackoff returned nil without writing anything and every
+	// caller read that as a successful write, turning the worker into a simulator
+	// that fires completion hooks for jobs still 'running' in the DB. The nil
+	// checks above only substitute a default for an ABSENT config, never for a
+	// present-but-nonsensical one. Clamp onto a COPY: the pointer may be shared
+	// with an option value the caller reuses across workers, and mutating it in
+	// place would be a cross-worker write. 1 preserves DisableRetry()'s meaning.
+	if config.StorageRetry.MaxAttempts < 1 {
+		clamped := *config.StorageRetry
+		clamped.MaxAttempts = 1
+		config.StorageRetry = &clamped
+	}
+	if config.DequeueRetry.MaxAttempts < 1 {
+		clamped := *config.DequeueRetry
+		clamped.MaxAttempts = 1
+		config.DequeueRetry = &clamped
 	}
 
 	// Set default stale lock reaper cadence. The reaper always runs (it
@@ -1661,8 +1691,19 @@ func (w *Worker) releaseSlotNames(ctx context.Context, jobID core.UUID, slots []
 	if !ok {
 		return
 	}
+	// Prefer the ownership-fenced release. Without the worker_id predicate, a
+	// deferred release from a worker whose job was already reclaimed by the
+	// stale-lock reaper deletes the slot row the NEW holder is relying on,
+	// under-counting the cap and admitting an extra concurrent job.
+	owned, fenced := storage.(concurrencySlotOwnedReleaser)
 	for _, slot := range slots {
-		if err := storage.ReleaseConcurrencySlot(ctx, slot, jobID); err != nil {
+		var err error
+		if fenced {
+			err = owned.ReleaseConcurrencySlotOwned(ctx, slot, jobID, w.config.WorkerID)
+		} else {
+			err = storage.ReleaseConcurrencySlot(ctx, slot, jobID)
+		}
+		if err != nil {
 			w.logger.Warn("failed to release concurrency slot",
 				"job_id", jobID,
 				"slot", slot,
@@ -1798,9 +1839,13 @@ func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 			}
 			return
 		}
-		if err := w.failWithRetry(ctx, job.ID, fmt.Sprintf("no handler for %s", job.Type), nil); errors.Is(err, core.ErrJobNotOwned) {
-			w.logger.Warn("job no longer owned after no-handler failure; skipping sub-job completion",
-				"job_id", job.ID)
+		// The failure must be RECORDED before the (non-idempotent) fan-out
+		// accounting runs for it. A worker that reclaims the job may even have
+		// the handler registered.
+		if !w.dispositionWriteLanded(ctx, job.ID,
+			w.failWithRetry(ctx, job.ID, fmt.Sprintf("no handler for %s", job.Type), nil),
+			"no-handler failure",
+			"job no longer owned after no-handler failure; skipping sub-job completion") {
 			return
 		}
 		if err := w.handleSubJobCompletion(ctx, job, false); err != nil {
@@ -1988,6 +2033,37 @@ func (w *Worker) failTerminalWithResult(ctx context.Context, storage failTermina
 		return failErr
 	})
 	return fo, err
+}
+
+// dispositionWriteLanded reports whether a disposition write (Fail, retry
+// scheduling, terminal failure) actually reached the database, and performs the
+// correct cleanup when it did not.
+//
+// It returns TRUE only when the caller may proceed to hooks, events and fan-out
+// accounting. It returns false in both failure shapes:
+//
+//   - ErrJobNotOwned: the job was reclaimed or cancelled by another path, which
+//     now owns the outcome. Nothing to clean up.
+//   - any other error: the write did NOT land, so the row is still 'running'
+//     under our lock and nothing re-dispatches it until the stale-lock reaper
+//     (45 minutes by default). Release for reclaim.
+//
+// This exists as ONE function because the contract was previously open-coded at
+// three call sites with subtly different shapes, and the two that got it wrong
+// went on to fire hooks and emit events describing a state the database never
+// entered. A contract repeated by hand is a contract that drifts — the same way
+// two hand-synced checkpoint column lists let span_end go missing.
+func (w *Worker) dispositionWriteLanded(ctx context.Context, jobID core.UUID, failErr error, action, notOwnedMsg string) bool {
+	if failErr == nil {
+		return true
+	}
+	if errors.Is(failErr, core.ErrJobNotOwned) {
+		w.logger.Warn(notOwnedMsg, "job_id", jobID)
+		return false
+	}
+	// failWithRetry already logged the underlying error; don't log it twice.
+	w.releaseAfterTerminalWriteError(ctx, jobID, action)
+	return false
 }
 
 func (w *Worker) releaseAfterTerminalWriteError(ctx context.Context, jobID core.UUID, action string) {
@@ -2200,9 +2276,16 @@ func (w *Worker) handleError(ctx context.Context, jobCtx context.Context, job *c
 		// Persist the retry first. If storage reports the job is no longer owned
 		// by this worker, it was reclaimed or cancelled by another path. The owner
 		// is now responsible for hooks, events, and fan-out accounting.
-		if failErr := w.failWithRetry(ctx, job.ID, err.Error(), retryAt); errors.Is(failErr, core.ErrJobNotOwned) {
-			w.logger.Warn("job no longer owned by this worker; skipping failure handling",
-				"job_id", job.ID, "error", err)
+		// If the retry was not scheduled, firing the retry hooks and emitting
+		// JobRetrying would describe a state the database never entered —
+		// downstream consumers would act on a reschedule that does not exist.
+		// Release instead: a healthy worker reclaims within a poll, and Release
+		// decrements attempt so the job still gets the retry it was owed, just
+		// without the backoff delay.
+		if !w.dispositionWriteLanded(ctx, job.ID,
+			w.failWithRetry(ctx, job.ID, err.Error(), retryAt),
+			"retry scheduling",
+			"job no longer owned by this worker; skipping failure handling") {
 			return
 		}
 		w.queue.CallRetryHooks(jobCtx, job, job.Attempt, err)
@@ -2232,9 +2315,13 @@ func (w *Worker) handleError(ctx context.Context, jobCtx context.Context, job *c
 
 	// Legacy storage path: terminal failures use the original split
 	// Fail+fan-out accounting sequence.
-	if failErr := w.failWithRetry(ctx, job.ID, err.Error(), nil); errors.Is(failErr, core.ErrJobNotOwned) {
-		w.logger.Warn("job no longer owned by this worker; skipping failure handling",
-			"job_id", job.ID, "error", err)
+	// IncrementFanOutFailed is not idempotent, so running the accounting for a
+	// terminal write that did not land double-charges the count once the reaper
+	// re-runs the job.
+	if !w.dispositionWriteLanded(ctx, job.ID,
+		w.failWithRetry(ctx, job.ID, err.Error(), nil),
+		"terminal failure",
+		"job no longer owned by this worker; skipping failure handling") {
 		return
 	}
 

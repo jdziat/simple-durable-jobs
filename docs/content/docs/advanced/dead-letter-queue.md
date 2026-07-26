@@ -78,19 +78,29 @@ Handlers must still be idempotent because execution is at least once.
 
 ## Retention interaction
 
-Retention GC still prunes terminal failed and cancelled rows by `completed_at`.
-DLQ metadata does not protect a failed row from retention.
+Retention GC is on by default, and dead-letter metadata does not protect a
+failed row from it: terminal failed and cancelled rows are pruned by
+`completed_at`, 90 days after they reached their terminal status on a worker
+started with no retention options. Triage that has not happened by then has no
+row left to triage.
 
-Configure `RetentionFailedAfter` with enough time for operators to inspect,
-diagnose, export, or requeue dead-lettered jobs:
+Widen `RetentionFailedAfter` to however long operators actually need to inspect,
+diagnose, export, or requeue dead-lettered jobs. `WithRetention` **replaces** the
+stock windows rather than merging with them, so restate the windows you still
+want — a window omitted from the call is `0`, which keeps that status forever:
 
 ```go
 w := jobs.NewWorker(q,
 	jobs.WithRetention(
-		jobs.RetentionFailedAfter(30*24*time.Hour),
+		jobs.RetentionCompletedAfter(30*24*time.Hour),
+		jobs.RetentionFailedAfter(180*24*time.Hour),
+		jobs.RetentionConsumedSignalsAfter(7*24*time.Hour),
 	),
 )
 ```
+
+See [Retention GC]({{< relref "/docs/advanced/retention-gc" >}}) for the stock
+windows and for how to turn retention off entirely.
 
 Deletes are permanent. When retention removes a dead-lettered job, it also
 removes the row operators would use for DLQ triage and replay.

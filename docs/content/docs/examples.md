@@ -363,7 +363,12 @@ func main() {
     }
 
     // Cron expression: every hour at minute 0
-    if err := queue.Schedule("hourly-task", nil, jobs.Cron("0 * * * *")); err != nil {
+    // Cron returns (Schedule, error) so a malformed expression fails fast.
+    hourly, err := jobs.Cron("0 * * * *")
+    if err != nil {
+        panic(err)
+    }
+    if err := queue.Schedule("hourly-task", nil, hourly); err != nil {
         panic(err)
     }
 

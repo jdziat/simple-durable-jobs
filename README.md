@@ -118,9 +118,14 @@ func main() {
     // Setup database. SafeSQLiteDSN adds the DSN parameters (WAL + busy_timeout
     // + immediate transactions) required for safe concurrent workers — without
     // them, concurrent writes transiently fail with SQLITE_BUSY/SQLITE_READONLY.
-    db, _ := gorm.Open(sqlite.Open(jobs.SafeSQLiteDSN("jobs.db")), &gorm.Config{})
+    db, err := gorm.Open(sqlite.Open(jobs.SafeSQLiteDSN("jobs.db")), &gorm.Config{})
+    if err != nil {
+        log.Fatal(err)
+    }
     storage := jobs.NewGormStorage(db)
-    storage.Migrate(context.Background())
+    if err := storage.Migrate(context.Background()); err != nil {
+        log.Fatal(err)
+    }
 
     // Create queue
     queue := jobs.New(storage)
@@ -132,14 +137,18 @@ func main() {
     })
 
     // Enqueue a job
-    queue.Enqueue(context.Background(), "send-email", EmailArgs{
+    if _, err := queue.Enqueue(context.Background(), "send-email", EmailArgs{
         To:      "user@example.com",
         Subject: "Hello!",
-    })
+    }); err != nil {
+        log.Fatal(err)
+    }
 
     // Start worker
     worker := queue.NewWorker()
-    worker.Start(context.Background())
+    if err := worker.Start(context.Background()); err != nil {
+        log.Fatal(err)
+    }
 }
 
 type EmailArgs struct {
@@ -331,8 +340,13 @@ if err := queue.Schedule("backup", nil, jobs.Weekly(time.Sunday, 2, 0)); err != 
     return err
 }
 
-// Use cron expressions
-if err := queue.Schedule("hourly-check", nil, jobs.Cron("0 * * * *")); err != nil {
+// Use cron expressions. Cron parses eagerly and returns (Schedule, error), so a
+// malformed expression fails here rather than silently never firing.
+hourly, err := jobs.Cron("0 * * * *")
+if err != nil {
+    return err
+}
+if err := queue.Schedule("hourly-check", nil, hourly); err != nil {
     return err
 }
 
@@ -475,11 +489,19 @@ The library uses GORM, supporting:
 // PostgreSQL
 import "gorm.io/driver/postgres"
 
-db, _ := gorm.Open(postgres.Open("host=localhost user=app dbname=jobs"), &gorm.Config{})
+db, err := gorm.Open(postgres.Open("host=localhost user=app dbname=jobs"), &gorm.Config{})
+if err != nil {
+    log.Fatal(err)
+}
 storage := jobs.NewGormStorage(db)
 
-// With connection pool tuning
-storage := jobs.NewGormStorageWithPool(db, jobs.HighConcurrencyPoolConfig())
+// With connection pool tuning. NewGormStorageWithPool returns (*GormStorage,
+// error), and WithPoolConfig adapts any PoolConfig — the presets included — to
+// the PoolOption it takes.
+tuned, err := jobs.NewGormStorageWithPool(db, jobs.WithPoolConfig(jobs.HighConcurrencyPoolConfig()))
+if err != nil {
+    log.Fatal(err)
+}
 ```
 
 `NewGormStorage(db)` applies a safe bounded default pool unless the pool is

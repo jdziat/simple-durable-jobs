@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"errors"
+	"slices"
 	"sort"
 	"time"
 
@@ -397,7 +398,7 @@ func (s *GormStorage) dequeueBatchLocked(ctx context.Context, queues []string, w
 			})
 		})
 		if err != nil {
-			return nil, err
+			return nil, s.releaseClaimedOnAbort(claimedIDs, workerID, err)
 		}
 
 		if len(batchIDs) > 0 {
@@ -414,7 +415,7 @@ func (s *GormStorage) dequeueBatchLocked(ctx context.Context, queues []string, w
 
 		hasMore, err := s.hasClaimableBatchJob(ctx, queues)
 		if err != nil {
-			return nil, err
+			return nil, s.releaseClaimedOnAbort(claimedIDs, workerID, err)
 		}
 		if !hasMore {
 			break
@@ -424,7 +425,7 @@ func (s *GormStorage) dequeueBatchLocked(ctx context.Context, queues []string, w
 			break
 		}
 		if err := sleepDequeueBatchRetry(ctx, time.Duration(emptyRetries)*2*time.Millisecond); err != nil {
-			return nil, err
+			return nil, s.releaseClaimedOnAbort(claimedIDs, workerID, err)
 		}
 	}
 
@@ -438,7 +439,7 @@ func (s *GormStorage) dequeueBatchLocked(ctx context.Context, queues []string, w
 		// COALESCE(run_at, created_at) for a deterministic priority,time ordering.
 		Order("priority DESC, COALESCE(run_at, created_at) ASC").
 		Find(&jobs).Error; err != nil {
-		return nil, err
+		return nil, s.releaseClaimedOnAbort(claimedIDs, workerID, err)
 	}
 	decoded, err := s.decodeClaimedBatch(ctx, jobs, workerID)
 	if err != nil {
@@ -468,6 +469,64 @@ func (s *GormStorage) decodeClaimedBatch(ctx context.Context, jobs []*core.Job, 
 	}
 	return out, nil
 }
+
+// releaseClaimedOnAbort returns rows already claimed by this call to pending,
+// then returns cause joined with any release failure.
+//
+// WHY: dequeueBatchLocked's outer loop runs an UNBOUNDED number of separate
+// COMMITTED transactions, accumulating claims only in an in-memory slice. Every
+// error exit after the first successful iteration therefore threw away rows that
+// are durably status='running', locked_by=us, attempt+1 — never dispatched,
+// never released. They read as HEALTHY to any queue-depth alert, and the only
+// recovery is ReleaseStaleLocks at a DEFAULT StaleLockAge of 45 MINUTES. The
+// same applies to the post-claim re-fetch, which is a separate statement outside
+// the claim transaction and so can fail on a batch that is already committed.
+//
+// Two details are load-bearing:
+//   - The release runs on a context DETACHED from the caller's. The most common
+//     way to reach this path is worker shutdown cancelling ctx, and a release
+//     issued on that same cancelled context would itself fail, stranding exactly
+//     the rows we are trying to save.
+//   - errors.Join preserves errors.Is(err, context.Canceled) for the caller.
+//     pkg/worker/worker.go's dequeue loop uses that test to stay quiet during a
+//     normal shutdown; wrapping the cause in anything opaque would turn every
+//     clean stop into a logged error.
+func (s *GormStorage) releaseClaimedOnAbort(claimedIDs []core.UUID, workerID string, cause error) error {
+	if len(claimedIDs) == 0 {
+		return cause
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(context.Background()), releaseOnAbortTimeout)
+	defer cancel()
+
+	now := time.Now()
+	var relErr error
+	for chunk := range slices.Chunk(claimedIDs, releaseOnAbortChunk) {
+		if err := s.db.WithContext(ctx).
+			Model(&core.Job{}).
+			Where("id IN ? AND locked_by = ? AND status = ?", chunk, workerID, core.StatusRunning).
+			Updates(map[string]any{
+				"status":       core.StatusPending,
+				"locked_by":    "",
+				"locked_until": nil,
+				"started_at":   nil,
+				"attempt":      gorm.Expr("CASE WHEN attempt > 0 THEN attempt - 1 ELSE 0 END"),
+				"dq_ready":     s.dqReadyExpr(now),
+				"updated_at":   now,
+			}).Error; err != nil {
+			relErr = errors.Join(relErr, err)
+		}
+	}
+	return errors.Join(cause, relErr)
+}
+
+const (
+	// releaseOnAbortTimeout bounds the detached release so a wedged database
+	// cannot make an aborting dequeue hang forever.
+	releaseOnAbortTimeout = 10 * time.Second
+	// releaseOnAbortChunk keeps the IN-list small enough to stay off the
+	// pathological-plan cliff on every dialect.
+	releaseOnAbortChunk = 200
+)
 
 func (s *GormStorage) hasClaimableBatchJob(ctx context.Context, queues []string) (bool, error) {
 	var job core.Job

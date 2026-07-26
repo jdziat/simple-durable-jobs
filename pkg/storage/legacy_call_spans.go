@@ -19,7 +19,7 @@ type LegacyCallSpanJob struct {
 // FindLegacyCallSpanJobs returns non-terminal jobs carrying more than one Call
 // checkpoint written before span tracking existed (span_end = 0).
 //
-// WHY THIS EXISTS
+// # WHY THIS EXISTS
 //
 // Before v4.6, Call indices came from a single flat counter shared with nested
 // durable operations. On replay an outer Call was served from its checkpoint

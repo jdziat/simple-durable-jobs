@@ -101,7 +101,18 @@ func TestDequeueBatchPerQueue_MidBatchErrorDoesNotStrandEarlierClaims(t *testing
 	case os.Getenv("TEST_DATABASE_URL") != "":
 		s = newPostgresTestStorage(t) // real PG tables — the primary target of this fix
 	case os.Getenv("TEST_MYSQL_URL") != "":
-		t.Skip("dequeueBatchReturning is the PG/SQLite path; MySQL uses the already-transactional locked path")
+		// This test targets dequeueBatchReturning, which MySQL does not use.
+		//
+		// The skip previously read "MySQL uses the already-transactional locked
+		// path", which is only half true and was load-bearing in the wrong
+		// direction: each ITERATION of dequeueBatchLocked is transactional, but
+		// its outer loop runs an unbounded number of separate COMMITTED
+		// transactions, so an error on a later iteration used to strand the
+		// earlier ones exactly as F4 describes. That gap is closed by
+		// releaseClaimedOnAbort and covered by TestReleaseClaimedOnAbort_* and
+		// TestDequeue_ReleasesClaimOnPayloadDecodeFailure, which run on every
+		// dialect including this one.
+		t.Skip("dequeueBatchReturning is the PG/SQLite path; MySQL's equivalent is covered by TestReleaseClaimedOnAbort_*")
 	default:
 		// Temp-FILE sqlite (not :memory:) so a claim we deliberately fail below
 		// cannot surface a fresh, tableless pool connection to the later

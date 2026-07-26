@@ -133,6 +133,22 @@ func ConnMaxIdleTime(d time.Duration) PoolOption {
 	})
 }
 
+// WithPoolConfig sets every pool field at once from a PoolConfig, which is what
+// makes all four presets (DefaultPoolConfig, HighConcurrencyPoolConfig,
+// LowLatencyPoolConfig, ResourceConstrainedPoolConfig) usable at all: PoolOption is sealed by an
+// unexported method, so before this existed no exported function accepted a
+// PoolConfig and all four presets were unreachable exported API — the
+// documented "using a preset" snippet could not compile (2026-07-24 teardown).
+//
+// It REPLACES the accumulated config rather than merging into it, so ordinary
+// last-writer-wins ordering applies: WithPoolConfig after MaxOpenConns(7)
+// discards the 7.
+func WithPoolConfig(cfg PoolConfig) PoolOption {
+	return poolOptionFunc(func(c *PoolConfig) {
+		*c = cfg
+	})
+}
+
 // ConfigurePool applies pool configuration to a GORM database connection.
 // Returns an error if the underlying *sql.DB cannot be retrieved.
 func ConfigurePool(db *gorm.DB, opts ...PoolOption) error {

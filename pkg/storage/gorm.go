@@ -258,6 +258,9 @@ func (s *GormStorage) Migrate(ctx context.Context) error {
 			if err := requireMySQLUTCDriverLoc(ctx, db); err != nil {
 				return err
 			}
+			if err := requireMySQLUTF8MB4(ctx, db); err != nil {
+				return err
+			}
 		}
 
 		// Heal pre-existing NULL dispatcher columns BEFORE AutoMigrate enforces
@@ -431,6 +434,61 @@ func requireMySQLUTCSession(ctx context.Context, db *gorm.DB) error {
 		return fmt.Errorf("storage: MySQL session clock is not UTC; NOW(6) drives DB-clock lock/lease writes; set time_zone='+00:00' or loc=UTC in the DSN")
 	}
 	return nil
+}
+
+// requireMySQLUTF8MB4 refuses to migrate a MySQL database whose default
+// character set cannot carry the utf8mb4_0900_* collations the schema pins.
+//
+// WHY THIS IS A PREFLIGHT AND NOT A FIX
+//
+// Every collation-bearing migration writes `... COLLATE utf8mb4_0900_as_cs`
+// with NO accompanying CHARACTER SET. On a utf8mb4 database that is correct and
+// harmless — the column inherits utf8mb4 and the collation matches. On a
+// database still defaulting to utf8mb3 (the MySQL 5.x-era default, and what an
+// old `CREATE DATABASE` leaves behind) the column inherits utf8mb3 while being
+// handed a utf8mb4 collation, and the server rejects it with
+// ER_COLLATION_CHARSET_MISMATCH.
+//
+// That error used to surface partway through the ledger, so the failure mode
+// was a boot crashloop with some DDL already applied and some not — on a
+// legitimate existing database, with an error message that names a collation
+// rather than the actual problem. Those migrations are already stamped in
+// production ledgers and MUST NOT be edited, so the repair is to refuse EARLY,
+// before any DDL runs, and say exactly what to do about it.
+//
+// MariaDB is detected separately: it has no utf8mb4_0900_* collations at all, so
+// it would otherwise fail this check with a message telling the operator to
+// convert a charset that is already correct.
+func requireMySQLUTF8MB4(ctx context.Context, db *gorm.DB) error {
+	var version string
+	if err := db.WithContext(ctx).Raw("SELECT VERSION()").Scan(&version).Error; err != nil {
+		return fmt.Errorf("storage: read MySQL version: %w", err)
+	}
+	if strings.Contains(strings.ToLower(version), "mariadb") {
+		return fmt.Errorf(
+			"storage: MariaDB is not supported (server reports %q): the schema pins utf8mb4_0900_* collations, "+
+				"which exist only in MySQL 8.0+. Use MySQL 8.0+, PostgreSQL, or SQLite", version)
+	}
+
+	var charset string
+	if err := db.WithContext(ctx).Raw(
+		"SELECT DEFAULT_CHARACTER_SET_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = DATABASE()",
+	).Scan(&charset).Error; err != nil {
+		return fmt.Errorf("storage: read MySQL database character set: %w", err)
+	}
+	// An empty result means DATABASE() is NULL — no schema selected in the DSN.
+	// Let the migration proceed and fail naturally; that is a DSN problem, not a
+	// charset one, and guessing here would produce a misleading message.
+	if charset == "" || strings.EqualFold(charset, "utf8mb4") {
+		return nil
+	}
+	return fmt.Errorf(
+		"storage: MySQL database default character set is %q, but the schema requires utf8mb4 "+
+			"(its collations are utf8mb4_0900_*). Migrating would fail partway through with "+
+			"ER_COLLATION_CHARSET_MISMATCH, leaving the schema half-applied, so no DDL was run. "+
+			"Fix with: ALTER DATABASE `<name>` CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci; "+
+			"existing tables also need CONVERT TO CHARACTER SET utf8mb4 — see the MySQL notes in "+
+			"docs/content/docs/production-ops.md", charset)
 }
 
 // requireMySQLUTCDriverLoc fails Migrate when the MySQL driver's DSN `loc` is not
@@ -730,7 +788,15 @@ func (s *GormStorage) dequeueOnce(ctx context.Context, queues []string, workerID
 		return nil, nil
 	}
 	if err := s.decodeJobPayloads(&job); err != nil {
-		return nil, err
+		// The claim is already COMMITTED here, so returning without releasing
+		// leaves the row status='running', locked_by=us and undispatched —
+		// invisible to any queue-depth alert (it reads as healthy work in
+		// progress) and reclaimable only by ReleaseStaleLocks, by default 45
+		// minutes later. The BATCH path has released poison rows since the
+		// teardown-g3 fix (decodeClaimedBatch); this single-job path was left
+		// behind. A misconfigured codec should produce a visible, self-contained
+		// symptom on one row, not a silently parked job.
+		return nil, s.releaseClaimedOnAbort([]core.UUID{job.ID}, workerID, err)
 	}
 	return &job, nil
 }
@@ -805,7 +871,15 @@ func (s *GormStorage) dequeueSQLite(ctx context.Context, queues []string, worker
 		return nil, nil
 	}
 	if err := s.decodeJobPayloads(&job); err != nil {
-		return nil, err
+		// The claim is already COMMITTED here, so returning without releasing
+		// leaves the row status='running', locked_by=us and undispatched —
+		// invisible to any queue-depth alert (it reads as healthy work in
+		// progress) and reclaimable only by ReleaseStaleLocks, by default 45
+		// minutes later. The BATCH path has released poison rows since the
+		// teardown-g3 fix (decodeClaimedBatch); this single-job path was left
+		// behind. A misconfigured codec should produce a visible, self-contained
+		// symptom on one row, not a silently parked job.
+		return nil, s.releaseClaimedOnAbort([]core.UUID{job.ID}, workerID, err)
 	}
 	return &job, nil
 }
