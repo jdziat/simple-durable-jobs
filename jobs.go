@@ -1030,7 +1030,6 @@ func Weekly(day time.Weekday, hour, minute int) Schedule {
 	return schedule.Weekly(day, hour, minute)
 }
 
-// Cron creates a schedule from a cron expression.
 // CronIn is Cron with the evaluation location supplied separately, for callers
 // holding a *time.Location rather than a timezone name.
 func CronIn(loc *time.Location, expr string) (Schedule, error) {
@@ -1053,6 +1052,13 @@ func WeeklyIn(loc *time.Location, day time.Weekday, hour, minute int) Schedule {
 	return schedule.WeeklyIn(loc, day, hour, minute)
 }
 
+// Cron creates a schedule from a cron expression.
+//
+// The expression is evaluated in UTC unless it carries an explicit
+// "CRON_TZ=Area/City " or "TZ=Area/City " prefix, which is honoured. Note that
+// the default is UTC and not the host's local zone, so the same expression fires
+// at the same instant on every node in a fleet. Use [CronIn] to supply a
+// *time.Location directly.
 func Cron(expr string) (Schedule, error) {
 	return schedule.Cron(expr)
 }

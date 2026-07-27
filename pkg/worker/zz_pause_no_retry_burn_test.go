@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -292,4 +293,65 @@ func TestProcessJob_DropsTheMarkEvenWhenTheHandlerPanics(t *testing.T) {
 	assert.False(t, w.takePauseCancelled(job.ID),
 		"the mark must be dropped on the panic path too — the cleanup defer is registered after "+
 			"the recovery defer and LIFO must keep it running first")
+}
+
+// TestPause_GenuineErrorDuringAPauseStillFails guards the `selfCancelled &&`
+// conjunction, which had no test.
+//
+// Pause(Aggressive) marks every running job. A handler that returns a GENUINE
+// error at the instant a pause lands therefore carries a mark too — and releasing
+// on the mark ALONE would drop that failure on the floor: no Fail, no JobFailed,
+// no attempt burned, the error silently discarded. The release must additionally
+// require the error to actually BE this worker's self-cancel.
+//
+// FALSE-GREEN TRAP: a handler returning context.Canceled cannot distinguish the
+// two guards, since it satisfies both. The discriminating handler returns a
+// non-cancellation error while the mark is set.
+func TestPause_GenuineErrorDuringAPauseStillFails(t *testing.T) {
+	var failCalls atomic.Int64
+	store := &mockStorage{}
+	store.failFunc = func(context.Context, core.UUID, string, string, *time.Time) error {
+		failCalls.Add(1)
+		return nil
+	}
+
+	q := queue.New(store)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	q.Register("real-failure", func(ctx context.Context, _ struct{}) error {
+		close(started)
+		<-release
+		return errors.New("the database actually fell over")
+	})
+
+	job := &core.Job{
+		ID: core.NewID(), Type: "real-failure", Queue: "default",
+		Status: core.StatusRunning, Attempt: 1, MaxRetries: 3,
+	}
+
+	w := NewWorker(q)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() { defer close(done); w.processJob(ctx, job) }()
+
+	select {
+	case <-started:
+	case <-time.After(10 * time.Second):
+		t.Fatal("handler never started")
+	}
+
+	w.Pause(core.PauseModeAggressive) // marks the job
+	close(release)                    // ...and it fails for an unrelated reason
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("processJob never returned")
+	}
+
+	assert.Equal(t, int64(1), failCalls.Load(),
+		"a genuine error that lands during a pause must still travel the failure path — "+
+			"releasing on the pause mark alone would discard a real failure entirely")
 }

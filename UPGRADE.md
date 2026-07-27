@@ -15,8 +15,11 @@ Three releases matter here.
   places, all of them cases where the old behaviour was wrong — but wrong in ways
   a deployment may have been tuned around. Those are listed below.
 
-Nothing here is an API break. `gorelease` reports every change compatible; the
-only additions are new options, new event aliases and new storage methods.
+No API break: `gorelease` reports every change compatible, and the only additions
+are new options, new event aliases and new storage methods. That is *signature*
+compatibility — one exported method's observable **error contract** does change
+(`EnqueueScheduledFire` now returns a sentinel on a deliberate skip), which is
+described below.
 
 ---
 
@@ -211,9 +214,11 @@ count on every child unconditionally, which made the fan-out default unreachable
 - **Hand-written `fanout.SubJob{}` literals** with no explicit `Retries` go from
   3 retries to 2. The fan-out default is now `queue.DefaultJobRetries`, matching
   what `Sub()`-built children already received — chosen so the common path does
-  not move. Set `Retries` explicitly if you relied on 3. A literal that DOES set
-  `Retries` or `Priority` keeps its value; only an absent (zero) one takes the
-  fan-out default.
+  not move. Set `Retries` explicitly if you relied on 3. A literal that sets `Retries` or
+  `Priority` to a **non-zero** value keeps it; a zero takes the fan-out default,
+  because a plain struct literal cannot express "explicitly zero" — there is no
+  field to distinguish it from an omission. Use `jobs.Sub(..., jobs.Retries(0))`
+  when you mean zero.
 - Passing a dedup option (`Unique`, `IdempotencyKey`, `UniqueFor`) to `Sub` logs
   one `WARN` per fan-out. Those are parent-level concepts and remain ignored:
   children carry a fan-out-owned unique key so parent replay stays idempotent.
@@ -267,7 +272,7 @@ running process into a crash. v5 replaces this with a typed signature.
 tight loop (see above).
 
 **After:** the claim is committed and the method returns
-`(claimed, uuid.Nil, core.ErrDuplicateJob)`.
+`(claimed, jobs.NilUUID, jobs.ErrDuplicateJob)`.
 
 **What you may notice:** this is an exported method whose **error contract**
 changed. It is signature-compatible, but a caller that treats any non-nil error

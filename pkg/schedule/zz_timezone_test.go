@@ -1,6 +1,8 @@
 package schedule
 
 import (
+	"os"
+	"os/exec"
 	"testing"
 	"time"
 
@@ -54,7 +56,32 @@ func TestCron_DoesNotPanicOnAMalformedPrefix(t *testing.T) {
 // Without a prefix the schedule must stay UTC. robfig defaults an unpinned
 // schedule to the host's LOCAL zone, so dropping the pin would silently move
 // every existing prefix-free schedule to whatever TZ the host happens to set.
+// A prefix-free expression must be evaluated in UTC and NOT in the host's zone,
+// so one expression fires at the same instant on every node in a fleet.
+//
+// FALSE-GREEN TRAP: under TZ=UTC — which is what CI runs — "defaults to UTC" and
+// "defaults to the host zone" are behaviourally IDENTICAL, so no in-process
+// assertion can tell them apart, and removing the UTC pin left this test green.
+// The only way to make it discriminate is to evaluate under a zone that is not
+// UTC, so the test re-executes itself once with TZ set. Go resolves time.Local
+// from TZ at process start, which is why this needs a child process rather than
+// os.Setenv.
 func TestCron_WithoutPrefixStaysUTC(t *testing.T) {
+	const childEnv = "SDJ_CRON_TZ_CHILD"
+	if os.Getenv(childEnv) == "" {
+		cmd := exec.Command(os.Args[0], "-test.run", "^TestCron_WithoutPrefixStaysUTC$", "-test.v")
+		cmd.Env = append(os.Environ(), childEnv+"=1", "TZ=Asia/Tokyo")
+		out, err := cmd.CombinedOutput()
+		require.NoError(t, err,
+			"the prefix-free path must stay UTC when the host zone is NOT UTC:\n%s", out)
+		return
+	}
+
+	// In the child, time.Local is Asia/Tokyo (UTC+9), so the two candidate
+	// behaviours give answers nine hours apart.
+	require.NotEqual(t, time.UTC.String(), time.Local.String(),
+		"the child must run in a non-UTC zone or this test proves nothing")
+
 	s, err := Cron("0 9 * * *")
 	require.NoError(t, err)
 	from := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
@@ -96,4 +123,54 @@ func TestDailyIn_FiresOncePerDayAcrossASpringForward(t *testing.T) {
 	for day, n := range seen {
 		assert.Equal(t, 1, n, "DailyIn must fire exactly once on %s, got %d", day, n)
 	}
+}
+
+// Daily and Weekly advance by rolling the CALENDAR day, not by adding 24h (or
+// 168h) to a normalized instant. In a DST zone those differ: time.Date
+// normalizes a time that does not exist on a spring-forward day (02:30 -> 01:30),
+// and AddDate on the normalized instant then carries the shift forward, so the
+// schedule can fire twice on one day or skip one entirely.
+//
+// FALSE-GREEN TRAP, confirmed by a reviewer: the calendar roll had NO test.
+// Replacing it with AddDate left the whole repo green, because every other
+// schedule test runs in UTC where the two are identical. These use a real DST
+// zone and step across the transition.
+func TestDailyIn_RollsTheCalendarDayAcrossSpringForward(t *testing.T) {
+	ny, err := time.LoadLocation("America/New_York")
+	require.NoError(t, err)
+
+	// 2026-03-08 is the US spring-forward date: 02:00 -> 03:00, so 02:30 does not
+	// exist. A schedule at 02:30 must still advance one calendar day at a time.
+	s := DailyIn(ny, 2, 30)
+	from := time.Date(2026, 3, 7, 12, 0, 0, 0, ny)
+
+	seen := map[string]int{}
+	for range 4 {
+		from = s.Next(from)
+		seen[from.In(ny).Format("2006-01-02")]++
+	}
+	for day, n := range seen {
+		assert.Equal(t, 1, n,
+			"a daily schedule must fire exactly once per calendar day; %s fired %d times "+
+				"(adding 24h to a DST-normalized instant double-fires)", day, n)
+	}
+	assert.Len(t, seen, 4, "four advances must land on four distinct days")
+}
+
+func TestWeeklyIn_RollsSevenCalendarDaysAcrossSpringForward(t *testing.T) {
+	ny, err := time.LoadLocation("America/New_York")
+	require.NoError(t, err)
+
+	s := WeeklyIn(ny, time.Sunday, 2, 30)
+	from := time.Date(2026, 3, 1, 12, 0, 0, 0, ny)
+
+	first := s.Next(from)
+	second := s.Next(first)
+
+	assert.Equal(t, time.Sunday, first.In(ny).Weekday(), "must land on the requested weekday")
+	assert.Equal(t, time.Sunday, second.In(ny).Weekday(),
+		"and must STILL land on it after crossing the DST boundary — adding 168h to a "+
+			"normalized instant drifts the weekday")
+	assert.Equal(t, 7, int(second.In(ny).Sub(first.In(ny)).Hours()/24+0.5),
+		"consecutive fires must be seven calendar days apart")
 }

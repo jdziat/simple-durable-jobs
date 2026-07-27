@@ -89,6 +89,49 @@ func TestStatsCollector_SnapshotReportsTheSameQueueSet(t *testing.T) {
 			"status, and writing those adds a zero row per queue per minute forever")
 }
 
+// TestGetQueueDepthQueueOnly_CountsOnlyPendingAndRunning pins the storage query
+// directly, because the collector-level test above CANNOT see it.
+//
+// FALSE-GREEN TRAP, confirmed by a reviewer: the WHERE clause and
+// aggregateQueueDepth's zero-skip each mask the other's removal. Delete the WHERE
+// and the zero-skip still drops terminal-only queues; delete the zero-skip and the
+// WHERE still does. Both deletions leave the whole suite green, so neither guard
+// is actually tested through the collector. The WHERE is the one that matters for
+// cost — it is what keeps the scan bounded instead of reading the entire jobs
+// table every minute — so it is asserted here at its own level, by counting the
+// rows the query returns rather than what survives downstream filtering.
+func TestGetQueueDepthQueueOnly_CountsOnlyPendingAndRunning(t *testing.T) {
+	_, _, q := setupCollectorTest(t)
+	ctx := context.Background()
+	store := q.Storage()
+
+	for _, tc := range []struct {
+		queue  string
+		status core.JobStatus
+	}{
+		{"live", core.StatusPending},
+		{"live", core.StatusRunning},
+		{"terminal-only", core.StatusCompleted},
+		{"terminal-only", core.StatusFailed},
+		{"terminal-only", core.StatusCancelled},
+	} {
+		require.NoError(t, store.Enqueue(ctx, &core.Job{
+			ID: core.NewID(), Queue: tc.queue, Type: "work", Status: tc.status,
+		}))
+	}
+
+	agg, ok := store.(queueDepthOnlyStorage)
+	require.True(t, ok)
+	depth, err := agg.GetQueueDepthQueueOnly(ctx)
+	require.NoError(t, err)
+
+	assert.Equal(t, [2]int64{1, 1}, depth["live"], "pending and running are counted")
+	assert.NotContains(t, depth, "terminal-only",
+		"the query must not return a queue whose jobs are all terminal: without the "+
+			"status filter it scans and groups the ENTIRE jobs table every minute, which the "+
+			"default 30-day retention makes overwhelmingly completed rows")
+}
+
 // TestStatsCollector_SnapshotFallsBackWithoutTheAggregate keeps the fallback
 // honest: a custom core.Storage that does not implement GetQueueDepthStats must
 // still produce depth samples via the row scan.

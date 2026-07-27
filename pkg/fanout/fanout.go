@@ -77,7 +77,8 @@ func FanOut[T any](ctx context.Context, subJobs []SubJob, opts ...Option) ([]Res
 			return nil, fmt.Errorf("fan-out not found: %s", fanOutID)
 		}
 
-		jobs, err := buildSubJobs(subJobs, cfg, jc, fanOutID)
+		// Replay: anchor relative delays to the fan-out's creation, not to now.
+		jobs, err := buildSubJobs(subJobs, cfg, jc, fanOutID, fanOut.CreatedAt)
 		if err != nil {
 			return nil, err
 		}
@@ -104,7 +105,7 @@ func FanOut[T any](ctx context.Context, subJobs []SubJob, opts ...Option) ([]Res
 
 	// First execution: create fan-out and sub-jobs
 	fanOutID = core.NewID()
-	jobs, err := buildSubJobs(subJobs, cfg, jc, fanOutID)
+	jobs, err := buildSubJobs(subJobs, cfg, jc, fanOutID, time.Now())
 	if err != nil {
 		return nil, err
 	}
@@ -208,9 +209,17 @@ func FanOut[T any](ctx context.Context, subJobs []SubJob, opts ...Option) ([]Res
 	return nil, &WaitingError{FanOutID: fanOutID}
 }
 
-func buildSubJobs(subJobs []SubJob, cfg *config, jc *intctx.JobContext, fanOutID core.UUID) ([]*core.Job, error) {
+// buildSubJobs materialises the child rows. `now` is the reference instant a
+// relative Delay is measured from, and it is a PARAMETER rather than time.Now()
+// because this runs on the replay path too: after a crash between creating the
+// fan-out and persisting its children, calling time.Now() here would re-anchor
+// every delayed child to the recovery instant, so a child asked to wait an hour
+// would wait an hour FROM THE REPLAY — drifting by the whole crash-to-recovery
+// gap, silently, on the one path where the caller cannot see it. The replay
+// passes the fan-out's own CreatedAt so it reproduces the original schedule.
+// An absolute RunAt is unaffected either way; only Delay is relative.
+func buildSubJobs(subJobs []SubJob, cfg *config, jc *intctx.JobContext, fanOutID core.UUID, now time.Time) ([]*core.Job, error) {
 	jobs := make([]*core.Job, len(subJobs))
-	now := time.Now()
 	var dedupIgnored []int
 	for i, sj := range subJobs {
 		if err := security.ValidateJobTypeName(sj.Type); err != nil {

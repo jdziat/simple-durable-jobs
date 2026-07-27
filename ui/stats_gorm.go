@@ -44,14 +44,22 @@ func (s *gormStatsStorage) MigrateStats(ctx context.Context) error {
 const jobStatsTimestampIndex = "idx_job_stats_timestamp"
 
 func (s *gormStatsStorage) ensureTimestampIndex(ctx context.Context) error {
-	m := s.db.Migrator()
-	if m.HasIndex(&JobStat{}, jobStatsTimestampIndex) {
+	if s.db.Migrator().HasIndex(&JobStat{}, jobStatsTimestampIndex) {
 		return nil
 	}
+	return s.createTimestampIndex(ctx)
+}
+
+// createTimestampIndex issues the CREATE and tolerates losing the race.
+//
+// Split out from ensureTimestampIndex so the recovery is reachable from a test:
+// through ensureTimestampIndex the leading HasIndex guard short-circuits before
+// the CREATE, so no sequential test can ever enter this path.
+func (s *gormStatsStorage) createTimestampIndex(ctx context.Context) error {
 	err := s.db.WithContext(ctx).Exec(
 		"CREATE INDEX " + jobStatsTimestampIndex + " ON job_stats (timestamp)",
 	).Error
-	if err != nil && m.HasIndex(&JobStat{}, jobStatsTimestampIndex) {
+	if err != nil && s.db.Migrator().HasIndex(&JobStat{}, jobStatsTimestampIndex) {
 		return nil // lost the race to a peer; the index is there, which is all we wanted
 	}
 	return err

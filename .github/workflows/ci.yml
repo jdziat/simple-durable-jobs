@@ -150,20 +150,30 @@ jobs:
 
       # A committed conflict marker had NO gate: `go build/vet/test ./...` covers
       # only the root module, so docs/ (its own go.mod) is never compiled, and
-      # Hugo renders `<<<<<<< HEAD` as ordinary text without erroring — so
+      # Hugo renders a conflict marker as ordinary text without erroring — so
       # pages.yml would have published it to the live docs site on merge. It
       # happened: markers survived a release-branch merge into two published
       # pages, and one of them put `return err` inside `func main()`.
       #
-      # Anchored to line start so prose that merely mentions the markers, and
-      # this comment, do not trip it. dist/ is a generated bundle.
+      # The pattern is anchored to line start, and is BUILT rather than written
+      # literally so this file is scanned like any other — an earlier version
+      # excluded this workflow to stop the comment self-tripping, which meant a
+      # real marker here would never have been found.
+      #
+      # FAILS CLOSED: git grep exits 0 on a match, 1 on none, and >1 on an actual
+      # error. Only 1 is a pass; anything else fails the build rather than being
+      # silently read as "clean". dist/ is a generated bundle.
       - name: No committed conflict markers
         run: |
-          if git grep -nE '^(<{7}|={7}|>{7})( |$)' -- . ':!ui/frontend/dist' ':!.github/workflows/ci.yml'; then
-            echo "::error::unresolved merge-conflict markers are committed (listed above)"
-            exit 1
-          fi
-          echo "no conflict markers"
+          set -uo pipefail
+          pat="^($(printf '<%.0s' $(seq 7))|$(printf '=%.0s' $(seq 7))|$(printf '>%.0s' $(seq 7)))( |$)"
+          git grep -nE "$pat" -- . ':!ui/frontend/dist'
+          status=$?
+          case "$status" in
+            0) echo "::error::unresolved merge-conflict markers are committed (listed above)"; exit 1 ;;
+            1) echo "no conflict markers" ;;
+            *) echo "::error::conflict-marker scan failed (git grep exit $status)"; exit "$status" ;;
+          esac
 
       - name: Set up Go
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
@@ -178,6 +188,14 @@ jobs:
       - name: Build frontend
         working-directory: ui/frontend
         run: npm install && npm run build
+
+      # The frontend unit tests existed but NOTHING RAN THEM: no workflow invoked
+      # vitest, so every assertion in ui/frontend/src/**/*.test.ts was decorative
+      # in CI and a regression there was invisible. That included the RPC base-URL
+      # resolution the dashboard's sub-path mount depends on.
+      - name: Frontend unit tests
+        working-directory: ui/frontend
+        run: npm run test:unit
 
       - name: golangci-lint
         uses: golangci/golangci-lint-action@9fae48acfc02a90574d7c304a1758ef9895495fa # v7.0.1

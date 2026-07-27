@@ -49,3 +49,31 @@ func TestMigrateStats_IsIdempotent(t *testing.T) {
 	}
 	assert.True(t, db.Migrator().HasIndex(&JobStat{}, jobStatsTimestampIndex))
 }
+
+// TestEnsureTimestampIndex_ToleratesAConcurrentCreator guards the recovery in the
+// UI-side bootstrap — the copy that matters most, because it is the one that runs
+// WITHOUT the storage fleet lock, on every dashboard mount.
+//
+// FALSE-GREEN TRAP, confirmed by a reviewer: TestMigrateStats_IsIdempotent calls
+// MigrateStats three times in sequence, so every call after the first returns at
+// the LEADING HasIndex guard and the error path is never entered. Deleting the
+// recovery entirely left that test green. Reaching the recovery requires the index
+// to appear after the guard has already passed, which is what creating it directly
+// — behind MigrateStats' back — simulates.
+func TestEnsureTimestampIndex_ToleratesAConcurrentCreator(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+	require.NoError(t, err)
+	s := &gormStatsStorage{db: db}
+	ctx := context.Background()
+
+	require.NoError(t, db.AutoMigrate(&JobStat{}))
+	// A peer created it after our guard would have passed.
+	require.NoError(t, db.Exec(
+		"CREATE INDEX "+jobStatsTimestampIndex+" ON job_stats (timestamp)").Error)
+
+	// Drive the CREATE path directly: the leading guard would otherwise short-circuit.
+	require.NoError(t, s.createTimestampIndex(ctx),
+		"losing the race must not fail the dashboard mount: the index is there, which is all "+
+			"this wanted")
+	assert.True(t, db.Migrator().HasIndex(&JobStat{}, jobStatsTimestampIndex))
+}

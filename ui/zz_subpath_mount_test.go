@@ -115,12 +115,17 @@ func TestHandler_StillBootsAtTheRootMount(t *testing.T) {
 	}
 }
 
-// TestHandler_RPCIsReachableUnderTheSubPathMount covers the other half of
-// "the app boots". The compiled client derives its RPC base from the document's
-// own directory, so under the documented mount it calls
-// /jobs/jobs.v1.JobsService/... — which must route through StripPrefix to the
-// Connect handler. It used to build that URL from window.location.origin, which
-// pointed every call at a path the surrounding mux does not serve.
+// TestHandler_RPCIsReachableUnderTheSubPathMount asserts the SERVER half only:
+// that /jobs/jobs.v1.JobsService/... routes through StripPrefix to the Connect
+// handler.
+//
+// SCOPE, stated because an earlier version of this comment overclaimed: this test
+// does NOT verify the client-side fix. That fix is in TypeScript
+// (lib/rpcBaseUrl.ts + client.ts) and this test never loads JavaScript — it
+// passes unchanged against origin/main's handler.go, because the server routing
+// was already prefix-clean and was never the bug. The client half is covered by
+// ui/frontend/src/lib/rpcBaseUrl.test.ts, which CI now actually runs. What this
+// pins is that the route the client computes is one the server answers.
 func TestHandler_RPCIsReachableUnderTheSubPathMount(t *testing.T) {
 	const mount = "/jobs"
 
