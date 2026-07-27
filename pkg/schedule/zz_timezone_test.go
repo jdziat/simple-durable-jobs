@@ -1,8 +1,6 @@
 package schedule
 
 import (
-	"os"
-	"os/exec"
 	"testing"
 	"time"
 
@@ -59,34 +57,31 @@ func TestCron_DoesNotPanicOnAMalformedPrefix(t *testing.T) {
 // A prefix-free expression must be evaluated in UTC and NOT in the host's zone,
 // so one expression fires at the same instant on every node in a fleet.
 //
-// FALSE-GREEN TRAP: under TZ=UTC — which is what CI runs — "defaults to UTC" and
-// "defaults to the host zone" are behaviourally IDENTICAL, so no in-process
-// assertion can tell them apart, and removing the UTC pin left this test green.
-// The only way to make it discriminate is to evaluate under a zone that is not
-// UTC, so the test re-executes itself once with TZ set. Go resolves time.Local
-// from TZ at process start, which is why this needs a child process rather than
-// os.Setenv.
+// FALSE-GREEN TRAP, and the SECOND attempt at this test. robfig/cron's
+// SpecSchedule.Next contains `if loc == time.Local { loc = t.Location() }` — an
+// UNPINNED schedule evaluates in the INPUT's location. So feeding a UTC-faced
+// `from` makes pinned-UTC and unpinned agree no matter what TZ the process runs
+// in, which is why the first version of this test stayed green with the pin
+// removed AND why re-executing under TZ=Asia/Tokyo did not help either: the input
+// was still UTC-faced.
+//
+// The discriminating input is a `from` on a NON-UTC clock face. Then a pinned
+// schedule answers in UTC while an unpinned one answers in the input's zone, and
+// the two differ by the offset. No TZ manipulation is needed.
 func TestCron_WithoutPrefixStaysUTC(t *testing.T) {
-	const childEnv = "SDJ_CRON_TZ_CHILD"
-	if os.Getenv(childEnv) == "" {
-		cmd := exec.Command(os.Args[0], "-test.run", "^TestCron_WithoutPrefixStaysUTC$", "-test.v")
-		cmd.Env = append(os.Environ(), childEnv+"=1", "TZ=Asia/Tokyo")
-		out, err := cmd.CombinedOutput()
-		require.NoError(t, err,
-			"the prefix-free path must stay UTC when the host zone is NOT UTC:\n%s", out)
-		return
-	}
-
-	// In the child, time.Local is Asia/Tokyo (UTC+9), so the two candidate
-	// behaviours give answers nine hours apart.
-	require.NotEqual(t, time.UTC.String(), time.Local.String(),
-		"the child must run in a non-UTC zone or this test proves nothing")
-
 	s, err := Cron("0 9 * * *")
 	require.NoError(t, err)
-	from := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
-	assert.Equal(t, time.Date(2026, 7, 21, 9, 0, 0, 0, time.UTC), s.Next(from).UTC(),
-		"a prefix-free expression must remain UTC, not follow the host timezone")
+
+	// Deliberately NOT UTC. from is 12:00+09:00 == 03:00 UTC, so:
+	//   pinned UTC   -> the next 09:00 UTC is the SAME day, 2026-07-20 09:00Z
+	//   unpinned     -> the next 09:00 in +09:00 is 2026-07-21 09:00+09:00,
+	//                   i.e. 2026-07-21 00:00Z — fifteen hours apart.
+	east := time.FixedZone("probe+9", 9*3600)
+	from := time.Date(2026, 7, 20, 12, 0, 0, 0, east)
+
+	assert.Equal(t, time.Date(2026, 7, 20, 9, 0, 0, 0, time.UTC), s.Next(from).UTC(),
+		"a prefix-free expression must be evaluated in UTC, not in the zone of the instant it "+
+			"is asked about and not in the host's zone")
 }
 
 func TestCronIn_RejectsAConflictingPrefix(t *testing.T) {

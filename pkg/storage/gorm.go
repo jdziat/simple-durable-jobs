@@ -1328,17 +1328,26 @@ func (s *GormStorage) ClaimScheduledFire(ctx context.Context, name string, fireT
 // a claim that durably advanced last_fire_at followed by a failed enqueue would
 // silently drop a due scheduled run (teardown g8). See Queue.EnqueueScheduledFire.
 func (s *GormStorage) ClaimScheduledFireTx(ctx context.Context, tx *gorm.DB, name string, fireTime time.Time) (bool, error) {
-	// Same clock-face normalization as fillEnqueueDefaults, and load-bearing for
-	// the same reason. `last_fire_at < ?` is a TEXT comparison on SQLite, so the
-	// boundary and the stored cursor must be rendered on ONE face. A schedule with
-	// an explicit location — CronIn/DailyIn/WeeklyIn, or a CRON_TZ= prefix —
-	// produces a boundary in THAT location, so 13:00-04:00 (17:00 UTC) sorts BELOW
-	// a 16:00+00:00 cursor it is genuinely after, the claim matches nothing, and
-	// the schedule silently never fires. A no-op on Postgres and MySQL.
-	fireTime = fireTime.In(time.Local)
+	// `last_fire_at < ?` is a TEXT comparison on SQLite, so the boundary and the
+	// stored cursor must be rendered on ONE clock face. A schedule with an
+	// explicit location — CronIn/DailyIn/WeeklyIn, or a CRON_TZ= prefix — produces
+	// a boundary in THAT location, so 13:00-04:00 (17:00 UTC) sorted BELOW a
+	// 16:00+00:00 cursor it is genuinely after, the claim matched nothing, and the
+	// schedule silently never fired.
+	//
+	// UTC, NOT time.Local — the opposite of the run_at normalization, for a reason
+	// specific to this column. Both sides of this comparison are SCHEDULE-DERIVED;
+	// unlike the dequeue predicates, no local wall-clock bind is involved. And
+	// every cursor already in a database was written on the UTC face, because all
+	// the default constructors pin it (Daily/Weekly/Cron all resolve to UTC), so
+	// UTC is also the face that keeps EXISTING rows comparable. Normalizing to
+	// local instead silently stops every already-running schedule on upgrade:
+	// measured, a stored "2026-07-26 23:00:00+00:00" cursor stops matching a
+	// local-faced bind entirely. A no-op on Postgres and MySQL.
+	fireTime = fireTime.UTC()
 
 	if err := tx.WithContext(ctx).Clauses(clause.OnConflict{DoNothing: true}).
-		Create(&core.ScheduledFire{Name: name, LastFireAt: time.Unix(0, 0).In(time.Local)}).Error; err != nil {
+		Create(&core.ScheduledFire{Name: name, LastFireAt: time.Unix(0, 0).UTC()}).Error; err != nil {
 		return false, err
 	}
 
@@ -1366,8 +1375,8 @@ func (s *GormStorage) ClaimScheduledFireTx(ctx context.Context, tx *gorm.DB, nam
 func (s *GormStorage) SeedScheduledFire(ctx context.Context, name string, anchor time.Time) (time.Time, error) {
 	// The anchor shares the cursor's clock face for the same reason the claim
 	// does: it IS the cursor's initial value, and a boundary is compared against
-	// it as text on SQLite.
-	anchor = anchor.In(time.Local)
+	// it as text on SQLite. UTC for the same reason too — see ClaimScheduledFireTx.
+	anchor = anchor.UTC()
 
 	if err := s.db.WithContext(ctx).Clauses(clause.OnConflict{DoNothing: true}).
 		Create(&core.ScheduledFire{Name: name, LastFireAt: anchor}).Error; err != nil {

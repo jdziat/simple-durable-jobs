@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jdziat/simple-durable-jobs/v4/pkg/core"
 	"github.com/jdziat/simple-durable-jobs/v4/pkg/schedule"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -64,4 +65,33 @@ func TestClaimScheduledFire_DoesNotClaimAnEarlierBoundary(t *testing.T) {
 	won, err := s.ClaimScheduledFire(ctx, "tz-sched-back", earlier)
 	require.NoError(t, err)
 	assert.False(t, won, "a boundary before the cursor must not be claimable in any zone")
+}
+
+// TestClaimScheduledFire_LegacyUTCCursorStillClaims is the UPGRADE path, and it
+// is the reason this column normalizes to UTC rather than to time.Local like
+// run_at does.
+//
+// Every cursor already in a database was written on the UTC face: all the default
+// constructors pin it (Daily/Weekly/Cron all resolve to UTC). Normalizing to local
+// instead makes the stored cursor and the new bind different faces, and since the
+// comparison is lexical TEXT on SQLite the claim then matches nothing — silently
+// stopping every already-running schedule on upgrade. Measured before this was
+// corrected: a stored "2026-07-26 23:00:00+00:00" cursor claimed FALSE against the
+// very next hourly boundary.
+//
+// FALSE-GREEN TRAP: writing the legacy row through SeedScheduledFire would
+// normalize it on the way in and prove nothing. The row has to be inserted
+// directly, the way an older binary left it.
+func TestClaimScheduledFire_LegacyUTCCursorStillClaims(t *testing.T) {
+	s := newTestStorage(t)
+	ctx := context.Background()
+
+	stored := time.Date(2026, 7, 26, 23, 0, 0, 0, time.UTC)
+	require.NoError(t, s.DB().Create(&core.ScheduledFire{Name: "legacy", LastFireAt: stored}).Error)
+
+	won, err := s.ClaimScheduledFire(ctx, "legacy", stored.Add(time.Hour))
+	require.NoError(t, err)
+	assert.True(t, won,
+		"a cursor written by an older binary on the UTC face must still be claimable, or every "+
+			"existing schedule silently stops firing on upgrade")
 }
