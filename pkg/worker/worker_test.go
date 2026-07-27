@@ -1396,14 +1396,14 @@ func TestWorker_TrackQueueJob_IncrementsCounter(t *testing.T) {
 	q := queue.New(mock)
 	w := NewWorker(q, WorkerQueue("emails", Concurrency(5)))
 
-	w.trackQueueJob("job-1", "emails")
+	w.trackQueueJob(1, "emails")
 
 	counter, ok := w.queueRunning["emails"]
 	require.True(t, ok)
 	assert.Equal(t, int32(1), counter.Load())
 
 	w.queueJobIDMu.Lock()
-	qname, recorded := w.queueJobID["job-1"]
+	qname, recorded := w.queueJobID[1]
 	w.queueJobIDMu.Unlock()
 
 	assert.True(t, recorded)
@@ -1415,15 +1415,15 @@ func TestWorker_UntrackQueueJob_DecrementsCounter(t *testing.T) {
 	q := queue.New(mock)
 	w := NewWorker(q, WorkerQueue("emails", Concurrency(5)))
 
-	w.trackQueueJob("job-1", "emails")
-	w.untrackQueueJob("job-1")
+	w.trackQueueJob(1, "emails")
+	w.untrackQueueJob(1)
 
 	counter, ok := w.queueRunning["emails"]
 	require.True(t, ok)
 	assert.Equal(t, int32(0), counter.Load())
 
 	w.queueJobIDMu.Lock()
-	_, still := w.queueJobID["job-1"]
+	_, still := w.queueJobID[1]
 	w.queueJobIDMu.Unlock()
 
 	assert.False(t, still, "job should be removed from queueJobID map")
@@ -1435,7 +1435,7 @@ func TestWorker_UntrackQueueJob_UnknownJobIsNoop(t *testing.T) {
 	w := NewWorker(q, WorkerQueue("emails", Concurrency(5)))
 
 	// Should not panic or decrement below zero.
-	w.untrackQueueJob("nonexistent-job")
+	w.untrackQueueJob(99999)
 
 	counter := w.queueRunning["emails"]
 	assert.Equal(t, int32(0), counter.Load())
@@ -1448,14 +1448,14 @@ func TestWorker_TrackUntrackMultipleJobs(t *testing.T) {
 
 	const n = 5
 	for i := range n {
-		w.trackQueueJob(core.UUID(string(rune('a'+i))), "default")
+		w.trackQueueJob(uint64(i)+1, "default")
 	}
 
 	counter := w.queueRunning["default"]
 	assert.Equal(t, int32(n), counter.Load())
 
 	for i := range n {
-		w.untrackQueueJob(core.UUID(string(rune('a' + i))))
+		w.untrackQueueJob(uint64(i) + 1)
 	}
 	assert.Equal(t, int32(0), counter.Load())
 }
@@ -1487,8 +1487,8 @@ func TestWorker_QueuesWithCapacity_FullQueueExcluded(t *testing.T) {
 	)
 
 	// Fill the "full" queue to its limit.
-	w.trackQueueJob("j1", "full")
-	w.trackQueueJob("j2", "full")
+	w.trackQueueJob(1, "full")
+	w.trackQueueJob(1, "full")
 
 	available := w.queuesWithCapacity()
 
@@ -1500,7 +1500,7 @@ func TestWorker_QueuesWithCapacity_AllFullReturnsEmpty(t *testing.T) {
 	q := queue.New(mock)
 	w := NewWorker(q, WorkerQueue("only", Concurrency(1)))
 
-	w.trackQueueJob("j1", "only")
+	w.trackQueueJob(1, "only")
 
 	available := w.queuesWithCapacity()
 
@@ -1512,7 +1512,7 @@ func TestWorker_QueuesWithCapacity_PartiallyFilled(t *testing.T) {
 	q := queue.New(mock)
 	w := NewWorker(q, WorkerQueue("q1", Concurrency(3)))
 
-	w.trackQueueJob("j1", "q1")
+	w.trackQueueJob(1, "q1")
 	// 1 of 3 slots used — queue still has capacity.
 
 	available := w.queuesWithCapacity()
@@ -2226,7 +2226,7 @@ func TestWorker_ShutdownReleasesDequeuedJobInsteadOfDropping(t *testing.T) {
 	assert.Equal(t, []core.UUID{job.ID}, mock.getReleasedJobIDs())
 	assert.Equal(t, int32(0), w.queueRunning["default"].Load())
 	w.queueJobIDMu.Lock()
-	_, tracked := w.queueJobID[job.ID]
+	_, tracked := w.queueJobID[1]
 	w.queueJobIDMu.Unlock()
 	assert.False(t, tracked, "shutdown release must untrack the per-queue job slot")
 }
@@ -3147,7 +3147,7 @@ func TestWorker_RunHeartbeat_ExitsOnContextCancel(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		w.runHeartbeat(ctx, job)
+		w.runHeartbeat(ctx, job, 0)
 	}()
 
 	cancel()
@@ -3177,7 +3177,7 @@ func TestWorker_RunHeartbeat_StopsOnAggressivePause(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		w.runHeartbeat(ctx, job)
+		w.runHeartbeat(ctx, job, 0)
 	}()
 
 	w.Pause(core.PauseModeAggressive)
@@ -4322,7 +4322,7 @@ func TestRunHeartbeat_AbandonsOrphanedJob(t *testing.T) {
 	defer hbCancel()
 	done := make(chan struct{})
 	go func() {
-		w.runHeartbeat(hbCtx, &core.Job{ID: "test-job-id"})
+		w.runHeartbeat(hbCtx, &core.Job{ID: "test-job-id"}, 0)
 		close(done)
 	}()
 
@@ -4375,7 +4375,7 @@ func TestRunHeartbeat_TransientErrorDoesNotAbandon(t *testing.T) {
 
 	hbCtx, hbCancel := context.WithCancel(context.Background())
 	defer hbCancel()
-	go w.runHeartbeat(hbCtx, &core.Job{ID: "transient-job"})
+	go w.runHeartbeat(hbCtx, &core.Job{ID: "transient-job"}, 0)
 
 	// Let the heartbeat tick several times.
 	time.Sleep(150 * time.Millisecond)
@@ -4429,7 +4429,7 @@ func TestRunHeartbeat_SuccessResetsCounter(t *testing.T) {
 	defer hbCancel()
 	done := make(chan struct{})
 	go func() {
-		w.runHeartbeat(hbCtx, &core.Job{ID: "blip-job"})
+		w.runHeartbeat(hbCtx, &core.Job{ID: "blip-job"}, 0)
 		close(done)
 	}()
 

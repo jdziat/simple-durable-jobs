@@ -77,13 +77,22 @@ type Worker struct {
 
 	// Per-queue concurrency tracking
 	queueRunning map[string]*atomic.Int32 // queue name -> active count
-	queueJobID   map[core.UUID]string     // job ID -> queue name (for decrement on completion)
+	// queueJobID and slotJobID are keyed by RUN TOKEN, not job id, for the same
+	// reason pauseCancelled is: the pause path releases to `pending` while this
+	// worker still polls, so two runs of ONE job id can be alive at once. Keyed by
+	// job id they are a single shared slot — run #2 overwrites run #1's entry, and
+	// whichever cleans up first deletes it, so the other's decrement or release
+	// never happens. Measured: a permanent +1 leak on the per-queue counter (which
+	// eventually bounces 100% of that queue's work while the worker looks healthy)
+	// and a fleet concurrency slot released out from under a still-running handler,
+	// which under-counts the cap and admits an extra concurrent job.
+	queueJobID   map[uint64]string // run token -> queue name (for decrement on completion)
 	queueJobIDMu sync.Mutex
 
 	// DB-backed concurrency slots acquired for dequeued jobs. Only populated
 	// when the storage backend implements concurrencySlotStorage.
 	slotJobIDMu sync.Mutex
-	slotJobID   map[core.UUID][]string
+	slotJobID   map[uint64][]string // run token -> slots held by that run
 
 	// Per-worker queue rate-limit buckets. Only populated for queues configured
 	// with WithQueueRateLimit.
@@ -490,8 +499,8 @@ func NewWorker(q *queue.Queue, opts ...WorkerOption) *Worker {
 		runningJobs:             make(map[core.UUID]runningJobEntry),
 		pauseCancelled:          make(map[uint64]struct{}),
 		queueRunning:            queueRunning,
-		queueJobID:              make(map[core.UUID]string),
-		slotJobID:               make(map[core.UUID][]string),
+		queueJobID:              make(map[uint64]string),
+		slotJobID:               make(map[uint64][]string),
 		queueRateBuckets:        queueRateBuckets,
 		rateSaturatedUntil:      make(map[string]time.Time),
 		allRateLimitsUnkeyed:    allRateLimitsUnkeyed,
@@ -530,7 +539,7 @@ func (w *Worker) Start(ctx context.Context) error {
 		totalConcurrency += c
 	}
 
-	jobsChan := make(chan *core.Job, totalConcurrency)
+	jobsChan := make(chan dispatchedJob, totalConcurrency)
 	handlerBase, cancelHandlers := context.WithCancel(context.WithoutCancel(ctx))
 	defer cancelHandlers()
 
@@ -684,7 +693,7 @@ func (w *Worker) warnDegradedStorageDurability(storage core.Storage) {
 	}
 }
 
-func (w *Worker) drainDequeuedJobs(ctx context.Context, jobsChan chan<- *core.Job, totalConcurrency int) {
+func (w *Worker) drainDequeuedJobs(ctx context.Context, jobsChan chan<- dispatchedJob, totalConcurrency int) {
 	deadline := time.Now().Add(w.config.PollInterval)
 	initialQueues := w.queuesWithCapacity()
 	releaseBudget := w.dequeueSlots(initialQueues, totalConcurrency)
@@ -890,52 +899,57 @@ func (w *Worker) dequeueQueueBudgets(queues []string, limit int) map[string]int 
 	return budgets
 }
 
-func (w *Worker) dispatchDequeuedJobs(ctx context.Context, jobsChan chan<- *core.Job, jobs []*core.Job) (dispatched int, released int) {
+func (w *Worker) dispatchDequeuedJobs(ctx context.Context, jobsChan chan<- dispatchedJob, jobs []*core.Job) (dispatched int, released int) {
 	for _, job := range jobs {
 		if job == nil {
 			continue
 		}
-		if !w.tryTrackQueueJob(job.ID, job.Queue) {
+		// The run token is allocated HERE, not in processJob, because admission
+		// state (the per-queue counter and the concurrency slots) is registered on
+		// this side of the channel and has to be keyed by the same run that will
+		// later release it.
+		runToken := w.nextRunToken.Add(1)
+		if !w.tryTrackQueueJob(runToken, job.Queue) {
 			w.recordBounce(bounceQueueCap)
-			w.releaseDequeuedJobOnShutdown(ctx, job)
+			w.releaseDequeuedJobOnShutdown(ctx, job, runToken)
 			released++
 			continue
 		}
 		if !w.tryConsumeQueueRateLimit(job.Queue) {
 			w.recordBounce(bounceQueueRate)
-			w.releaseDequeuedJobOnShutdown(ctx, job)
+			w.releaseDequeuedJobOnShutdown(ctx, job, runToken)
 			released++
 			continue
 		}
-		if ok := w.tryAcquireConcurrencySlots(ctx, job); !ok {
+		if ok := w.tryAcquireConcurrencySlots(ctx, job, runToken); !ok {
 			w.recordBounce(bounceConcurrency)
 			w.refundQueueRateLimit(job.Queue)
-			w.releaseDequeuedJobOnShutdown(ctx, job)
+			w.releaseDequeuedJobOnShutdown(ctx, job, runToken)
 			released++
 			continue
 		}
 		if ctx.Err() != nil {
 			w.recordBounce(bounceShutdown)
 			w.refundQueueRateLimit(job.Queue)
-			w.releaseDequeuedJobOnShutdown(ctx, job)
+			w.releaseDequeuedJobOnShutdown(ctx, job, runToken)
 			released++
 			continue
 		}
 		if ok, reason := w.tryConsumeRateLimits(ctx, job); !ok {
 			w.recordBounce(reason) // fleet_rate (paid the DB tx) or fleet_rate_cached (cooldown skip)
 			w.refundQueueRateLimit(job.Queue)
-			w.releaseDequeuedJobOnShutdown(ctx, job)
+			w.releaseDequeuedJobOnShutdown(ctx, job, runToken)
 			released++
 			continue
 		}
 
 		select {
-		case jobsChan <- job:
+		case jobsChan <- dispatchedJob{job: job, token: runToken}:
 			dispatched++
 		case <-ctx.Done():
 			w.recordBounce(bounceShutdown)
 			w.refundQueueRateLimit(job.Queue)
-			w.releaseDequeuedJobOnShutdown(ctx, job)
+			w.releaseDequeuedJobOnShutdown(ctx, job, runToken)
 			released++
 		}
 	}
@@ -963,7 +977,7 @@ func (w *Worker) releaseClaimedJobs(ctx context.Context, jobs []*core.Job) {
 	}
 }
 
-func (w *Worker) releaseDequeuedJobOnShutdown(ctx context.Context, job *core.Job) {
+func (w *Worker) releaseDequeuedJobOnShutdown(ctx context.Context, job *core.Job, runToken uint64) {
 	releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
 
@@ -972,8 +986,8 @@ func (w *Worker) releaseDequeuedJobOnShutdown(ctx context.Context, job *core.Job
 			"job_id", job.ID,
 			"error", err)
 	}
-	w.releaseConcurrencySlots(releaseCtx, job.ID)
-	w.untrackQueueJob(job.ID)
+	w.releaseConcurrencySlots(releaseCtx, job.ID, runToken)
+	w.untrackQueueJob(runToken)
 }
 
 // waitHandlers waits up to timeout for all in-flight job handlers to finish,
@@ -1282,13 +1296,14 @@ func (w *Worker) refundQueueRateLimit(queueName string) {
 	bucket.refund(time.Now())
 }
 
-// trackQueueJob increments the running counter for a queue and records the job→queue mapping.
-func (w *Worker) trackQueueJob(jobID core.UUID, queueName string) {
+// trackQueueJob increments the running counter for a queue and records the
+// run→queue mapping.
+func (w *Worker) trackQueueJob(runToken uint64, queueName string) {
 	if counter, ok := w.queueRunning[queueName]; ok {
 		counter.Add(1)
 	}
 	w.queueJobIDMu.Lock()
-	w.queueJobID[jobID] = queueName
+	w.queueJobID[runToken] = queueName
 	w.queueJobIDMu.Unlock()
 }
 
@@ -1296,15 +1311,15 @@ func (w *Worker) trackQueueJob(jobID core.UUID, queueName string) {
 // CAS is not advisory: once a queue is at its configured cap, dispatch must
 // release the dequeued job instead of letting it borrow capacity from another
 // queue.
-func (w *Worker) tryTrackQueueJob(jobID core.UUID, queueName string) bool {
+func (w *Worker) tryTrackQueueJob(runToken uint64, queueName string) bool {
 	counter, ok := w.queueRunning[queueName]
 	if !ok {
-		w.trackQueueJob(jobID, queueName)
+		w.trackQueueJob(runToken, queueName)
 		return true
 	}
 	maxConcurrency, ok := w.config.Queues[queueName]
 	if !ok {
-		w.trackQueueJob(jobID, queueName)
+		w.trackQueueJob(runToken, queueName)
 		return true
 	}
 	for {
@@ -1314,19 +1329,20 @@ func (w *Worker) tryTrackQueueJob(jobID core.UUID, queueName string) bool {
 		}
 		if counter.CompareAndSwap(current, current+1) {
 			w.queueJobIDMu.Lock()
-			w.queueJobID[jobID] = queueName
+			w.queueJobID[runToken] = queueName
 			w.queueJobIDMu.Unlock()
 			return true
 		}
 	}
 }
 
-// untrackQueueJob decrements the running counter for a job's queue.
-func (w *Worker) untrackQueueJob(jobID core.UUID) {
+// untrackQueueJob decrements the running counter for THIS RUN's queue. Keyed by
+// run token so a second run of the same job id cannot consume this one's entry.
+func (w *Worker) untrackQueueJob(runToken uint64) {
 	w.queueJobIDMu.Lock()
-	queueName, ok := w.queueJobID[jobID]
+	queueName, ok := w.queueJobID[runToken]
 	if ok {
-		delete(w.queueJobID, jobID)
+		delete(w.queueJobID, runToken)
 	}
 	w.queueJobIDMu.Unlock()
 
@@ -1661,7 +1677,7 @@ func (w *Worker) DequeueRateSaturationCacheSize() int64 {
 	return int64(len(w.rateSaturatedUntil))
 }
 
-func (w *Worker) tryAcquireConcurrencySlots(ctx context.Context, job *core.Job) bool {
+func (w *Worker) tryAcquireConcurrencySlots(ctx context.Context, job *core.Job, runToken uint64) bool {
 	if len(w.config.ConcurrencyCaps) == 0 {
 		return true
 	}
@@ -1693,15 +1709,19 @@ func (w *Worker) tryAcquireConcurrencySlots(ctx context.Context, job *core.Job) 
 		acquiredSlots = append(acquiredSlots, slotName)
 	}
 	w.slotJobIDMu.Lock()
-	w.slotJobID[job.ID] = acquiredSlots
+	w.slotJobID[runToken] = acquiredSlots
 	w.slotJobIDMu.Unlock()
 	return true
 }
 
-func (w *Worker) releaseConcurrencySlots(ctx context.Context, jobID core.UUID) {
+// releaseConcurrencySlots releases the slots THIS RUN acquired. Keyed by run
+// token: releasing by job id alone let an earlier run delete the slot row a later
+// run of the same job is still relying on, and the ownership fence cannot catch
+// that because both runs share the job id AND the worker id.
+func (w *Worker) releaseConcurrencySlots(ctx context.Context, jobID core.UUID, runToken uint64) {
 	w.slotJobIDMu.Lock()
-	slots := w.slotJobID[jobID]
-	delete(w.slotJobID, jobID)
+	slots := w.slotJobID[runToken]
+	delete(w.slotJobID, runToken)
 	w.slotJobIDMu.Unlock()
 	w.releaseSlotNames(ctx, jobID, slots)
 }
@@ -1735,9 +1755,9 @@ func (w *Worker) releaseSlotNames(ctx context.Context, jobID core.UUID, slots []
 	}
 }
 
-func (w *Worker) renewConcurrencySlots(ctx context.Context, jobID core.UUID) {
+func (w *Worker) renewConcurrencySlots(ctx context.Context, jobID core.UUID, runToken uint64) {
 	w.slotJobIDMu.Lock()
-	slots := append([]string(nil), w.slotJobID[jobID]...)
+	slots := append([]string(nil), w.slotJobID[runToken]...)
 	w.slotJobIDMu.Unlock()
 	if len(slots) == 0 {
 		return
@@ -1799,15 +1819,30 @@ func (w *Worker) dequeueBatchPerQueueWithRetry(ctx context.Context, storage perQ
 	return jobs, err
 }
 
-func (w *Worker) processLoop(ctx context.Context, jobs <-chan *core.Job) {
+// dispatchedJob carries a dequeued job together with the run token allocated for
+// it at admission, so the run that registered the per-queue counter and the
+// concurrency slots is the run that releases them.
+type dispatchedJob struct {
+	job   *core.Job
+	token uint64
+}
+
+func (w *Worker) processLoop(ctx context.Context, jobs <-chan dispatchedJob) {
 	defer w.handlerWG.Done()
 
-	for job := range jobs {
-		w.processJob(ctx, job)
+	for dj := range jobs {
+		w.processJobRun(ctx, dj.job, dj.token)
 	}
 }
 
+// processJob runs a job under a freshly allocated run token. Callers that already
+// hold one (the dispatch path, which registered admission state against it) use
+// processJobRun instead.
 func (w *Worker) processJob(ctx context.Context, job *core.Job) {
+	w.processJobRun(ctx, job, w.nextRunToken.Add(1))
+}
+
+func (w *Worker) processJobRun(ctx context.Context, job *core.Job, runToken uint64) {
 	// Defense-in-depth: no panic may escape processJob and crash the processLoop
 	// goroutine (an unrecovered goroutine panic terminates the whole process).
 	// User callbacks are individually recovered (queue.safeUserCallback,
@@ -1837,8 +1872,8 @@ func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 	}()
 
 	// Ensure per-queue concurrency counter is decremented when job finishes
-	defer w.untrackQueueJob(job.ID)
-	defer w.releaseConcurrencySlots(context.WithoutCancel(ctx), job.ID)
+	defer w.untrackQueueJob(runToken)
+	defer w.releaseConcurrencySlots(context.WithoutCancel(ctx), job.ID, runToken)
 
 	startTime := time.Now()
 
@@ -1893,7 +1928,6 @@ func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 
 	// Track this running job for aggressive pause (worker-local + queue-level registry)
 	w.runningJobsMu.Lock()
-	runToken := w.nextRunToken.Add(1)
 	w.runningJobs[job.ID] = runningJobEntry{cancel: cancelJob, token: runToken}
 	w.runningJobsMu.Unlock()
 	w.queue.RegisterRunningJob(job.ID, cancelJob)
@@ -1964,7 +1998,7 @@ func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 	defer cancelHeartbeat()
 
 	// Start heartbeat goroutine to extend lock during long-running jobs
-	go w.runHeartbeat(heartbeatCtx, job)
+	go w.runHeartbeat(heartbeatCtx, job, runToken)
 
 	resultBytes, err := w.queue.RunExecutionMiddleware(jobCtx, job, func(ctx context.Context, j *core.Job) ([]byte, error) {
 		return w.executeHandler(ctx, j, h)
@@ -2008,7 +2042,7 @@ func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 		// silently mark a shutdown-interrupted job COMPLETED (dropping its
 		// unfinished phases). Only this worker's own shutdown-cancel qualifies.
 		if w.shuttingDown.Load() && errors.Is(err, context.Canceled) {
-			w.releaseDequeuedJobOnShutdown(ctx, job)
+			w.releaseDequeuedJobOnShutdown(ctx, job, runToken)
 			cancelHeartbeat()
 			return
 		}
@@ -2261,7 +2295,7 @@ const orphanHeartbeatThreshold = 3
 // Non-ownership errors (DB unreachable, retry exhaustion on a transient
 // error) are logged but don't trip the counter — those are operational
 // issues to fix elsewhere, not orphaning.
-func (w *Worker) runHeartbeat(ctx context.Context, job *core.Job) {
+func (w *Worker) runHeartbeat(ctx context.Context, job *core.Job, runToken uint64) {
 	// Heartbeat every 2 minutes (lock is 45 minutes, so plenty of buffer).
 	// Tests override w.heartbeatInterval directly to drive the loop at
 	// sub-second speed.
@@ -2294,7 +2328,7 @@ func (w *Worker) runHeartbeat(ctx context.Context, job *core.Job) {
 			switch {
 			case err == nil:
 				consecutiveOrphanErrs = 0
-				w.renewConcurrencySlots(ctx, job.ID)
+				w.renewConcurrencySlots(ctx, job.ID, runToken)
 				w.logger.Debug("heartbeat sent", "job_id", job.ID)
 			case errors.Is(err, core.ErrJobNotOwned):
 				consecutiveOrphanErrs++

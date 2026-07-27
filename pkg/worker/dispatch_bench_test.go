@@ -47,14 +47,14 @@ func (s *deterministicDequeueStorage) Dequeue(_ context.Context, _ []string, _ s
 	return job, nil
 }
 
-func newDeterministicDispatchWorker(n int) (*Worker, chan *core.Job) {
+func newDeterministicDispatchWorker(n int) (*Worker, chan dispatchedJob) {
 	store := newDeterministicDequeueStorage(n)
 	w := NewWorker(queue.New(store),
 		WorkerQueue("default", Concurrency(n)),
 		WithDequeueBatchSize(1),
 		DisableRetry(),
 	)
-	return w, make(chan *core.Job, n)
+	return w, make(chan dispatchedJob, n)
 }
 
 func runDrainOnTicks(t testing.TB, n int) (ticks int, dispatched int) {

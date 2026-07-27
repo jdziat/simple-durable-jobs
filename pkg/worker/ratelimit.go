@@ -119,6 +119,26 @@ func deriveRateLimitWindow(perSecond float64) time.Duration {
 	seconds := units / perSecond
 	window := time.Duration(seconds * float64(time.Second))
 	window = window.Truncate(time.Millisecond)
+
+	// Re-check the ENFORCED unit count against the window we are actually going to
+	// use, and shrink until it matches. The arithmetic above is exact in the reals
+	// — units/PerSecond*PerSecond is units — but not in float64, and the storage
+	// gate does not evaluate the ideal, it evaluates ceil(PerSecond*window) on the
+	// truncated value. PerSecond=6.25 derives a 1.12s window, and 6.25*1.12 is
+	// 7.000000000000001 in float64, so the gate admits EIGHT units where seven were
+	// intended and enforces 7.14/sec — 14.3% fast, well past the 0.5% this
+	// derivation promises and UPGRADE.md advertises.
+	//
+	// One millisecond off is enough to drop back below the integer, and shrinking
+	// can only make the enforced rate slower, never faster. Bounded so a
+	// pathological input cannot spin.
+	for i := 0; i < 8 && window > time.Millisecond; i++ {
+		if math.Ceil(perSecond*window.Seconds()) <= units {
+			break
+		}
+		window -= time.Millisecond
+	}
+
 	if window < defaultRateLimitWindow {
 		window = defaultRateLimitWindow
 	}

@@ -48,6 +48,38 @@ func TestDeriveRateLimitWindow_EnforcedRateIsExact(t *testing.T) {
 	}
 }
 
+// TestDeriveRateLimitWindow_EnforcedRateIsExactAcrossTheRange SWEEPS instead of
+// sampling.
+//
+// FALSE-GREEN BY CONSTRUCTION, which is what the table-driven test above is: its
+// eleven values are the same ones already tabulated in UPGRADE.md, so it can only
+// ever confirm rates whose behaviour was measured when the list was written. A
+// sweep of 500,000 rates found exactly one offender it could never have caught —
+// PerSecond=6.25 derived a 1.12s window, and 6.25*1.12 is 7.000000000000001 in
+// float64, so the storage gate admitted EIGHT units where seven were intended and
+// enforced 7.14/sec: 14.3% fast, against a documented bound of 0.5%.
+//
+// The bound is a PROPERTY of the derivation, so it is tested as one.
+func TestDeriveRateLimitWindow_EnforcedRateIsExactAcrossTheRange(t *testing.T) {
+	const step = 0.0001
+	worstRel, worstRate := 0.0, 0.0
+	for i := 1; ; i++ {
+		perSecond := float64(i) * step
+		if perSecond > 50 {
+			break
+		}
+		rel := math.Abs(enforcedRate(perSecond)-perSecond) / perSecond
+		if rel > worstRel {
+			worstRel, worstRate = rel, perSecond
+		}
+	}
+	assert.LessOrEqual(t, worstRel, 0.005,
+		"the worst rate in 0.0001..50 is PerSecond=%v, enforced %v (%.4f%% off) — the derivation "+
+			"promises 0.5%% and UPGRADE.md advertises it, so it has to hold across the range and "+
+			"not just at the values someone happened to tabulate",
+		worstRate, enforcedRate(worstRate), worstRel*100)
+}
+
 // TestDeriveRateLimitWindow_ExactRatesDoNotMove pins the compatibility promise:
 // the configurations that were ALREADY exact must derive the same window as
 // before, so no existing deployment sees its window change.

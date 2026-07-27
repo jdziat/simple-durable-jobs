@@ -655,3 +655,64 @@ func TestProcessJob_LaterRunKeepsTheQueueRegistration(t *testing.T) {
 		"an earlier run's cleanup must leave the later run registered with the QUEUE, or "+
 			"CancelJob marks the row and never reaches the handler still executing it")
 }
+
+// TestProcessJob_LaterRunKeepsItsAdmissionState covers the two REMAINING job-id
+// keyed maps that the pause path made unsafe: the per-queue running counter and
+// the fleet concurrency slots.
+//
+// Keying pauseCancelled and runningJobs by run token fixed two of four. These two
+// register in dispatchDequeuedJobs, on the far side of the channel, and were still
+// keyed by job id alone — so with two runs of one job id alive:
+//
+//   - untrackQueueJob: run #1 deletes the shared entry and decrements 2->1; run
+//     #2 finds nothing and never decrements. A PERMANENT +1 on the queue counter,
+//     cumulative across pause/resume cycles, until tryTrackQueueJob refuses every
+//     job and the worker bounces 100% of that queue's work while looking healthy.
+//   - releaseConcurrencySlots: run #1 reads run #2's slot list and releases the
+//     fleet cap row while run #2's handler is still executing. The ownership fence
+//     cannot catch it, because both runs share the job id AND the worker id — so
+//     the cap under-counts and admits an extra concurrent job.
+//
+// FALSE-GREEN TRAP: admitting the two runs by calling processJob directly registers
+// NOTHING, because admission happens in dispatch. The runs have to be admitted the
+// way dispatch admits them, with their own run tokens.
+func TestProcessJob_LaterRunKeepsItsAdmissionState(t *testing.T) {
+	q := queue.New(&mockStorage{})
+	w := NewWorker(q, WorkerQueue("default", Concurrency(4)))
+
+	// Two runs of ONE job id, admitted exactly as dispatchDequeuedJobs does.
+	jobID := core.NewID()
+	tok1 := w.nextRunToken.Add(1)
+	require.True(t, w.tryTrackQueueJob(tok1, "default"))
+	tok2 := w.nextRunToken.Add(1)
+	require.True(t, w.tryTrackQueueJob(tok2, "default"))
+
+	w.slotJobIDMu.Lock()
+	w.slotJobID[tok1] = []string{"cap:run1"}
+	w.slotJobID[tok2] = []string{"cap:run2"}
+	w.slotJobIDMu.Unlock()
+
+	counter := w.queueRunning["default"]
+	require.Equal(t, int32(2), counter.Load())
+
+	// Run #1 finishes and cleans up. It must touch only its own state.
+	w.untrackQueueJob(tok1)
+	w.releaseConcurrencySlots(context.Background(), jobID, tok1)
+
+	assert.Equal(t, int32(1), counter.Load(),
+		"run #1's cleanup must decrement exactly once, leaving run #2 counted")
+
+	w.slotJobIDMu.Lock()
+	stillHeld := append([]string(nil), w.slotJobID[tok2]...)
+	w.slotJobIDMu.Unlock()
+	assert.Equal(t, []string{"cap:run2"}, stillHeld,
+		"run #2's concurrency slots must survive run #1's cleanup, or the fleet cap is "+
+			"released under a handler that is still executing and admits an extra job")
+
+	// Run #2 then finishes and the counter returns to zero — no permanent leak.
+	w.untrackQueueJob(tok2)
+	w.releaseConcurrencySlots(context.Background(), jobID, tok2)
+	assert.Equal(t, int32(0), counter.Load(),
+		"both runs must decrement, or the per-queue counter leaks +1 per pause/resume cycle "+
+			"until the worker refuses every job on that queue")
+}
