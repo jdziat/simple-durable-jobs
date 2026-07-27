@@ -171,8 +171,13 @@ jobs:
         run: |
           set -uo pipefail
           pat="^($(printf '<%.0s' $(seq 7))|$(printf '=%.0s' $(seq 7))|$(printf '>%.0s' $(seq 7)))( |$)"
+          # errexit OFF around the scan: GitHub runs steps as `bash -e`, and
+          # git grep exits 1 for "no match", which would kill the step before
+          # $? could be read — reporting a clean tree as a failure.
+          set +e
           git grep -nE "$pat" -- . ':!ui/frontend/dist'
           status=$?
+          set -e
           case "$status" in
             0) echo "::error::unresolved merge-conflict markers are committed (listed above)"; exit 1 ;;
             1) echo "no conflict markers" ;;
