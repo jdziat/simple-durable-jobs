@@ -199,8 +199,10 @@ jobs:
           found=""
           while IFS= read -r f; do
             [ -f "$f" ] || continue
+            # ELF | Mach-O (be/le, 32/64, universal) | PE/COFF | ar archive | wasm
             case "$(head -c 4 "$f" | od -An -tx1 | tr -d ' \n')" in
-              7f454c46|cafebabe|feedface|feedfacf|cffaedfe|4d5a*) found="$found $f" ;;
+              7f454c46|feedface|feedfacf|cefaedfe|cffaedfe|cafebabe|4d5a*|213c6172|0061736d)
+                found="$found $f" ;;
             esac
           done < <(git ls-files)
           if [ -n "$found" ]; then

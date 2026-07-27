@@ -24,10 +24,11 @@ import (
 // offset. A fix that forces either face stalls the other lineage.
 func families() map[string]schedule.Schedule {
 	f := map[string]schedule.Schedule{
-		"every":     schedule.Every(time.Hour),
-		"daily":     schedule.Daily(9, 0),
-		"weekly":    schedule.Weekly(time.Monday, 9, 0),
-		"crossface": schedule.Every(time.Hour),
+		"every":       schedule.Every(time.Hour),
+		"daily":       schedule.Daily(9, 0),
+		"weekly":      schedule.Weekly(time.Monday, 9, 0),
+		"crossface":   schedule.Every(time.Hour),
+		"seeded-only": schedule.Daily(9, 0),
 	}
 	if c, err := schedule.Cron("0 * * * *"); err == nil {
 		f["cron"] = c
@@ -35,7 +36,9 @@ func families() map[string]schedule.Schedule {
 	return f
 }
 
-func order() []string { return []string{"cron", "crossface", "daily", "every", "weekly"} }
+func order() []string {
+	return []string{"cron", "crossface", "daily", "every", "seeded-only", "weekly"}
+}
 
 // crossZone is a fixed offset deliberately unlike any host zone the matrix runs
 // under, and deliberately NOT a whole hour.
@@ -81,6 +84,17 @@ func main() {
 			}
 			// Seed and first fire always go in on the HOST's face, as a released
 			// binary would write them.
+			//
+			// EXCEPT "seeded-only", which is left at the raw seed. That is the state
+			// a schedule is in between first registration and its first fire, and it
+			// is the one the claim overwrites everywhere else: the seed is written on
+			// the HOST's face from time.Now(), while a UTC-pinned family's first
+			// boundary arrives on UTC. Every other family here destroys that state
+			// immediately by claiming, which is exactly how this harness came to be
+			// blind to a whole predicate regression.
+			if name == "seeded-only" {
+				continue
+			}
 			if _, err := st.ClaimScheduledFire(ctx, name, s.Next(anchor)); err != nil {
 				panic(err)
 			}
