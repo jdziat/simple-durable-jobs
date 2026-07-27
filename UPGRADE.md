@@ -295,10 +295,24 @@ re-pointed at the same instant on this process's local clock face before it is
 written. The instant never changes; only the rendering does. A no-op on
 Postgres and MySQL.
 
-**What you may notice:** nothing, unless you were passing a non-local `run_at` on
-SQLite, in which case delayed jobs now fire when you asked rather than hours off.
-No migration: existing rows were written by the driver on the local face already,
-and rewriting them is what made the original design of this fix dangerous.
+Schedule boundaries get the same treatment. `last_fire_at` is compared the same
+way, and `CronIn` / `DailyIn` / `WeeklyIn` (and a `CRON_TZ=` prefix) produce
+boundaries in *their* location — so on SQLite a `DailyIn(America/New_York, 13, 0)`
+boundary rendered `13:00:00-04:00` sorted **below** a `16:00:00+00:00` cursor it
+was genuinely an hour after, the claim matched nothing, and the schedule silently
+never fired.
+
+**What you may notice:** on SQLite, delayed jobs and non-UTC schedules enqueued
+**after** the upgrade now fire when you asked.
+
+**Rows already in the database are NOT rewritten**, deliberately — an in-place
+rewrite is what made the original design of this fix dangerous. A `run_at` already
+stored on a foreign clock face keeps it, so a delayed job enqueued **before** the
+upgrade can still become eligible late: a value supplied as UTC is stored
+`2026-07-26 23:00:00+00:00`, which sorts above every same-date local-faced bind,
+so it waits until the local date rolls past its UTC date. If you have a backlog of
+delayed jobs that were enqueued with a non-local `run_at`, re-enqueue them.
+Postgres and MySQL are unaffected throughout.
 
 ### The dashboard counts queue depth instead of paging job rows
 
@@ -321,6 +335,12 @@ unfiltered is a parallel sequential scan on Postgres (4,935 buffers, 32 ms) and
 on MySQL a full scan of `idx_jobs_dequeue_eligible`, the index the claim path
 depends on; filtered is an index scan (609 buffers, 0.5 ms). Every 60 seconds, in
 every process that mounts the dashboard, whether or not anyone is looking at it.
+
+The filter makes the cost proportional to queue **depth** instead of to **table
+size**. It is not a promise of an index scan in every shape: with a genuinely
+large live backlog the planner may still choose a sequential scan — but then it is
+proportional to the backlog you actually have, rather than to your entire job
+history.
 
 **What you may notice:** the depth chart's numbers change — upward — on any queue
 that was over the cap; they were an undercount. Which queues appear is

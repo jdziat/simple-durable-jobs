@@ -1328,8 +1328,17 @@ func (s *GormStorage) ClaimScheduledFire(ctx context.Context, name string, fireT
 // a claim that durably advanced last_fire_at followed by a failed enqueue would
 // silently drop a due scheduled run (teardown g8). See Queue.EnqueueScheduledFire.
 func (s *GormStorage) ClaimScheduledFireTx(ctx context.Context, tx *gorm.DB, name string, fireTime time.Time) (bool, error) {
+	// Same clock-face normalization as fillEnqueueDefaults, and load-bearing for
+	// the same reason. `last_fire_at < ?` is a TEXT comparison on SQLite, so the
+	// boundary and the stored cursor must be rendered on ONE face. A schedule with
+	// an explicit location — CronIn/DailyIn/WeeklyIn, or a CRON_TZ= prefix —
+	// produces a boundary in THAT location, so 13:00-04:00 (17:00 UTC) sorts BELOW
+	// a 16:00+00:00 cursor it is genuinely after, the claim matches nothing, and
+	// the schedule silently never fires. A no-op on Postgres and MySQL.
+	fireTime = fireTime.In(time.Local)
+
 	if err := tx.WithContext(ctx).Clauses(clause.OnConflict{DoNothing: true}).
-		Create(&core.ScheduledFire{Name: name, LastFireAt: time.Unix(0, 0).UTC()}).Error; err != nil {
+		Create(&core.ScheduledFire{Name: name, LastFireAt: time.Unix(0, 0).In(time.Local)}).Error; err != nil {
 		return false, err
 	}
 
@@ -1355,6 +1364,11 @@ func (s *GormStorage) ClaimScheduledFireTx(ctx context.Context, tx *gorm.DB, nam
 // starting cursor so all workers compute identical fire times and the atomic
 // ClaimScheduledFire then elects exactly one firing per boundary.
 func (s *GormStorage) SeedScheduledFire(ctx context.Context, name string, anchor time.Time) (time.Time, error) {
+	// The anchor shares the cursor's clock face for the same reason the claim
+	// does: it IS the cursor's initial value, and a boundary is compared against
+	// it as text on SQLite.
+	anchor = anchor.In(time.Local)
+
 	if err := s.db.WithContext(ctx).Clauses(clause.OnConflict{DoNothing: true}).
 		Create(&core.ScheduledFire{Name: name, LastFireAt: anchor}).Error; err != nil {
 		return time.Time{}, err

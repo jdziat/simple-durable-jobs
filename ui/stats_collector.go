@@ -209,12 +209,12 @@ func (sc *StatsCollector) snapshot(ctx context.Context) {
 
 // aggregateQueueDepth counts depth with one GROUP BY per call.
 //
-// The queue SET it reports is deliberately identical to the scan's: a row only
-// for queues with pending or running work. The aggregate itself also returns
-// queues whose jobs are all terminal, and writing those would add a zero-depth
-// sample every minute, forever, for every queue that has ever run a job —
-// unbounded growth in job_stats and a behaviour change nobody asked for. This
-// packet is about the numbers being RIGHT, not about which queues appear.
+// The queue SET it reports is identical to the scan's: a row only for queues with
+// pending or running work, so a queue whose jobs are all terminal is not sampled.
+// GetQueueDepthQueueOnly already filters to those two statuses and so cannot
+// return an all-terminal queue; the zero check below is defence against a
+// third-party core.Storage whose implementation does not, and is not a property
+// of the query this normally calls.
 func (sc *StatsCollector) aggregateQueueDepth(ctx context.Context, agg queueDepthOnlyStorage) (map[string]*[2]int64, error) {
 	depth, err := agg.GetQueueDepthQueueOnly(ctx)
 	if err != nil {
@@ -262,7 +262,7 @@ func (sc *StatsCollector) scanQueueDepth(ctx context.Context, storage core.Stora
 			sc.logger.Warn("queue-depth sample truncated; the dashboard depth chart is an UNDERCOUNT",
 				"status", status,
 				"cap", scanCap,
-				"hint", "this storage does not implement GetQueueDepthStats, so depth is counted by paging rows")
+				"hint", "this storage does not implement GetQueueDepthQueueOnly, so depth is counted by paging rows")
 		}
 		for _, job := range jobs {
 			d, ok := queueDepth[job.Queue]

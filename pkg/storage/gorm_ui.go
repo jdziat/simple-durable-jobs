@@ -30,11 +30,18 @@ func (s *GormStorage) GetQueueStats(ctx context.Context) ([]*jobsv1.QueueStats, 
 // wants depth: that one groups over EVERY status with no WHERE, so it is
 // unbounded in table size — and the default retention keeps completed jobs for 30
 // days, making "a few pending, millions completed" the normal shape. Measured on
-// live databases at 2M jobs, the unfiltered form is a parallel seq scan on
-// Postgres (32,787 buffers) and on MySQL a full covering scan of
-// idx_jobs_dequeue_eligible — the HOT DEQUEUE INDEX — taking 1.4s and evicting
-// exactly the buffer-pool pages the claim path needs. Restricting to the two
-// statuses actually read brings that to 2,016 buffers and 2.7ms respectively.
+// live databases at 300k jobs (a few thousand pending, the rest completed), the
+// unfiltered form is a parallel seq scan on Postgres — 4,935 buffers, 32ms — and
+// on MySQL a full scan of idx_jobs_dequeue_eligible, the index the claim path
+// depends on, evicting exactly the buffer-pool pages the dequeue needs.
+// Restricting to the two statuses read gives an index scan: 609 buffers, 0.5ms.
+//
+// The win is that the cost becomes bounded by queue DEPTH rather than by TABLE
+// SIZE, which is what matters when the default retention keeps 30 days of
+// completed rows. It is not a guarantee of an index scan in every shape: under a
+// genuinely large LIVE backlog the planner can still choose a sequential scan on
+// Postgres, and MySQL range-scans the claim index — but both are then
+// proportional to the backlog the operator actually has, not to history.
 //
 // It also touches only the jobs table. GetQueueDepthStats additionally reads
 // queue_states for pause flags and propagates that error, so an unrelated failure
