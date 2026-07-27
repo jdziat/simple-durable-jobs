@@ -1,8 +1,11 @@
 package worker
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -453,4 +456,71 @@ func TestProcessJob_LaterRunKeepsItsRegistration(t *testing.T) {
 		"a later run's registration must survive an earlier run's cleanup, or it is invisible "+
 			"to Pause, CancelJob and the ownership audit for its whole duration")
 	assert.Equal(t, tok2, cur.token, "and it must still be the LATER run that is registered")
+}
+
+// TestPause_AggressiveLogsExactlyOneOutcome guards a defect that survived its own
+// first fix: the switch reporting the three release outcomes was added, but the
+// original unconditional Info was left BELOW it, so a failed release logged an
+// error and then immediately promised "it will re-dispatch on resume" — which is
+// false, since the row stays locked until the stale-lock reaper fires ~45 minutes
+// later. That is the line an operator greps during exactly that incident.
+//
+// FALSE-GREEN TRAP: asserting that the success message appears passes with the
+// duplicate present, because it appears twice. The assertion has to be on the
+// COUNT, and on the failure path it has to be that the message is absent.
+func TestPause_AggressiveLogsExactlyOneOutcome(t *testing.T) {
+	const promise = "it will re-dispatch on resume"
+
+	run := func(t *testing.T, releaseErr error) string {
+		t.Helper()
+		var buf bytes.Buffer
+		store := &mockStorage{}
+		store.releaseJobFunc = func(context.Context, core.UUID, string) error { return releaseErr }
+
+		q := queue.New(store)
+		started := make(chan struct{})
+		q.Register("slow", func(ctx context.Context, _ struct{}) error {
+			close(started)
+			<-ctx.Done()
+			return ctx.Err()
+		})
+
+		w := NewWorker(q)
+		w.logger = slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+		// Keep the release from spending its full retry budget on a failing store.
+		w.config.StorageRetry.MaxAttempts = 1
+
+		job := &core.Job{ID: core.NewID(), Type: "slow", Queue: "default", Status: core.StatusRunning, MaxRetries: 2}
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+
+		done := make(chan struct{})
+		go func() { defer close(done); w.processJob(ctx, job) }()
+		select {
+		case <-started:
+		case <-time.After(10 * time.Second):
+			t.Fatal("handler never started")
+		}
+		w.Pause(core.PauseModeAggressive)
+		select {
+		case <-done:
+		case <-time.After(15 * time.Second):
+			t.Fatal("processJob never returned")
+		}
+		return buf.String()
+	}
+
+	t.Run("a successful release promises the resume exactly once", func(t *testing.T) {
+		assert.Equal(t, 1, strings.Count(run(t, nil), promise),
+			"the outcome must be reported once, not once per code path that reports it")
+	})
+
+	t.Run("a failed release does not promise a resume at all", func(t *testing.T) {
+		out := run(t, errors.New("storage unavailable"))
+		assert.NotContains(t, out, promise,
+			"the job is still locked and nothing re-dispatches it until the stale-lock reaper "+
+				"runs; telling the operator otherwise is worst exactly when they are debugging it")
+		assert.Contains(t, out, "stays locked until the stale-lock reaper",
+			"and the error must say what actually happens")
+	})
 }

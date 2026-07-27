@@ -1896,8 +1896,9 @@ func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 		// re-dequeued into a second processJob before this deferred cleanup runs.
 		// An unconditional delete would then remove the SECOND run's registration,
 		// leaving it invisible to Pause(Aggressive), Queue.CancelJob's local cancel
-		// and the ownership audit for its whole duration. Comparing the func
-		// pointer keeps each run responsible for exactly its own entry.
+		// and the ownership audit for its whole duration. The per-run token keeps
+		// each run responsible for exactly its own entry — see runningJobEntry for
+		// why the cancel func itself cannot serve as that identity.
 		if cur, ok := w.runningJobs[job.ID]; ok && cur.token == runToken {
 			delete(w.runningJobs, job.ID)
 			w.queue.UnregisterRunningJob(job.ID)
@@ -2041,6 +2042,26 @@ func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 			return w.queue.Storage().Release(releaseCtx, job.ID, w.config.WorkerID)
 		})
 		cancelRelease()
+		// End the attempt's observability span BEFORE reporting the outcome, so it
+		// is closed on every branch below. Without this the pause path is the one
+		// disposition that ends no span at all: complete, fail, retry and waiting
+		// each have a hook, so an aggressively-paused job leaked a span that was
+		// never exported — on EVERY paused job, and pausing a busy worker leaks one
+		// per in-flight job at once.
+		//
+		// The waiting hooks are the right shape and are reused deliberately: this
+		// attempt completed neither successfully nor with failure, and the resume
+		// starts a brand-new attempt with a fresh span, which is exactly the
+		// fan-out/signal case they were written for. Span consumers therefore see
+		// job.disposition="waiting" on this path as well as on a genuine fan-out
+		// wait; the log line below is what distinguishes them. (Not JobPaused: that
+		// is emitted only by Queue.PauseJob, which sets no pause mark and so never
+		// reaches this branch — Worker.Pause emits WorkerPaused.)
+		w.queue.CallWaitingHooks(jobCtx, job)
+
+		// EXACTLY ONE of these fires. An earlier version added this switch but left
+		// the original unconditional Info below it, so the failure branch logged an
+		// error and then immediately promised a resume that was not coming.
 		switch {
 		case relErr != nil && !errors.Is(relErr, core.ErrJobNotOwned):
 			// Say what actually happens now, not what the happy path would have
@@ -2060,22 +2081,6 @@ func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 		default:
 			w.logger.Info("job released by aggressive pause; it will re-dispatch on resume", "job_id", job.ID)
 		}
-		// End the attempt's observability span. Without this the pause path is the
-		// one disposition that ends no span at all: complete, fail, retry and
-		// waiting each have a hook, so an aggressively-paused job leaked a span
-		// that was never exported — on EVERY paused job, and pausing a busy worker
-		// leaks one per in-flight job at once.
-		//
-		// The waiting hooks are the right shape and are reused deliberately: this
-		// attempt completed neither successfully nor with failure, and the resume
-		// starts a brand-new attempt with a fresh span, which is exactly the
-		// fan-out/signal case they were written for. Span consumers therefore see
-		// job.disposition="waiting" on this path as well as on a genuine fan-out
-		// wait; the log line below is what distinguishes them. (Not JobPaused: that
-		// is emitted only by Queue.PauseJob, which sets no pause mark and so never
-		// reaches this branch — Worker.Pause emits WorkerPaused.)
-		w.queue.CallWaitingHooks(jobCtx, job)
-		w.logger.Info("job released by aggressive pause; it will re-dispatch on resume", "job_id", job.ID)
 	} else if err != nil {
 		w.queue.CallErrorHandler(jobCtx, job, err)
 		w.handleError(ctx, jobCtx, job, err)
