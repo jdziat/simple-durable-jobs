@@ -146,7 +146,11 @@ jobs:
     name: Lint
     runs-on: ubuntu-latest
     steps:
+      # fetch-depth: 0 so the upgrade-matrix step below can resolve the previous
+      # release tag; the default shallow clone carries no tags at all.
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
 
       # A committed conflict marker had NO gate: `go build/vet/test ./...` covers
       # only the root module, so docs/ (its own go.mod) is never compiled, and
@@ -196,6 +200,16 @@ jobs:
       - name: Frontend unit tests
         working-directory: ui/frontend
         run: npm run test:unit
+
+      # Cross-version upgrade guard. Two review rounds running, the worst defects
+      # in this line were fixes that were correct against a FRESH database and
+      # silently broke deployments whose rows an older binary had written — every
+      # ordinary test starts from an empty database, so none of them could see it.
+      # This builds the previous release, lets it populate a SQLite file, then
+      # points this tree's binary at that same file and checks the schedules still
+      # fire. The job's checkout uses fetch-depth 0 so the baseline tag resolves.
+      - name: Upgrade matrix (previous release -> HEAD)
+        run: ./scripts/upgrade-matrix.sh
 
       - name: golangci-lint
         uses: golangci/golangci-lint-action@9fae48acfc02a90574d7c304a1758ef9895495fa # v7.0.1

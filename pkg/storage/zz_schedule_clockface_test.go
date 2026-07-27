@@ -129,3 +129,66 @@ func TestClaimScheduledFire_LegacyLocalFacedCursorStillClaims(t *testing.T) {
 		"an Every cursor written on a positive-offset local face must still claim — forcing "+
 			"either clock face at write time stalls one of the two schedule families on upgrade")
 }
+
+// TestScheduleCursorLess_NormalizesEveryStoredShape pins the normalizing
+// expression against every value the column can actually hold.
+//
+// The claim predicate is only correct if strftime() renders the SAME UTC instant
+// for the same moment however it was written — and the driver can have written it
+// on any offset, with or without sub-second digits, and older rows may predate
+// conventions this wave assumes. A shape it silently got wrong would resurrect the
+// stalled-schedule bug for exactly the deployments that have been running longest.
+//
+// FALSE-GREEN TRAP: comparing each rendering to a hardcoded string tests the
+// format, not the property. The property is that equal instants render EQUAL and
+// ordered instants render ORDERED, which is what the claim compares.
+func TestScheduleCursorLess_NormalizesEveryStoredShape(t *testing.T) {
+	s := newTestStorage(t)
+	if !s.isSQLite {
+		t.Skip("the normalizing expression is SQLite-only; PG/MySQL compare real timestamps")
+	}
+	const expr = `strftime('%Y-%m-%d %H:%M:%f', ?)`
+
+	render := func(v any) *string {
+		var out *string
+		require.NoError(t, s.DB().Raw("SELECT "+expr, v).Scan(&out).Error)
+		return out
+	}
+
+	// The same instant, written every way the driver and history can produce it.
+	sameInstant := []string{
+		"2026-07-26 23:00:00+00:00", // UTC face — Daily/Weekly/Cron cursors
+		"2026-07-27 08:00:00+09:00", // positive local face — Every cursors east of UTC
+		"2026-07-26 16:00:00-07:00", // negative local face — Every cursors west
+		"2026-07-26 23:00:00",       // no offset suffix at all
+		"2026-07-26T23:00:00Z",      // RFC3339 with Z
+	}
+	want := render(sameInstant[0])
+	require.NotNil(t, want)
+	for _, v := range sameInstant[1:] {
+		got := render(v)
+		require.NotNil(t, got, "%q must render, not NULL", v)
+		assert.Equal(t, *want, *got,
+			"%q is the same instant as %q and must normalize identically, or a cursor written "+
+				"on that face stalls its schedule", v, sameInstant[0])
+	}
+
+	// Ordering must survive the normalization, in both directions across faces.
+	later := render("2026-07-27 09:00:00+09:00") // one hour after
+	require.NotNil(t, later)
+	assert.Less(t, *want, *later, "an instant an hour later must sort after, across clock faces")
+
+	// Shapes that must not error or produce nonsense.
+	for _, v := range []string{
+		"0001-01-01 00:00:00+00:00", // Go's zero time
+		"1969-07-20 20:17:00+00:00", // pre-epoch
+		"9999-12-31 23:59:59+00:00", // far future
+		"2026-03-08 02:30:00-05:00", // inside a US spring-forward fold
+	} {
+		assert.NotNil(t, render(v), "%q must normalize rather than yielding NULL", v)
+	}
+
+	// A NULL cursor must fail CLOSED: the predicate yields NULL, the row does not
+	// match, and the boundary is simply not claimed — never an error or a claim.
+	assert.Nil(t, render(nil), "NULL must stay NULL so the claim fails closed")
+}
