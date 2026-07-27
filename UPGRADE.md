@@ -252,6 +252,14 @@ deliberately.
 Rates that were already exact — whole numbers and `1/n` — derive the same window
 as before and do not move.
 
+An explicitly set `RateLimitConfig.Window` is now floored to a whole millisecond
+and clamped, where it was previously used verbatim. That alignment is not
+cosmetic: `window_start` is `now.Truncate(window)` and the column is `datetime(3)`
+on MySQL, so a window like `1500µs` produced a start MySQL rounded on write, after
+which the consume's own `WHERE window_start = ?` matched nothing and every
+rate-limited job bounced forever. A window that is already a whole number of
+milliseconds — which every documented example is — is unchanged.
+
 ### `NewWorker` reports arguments it cannot use
 
 **Before:** `Queue.NewWorker` takes `...any` (the facade cannot name

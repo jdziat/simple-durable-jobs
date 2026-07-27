@@ -119,3 +119,46 @@ func TestDeriveRateLimitWindow_UpperClampIsReachable(t *testing.T) {
 	assert.Equal(t, maxRateLimitWindow, deriveRateLimitWindow(2e-10),
 		"this input must exercise the upper clamp, or the bound above is untested")
 }
+
+// TestResolveRateLimitWindow_ExplicitWindowIsAlsoAligned closes the hole between
+// the two ways a window is chosen.
+//
+// The millisecond alignment exists because window_start is now.Truncate(window)
+// and rate_limit_windows.window_start is datetime(3) on MySQL: a
+// sub-millisecond-precision start is ROUNDED on write, the consume's own
+// "WHERE window_start = ?" matches nothing, and every rate-limited job bounces
+// forever. deriveRateLimitWindow guaranteed that; an author-set Window bypassed
+// it entirely, so RateLimitConfig{Window: 1500 * time.Microsecond} reintroduced
+// the exact failure the derivation was hardened against.
+//
+// FALSE-GREEN TRAP: asserting that an explicit window is returned unchanged is
+// what the old behaviour did — it passes precisely when the bug is present. The
+// assertion has to be the INVARIANT (whole milliseconds, positive, clamped),
+// applied to explicit and derived windows alike.
+func TestResolveRateLimitWindow_ExplicitWindowIsAlsoAligned(t *testing.T) {
+	w := &Worker{}
+
+	for name, limit := range map[string]RateLimitConfig{
+		"sub-millisecond":      {PerSecond: 10, Window: 1500 * time.Microsecond},
+		"nanosecond-precision": {PerSecond: 10, Window: time.Second + 7*time.Nanosecond},
+		"absurdly-large":       {PerSecond: 10, Window: 1 << 62},
+		"derived":              {PerSecond: 2.5},
+	} {
+		got := w.resolveRateLimitWindow(limit)
+		assert.Positive(t, got, "%s must yield a usable window", name)
+		assert.Zero(t, got%time.Millisecond,
+			"%s derives %v, which is not a whole number of milliseconds — MySQL datetime(3) "+
+				"rounds window_start and strands every consume", name, got)
+		assert.LessOrEqual(t, got, maxRateLimitWindow, "%s must be clamped", name)
+	}
+}
+
+// TestResolveRateLimitWindow_HonoursAnExplicitWindow is the compatibility control:
+// aligning must not silently retune a window an author set deliberately.
+func TestResolveRateLimitWindow_HonoursAnExplicitWindow(t *testing.T) {
+	w := &Worker{}
+	for _, want := range []time.Duration{time.Second, 250 * time.Millisecond, 5 * time.Second} {
+		assert.Equal(t, want, w.resolveRateLimitWindow(RateLimitConfig{PerSecond: 3, Window: want}),
+			"an already-aligned explicit window must be used exactly as given")
+	}
+}

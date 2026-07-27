@@ -52,12 +52,32 @@ type windowedRateLimiter interface {
 }
 
 // resolveRateLimitWindow chooses the fixed-window length for a fleet rate limit.
-// An explicit author-set Window is always honored; otherwise it is derived.
+// An explicit author-set Window is honoured; otherwise it is derived.
+//
+// Either way the result is floored to a whole MILLISECOND and clamped, because
+// the alignment that requirement exists for is a property of the STORED
+// window_start and does not care where the window came from. window_start is
+// now.Truncate(window) and rate_limit_windows.window_start is datetime(3) on
+// MySQL, so a window like 1500µs yields a microsecond-precision start that MySQL
+// ROUNDS on write; the consume's own "WHERE window_start = ?" then matches
+// nothing and every rate-limited job bounces forever. Deriving the window already
+// guaranteed this; an explicit one used to bypass it and reintroduce exactly that
+// failure, so the invariant is enforced here rather than in one of the two paths.
+//
+// A sub-millisecond explicit window would floor to zero, which is not a window at
+// all, so it takes the default instead.
 func (w *Worker) resolveRateLimitWindow(limit RateLimitConfig) time.Duration {
-	if limit.Window > 0 {
-		return limit.Window
+	if limit.Window <= 0 {
+		return deriveRateLimitWindow(limit.PerSecond)
 	}
-	return deriveRateLimitWindow(limit.PerSecond)
+	window := limit.Window.Truncate(time.Millisecond)
+	if window <= 0 {
+		return defaultRateLimitWindow
+	}
+	if window > maxRateLimitWindow {
+		return maxRateLimitWindow
+	}
+	return window
 }
 
 // deriveRateLimitWindow picks the fixed window whose per-window ceiling expresses
