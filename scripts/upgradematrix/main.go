@@ -24,9 +24,10 @@ import (
 // offset. A fix that forces either face stalls the other lineage.
 func families() map[string]schedule.Schedule {
 	f := map[string]schedule.Schedule{
-		"every":  schedule.Every(time.Hour),
-		"daily":  schedule.Daily(9, 0),
-		"weekly": schedule.Weekly(time.Monday, 9, 0),
+		"every":     schedule.Every(time.Hour),
+		"daily":     schedule.Daily(9, 0),
+		"weekly":    schedule.Weekly(time.Monday, 9, 0),
+		"crossface": schedule.Every(time.Hour),
 	}
 	if c, err := schedule.Cron("0 * * * *"); err == nil {
 		f["cron"] = c
@@ -34,7 +35,22 @@ func families() map[string]schedule.Schedule {
 	return f
 }
 
-func order() []string { return []string{"cron", "daily", "every", "weekly"} }
+func order() []string { return []string{"cron", "crossface", "daily", "every", "weekly"} }
+
+// crossZone is a fixed offset deliberately unlike any host zone the matrix runs
+// under, and deliberately NOT a whole hour.
+//
+// The "crossface" family models what CronIn / DailyIn / WeeklyIn and a CRON_TZ=
+// prefix produce: a boundary rendered in the SCHEDULE's location rather than the
+// cursor's. Without it this whole harness is blind to the bug it exists for —
+// every other family's Next() preserves the anchor's location, so its boundary
+// always shares its cursor's clock face and even a raw lexical comparison
+// succeeds. Measured: reverting the predicate to the pre-wave form still reported
+// "OK" for all four of the original families.
+//
+// It is built with time.FixedZone rather than the new *In constructors on purpose:
+// this file is compiled against the BASELINE tag too, which does not have them.
+var crossZone = time.FixedZone("probe+0530", 5*3600+30*60)
 
 func main() {
 	if len(os.Args) < 3 {
@@ -63,6 +79,8 @@ func main() {
 			if err != nil {
 				panic(err)
 			}
+			// Seed and first fire always go in on the HOST's face, as a released
+			// binary would write them.
 			if _, err := st.ClaimScheduledFire(ctx, name, s.Next(anchor)); err != nil {
 				panic(err)
 			}
@@ -87,6 +105,11 @@ func main() {
 				continue
 			}
 			next := s.Next(cur)
+			if name == "crossface" {
+				// Same instant, different clock face — the shape a schedule with an
+				// explicit location produces against a cursor written on another.
+				next = next.In(crossZone)
+			}
 			won, err := st.ClaimScheduledFire(ctx, name, next)
 			if err != nil {
 				panic(err)

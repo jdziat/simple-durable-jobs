@@ -51,6 +51,15 @@ bin/
 ui/frontend/buf.yaml
 ui/frontend/proto
 
+# Compiled binaries from `go build ./...` at the repo root. This is a LIBRARY:
+# a Go module zip contains every file under the module root, so a stray binary is
+# downloaded by every `go get` and, because module versions are IMMUTABLE in the
+# proxy, cannot be withdrawn afterwards. One slipped in this way and inflated the
+# published zip 7.7x before it was caught.
+/upgradematrix
+/simple-durable-jobs
+/sdj
+
 # Hugo build output. Anchored to docs/ on purpose: a bare `public/` also matched
 # ui/frontend/public/, which is Vite's static-asset directory and IS source --
 # so the dashboard's favicon was silently excluded from the repo and reappeared
