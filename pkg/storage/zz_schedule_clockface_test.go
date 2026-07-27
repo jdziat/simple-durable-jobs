@@ -95,3 +95,37 @@ func TestClaimScheduledFire_LegacyUTCCursorStillClaims(t *testing.T) {
 		"a cursor written by an older binary on the UTC face must still be claimable, or every "+
 			"existing schedule silently stops firing on upgrade")
 }
+
+// TestClaimScheduledFire_LegacyLocalFacedCursorStillClaims is the OTHER upgrade
+// path, and the one that proves a write-side clock face cannot be the fix.
+//
+// Existing databases hold a MIXTURE. Daily/Weekly/Cron pin UTC, so their cursors
+// are UTC-faced (covered above). But `Every` seeds from time.Now() via
+// establishScheduleBase, and everySchedule.Next is from.Truncate(d).Add(d) which
+// PRESERVES the location — so every Every cursor is on the host's LOCAL face.
+//
+// Measured against a real v4.7.0 build under TZ=Asia/Tokyo: normalizing writes to
+// UTC made nine consecutive hourly boundaries claim FALSE with a nil error, i.e.
+// the schedule silently stopped for the length of the UTC offset before
+// self-healing. Normalizing to local instead breaks the UTC family the same way.
+// The comparison has to be face-independent, which is what datetime() gives.
+//
+// FALSE-GREEN TRAP: a fixed zone whose offset is NEGATIVE relative to UTC still
+// sorts correctly as text, so it passes with the bug present. The probe zone must
+// be POSITIVE (east of UTC), which is where the lexical order inverts.
+func TestClaimScheduledFire_LegacyLocalFacedCursorStillClaims(t *testing.T) {
+	s := newTestStorage(t)
+	ctx := context.Background()
+
+	east := time.FixedZone("probe+9", 9*3600)
+	stored := time.Date(2026, 7, 27, 11, 0, 0, 0, east) // 02:00Z, written by an older binary
+	require.NoError(t, s.DB().Create(&core.ScheduledFire{Name: "every-legacy", LastFireAt: stored}).Error)
+
+	// The next hourly boundary an Every schedule produces keeps that same location.
+	next := stored.Add(time.Hour)
+	won, err := s.ClaimScheduledFire(ctx, "every-legacy", next)
+	require.NoError(t, err)
+	assert.True(t, won,
+		"an Every cursor written on a positive-offset local face must still claim — forcing "+
+			"either clock face at write time stalls one of the two schedule families on upgrade")
+}

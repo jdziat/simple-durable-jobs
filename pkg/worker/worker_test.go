@@ -1163,7 +1163,7 @@ func TestWorker_OwnershipAudit_EmitsJobReclaimed(t *testing.T) {
 	// Seed a running job so the audit snapshot is non-empty. Safe: no jobs are
 	// dequeued in this test, so processJob never touches the map.
 	w.runningJobsMu.Lock()
-	w.runningJobs["job-9"] = func() {}
+	w.runningJobs["job-9"] = runningJobEntry{cancel: func() {}}
 	w.runningJobsMu.Unlock()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1248,10 +1248,10 @@ func TestWorker_AggressivePauseCancelsRegisteredJob(t *testing.T) {
 
 	// Simulate a running job by injecting a cancel func directly.
 	w.runningJobsMu.Lock()
-	w.runningJobs["job-1"] = func() {
+	w.runningJobs["job-1"] = runningJobEntry{cancel: func() {
 		cancelFn()
 		close(cancelled)
-	}
+	}}
 	w.runningJobsMu.Unlock()
 
 	w.Pause(core.PauseModeAggressive)
@@ -1285,10 +1285,10 @@ func TestWorker_CancelJob_KnownIDReturnsTrueAndCancels(t *testing.T) {
 	ctx, cancelFn := context.WithCancel(context.Background())
 
 	w.runningJobsMu.Lock()
-	w.runningJobs["job-abc"] = func() {
+	w.runningJobs["job-abc"] = runningJobEntry{cancel: func() {
 		cancelFn()
 		close(cancelled)
-	}
+	}}
 	w.runningJobsMu.Unlock()
 
 	found := w.CancelJob("job-abc")
@@ -1317,8 +1317,8 @@ func TestWorker_RunningJobCount_ReflectsRegisteredJobs(t *testing.T) {
 	w := newTestWorker(t)
 
 	w.runningJobsMu.Lock()
-	w.runningJobs["j1"] = func() {}
-	w.runningJobs["j2"] = func() {}
+	w.runningJobs["j1"] = runningJobEntry{cancel: func() {}}
+	w.runningJobs["j2"] = runningJobEntry{cancel: func() {}}
 	w.runningJobsMu.Unlock()
 
 	assert.Equal(t, 2, w.RunningJobCount())
@@ -1351,7 +1351,7 @@ func TestWorker_WaitForPause_TimeoutWithRunningJobs(t *testing.T) {
 
 	// Inject a job that never finishes.
 	w.runningJobsMu.Lock()
-	w.runningJobs["stuck-job"] = func() {}
+	w.runningJobs["stuck-job"] = runningJobEntry{cancel: func() {}}
 	w.runningJobsMu.Unlock()
 
 	w.Pause(core.PauseModeGraceful)
@@ -1372,7 +1372,7 @@ func TestWorker_WaitForPause_CompletesWhenJobFinishes(t *testing.T) {
 
 	// Register a "running" job then remove it after a short delay.
 	w.runningJobsMu.Lock()
-	w.runningJobs["finishing-job"] = func() {}
+	w.runningJobs["finishing-job"] = runningJobEntry{cancel: func() {}}
 	w.runningJobsMu.Unlock()
 
 	go func() {
@@ -4314,7 +4314,7 @@ func TestRunHeartbeat_AbandonsOrphanedJob(t *testing.T) {
 	jobCtx, jobCancel := context.WithCancel(context.Background())
 	defer jobCancel()
 	w.runningJobsMu.Lock()
-	w.runningJobs["test-job-id"] = jobCancel
+	w.runningJobs["test-job-id"] = runningJobEntry{cancel: jobCancel}
 	w.runningJobsMu.Unlock()
 
 	// Drive the heartbeat loop until orphan threshold trips.
@@ -4370,7 +4370,7 @@ func TestRunHeartbeat_TransientErrorDoesNotAbandon(t *testing.T) {
 	jobCtx, jobCancel := context.WithCancel(context.Background())
 	defer jobCancel()
 	w.runningJobsMu.Lock()
-	w.runningJobs["transient-job"] = jobCancel
+	w.runningJobs["transient-job"] = runningJobEntry{cancel: jobCancel}
 	w.runningJobsMu.Unlock()
 
 	hbCtx, hbCancel := context.WithCancel(context.Background())
@@ -4422,7 +4422,7 @@ func TestRunHeartbeat_SuccessResetsCounter(t *testing.T) {
 	jobCtx, jobCancel := context.WithCancel(context.Background())
 	defer jobCancel()
 	w.runningJobsMu.Lock()
-	w.runningJobs["blip-job"] = jobCancel
+	w.runningJobs["blip-job"] = runningJobEntry{cancel: jobCancel}
 	w.runningJobsMu.Unlock()
 
 	hbCtx, hbCancel := context.WithCancel(context.Background())
@@ -4475,7 +4475,7 @@ func TestCompleteFanOut_CancelsLocalSubJobHandlers(t *testing.T) {
 	for _, id := range []string{"sub-a", "sub-b"} {
 		id := id
 		w.runningJobsMu.Lock()
-		w.runningJobs[core.UUID(id)] = func() { cancelCalls[string(id)]++ }
+		w.runningJobs[core.UUID(id)] = runningJobEntry{cancel: func() { cancelCalls[string(id)]++ }}
 		w.runningJobsMu.Unlock()
 	}
 	// sub-c is intentionally NOT in this worker's runningJobs — it's
@@ -4516,8 +4516,8 @@ func TestReapStaleLocks_CancelsLocalHandlersOfReleasedJobs(t *testing.T) {
 	// stored func) and read from the test goroutine, so they must be atomic.
 	var orphan1, orphan2 atomic.Int32
 	w.runningJobsMu.Lock()
-	w.runningJobs["orphan-1"] = func() { orphan1.Add(1) }
-	w.runningJobs["orphan-2"] = func() { orphan2.Add(1) }
+	w.runningJobs["orphan-1"] = runningJobEntry{cancel: func() { orphan1.Add(1) }}
+	w.runningJobs["orphan-2"] = runningJobEntry{cancel: func() { orphan2.Add(1) }}
 	w.runningJobsMu.Unlock()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -4566,8 +4566,8 @@ func TestOwnershipAudit_CancelsOrphanedLocalHandlers(t *testing.T) {
 	// stored func) and read from the test goroutine, so they must be atomic.
 	var mineCancelled, stolenCancelled atomic.Int32
 	w.runningJobsMu.Lock()
-	w.runningJobs["job-mine"] = func() { mineCancelled.Add(1) }
-	w.runningJobs["job-stolen"] = func() { stolenCancelled.Add(1) }
+	w.runningJobs["job-mine"] = runningJobEntry{cancel: func() { mineCancelled.Add(1) }}
+	w.runningJobs["job-stolen"] = runningJobEntry{cancel: func() { stolenCancelled.Add(1) }}
 	w.runningJobsMu.Unlock()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -4616,7 +4616,7 @@ func TestOwnershipAudit_DoesNotCancelSelfSuspendedJob(t *testing.T) {
 	// its own parent to wait on a fan-out (the real production transition).
 	var cancelled atomic.Int32
 	w.runningJobsMu.Lock()
-	w.runningJobs[job.ID] = func() { cancelled.Add(1) }
+	w.runningJobs[job.ID] = runningJobEntry{cancel: func() { cancelled.Add(1) }}
 	w.runningJobsMu.Unlock()
 	require.NoError(t, store.MarkWaiting(ctx, job.ID, workerID))
 
@@ -4652,8 +4652,8 @@ func TestOwnershipAudit_NoOpWhenNoOrphans(t *testing.T) {
 
 	cancelled := 0
 	w.runningJobsMu.Lock()
-	w.runningJobs["healthy-1"] = func() { cancelled++ }
-	w.runningJobs["healthy-2"] = func() { cancelled++ }
+	w.runningJobs["healthy-1"] = runningJobEntry{cancel: func() { cancelled++ }}
+	w.runningJobs["healthy-2"] = runningJobEntry{cancel: func() { cancelled++ }}
 	w.runningJobsMu.Unlock()
 
 	ctx, cancel := context.WithCancel(context.Background())

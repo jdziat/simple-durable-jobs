@@ -1,6 +1,7 @@
 package fanout
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -153,4 +154,55 @@ func TestBuildSubJobs_SchedulingAndDeterminismReachTheChild(t *testing.T) {
 	assert.Equal(t, int(queue.Strict), built[0].Determinism,
 		"Determinism must reach the child — a sub-job asked to replay strictly must actually do so")
 	assert.Equal(t, 90*time.Second, built[0].Timeout, "Timeout must reach the child")
+}
+
+// enqueueSpy captures the child rows the REPLAY path persists.
+type enqueueSpy struct {
+	*minimalStorage
+	fanOut *core.FanOut
+	seen   []*core.Job
+}
+
+func (s *enqueueSpy) GetFanOut(context.Context, core.UUID) (*core.FanOut, error) {
+	return s.fanOut, nil
+}
+func (s *enqueueSpy) GetSubJobs(context.Context, core.UUID) ([]*core.Job, error) {
+	return nil, nil // nothing persisted yet: the crash happened before the batch landed
+}
+func (s *enqueueSpy) EnqueueBatch(ctx context.Context, jobs []*core.Job) error {
+	s.seen = append(s.seen, jobs...)
+	return s.minimalStorage.EnqueueBatch(ctx, jobs)
+}
+
+// TestFanOut_ReplayAnchorsDelayOnTheFanOutCreation pins the CALL SITE, which the
+// buildSubJobs-level tests cannot.
+//
+// FALSE-GREEN TRAP, found by review: every other test passes the anchor in
+// directly, so they prove the parameter is USED and not that the right value is
+// SUPPLIED. Reverting fanout.go's replay call to time.Now() — which is the
+// original bug — left all of them, and ./tests, fully green. Only driving FanOut
+// down the replay branch and inspecting the persisted child can see it.
+func TestFanOut_ReplayAnchorsDelayOnTheFanOutCreation(t *testing.T) {
+	parentID := core.UUID("p-replay-anchor")
+	created := time.Now().Add(-30 * time.Minute) // the fan-out was made half an hour ago
+
+	store := &enqueueSpy{
+		minimalStorage: newMinimalStorage(),
+		fanOut: &core.FanOut{
+			ID: core.NewID(), ParentJobID: parentID, TotalCount: 1,
+			Status: core.FanOutPending, CreatedAt: created,
+		},
+	}
+	jc := makeErrJobCtx(&errStorage{minimalStorage: store.minimalStorage}, parentID, "default")
+	jc.Storage = store
+
+	ctx := buildCtxErr(jc, []core.Checkpoint{resumeCheckpoint(parentID, store.fanOut.ID)})
+	_, err := FanOut[string](ctx, []SubJob{{Type: "do-work", Args: "x", Delay: time.Hour}})
+	require.Error(t, err, "the parent re-suspends into WaitingError on a replay")
+
+	require.Len(t, store.seen, 1, "the replay must persist the missing child")
+	require.NotNil(t, store.seen[0].RunAt)
+	assert.WithinDuration(t, created.Add(time.Hour), *store.seen[0].RunAt, time.Second,
+		"the replay must anchor the Delay on the fan-out's creation: anchoring on the recovery "+
+			"instant makes this child wait an extra 30 minutes, silently")
 }

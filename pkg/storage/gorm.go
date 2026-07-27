@@ -1322,30 +1322,42 @@ func (s *GormStorage) ClaimScheduledFire(ctx context.Context, name string, fireT
 	return s.ClaimScheduledFireTx(ctx, s.db, name, fireTime)
 }
 
+// scheduleCursorLess returns the "cursor is before this boundary" predicate.
+//
+// SQLite has no datetime type: the driver writes every timestamp as TEXT with a
+// trailing offset, and a bare `last_fire_at < ?` therefore compares two clock
+// FACES lexically rather than two instants. That is wrong in both directions, and
+// it cannot be fixed by choosing a face at write time, because existing databases
+// already hold a MIXTURE — Daily/Weekly/Cron pin UTC so their cursors are
+// UTC-faced, while Every seeds from time.Now() and everySchedule.Next preserves
+// that location, so its cursors are LOCAL-faced. Normalizing writes to either one
+// silently stalls the other family on upgrade for the length of the UTC offset.
+// Both directions were measured against databases written by a real v4.7.0 build.
+//
+// strftime() parses the offset and renders UTC, so the comparison is on INSTANTS
+// and is correct for every row whatever face it was stored on — no migration, and
+// no dependence on which constructor wrote it. Postgres and MySQL store a real
+// timestamp and already compare instants, so they keep the native form.
+//
+// %f, not datetime(): datetime() truncates to whole SECONDS, which collapses any
+// two boundaries inside the same second into "not less than" and stalls a
+// sub-second schedule outright (it broke Every-based scheduling immediately). %f
+// keeps milliseconds, which is the column's own resolution and two orders of
+// magnitude finer than the 100ms poll interval.
+func (s *GormStorage) scheduleCursorLess() string {
+	if s.isSQLite {
+		const utcMillis = `strftime('%Y-%m-%d %H:%M:%f', `
+		return utcMillis + "last_fire_at) < " + utcMillis + "?)"
+	}
+	return "last_fire_at < ?"
+}
+
 // ClaimScheduledFireTx is ClaimScheduledFire performed within a caller-owned
 // transaction, so the boundary claim can be committed ATOMICALLY with the
 // enqueue of the fired job (and rolled back together on failure). Without this,
 // a claim that durably advanced last_fire_at followed by a failed enqueue would
 // silently drop a due scheduled run (teardown g8). See Queue.EnqueueScheduledFire.
 func (s *GormStorage) ClaimScheduledFireTx(ctx context.Context, tx *gorm.DB, name string, fireTime time.Time) (bool, error) {
-	// `last_fire_at < ?` is a TEXT comparison on SQLite, so the boundary and the
-	// stored cursor must be rendered on ONE clock face. A schedule with an
-	// explicit location — CronIn/DailyIn/WeeklyIn, or a CRON_TZ= prefix — produces
-	// a boundary in THAT location, so 13:00-04:00 (17:00 UTC) sorted BELOW a
-	// 16:00+00:00 cursor it is genuinely after, the claim matched nothing, and the
-	// schedule silently never fired.
-	//
-	// UTC, NOT time.Local — the opposite of the run_at normalization, for a reason
-	// specific to this column. Both sides of this comparison are SCHEDULE-DERIVED;
-	// unlike the dequeue predicates, no local wall-clock bind is involved. And
-	// every cursor already in a database was written on the UTC face, because all
-	// the default constructors pin it (Daily/Weekly/Cron all resolve to UTC), so
-	// UTC is also the face that keeps EXISTING rows comparable. Normalizing to
-	// local instead silently stops every already-running schedule on upgrade:
-	// measured, a stored "2026-07-26 23:00:00+00:00" cursor stops matching a
-	// local-faced bind entirely. A no-op on Postgres and MySQL.
-	fireTime = fireTime.UTC()
-
 	if err := tx.WithContext(ctx).Clauses(clause.OnConflict{DoNothing: true}).
 		Create(&core.ScheduledFire{Name: name, LastFireAt: time.Unix(0, 0).UTC()}).Error; err != nil {
 		return false, err
@@ -1353,7 +1365,7 @@ func (s *GormStorage) ClaimScheduledFireTx(ctx context.Context, tx *gorm.DB, nam
 
 	result := tx.WithContext(ctx).
 		Model(&core.ScheduledFire{}).
-		Where("name = ? AND last_fire_at < ?", name, fireTime).
+		Where("name = ? AND "+s.scheduleCursorLess(), name, fireTime).
 		Updates(map[string]any{
 			"last_fire_at":  fireTime,
 			"last_fired_at": fireTime,
@@ -1373,11 +1385,6 @@ func (s *GormStorage) ClaimScheduledFireTx(ctx context.Context, tx *gorm.DB, nam
 // starting cursor so all workers compute identical fire times and the atomic
 // ClaimScheduledFire then elects exactly one firing per boundary.
 func (s *GormStorage) SeedScheduledFire(ctx context.Context, name string, anchor time.Time) (time.Time, error) {
-	// The anchor shares the cursor's clock face for the same reason the claim
-	// does: it IS the cursor's initial value, and a boundary is compared against
-	// it as text on SQLite. UTC for the same reason too — see ClaimScheduledFireTx.
-	anchor = anchor.UTC()
-
 	if err := s.db.WithContext(ctx).Clauses(clause.OnConflict{DoNothing: true}).
 		Create(&core.ScheduledFire{Name: name, LastFireAt: anchor}).Error; err != nil {
 		return time.Time{}, err

@@ -50,7 +50,14 @@ type Worker struct {
 	shuttingDown atomic.Bool
 
 	// Running job cancellation (for aggressive pause)
-	runningJobs map[core.UUID]context.CancelFunc
+	// runningJobs maps a job id to the run currently executing it. The value
+	// carries a per-run token because a job can legitimately be running under a
+	// LATER run while an earlier one is still unwinding: the aggressive-pause path
+	// releases to `pending` while this worker is still polling, so the same job can
+	// be re-dequeued before the first run's deferred cleanup fires.
+	runningJobs map[core.UUID]runningJobEntry
+	// nextRunToken issues the per-run identity above.
+	nextRunToken atomic.Uint64
 	// pauseCancelled marks jobs whose handler context was cancelled by
 	// Pause(PauseModeAggressive) rather than by a genuine failure or shutdown.
 	// Guarded by runningJobsMu, which already guards the cancel funcs the pause
@@ -470,7 +477,7 @@ func NewWorker(q *queue.Queue, opts ...WorkerOption) *Worker {
 		config:                  config,
 		logger:                  slog.Default(),
 		forcedHandlerDrainGrace: defaultForcedHandlerDrainGrace,
-		runningJobs:             make(map[core.UUID]context.CancelFunc),
+		runningJobs:             make(map[core.UUID]runningJobEntry),
 		pauseCancelled:          make(map[core.UUID]struct{}),
 		queueRunning:            queueRunning,
 		queueJobID:              make(map[core.UUID]string),
@@ -1876,12 +1883,25 @@ func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 
 	// Track this running job for aggressive pause (worker-local + queue-level registry)
 	w.runningJobsMu.Lock()
-	w.runningJobs[job.ID] = cancelJob
+	runToken := w.nextRunToken.Add(1)
+	w.runningJobs[job.ID] = runningJobEntry{cancel: cancelJob, token: runToken}
 	w.runningJobsMu.Unlock()
 	w.queue.RegisterRunningJob(job.ID, cancelJob)
 	defer func() {
 		w.runningJobsMu.Lock()
-		delete(w.runningJobs, job.ID)
+		// KEYED delete: only remove the entry if it is still OURS.
+		//
+		// The aggressive-pause path is the first that releases a job to `pending`
+		// while this worker is still alive and polling, so the same job can be
+		// re-dequeued into a second processJob before this deferred cleanup runs.
+		// An unconditional delete would then remove the SECOND run's registration,
+		// leaving it invisible to Pause(Aggressive), Queue.CancelJob's local cancel
+		// and the ownership audit for its whole duration. Comparing the func
+		// pointer keeps each run responsible for exactly its own entry.
+		if cur, ok := w.runningJobs[job.ID]; ok && cur.token == runToken {
+			delete(w.runningJobs, job.ID)
+			w.queue.UnregisterRunningJob(job.ID)
+		}
 		// Drop any unconsumed pause mark HERE, per job, rather than in Resume.
 		// The mark is consumed by takePauseCancelled on the error path; it survives
 		// only when the handler finished without ever surfacing the cancellation.
@@ -1889,7 +1909,6 @@ func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 		// a later run nor be cleared out from under a job that is still executing.
 		delete(w.pauseCancelled, job.ID)
 		w.runningJobsMu.Unlock()
-		w.queue.UnregisterRunningJob(job.ID)
 	}()
 
 	// Call start hooks
@@ -2022,9 +2041,24 @@ func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 			return w.queue.Storage().Release(releaseCtx, job.ID, w.config.WorkerID)
 		})
 		cancelRelease()
-		if relErr != nil && !errors.Is(relErr, core.ErrJobNotOwned) {
-			w.logger.Error("failed to release job cancelled by aggressive pause after retries",
-				"job_id", job.ID, "error", relErr)
+		switch {
+		case relErr != nil && !errors.Is(relErr, core.ErrJobNotOwned):
+			// Say what actually happens now, not what the happy path would have
+			// done. The row is still 'running' holding our lock, and NOTHING
+			// re-dispatches it until the stale-lock reaper fires at StaleLockAge —
+			// 45 minutes by default. Resume() re-dispatches PENDING rows, so it
+			// does not help. This is the line an operator greps for during exactly
+			// that incident, and it used to be followed by an unconditional Info
+			// promising a resume that was not coming.
+			w.logger.Error("failed to release job cancelled by aggressive pause; it will NOT re-dispatch on resume and stays locked until the stale-lock reaper reclaims it",
+				"job_id", job.ID, "stale_lock_age", w.config.StaleLockAge, "error", relErr)
+		case errors.Is(relErr, core.ErrJobNotOwned):
+			// Another worker already owns it — the reaper or an ownership audit got
+			// there first. Not our job to re-dispatch, and not an error.
+			w.logger.Info("job cancelled by aggressive pause was already reclaimed by another owner",
+				"job_id", job.ID)
+		default:
+			w.logger.Info("job released by aggressive pause; it will re-dispatch on resume", "job_id", job.ID)
 		}
 		// End the attempt's observability span. Without this the pause path is the
 		// one disposition that ends no span at all: complete, fail, retry and
@@ -2036,8 +2070,10 @@ func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 		// attempt completed neither successfully nor with failure, and the resume
 		// starts a brand-new attempt with a fresh span, which is exactly the
 		// fan-out/signal case they were written for. Span consumers therefore see
-		// job.disposition="waiting" here; the accompanying log line and the
-		// JobPaused event distinguish a pause from a fan-out wait.
+		// job.disposition="waiting" on this path as well as on a genuine fan-out
+		// wait; the log line below is what distinguishes them. (Not JobPaused: that
+		// is emitted only by Queue.PauseJob, which sets no pause mark and so never
+		// reaches this branch — Worker.Pause emits WorkerPaused.)
 		w.queue.CallWaitingHooks(jobCtx, job)
 		w.logger.Info("job released by aggressive pause; it will re-dispatch on resume", "job_id", job.ID)
 	} else if err != nil {
@@ -2860,39 +2896,10 @@ func (w *Worker) runScheduler(ctx context.Context) {
 						opts = append(opts, queue.UniqueFor(sj.Options.UniqueForTTL))
 					}
 					_, _, err := w.queue.EnqueueScheduledFire(ctx, name, nextRun, sj.Name, sj.Args, opts...)
-					switch {
-					case errors.Is(err, core.ErrDuplicateJob):
-						// DELIBERATE SKIP, not a failure: the schedule declared
-						// queue.Unique and a previous fire is still live, so running a
-						// second instance is exactly what the author asked us not to do.
-						// EnqueueScheduledFire COMMITTED the claim, so the durable cursor
-						// already advanced and peers will not re-attempt this boundary.
-						// Advance locally too, and log at Info — this is a normal
-						// outcome, not an error.
-						w.logger.Info("scheduled fire skipped: a job with this schedule's unique key is still active",
-							"name", name, "fire_time", nextRun)
-						delete(fireFailures, name)
-						delete(fireRetryAt, name)
-						lastRun[name] = nextRun
-					case err != nil:
-						// GENUINE failure. Claim+enqueue are atomic, so this rolled back
-						// the claim and the boundary stays re-claimable. Do NOT advance
-						// lastRun — retry the same boundary rather than drop the fire —
-						// but back off, so a persistent failure does not cost one
-						// transaction and one ERROR log every 100ms tick.
-						fireFailures[name]++
-						delay := scheduleFireRetryDelay(fireFailures[name])
-						fireRetryAt[name] = now.Add(delay)
-						w.logger.Error("failed to claim+enqueue scheduled fire; will retry boundary",
-							"name", name, "fire_time", nextRun, "error", err,
-							"consecutive_failures", fireFailures[name], "retry_in", delay)
-					default:
-						// Either we claimed and enqueued, or a peer already claimed this
-						// boundary; in both cases this worker is done with it.
-						delete(fireFailures, name)
-						delete(fireRetryAt, name)
-						lastRun[name] = nextRun
-					}
+					w.applyScheduleFireDisposition(scheduleFireOutcome{
+						name: name, nextRun: nextRun, now: now, err: err,
+						failures: fireFailures, retryAt: fireRetryAt, lastRun: lastRun,
+					})
 				}
 			}
 		}
@@ -3328,7 +3335,8 @@ func (w *Worker) Pause(mode core.PauseMode) {
 		// advanced — the job was permanently DEAD-LETTERED by an operation
 		// documented as the reversible half of Pause/Resume.
 		w.runningJobsMu.Lock()
-		for jobID, cancel := range w.runningJobs {
+		for jobID, rj := range w.runningJobs {
+			cancel := rj.cancel
 			w.pauseCancelled[jobID] = struct{}{}
 			cancel()
 		}
@@ -3347,7 +3355,8 @@ func (w *Worker) Pause(mode core.PauseMode) {
 // Returns true if the job was found and cancelled.
 func (w *Worker) CancelJob(jobID core.UUID) bool {
 	w.runningJobsMu.Lock()
-	cancel, ok := w.runningJobs[jobID]
+	rj, ok := w.runningJobs[jobID]
+	cancel := rj.cancel
 	w.runningJobsMu.Unlock()
 	if ok {
 		cancel()
@@ -3481,5 +3490,67 @@ func (w *Worker) WaitForPause(timeout time.Duration) error {
 		}
 
 		time.Sleep(pollInterval)
+	}
+}
+
+// runningJobEntry is one execution of a job on this worker.
+//
+// token identifies THAT run. Go cannot compare funcs, and every closure from a
+// single context.WithCancel call site shares a code pointer, so the cancel func
+// itself cannot serve as identity — an explicit monotonic token can.
+type runningJobEntry struct {
+	cancel context.CancelFunc
+	token  uint64
+}
+
+// scheduleFireOutcome is one EnqueueScheduledFire attempt plus the scheduler's
+// local bookkeeping.
+type scheduleFireOutcome struct {
+	name     string
+	nextRun  time.Time
+	now      time.Time
+	err      error
+	failures map[string]int
+	retryAt  map[string]time.Time
+	lastRun  map[string]time.Time
+}
+
+// applyScheduleFireDisposition records the outcome of one scheduled-fire attempt.
+//
+// Extracted from runScheduler's loop so it can be tested: driving the loop itself
+// requires real time to pass, so the three dispositions previously had no
+// coverage at all and swapping any of them for the old log-and-continue behaviour
+// left the suite green. The distinction between them is the whole point of the
+// change — whether a boundary is skipped once or retried at 10 Hz forever.
+func (w *Worker) applyScheduleFireDisposition(o scheduleFireOutcome) {
+	switch {
+	case errors.Is(o.err, core.ErrDuplicateJob):
+		// DELIBERATE SKIP, not a failure: the schedule declared queue.Unique and a
+		// previous fire is still live, so running a second instance is exactly what
+		// the author asked us not to do. EnqueueScheduledFire COMMITTED the claim,
+		// so the durable cursor already advanced and peers will not re-attempt this
+		// boundary. Advance locally too, and log at Info — a normal outcome.
+		w.logger.Info("scheduled fire skipped: a job with this schedule's unique key is still active",
+			"name", o.name, "fire_time", o.nextRun)
+		delete(o.failures, o.name)
+		delete(o.retryAt, o.name)
+		o.lastRun[o.name] = o.nextRun
+	case o.err != nil:
+		// GENUINE failure. Claim+enqueue are atomic, so this rolled back the claim
+		// and the boundary stays re-claimable. Do NOT advance lastRun — retry the
+		// same boundary rather than drop the fire — but back off, so a persistent
+		// failure does not cost one transaction and one ERROR log every 100ms tick.
+		o.failures[o.name]++
+		delay := scheduleFireRetryDelay(o.failures[o.name])
+		o.retryAt[o.name] = o.now.Add(delay)
+		w.logger.Error("failed to claim+enqueue scheduled fire; will retry boundary",
+			"name", o.name, "fire_time", o.nextRun, "error", o.err,
+			"consecutive_failures", o.failures[o.name], "retry_in", delay)
+	default:
+		// Either we claimed and enqueued, or a peer already claimed this boundary;
+		// in both cases this worker is done with it.
+		delete(o.failures, o.name)
+		delete(o.retryAt, o.name)
+		o.lastRun[o.name] = o.nextRun
 	}
 }

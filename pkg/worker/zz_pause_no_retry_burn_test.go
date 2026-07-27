@@ -267,15 +267,17 @@ func TestPause_ResumeBeforeHandlerSurfacesDoesNotDeadLetter(t *testing.T) {
 	assert.Contains(t, releasedIDs, job.ID, "the job must still be released for re-dispatch")
 }
 
-// TestProcessJob_DropsTheMarkEvenWhenTheHandlerPanics covers the defer-ordering
-// property the per-job cleanup depends on.
+// TestProcessJob_DropsTheMarkWhenTheHandlerPanics covers the panic path.
 //
-// processJob registers its panic-recovery defer BEFORE the runningJobs/mark
-// cleanup defer, and defers run LIFO — so the cleanup runs first and the mark is
-// dropped even on the panic path. If the two were ever reordered, a panicking job
-// would leave its mark behind and a genuine failure on its next run would be
-// silently swallowed as a pause.
-func TestProcessJob_DropsTheMarkEvenWhenTheHandlerPanics(t *testing.T) {
+// SCOPE, corrected after review: an earlier version of this comment claimed the
+// test proves a defer-ORDERING property. It does not, and the claim was wrong
+// twice over — a handler panic is recovered in executeHandler, so processJob's own
+// recovery defer is never entered here; and on a panic unwind every registered
+// defer runs regardless of order, which only decides which runs first. What this
+// actually pins is the outcome that matters: a job whose handler panicked leaves
+// no mark behind, so a genuine failure on its next run cannot be swallowed as a
+// pause.
+func TestProcessJob_DropsTheMarkWhenTheHandlerPanics(t *testing.T) {
 	q := queue.New(&mockStorage{})
 	q.Register("boom", func(context.Context, struct{}) error { panic("handler exploded") })
 
@@ -407,4 +409,48 @@ func TestPause_AggressiveEndsTheAttemptSpan(t *testing.T) {
 
 	assert.Equal(t, int64(1), waitingHookCalls.Load(),
 		"an aggressively-paused attempt must end its span, or every paused job leaks one")
+}
+
+// TestProcessJob_LaterRunKeepsItsRegistration guards a lifecycle race the pause
+// path introduced.
+//
+// Releasing to `pending` while this worker is still alive and polling is new: the
+// same job can be re-dequeued into a SECOND processJob before the first one's
+// deferred cleanup runs. An unconditional `delete(runningJobs, id)` in that
+// cleanup then removes the SECOND run's registration, leaving it invisible to
+// Pause(Aggressive), Queue.CancelJob's local cancel, and the ownership audit for
+// its whole duration. The entry is keyed on a per-run token so each run only ever
+// removes its own.
+//
+// FALSE-GREEN TRAP: comparing the cancel funcs instead of a token looks like it
+// works and cannot — Go forbids comparing funcs, and every closure from one
+// context.WithCancel call site shares a code pointer, so a reflect-based identity
+// check returns true for two DIFFERENT runs and deletes the live entry anyway.
+func TestProcessJob_LaterRunKeepsItsRegistration(t *testing.T) {
+	w := NewWorker(queue.New(&mockStorage{}))
+	id := core.NewID()
+
+	// Simulate run #1 registering, then run #2 replacing it.
+	w.runningJobsMu.Lock()
+	tok1 := w.nextRunToken.Add(1)
+	w.runningJobs[id] = runningJobEntry{cancel: func() {}, token: tok1}
+	tok2 := w.nextRunToken.Add(1)
+	w.runningJobs[id] = runningJobEntry{cancel: func() {}, token: tok2}
+	w.runningJobsMu.Unlock()
+
+	// Run #1's deferred cleanup finally fires. It must NOT evict run #2.
+	w.runningJobsMu.Lock()
+	if cur, ok := w.runningJobs[id]; ok && cur.token == tok1 {
+		delete(w.runningJobs, id)
+	}
+	w.runningJobsMu.Unlock()
+
+	w.runningJobsMu.Lock()
+	cur, stillThere := w.runningJobs[id]
+	w.runningJobsMu.Unlock()
+
+	require.True(t, stillThere,
+		"a later run's registration must survive an earlier run's cleanup, or it is invisible "+
+			"to Pause, CancelJob and the ownership audit for its whole duration")
+	assert.Equal(t, tok2, cur.token, "and it must still be the LATER run that is registered")
 }
