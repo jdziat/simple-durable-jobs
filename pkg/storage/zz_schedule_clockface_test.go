@@ -192,3 +192,65 @@ func TestScheduleCursorLess_NormalizesEveryStoredShape(t *testing.T) {
 	// match, and the boundary is simply not claimed — never an error or a claim.
 	assert.Nil(t, render(nil), "NULL must stay NULL so the claim fails closed")
 }
+
+// TestClaimScheduledFire_SubMillisecondBoundariesStillAdvance guards a regression
+// the instant-normalization introduced.
+//
+// Normalizing BOTH sides truncates to the expression's resolution: strftime('%f')
+// keeps milliseconds, datetime() only whole seconds. Two boundaries inside one
+// millisecond then compare "not less than", the claim matches nothing, and the
+// schedule stops entirely — measured against a released v4.7.0 binary,
+// Every(100µs) went from 20/20 boundaries to 2/20 and Every(1ns) to 0/20. A
+// silent permanent stall is exactly the failure this whole change set exists to
+// remove, so trading it for the cross-face fix would be no trade at all.
+//
+// The predicate is face-aware: identical offsets compare as raw text, which is
+// exact to the nanoseconds the driver wrote.
+//
+// FALSE-GREEN TRAP: boundaries a second or more apart pass under every variant,
+// including the ones that stall. The gap has to be sub-millisecond.
+func TestClaimScheduledFire_SubMillisecondBoundariesStillAdvance(t *testing.T) {
+	s := newTestStorage(t)
+	ctx := context.Background()
+
+	base := time.Date(2026, 7, 27, 10, 0, 0, 0, time.UTC)
+	_, err := s.SeedScheduledFire(ctx, "sub-ms", base)
+	require.NoError(t, err)
+
+	// The floor is the COLUMN's own resolution, and it differs per dialect. Steps
+	// below it cannot be represented at all, so failing to advance there is
+	// physics rather than a defect. Measured directly:
+	//
+	//   SQLite    text-encoded  -> nanoseconds round-trip
+	//   Postgres  timestamptz   -> MICROSECOND (a 1ns and a 100ns step round away)
+	//   MySQL     datetime(3)   -> MILLISECOND
+	//
+	// Only SQLite was ever at risk from the comparison expression truncating,
+	// because only there does the column hold more precision than a normalized
+	// rendering would keep.
+	floor := time.Millisecond // MySQL datetime(3)
+	switch {
+	case s.isSQLite:
+		floor = time.Nanosecond
+	case s.db.Name() == "postgres":
+		floor = time.Microsecond
+	}
+	steps := []time.Duration{floor, 100 * floor, 500 * floor}
+	for _, step := range steps {
+		t.Run(step.String(), func(t *testing.T) {
+			name := "sub-ms-" + step.String()
+			_, err := s.SeedScheduledFire(ctx, name, base)
+			require.NoError(t, err)
+
+			cur := base
+			for i := range 20 {
+				cur = cur.Add(step)
+				won, err := s.ClaimScheduledFire(ctx, name, cur)
+				require.NoError(t, err)
+				require.True(t, won,
+					"boundary %d at +%v must be claimable: a schedule whose period is below the "+
+						"comparison's resolution stops firing entirely and silently", i+1, step)
+			}
+		})
+	}
+}

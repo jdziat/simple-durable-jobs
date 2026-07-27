@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log/slog"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -86,14 +87,13 @@ func TestPause_AggressiveReleasesInsteadOfFailing(t *testing.T) {
 // forever, turning a dead-letter bug into an infinite-retry bug.
 func TestPause_AggressiveConsumesTheMarkExactlyOnce(t *testing.T) {
 	w := NewWorker(queue.New(&mockStorage{}))
-	id := core.NewID()
 
 	w.runningJobsMu.Lock()
-	w.pauseCancelled[id] = struct{}{}
+	w.pauseCancelled[1] = struct{}{}
 	w.runningJobsMu.Unlock()
 
-	assert.True(t, w.takePauseCancelled(id), "the first read must see the mark")
-	assert.False(t, w.takePauseCancelled(id),
+	assert.True(t, w.takePauseCancelled(1), "the first read must see the mark")
+	assert.False(t, w.takePauseCancelled(1),
 		"the mark must be consumed — a surviving mark would mask a real failure on the job's next run")
 }
 
@@ -110,15 +110,14 @@ func TestPause_AggressiveConsumesTheMarkExactlyOnce(t *testing.T) {
 // own completion must.
 func TestResume_DoesNotClearMarksForStillRunningJobs(t *testing.T) {
 	w := NewWorker(queue.New(&mockStorage{}))
-	id := core.NewID()
 
 	w.runningJobsMu.Lock()
-	w.pauseCancelled[id] = struct{}{}
+	w.pauseCancelled[1] = struct{}{}
 	w.runningJobsMu.Unlock()
 
 	w.Resume()
 
-	assert.True(t, w.takePauseCancelled(id),
+	assert.True(t, w.takePauseCancelled(1),
 		"Resume must NOT clear the mark of a job still running: its handler may not have "+
 			"surfaced the cancellation yet, and losing the mark dead-letters it")
 }
@@ -137,14 +136,14 @@ func TestProcessJob_DropsTheUnconsumedMarkOnCompletion(t *testing.T) {
 	// Mark it as if an aggressive pause had cancelled it, then let it finish
 	// normally — the handler never observes the cancellation.
 	w.runningJobsMu.Lock()
-	w.pauseCancelled[job.ID] = struct{}{}
+	w.pauseCancelled[1] = struct{}{}
 	w.runningJobsMu.Unlock()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	w.processJob(ctx, job)
 
-	assert.False(t, w.takePauseCancelled(job.ID),
+	assert.False(t, w.takePauseCancelled(1),
 		"a finished job must leave no mark behind, or a real failure on its next run is "+
 			"silently swallowed as a pause and released forever")
 }
@@ -288,16 +287,16 @@ func TestProcessJob_DropsTheMarkWhenTheHandlerPanics(t *testing.T) {
 	job := &core.Job{ID: core.NewID(), Type: "boom", Queue: "default", Status: core.StatusRunning, MaxRetries: 2}
 
 	w.runningJobsMu.Lock()
-	w.pauseCancelled[job.ID] = struct{}{}
+	w.pauseCancelled[1] = struct{}{}
 	w.runningJobsMu.Unlock()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	require.NotPanics(t, func() { w.processJob(ctx, job) }, "a handler panic must be recovered")
 
-	assert.False(t, w.takePauseCancelled(job.ID),
-		"the mark must be dropped on the panic path too — the cleanup defer is registered after "+
-			"the recovery defer and LIFO must keep it running first")
+	assert.False(t, w.takePauseCancelled(1),
+		"a job whose handler panicked must leave no mark behind, or a genuine failure on its "+
+			"next run is silently swallowed as a pause")
 }
 
 // TestPause_GenuineErrorDuringAPauseStillFails guards the `selfCancelled &&`
@@ -414,48 +413,102 @@ func TestPause_AggressiveEndsTheAttemptSpan(t *testing.T) {
 		"an aggressively-paused attempt must end its span, or every paused job leaks one")
 }
 
-// TestProcessJob_LaterRunKeepsItsRegistration guards a lifecycle race the pause
-// path introduced.
+// TestProcessJob_LaterRunDoesNotLoseItsStateToAnEarlierCleanup guards a
+// lifecycle race the pause path introduced, through the REAL code.
 //
-// Releasing to `pending` while this worker is still alive and polling is new: the
-// same job can be re-dequeued into a SECOND processJob before the first one's
-// deferred cleanup runs. An unconditional `delete(runningJobs, id)` in that
-// cleanup then removes the SECOND run's registration, leaving it invisible to
-// Pause(Aggressive), Queue.CancelJob's local cancel, and the ownership audit for
-// its whole duration. The entry is keyed on a per-run token so each run only ever
-// removes its own.
+// Releasing to `pending` while this worker still polls is new: the same job can be
+// re-dequeued into a SECOND processJob before the first one's deferred cleanup
+// runs. That cleanup must not evict the second run's registration, and — the half
+// this originally missed — must not eat its pause mark either. Losing the mark
+// sends run #2's pause cancellation down the ordinary failure path and calls Fail,
+// which is exactly the attempt-burning this packet exists to prevent.
 //
-// FALSE-GREEN TRAP: comparing the cancel funcs instead of a token looks like it
-// works and cannot — Go forbids comparing funcs, and every closure from one
-// context.WithCancel call site shares a code pointer, so a reflect-based identity
-// check returns true for two DIFFERENT runs and deletes the live entry anyway.
-func TestProcessJob_LaterRunKeepsItsRegistration(t *testing.T) {
-	w := NewWorker(queue.New(&mockStorage{}))
-	id := core.NewID()
-
-	// Simulate run #1 registering, then run #2 replacing it.
-	w.runningJobsMu.Lock()
-	tok1 := w.nextRunToken.Add(1)
-	w.runningJobs[id] = runningJobEntry{cancel: func() {}, token: tok1}
-	tok2 := w.nextRunToken.Add(1)
-	w.runningJobs[id] = runningJobEntry{cancel: func() {}, token: tok2}
-	w.runningJobsMu.Unlock()
-
-	// Run #1's deferred cleanup finally fires. It must NOT evict run #2.
-	w.runningJobsMu.Lock()
-	if cur, ok := w.runningJobs[id]; ok && cur.token == tok1 {
-		delete(w.runningJobs, id)
+// FALSE-GREEN TRAPS, both of which earlier versions of this test fell into:
+//  1. asserting against a hand-rolled copy of the keyed-delete logic passes with
+//     the production guard reverted, because the production code never runs;
+//  2. pausing run #2 AFTER run #1 has finished closes the window by ordering, so
+//     there is no race left to lose. The mark for run #2 must exist BEFORE run
+//     #1's cleanup fires.
+//
+// The interleaving is therefore forced: run #1 blocks inside Release (past its own
+// mark), run #2 starts and is marked by a pause, and only THEN is run #1 let go so
+// its cleanup lands on run #2's live state. Run #2 holds its cancellation until
+// that has happened.
+func TestProcessJob_LaterRunDoesNotLoseItsStateToAnEarlierCleanup(t *testing.T) {
+	var failCalls atomic.Int64
+	store := &mockStorage{}
+	store.failFunc = func(context.Context, core.UUID, string, string, *time.Time) error {
+		failCalls.Add(1)
+		return nil
 	}
-	w.runningJobsMu.Unlock()
+	releaseGate := make(chan struct{})
+	var firstRelease sync.Once
+	store.releaseJobFunc = func(context.Context, core.UUID, string) error {
+		firstRelease.Do(func() { <-releaseGate }) // hold run #1 before its defer
+		return nil
+	}
 
-	w.runningJobsMu.Lock()
-	cur, stillThere := w.runningJobs[id]
-	w.runningJobsMu.Unlock()
+	q := queue.New(store)
+	started := make(chan struct{}, 2)
+	surfaced := make(chan struct{}) // run #2 waits here after being cancelled
+	var runs atomic.Int64
+	q.Register("slow", func(ctx context.Context, _ struct{}) error {
+		mine := runs.Add(1)
+		started <- struct{}{}
+		<-ctx.Done()
+		if mine == 2 {
+			<-surfaced // do not return until run #1's cleanup has run
+		}
+		return ctx.Err()
+	})
 
-	require.True(t, stillThere,
-		"a later run's registration must survive an earlier run's cleanup, or it is invisible "+
-			"to Pause, CancelJob and the ownership audit for its whole duration")
-	assert.Equal(t, tok2, cur.token, "and it must still be the LATER run that is registered")
+	jobID := core.NewID()
+	newJob := func() *core.Job {
+		return &core.Job{ID: jobID, Type: "slow", Queue: "default", Status: core.StatusRunning, Attempt: 1, MaxRetries: 2}
+	}
+
+	w := NewWorker(q)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	done1 := make(chan struct{})
+	go func() { defer close(done1); w.processJob(ctx, newJob()) }()
+	<-started
+	w.Pause(core.PauseModeAggressive) // marks + cancels run #1; it blocks in Release
+	w.Resume()
+
+	done2 := make(chan struct{})
+	go func() { defer close(done2); w.processJob(ctx, newJob()) }()
+	<-started
+
+	// Mark run #2 while run #1 is STILL unwinding — this is the state whose loss
+	// is the bug. Both runs are marked at this point: run #1's mark is its own
+	// (already consumed or not), run #2's is separate because marks are keyed by
+	// RUN, not by job id.
+	w.Pause(core.PauseModeAggressive)
+	require.Eventually(t, func() bool {
+		w.runningJobsMu.Lock()
+		defer w.runningJobsMu.Unlock()
+		return len(w.pauseCancelled) > 0
+	}, 5*time.Second, 5*time.Millisecond, "run #2 must be marked before run #1 cleans up")
+
+	close(releaseGate) // run #1's deferred cleanup now lands on run #2's state
+	select {
+	case <-done1:
+	case <-time.After(10 * time.Second):
+		t.Fatal("run #1 never returned")
+	}
+
+	close(surfaced) // now let run #2 surface its cancellation
+	select {
+	case <-done2:
+	case <-time.After(10 * time.Second):
+		t.Fatal("run #2 never returned")
+	}
+
+	assert.Zero(t, failCalls.Load(),
+		"an earlier run's cleanup must not eat a later run's pause mark: losing it sends the "+
+			"later run's pause cancellation down the failure path and burns an attempt")
 }
 
 // TestPause_AggressiveLogsExactlyOneOutcome guards a defect that survived its own

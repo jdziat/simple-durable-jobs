@@ -62,7 +62,17 @@ type Worker struct {
 	// Pause(PauseModeAggressive) rather than by a genuine failure or shutdown.
 	// Guarded by runningJobsMu, which already guards the cancel funcs the pause
 	// invokes, so the mark and the cancel cannot be observed out of order.
-	pauseCancelled map[core.UUID]struct{}
+	// pauseCancelled holds the RUN TOKENS whose handler an aggressive pause
+	// cancelled. Keyed by run, NOT by job id.
+	//
+	// Two runs of the same job id can be alive at once now that the pause path
+	// releases to `pending` while this worker still polls, and a map keyed by job
+	// id is a single shared slot between them — whichever run reads or writes it
+	// last wins, so one run steals or clobbers the other's mark and that run's
+	// cancellation falls through to the ordinary failure path and burns an
+	// attempt. Both directions of that were reproduced before this was keyed by
+	// run. A token is unique to one run, so there is nothing to share.
+	pauseCancelled map[uint64]struct{}
 	runningJobsMu  sync.Mutex
 
 	// Per-queue concurrency tracking
@@ -478,7 +488,7 @@ func NewWorker(q *queue.Queue, opts ...WorkerOption) *Worker {
 		logger:                  slog.Default(),
 		forcedHandlerDrainGrace: defaultForcedHandlerDrainGrace,
 		runningJobs:             make(map[core.UUID]runningJobEntry),
-		pauseCancelled:          make(map[core.UUID]struct{}),
+		pauseCancelled:          make(map[uint64]struct{}),
 		queueRunning:            queueRunning,
 		queueJobID:              make(map[core.UUID]string),
 		slotJobID:               make(map[core.UUID][]string),
@@ -1899,16 +1909,25 @@ func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 		// and the ownership audit for its whole duration. The per-run token keeps
 		// each run responsible for exactly its own entry — see runningJobEntry for
 		// why the cancel func itself cannot serve as that identity.
+		//
+		// BOTH deletes are inside the guard. The pause mark needs it for the same
+		// reason and more urgently: Pause(Aggressive) marks by JOB ID from
+		// runningJobs, so once a later run has replaced the entry a new mark
+		// belongs to THAT run. An unconditional delete here let run #1's cleanup
+		// eat run #2's mark, after which run #2's pause cancellation fell through
+		// to the ordinary failure path and called Fail — the precise
+		// attempt-burning this packet exists to prevent, reintroduced by the fix
+		// for a different race.
 		if cur, ok := w.runningJobs[job.ID]; ok && cur.token == runToken {
 			delete(w.runningJobs, job.ID)
+			w.runningJobsMu.Unlock()
 			w.queue.UnregisterRunningJob(job.ID)
+			w.runningJobsMu.Lock()
 		}
-		// Drop any unconsumed pause mark HERE, per job, rather than in Resume.
-		// The mark is consumed by takePauseCancelled on the error path; it survives
-		// only when the handler finished without ever surfacing the cancellation.
-		// This runs exactly when that job is done, so a mark can neither leak into
-		// a later run nor be cleared out from under a job that is still executing.
-		delete(w.pauseCancelled, job.ID)
+		// Drop this run's mark if it went unconsumed — which happens when the
+		// handler finished without ever surfacing the cancellation. The key is our
+		// own token, so this can never touch another run's.
+		delete(w.pauseCancelled, runToken)
 		w.runningJobsMu.Unlock()
 	}()
 
@@ -2009,7 +2028,7 @@ func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 	// marked. Releasing on that would drop a real failure on the floor: no Fail,
 	// no JobFailed, no attempt burned, error discarded. Require the error to
 	// actually BE this worker's self-cancel.
-	if err != nil && selfCancelled && w.takePauseCancelled(job.ID) {
+	if err != nil && selfCancelled && w.takePauseCancelled(runToken) {
 		// An aggressive pause cancelled this handler. That is an OPERATOR
 		// instruction to stop, not a job failure, so it must not travel the
 		// failure path: doing so burned an attempt and — at the default
@@ -3317,13 +3336,15 @@ func (w *Worker) runOwnershipAudit(ctx context.Context) {
 // Consuming the mark matters: a job released by a pause is re-dispatched on
 // resume, and if the mark survived, a genuine failure on that later run would be
 // silently swallowed as "just a pause" and released forever.
-func (w *Worker) takePauseCancelled(jobID core.UUID) bool {
+// takePauseCancelled reports whether THIS run's handler was cancelled by an
+// aggressive pause, consuming the mark if so.
+func (w *Worker) takePauseCancelled(runToken uint64) bool {
 	w.runningJobsMu.Lock()
 	defer w.runningJobsMu.Unlock()
-	if _, ok := w.pauseCancelled[jobID]; !ok {
+	if _, ok := w.pauseCancelled[runToken]; !ok {
 		return false
 	}
-	delete(w.pauseCancelled, jobID)
+	delete(w.pauseCancelled, runToken)
 	return true
 }
 
@@ -3340,10 +3361,9 @@ func (w *Worker) Pause(mode core.PauseMode) {
 		// advanced — the job was permanently DEAD-LETTERED by an operation
 		// documented as the reversible half of Pause/Resume.
 		w.runningJobsMu.Lock()
-		for jobID, rj := range w.runningJobs {
-			cancel := rj.cancel
-			w.pauseCancelled[jobID] = struct{}{}
-			cancel()
+		for _, rj := range w.runningJobs {
+			w.pauseCancelled[rj.token] = struct{}{}
+			rj.cancel()
 		}
 		w.runningJobsMu.Unlock()
 	}

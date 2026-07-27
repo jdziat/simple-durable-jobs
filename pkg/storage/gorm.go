@@ -1334,22 +1334,38 @@ func (s *GormStorage) ClaimScheduledFire(ctx context.Context, name string, fireT
 // silently stalls the other family on upgrade for the length of the UTC offset.
 // Both directions were measured against databases written by a real v4.7.0 build.
 //
-// strftime() parses the offset and renders UTC, so the comparison is on INSTANTS
-// and is correct for every row whatever face it was stored on — no migration, and
-// no dependence on which constructor wrote it. Postgres and MySQL store a real
-// timestamp and already compare instants, so they keep the native form.
+// It is FACE-AWARE, and both halves are load-bearing:
 //
-// %f, not datetime(): datetime() truncates to whole SECONDS, which collapses any
-// two boundaries inside the same second into "not less than" and stalls a
-// sub-second schedule outright (it broke Every-based scheduling immediately). %f
-// keeps milliseconds, which is the column's own resolution and two orders of
-// magnitude finer than the 100ms poll interval.
-func (s *GormStorage) scheduleCursorLess() string {
-	if s.isSQLite {
-		const utcMillis = `strftime('%Y-%m-%d %H:%M:%f', `
-		return utcMillis + "last_fire_at) < " + utcMillis + "?)"
+//   - When the stored cursor and the incoming boundary carry the SAME offset —
+//     which is the normal case, since both derive from one anchor — they are
+//     compared as raw text. That is exact to the full precision the driver wrote
+//     (nanoseconds), so a sub-millisecond schedule still advances.
+//   - When the offsets DIFFER, strftime() parses each and renders UTC, so the
+//     comparison is on instants and is correct for every row whatever face it was
+//     stored on — no migration, and no dependence on which constructor wrote it.
+//
+// Normalizing unconditionally is what an earlier version did, and it truncated to
+// the expression's resolution: %f keeps milliseconds, which silently stalled
+// sub-millisecond Every schedules that a released binary advanced (measured
+// against v4.7.0: Every(100µs) went 20/20 -> 2/20, Every(1ns) -> 0/20). datetime()
+// is worse still, truncating to whole SECONDS. Falling back to raw text ONLY when
+// the faces match keeps precision without reintroducing the cross-face bug, since
+// a lexical comparison of two identically-offset timestamps is exact.
+//
+// Postgres and MySQL store a real timestamp and already compare instants, so they
+// keep the native form.
+//
+// Returns the predicate and the binds it needs, because the SQLite form
+// references the boundary three times.
+func (s *GormStorage) scheduleCursorLess(fireTime time.Time) (string, []any) {
+	if !s.isSQLite {
+		return "last_fire_at < ?", []any{fireTime}
 	}
-	return "last_fire_at < ?"
+	const utc = `strftime('%Y-%m-%d %H:%M:%f', `
+	// substr(x, -6) is the trailing "+HH:MM" / "-HH:MM" the driver always writes.
+	pred := "CASE WHEN substr(last_fire_at, -6) = substr(?, -6) THEN last_fire_at < ? " +
+		"ELSE " + utc + "last_fire_at) < " + utc + "?) END"
+	return pred, []any{fireTime, fireTime, fireTime}
 }
 
 // ClaimScheduledFireTx is ClaimScheduledFire performed within a caller-owned
@@ -1363,9 +1379,11 @@ func (s *GormStorage) ClaimScheduledFireTx(ctx context.Context, tx *gorm.DB, nam
 		return false, err
 	}
 
+	cursorLess, cursorArgs := s.scheduleCursorLess(fireTime)
+	whereArgs := append([]any{name}, cursorArgs...)
 	result := tx.WithContext(ctx).
 		Model(&core.ScheduledFire{}).
-		Where("name = ? AND "+s.scheduleCursorLess(), name, fireTime).
+		Where("name = ? AND "+cursorLess, whereArgs...).
 		Updates(map[string]any{
 			"last_fire_at":  fireTime,
 			"last_fired_at": fireTime,
