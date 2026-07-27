@@ -1920,9 +1920,15 @@ func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 		// for a different race.
 		if cur, ok := w.runningJobs[job.ID]; ok && cur.token == runToken {
 			delete(w.runningJobs, job.ID)
-			w.runningJobsMu.Unlock()
+			// Unregister WITHOUT dropping runningJobsMu. Releasing it here reopened
+			// the very window the token closes, one level down: a later run that
+			// registered in the gap had its QUEUE-level entry deleted by this one,
+			// leaving a live handler invisible to Queue.CancelJob and
+			// Queue.PauseJob for its whole duration. Holding the lock across the
+			// call is safe because q.runningJobsMu is a LEAF — every queue path
+			// copies the cancel func out and unlocks before invoking it, so nothing
+			// acquires this mutex while holding that one.
 			w.queue.UnregisterRunningJob(job.ID)
-			w.runningJobsMu.Lock()
 		}
 		// Drop this run's mark if it went unconsumed — which happens when the
 		// handler finished without ever surfacing the cancellation. The key is our

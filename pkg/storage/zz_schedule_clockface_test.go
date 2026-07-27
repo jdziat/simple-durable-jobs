@@ -108,7 +108,10 @@ func TestClaimScheduledFire_LegacyUTCCursorStillClaims(t *testing.T) {
 // UTC made nine consecutive hourly boundaries claim FALSE with a nil error, i.e.
 // the schedule silently stopped for the length of the UTC offset before
 // self-healing. Normalizing to local instead breaks the UTC family the same way.
-// The comparison has to be face-independent, which is what datetime() gives.
+// The comparison has to be face-independent, which is what the shipped predicate
+// gives: raw text when the two offsets match, strftime-normalized instants when
+// they differ. (Not datetime() — that truncates to whole SECONDS and stalls
+// sub-second schedules; see scheduleCursorLess.)
 //
 // FALSE-GREEN TRAP: a fixed zone whose offset is NEGATIVE relative to UTC still
 // sorts correctly as text, so it passes with the bug present. The probe zone must
@@ -121,13 +124,18 @@ func TestClaimScheduledFire_LegacyLocalFacedCursorStillClaims(t *testing.T) {
 	stored := time.Date(2026, 7, 27, 11, 0, 0, 0, east) // 02:00Z, written by an older binary
 	require.NoError(t, s.DB().Create(&core.ScheduledFire{Name: "every-legacy", LastFireAt: stored}).Error)
 
-	// The next hourly boundary an Every schedule produces keeps that same location.
-	next := stored.Add(time.Hour)
+	// The boundary is rendered on a DIFFERENT face — what a schedule carrying its
+	// own location (CronIn/DailyIn/WeeklyIn, or a CRON_TZ= prefix) produces against
+	// this legacy cursor. A same-face boundary would compare correctly under every
+	// predicate ever shipped here, including the broken ones, so it would prove
+	// nothing about the upgrade.
+	next := stored.Add(time.Hour).UTC()
 	won, err := s.ClaimScheduledFire(ctx, "every-legacy", next)
 	require.NoError(t, err)
 	assert.True(t, won,
-		"an Every cursor written on a positive-offset local face must still claim — forcing "+
-			"either clock face at write time stalls one of the two schedule families on upgrade")
+		"an Every cursor written on a positive-offset local face must still claim a boundary "+
+			"expressed elsewhere — forcing either clock face at write time stalls one of the two "+
+			"schedule families on upgrade")
 }
 
 // TestScheduleCursorLess_NormalizesEveryStoredShape pins the normalizing

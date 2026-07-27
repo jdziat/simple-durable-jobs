@@ -33,8 +33,9 @@ echo "baseline: $BASE_TAG    working tree: $(git -C "$ROOT" rev-parse --short HE
 
 mkdir -p "$WORK/base"
 git -C "$ROOT" archive "$BASE_TAG" | tar -x -C "$WORK/base"
+# The probe is copied INTO the baseline tree so both binaries run identical probe
+# code against their own library version; HEAD builds it from the working tree.
 cp -r "$ROOT/scripts/upgradematrix" "$WORK/base/upgradematrix"
-cp -r "$ROOT/scripts/upgradematrix" "$WORK/head_probe_src"
 
 ( cd "$WORK/base" && go build -o "$WORK/seed" ./upgradematrix/ )
 ( cd "$ROOT" && go build -o "$WORK/head" ./scripts/upgradematrix/ )

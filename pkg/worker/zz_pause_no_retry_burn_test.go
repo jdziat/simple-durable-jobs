@@ -579,52 +579,79 @@ func TestPause_AggressiveLogsExactlyOneOutcome(t *testing.T) {
 }
 
 // TestProcessJob_LaterRunKeepsTheQueueRegistration covers the other half of the
-// keyed cleanup: the QUEUE-level registry that Queue.CancelJob uses to cancel a
-// locally-running job.
+// keyed cleanup: the QUEUE-level registry that Queue.CancelJob and
+// Queue.PauseJob read to reach a locally-running handler.
 //
 // An earlier run must not unregister a job a later run now owns, or CancelJob
-// silently degrades to a durable-only cancel — the storage row is marked but the
-// handler keeps running to completion, which is precisely the "cancel does not
-// cancel" behaviour this project has fixed before.
+// degrades to a durable-only cancel — the row is marked and the handler runs to
+// completion, which is the "cancel does not cancel" class this project has fixed
+// before.
 //
-// FALSE-GREEN TRAP: asserting on the worker's own runningJobs map tests the wrong
-// registry. CancelJob reads the QUEUE's, so the observation has to be that
-// cancelling actually reaches the running handler.
+// FALSE-GREEN TRAP, and the previous version of this test was exactly it: it
+// copy-pasted the production guard into its own body and asserted on the copy, so
+// it was structurally incapable of failing on any change to worker.go — reverting
+// the guard entirely left the whole package green. It reads as coverage for the
+// one mechanism this area most needs covered, which makes it worse than nothing.
+// This drives two REAL processJob runs and then cancels through the public Queue
+// API.
 func TestProcessJob_LaterRunKeepsTheQueueRegistration(t *testing.T) {
-	q := queue.New(&mockStorage{})
-	w := NewWorker(q)
-	jobID := core.NewID()
-
-	// Run #1 registers, then run #2 replaces it — the state after a re-dequeue.
-	c1 := func() {}
-	var cancelled2 atomic.Bool
-	c2 := func() { cancelled2.Store(true) }
-
-	w.runningJobsMu.Lock()
-	tok1 := w.nextRunToken.Add(1)
-	w.runningJobs[jobID] = runningJobEntry{cancel: c1, token: tok1}
-	w.runningJobsMu.Unlock()
-	q.RegisterRunningJob(jobID, c1)
-
-	w.runningJobsMu.Lock()
-	tok2 := w.nextRunToken.Add(1)
-	w.runningJobs[jobID] = runningJobEntry{cancel: c2, token: tok2}
-	w.runningJobsMu.Unlock()
-	q.RegisterRunningJob(jobID, c2)
-
-	// Run #1's deferred cleanup fires: its guard must fail, so it must NOT touch
-	// the queue registry.
-	w.runningJobsMu.Lock()
-	if cur, ok := w.runningJobs[jobID]; ok && cur.token == tok1 {
-		delete(w.runningJobs, jobID)
-		w.runningJobsMu.Unlock()
-		q.UnregisterRunningJob(jobID)
-		w.runningJobsMu.Lock()
+	store := &mockStorage{}
+	releaseGate := make(chan struct{})
+	var firstRelease sync.Once
+	store.releaseJobFunc = func(context.Context, core.UUID, string) error {
+		firstRelease.Do(func() { <-releaseGate }) // hold run #1 before its cleanup
+		return nil
 	}
-	w.runningJobsMu.Unlock()
 
+	q := queue.New(store)
+	started := make(chan struct{}, 2)
+	var runs atomic.Int64
+	var run2Cancelled atomic.Bool
+	q.Register("slow", func(ctx context.Context, _ struct{}) error {
+		mine := runs.Add(1)
+		started <- struct{}{}
+		<-ctx.Done()
+		if mine == 2 {
+			run2Cancelled.Store(true)
+		}
+		return ctx.Err()
+	})
+
+	jobID := core.NewID()
+	newJob := func() *core.Job {
+		return &core.Job{ID: jobID, Type: "slow", Queue: "default", Status: core.StatusRunning, MaxRetries: 2}
+	}
+
+	w := NewWorker(q)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	done1 := make(chan struct{})
+	go func() { defer close(done1); w.processJob(ctx, newJob()) }()
+	<-started
+	w.Pause(core.PauseModeAggressive) // run #1 heads into Release and blocks
+	w.Resume()
+
+	done2 := make(chan struct{})
+	go func() { defer close(done2); w.processJob(ctx, newJob()) }()
+	<-started
+
+	// Run #1's deferred cleanup lands while run #2 is registered and running.
+	close(releaseGate)
+	select {
+	case <-done1:
+	case <-time.After(10 * time.Second):
+		t.Fatal("run #1 never returned")
+	}
+
+	// The only thing that can reach run #2's handler is the QUEUE registry.
 	require.NoError(t, q.CancelJob(context.Background(), jobID))
-	assert.True(t, cancelled2.Load(),
+	select {
+	case <-done2:
+	case <-time.After(10 * time.Second):
+		t.Fatal("run #2 never returned; CancelJob did not reach its handler")
+	}
+	assert.True(t, run2Cancelled.Load(),
 		"an earlier run's cleanup must leave the later run registered with the QUEUE, or "+
 			"CancelJob marks the row and never reaches the handler still executing it")
 }
