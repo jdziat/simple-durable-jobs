@@ -577,3 +577,54 @@ func TestPause_AggressiveLogsExactlyOneOutcome(t *testing.T) {
 			"and the error must say what actually happens")
 	})
 }
+
+// TestProcessJob_LaterRunKeepsTheQueueRegistration covers the other half of the
+// keyed cleanup: the QUEUE-level registry that Queue.CancelJob uses to cancel a
+// locally-running job.
+//
+// An earlier run must not unregister a job a later run now owns, or CancelJob
+// silently degrades to a durable-only cancel — the storage row is marked but the
+// handler keeps running to completion, which is precisely the "cancel does not
+// cancel" behaviour this project has fixed before.
+//
+// FALSE-GREEN TRAP: asserting on the worker's own runningJobs map tests the wrong
+// registry. CancelJob reads the QUEUE's, so the observation has to be that
+// cancelling actually reaches the running handler.
+func TestProcessJob_LaterRunKeepsTheQueueRegistration(t *testing.T) {
+	q := queue.New(&mockStorage{})
+	w := NewWorker(q)
+	jobID := core.NewID()
+
+	// Run #1 registers, then run #2 replaces it — the state after a re-dequeue.
+	c1 := func() {}
+	var cancelled2 atomic.Bool
+	c2 := func() { cancelled2.Store(true) }
+
+	w.runningJobsMu.Lock()
+	tok1 := w.nextRunToken.Add(1)
+	w.runningJobs[jobID] = runningJobEntry{cancel: c1, token: tok1}
+	w.runningJobsMu.Unlock()
+	q.RegisterRunningJob(jobID, c1)
+
+	w.runningJobsMu.Lock()
+	tok2 := w.nextRunToken.Add(1)
+	w.runningJobs[jobID] = runningJobEntry{cancel: c2, token: tok2}
+	w.runningJobsMu.Unlock()
+	q.RegisterRunningJob(jobID, c2)
+
+	// Run #1's deferred cleanup fires: its guard must fail, so it must NOT touch
+	// the queue registry.
+	w.runningJobsMu.Lock()
+	if cur, ok := w.runningJobs[jobID]; ok && cur.token == tok1 {
+		delete(w.runningJobs, jobID)
+		w.runningJobsMu.Unlock()
+		q.UnregisterRunningJob(jobID)
+		w.runningJobsMu.Lock()
+	}
+	w.runningJobsMu.Unlock()
+
+	require.NoError(t, q.CancelJob(context.Background(), jobID))
+	assert.True(t, cancelled2.Load(),
+		"an earlier run's cleanup must leave the later run registered with the QUEUE, or "+
+			"CancelJob marks the row and never reaches the handler still executing it")
+}

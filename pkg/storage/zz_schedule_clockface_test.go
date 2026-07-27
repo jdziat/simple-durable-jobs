@@ -254,3 +254,59 @@ func TestClaimScheduledFire_SubMillisecondBoundariesStillAdvance(t *testing.T) {
 		})
 	}
 }
+
+// TestClaimScheduledFire_VariableWidthFractionsCompareByValue pins the property
+// the same-offset fast path silently depends on.
+//
+// mattn/go-sqlite3 renders the fraction with Go's ".999999999" verb, which ELIDES
+// trailing zeros — so the stored width VARIES with the value:
+//
+//	500000000ns -> "...10:00:00.5+00:00"
+//	450000000ns -> "...10:00:00.45+00:00"
+//	        0ns -> "...10:00:00+00:00"      (no fraction at all)
+//
+// A lexical comparison of decimal fractions is only correct if the character that
+// TERMINATES a short fraction sorts below every digit. It does, but by luck of the
+// format rather than by design: the terminator is the offset sign, '+' (0x2B) or
+// '-' (0x2D), and both are below '0' (0x30). If the driver ever rendered a
+// zero-padded fixed-width fraction, or terminated with 'Z' (0x5A, ABOVE the
+// digits), the fast path would silently invert and a schedule would stop
+// advancing inside a second.
+//
+// FALSE-GREEN TRAP: pairs that differ in the whole-seconds part never reach the
+// fraction, and equal-width fractions compare the same either way. Only pairs
+// whose fractions differ in WIDTH exercise this.
+func TestClaimScheduledFire_VariableWidthFractionsCompareByValue(t *testing.T) {
+	s := newTestStorage(t)
+	if !s.isSQLite {
+		t.Skip("the text fast path is SQLite-only")
+	}
+	ctx := context.Background()
+	base := time.Date(2026, 7, 27, 10, 0, 0, 0, time.UTC)
+
+	for _, tc := range []struct {
+		name       string
+		cursor, to time.Duration
+		wantClaim  bool
+	}{
+		{"no-fraction to .5", 0, 500 * time.Millisecond, true},
+		{".05 to .5", 50 * time.Millisecond, 500 * time.Millisecond, true},
+		{".45 to .5", 450 * time.Millisecond, 500 * time.Millisecond, true},
+		{".5 to .55", 500 * time.Millisecond, 550 * time.Millisecond, true},
+		{".5 back to .45", 500 * time.Millisecond, 450 * time.Millisecond, false},
+		{".55 back to .5", 550 * time.Millisecond, 500 * time.Millisecond, false},
+		{".5 back to no-fraction", 500 * time.Millisecond, 0, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			name := "frac-" + tc.name
+			_, err := s.SeedScheduledFire(ctx, name, base.Add(tc.cursor))
+			require.NoError(t, err)
+
+			won, err := s.ClaimScheduledFire(ctx, name, base.Add(tc.to))
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantClaim, won,
+				"fractions of DIFFERENT WIDTH must compare by value, not by character count: "+
+					"cursor .%09d vs boundary .%09d", tc.cursor.Nanoseconds(), tc.to.Nanoseconds())
+		})
+	}
+}
