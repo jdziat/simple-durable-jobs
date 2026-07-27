@@ -119,3 +119,28 @@ func TestMigrateJobStatsTimestampIndex_ToleratesAConcurrentCreator(t *testing.T)
 	}
 	assert.True(t, db.Migrator().HasIndex(jobStatsTable, jobStatsTimestampIndex))
 }
+
+// TestCreateJobStatsTimestampIndex_ToleratesALostRace is the DETERMINISTIC form
+// of the test above.
+//
+// The concurrency test reaches the recovery branch only probabilistically — the
+// racers can serialise and every one of them then returns at the leading HasIndex
+// guard. This drives the CREATE directly with the index already present, which is
+// exactly the state a lost race leaves, so the recovery is entered on every run
+// and on every dialect including SQLite.
+func TestCreateJobStatsTimestampIndex_ToleratesALostRace(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+	dropJobStats(t, db)
+
+	require.NoError(t, db.WithContext(ctx).Exec(
+		`CREATE TABLE job_stats (id integer primary key, queue varchar(255), timestamp timestamp)`,
+	).Error)
+	require.NoError(t, db.WithContext(ctx).Exec(
+		"CREATE INDEX "+jobStatsTimestampIndex+" ON "+jobStatsTable+" (timestamp)").Error)
+
+	require.NoError(t, createJobStatsTimestampIndex(ctx, db, db.Name()),
+		"a CREATE that loses to a concurrent creator must not fail the migration: the index is "+
+			"there, which is the only thing it wanted")
+	assert.True(t, db.Migrator().HasIndex(jobStatsTable, jobStatsTimestampIndex))
+}

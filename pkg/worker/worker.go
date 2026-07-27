@@ -2026,6 +2026,19 @@ func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 			w.logger.Error("failed to release job cancelled by aggressive pause after retries",
 				"job_id", job.ID, "error", relErr)
 		}
+		// End the attempt's observability span. Without this the pause path is the
+		// one disposition that ends no span at all: complete, fail, retry and
+		// waiting each have a hook, so an aggressively-paused job leaked a span
+		// that was never exported — on EVERY paused job, and pausing a busy worker
+		// leaks one per in-flight job at once.
+		//
+		// The waiting hooks are the right shape and are reused deliberately: this
+		// attempt completed neither successfully nor with failure, and the resume
+		// starts a brand-new attempt with a fresh span, which is exactly the
+		// fan-out/signal case they were written for. Span consumers therefore see
+		// job.disposition="waiting" here; the accompanying log line and the
+		// JobPaused event distinguish a pause from a fan-out wait.
+		w.queue.CallWaitingHooks(jobCtx, job)
 		w.logger.Info("job released by aggressive pause; it will re-dispatch on resume", "job_id", job.ID)
 	} else if err != nil {
 		w.queue.CallErrorHandler(jobCtx, job, err)

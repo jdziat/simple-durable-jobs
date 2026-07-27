@@ -355,3 +355,56 @@ func TestPause_GenuineErrorDuringAPauseStillFails(t *testing.T) {
 		"a genuine error that lands during a pause must still travel the failure path — "+
 			"releasing on the pause mark alone would discard a real failure entirely")
 }
+
+// TestPause_AggressiveEndsTheAttemptSpan guards an observability leak.
+//
+// Every other disposition ends the attempt's span through a hook — complete,
+// fail, retry and waiting each have one, and waitingHook's own comment says a
+// parked attempt would otherwise "leak a span that is never exported". The pause
+// release was the one path that ended none, so an aggressively-paused job leaked
+// a span, and pausing a busy worker leaked one per in-flight job at once.
+//
+// FALSE-GREEN TRAP: asserting the job was released passes with the leak fully
+// present — the release was never the missing part. The discriminating
+// observation is that the span-ending hook actually fired.
+func TestPause_AggressiveEndsTheAttemptSpan(t *testing.T) {
+	var waitingHookCalls atomic.Int64
+
+	q := queue.New(&mockStorage{})
+	q.OnJobWaiting(func(context.Context, *core.Job) { waitingHookCalls.Add(1) })
+
+	started := make(chan struct{})
+	q.Register("slow", func(ctx context.Context, _ struct{}) error {
+		close(started)
+		<-ctx.Done()
+		return ctx.Err()
+	})
+
+	job := &core.Job{
+		ID: core.NewID(), Type: "slow", Queue: "default",
+		Status: core.StatusRunning, Attempt: 1, MaxRetries: 2,
+	}
+
+	w := NewWorker(q)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() { defer close(done); w.processJob(ctx, job) }()
+
+	select {
+	case <-started:
+	case <-time.After(10 * time.Second):
+		t.Fatal("handler never started")
+	}
+	w.Pause(core.PauseModeAggressive)
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("processJob never returned")
+	}
+
+	assert.Equal(t, int64(1), waitingHookCalls.Load(),
+		"an aggressively-paused attempt must end its span, or every paused job leaks one")
+}

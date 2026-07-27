@@ -375,17 +375,28 @@ func migrateJobStatsTimestampIndex(ctx context.Context, db *gorm.DB, dialect str
 	if m.HasIndex(jobStatsTable, jobStatsTimestampIndex) {
 		return nil
 	}
+	return createJobStatsTimestampIndex(ctx, db, dialect)
+}
+
+// createJobStatsTimestampIndex issues the CREATE and tolerates losing the race.
+//
+// The HasIndex guard in the caller is a check-then-act, and the mirror in
+// ui.gormStatsStorage.MigrateStats runs WITHOUT the fleet lock this migration
+// holds — so a dashboard mounting concurrently with Migrate() can create the
+// index between that check and this CREATE. Losing the race must not abort the
+// migration: re-check, and fail only if the index genuinely is not there.
+// (CREATE INDEX IF NOT EXISTS would cover SQLite and Postgres but not MySQL, so
+// the re-check is the portable form.)
+//
+// Split from the caller so the recovery is reachable from a test: through the
+// caller the leading HasIndex guard short-circuits before the CREATE, so no
+// sequential test can enter this path and a concurrency test can only reach it
+// probabilistically.
+func createJobStatsTimestampIndex(ctx context.Context, db *gorm.DB, dialect string) error {
 	if err := db.WithContext(ctx).Exec(
 		"CREATE INDEX " + jobStatsTimestampIndex + " ON " + jobStatsTable + " (timestamp)",
 	).Error; err != nil {
-		// The HasIndex guard above is a check-then-act, and the mirror in
-		// ui.gormStatsStorage.MigrateStats runs WITHOUT the fleet lock this
-		// migration holds — so a dashboard mounting concurrently with Migrate()
-		// can create the index between our check and our CREATE. Losing that race
-		// must not abort the migration: re-check, and only fail if the index
-		// genuinely is not there. (CREATE INDEX IF NOT EXISTS would cover SQLite
-		// and Postgres but not MySQL, so the re-check is the portable form.)
-		if m.HasIndex(jobStatsTable, jobStatsTimestampIndex) {
+		if db.Migrator().HasIndex(jobStatsTable, jobStatsTimestampIndex) {
 			return nil
 		}
 		return fmt.Errorf("create %s (%s): %w", jobStatsTimestampIndex, dialect, err)
