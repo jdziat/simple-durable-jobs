@@ -97,3 +97,65 @@ func TestDispatch_AdmissionBalancesOnEveryBailOut(t *testing.T) {
 		assertAdmissionDrained(t, w, "default")
 	})
 }
+
+// TestProcessJob_FreshTokenPathLeaksNothing covers the entry point that was kept
+// for direct callers and tests.
+//
+// processJob allocates a fresh run token and registers NOTHING with dispatch, so
+// its defers must find nothing and remove nothing — in particular they must not
+// decrement a counter no one incremented, which would let the queue over-admit.
+//
+// FALSE-GREEN TRAP: with a queue that has no configured cap there is no counter to
+// corrupt, so the queue has to be configured for the assertion to mean anything.
+func TestProcessJob_FreshTokenPathLeaksNothing(t *testing.T) {
+	q := queue.New(&mockStorage{})
+	q.Register("quick", func(context.Context, struct{}) error { return nil })
+	q.Register("boom", func(context.Context, struct{}) error { panic("exploded") })
+	w := NewWorker(q, WorkerQueue("default", Concurrency(3)))
+
+	counter := w.queueRunning["default"]
+	require.Equal(t, int32(0), counter.Load())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	for _, typ := range []string{"quick", "boom", "quick"} {
+		w.processJob(ctx, &core.Job{
+			ID: core.NewID(), Type: typ, Queue: "default",
+			Status: core.StatusRunning, MaxRetries: 1,
+		})
+	}
+
+	assert.Equal(t, int32(0), counter.Load(),
+		"a run that never went through dispatch registered no admission state, so its cleanup "+
+			"must not decrement a counter nobody incremented — that would let the queue admit "+
+			"more than its cap")
+	assertAdmissionDrained(t, w, "default")
+}
+
+// TestDispatch_TokensAreUniquePerRun guards the property every one of these maps
+// now depends on. A repeated token would silently reintroduce the shared-slot bug
+// that took three attempts to fix.
+func TestDispatch_TokensAreUniquePerRun(t *testing.T) {
+	w := NewWorker(queue.New(&mockStorage{}), WorkerQueue("default", Concurrency(100)))
+	jobID := core.NewID() // deliberately the SAME job id every time
+	jobs := make([]*core.Job, 50)
+	for i := range jobs {
+		jobs[i] = &core.Job{ID: jobID, Type: "t", Queue: "default", Status: core.StatusRunning}
+	}
+
+	ch := make(chan dispatchedJob, len(jobs))
+	dispatched, _ := w.dispatchDequeuedJobs(context.Background(), ch, jobs)
+	require.Equal(t, len(jobs), dispatched)
+	close(ch)
+
+	seen := map[uint64]bool{}
+	for dj := range ch {
+		require.False(t, seen[dj.token], "run token %d was issued twice", dj.token)
+		seen[dj.token] = true
+		w.untrackQueueJob(dj.token)
+		w.releaseConcurrencySlots(context.Background(), dj.job.ID, dj.token)
+	}
+	assert.Len(t, seen, len(jobs), "every run must get its own token, even for one job id")
+	assertAdmissionDrained(t, w, "default")
+}
