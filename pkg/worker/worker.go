@@ -1994,6 +1994,27 @@ const slotReleaseTimeout = 5 * time.Second
 // configurations: bounding the TOTAL beats giving every slot a comfortable share.
 // A slot whose DELETE is cut short leaks one cap row until its TTL, which
 // self-heals; a lease that lapses double-executes a job, which does not.
+//
+// WHERE THAT BITES, computed rather than left implicit. The per-slot share is
+// budget/len(caps):
+//
+//	default (2m interval):        5s budget  -> 5s at 1 cap, 250ms at 20
+//	StaleLockAge 2s (~667ms):     333ms      -> 333ms at 1 cap, 17ms at 20
+//	StaleLockAge <=600ms (200ms): 100ms      -> 100ms at 1 cap, 5ms at 20
+//
+// So a sub-second StaleLockAge combined with many caps means slot rows are
+// effectively reclaimed by TTL expiry rather than by explicit release. That is the
+// correct end of the trade — such a deployment has asked for aggressive
+// reclamation and gets it — but it is a real consequence and not a rounding error.
+// A worker built by NewWorker always has a heartbeat interval (floored at 200ms),
+// so the 5s ceiling only applies when the interval exceeds 10s; the `> 0` guard
+// below is for a zero-valued struct in tests, not a production path.
+//
+// One further cost of giving the job release and the slot release INDEPENDENT
+// budgets: a worst-case shutdown release is now their sum rather than a shared 5s.
+// That is the right direction — the shared budget's failure mode was releasing no
+// slot rows at all — but it is more wall time, bounded and paid only when storage
+// is already unresponsive.
 func (w *Worker) slotReleaseBudget() time.Duration {
 	budget := slotReleaseTimeout
 	// HALF an interval, not a whole one: the hold must leave room for the beat it
