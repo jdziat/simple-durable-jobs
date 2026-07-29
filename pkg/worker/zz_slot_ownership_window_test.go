@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -907,11 +908,173 @@ func TestReleaseSlotNames_OneSlowSlotDoesNotStarveTheOthers(t *testing.T) {
 
 	w.releaseConcurrencySlots(ctx, job.ID, tok)
 
+	// NOT an assertion on attempts: the storage counts an attempt BEFORE it checks
+	// the context, so all three are counted under the broken code too — state
+	// already in the asserted condition. What discriminates is whether the rows are
+	// actually gone, below.
 	require.Equal(t, int64(3), store.attempts.Load(),
-		"every slot must be ATTEMPTED, not skipped once the budget is gone")
+		"sanity only: the loop reaches every slot in both versions")
 	assert.Zero(t, base.slotCount("region:acme"),
 		"a slot after a slow one must still be released: sharing one budget across the loop lets "+
 			"the first DELETE consume it, and every later row then sits until its 45-minute TTL "+
 			"holding a FLEET-WIDE cap slot that nobody owns")
 	assert.Zero(t, base.slotCount("zone:acme"), "and so must the one after that")
+}
+
+// slowJobReleaseStorage makes the JOB release slow and honours its context, the
+// way a driver does under a contended pool. Slot deletes are instant, so anything
+// that fails is a budget problem, not a speed problem.
+type slowJobReleaseStorage struct {
+	*capMockStorage
+	jobReleaseDelay time.Duration
+	slotAttempts    atomic.Int64
+	slotExpired     atomic.Int64
+}
+
+func (s *slowJobReleaseStorage) Release(ctx context.Context, jobID core.UUID, workerID string) error {
+	select {
+	case <-time.After(s.jobReleaseDelay):
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	return s.capMockStorage.Release(ctx, jobID, workerID)
+}
+
+func (s *slowJobReleaseStorage) ReleaseConcurrencySlotOwned(ctx context.Context, slotName string, jobID core.UUID, workerID string) error {
+	s.slotAttempts.Add(1)
+	if err := ctx.Err(); err != nil {
+		s.slotExpired.Add(1)
+		return err
+	}
+	return s.ReleaseConcurrencySlot(ctx, slotName, jobID)
+}
+
+// denyingRateStorage refuses every fleet rate consume, which bounces a job AFTER
+// its concurrency slots have been acquired.
+type denyingRateStorage struct{ *slowJobReleaseStorage }
+
+func (denyingRateStorage) TryConsumeRate(context.Context, string, float64, time.Duration, time.Time) (bool, error) {
+	return false, nil
+}
+
+// TestDispatch_SlotReleaseGetsItsOwnBudgetNotTheJobRelease'sLeftovers covers a
+// defect one layer above the per-slot division.
+//
+// releaseDequeuedJobOnShutdown spent ONE 5-second context on the job Release and
+// then handed the same context to every slot DELETE. releaseSlotNames divides
+// slotReleaseTimeout among the slots — but it divides a CONSTANT, not the parent's
+// REMAINING budget, so `WithTimeout(alreadyDoneParent, perSlot)` returns children
+// that are born expired. A slow job Release therefore leaked EVERY cap row, not
+// just the ones after the first: the same shape the division was written to fix,
+// moved up a level, with a bigger blast radius.
+//
+// Driven through the real dispatchDequeuedJobs with a storage that honours its
+// deadline — not by calling the helper directly and not with a mock that ignores
+// ctx, either of which would hide the defect entirely.
+func TestDispatch_SlotReleaseGetsItsOwnBudget(t *testing.T) {
+	job := runningJob("job-1", "acme")
+	base := newCapMockStorage([]*core.Job{job})
+	slow := &slowJobReleaseStorage{capMockStorage: base, jobReleaseDelay: 8 * time.Second}
+	store := denyingRateStorage{slowJobReleaseStorage: slow}
+
+	q := queue.New(store)
+	q.Register(job.Type, func(context.Context, struct{}) error { return nil })
+	key := CapKey(func(j *core.Job) string { return j.UniqueKey })
+	w := NewWorker(q,
+		WorkerQueue("default", Concurrency(4)),
+		ConcurrencyCap("customer", 1, key),
+		ConcurrencyCap("region", 1, key),
+		ConcurrencyCap("zone", 1, key),
+		RateLimit("fleet", 100), // always denied -> bounce AFTER the caps are held
+		DisableRetry(),
+	)
+	w.config.WorkerID = "worker-1"
+
+	ch := make(chan dispatchedJob, 4)
+	dispatched, released := w.dispatchDequeuedJobs(context.Background(), ch, []*core.Job{job})
+	require.Zero(t, dispatched, "the fleet rate limit denies, so nothing is dispatched")
+	require.Equal(t, 1, released)
+
+	require.Equal(t, int64(3), slow.slotAttempts.Load(), "every slot must be attempted")
+	assert.Zero(t, slow.slotExpired.Load(),
+		"no slot DELETE may start on an already-expired context: the slot release must have its "+
+			"own budget, not whatever the job release left behind")
+	for _, n := range []string{"customer:acme", "region:acme", "zone:acme"} {
+		assert.Zero(t, base.slotCount(n),
+			"%s must be released. A slow job Release consuming the shared budget leaves EVERY cap "+
+				"row held by nobody until the 45-minute TTL — denied to every worker in the fleet", n)
+	}
+}
+
+// hangingSlotStorage blocks every slot DELETE until its context expires.
+type hangingSlotStorage struct{ *capMockStorage }
+
+func (s *hangingSlotStorage) ReleaseConcurrencySlotOwned(ctx context.Context, _ string, _ core.UUID, _ string) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+// TestReleaseConcurrencySlots_TotalHoldStaysInsideAHeartbeat measures the actual
+// wall-clock time the release spends holding slotJobIDMu, at several cap counts
+// and heartbeat intervals.
+//
+// This is the invariant slotReleaseBudget exists for, and it had NO test that
+// could fail. The only bound test configured ONE cap and asserted merely that a
+// deadline EXISTED — with one cap a per-slot budget and a total budget are
+// byte-identical, so replacing the division with the full budget (making the total
+// N x 5s) left the whole package green. That is the "vacuous by configuration"
+// shape this campaign keeps hitting, and my own commit message named it for the
+// OTHER half of the same fix and then did not apply it here.
+//
+// FALSE-GREEN TRAP, and my first attempt at this test was it: I re-derived
+// slotReleaseTimeout/len(slots) in the test body and asserted on that. It passes
+// whatever the production code does, because it never calls it. The assertion has
+// to be on MEASURED elapsed time.
+//
+// Why it matters: runHeartbeat calls renewConcurrencySlots synchronously in its
+// ticker arm, and that takes this mutex. A release that outlives a heartbeat
+// interval delays the next Heartbeat; since hbInterval is StaleLockAge/3, staying
+// within one interval leaves two beats of margin before the reaper reclaims a
+// still-executing job.
+func TestReleaseConcurrencySlots_TotalHoldStaysInsideAHeartbeat(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		caps     int
+		hbInterv time.Duration
+	}{
+		{"default heartbeat, 1 cap", 1, 2 * time.Minute},
+		{"default heartbeat, 3 caps", 3, 2 * time.Minute},
+		{"default heartbeat, 12 caps", 12, 2 * time.Minute},
+		{"aggressive StaleLockAge, 1 cap", 1, 667 * time.Millisecond},
+		{"aggressive StaleLockAge, 20 caps", 20, 667 * time.Millisecond},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			job := runningJob("job-1", "acme")
+			base := newCapMockStorage([]*core.Job{job})
+			q := queue.New(&hangingSlotStorage{capMockStorage: base})
+			key := CapKey(func(j *core.Job) string { return j.UniqueKey })
+			opts := []WorkerOption{WorkerQueue("default", Concurrency(2))}
+			for i := 0; i < tc.caps; i++ {
+				opts = append(opts, ConcurrencyCap(fmt.Sprintf("cap%d", i), 1, key))
+			}
+			w := NewWorker(q, opts...)
+			w.config.WorkerID = "worker-1"
+			w.heartbeatInterval = tc.hbInterv
+
+			ctx := context.Background()
+			tok := w.nextRunToken.Add(1)
+			require.True(t, w.tryAcquireConcurrencySlots(ctx, job, tok))
+
+			start := time.Now()
+			w.releaseConcurrencySlots(context.WithoutCancel(ctx), job.ID, tok)
+			elapsed := time.Since(start)
+
+			assert.Less(t, elapsed, tc.hbInterv,
+				"the release held slotJobIDMu for %v with %d caps and a %v heartbeat interval. "+
+					"renewConcurrencySlots takes the same mutex from every heartbeat, so a hold "+
+					"longer than one interval delays the next Heartbeat write — and at "+
+					"StaleLockAge = 3x that interval, enough delay lets the reaper hand a "+
+					"still-executing job to a peer", elapsed, tc.caps, tc.hbInterv)
+		})
+	}
 }

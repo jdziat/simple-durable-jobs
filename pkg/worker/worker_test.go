@@ -1487,8 +1487,11 @@ func TestWorker_QueuesWithCapacity_FullQueueExcluded(t *testing.T) {
 	)
 
 	// Fill the "full" queue to its limit.
+	// DISTINCT tokens: two runs under one token is an ordering dispatch cannot
+	// produce, and it survives here only because the assertion reads the atomic
+	// counter rather than the token-keyed map.
 	w.trackQueueJob(1, "full")
-	w.trackQueueJob(1, "full")
+	w.trackQueueJob(2, "full")
 
 	available := w.queuesWithCapacity()
 

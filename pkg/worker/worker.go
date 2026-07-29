@@ -984,15 +984,35 @@ func (w *Worker) releaseClaimedJobs(ctx context.Context, jobs []*core.Job) {
 }
 
 func (w *Worker) releaseDequeuedJobOnShutdown(ctx context.Context, job *core.Job, runToken uint64) {
-	releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-	defer cancel()
+	// TWO budgets, not one shared between them. These are independent pieces of
+	// cleanup — the job row and the fleet-cap rows — and neither should be able to
+	// starve the other.
+	//
+	// Sharing one context meant a slow job Release consumed the whole 5s, after
+	// which every slot DELETE ran on an already-Done parent. releaseSlotNames
+	// divides slotReleaseTimeout among the slots, but it divides a CONSTANT rather
+	// than the parent's REMAINING budget, so `WithTimeout(donePparent, perSlot)`
+	// returns children that are already expired and NOT ONE row is deleted. That is
+	// the same defect the per-slot division was written to fix, moved one layer up,
+	// and strictly worse: the earlier version leaked slots 2..N, this leaked all of
+	// them.
+	//
+	// The path that matters is graceful shutdown, which releases every in-flight
+	// job at once — so the connection pool is at its most contended exactly when
+	// Release is asked to finish inside 5s, and database/sql charges pool wait to
+	// the same context.
+	jobCtx, cancelJob := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancelJob()
 
-	if err := w.queue.Storage().Release(releaseCtx, job.ID, w.config.WorkerID); err != nil && !errors.Is(err, core.ErrJobNotOwned) {
+	if err := w.queue.Storage().Release(jobCtx, job.ID, w.config.WorkerID); err != nil && !errors.Is(err, core.ErrJobNotOwned) {
 		w.logger.Warn("failed to release dequeued job during shutdown",
 			"job_id", job.ID,
 			"error", err)
 	}
-	w.releaseConcurrencySlots(releaseCtx, job.ID, runToken)
+
+	slotCtx, cancelSlots := context.WithTimeout(context.WithoutCancel(ctx), w.slotReleaseBudget())
+	defer cancelSlots()
+	w.releaseConcurrencySlots(slotCtx, job.ID, runToken)
 	w.untrackQueueJob(runToken)
 }
 
@@ -1952,14 +1972,41 @@ func unionSlotNames(a, b []string) []string {
 // own fair share, so all of them get a genuine attempt and the total stays capped.
 const slotReleaseTimeout = 5 * time.Second
 
-// minSlotReleaseTimeout keeps the per-slot share usable under an unusually large
-// number of configured caps. Past ten caps the floor binds and the TOTAL grows
-// linearly instead of staying at slotReleaseTimeout: 10 caps = 5s, 20 = 10s,
-// 50 = 25s. That is the right trade — the alternative is deletes that cannot
-// possibly succeed — and it stays safe on the axis that matters, because the
-// worst case is still far inside the 2-minute heartbeat interval, so no beat is
-// missed and no lease approaches the 45-minute StaleLockAge.
-const minSlotReleaseTimeout = 500 * time.Millisecond
+// slotReleaseBudget is the TOTAL time a release may spend in storage while holding
+// slotJobIDMu.
+//
+// It is derived from the heartbeat interval rather than being a constant, because
+// the safety argument depends on it. runHeartbeat calls renewConcurrencySlots
+// synchronously in its ticker arm, and that takes this same mutex — so a release
+// that outlives a heartbeat interval delays the next Heartbeat write. The reaper
+// reclaims a job whose last heartbeat is older than StaleLockAge, and
+// hbInterval = StaleLockAge/3, so delaying at most ONE beat still leaves two
+// beats of margin. Exceeding StaleLockAge means a still-executing job is handed to
+// a peer: double execution, the thing runHeartbeat exists to prevent.
+//
+// An earlier version used a flat 5s and justified it as "far inside the 2-minute
+// heartbeat interval". Both of those are DEFAULTS, not invariants: WithStaleLockAge
+// is a public option, and at StaleLockAge=2s the interval is ~667ms, so a 5s hold
+// was 7.4x the interval and 2.5x StaleLockAge — reclaimable while the handler was
+// still running. The chaos harness configures exactly that shape.
+//
+// WHICH PROPERTY WINS, stated because the two genuinely conflict at extreme
+// configurations: bounding the TOTAL beats giving every slot a comfortable share.
+// A slot whose DELETE is cut short leaks one cap row until its TTL, which
+// self-heals; a lease that lapses double-executes a job, which does not.
+func (w *Worker) slotReleaseBudget() time.Duration {
+	budget := slotReleaseTimeout
+	// HALF an interval, not a whole one: the hold must leave room for the beat it
+	// is delaying to still land inside its own interval. Budgeting a full interval
+	// means the next Heartbeat lands exactly one interval late in the worst case,
+	// which eats a third of the StaleLockAge margin outright.
+	if w.heartbeatInterval > 0 {
+		if half := w.heartbeatInterval / 2; half < budget {
+			budget = half
+		}
+	}
+	return budget
+}
 
 func (w *Worker) releaseSlotNames(ctx context.Context, jobID core.UUID, slots []string) {
 	if len(slots) == 0 {
@@ -1983,10 +2030,19 @@ func (w *Worker) releaseSlotNames(ctx context.Context, jobID core.UUID, slots []
 	// Bounding here rather than at one call site means every entry point is capped,
 	// including any added later. A caller that already supplied a tighter deadline
 	// keeps it.
-	perSlot := slotReleaseTimeout / time.Duration(len(slots))
-	if perSlot < minSlotReleaseTimeout {
-		perSlot = minSlotReleaseTimeout
-	}
+	// NO FLOOR. An earlier version clamped the per-slot share to a minimum, which
+	// quietly contradicted the priority stated on slotReleaseBudget: at 20 caps and
+	// an aggressive StaleLockAge the clamp pushed the TOTAL to 500ms against a
+	// 333ms budget, so the bound that exists to protect the heartbeat was not
+	// actually being honoured. It was also a constant no test could fail on — the
+	// clamp only binds past ~11 caps, and removing it left the suite green.
+	//
+	// Dividing exactly means the total is the budget, full stop. A very large cap
+	// count therefore gives each slot a small share, and a DELETE that cannot
+	// finish in it leaves its row to expire at the TTL. That is the trade this
+	// function already declares: a leaked row self-heals, a lapsed lease
+	// double-executes a job.
+	perSlot := w.slotReleaseBudget() / time.Duration(len(slots))
 
 	storage, ok := w.queue.Storage().(concurrencySlotStorage)
 	if !ok {

@@ -109,8 +109,14 @@ func TestWorkerBatchDequeuePrefersPerQueueBudgets(t *testing.T) {
 		WithDequeueBatchSize(2),
 		DisableRetry(),
 	)
+	// DISTINCT tokens. Registering two runs under ONE token is an ordering
+	// dispatch cannot produce (TestDispatch_TokensAreUniquePerRun pins that), and
+	// it passes here only because the assertion reads the atomic counter, which
+	// double-increments, rather than the token-keyed map, which would hold one
+	// entry. Move the budget computation to the map and this test silently
+	// changes meaning without failing.
 	w.trackQueueJob(1, "hot")
-	w.trackQueueJob(1, "hot")
+	w.trackQueueJob(2, "hot")
 
 	jobs, err := w.dequeueAvailableJobs(context.Background(), []string{"hot", "idle"}, 5)
 	require.NoError(t, err)

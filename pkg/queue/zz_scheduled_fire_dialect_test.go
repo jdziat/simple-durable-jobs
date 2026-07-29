@@ -29,6 +29,17 @@ func openRealDialectDB(t *testing.T) *gorm.DB {
 	t.Helper()
 	var db *gorm.DB
 	var err error
+	// FAIL when BOTH are set rather than silently preferring one. The MySQL
+	// gap-lock deadlock test in this file guards a hazard that exists ONLY on
+	// InnoDB — run it against Postgres and it passes while proving nothing. CI is
+	// safe (each backend leg sets exactly one DSN and unsets the other), but the
+	// repo's own local workflow exports both, so a maintainer verifying that fix by
+	// hand would get a green that means nothing. That is the false-green shape this
+	// whole file exists to close.
+	if os.Getenv("TEST_DATABASE_URL") != "" && os.Getenv("TEST_MYSQL_URL") != "" {
+		t.Fatal("both TEST_DATABASE_URL and TEST_MYSQL_URL are set: this file's tests are " +
+			"dialect-specific and would silently run against Postgres only. Unset one.")
+	}
 	switch {
 	case os.Getenv("TEST_DATABASE_URL") != "":
 		db, err = gorm.Open(postgres.Open(os.Getenv("TEST_DATABASE_URL")), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})

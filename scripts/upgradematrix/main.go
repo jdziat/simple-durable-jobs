@@ -77,6 +77,25 @@ func main() {
 		os.Exit(1)
 	}
 
+	// order() and families() must agree. `if !ok { continue }` below silently skips
+	// any name order() lists that families() does not have, and the harness then
+	// still prints "every schedule family claimed its next boundary in every zone"
+	// — blind, while claiming full coverage. An earlier commit closed the
+	// cron-parse-error version of exactly this and left the list version open.
+	if len(order()) != len(families()) {
+		fmt.Fprintf(os.Stderr,
+			"upgrade matrix is misconfigured: order() lists %d families, families() defines %d. "+
+				"A name in one and not the other is silently skipped, and the run still reports OK.\n",
+			len(order()), len(families()))
+		os.Exit(2)
+	}
+	for _, name := range order() {
+		if _, ok := families()[name]; !ok {
+			fmt.Fprintf(os.Stderr, "upgrade matrix: order() names %q, which families() does not define\n", name)
+			os.Exit(2)
+		}
+	}
+
 	switch os.Args[2] {
 	case "seed":
 		for _, name := range order() {
