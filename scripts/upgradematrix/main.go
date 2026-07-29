@@ -30,9 +30,15 @@ func families() map[string]schedule.Schedule {
 		"crossface":   schedule.Every(time.Hour),
 		"seeded-only": schedule.Daily(9, 0),
 	}
-	if c, err := schedule.Cron("0 * * * *"); err == nil {
-		f["cron"] = c
+	c, err := schedule.Cron("0 * * * *")
+	if err != nil {
+		// Do NOT silently drop the family. Omitting it lets the matrix report
+		// success while never testing that schedule shape at all, which is exactly
+		// the way this harness was blind to a predicate regression before.
+		fmt.Fprintf(os.Stderr, "upgradematrix: cron schedule failed to parse: %v\n", err)
+		os.Exit(1)
 	}
+	f["cron"] = c
 	return f
 }
 
@@ -95,8 +101,25 @@ func main() {
 			if name == "seeded-only" {
 				continue
 			}
-			if _, err := st.ClaimScheduledFire(ctx, name, s.Next(anchor)); err != nil {
+			boundary := s.Next(anchor)
+			won, err := st.ClaimScheduledFire(ctx, name, boundary)
+			if err != nil {
 				panic(err)
+			}
+			if !won {
+				// The baseline could not claim a boundary genuinely LATER than its
+				// own anchor. That is not a harness failure — it is the released
+				// version demonstrating the very bug this matrix exists to check, so
+				// it is reported rather than hidden or treated as fatal. Measured
+				// under TZ=Asia/Tokyo: anchor 11:33+09:00 (02:33 UTC), boundary
+				// 09:00Z, six hours later, rejected by the baseline's lexical text
+				// comparison.
+				//
+				// The row is left at the anchor, which is itself a legitimate upgrade
+				// fixture (the same shape as "seeded-only"), and the check phase then
+				// verifies HEAD can move it.
+				fmt.Printf("%-11s BASELINE COULD NOT CLAIM (pre-existing bug) anchor=%s boundary=%s\n",
+					name, anchor.Format("15:04:05Z07:00"), boundary.Format("15:04:05Z07:00"))
 			}
 		}
 		var rows []struct{ Name, V string }
