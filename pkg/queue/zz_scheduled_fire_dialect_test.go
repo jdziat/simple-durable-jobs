@@ -201,8 +201,15 @@ func TestEnqueueScheduledFire_PriorFireReadTakesTheRowLock(t *testing.T) {
 	require.True(t, claimed)
 
 	// Hold a conflicting row lock in a transaction of our own.
+	//
+	// The rollback is registered BEFORE anything can fail. Without it, a tripped
+	// require below would FailNow with this transaction still open, holding a
+	// FOR UPDATE lock on scheduled_fires — and the cleanup DELETE on that same row,
+	// plus every other test sharing this database, would then block until the
+	// process exited. Rollback after a commit is a harmless no-op.
 	held := db.Begin()
 	require.NoError(t, held.Error)
+	t.Cleanup(func() { _ = held.Rollback() })
 	var locked core.ScheduledFire
 	require.NoError(t, held.Clauses(clause.Locking{Strength: "UPDATE"}).
 		Where("name = ?", name).First(&locked).Error)

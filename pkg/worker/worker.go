@@ -1692,11 +1692,43 @@ func (w *Worker) tryAcquireConcurrencySlots(ctx context.Context, job *core.Job, 
 		return true
 	}
 	ttl := w.concurrencySlotTTL()
+	// Ownership is recorded INCREMENTALLY, one slot at a time, rather than once at
+	// the end. Two reasons, and the second is a bug this cost us:
+	//
+	//  1. Ownership of a row transfers at the instant this run JOINS it — not when
+	//     the run later registers in runningJobs. Those are different moments: this
+	//     function runs in dispatchDequeuedJobs, the job then crosses jobsChan
+	//     (which BLOCKS while every processLoop goroutine is busy), and only then
+	//     does processJobRun register. A release that inferred ownership from
+	//     runningJobs was blind for that whole window.
+	//
+	//  2. THE ROLLBACK PATHS BELOW ARE RELEASES TOO. They used to call
+	//     releaseSlotNames directly, which has no run-token awareness, so a partial
+	//     acquire deleted rows an EARLIER run of the same job id was still holding
+	//     — the exact over-admission the ownership fence exists to prevent, on the
+	//     one path that did not consult it. Reachable with two or more caps: run #2
+	//     renews cap A idempotently (SHARING run #1's row), then errors or is
+	//     refused on cap B, and its rollback deletes A out from under run #1. The
+	//     ownership fence cannot refuse it — same job id, same worker id.
+	//
+	// Recording as we go means every bail-out can route through
+	// releaseConcurrencySlots, which consults the fence and cleans up this run's
+	// entry. There is exactly ONE place that deletes these rows now.
+	// Stores a COPY. The local slice is appended to on the next iteration, and
+	// append reuses the backing array while there is capacity — the stored header's
+	// length means it cannot observe that, but "cannot observe it" is a subtlety a
+	// reader should not have to re-derive around fleet-cap bookkeeping. There are
+	// at most a handful of caps.
+	record := func(names []string) {
+		w.slotJobIDMu.Lock()
+		w.slotJobID[runToken] = slotHold{jobID: job.ID, names: append([]string(nil), names...)}
+		w.slotJobIDMu.Unlock()
+	}
 	acquiredSlots := make([]string, 0, len(w.config.ConcurrencyCaps))
 	for _, cap := range w.config.ConcurrencyCaps {
 		slotName, ok := w.capSlotName(cap, job)
 		if !ok {
-			w.releaseSlotNames(ctx, job.ID, acquiredSlots)
+			w.releaseConcurrencySlots(ctx, job.ID, runToken)
 			return false
 		}
 		acquired, err := storage.TryAcquireConcurrencySlot(ctx, slotName, job.ID, w.config.WorkerID, cap.Limit, ttl)
@@ -1705,24 +1737,16 @@ func (w *Worker) tryAcquireConcurrencySlots(ctx context.Context, job *core.Job, 
 				"job_id", job.ID,
 				"slot", slotName,
 				"error", err)
-			w.releaseSlotNames(ctx, job.ID, acquiredSlots)
+			w.releaseConcurrencySlots(ctx, job.ID, runToken)
 			return false
 		}
 		if !acquired {
-			w.releaseSlotNames(ctx, job.ID, acquiredSlots)
+			w.releaseConcurrencySlots(ctx, job.ID, runToken)
 			return false
 		}
 		acquiredSlots = append(acquiredSlots, slotName)
+		record(acquiredSlots)
 	}
-	// Ownership of the row transfers HERE, at the instant this run joins it — not
-	// when the run later registers in runningJobs. Those are different moments:
-	// this function runs in dispatchDequeuedJobs, the job then crosses jobsChan
-	// (which BLOCKS while every processLoop goroutine is busy), and only then does
-	// processJobRun register. A release that inferred ownership from runningJobs
-	// was blind for that whole window.
-	w.slotJobIDMu.Lock()
-	w.slotJobID[runToken] = slotHold{jobID: job.ID, names: acquiredSlots}
-	w.slotJobIDMu.Unlock()
 	return true
 }
 
@@ -2351,10 +2375,6 @@ const orphanHeartbeatThreshold = 3
 // the lock and another worker has picked the job up). In that case
 // runHeartbeat cancels THIS RUN's handler via cancelRun and returns, so:
 //
-// By run token, not by job id. Cancelling by id would let an orphaned
-// heartbeat kill whichever run currently owns the id — including the
-// healthy run that REPLACED this one after a pause-release, which would
-// then fail and burn an attempt it never earned.
 //  1. The handler stops doing wasted work against a job it doesn't own.
 //  2. The "heartbeat failed after retries / jobs: job not owned by this
 //     worker" log line stops repeating forever — observed in production
@@ -2367,6 +2387,15 @@ const orphanHeartbeatThreshold = 3
 // Non-ownership errors (DB unreachable, retry exhaustion on a transient
 // error) are logged but don't trip the counter — those are operational
 // issues to fix elsewhere, not orphaning.
+//
+// The cancel is by RUN TOKEN, not by job id. Cancelling by id would let an
+// orphaned heartbeat kill whichever run currently owns the id — including
+// the healthy run that REPLACED this one after a pause-release, which would
+// then fail and burn an attempt it never earned.
+//
+// It also RENEWS this run's fleet concurrency slot on every successful beat.
+// Without that the row expires at its TTL while the handler is still running,
+// another worker acquires the same cap slot, and the fleet cap over-admits.
 func (w *Worker) runHeartbeat(ctx context.Context, job *core.Job, runToken uint64) {
 	// Heartbeat every 2 minutes (lock is 45 minutes, so plenty of buffer).
 	// Tests override w.heartbeatInterval directly to drive the loop at

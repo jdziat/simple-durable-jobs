@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -582,5 +583,211 @@ func TestProcessJobRun_UnregisterUnderTheLockDoesNotDeadlock(t *testing.T) {
 		t.Fatal("processJob's cleanup deadlocked against a concurrent Queue.CancelJob/PauseJob — " +
 			"holding w.runningJobsMu across UnregisterRunningJob is only safe while q.runningJobsMu " +
 			"is a leaf, and something now acquires them in the opposite order")
+	}
+}
+
+// flakyCapStorage fails one named slot on a chosen attempt, which is how a
+// PARTIAL acquire happens in production: a transient storage error (a MySQL
+// deadlock whose retries ran out, a lock-wait timeout) or a cap that is genuinely
+// full by the time the second slot is asked for.
+type flakyCapStorage struct {
+	*capMockStorage
+	failSlot  string
+	failOnNth int
+	calls     int
+}
+
+func (s *flakyCapStorage) TryAcquireConcurrencySlot(ctx context.Context, slotName string, jobID core.UUID, workerID string, limit int, ttl time.Duration) (bool, error) {
+	if slotName == s.failSlot {
+		s.calls++
+		if s.calls == s.failOnNth {
+			return false, errors.New("transient db error")
+		}
+	}
+	return s.capMockStorage.TryAcquireConcurrencySlot(ctx, slotName, jobID, workerID, limit, ttl)
+}
+
+// TestTryAcquireConcurrencySlots_RollbackRespectsAnotherRunsRow covers the FOURTH
+// place that can delete a concurrency_slots row, and the only one that used to
+// bypass the ownership fence.
+//
+// The invariant is "the row survives while ANY token holds it, and the last holder
+// out deletes it". Round 10 enforced that in releaseConcurrencySlots — and then
+// left the three ROLLBACK exits of tryAcquireConcurrencySlots calling
+// releaseSlotNames raw, which has no run-token awareness at all. A partial acquire
+// therefore deleted rows an earlier run of the same job id was still holding: the
+// exact over-admission the fence exists to prevent, on the one path that did not
+// consult it. The ownership fence in storage cannot refuse it either — both runs
+// share the job id AND the worker id.
+//
+// FALSE-GREEN TRAP, and it is why this went unnoticed for a round: with ONE
+// configured cap the rollback is VACUOUS. The only failure point is the first
+// slot, so acquiredSlots is empty and there is nothing to wrongly delete. The
+// defect needs at least TWO caps — succeed on the first, fail on the second — so
+// this test configures two, and a version with one cap passes no matter what the
+// rollback does.
+func TestTryAcquireConcurrencySlots_RollbackRespectsAnotherRunsRow(t *testing.T) {
+	newWorker := func(t *testing.T, failSlot string, failOnNth int) (*Worker, *capMockStorage, *core.Job) {
+		t.Helper()
+		job := runningJob("job-1", "acme")
+		base := newCapMockStorage([]*core.Job{job})
+		store := &flakyCapStorage{capMockStorage: base, failSlot: failSlot, failOnNth: failOnNth}
+		q := queue.New(store)
+		q.Register(job.Type, func(context.Context, struct{}) error { return nil })
+		w := NewWorker(q,
+			WorkerQueue("default", Concurrency(3)),
+			ConcurrencyCap("customer", 1, CapKey(func(j *core.Job) string { return j.UniqueKey })),
+			ConcurrencyCap("region", 1, CapKey(func(j *core.Job) string { return j.UniqueKey })),
+			DisableRetry(),
+		)
+		w.config.WorkerID = "worker-1"
+		return w, base, job
+	}
+
+	t.Run("a later run failing partway must not delete the earlier run's row", func(t *testing.T) {
+		// Fail "region" on its SECOND request, i.e. during run #2's acquire.
+		w, store, job := newWorker(t, "region:acme", 2)
+		ctx := context.Background()
+
+		tok1 := w.nextRunToken.Add(1)
+		require.True(t, w.tryAcquireConcurrencySlots(ctx, job, tok1))
+		require.Equal(t, 1, store.slotCount("customer:acme"), "run #1 holds the first cap")
+		require.Equal(t, 1, store.slotCount("region:acme"), "and the second")
+
+		// Run #2 renews "customer" idempotently — SHARING run #1's row — then fails
+		// on "region" and rolls back.
+		tok2 := w.nextRunToken.Add(1)
+		require.False(t, w.tryAcquireConcurrencySlots(ctx, job, tok2),
+			"the partial acquire must be reported as a refusal")
+
+		assert.Equal(t, 1, store.slotCount("customer:acme"),
+			"run #2's rollback must not delete the row run #1 is still holding — that under-counts "+
+				"the FLEET cap for run #1's whole remaining runtime and admits an extra job")
+		assert.Equal(t, 1, store.slotCount("region:acme"),
+			"and run #1's second row is untouched too")
+
+		// Run #1 is still the sole holder, so its release really does clear both.
+		w.releaseConcurrencySlots(ctx, job.ID, tok1)
+		assert.Zero(t, store.slotCount("customer:acme"))
+		assert.Zero(t, store.slotCount("region:acme"))
+	})
+
+	t.Run("a rollback with no other holder still releases what it took", func(t *testing.T) {
+		// Fail "region" on its FIRST request: nobody else holds anything, so the
+		// rollback MUST delete the "customer" row it just acquired. This is the
+		// control — a fence that skipped unconditionally would leak here.
+		w, store, job := newWorker(t, "region:acme", 1)
+		ctx := context.Background()
+
+		tok := w.nextRunToken.Add(1)
+		require.False(t, w.tryAcquireConcurrencySlots(ctx, job, tok))
+
+		assert.Zero(t, store.slotCount("customer:acme"),
+			"a partial acquire with no other holder must roll back fully, or the fleet cap leaks "+
+				"a slot until its TTL expires and throttles every worker")
+		w.slotJobIDMu.Lock()
+		_, stillRecorded := w.slotJobID[tok]
+		w.slotJobIDMu.Unlock()
+		assert.False(t, stillRecorded, "and the run's bookkeeping entry must not outlive it")
+	})
+}
+
+// rateDenyingStorage refuses every fleet rate consume, which is the most ordinary
+// dispatch bail-out there is.
+type rateDenyingStorage struct{ *capMockStorage }
+
+func (rateDenyingStorage) TryConsumeRate(context.Context, string, float64, time.Duration, time.Time) (bool, error) {
+	return false, nil
+}
+
+// TestDispatch_RateLimitBounceReleasesTheCapRow covers the bail-out paths that go
+// through releaseDequeuedJobOnShutdown while HOLDING a fleet cap slot.
+//
+// FALSE-GREEN TRAP, and TestDispatch_AdmissionBalancesOnEveryBailOut is it: all
+// four of its subtests build a worker with NO ConcurrencyCap, so
+// tryAcquireConcurrencySlots returns at the `len(ConcurrencyCaps) == 0` guard and
+// records nothing — which makes assertAdmissionDrained's two slot assertions
+// trivially true on exactly the paths the file is named for. Deleting
+//
+//	w.releaseConcurrencySlots(releaseCtx, job.ID, runToken)
+//
+// from releaseDequeuedJobOnShutdown left ./pkg/worker green AND the whole ./tests
+// integration package green. A regression there leaks a FLEET-wide row for the
+// slot TTL — 45 minutes by default — throttling every worker in the deployment,
+// on the most routine path there is: a rate-limited bounce.
+//
+// So this configures a cap AND a rate limit that denies, and asserts on the ROW.
+func TestDispatch_RateLimitBounceReleasesTheCapRow(t *testing.T) {
+	job := runningJob("job-1", "acme")
+	base := newCapMockStorage([]*core.Job{job})
+	q := queue.New(rateDenyingStorage{capMockStorage: base})
+	q.Register(job.Type, func(context.Context, struct{}) error { return nil })
+	w := NewWorker(q,
+		WorkerQueue("default", Concurrency(3)),
+		ConcurrencyCap("customer", 1, CapKey(func(j *core.Job) string { return j.UniqueKey })),
+		RateLimit("api", 5),
+		DisableRetry(),
+	)
+	w.config.WorkerID = "worker-1"
+
+	ch := make(chan dispatchedJob, 1)
+	dispatched, released := w.dispatchDequeuedJobs(context.Background(), ch, []*core.Job{job})
+	require.Zero(t, dispatched, "the rate limit denies, so nothing may be dispatched")
+	require.Equal(t, 1, released, "and the job must be released back")
+
+	assert.Zero(t, base.slotCount("customer:acme"),
+		"a rate-limited bounce must release the fleet cap row it acquired — leaking it holds a "+
+			"CLUSTER-WIDE cap until its TTL expires (45 minutes by default) and throttles every "+
+			"worker in the deployment")
+	w.slotJobIDMu.Lock()
+	n := len(w.slotJobID)
+	w.slotJobIDMu.Unlock()
+	assert.Zero(t, n, "and no run→slots entry may outlive the bounce")
+}
+
+// TestRunHeartbeat_RenewsTheConcurrencySlot covers runHeartbeat's renewal CALL
+// SITE, which was free: deleting
+//
+//	w.renewConcurrencySlots(ctx, job.ID, runToken)
+//
+// left ./pkg/worker green, because the only tests that exercise renewal call
+// renewConcurrencySlots DIRECTLY. capMockStorage.renewals() exists, in its own
+// words, "so a test can assert renewConcurrencySlots drove it" — and the only
+// thing driving it was the test.
+//
+// Without the renewal a job that outlives concurrencySlotTTL loses its
+// concurrency_slots row, another worker acquires the same cap slot, and the fleet
+// cap over-admits: the identical failure this whole branch exists to close.
+func TestRunHeartbeat_RenewsTheConcurrencySlot(t *testing.T) {
+	job := runningJob("job-1", "acme")
+	store := newCapMockStorage([]*core.Job{job})
+	q := queue.New(store)
+	q.Register(job.Type, func(context.Context, struct{}) error { return nil })
+	w := NewWorker(q,
+		WorkerQueue("default", Concurrency(3)),
+		ConcurrencyCap("customer", 1, CapKey(func(j *core.Job) string { return j.UniqueKey })),
+		DisableRetry(),
+	)
+	w.config.WorkerID = "worker-1"
+	w.heartbeatInterval = 20 * time.Millisecond
+
+	ctx := context.Background()
+	tok := w.nextRunToken.Add(1)
+	require.True(t, w.tryAcquireConcurrencySlots(ctx, job, tok))
+
+	hbCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() { defer close(done); w.runHeartbeat(hbCtx, job, tok) }()
+
+	require.Eventually(t, func() bool { return len(store.renewals()) > 0 },
+		5*time.Second, 20*time.Millisecond,
+		"the heartbeat must renew this run's fleet cap row; without it the row expires at its TTL "+
+			"while the handler is still running and another worker is admitted past the cap")
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("runHeartbeat did not return after its context was cancelled")
 	}
 }

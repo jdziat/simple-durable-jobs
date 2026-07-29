@@ -312,6 +312,16 @@ func Concurrency(n int) WorkerOption {
 
 // CapKey derives the partition key for a ConcurrencyCap from the dequeued job.
 // The effective slot name is capName + ":" + key(job).
+//
+// The function must be STABLE for a given job across re-dispatches, not merely
+// bounded in cardinality. A job can be dequeued twice by one worker — an
+// aggressive pause releases it to pending and the poll loop picks it up again,
+// and the stale-lock reaper can do the same — and the two runs then briefly
+// overlap. The slot row is released once the LAST run holding that job id
+// finishes; if the key changed in between, the two runs hold DIFFERENT rows and
+// the earlier one's row is released by nobody, holding a fleet-wide cap until it
+// expires at its TTL. Derive the key from something immutable (tenant, queue, a
+// field of the payload), not from metadata a handler rewrites.
 func CapKey(fn func(*core.Job) string) CapOption {
 	return func(c *ConcurrencyCapConfig) {
 		c.Key = fn

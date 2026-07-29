@@ -252,7 +252,7 @@ The two series on the dashboard come from different places, and only one of them
 
 It can also under-report *within* that one process. Each subscriber gets a 100-event buffer and `Emit` **drops** rather than blocks when it is full, so a burst that outruns the collector is lost rather than queued. That is the right trade for an event bus -- a slow dashboard must never stall job execution -- but it means the chart is a sample, not a ledger.
 
-This is a property of the event bus, not a bug in the collector, and it is not something the dashboard can detect and warn about. If you need fleet-wide throughput, read it from the OpenTelemetry metrics in `pkg/metrics` (see [Observability](../observability/)), which every process exports to your collector. Treat the dashboard's throughput chart as a view of one process.
+This is a property of the event bus, not a bug in the collector. The *drop* half is at least observable: `Queue.DroppedEventCount()` returns a running total, so a process that wants to can tell whether its own feed lost events (the dashboard does not surface it today). The *multi-process* half is not observable from inside one process at all — a queue simply has no way to know what its peers ran. If you need fleet-wide throughput, read it from the OpenTelemetry metrics in `pkg/metrics` (see [Observability](../observability/)), which every process exports to your collector. Treat the dashboard's throughput chart as a view of one process.
 
 ### Stats Model
 

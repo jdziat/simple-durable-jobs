@@ -1,6 +1,12 @@
 package worker
 
 import (
+	"context"
+	"sync"
+
+	"github.com/jdziat/simple-durable-jobs/v4/pkg/core"
+	"github.com/jdziat/simple-durable-jobs/v4/pkg/queue"
+	"github.com/stretchr/testify/require"
 	"math"
 	"testing"
 	"time"
@@ -211,5 +217,66 @@ func TestResolveRateLimitWindow_HonoursAnExplicitWindow(t *testing.T) {
 	for _, want := range []time.Duration{time.Second, 250 * time.Millisecond, 5 * time.Second} {
 		assert.Equal(t, want, w.resolveRateLimitWindow(RateLimitConfig{PerSecond: 3, Window: want}),
 			"an already-aligned explicit window must be used exactly as given")
+	}
+}
+
+// windowCapturingStorage records the window every rate consume is actually given.
+type windowCapturingStorage struct {
+	*mockStorage
+	mu      sync.Mutex
+	windows map[string]time.Duration
+}
+
+func (s *windowCapturingStorage) TryConsumeRate(_ context.Context, limitName string, _ float64, window time.Duration, _ time.Time) (bool, error) {
+	s.mu.Lock()
+	s.windows[limitName] = window
+	s.mu.Unlock()
+	return true, nil
+}
+
+// TestTryConsumeRateLimits_UsesTheDerivedWindowAtTheCallSite covers the CALL SITE,
+// which was free.
+//
+// FALSE-GREEN TRAP, and every other test in this file was it: they call
+// deriveRateLimitWindow/resolveRateLimitWindow as pure functions and check the
+// result against enforcedRate(), a test-local RE-IMPLEMENTATION of the storage
+// gate's arithmetic. That is asserting on a copy of production. Nothing drove a
+// fractional PerSecond through tryConsumeRateLimits, so
+//
+//	window := w.resolveRateLimitWindow(limit)   ->   window := defaultRateLimitWindow
+//
+// left the entire package GREEN — and that constant is not a neutral placeholder,
+// it is EXACTLY the pre-fix behaviour for fractional rates. The whole point of the
+// derivation could have been reverted silently.
+//
+// The assertion here is deliberately NOT "the window equals what
+// resolveRateLimitWindow returns" — that would be the same copy trap one level up,
+// and it would pass if both were wrong. It is the PROPERTY the derivation exists
+// to guarantee, applied to the window that genuinely reached storage: the rate the
+// gate will enforce, ceil(PerSecond*window)/window, must be within the documented
+// 0.5% of the configured rate.
+func TestTryConsumeRateLimits_UsesTheDerivedWindowAtTheCallSite(t *testing.T) {
+	for _, perSecond := range []float64{0.011, 0.3, 1.01, 1.2, 2.5, 6.25, 7.3} {
+		store := &windowCapturingStorage{mockStorage: &mockStorage{}, windows: map[string]time.Duration{}}
+		q := queue.New(store)
+		w := NewWorker(q, RateLimit("api", perSecond))
+
+		job := &core.Job{ID: core.NewID(), Type: "t", Queue: "default", Status: core.StatusRunning}
+		allowed, _ := w.tryConsumeRateLimits(context.Background(), job)
+		require.True(t, allowed, "PerSecond=%v: the capturing storage always allows", perSecond)
+
+		store.mu.Lock()
+		got := store.windows["api"]
+		store.mu.Unlock()
+		require.Positive(t, got, "PerSecond=%v: no window reached storage at all", perSecond)
+
+		// The gate admits ceil(PerSecond*window) units per window, so this is the
+		// rate it will actually enforce.
+		enforced := math.Ceil(perSecond*got.Seconds()) / got.Seconds()
+		relErr := math.Abs(enforced-perSecond) / perSecond
+		assert.LessOrEqual(t, relErr, 0.005,
+			"PerSecond=%v reached storage with a %v window, which enforces %v (%.1f%% off). The "+
+				"configured rate must be honoured within 0.5%% at the CALL SITE, not merely by the "+
+				"derivation function in isolation", perSecond, got, enforced, relErr*100)
 	}
 }

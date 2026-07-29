@@ -17,9 +17,12 @@ Three releases matter here.
 
 No API break: `gorelease` reports every change compatible, and the only additions
 are new options, new event aliases and new storage methods. That is *signature*
-compatibility — one exported method's observable **error contract** does change
-(`EnqueueScheduledFire` now returns a sentinel on a deliberate skip), which is
-described below.
+compatibility — one exported method's observable behaviour does change:
+`EnqueueScheduledFire` now COMMITS the schedule's claim on a deduplicated fire and
+reports `claimed = true`, where it previously rolled the claim back. (v4.7.0 also
+returned `ErrDuplicateJob` here, so the error value itself is not new; what changed
+is that the boundary is now consumed rather than retried at 10 Hz.) Described
+below.
 
 ---
 
@@ -199,6 +202,17 @@ remove the compensation. Expressions without a prefix are unchanged and remain
 UTC — deliberately, since the underlying parser would otherwise default them to
 the host's timezone.
 
+**During a rolling deploy, a prefixed schedule can fire TWICE in one day.** The two
+versions disagree about which instant the next boundary is, and they share one
+cursor: the old binary claims the boundary at the UTC hour, the new one then claims
+the boundary at the requested local hour, and both are "next" by their own
+reckoning. Reproduced by alternating the real binaries against one SQLite cursor
+with `Cron("CRON_TZ=America/New_York 0 9 * * *")` — two fires on the same calendar
+day, at every old→new handover. It clears once the rollout completes. If a double
+run of that job would be harmful, either declare it `queue.Unique(...)` for the
+duration or pause the schedule across the deploy. Unprefixed schedules are
+unaffected, since neither version moves them.
+
 Also adds `CronIn`, `DailyIn`, `WeeklyIn` (and `MustCronIn`) for callers holding a
 `*time.Location` rather than a name. `DailyIn`/`WeeklyIn` advance by rolling the
 calendar **day** rather than the instant, so in a DST zone they fire exactly once
@@ -278,16 +292,22 @@ deliberately.
 Whole-number rates derive exactly the same window as before and do not move
 (verified for 1..20000).
 
-Some `1/n` rates DO move, by at most one second and essentially always **toward**
-the rate you configured: the old formula rounded up on the float representation of
-`1/n`, so those were never exact to begin with. Measured over n = 1..20000, 14%
-shift; the first is `1/49`, whose window goes from 50s to 49s. (17 of those movers,
-around n ≈ 16300, drift microscopically the other way — a relative error of about
-6×10⁻⁸, from the one-millisecond floor applied to a four-and-a-half-hour window.
-Far inside the bound above, but "always" would be the wrong word.) Every round reciprocal an
-operator actually writes — 1/2, 1/3, 1/4, 1/5, 1/6, 1/10, 1/12, 1/15, 1/20, 1/30,
-1/45, 1/60, 1/90, 1/120, 1/180, 1/300, 1/600, 1/900, 1/1800, 1/3600, 1/86400 — is
-unchanged.
+Some `1/n` rates DO move, by at most one second: the old formula rounded up on the
+float representation of `1/n`, so those were never exact to begin with. Measured
+over n = 1..20000, 2785 of them shift (13.9%); the first is `1/49`, whose window
+goes from 50s to 49s.
+
+Those movers split almost evenly — 1421 end closer to the rate you configured and
+1364 end very slightly farther, the first at `1/93` (a 93s window losing one
+millisecond). The worst drift away is **1.1×10⁻⁵**, i.e. 0.001%, which is two
+orders of magnitude inside the 0.5% bound above and far below what any limiter can
+observe. (An earlier draft of this file said "17 movers, around n ≈ 16300, about
+6×10⁻⁸". That was wrong in all three numbers; the figures here are measured
+against the shipped derivation.)
+
+Every round reciprocal an operator actually writes — 1/2, 1/3, 1/4, 1/5, 1/6,
+1/10, 1/12, 1/15, 1/20, 1/30, 1/45, 1/60, 1/90, 1/120, 1/180, 1/300, 1/600, 1/900,
+1/1800, 1/3600, 1/86400 — is unchanged.
 
 An explicitly set `RateLimitConfig.Window` is now floored to a whole millisecond
 and clamped, where it was previously used verbatim. That alignment is not
@@ -306,8 +326,10 @@ The two versions derive different windows for the same `PerSecond`, and
 different rows in `rate_limit_windows` and each gets a full independent budget.
 The enforced rate while both are running is the **sum**. Measured against the real
 storage gate at `PerSecond: 0.3` over 30 s: v4.7.0 alone admits 0.533/sec (its own
-overshoot), v4.8.0 alone admits 0.333/sec, and a mixed fleet admits **0.867/sec** —
-2.9× what you configured. It clears the moment the rollout completes, but it
+overshoot), v4.8.0 alone admits 0.333/sec, and an actually-mixed run admits
+**0.833/sec** — 2.8× what you configured. (The two budgets sum to 0.867; a mixed
+run lands slightly under that because the windows occasionally share a
+`window_start` and one admission is lost to the collision.) It clears the moment the rollout completes, but it
 persists indefinitely if you leave a canary on the old version, so if the limit
 exists to protect a third party, finish the rollout promptly or pause it.
 Whole-number rates derive the same window on both versions and are unaffected.
@@ -375,21 +397,25 @@ prefix fixes which *hour* fires, not which face it is stored on.)
 rewrite is what made the original design of this fix dangerous. A `run_at` already
 stored on a foreign clock face keeps it, so a delayed job enqueued **before** the
 upgrade can still fire at the wrong time, in **either direction** and by up to the
-full offset delta (as much as 14 hours):
+full offset DELTA between the two faces, not by one offset — so the bound is 26
+hours, not 14, since the stored and local offsets can sit at opposite ends of the
+range (`+14:00` against `-12:00`):
 
 The direction follows the **stored offset relative to this process's local
-offset** — not the host's zone, so a UTC host is not exempt:
+offset** — not the host's zone, so a UTC host is not exempt. The comparison is on
+the rendered digits, `T + offset_stored` against `now + offset_local`, so:
 
-- A stored offset **ahead of** this process's offset sorts below the bind, and the
-  job fires **early** — reproduced on a UTC host with a Tokyo-faced row, and under
-  `TZ=Asia/Tokyo` with a UTC-faced row scheduled two hours out that was dequeued
-  immediately. Early is usually the direction that matters: "send this in twelve
-  hours" going out now.
-- A stored offset **behind** this process's offset sorts above the bind, and the
-  job fires **late**.
+- A stored offset **behind** this process's offset renders SMALLER digits, sorts
+  below the bind, and the job fires **early** — a `-08:00`-faced row on a UTC
+  host, or a UTC-faced row under `TZ=Asia/Tokyo`. Early is usually the direction
+  that matters: "send this in twelve hours" going out now.
+- A stored offset **ahead of** this process's offset renders LARGER digits, sorts
+  above the bind, and the job fires **late** — a `+09:00`-faced row on a UTC host.
 
-An operator on a UTC host holding rows written by services in other zones is
-affected in **both** directions.
+The error appears once the offset difference exceeds the delay, so a row whose
+stored offset is 9 hours behind fires early for anything scheduled less than 9
+hours out. An operator on a UTC host holding rows written by services in other
+zones is affected in **both** directions.
 
 This is pre-existing behaviour and not a regression — v4.7.0 does the same thing to
 its own rows, and a v4.7.0-seeded database produces a character-identical set of
@@ -518,8 +544,11 @@ Any further migration is listed here by the packet that adds it.
 *code*, so any behaviour fixed above reverts with it. The one that can cost you
 work rather than just correctness is on **SQLite**: v4.7.0's lexical
 schedule-cursor comparison comes back, so a non-UTC or sub-second schedule can
-start stalling again on rows v4.8.0 had just been advancing correctly (measured
-under `TZ=Asia/Tokyo`: two to three schedules per zone stop firing). That is
+start stalling again on rows v4.8.0 had just been advancing correctly. Measured
+across four host zones: 2 schedules stalled under `TZ=Asia/Tokyo` and none under
+UTC, Europe/Berlin or America/Los_Angeles — it takes a host offset far enough from
+the stored face for the lexical comparison to invert, so whether you see it at all
+depends on where your workers run. That is
 v4.7.0's own pre-existing bug re-entering, not damage the rollback does — but "the
 rollback is safe" is a statement about the schema, not about schedules. Postgres
 and MySQL are unaffected.

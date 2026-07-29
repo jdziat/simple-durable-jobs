@@ -74,3 +74,19 @@ resource classes. Partitioning on a high-cardinality value (a job ID, a UUID, or
 arbitrary user input) creates a new permanent row per distinct value and grows
 `concurrency_slots` without bound. For "only N of these at a time" use a bounded
 key; do not derive it from `job.ID` or free-form data.
+
+## Keep the cap key stable per job
+
+Bounded is not sufficient — the key must also be **stable for a given job across
+re-dispatches**. A job can be dequeued twice by the same worker: an aggressive
+pause releases it to `pending` and the poll loop picks it up again, and the
+stale-lock reaper can do the same. The two runs briefly overlap, and they share one
+slot row, which is released once the last of them finishes.
+
+If the key changed between those two dequeues, the runs hold *different* rows and
+the earlier one's row is released by nobody — it holds a fleet-wide cap slot until
+it expires at its TTL, throttling every worker in the deployment for that window.
+
+Derive the key from something immutable for the life of the job (its tenant, its
+queue, a field of the payload). Do not derive it from mutable metadata that a
+handler rewrites, or from anything that depends on when the job happened to run.

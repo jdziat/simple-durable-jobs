@@ -121,7 +121,7 @@ jobs:
 
       - name: Build frontend
         working-directory: ui/frontend
-        run: npm install && npm run build
+        run: npm ci && npm run build
 
       - name: Download Go dependencies
         run: go mod download
@@ -211,12 +211,18 @@ jobs:
           found=""
           while IFS= read -r f; do
             [ -f "$f" ] || continue
+            # An EMPTY file has no character to match, so the grep below would call
+            # it binary and red the Lint job over a .gitkeep. Skip zero-byte files
+            # explicitly: they cannot be a compiled artifact.
+            [ -s "$f" ] || continue
             case "$f" in
               *.png|*.jpg|*.jpeg|*.gif|*.ico|*.webp|*.woff|*.woff2|*.ttf|*.otf|*.eot) continue ;;
             esac
-            # -I treats binary files as non-matching, so a file with NO match for
-            # "." (any character) is one git considers binary.
-            if ! git grep -Iq . -- "$f" 2>/dev/null; then
+            # -I treats binary files as non-matching, so a file with NO match is
+            # one git considers binary. The pattern is "^" (start of line), which
+            # every line of every text file has -- "." would miss a file that is
+            # only blank lines and report it as binary.
+            if ! git grep -Iq "^" -- "$f" 2>/dev/null; then
               found="$found $f($(stat -c%s "$f")B)"
             fi
           done < <(git ls-files)
@@ -239,7 +245,7 @@ jobs:
 
       - name: Build frontend
         working-directory: ui/frontend
-        run: npm install && npm run build
+        run: npm ci && npm run build
 
       # ui/frontend/dist is COMMITTED and //go:embed'd, so it is what consumers
       # actually get — but nothing ever compared it to its own source. A stale
@@ -253,11 +259,17 @@ jobs:
       # committed bundle genuinely does not match its source.
       - name: Committed frontend bundle matches its source
         run: |
-          if ! git diff --quiet -- ui/frontend/dist; then
+          # `git status --porcelain`, NOT `git diff`: diff only sees TRACKED files,
+          # so a brand-new asset the build emits (a favicon, a font) shows up as
+          # untracked and the check would pass while go:embed ships the bundle
+          # WITHOUT it. That is the exact shape of the favicon bug this same wave
+          # fixed, one layer up.
+          drift="$(git status --porcelain -- ui/frontend/dist)"
+          if [ -n "$drift" ]; then
             echo "::error::ui/frontend/dist does not match a fresh build of its source."
             echo "It is committed and go:embed'd, so the dashboard consumers get is the stale one."
             echo "Fix: (cd ui/frontend && npm run build) and commit the result."
-            git diff --stat -- ui/frontend/dist
+            echo "$drift"
             exit 1
           fi
           echo "committed bundle matches a fresh build"
@@ -408,7 +420,7 @@ jobs:
 
       - name: Build frontend
         working-directory: ui/frontend
-        run: npm install && npm run build
+        run: npm ci && npm run build
 
       - name: Build
         run: go build -v ./...
