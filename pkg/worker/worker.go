@@ -63,7 +63,7 @@ type Worker struct {
 	// Guarded by runningJobsMu, which already guards the cancel funcs the pause
 	// invokes, so the mark and the cancel cannot be observed out of order.
 	// pauseCancelled holds the RUN TOKENS whose handler an aggressive pause
-	// cancelled. Keyed by run, NOT by job id.
+	// cancelled — keyed by RUN, not by job id.
 	//
 	// Two runs of the same job id can be alive at once now that the pause path
 	// releases to `pending` while this worker still polls, and a map keyed by job
@@ -3379,11 +3379,12 @@ func (w *Worker) runOwnershipAudit(ctx context.Context) {
 // takePauseCancelled reports whether this job's handler was cancelled by an
 // aggressive pause, clearing the mark so it is consumed exactly once.
 //
-// Consuming the mark matters: a job released by a pause is re-dispatched on
-// resume, and if the mark survived, a genuine failure on that later run would be
-// silently swallowed as "just a pause" and released forever.
 // takePauseCancelled reports whether THIS run's handler was cancelled by an
 // aggressive pause, consuming the mark if so.
+//
+// Consuming it matters: a job released by a pause is re-dispatched on resume, and
+// a surviving mark would make a genuine failure on that later run look like "just
+// a pause" and be released forever.
 func (w *Worker) takePauseCancelled(runToken uint64) bool {
 	w.runningJobsMu.Lock()
 	defer w.runningJobsMu.Unlock()
@@ -3459,7 +3460,6 @@ func (w *Worker) cancelRun(jobID core.UUID, runToken uint64) bool {
 	return true
 }
 
-// Resume resumes the worker.
 // Resume lifts the pause and lets the poll loop dispatch again.
 //
 // It deliberately does NOT clear the pause-cancel marks. It used to, and that

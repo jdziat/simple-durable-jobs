@@ -30,7 +30,7 @@ func resumeUUID(t *testing.T, v string) core.UUID {
 // automatic fan-out-completion path; it must not override a human.
 // ──────────────────────────────────────────────────────────────────────────────
 
-func TestResumeJob_ResumesPausedJob(t *testing.T) {
+func TestResumeJob_DoesNotResumeAPausedJob(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStorage(t)
 	id := resumeUUID(t, "resume-paused")
@@ -51,7 +51,7 @@ func TestResumeJob_ResumesPausedJob(t *testing.T) {
 		"the pause stands until the operator lifts it via UnpauseJob (what Queue.ResumeJob calls)")
 }
 
-func TestResumeJob_PausedResumeSetsDqReady(t *testing.T) {
+func TestResumeJob_WaitingResumeSetsDqReady(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStorage(t)
 	id := resumeUUID(t, "resume-paused-dqready")
@@ -130,7 +130,7 @@ func TestResumeJob_CompletedReturnsFalse(t *testing.T) {
 // ResumeJob — preserves run_at across a paused resume (delayed schedule honored)
 // ──────────────────────────────────────────────────────────────────────────────
 
-func TestResumeJob_PausedResumePreservesRunAt(t *testing.T) {
+func TestResumeJob_WaitingResumePreservesRunAt(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStorage(t)
 	id := resumeUUID(t, "resume-paused-runat")
@@ -138,9 +138,9 @@ func TestResumeJob_PausedResumePreservesRunAt(t *testing.T) {
 	// A delayed job that was paused before its run_at fired.
 	future := time.Now().Add(time.Hour).UTC()
 	require.NoError(t, s.db.WithContext(ctx).Create(&core.Job{
-		ID:     id,
-		Type:   "fixture.job",
-		Queue:  "default",
+		ID:    id,
+		Type:  "fixture.job",
+		Queue: "default",
 		// Waiting, not paused: ResumeJob no longer accepts paused (an operator's
 		// decision is not the fan-out completion path's to undo). run_at
 		// preservation is a property of ResumeJob itself and is asserted here on

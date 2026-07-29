@@ -135,6 +135,11 @@ travels the ordinary failure path and still burns the attempt. Return (or wrap)
 around a pause. Alerting that counted those events will see them stop. Resume
 simply re-dispatches the job.
 
+`Queue.OnJobWaiting` hooks now also fire for each aggressively-paused job. That is
+how the attempt's tracing span is closed — without it every paused job leaked one —
+but if you registered that hook to account for fan-out and signal parks, you will
+see new entries. The hook receives an already-cancelled job context on this path.
+
 The heartbeat change is **not** limited to pause. It is detached from the job's
 own context, so any cancellation that leaves a handler running — including
 `Worker.Stop()` in a process that stays alive — now keeps the lease renewed until
@@ -264,10 +269,13 @@ deliberately.
 Whole-number rates derive exactly the same window as before and do not move
 (verified for 1..20000).
 
-Some `1/n` rates DO move, by at most one second and always **toward** the rate you
-configured: the old formula rounded up on the float representation of `1/n`, so
-those were never exact to begin with. Measured over n = 1..20000, 14% shift; the
-first is `1/49`, whose window goes from 50s to 49s. Every round reciprocal an
+Some `1/n` rates DO move, by at most one second and essentially always **toward**
+the rate you configured: the old formula rounded up on the float representation of
+`1/n`, so those were never exact to begin with. Measured over n = 1..20000, 14%
+shift; the first is `1/49`, whose window goes from 50s to 49s. (17 of those movers,
+around n ≈ 16300, drift microscopically the other way — a relative error of about
+6×10⁻⁸, from the one-millisecond floor applied to a four-and-a-half-hour window.
+Far inside the bound above, but "always" would be the wrong word.) Every round reciprocal an
 operator actually writes — 1/2, 1/3, 1/4, 1/5, 1/6, 1/10, 1/12, 1/15, 1/20, 1/30,
 1/45, 1/60, 1/90, 1/120, 1/180, 1/300, 1/600, 1/900, 1/1800, 1/3600, 1/86400 — is
 unchanged.
