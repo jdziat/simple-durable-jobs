@@ -196,12 +196,18 @@ per day — the old form could fire twice on a spring-forward day.
 ### Fan-out sub-job options are honoured
 
 **Before:** `fanout.Sub` accepted the full `queue.Option` set and silently dropped
-`Determinism`, `Delay`, `RunAt` and `IdempotencyKey`. It also stamped a retry
-count on every child unconditionally, which made the fan-out default unreachable
-— so `WithFanOutRetries(n)` was **completely dead** for anything built with
-`Sub()`, and an explicit `Retries(0)` was overridden with the default.
+`Determinism`, `Delay` and `RunAt`. It also stamped a retry count on every child
+unconditionally, which made the fan-out default unreachable — so
+`WithFanOutRetries(n)` was **completely dead** for anything built with `Sub()`, and
+an explicit `Retries(0)` was overridden with the default.
 
-**After:** all of these take effect.
+**After:** `Determinism`, `Delay`, `RunAt` and the retry options take effect.
+
+The dedup options (`Unique`, `IdempotencyKey`, `UniqueFor`) still do **not**, and
+that is deliberate — a fan-out child carries a fan-out-owned unique key so parent
+replay stays idempotent, and a caller-supplied one cannot be honoured without
+breaking that. What changed is that they are no longer silent: passing one logs a
+`WARN`. See the last bullet below.
 
 **What you may notice:**
 
@@ -242,15 +248,29 @@ against the real gate on SQLite, Postgres and MySQL:
 | 2.5 /s | 3 /s | +20% |
 | 7.3 /s | 8 /s | +9.6% |
 
-**After:** the configured rate is honoured within 0.5%.
+**After:** the configured rate is honoured within 0.5% for every rate a deployment
+would plausibly set — measured by sweeping, not by sampling, from about
+3.2×10⁻¹⁰/sec (one job per century) up to 10⁹/sec. Below that floor the
+hundred-year window clamp binds and the limiter runs fast; far below it the
+`float64`→`Duration` conversion overflows and it falls back to a one-second
+window. Those inputs are absurd rather than merely unusual, and the code comment on
+`maxRateLimitWindow` states the behaviour precisely.
 
 **What you may notice:** throughput on fractional rates **drops** — by up to half
 in the worst case. That is the rate you configured; you were previously getting
 more than you asked for. If you tuned against the old behaviour, raise the limit
 deliberately.
 
-Rates that were already exact — whole numbers and `1/n` — derive the same window
-as before and do not move.
+Whole-number rates derive exactly the same window as before and do not move
+(verified for 1..20000).
+
+Some `1/n` rates DO move, by at most one second and always **toward** the rate you
+configured: the old formula rounded up on the float representation of `1/n`, so
+those were never exact to begin with. Measured over n = 1..20000, 14% shift; the
+first is `1/49`, whose window goes from 50s to 49s. Every round reciprocal an
+operator actually writes — 1/2, 1/3, 1/4, 1/5, 1/6, 1/10, 1/12, 1/15, 1/20, 1/30,
+1/45, 1/60, 1/90, 1/120, 1/180, 1/300, 1/600, 1/900, 1/1800, 1/3600, 1/86400 — is
+unchanged.
 
 An explicitly set `RateLimitConfig.Window` is now floored to a whole millisecond
 and clamped, where it was previously used verbatim. That alignment is not
@@ -316,11 +336,20 @@ never fired.
 **Rows already in the database are NOT rewritten**, deliberately — an in-place
 rewrite is what made the original design of this fix dangerous. A `run_at` already
 stored on a foreign clock face keeps it, so a delayed job enqueued **before** the
-upgrade can still become eligible late: a value supplied as UTC is stored
-`2026-07-26 23:00:00+00:00`, which sorts above every same-date local-faced bind,
-so it waits until the local date rolls past its UTC date. If you have a backlog of
-delayed jobs that were enqueued with a non-local `run_at`, re-enqueue them.
-Postgres and MySQL are unaffected throughout.
+upgrade can still fire at the wrong time, in **either direction** and by up to the
+full offset delta (as much as 14 hours):
+
+- In a zone **behind** UTC, a UTC-faced value sorts above the local-faced bind and
+  the job fires **late**.
+- In a zone **ahead** of UTC it sorts below, and the job fires **early** —
+  reproduced under Asia/Tokyo, where a job scheduled two hours out was dequeued
+  immediately. Early is usually the direction that matters: "send this in twelve
+  hours" going out now.
+
+This is pre-existing behaviour and not a regression — v4.7.0 does the same thing to
+its own rows — but it is not repaired by upgrading. If you have a backlog of
+delayed jobs enqueued with a non-local `run_at`, re-enqueue them; that fixes both
+directions. Postgres and MySQL are unaffected throughout.
 
 ### The dashboard counts queue depth instead of paging job rows
 

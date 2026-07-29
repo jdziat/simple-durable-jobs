@@ -2340,7 +2340,13 @@ func (w *Worker) runHeartbeat(ctx context.Context, job *core.Job, runToken uint6
 					w.logger.Error("heartbeat abandoning orphaned job — cancelling handler",
 						"job_id", job.ID,
 						"consecutive_orphan_errs", consecutiveOrphanErrs)
-					w.CancelJob(job.ID)
+					// Cancel THIS run, not whichever run currently owns the job id.
+					// The pause path deliberately allows two runs of one id to be
+					// alive at once, and the orphan condition belongs to the run whose
+					// heartbeat failed — cancelling by id alone reaches into a
+					// healthy later run and kills it, which then travels the failure
+					// path and burns an attempt it never earned.
+					w.cancelRun(job.ID, runToken)
 					return
 				}
 			default:
@@ -2886,7 +2892,7 @@ func (w *Worker) runScheduler(ctx context.Context) {
 				// off. lastRun is not advanced while it does, so the due boundary is
 				// still due when the backoff expires — nothing is dropped, it is just
 				// not re-attempted at the tick rate.
-				if retryAt, backingOff := fireRetryAt[name]; backingOff && now.Before(retryAt) {
+				if scheduleIsBackingOff(fireRetryAt, name, now) {
 					continue
 				}
 				if _, ok := lastRun[name]; !ok {
@@ -2897,7 +2903,7 @@ func (w *Worker) runScheduler(ctx context.Context) {
 					lastRun[name] = w.establishScheduleBase(ctx, name, sj.Schedule, now)
 				}
 				nextRun := sj.Schedule.Next(lastRun[name])
-				if nextRun.IsZero() {
+				if scheduleNeverFires(nextRun) {
 					// The schedule has no future fire (an unsatisfiable cron such as
 					// "0 0 30 2 *"; cron.SpecSchedule.Next returns the zero time when
 					// nothing matches within five years). Next is pure in its input and
@@ -3429,6 +3435,25 @@ func (w *Worker) CancelJob(jobID core.UUID) bool {
 	return ok
 }
 
+// cancelRun cancels a SPECIFIC run of a job, and does nothing if that run is no
+// longer the one registered for the id.
+//
+// CancelJob is the right tool for an operator cancelling "that job" — whichever
+// run is current. It is the wrong tool for a condition that belongs to one
+// particular run, such as an orphaned heartbeat: since the pause path lets two
+// runs of one id be alive at once, cancelling by id there reaches past the failed
+// run into a healthy later one.
+func (w *Worker) cancelRun(jobID core.UUID, runToken uint64) bool {
+	w.runningJobsMu.Lock()
+	rj, ok := w.runningJobs[jobID]
+	w.runningJobsMu.Unlock()
+	if !ok || rj.token != runToken {
+		return false
+	}
+	rj.cancel()
+	return true
+}
+
 // Resume resumes the worker.
 // Resume lifts the pause and lets the poll loop dispatch again.
 //
@@ -3618,4 +3643,28 @@ func (w *Worker) applyScheduleFireDisposition(o scheduleFireOutcome) {
 		delete(o.retryAt, o.name)
 		o.lastRun[o.name] = o.nextRun
 	}
+}
+
+// scheduleIsBackingOff reports whether this schedule is inside a failure backoff
+// window and must not be re-attempted on this tick.
+//
+// This is the gate that actually CONSUMES the delay applyScheduleFireDisposition
+// records — the only thing standing between a persistently failing schedule and
+// one claim transaction plus one ERROR log every 100ms tick. It is a named
+// function rather than an inline condition so that consuming the delay can be
+// tested, not just computing it.
+func scheduleIsBackingOff(fireRetryAt map[string]time.Time, name string, now time.Time) bool {
+	retryAt, backingOff := fireRetryAt[name]
+	return backingOff && now.Before(retryAt)
+}
+
+// scheduleNeverFires reports whether a schedule has no future fire at all.
+//
+// cron.SpecSchedule.Next returns the ZERO time when nothing matches within five
+// years — an unsatisfiable expression such as "0 0 30 2 *". Next is pure in its
+// input and lastRun is not advanced, so the condition is permanent, and without
+// this gate the zero time reads as "due" (every instant is after it) and every
+// tick runs a doomed claim transaction forever, silently.
+func scheduleNeverFires(nextRun time.Time) bool {
+	return nextRun.IsZero()
 }

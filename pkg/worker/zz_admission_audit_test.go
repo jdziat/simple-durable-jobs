@@ -298,3 +298,40 @@ func TestProcessJobRun_ReleasesConcurrencySlotsRegisteredByDispatch(t *testing.T
 		})
 	}
 }
+
+// TestCancelRun_OnlyCancelsItsOwnRun covers the FIFTH job-id-keyed lookup, which
+// the four map re-keyings missed.
+//
+// runHeartbeat's orphan branch used to call CancelJob(job.ID), which resolves
+// whichever run currently owns the id. Since the pause path deliberately allows
+// two runs of one id to be alive at once, an orphaned heartbeat belonging to run #1
+// reached past it and cancelled a HEALTHY run #2 — which then travelled the failure
+// path and burned an attempt it never earned.
+//
+// FALSE-GREEN TRAP: asserting that cancelling by token works passes with the bug
+// present, because the happy case is identical. The discriminating case is a STALE
+// token: it must cancel nothing.
+func TestCancelRun_OnlyCancelsItsOwnRun(t *testing.T) {
+	w := NewWorker(queue.New(&mockStorage{}))
+	jobID := core.NewID()
+
+	var run1Cancelled, run2Cancelled bool
+	w.runningJobsMu.Lock()
+	tok1 := w.nextRunToken.Add(1)
+	w.runningJobs[jobID] = runningJobEntry{cancel: func() { run1Cancelled = true }, token: tok1}
+	tok2 := w.nextRunToken.Add(1)
+	w.runningJobs[jobID] = runningJobEntry{cancel: func() { run2Cancelled = true }, token: tok2}
+	w.runningJobsMu.Unlock()
+
+	// Run #1's orphan condition fires after run #2 has taken over the id.
+	assert.False(t, w.cancelRun(jobID, tok1),
+		"a stale run token must cancel nothing")
+	assert.False(t, run2Cancelled,
+		"an orphaned heartbeat belonging to an earlier run must NOT cancel the healthy run that "+
+			"replaced it — that run would then fail and burn an attempt it never earned")
+	assert.False(t, run1Cancelled, "run #1 is no longer registered, so there is nothing to cancel")
+
+	// The current run is still cancellable by its own token, and by CancelJob.
+	assert.True(t, w.cancelRun(jobID, tok2))
+	assert.True(t, run2Cancelled)
+}

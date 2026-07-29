@@ -159,13 +159,28 @@ func TestWeeklyIn_RollsSevenCalendarDaysAcrossSpringForward(t *testing.T) {
 	s := WeeklyIn(ny, time.Sunday, 2, 30)
 	from := time.Date(2026, 3, 1, 12, 0, 0, 0, ny)
 
-	first := s.Next(from)
-	second := s.Next(first)
+	fires := make([]time.Time, 0, 5)
+	for range 5 {
+		from = s.Next(from)
+		fires = append(fires, from.In(ny))
+	}
 
-	assert.Equal(t, time.Sunday, first.In(ny).Weekday(), "must land on the requested weekday")
-	assert.Equal(t, time.Sunday, second.In(ny).Weekday(),
-		"and must STILL land on it after crossing the DST boundary — adding 168h to a "+
-			"normalized instant drifts the weekday")
-	assert.Equal(t, 7, int(second.In(ny).Sub(first.In(ny)).Hours()/24+0.5),
-		"consecutive fires must be seven calendar days apart")
+	// 2026-03-08 02:30 does not exist (spring forward), so time.Date normalizes
+	// that ONE fire to 01:30 EST. Every fire after it must be back at 02:30.
+	seen := map[string]bool{}
+	for i, f := range fires {
+		assert.Equal(t, time.Sunday, f.Weekday(), "fire %d landed on %s", i+1, f.Weekday())
+
+		date := f.Format("2006-01-02")
+		assert.False(t, seen[date], "fire %d repeats %s — a weekly schedule fired twice in one week", i+1, date)
+		seen[date] = true
+
+		if i == 0 {
+			continue // the normalized transition fire
+		}
+		assert.Equal(t, "02:30", f.Format("15:04"),
+			"fire %d is at %s: rolling the INSTANT rather than the calendar day carries the "+
+				"DST-normalized 01:30 forward permanently, so the schedule runs an hour early "+
+				"for the rest of its life", i+1, f.Format("15:04 MST"))
+	}
 }

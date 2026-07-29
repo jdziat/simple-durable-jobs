@@ -7,8 +7,10 @@ import (
 
 	"github.com/jdziat/simple-durable-jobs/v4/pkg/core"
 	"github.com/jdziat/simple-durable-jobs/v4/pkg/queue"
+	"github.com/jdziat/simple-durable-jobs/v4/pkg/schedule"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // The scheduler had exactly ONE disposition for a non-success outcome: log ERROR,
@@ -113,4 +115,57 @@ func TestApplyScheduleFireDisposition(t *testing.T) {
 			"the backoff must grow, or a persistent failure costs a transaction and an ERROR "+
 				"log every tick")
 	})
+}
+
+// TestScheduleBackoff_IsActuallyConsumed pairs the two halves of the backoff.
+//
+// applyScheduleFireDisposition RECORDS a delay and was already tested; the loop
+// gate that CONSUMES it was not, so UPGRADE.md's claim — "genuine failures now back
+// off per schedule (100ms doubling to 30s) instead of retrying every tick" — rested
+// entirely on the half that computes a number nobody reads. Deleting the gate left
+// the whole package green.
+//
+// FALSE-GREEN TRAP: asserting the delay VALUE only re-tests scheduleFireRetryDelay,
+// which is already covered. The assertion has to be that a tick inside the window
+// is suppressed and a tick after it is not.
+func TestScheduleBackoff_IsActuallyConsumed(t *testing.T) {
+	w := NewWorker(queue.New(&mockStorage{}))
+	now := time.Date(2026, 7, 27, 9, 0, 0, 0, time.UTC)
+
+	o := scheduleFireOutcome{
+		name: "s", nextRun: now, now: now, err: errors.New("database fell over"),
+		failures: map[string]int{}, retryAt: map[string]time.Time{}, lastRun: map[string]time.Time{},
+	}
+	w.applyScheduleFireDisposition(o)
+	delay := o.retryAt["s"].Sub(now)
+	require.Positive(t, delay, "the disposition must have recorded a backoff")
+
+	assert.True(t, scheduleIsBackingOff(o.retryAt, "s", now),
+		"a tick at the instant of failure must be suppressed")
+	assert.True(t, scheduleIsBackingOff(o.retryAt, "s", now.Add(delay/2)),
+		"a tick inside the window must be suppressed — this is the only thing that stops one "+
+			"claim transaction and one ERROR log every 100ms tick")
+	assert.False(t, scheduleIsBackingOff(o.retryAt, "s", o.retryAt["s"]),
+		"the tick AT the deadline must be allowed through, or the boundary is delayed a tick")
+	assert.False(t, scheduleIsBackingOff(o.retryAt, "s", now.Add(delay*2)),
+		"a tick after the window must be allowed through")
+	assert.False(t, scheduleIsBackingOff(o.retryAt, "other", now.Add(-time.Hour)),
+		"backoff is per schedule: an unrelated name must never be suppressed")
+}
+
+// TestScheduleNeverFires guards the unsatisfiable-cron gate, which UPGRADE.md names
+// explicitly ("an unsatisfiable cron such as 0 0 30 2 * is logged once and skipped
+// rather than spinning forever") and which nothing tested. Without it the zero time
+// reads as due — every instant is after it — and every tick runs a doomed claim
+// transaction, permanently, because Next is pure and lastRun never advances.
+func TestScheduleNeverFires(t *testing.T) {
+	assert.True(t, scheduleNeverFires(time.Time{}),
+		"the zero time means cron found no match within five years")
+	assert.False(t, scheduleNeverFires(time.Date(2026, 7, 27, 9, 0, 0, 0, time.UTC)))
+
+	// The real thing: February 30th never occurs.
+	s, err := schedule.Cron("0 0 30 2 *")
+	require.NoError(t, err, "the expression is syntactically valid; it is just unsatisfiable")
+	assert.True(t, scheduleNeverFires(s.Next(time.Date(2026, 7, 27, 9, 0, 0, 0, time.UTC))),
+		"an unsatisfiable cron must be detected, or it spins a claim transaction every tick forever")
 }
