@@ -785,3 +785,82 @@ func TestProcessJob_LaterRunKeepsItsAdmissionState(t *testing.T) {
 		"both runs must decrement, or the per-queue counter leaks +1 per pause/resume cycle "+
 			"until the worker refuses every job on that queue")
 }
+
+// TestCancelJob_TravelsTheFailurePathNotThePauseRelease covers the third clause of
+// the pause-release condition, which was a FREE GUARD:
+//
+//	if err != nil && selfCancelled && w.takePauseCancelled(runToken) {
+//
+// Deleting `&& w.takePauseCancelled(runToken)` left the ENTIRE repository suite
+// green — every package plus the 300-second ./tests integration package.
+//
+// It is load-bearing because `selfCancelled` is true for ANY worker-induced cancel
+// that surfaces as context.Canceled with the parent context alive. That is not
+// only an aggressive pause: it is also Worker.CancelJob (the operator API), the
+// fan-out CancelOnFail sweep, and the stale-lock reaper. None of those set a pause
+// mark. Without the third clause all three are silently rerouted into the
+// pause-release path — the job goes back to `pending` with its attempt INTACT, no
+// Fail, no JobFailed/JobRetrying, the error discarded, and an INFO line promising
+// "it will re-dispatch on resume" for something nobody paused.
+//
+// FALSE-GREEN TRAP, and it is why this survived five rounds of review: the OTHER
+// half of the same condition IS covered (dropping `selfCancelled` reds
+// TestPause_GenuineErrorDuringAPauseStillFails), and the HELPER is unit-tested
+// five times over in this very file. Neither says anything about whether the call
+// site uses it. The assertion has to be on the persisted ROW.
+func TestCancelJob_TravelsTheFailurePathNotThePauseRelease(t *testing.T) {
+	var failCalls atomic.Int64
+	var lastErr atomic.Value
+	store := &mockStorage{}
+	store.failFunc = func(_ context.Context, _ core.UUID, _ string, errMsg string, _ *time.Time) error {
+		failCalls.Add(1)
+		lastErr.Store(errMsg)
+		return nil
+	}
+
+	q := queue.New(store)
+	started := make(chan struct{})
+	q.Register("slow", func(ctx context.Context, _ struct{}) error {
+		close(started)
+		<-ctx.Done()
+		return ctx.Err() // surfaces as context.Canceled, exactly like a pause
+	})
+
+	w := NewWorker(q)
+	job := &core.Job{ID: core.NewID(), Type: "slow", Queue: "default", Status: core.StatusRunning, MaxRetries: 3}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() { defer close(done); w.processJob(ctx, job) }()
+	select {
+	case <-started:
+	case <-time.After(10 * time.Second):
+		t.Fatal("handler never started")
+	}
+
+	// An OPERATOR cancel, not a pause. Nothing marks pauseCancelled.
+	require.True(t, w.CancelJob(job.ID), "the running job must be cancellable by id")
+
+	select {
+	case <-done:
+	case <-time.After(15 * time.Second):
+		t.Fatal("processJob never returned")
+	}
+
+	assert.Equal(t, int64(1), failCalls.Load(),
+		"a cancel that nobody paused must travel the FAILURE path: without the pause mark check "+
+			"it is released to pending with its attempt intact, so an operator cancel silently "+
+			"becomes a free retry and the job runs again")
+	if v := lastErr.Load(); v != nil {
+		assert.Contains(t, v.(string), "context canceled",
+			"and the cancellation must be recorded as the failure reason, not discarded")
+	}
+
+	store.mu.Lock()
+	released := append([]core.UUID(nil), store.releasedJobIDs...)
+	store.mu.Unlock()
+	assert.NotContains(t, released, job.ID,
+		"and it must NOT be Release()d as though it had been paused")
+}

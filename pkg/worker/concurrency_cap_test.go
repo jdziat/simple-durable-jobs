@@ -229,3 +229,11 @@ func TestRenewConcurrencySlots(t *testing.T) {
 	w.renewConcurrencySlots(context.Background(), "job-unknown", 99999)
 	assert.Equal(t, []string{"customer:a:job-1"}, store.renewals())
 }
+
+// TryAcquireConcurrencySlotOK is a test-only seeding helper: it inserts a held
+// slot row directly, without going through the admission path, so a test can set
+// up "a previous run already holds this".
+func (s *capMockStorage) TryAcquireConcurrencySlotOK(slotName string, jobID core.UUID, workerID string) bool {
+	ok, err := s.TryAcquireConcurrencySlot(context.Background(), slotName, jobID, workerID, 1, time.Minute)
+	return ok && err == nil
+}

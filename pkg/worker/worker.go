@@ -1742,11 +1742,22 @@ func (w *Worker) tryAcquireConcurrencySlots(ctx context.Context, job *core.Job, 
 		w.slotJobID[runToken] = slotHold{jobID: job.ID, names: append([]string(nil), names...)}
 		w.slotJobIDMu.Unlock()
 	}
+	// A rollback must not release on the context that just failed. On shutdown ctx
+	// is already Done, so the DELETE is refused too and a slot acquired moments
+	// earlier survives to its TTL — a fleet-wide cap slot held by a worker that has
+	// exited. Every other bail-out in dispatchDequeuedJobs already goes through
+	// releaseDequeuedJobOnShutdown, which detaches for exactly this reason; these
+	// three did not.
+	rollback := func() {
+		releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		w.releaseConcurrencySlots(releaseCtx, job.ID, runToken)
+	}
 	acquiredSlots := make([]string, 0, len(w.config.ConcurrencyCaps))
 	for _, cap := range w.config.ConcurrencyCaps {
 		slotName, ok := w.capSlotName(cap, job)
 		if !ok {
-			w.releaseConcurrencySlots(ctx, job.ID, runToken)
+			rollback()
 			return false
 		}
 		acquiredSlots = append(acquiredSlots, slotName)
@@ -1757,11 +1768,11 @@ func (w *Worker) tryAcquireConcurrencySlots(ctx context.Context, job *core.Job, 
 				"job_id", job.ID,
 				"slot", slotName,
 				"error", err)
-			w.releaseConcurrencySlots(ctx, job.ID, runToken)
+			rollback()
 			return false
 		}
 		if !acquired {
-			w.releaseConcurrencySlots(ctx, job.ID, runToken)
+			rollback()
 			return false
 		}
 	}

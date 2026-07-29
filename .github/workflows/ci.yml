@@ -166,7 +166,14 @@ jobs:
       #
       # FAILS CLOSED: git grep exits 0 on a match, 1 on none, and >1 on an actual
       # error. Only 1 is a pass; anything else fails the build rather than being
-      # silently read as "clean". dist/ is a generated bundle.
+      # silently read as "clean".
+      #
+      # KNOWN FALSE POSITIVE, accepted knowingly: a Markdown setext heading
+      # underlined with EXACTLY seven `=` is indistinguishable from a conflict
+      # marker at this level, and the Hugo docs this gate protects are Markdown.
+      # Eight or more is fine, which will look arbitrary to whoever hits it. It
+      # fails closed (a confusing red build, never a silent pass), so it is left as
+      # is rather than made cleverer; if you hit it, use a `##` heading.
       - name: No committed conflict markers
         run: |
           set -uo pipefail
@@ -209,7 +216,14 @@ jobs:
         run: |
           set -uo pipefail
           found=""
-          while IFS= read -r f; do
+          # -z / read -d '': without them git C-QUOTES any path containing a
+          # non-ASCII or control character, emitting the literal "sub/caf\303\251.bin".
+          # [ -f "$f" ] then fails on that string and the loop skips the file --
+          # so the guard was evadable by FILENAME, which is the same
+          # "only covers what someone predicted" flaw it was rewritten to fix,
+          # moved from formats to paths. Reproduced with identical ELF bytes under
+          # two names: the ASCII one was caught, the accented one passed.
+          while IFS= read -r -d '' f; do
             [ -f "$f" ] || continue
             # An EMPTY file has no character to match, so the grep below would call
             # it binary and red the Lint job over a .gitkeep. Skip zero-byte files
@@ -225,7 +239,7 @@ jobs:
             if ! git grep -Iq "^" -- "$f" 2>/dev/null; then
               found="$found $f($(stat -c%s "$f")B)"
             fi
-          done < <(git ls-files)
+          done < <(git ls-files -z)
           if [ -n "$found" ]; then
             echo "::error::binary files are committed outside the asset allowlist:$found"
             echo "If one is a genuine asset, add its extension to the allowlist in this step."

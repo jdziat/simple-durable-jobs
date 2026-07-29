@@ -1264,6 +1264,22 @@ func (q *Queue) UnregisterRunningJob(jobID core.UUID) {
 	q.runningJobsMu.Unlock()
 }
 
+// RunningJobCount reports how many jobs this process currently has registered as
+// locally running — the registry CancelJob and PauseJob consult to reach a live
+// handler.
+//
+// It exists because the invariant "a finished job unregisters itself" had no
+// observable: a worker that stopped calling UnregisterRunningJob left the whole
+// test suite green while this map grew by one retained context.CancelFunc per job
+// the process ever ran, and CancelJob/PauseJob began acting on stale entries for
+// long-finished jobs. Steady-state this should track in-flight work, not total
+// work done; a number that only ever climbs is that leak.
+func (q *Queue) RunningJobCount() int {
+	q.runningJobsMu.Lock()
+	defer q.runningJobsMu.Unlock()
+	return len(q.runningJobs)
+}
+
 // --- Job Pause Operations ---
 
 // PauseJob pauses a specific job. For pending/waiting jobs, the status is set

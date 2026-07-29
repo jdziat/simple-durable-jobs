@@ -11,7 +11,7 @@
 FROM node:20-bookworm AS frontend
 WORKDIR /app/ui/frontend
 COPY ui/frontend/package*.json ./
-RUN npm install
+RUN npm ci
 COPY ui/frontend/ ./
 RUN npm run build
 
