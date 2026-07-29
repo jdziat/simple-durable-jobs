@@ -1341,8 +1341,14 @@ func (s *GormStorage) ClaimScheduledFire(ctx context.Context, name string, fireT
 //     compared as raw text. That is exact to the full precision the driver wrote
 //     (nanoseconds), so a sub-millisecond schedule still advances.
 //   - When the offsets DIFFER, strftime() parses each and renders UTC, so the
-//     comparison is on instants and is correct for every row whatever face it was
-//     stored on — no migration, and no dependence on which constructor wrote it.
+//     comparison is on instants whatever face the row was stored on — no
+//     migration, and no dependence on which constructor wrote it. That branch is
+//     correct to MILLISECOND resolution and no finer, because %f is milliseconds
+//     (see below): a CROSS-FACE pair less than 1 ms apart collapses and the
+//     schedule stalls. Reaching that needs a sub-millisecond schedule whose
+//     process timezone CHANGED between two fires, since a stable zone always
+//     takes the exact raw-text branch above — narrow, but real, and stated here
+//     rather than implied away.
 //
 // Normalizing unconditionally is what an earlier version did, and it truncated to
 // the expression's resolution: %f keeps milliseconds, which silently stalled
@@ -2289,9 +2295,12 @@ func (s *GormStorage) ResumeJob(ctx context.Context, jobID core.UUID) (bool, err
 	return result.RowsAffected > 0, nil
 }
 
-// ResumeSignalWaitingJob resumes a job that is waiting on a signal. Unlike the
-// general ResumeJob it matches StatusWaiting ONLY (never paused — a producer
-// must not be able to un-pause an operator-paused job), and it clears run_at:
+// ResumeSignalWaitingJob resumes a job that is waiting on a signal. It matches
+// StatusWaiting ONLY — never paused, because a producer must not be able to
+// un-pause an operator-paused job. (This used to read "unlike the general
+// ResumeJob"; ResumeJob was narrowed to waiting-only in the same wave, so the
+// contrast is gone and the two now agree on which statuses they accept.) It also
+// clears run_at:
 // WaitForSignalTimeout parks a future run_at as its wake deadline, so when a
 // signal arrives early the resume must not leave a future run_at that would
 // block Dequeue until that deadline. Returns whether a row was resumed.

@@ -32,11 +32,17 @@ Thumbs.db
 .env.local
 *.local
 
-# Database files (test artifacts)
+# Database files (test artifacts). `*.db` alone is not enough: a scratch DB named
+# `sqlite.db.tmp` matched none of these patterns and was committed at the module
+# root, 221 KB of it, one commit after the CI guard for exactly this was added.
 *.db
 *.db-journal
 *.db-shm
 *.db-wal
+*.db.*
+*.sqlite
+*.sqlite3
+*.tmp
 
 # Build output
 /dist/

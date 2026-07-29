@@ -410,11 +410,15 @@ const jobStatsTable = "job_stats"
 // migrateConcurrencySlotsJobIDIndex adds the index every slot release needs.
 //
 // concurrency_slots is keyed on (slot_name, job_id) with no index on job_id
-// alone, yet the release path deletes by (slot_name, job_id) and the terminal
-// job write deletes by job_id — so each one scanned the whole table. On MySQL
-// under REPEATABLE READ an unindexed DELETE also takes a next-key lock across
-// the scanned range, which serializes releases against every other slot holder
-// rather than just the row's own.
+// alone. The release path deletes by (slot_name, job_id), which is the primary
+// key and was always an index lookup — an earlier version of this comment claimed
+// it scanned too, which is wrong and contradicted its own opening clause
+// (EXPLAINed at 20k rows: Postgres "Index Scan using concurrency_slots_pkey",
+// MySQL "type=range key=PRIMARY rows=1"). It is the TERMINAL JOB WRITE, which
+// deletes by job_id alone, that scanned the whole table — Postgres Seq Scan,
+// MySQL type=ALL. On MySQL under REPEATABLE READ that unindexed DELETE also takes
+// a next-key lock across the scanned range, which serializes it against every
+// other slot holder rather than just the row's own.
 //
 // The table is deliberately unbounded (one live row per held slot plus a
 // permanent per-slot sentinel), so the scan cost grows with concurrency — worst

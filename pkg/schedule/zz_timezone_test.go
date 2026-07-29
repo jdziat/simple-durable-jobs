@@ -43,6 +43,14 @@ func TestCron_DoesNotPanicOnAMalformedPrefix(t *testing.T) {
 		"TZ=Europe/Berlin",
 		"CRON_TZ=",
 		"TZ=",
+		// The four above ALL land on the `sep < 0` branch ("a timezone but no
+		// schedule fields"), so the separate empty-NAME check below it was
+		// unreachable from this table: deleting it and falling through to UTC kept
+		// the whole package green. These two carry a separator, so the name really
+		// is empty and the check is the only thing standing between them and a
+		// schedule that silently runs in UTC instead of being rejected.
+		"TZ= 0 9 * * *",
+		"CRON_TZ=  0 9 * * *",
 	} {
 		assert.NotPanics(t, func() {
 			_, err := Cron(expr)
@@ -98,6 +106,18 @@ func TestCronIn_RejectsAConflictingPrefix(t *testing.T) {
 	require.NoError(t, err)
 	from := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
 	assert.Equal(t, time.Date(2026, 7, 20, 9, 0, 0, 0, ny).UTC(), s.Next(from).UTC())
+}
+
+// DailyIn and WeeklyIn document "loc must be non-nil" and enforce it with a panic,
+// but CronIn was the only one of the three whose nil case was tested — replacing
+// either panic with a silent `loc = time.UTC` left the whole package green. A
+// silent UTC fallback is precisely the bug this wave fixed in Cron: the schedule
+// runs, at the wrong hour, and nothing says so.
+func TestDailyInWeeklyIn_RejectANilLocation(t *testing.T) {
+	assert.Panics(t, func() { DailyIn(nil, 9, 0) },
+		"DailyIn documents a non-nil location; falling back to UTC would fire at the wrong hour silently")
+	assert.Panics(t, func() { WeeklyIn(nil, time.Monday, 9, 0) },
+		"WeeklyIn documents a non-nil location; falling back to UTC would fire at the wrong hour silently")
 }
 
 // DailyIn/WeeklyIn advance by rolling the calendar DAY, not the instant. With

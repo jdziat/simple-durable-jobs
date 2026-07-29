@@ -109,7 +109,10 @@ cancelled — and the fan-out row permanently violated the documented
 - `ResumeJob` is correspondingly narrowed: a fan-out completion no longer
   silently un-pauses a parent an operator deliberately paused. The dashboard's
   own Resume is unaffected — it goes through `UnpauseJob`, which restores the
-  pre-pause status.
+  pre-pause status. If you call `core.Storage.ResumeJob` **directly** (it is part
+  of the exported interface), note that it now returns `(false, nil)` for a
+  `paused` job instead of resuming it — a silent no-op, not an error. Use
+  `UnpauseJob` for operator resume.
 
 ### Aggressive pause no longer burns a retry or dead-letters
 
@@ -184,8 +187,11 @@ not late. A prefix with no schedule fields after it
 (`Cron("CRON_TZ=America/New_York")`) **panicked** with a slice-bounds error, in a
 constructor that returns an error.
 
-**After:** the prefix is honoured, an unresolvable timezone name is an error
-rather than a silent fallback, and no input panics.
+**After:** the prefix is honoured, an unresolvable timezone name is an error, and
+no input panics. (v4.7.0 already errored on an unknown zone — `provided bad
+location Not/AZone` — so that part is a better message, not new behaviour. The
+genuine silent fallback is the UTC overwrite of a **valid** zone, described
+above.)
 
 **What you may notice:** a schedule that carries a prefix **moves to the hour it
 asked for**. If you compensated for the old behaviour by shifting the expression,
@@ -194,9 +200,12 @@ UTC — deliberately, since the underlying parser would otherwise default them t
 the host's timezone.
 
 Also adds `CronIn`, `DailyIn`, `WeeklyIn` (and `MustCronIn`) for callers holding a
-`*time.Location` rather than a name. `Daily`/`Weekly` now advance by rolling the
+`*time.Location` rather than a name. `DailyIn`/`WeeklyIn` advance by rolling the
 calendar **day** rather than the instant, so in a DST zone they fire exactly once
-per day — the old form could fire twice on a spring-forward day.
+per day — the old form could fire twice on a spring-forward day. **`Daily` and
+`Weekly` are unchanged**: they are `DailyIn(time.UTC, …)`/`WeeklyIn(time.UTC, …)`,
+and UTC has no DST, so nothing an existing `Daily(9, 0)` caller has observes any
+difference.
 
 ### Fan-out sub-job options are honoured
 
@@ -286,7 +295,22 @@ cosmetic: `window_start` is `now.Truncate(window)` and the column is `datetime(3
 on MySQL, so a window like `1500µs` produced a start MySQL rounded on write, after
 which the consume's own `WHERE window_start = ?` matched nothing and every
 rate-limited job bounced forever. A window that is already a whole number of
-milliseconds — which every documented example is — is unchanged.
+milliseconds — which every documented example is — is unchanged. A window
+**below** one millisecond cannot be floored to a usable value and falls back to
+the one-second default rather than to 1ms, so `Window: 500 * time.Microsecond`
+becomes `1s` — a 2000× jump. Such a window never worked on MySQL anyway.
+
+**During a rolling deploy, a fractional rate briefly runs FASTER, not slower.**
+The two versions derive different windows for the same `PerSecond`, and
+`window_start` is `now.Truncate(window)`, so the old and new binaries key
+different rows in `rate_limit_windows` and each gets a full independent budget.
+The enforced rate while both are running is the **sum**. Measured against the real
+storage gate at `PerSecond: 0.3` over 30 s: v4.7.0 alone admits 0.533/sec (its own
+overshoot), v4.8.0 alone admits 0.333/sec, and a mixed fleet admits **0.867/sec** —
+2.9× what you configured. It clears the moment the rollout completes, but it
+persists indefinitely if you leave a canary on the old version, so if the limit
+exists to protect a third party, finish the rollout promptly or pause it.
+Whole-number rates derive the same window on both versions and are unaffected.
 
 ### `NewWorker` reports arguments it cannot use
 
@@ -312,9 +336,12 @@ tight loop (see above).
 
 **What you may notice:** this is an exported method whose **error contract**
 changed. It is signature-compatible, but a caller that treats any non-nil error
-as a failure will start logging one per deduplicated fire. Test with
+as a failure will log one per deduplicated fire. Test with
 `errors.Is(err, core.ErrDuplicateJob)` and treat it as success — the claim was
-committed and the schedule advanced.
+committed and the schedule advanced. Note the direction: such a caller was
+previously logging one failure per 100ms **tick** for the entire runtime of the
+blocking job, because the fire was retried in a tight loop. This is strictly less
+noise, not more.
 
 ### `run_at` is stored on one clock face
 
@@ -332,11 +359,14 @@ written. The instant never changes; only the rendering does. A no-op on
 Postgres and MySQL.
 
 Schedule boundaries get the same treatment. `last_fire_at` is compared the same
-way, and `CronIn` / `DailyIn` / `WeeklyIn` (and a `CRON_TZ=` prefix) produce
-boundaries in *their* location — so on SQLite a `DailyIn(America/New_York, 13, 0)`
+way, and `DailyIn` / `WeeklyIn` produce boundaries in *their* location — so on
+SQLite a `DailyIn(America/New_York, 13, 0)`
 boundary rendered `13:00:00-04:00` sorted **below** a `16:00:00+00:00` cursor it
 was genuinely an hour after, the claim matched nothing, and the schedule silently
-never fired.
+never fired. (A `CRON_TZ=` prefix does *not* produce a foreign face: robfig's
+`Next` returns its answer in the **cursor's** location, so a cron boundary always
+carries whatever face it was asked about — measured under three host zones. The
+prefix fixes which *hour* fires, not which face it is stored on.)
 
 **What you may notice:** on SQLite, delayed jobs and non-UTC schedules enqueued
 **after** the upgrade now fire when you asked.
@@ -347,17 +377,33 @@ stored on a foreign clock face keeps it, so a delayed job enqueued **before** th
 upgrade can still fire at the wrong time, in **either direction** and by up to the
 full offset delta (as much as 14 hours):
 
-- In a zone **behind** UTC, a UTC-faced value sorts above the local-faced bind and
-  the job fires **late**.
-- In a zone **ahead** of UTC it sorts below, and the job fires **early** —
-  reproduced under Asia/Tokyo, where a job scheduled two hours out was dequeued
+The direction follows the **stored offset relative to this process's local
+offset** — not the host's zone, so a UTC host is not exempt:
+
+- A stored offset **ahead of** this process's offset sorts below the bind, and the
+  job fires **early** — reproduced on a UTC host with a Tokyo-faced row, and under
+  `TZ=Asia/Tokyo` with a UTC-faced row scheduled two hours out that was dequeued
   immediately. Early is usually the direction that matters: "send this in twelve
   hours" going out now.
+- A stored offset **behind** this process's offset sorts above the bind, and the
+  job fires **late**.
+
+An operator on a UTC host holding rows written by services in other zones is
+affected in **both** directions.
 
 This is pre-existing behaviour and not a regression — v4.7.0 does the same thing to
-its own rows — but it is not repaired by upgrading. If you have a backlog of
-delayed jobs enqueued with a non-local `run_at`, re-enqueue them; that fixes both
-directions. Postgres and MySQL are unaffected throughout.
+its own rows, and a v4.7.0-seeded database produces a character-identical set of
+mis-fires under v4.7.0 and v4.8.0 — but it is not repaired by upgrading. If you
+have a backlog of delayed jobs enqueued with a non-local `run_at`, re-enqueue them;
+that fixes both directions. Postgres and MySQL are unaffected throughout.
+
+One transient side effect on SQLite: a deployment that consistently enqueued with a
+single foreign zone previously held **consistent** faces in `run_at`, and after the
+upgrade holds a **mixture** — new rows local-faced, old rows foreign-faced. Because
+the dequeue order is `COALESCE(run_at, created_at)` compared as text, the relative
+FIFO ordering **among delayed jobs** is perturbed until the pre-upgrade rows drain.
+Eligibility for new rows is correct throughout; only the order in which two already
+eligible delayed jobs are picked up can differ.
 
 ### The dashboard counts queue depth instead of paging job rows
 
@@ -463,6 +509,17 @@ the last is new in **v4.8.0**; the other two are already in the releases named:
 | **v38** | `idx_job_stats_timestamp` | v4.8.0 |
 
 All three are additive — one column with a default, and two indexes — so an older
-binary runs correctly against the newer schema and rolling back the application is
-safe. No migration in this line
-rewrites data. Any further migration is listed here by the packet that adds it.
+binary runs correctly against the newer schema. No migration in this line rewrites
+data. Verified in both directions on SQLite, live Postgres and live MySQL: the
+v4.7.0 binary migrates against a v38 ledger and completes a full job lifecycle.
+Any further migration is listed here by the packet that adds it.
+
+**One caveat, and it is not about the schema.** Rolling back restores the old
+*code*, so any behaviour fixed above reverts with it. The one that can cost you
+work rather than just correctness is on **SQLite**: v4.7.0's lexical
+schedule-cursor comparison comes back, so a non-UTC or sub-second schedule can
+start stalling again on rows v4.8.0 had just been advancing correctly (measured
+under `TZ=Asia/Tokyo`: two to three schedules per zone stop firing). That is
+v4.7.0's own pre-existing bug re-entering, not damage the rollback does — but "the
+rollback is safe" is a statement about the schema, not about schedules. Postgres
+and MySQL are unaffected.

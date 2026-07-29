@@ -576,6 +576,67 @@ func TestPause_AggressiveLogsExactlyOneOutcome(t *testing.T) {
 		assert.Contains(t, out, "stays locked until the stale-lock reaper",
 			"and the error must say what actually happens")
 	})
+
+	// The two subtests above both pin MaxAttempts=1 to keep a failing store from
+	// burning its budget — which means neither of them can see the RETRY at all.
+	// Collapsing retryWithBackoff to a single call left ./pkg/worker green, and
+	// ./tests too: a 14-line comment explaining why the retry is load-bearing, with
+	// nothing checking that it exists.
+	//
+	// It is load-bearing because Release is the ONLY write on this path. Lose it to
+	// one transient conflict — most often this worker's own poll loop holding an
+	// open dequeue transaction — and the row stays 'running' under our lock with
+	// nothing to re-dispatch it until the stale-lock reaper fires at StaleLockAge,
+	// 45 minutes by default. Resume() only re-dispatches PENDING rows.
+	t.Run("a transient release failure is retried rather than stranding the job", func(t *testing.T) {
+		var buf bytes.Buffer
+		var calls atomic.Int32
+		store := &mockStorage{}
+		store.releaseJobFunc = func(context.Context, core.UUID, string) error {
+			if calls.Add(1) == 1 {
+				return errors.New("database is locked") // the transient conflict
+			}
+			return nil
+		}
+
+		q := queue.New(store)
+		started := make(chan struct{})
+		q.Register("slow", func(ctx context.Context, _ struct{}) error {
+			close(started)
+			<-ctx.Done()
+			return ctx.Err()
+		})
+
+		w := NewWorker(q)
+		w.logger = slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+		require.Greater(t, w.config.StorageRetry.MaxAttempts, 1,
+			"guard on the premise: with a single attempt this test cannot observe a retry")
+		w.config.StorageRetry.InitialBackoff = time.Millisecond
+
+		job := &core.Job{ID: core.NewID(), Type: "slow", Queue: "default", Status: core.StatusRunning, MaxRetries: 2}
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+
+		done := make(chan struct{})
+		go func() { defer close(done); w.processJob(ctx, job) }()
+		select {
+		case <-started:
+		case <-time.After(10 * time.Second):
+			t.Fatal("handler never started")
+		}
+		w.Pause(core.PauseModeAggressive)
+		select {
+		case <-done:
+		case <-time.After(15 * time.Second):
+			t.Fatal("processJob never returned")
+		}
+
+		assert.Equal(t, int32(2), calls.Load(),
+			"a transient release conflict must be retried; a single-shot release strands the job "+
+				"as 'running' under this worker's lock for StaleLockAge — 45 minutes by default")
+		assert.Contains(t, buf.String(), promise,
+			"and once the retry succeeds the job really is released, so the resume promise is true")
+	})
 }
 
 // TestProcessJob_LaterRunKeepsTheQueueRegistration covers the other half of the
@@ -688,8 +749,8 @@ func TestProcessJob_LaterRunKeepsItsAdmissionState(t *testing.T) {
 	require.True(t, w.tryTrackQueueJob(tok2, "default"))
 
 	w.slotJobIDMu.Lock()
-	w.slotJobID[tok1] = []string{"cap:run1"}
-	w.slotJobID[tok2] = []string{"cap:run2"}
+	w.slotJobID[tok1] = slotHold{jobID: jobID, names: []string{"cap:run1"}}
+	w.slotJobID[tok2] = slotHold{jobID: jobID, names: []string{"cap:run2"}}
 	w.slotJobIDMu.Unlock()
 
 	counter := w.queueRunning["default"]
@@ -703,7 +764,7 @@ func TestProcessJob_LaterRunKeepsItsAdmissionState(t *testing.T) {
 		"run #1's cleanup must decrement exactly once, leaving run #2 counted")
 
 	w.slotJobIDMu.Lock()
-	stillHeld := append([]string(nil), w.slotJobID[tok2]...)
+	stillHeld := append([]string(nil), w.slotJobID[tok2].names...)
 	w.slotJobIDMu.Unlock()
 	assert.Equal(t, []string{"cap:run2"}, stillHeld,
 		"run #2's concurrency slots must survive run #1's cleanup, or the fleet cap is "+

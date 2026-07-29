@@ -91,8 +91,14 @@ type Worker struct {
 
 	// DB-backed concurrency slots acquired for dequeued jobs. Only populated
 	// when the storage backend implements concurrencySlotStorage.
+	//
+	// The value carries the job id as well as the slot names, because the DATABASE
+	// row is keyed (slot_name, job_id) while this map is keyed by run token: two
+	// runs of one job id SHARE a row, so deciding whether a release may delete it
+	// requires asking "does any OTHER token still hold this job id?", which needs
+	// the job id on the value side. See releaseConcurrencySlots.
 	slotJobIDMu sync.Mutex
-	slotJobID   map[uint64][]string // run token -> slots held by that run
+	slotJobID   map[uint64]slotHold // run token -> the row that run holds
 
 	// Per-worker queue rate-limit buckets. Only populated for queues configured
 	// with WithQueueRateLimit.
@@ -500,7 +506,7 @@ func NewWorker(q *queue.Queue, opts ...WorkerOption) *Worker {
 		pauseCancelled:          make(map[uint64]struct{}),
 		queueRunning:            queueRunning,
 		queueJobID:              make(map[uint64]string),
-		slotJobID:               make(map[uint64][]string),
+		slotJobID:               make(map[uint64]slotHold),
 		queueRateBuckets:        queueRateBuckets,
 		rateSaturatedUntil:      make(map[string]time.Time),
 		allRateLimitsUnkeyed:    allRateLimitsUnkeyed,
@@ -1708,8 +1714,14 @@ func (w *Worker) tryAcquireConcurrencySlots(ctx context.Context, job *core.Job, 
 		}
 		acquiredSlots = append(acquiredSlots, slotName)
 	}
+	// Ownership of the row transfers HERE, at the instant this run joins it — not
+	// when the run later registers in runningJobs. Those are different moments:
+	// this function runs in dispatchDequeuedJobs, the job then crosses jobsChan
+	// (which BLOCKS while every processLoop goroutine is busy), and only then does
+	// processJobRun register. A release that inferred ownership from runningJobs
+	// was blind for that whole window.
 	w.slotJobIDMu.Lock()
-	w.slotJobID[runToken] = acquiredSlots
+	w.slotJobID[runToken] = slotHold{jobID: job.ID, names: acquiredSlots}
 	w.slotJobIDMu.Unlock()
 	return true
 }
@@ -1719,34 +1731,54 @@ func (w *Worker) tryAcquireConcurrencySlots(ctx context.Context, job *core.Job, 
 // run of the same job is still relying on, and the ownership fence cannot catch
 // that because both runs share the job id AND the worker id.
 func (w *Worker) releaseConcurrencySlots(ctx context.Context, jobID core.UUID, runToken uint64) {
-	w.slotJobIDMu.Lock()
-	slots := w.slotJobID[runToken]
-	delete(w.slotJobID, runToken)
-	w.slotJobIDMu.Unlock()
-
 	// Keying the in-memory list by run is not enough, because the DATABASE row is
 	// not keyed by run: concurrency_slots is (slot_name, job_id) and capSlotName is
 	// deterministic per (cap, job), so two runs of one job id derive the SAME row.
 	// Run #2 re-acquiring lands in TryAcquireConcurrencySlot's idempotent-renewal
-	// branch and shares run #1's row rather than creating its own.
+	// branch and SHARES run #1's row rather than creating its own.
 	//
-	// So if a LATER run of this job id is still registered, the row it is relying on
-	// is this row, and releasing would delete the fleet cap out from under a handler
-	// that is still executing — which the ownership fence cannot refuse, since both
-	// runs share the job id AND the worker id, and which RenewConcurrencySlot cannot
-	// repair because it is UPDATE-only. Hand the row over instead; the later run
-	// releases it under its own token when it finishes.
+	// Deleting that row while another run still holds it drops the fleet cap out
+	// from under a handler that is still executing — which the ownership fence
+	// cannot refuse (both runs share the job id AND the worker id) and which
+	// RenewConcurrencySlot cannot repair (it is UPDATE-only, so it silently
+	// resurrects nothing).
 	//
-	// If that later run finishes FIRST, it deletes the row and this release becomes
-	// a no-op on an absent row, which is already idempotent.
-	w.runningJobsMu.Lock()
-	cur, stillRegistered := w.runningJobs[jobID]
-	w.runningJobsMu.Unlock()
-	if stillRegistered && cur.token != runToken {
+	// The invariant is therefore: THE ROW SURVIVES WHILE ANY TOKEN HOLDS IT, and
+	// the last holder to finish is the one that deletes it. That is decided here,
+	// under a single mutex, by asking whether any OTHER token still holds this job
+	// id — which is why slotHold carries the job id.
+	//
+	// An earlier attempt asked runningJobs instead. That is the wrong map: a run
+	// joins the row in tryAcquireConcurrencySlots (dispatch side) but only appears
+	// in runningJobs later, in processJobRun, with a blocking channel send in
+	// between. Between those two moments the later run was invisible and its row
+	// was deleted — the exact over-admission this exists to prevent. Keying on the
+	// map written at ACQUIRE time has no such window, and it covers the reverse
+	// direction too: a later run that finishes FIRST still sees the earlier holder
+	// and leaves the row for it.
+	//
+	// The scan is linear in the number of runs currently HOLDING slots, which is
+	// bounded by this worker's total configured concurrency (a slot is only ever
+	// recorded for a dispatched, not-yet-finished run) — tens to low hundreds, not
+	// job throughput. A jobID-keyed refcount would make it O(1), at the cost of a
+	// second map to keep in sync with this one; that is one more invariant to get
+	// wrong, and getting this one wrong is what produced the bug twice already.
+	w.slotJobIDMu.Lock()
+	hold := w.slotJobID[runToken]
+	delete(w.slotJobID, runToken)
+	heldByAnother := false
+	for otherToken, other := range w.slotJobID {
+		if otherToken != runToken && other.jobID == jobID {
+			heldByAnother = true
+			break
+		}
+	}
+	w.slotJobIDMu.Unlock()
+
+	if heldByAnother {
 		return
 	}
-
-	w.releaseSlotNames(ctx, jobID, slots)
+	w.releaseSlotNames(ctx, jobID, hold.names)
 }
 
 func (w *Worker) releaseSlotNames(ctx context.Context, jobID core.UUID, slots []string) {
@@ -1780,7 +1812,7 @@ func (w *Worker) releaseSlotNames(ctx context.Context, jobID core.UUID, slots []
 
 func (w *Worker) renewConcurrencySlots(ctx context.Context, jobID core.UUID, runToken uint64) {
 	w.slotJobIDMu.Lock()
-	slots := append([]string(nil), w.slotJobID[runToken]...)
+	slots := append([]string(nil), w.slotJobID[runToken].names...)
 	w.slotJobIDMu.Unlock()
 	if len(slots) == 0 {
 		return
@@ -1977,14 +2009,27 @@ func (w *Worker) processJobRun(ctx context.Context, job *core.Job, runToken uint
 		// for a different race.
 		if cur, ok := w.runningJobs[job.ID]; ok && cur.token == runToken {
 			delete(w.runningJobs, job.ID)
-			// Unregister WITHOUT dropping runningJobsMu. Releasing it here reopened
-			// the very window the token closes, one level down: a later run that
-			// registered in the gap had its QUEUE-level entry deleted by this one,
-			// leaving a live handler invisible to Queue.CancelJob and
-			// Queue.PauseJob for its whole duration. Holding the lock across the
-			// call is safe because q.runningJobsMu is a LEAF — every queue path
-			// copies the cancel func out and unlocks before invoking it, so nothing
-			// acquires this mutex while holding that one.
+			// Unregister WITHOUT dropping runningJobsMu, so the two registries are
+			// torn down as one step. Dropping it here would reopen the window the
+			// token closes, one level down: a later run that both registered in
+			// runningJobs AND registered with the queue inside the gap would have
+			// its QUEUE-level entry deleted by this one, leaving a live handler
+			// invisible to Queue.CancelJob and Queue.PauseJob for its whole
+			// duration.
+			//
+			// HONESTY: unlike the token guard above, that interleave is ARGUED, not
+			// reproduced. It needs another run to complete both registrations inside
+			// a window of a few instructions, and nothing outside this function can
+			// schedule that, so no test here fails when the lock is narrowed — do
+			// not read the surrounding tests as covering it. The lock is held
+			// because it costs nothing and closes the window by construction, which
+			// is a better trade than a race that would be invisible in production.
+			//
+			// Safe because q.runningJobsMu is a LEAF: all five of its sites
+			// (queue.go RegisterRunningJob / UnregisterRunningJob / PauseJob /
+			// CancelJob / the resume path) are Lock, read-or-write, Unlock, copying
+			// the cancel func out before invoking it, so nothing acquires THIS mutex
+			// while holding that one and the nesting cannot invert.
 			w.queue.UnregisterRunningJob(job.ID)
 		}
 		// Drop this run's mark if it went unconsumed — which happens when the
@@ -2304,8 +2349,12 @@ const orphanHeartbeatThreshold = 3
 // If the heartbeat repeatedly receives core.ErrJobNotOwned, the handler
 // is presumed orphaned (the stale-lock reaper at line 708 has released
 // the lock and another worker has picked the job up). In that case
-// runHeartbeat cancels the handler's context via CancelJob and returns,
-// so:
+// runHeartbeat cancels THIS RUN's handler via cancelRun and returns, so:
+//
+// By run token, not by job id. Cancelling by id would let an orphaned
+// heartbeat kill whichever run currently owns the id — including the
+// healthy run that REPLACED this one after a pause-release, which would
+// then fail and burn an attempt it never earned.
 //  1. The handler stops doing wasted work against a job it doesn't own.
 //  2. The "heartbeat failed after retries / jobs: job not owned by this
 //     worker" log line stops repeating forever — observed in production
@@ -3619,6 +3668,14 @@ func (w *Worker) WaitForPause(timeout time.Duration) error {
 type runningJobEntry struct {
 	cancel context.CancelFunc
 	token  uint64
+}
+
+// slotHold is the concurrency-slot row one RUN holds. jobID is carried alongside
+// the names because the row is keyed (slot_name, job_id) in the database while
+// this map is keyed by run token — see Worker.slotJobID and releaseConcurrencySlots.
+type slotHold struct {
+	jobID core.UUID
+	names []string
 }
 
 // scheduleFireOutcome is one EnqueueScheduledFire attempt plus the scheduler's

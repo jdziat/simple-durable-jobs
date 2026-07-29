@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -281,7 +282,7 @@ func TestProcessJobRun_ReleasesConcurrencySlotsRegisteredByDispatch(t *testing.T
 
 			dj := <-ch
 			w.slotJobIDMu.Lock()
-			held := len(w.slotJobID[dj.token])
+			held := len(w.slotJobID[dj.token].names)
 			w.slotJobIDMu.Unlock()
 			require.Positive(t, held, "dispatch must have acquired a cap slot, or this proves nothing")
 
@@ -349,6 +350,18 @@ func TestCancelRun_OnlyCancelsItsOwnRun(t *testing.T) {
 // fleet cap under a handler that is still executing. The ownership fence cannot
 // refuse it (same job id, same worker id) and RenewConcurrencySlot cannot repair
 // it (UPDATE-only), so the cap under-counts for run #2's whole remaining runtime.
+//
+// SECOND TRAP, one level up, and this test fell into it too: the FIRST version
+// established run #2 by writing w.runningJobs BEFORE calling
+// tryAcquireConcurrencySlots. Production does the reverse — the slot is acquired
+// in dispatchDequeuedJobs, the job then crosses jobsChan (a BLOCKING send), and
+// only then does processJobRun register — so the test drove an interleaving the
+// code cannot produce, passed, and certified a guard that was blind for the whole
+// acquire→register window. A test that only passes because it picked the
+// favourable ordering is as useless as one that cannot fail.
+//
+// So these tests never touch runningJobs. Ownership is established by ACQUIRING,
+// exactly as dispatch does, and that is the ordering under test.
 func TestReleaseConcurrencySlots_DoesNotDeleteTheRowALaterRunHolds(t *testing.T) {
 	job := runningJob("job-1", "acme")
 	store := newCapMockStorage([]*core.Job{job})
@@ -367,12 +380,18 @@ func TestReleaseConcurrencySlots_DoesNotDeleteTheRowALaterRunHolds(t *testing.T)
 	require.True(t, w.tryAcquireConcurrencySlots(ctx, job, tok1))
 	require.Equal(t, 1, store.slotCount("customer:acme"), "run #1 must hold the row")
 
-	// Run #2 takes over the job id and re-acquires — it SHARES run #1's row.
+	// Run #2 takes over the job id and re-acquires — it SHARES run #1's row. This
+	// is the dispatch-side acquire, and NOTHING has registered it in runningJobs
+	// yet: production cannot, because the blocking jobsChan send happens between
+	// this line and processJobRun. That window is the one under test.
 	tok2 := w.nextRunToken.Add(1)
-	w.runningJobsMu.Lock()
-	w.runningJobs[job.ID] = runningJobEntry{cancel: func() {}, token: tok2}
-	w.runningJobsMu.Unlock()
 	require.True(t, w.tryAcquireConcurrencySlots(ctx, job, tok2))
+	w.runningJobsMu.Lock()
+	_, registered := w.runningJobs[job.ID]
+	w.runningJobsMu.Unlock()
+	require.False(t, registered,
+		"guard on the premise: run #2 must NOT be in runningJobs here, or this test is back to "+
+			"driving an ordering production never takes")
 
 	// Run #1's deferred cleanup lands while run #2 is still executing.
 	w.releaseConcurrencySlots(ctx, job.ID, tok1)
@@ -382,9 +401,6 @@ func TestReleaseConcurrencySlots_DoesNotDeleteTheRowALaterRunHolds(t *testing.T)
 			"be admitted past the limit while this handler is still running")
 
 	// And when run #2 finishes, the row is finally released.
-	w.runningJobsMu.Lock()
-	delete(w.runningJobs, job.ID)
-	w.runningJobsMu.Unlock()
 	w.releaseConcurrencySlots(ctx, job.ID, tok2)
 	assert.Zero(t, store.slotCount("customer:acme"),
 		"the last run out must release the row, or the cap leaks a slot permanently")
@@ -422,24 +438,15 @@ func TestReleaseConcurrencySlots_HandoverDoesNotLeakTheRow(t *testing.T) {
 		tok1 := w.nextRunToken.Add(1)
 		require.True(t, w.tryAcquireConcurrencySlots(ctx, job, tok1))
 		tok2 := w.nextRunToken.Add(1)
-		w.runningJobsMu.Lock()
-		w.runningJobs[job.ID] = runningJobEntry{cancel: func() {}, token: tok2}
-		w.runningJobsMu.Unlock()
 		require.True(t, w.tryAcquireConcurrencySlots(ctx, job, tok2))
 
 		w.releaseConcurrencySlots(ctx, job.ID, tok1) // hands over to #2
 		tok3 := w.nextRunToken.Add(1)
-		w.runningJobsMu.Lock()
-		w.runningJobs[job.ID] = runningJobEntry{cancel: func() {}, token: tok3}
-		w.runningJobsMu.Unlock()
 		require.True(t, w.tryAcquireConcurrencySlots(ctx, job, tok3))
 		w.releaseConcurrencySlots(ctx, job.ID, tok2) // hands over to #3
 		require.Equal(t, 1, store.slotCount("customer:acme"), "still held by run #3")
 
 		// Run #3 is the last out.
-		w.runningJobsMu.Lock()
-		delete(w.runningJobs, job.ID)
-		w.runningJobsMu.Unlock()
 		w.releaseConcurrencySlots(ctx, job.ID, tok3)
 		assert.Zero(t, store.slotCount("customer:acme"),
 			"the last run out must release, however many handovers preceded it")
@@ -452,20 +459,53 @@ func TestReleaseConcurrencySlots_HandoverDoesNotLeakTheRow(t *testing.T) {
 		tok1 := w.nextRunToken.Add(1)
 		require.True(t, w.tryAcquireConcurrencySlots(ctx, job, tok1))
 		tok2 := w.nextRunToken.Add(1)
-		w.runningJobsMu.Lock()
-		w.runningJobs[job.ID] = runningJobEntry{cancel: func() {}, token: tok2}
-		w.runningJobsMu.Unlock()
 		require.True(t, w.tryAcquireConcurrencySlots(ctx, job, tok2))
 
-		// #2 finishes first and deregisters, so #1 is now the current entry's owner.
-		w.runningJobsMu.Lock()
-		delete(w.runningJobs, job.ID)
-		w.runningJobsMu.Unlock()
+		// #2 finishes FIRST. It must leave the row for #1, which is still running —
+		// the reverse direction of the handover, and the one a "latest run wins"
+		// rule would get wrong.
 		w.releaseConcurrencySlots(ctx, job.ID, tok2)
+		assert.Equal(t, 1, store.slotCount("customer:acme"),
+			"run #1's handler is still executing; the row it is relying on must not be deleted "+
+				"just because a later run finished first")
 		w.releaseConcurrencySlots(ctx, job.ID, tok1)
 
 		assert.Zero(t, store.slotCount("customer:acme"),
 			"out-of-order completion must still end with the row released, not held forever")
+	})
+
+	// Everything above calls tryAcquireConcurrencySlots directly, which is what
+	// dispatch calls — but "which is what dispatch calls" is an assumption, and the
+	// previous version of these tests was wrong about exactly that kind of
+	// assumption. This one goes through dispatchDequeuedJobs itself, so the
+	// acquire-then-blocking-send-then-register ordering is the code's, not mine.
+	t.Run("both runs admitted through the real dispatch path", func(t *testing.T) {
+		w, store, job := newWorker(t)
+		ctx := context.Background()
+
+		ch := make(chan dispatchedJob, 2)
+		n, _ := w.dispatchDequeuedJobs(ctx, ch, []*core.Job{job})
+		require.Equal(t, 1, n)
+		run1 := <-ch
+		require.Equal(t, 1, store.slotCount("customer:acme"))
+
+		// The job is released back to pending and re-dequeued by this same worker —
+		// the aggressive-pause-then-resume sequence, and the stale-lock reaper
+		// reclaim. dispatchDequeuedJobs admits it again under a fresh token.
+		n, _ = w.dispatchDequeuedJobs(ctx, ch, []*core.Job{job})
+		require.Equal(t, 1, n)
+		run2 := <-ch
+		require.NotEqual(t, run1.token, run2.token, "each dispatch must mint its own run token")
+
+		// Run #1's deferred cleanup lands here — after run #2 was admitted, before
+		// run #2 has been registered by processJobRun.
+		w.releaseConcurrencySlots(ctx, job.ID, run1.token)
+		assert.Equal(t, 1, store.slotCount("customer:acme"),
+			"run #2 was admitted through the real dispatch path and holds this row; run #1's "+
+				"cleanup must not delete the fleet cap out from under it")
+
+		w.releaseConcurrencySlots(ctx, job.ID, run2.token)
+		assert.Zero(t, store.slotCount("customer:acme"), "and the last one out releases it")
 	})
 
 	t.Run("the run that panics still releases through its defer", func(t *testing.T) {
@@ -494,4 +534,53 @@ func TestReleaseConcurrencySlots_HandoverDoesNotLeakTheRow(t *testing.T) {
 			"a panicking run must still release its fleet slot — the row is cluster-wide and would "+
 				"otherwise throttle every worker until its TTL expires")
 	})
+}
+
+// TestProcessJobRun_UnregisterUnderTheLockDoesNotDeadlock covers the RISK the
+// widened lock scope introduces, which is the half that is testable.
+//
+// processJobRun's cleanup holds w.runningJobsMu across w.queue.UnregisterRunningJob,
+// so it acquires q.runningJobsMu while holding its own. That is only safe while the
+// queue mutex stays a LEAF — the moment any queue path acquires the worker's mutex
+// (or calls back into the worker) while holding its own, the two orders invert and
+// the fleet wedges. Queue.CancelJob and Queue.PauseJob are the paths that take
+// q.runningJobsMu on the operator side, so they are what this hammers.
+//
+// FALSE-GREEN TRAP: a single completing job proves nothing — the inversion needs an
+// operator call in flight against a job that is finishing. This drives many rounds
+// of exactly that overlap and fails on a TIMEOUT rather than an assertion, because
+// a lock-order inversion presents as a hang, not a wrong value.
+func TestProcessJobRun_UnregisterUnderTheLockDoesNotDeadlock(t *testing.T) {
+	store := &mockStorage{}
+	q := queue.New(store)
+	q.Register("quick", func(context.Context, struct{}) error { return nil })
+	w := NewWorker(q)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	const rounds = 300
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		var wg sync.WaitGroup
+		for i := 0; i < rounds; i++ {
+			job := &core.Job{ID: core.NewID(), Type: "quick", Queue: "default", Status: core.StatusRunning}
+			wg.Add(3)
+			// The finishing run: registers, runs, then unregisters under the lock.
+			go func() { defer wg.Done(); w.processJob(ctx, job) }()
+			// Two operator calls racing that teardown from the queue side.
+			go func() { defer wg.Done(); _ = q.CancelJob(ctx, job.ID) }()
+			go func() { defer wg.Done(); _ = q.PauseJob(ctx, job.ID) }()
+			wg.Wait()
+		}
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(25 * time.Second):
+		t.Fatal("processJob's cleanup deadlocked against a concurrent Queue.CancelJob/PauseJob — " +
+			"holding w.runningJobsMu across UnregisterRunningJob is only safe while q.runningJobsMu " +
+			"is a leaf, and something now acquires them in the opposite order")
+	}
 }

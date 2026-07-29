@@ -41,6 +41,12 @@ cp -r "$ROOT/scripts/upgradematrix" "$WORK/base/upgradematrix"
 ( cd "$ROOT" && go build -o "$WORK/head" ./scripts/upgradematrix/ )
 
 fail=0
+# ASIA/TOKYO MUST STAY IN THIS LIST. Measured: with the schedule-cursor predicate
+# reverted, only the Tokyo leg reports STALLED — UTC, Berlin and Los_Angeles all
+# pass, because their offsets happen to compare correctly LEXICALLY against
+# crossZone (+05:30, see upgradematrix/main.go). The whole discriminating power of
+# this gate rests on running at least one zone whose offset exceeds crossZone's.
+# Drop Tokyo, or change crossZone, and this keeps printing OK while blind.
 for tz in UTC Asia/Tokyo Europe/Berlin America/Los_Angeles; do
   db="$WORK/$(echo "$tz" | tr / _).db"
   echo "######## TZ=$tz ########"

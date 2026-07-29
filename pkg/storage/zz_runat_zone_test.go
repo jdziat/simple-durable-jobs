@@ -24,17 +24,30 @@ func TestEnqueue_NormalizesRunAtToOneClockFace(t *testing.T) {
 	s := newTestStorage(t)
 	ctx := context.Background()
 
-	// A caller handing in UTC while the process runs in some other zone — the
-	// common shape: queue.At(t) with a UTC t, or a parsed RFC 3339 "...Z".
-	utcRunAt := time.Now().Add(2 * time.Hour).UTC()
-	job := &core.Job{ID: core.NewID(), Type: "t", Queue: "default", RunAt: &utcRunAt}
+	// DEGENERATE UNDER TZ=UTC, which is exactly what CI runs — and this test was.
+	// The old version handed in a `.UTC()` value and asserted
+	// `job.RunAt.Location() == time.Local`. On a UTC host Go's localLoc is
+	// {name:"UTC"}, so testify's DeepEqual matched whether or not normalization
+	// ran: deleting the fix outright left this green in CI and only failed under
+	// TZ=Asia/Tokyo. A test that only discriminates in a timezone CI never uses is
+	// not coverage.
+	//
+	// So the input zone is derived RELATIVE to time.Local (offsetZone), which is
+	// foreign in EVERY host zone, and the assertion is on the rendered OFFSET
+	// rather than on the Location pointer — offsets compare by value and cannot
+	// alias the way two distinct *Location both named "UTC" can.
+	foreign := offsetZone(t, 8*time.Hour)
+	foreignRunAt := time.Now().Add(2 * time.Hour).In(foreign)
+	job := &core.Job{ID: core.NewID(), Type: "t", Queue: "default", RunAt: &foreignRunAt}
 	require.NoError(t, s.Enqueue(ctx, job))
 
 	require.NotNil(t, job.RunAt)
-	assert.Equal(t, time.Local, job.RunAt.Location(),
+	_, wantOffset := time.Now().Zone()
+	_, gotOffset := job.RunAt.Zone()
+	assert.Equal(t, wantOffset, gotOffset,
 		"run_at must be written on the same clock face as the due-ness binds, or SQLite's "+
 			"lexical comparison mis-orders it by the delta between the zones")
-	assert.True(t, job.RunAt.Equal(utcRunAt),
+	assert.True(t, job.RunAt.Equal(foreignRunAt),
 		"normalization must change the CLOCK FACE only — never the instant")
 }
 
@@ -45,8 +58,14 @@ func TestEnqueue_DoesNotMutateTheCallersRunAtValue(t *testing.T) {
 	s := newTestStorage(t)
 	ctx := context.Background()
 
-	shared := time.Now().Add(time.Hour).UTC()
+	// Same TZ=UTC degeneracy as above: with a `.UTC()` value on a UTC host,
+	// repointing and writing-through are indistinguishable, so this passed in CI
+	// with normalization deleted. A zone derived relative to time.Local is foreign
+	// everywhere, which makes the two outcomes differ in every host zone.
+	foreign := offsetZone(t, 8*time.Hour)
+	shared := time.Now().Add(time.Hour).In(foreign)
 	before := shared
+	_, foreignOffset := shared.Zone()
 
 	for range 2 {
 		job := &core.Job{ID: core.NewID(), Type: "t", Queue: "default", RunAt: &shared}
@@ -56,7 +75,10 @@ func TestEnqueue_DoesNotMutateTheCallersRunAtValue(t *testing.T) {
 	assert.Equal(t, before, shared,
 		"normalization must REPOINT job.RunAt, not write through the pointer — the caller's "+
 			"Option value is shared across enqueues")
-	assert.Equal(t, time.UTC, shared.Location())
+	_, gotOffset := shared.Zone()
+	assert.Equal(t, foreignOffset, gotOffset,
+		"the caller's value must keep ITS zone; normalizing through the pointer would rewrite an "+
+			"Option the caller reuses across enqueues")
 }
 
 // offsetZone returns a fixed zone whose UTC offset is delta away from THIS

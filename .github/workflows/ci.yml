@@ -175,7 +175,11 @@ jobs:
           # git grep exits 1 for "no match", which would kill the step before
           # $? could be read — reporting a clean tree as a failure.
           set +e
-          git grep -nE "$pat" -- . ':!ui/frontend/dist'
+          # ui/frontend/dist is NOT excluded. It is tracked and //go:embed'd, so a
+          # marker there ships inside the module zip and breaks the dashboard
+          # bundle for every consumer — the one place a marker does the most damage
+          # is the last place to skip.
+          git grep -nE "$pat" -- .
           status=$?
           set -e
           case "$status" in
@@ -184,32 +188,44 @@ jobs:
             *) echo "::error::conflict-marker scan failed (git grep exit $status)"; exit "$status" ;;
           esac
 
-      # A Go module zip contains EVERY file under the module root, so a compiled
-      # binary committed by accident is downloaded by every `go get` of this
-      # library — and module versions are IMMUTABLE in the proxy, so it cannot be
-      # withdrawn afterwards, only superseded. It happened: a 14.5 MB ELF from
-      # `go build ./scripts/...` run at the root inflated the published zip 7.7x,
-      # to ~80% binary by content, and was caught only by review.
+      # A Go module zip contains EVERY file under the module root, so anything
+      # tracked here is downloaded by every `go get` -- and module versions are
+      # IMMUTABLE in the proxy, so a mistake cannot be withdrawn afterwards, only
+      # superseded. .gitignore alone cannot prevent this because it only covers
+      # names someone predicted.
       #
-      # .gitignore alone cannot prevent this because it only covers names someone
-      # predicted. This checks what is actually TRACKED, by magic bytes.
-      - name: No committed executables
+      # The first version of this step matched a LIST of magic bytes (ELF, Mach-O,
+      # PE, ar, wasm). That reproduced the very flaw it criticised .gitignore for:
+      # one commit later a 221 KB `sqlite.db.tmp` was committed at the module root
+      # and this step passed green, because "SQLite format 3" was not a format
+      # anyone had thought to list.
+      #
+      # So it is INVERTED: git itself decides what is binary (`git grep -I`, the
+      # same NUL-byte heuristic used for diffs), and only an explicit allowlist of
+      # asset extensions is permitted. An unrecognised binary format is now a
+      # failure by default rather than a pass by default. Adding a genuine new
+      # asset type means adding it here, on purpose.
+      - name: No committed binaries outside the asset allowlist
         run: |
           set -uo pipefail
           found=""
           while IFS= read -r f; do
             [ -f "$f" ] || continue
-            # ELF | Mach-O (be/le, 32/64, universal) | PE/COFF | ar archive | wasm
-            case "$(head -c 4 "$f" | od -An -tx1 | tr -d ' \n')" in
-              7f454c46|feedface|feedfacf|cefaedfe|cffaedfe|cafebabe|4d5a*|213c6172|0061736d)
-                found="$found $f" ;;
+            case "$f" in
+              *.png|*.jpg|*.jpeg|*.gif|*.ico|*.webp|*.woff|*.woff2|*.ttf|*.otf|*.eot) continue ;;
             esac
+            # -I treats binary files as non-matching, so a file with NO match for
+            # "." (any character) is one git considers binary.
+            if ! git grep -Iq . -- "$f" 2>/dev/null; then
+              found="$found $f($(stat -c%s "$f")B)"
+            fi
           done < <(git ls-files)
           if [ -n "$found" ]; then
-            echo "::error::compiled binaries are committed:$found"
+            echo "::error::binary files are committed outside the asset allowlist:$found"
+            echo "If one is a genuine asset, add its extension to the allowlist in this step."
             exit 1
           fi
-          echo "no committed executables"
+          echo "no committed binaries outside the asset allowlist"
 
       - name: Set up Go
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
@@ -224,6 +240,27 @@ jobs:
       - name: Build frontend
         working-directory: ui/frontend
         run: npm install && npm run build
+
+      # ui/frontend/dist is COMMITTED and //go:embed'd, so it is what consumers
+      # actually get — but nothing ever compared it to its own source. A stale
+      # bundle would ship silently through go:embed while CI stayed green, because
+      # CI rebuilds from source and tests the REBUILT copy, never the committed
+      # one. Same shape as the frontend unit tests that existed but were never run:
+      # present, and load-bearing for nobody.
+      #
+      # The build is deterministic (verified byte-identical across rebuilds, all
+      # seven files) and both lockfiles are committed, so a diff here means the
+      # committed bundle genuinely does not match its source.
+      - name: Committed frontend bundle matches its source
+        run: |
+          if ! git diff --quiet -- ui/frontend/dist; then
+            echo "::error::ui/frontend/dist does not match a fresh build of its source."
+            echo "It is committed and go:embed'd, so the dashboard consumers get is the stale one."
+            echo "Fix: (cd ui/frontend && npm run build) and commit the result."
+            git diff --stat -- ui/frontend/dist
+            exit 1
+          fi
+          echo "committed bundle matches a fresh build"
 
       # The frontend unit tests existed but NOTHING RAN THEM: no workflow invoked
       # vitest, so every assertion in ui/frontend/src/**/*.test.ts was decorative

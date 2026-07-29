@@ -249,8 +249,10 @@ func TestHandler_GormStorage_NoQueue(t *testing.T) {
 	rw := httptest.NewRecorder()
 	h.ServeHTTP(rw, req)
 
-	acceptable := rw.Code == http.StatusOK || rw.Code == http.StatusNotFound
-	assert.True(t, acceptable, "unexpected status %d", rw.Code)
+	// Not "200 or 404": the SPA shell is embedded and committed, so 404 is not a
+	// reachable outcome for "/" and accepting it made this assertion vacuous —
+	// it passed for every status the handler can actually return.
+	assert.Equal(t, http.StatusOK, rw.Code, "the embedded dashboard shell must serve")
 }
 
 func TestHandler_GormStorage_WithQueue(t *testing.T) {
@@ -273,8 +275,10 @@ func TestHandler_GormStorage_WithQueue(t *testing.T) {
 	rw := httptest.NewRecorder()
 	h.ServeHTTP(rw, req)
 
-	acceptable := rw.Code == http.StatusOK || rw.Code == http.StatusNotFound
-	assert.True(t, acceptable, "unexpected status %d", rw.Code)
+	// Not "200 or 404": the SPA shell is embedded and committed, so 404 is not a
+	// reachable outcome for "/" and accepting it made this assertion vacuous —
+	// it passed for every status the handler can actually return.
+	assert.Equal(t, http.StatusOK, rw.Code, "the embedded dashboard shell must serve")
 }
 
 func TestHandler_GormStorage_StartsSingleCollectorPerDB(t *testing.T) {
@@ -363,6 +367,8 @@ func TestHandler_GormStorage_WithQueue_NoRetention(t *testing.T) {
 	rw := httptest.NewRecorder()
 	h.ServeHTTP(rw, req)
 
-	acceptable := rw.Code == http.StatusOK || rw.Code == http.StatusNotFound
-	assert.True(t, acceptable, "unexpected status %d", rw.Code)
+	// Not "200 or 404": the SPA shell is embedded and committed, so 404 is not a
+	// reachable outcome for "/" and accepting it made this assertion vacuous —
+	// it passed for every status the handler can actually return.
+	assert.Equal(t, http.StatusOK, rw.Code, "the embedded dashboard shell must serve")
 }

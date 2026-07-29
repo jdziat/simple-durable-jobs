@@ -216,7 +216,7 @@ func TestRenewConcurrencySlots(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, ok)
 	w.slotJobIDMu.Lock()
-	w.slotJobID[1] = []string{"customer:a"}
+	w.slotJobID[1] = slotHold{jobID: "job-1", names: []string{"customer:a"}}
 	w.slotJobIDMu.Unlock()
 
 	w.renewConcurrencySlots(context.Background(), "job-1", 1)

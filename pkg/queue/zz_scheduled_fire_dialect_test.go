@@ -16,6 +16,7 @@ import (
 	"gorm.io/driver/mysql"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 	"gorm.io/gorm/logger"
 )
 
@@ -142,4 +143,99 @@ func TestEnqueueScheduledFire_ConcurrentFreshSchedulesDoNotDeadlock(t *testing.T
 	assert.Equal(t, int64(names*rounds), claimed.Load(),
 		"every boundary must be claimed exactly once — a lost boundary is a scheduled run that "+
 			"nobody ran and nobody will retry")
+}
+
+// TestEnqueueScheduledFire_PriorFireReadTakesTheRowLock covers the FOR UPDATE on
+// the prior-fire read, which had NO coverage at all: deleting the clause left
+// ./pkg/queue green on SQLite, live Postgres AND live MySQL.
+//
+// FALSE-GREEN TRAP, and the test above is it. Its message says "FOR UPDATE must be
+// valid SQL on %s" — but it only ever asserts that the call SUCCEEDS, and a query
+// with no locking clause succeeds too. It cannot tell "the lock is taken" from
+// "the clause was never emitted", which is precisely the difference that matters.
+//
+// The discriminating setup is a fire the cursor guard will REJECT. On that path
+// ClaimScheduledFireTx's UPDATE matches no row and therefore takes no lock of its
+// own, so the ONLY thing that can block is the explicit locking read. Holding a
+// competing row lock from the test then separates the two cases exactly: with the
+// clause the call blocks until we commit, without it the call sails through.
+//
+// The property is what the comment in queue.go claims — that the read takes the
+// SAME row lock the claim is about to take, rather than reading first and locking
+// after, which would leave a window in which a peer's real fire is invisible and
+// the skip-restore writes a marker from before it.
+//
+// WHERE THIS TEST DISCRIMINATES, MEASURED, because "it passes on both dialects"
+// is not the same as "it covers both dialects":
+//
+//	Postgres — DISCRIMINATING. Drop the locking clause and this test fails: PG
+//	  locks only rows an UPDATE actually modifies, so a rejected claim takes no
+//	  lock and the call returns immediately.
+//	MySQL — NOT DISCRIMINATING, and the test still passes with the clause removed.
+//	  InnoDB locks rows it SCANS, not just rows it modifies, so the claim's own
+//	  UPDATE blocks on the held lock regardless. I confirmed this by removing the
+//	  FOR UPDATE and the ODKU pre-insert together and watching it still block, which
+//	  leaves the claim's UPDATE as the only statement that can be taking the lock.
+//	  So on MySQL the clause is belt-and-braces; the Postgres leg is what pins it.
+//
+// That asymmetry is the reason this is written as a lock-visibility test rather
+// than a concurrent read-modify-write race: the race needs an interleave inside a
+// closure in EnqueueScheduledFire that no external caller can schedule, and a
+// hammer-and-hope version would be both flaky and — on MySQL — vacuous.
+func TestEnqueueScheduledFire_PriorFireReadTakesTheRowLock(t *testing.T) {
+	db := openRealDialectDB(t)
+	store := storage.NewGormStorage(db)
+	require.NoError(t, store.Migrate(context.Background()))
+	q := New(store)
+	q.Register("probejob", func(context.Context, struct{}) error { return nil })
+	ctx := context.Background()
+
+	name := "lockprobe-" + time.Now().Format("150405.000000")
+	t.Cleanup(func() { db.Exec(`DELETE FROM scheduled_fires WHERE name = ?`, name) })
+
+	// Establish the cursor so the fire below is REJECTED, which is what keeps the
+	// claim's own UPDATE from taking a lock and muddying the signal.
+	boundary := time.Now().Truncate(time.Minute)
+	claimed, _, err := q.EnqueueScheduledFire(ctx, name, boundary, "probejob", nil)
+	require.NoError(t, err)
+	require.True(t, claimed)
+
+	// Hold a conflicting row lock in a transaction of our own.
+	held := db.Begin()
+	require.NoError(t, held.Error)
+	var locked core.ScheduledFire
+	require.NoError(t, held.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("name = ?", name).First(&locked).Error)
+
+	type result struct {
+		claimed bool
+		err     error
+	}
+	done := make(chan result, 1)
+	go func() {
+		// An EARLIER boundary: the cursor guard rejects it, so no UPDATE matches.
+		c, _, e := q.EnqueueScheduledFire(ctx, name, boundary.Add(-time.Minute), "probejob", nil)
+		done <- result{c, e}
+	}()
+
+	select {
+	case r := <-done:
+		held.Rollback()
+		t.Fatalf("the prior-fire read completed (claimed=%v err=%v) while another transaction "+
+			"held this row's lock — it is not taking the row lock, so a peer committing a real "+
+			"fire between the read and the claim stays invisible and the skip-restore loses it",
+			r.claimed, r.err)
+	case <-time.After(750 * time.Millisecond):
+		// Blocked, which is the point.
+	}
+
+	require.NoError(t, held.Commit().Error)
+
+	select {
+	case r := <-done:
+		require.NoError(t, r.err)
+		assert.False(t, r.claimed, "an earlier boundary must still be rejected by the cursor guard")
+	case <-time.After(15 * time.Second):
+		t.Fatal("the fire never completed after the competing lock was released")
+	}
 }
