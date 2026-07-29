@@ -880,3 +880,43 @@ func TestDispatch_EveryBounceRefundsTheQueueRateToken(t *testing.T) {
 			"a job bounced because the dispatch channel never drained must refund its token")
 	})
 }
+
+// TestDispatch_QueueCapBounceReleasesTheJobRow covers the one bail-out in
+// dispatchDequeuedJobs whose job release was a FREE CALL SITE: deleting
+// `w.releaseDequeuedJobOnShutdown(...)` from the queue-cap branch left the WHOLE
+// repository green. The other five bail-outs in the same loop are all guarded.
+//
+// The consequence is the worst kind: a job DEQUEUED and then bounced for lack of a
+// local slot is left `running` under this worker's lock, and nothing re-dispatches
+// it until the stale-lock reaper fires at StaleLockAge — 45 minutes by default.
+// It is the most ordinary bounce there is; it happens whenever a worker is at its
+// per-queue concurrency limit.
+//
+// FALSE-GREEN TRAP, and it is round 8's shape exactly: the owning subtest of
+// TestDispatch_AdmissionBalancesOnEveryBailOut asserts the RETURN COUNTER
+// (released == 3) and the in-memory bookkeeping, and never looks at the job row.
+// Both of those are satisfied by the `released++` on the line below. The
+// discriminating observation is that Release reached STORAGE.
+func TestDispatch_QueueCapBounceReleasesTheJobRow(t *testing.T) {
+	store := &mockStorage{}
+	q := queue.New(store)
+	// Concurrency 1: the second job in the batch is refused by the queue cap.
+	w := NewWorker(q, WorkerQueue("default", Concurrency(1)))
+
+	jobs := []*core.Job{
+		{ID: core.NewID(), Type: "t", Queue: "default", Status: core.StatusRunning},
+		{ID: core.NewID(), Type: "t", Queue: "default", Status: core.StatusRunning},
+	}
+	ch := make(chan dispatchedJob, 4)
+	dispatched, released := w.dispatchDequeuedJobs(context.Background(), ch, jobs)
+	require.Equal(t, 1, dispatched, "the cap admits exactly one")
+	require.Equal(t, 1, released, "and bounces the other")
+
+	store.mu.Lock()
+	releasedIDs := append([]core.UUID(nil), store.releasedJobIDs...)
+	store.mu.Unlock()
+	assert.Contains(t, releasedIDs, jobs[1].ID,
+		"a job bounced by the per-queue cap must be RELEASED in storage, not merely counted. "+
+			"Left unreleased it stays `running` under this worker's lock and nothing re-dispatches "+
+			"it until the stale-lock reaper fires at StaleLockAge — 45 minutes by default")
+}

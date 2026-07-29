@@ -72,6 +72,19 @@ func TestApplyScheduleFireDisposition(t *testing.T) {
 
 	t.Run("a unique-key dedup is a skip: the cursor advances", func(t *testing.T) {
 		o := newOutcome(core.ErrDuplicateJob)
+		// SEED the maps this subtest asserts on. newOutcome starts them EMPTY, so
+		// asserting NotContains against them accepted every outcome the code can
+		// produce — blanking both deletes in the dedup branch left the whole
+		// package green. The sibling success subtest below seeds them for exactly
+		// this reason; this one did not, and its assertions were decoration.
+		//
+		// The behaviour that matters: a schedule which accumulated failures and
+		// then gets a dedup-skip must have its streak and its stale retryAt
+		// CLEARED. Otherwise scheduleIsBackingOff keeps suppressing ticks until the
+		// old deadline, and the next genuine failure resumes at failures=N —
+		// jumping toward the 30s cap instead of restarting at 100ms.
+		o.failures["s"] = 3
+		o.retryAt["s"] = o.now.Add(time.Hour)
 		w.applyScheduleFireDisposition(o)
 
 		assert.Equal(t, boundary, o.lastRun["s"],

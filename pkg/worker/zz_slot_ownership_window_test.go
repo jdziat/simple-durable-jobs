@@ -590,3 +590,103 @@ func TestReleaseConcurrencySlots_UnionNeverCrossesJobIDs(t *testing.T) {
 	w.releaseConcurrencySlots(ctx, jobB.ID, tokB)
 	require.Zero(t, store.slotCount("customer:globex"))
 }
+
+// gatedReleaseStorage parks INSIDE the storage delete, so a test can try to land
+// an acquire while the DELETE is in flight — the window between deciding "nobody
+// else holds this row" and actually removing it.
+type gatedReleaseStorage struct {
+	*capMockStorage
+	entered chan struct{}
+	proceed chan struct{}
+	once    sync.Once
+}
+
+func (s *gatedReleaseStorage) ReleaseConcurrencySlotOwned(ctx context.Context, slotName string, jobID core.UUID, workerID string) error {
+	s.once.Do(func() {
+		close(s.entered)
+		<-s.proceed
+	})
+	return s.ReleaseConcurrencySlot(ctx, slotName, jobID)
+}
+
+// TestReleaseConcurrencySlots_DecisionAndDeleteAreAtomic covers the window between
+// the "no other run holds this row" decision and the DELETE that acts on it.
+//
+// The decision was made under slotJobIDMu and the mutex was then DROPPED before
+// the storage call. A later run of the same job id that publishes in that window
+// is invisible to the decision, renews the row through TryAcquireConcurrencySlot's
+// idempotent branch, and then loses it to the in-flight DELETE — a FLEET-WIDE cap
+// slot deleted out from under a handler that is still executing. The ownership
+// fence cannot refuse it: same job id, same worker id.
+//
+// The window is a full DB ROUND TRIP wide, which is orders of magnitude larger
+// than the acquire-side window an earlier round called a real defect and fixed.
+//
+// FALSE-GREEN TRAP, and the neighbouring test named for this exact invariant is
+// it: TestReleaseConcurrencySlots_DoesNotDeleteTheRowALaterRunHolds runs run #2's
+// acquire to COMPLETION and only then calls release. Strictly sequential — it can
+// only ever certify the favourable ordering. Catching this needs the acquire to
+// land INSIDE the release, which is what the gate below does.
+func TestReleaseConcurrencySlots_DecisionAndDeleteAreAtomic(t *testing.T) {
+	job := runningJob("job-1", "acme")
+	base := newCapMockStorage([]*core.Job{job})
+	store := &gatedReleaseStorage{
+		capMockStorage: base,
+		entered:        make(chan struct{}),
+		proceed:        make(chan struct{}),
+	}
+	q := queue.New(store)
+	q.Register(job.Type, func(context.Context, struct{}) error { return nil })
+	w := NewWorker(q,
+		WorkerQueue("default", Concurrency(3)),
+		ConcurrencyCap("customer", 1, CapKey(func(j *core.Job) string { return j.UniqueKey })),
+		DisableRetry(),
+	)
+	w.config.WorkerID = "worker-1"
+	ctx := context.Background()
+
+	tok1 := w.nextRunToken.Add(1)
+	require.True(t, w.tryAcquireConcurrencySlots(ctx, job, tok1))
+	require.Equal(t, 1, base.slotCount("customer:acme"))
+
+	// Run #1 releases; it parks inside the DELETE.
+	releaseDone := make(chan struct{})
+	go func() { defer close(releaseDone); w.releaseConcurrencySlots(ctx, job.ID, tok1) }()
+	<-store.entered
+
+	// The same job id is re-dequeued and admitted WHILE that delete is in flight.
+	// With the decision and the delete made atomic this blocks until the release
+	// finishes and then takes a fresh row; without it, it renews the doomed row.
+	tok2 := w.nextRunToken.Add(1)
+	acquired := make(chan bool, 1)
+	go func() { acquired <- w.tryAcquireConcurrencySlots(ctx, job, tok2) }()
+
+	// THE DISCRIMINATING OBSERVATION, and my first version of this test got it
+	// wrong: it released the gate immediately, so run #2 had not necessarily done
+	// anything yet and the test passed against the broken code. What actually
+	// distinguishes the two versions is whether run #2 can COMPLETE while the
+	// DELETE is still in flight. It must not — if it can, it has renewed a row
+	// that is about to be removed.
+	select {
+	case <-acquired:
+		close(store.proceed)
+		<-releaseDone
+		t.Fatal("run #2 completed its acquire while run #1's DELETE was still in flight: the " +
+			"decision and the delete are not atomic, so run #2 renewed the very row that " +
+			"release is about to remove, and will execute holding no fleet-cap row")
+	case <-time.After(750 * time.Millisecond):
+		// Correctly blocked behind the release.
+	}
+
+	close(store.proceed)
+	<-releaseDone
+	require.True(t, <-acquired, "run #2 must then be admitted, on a fresh row")
+
+	assert.Equal(t, 1, base.slotCount("customer:acme"),
+		"run #2 holds the fleet cap row and is about to execute; a release that decided "+
+			"'nobody else holds this' BEFORE run #2 published, and then deleted AFTER it did, "+
+			"removes the row out from under it and admits another job past the cap")
+
+	w.releaseConcurrencySlots(ctx, job.ID, tok2)
+	assert.Zero(t, base.slotCount("customer:acme"), "and the last run out still releases it")
+}

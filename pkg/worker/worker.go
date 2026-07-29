@@ -1843,21 +1843,48 @@ func (w *Worker) releaseConcurrencySlots(ctx context.Context, jobID core.UUID, r
 	// Merging keeps the invariant exact rather than approximate: the union of every
 	// name any live run of this job id holds is always covered, so whoever is last
 	// out releases all of them.
+	// THE LOCK IS HELD ACROSS THE DELETE. That is deliberate, and it is the whole
+	// point of this function.
+	//
+	// The decision "no other run holds this row" is only meaningful if no run can
+	// JOIN the row between making it and acting on it. Ownership is published under
+	// this mutex (record(), before the storage call), so holding it across
+	// releaseSlotNames makes the two atomic with respect to every acquire: a later
+	// run either publishes BEFORE the scan and is seen, or lands AFTER the delete
+	// and creates a fresh row. Neither loses a row it believes it holds.
+	//
+	// Making the decision under the lock and then releasing it before the DELETE —
+	// which is what this did — leaves a window a full DB ROUND TRIP wide, orders of
+	// magnitude larger than the acquire-side window a previous round called a real
+	// defect and fixed. Reproduced: run #2 renews the row through
+	// TryAcquireConcurrencySlot's idempotent branch, run #1's in-flight DELETE then
+	// removes it, and a further job is admitted past a FLEET-WIDE cap while run #2
+	// is still executing. ReleaseConcurrencySlotOwned cannot refuse it — same job
+	// id, same worker id.
+	//
+	// COST, stated rather than hand-waved: slot releases now serialise against each
+	// other and against acquires for the duration of a DELETE. That is bounded and
+	// proportionate — this mutex is touched ONLY when ConcurrencyCaps are
+	// configured (tryAcquireConcurrencySlots returns at the len()==0 guard
+	// otherwise), and a cap exists precisely to keep the number of concurrent
+	// capped jobs small. A worker with no caps never contends here at all.
+	//
+	// Safe to hold across I/O: this mutex is a LEAF. releaseSlotNames touches only
+	// the storage interface, and no path in this package acquires another worker
+	// mutex beneath it — verified by a static scan of every w.*Mu site.
 	w.slotJobIDMu.Lock()
+	defer w.slotJobIDMu.Unlock()
+
 	hold := w.slotJobID[runToken]
 	delete(w.slotJobID, runToken)
-	heldByAnother := false
 	for otherToken, other := range w.slotJobID {
 		if otherToken == runToken || other.jobID != jobID {
 			continue
 		}
-		heldByAnother = true
+		// Another run still holds this job's row: hand our names to it and leave
+		// the row alone. It releases the union when it finishes.
 		other.names = unionSlotNames(other.names, hold.names)
 		w.slotJobID[otherToken] = other
-	}
-	w.slotJobIDMu.Unlock()
-
-	if heldByAnother {
 		return
 	}
 	w.releaseSlotNames(ctx, jobID, hold.names)

@@ -202,16 +202,28 @@ remove the compensation. Expressions without a prefix are unchanged and remain
 UTC — deliberately, since the underlying parser would otherwise default them to
 the host's timezone.
 
-**During a rolling deploy, a prefixed schedule can fire TWICE in one day.** The two
-versions disagree about which instant the next boundary is, and they share one
-cursor: the old binary claims the boundary at the UTC hour, the new one then claims
-the boundary at the requested local hour, and both are "next" by their own
-reckoning. Reproduced by alternating the real binaries against one SQLite cursor
-with `Cron("CRON_TZ=America/New_York 0 9 * * *")` — two fires on the same calendar
-day, at every old→new handover. It clears once the rollout completes. If a double
-run of that job would be harmful, either declare it `queue.Unique(...)` for the
-duration or pause the schedule across the deploy. Unprefixed schedules are
-unaffected, since neither version moves them.
+**A prefixed schedule can fire TWICE on the day you upgrade — and stopping the old
+version first does NOT avoid it.** The two versions disagree about which instant
+the next boundary is and they share one cursor, so the old binary claims the
+boundary at the UTC hour and the new one then claims the boundary at the requested
+LOCAL hour, each "next" by its own reckoning.
+
+Reproduced with the real binaries against one SQLite cursor using
+`Cron("CRON_TZ=America/New_York 0 9 * * *")`, in BOTH deployment styles:
+
+- **Rolling** — two fires on the same calendar day at every old→new handover.
+- **Stop-the-world** — run v4.7.0 alone through the day (fires 09:00Z), stop it
+  completely, then start v4.8.0: it immediately catches up the 13:00Z boundary the
+  old binary skipped, so the job runs twice on the cutover day. Verified at
+  cutovers of 10:00Z, 14:00Z, 20:00Z and at next-midnight; every one double-fires.
+
+The extra fire is a **catch-up of a genuinely missed local boundary**, which is
+correct behaviour once you accept that the schedule was firing at the wrong hour
+before — but it happens regardless of how you sequence the deploy, so "cut over
+cleanly" is not a mitigation. If a double run would be harmful, declare the job
+`queue.Unique(...)` across the upgrade, or pause the schedule until after the
+first correct boundary has passed. Unprefixed schedules are unaffected, since
+neither version moves them.
 
 Also adds `CronIn`, `DailyIn`, `WeeklyIn` (and `MustCronIn`) for callers holding a
 `*time.Location` rather than a name. `DailyIn`/`WeeklyIn` advance by rolling the
