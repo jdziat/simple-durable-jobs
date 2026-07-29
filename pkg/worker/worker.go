@@ -1870,8 +1870,13 @@ func (w *Worker) releaseConcurrencySlots(ctx context.Context, jobID core.UUID, r
 	// capped jobs small. A worker with no caps never contends here at all.
 	//
 	// Safe to hold across I/O: this mutex is a LEAF. releaseSlotNames touches only
-	// the storage interface, and no path in this package acquires another worker
-	// mutex beneath it — verified by a static scan of every w.*Mu site.
+	// the storage interface and a read-only config field, GormStorage's release is
+	// a single DELETE with no callback, and no path in this package acquires
+	// another worker mutex beneath it — verified by a static scan of every w.*Mu
+	// site. The honest residual is a THIRD-PARTY core.Storage (or a custom slog
+	// handler on the warn path) that calls back into this worker while the mutex is
+	// held; nothing in-tree does, and liveness under a genuinely slow DELETE is
+	// covered by TestReleaseConcurrencySlots_SlowDeleteDoesNotWedgeDispatch.
 	w.slotJobIDMu.Lock()
 	defer w.slotJobIDMu.Unlock()
 
@@ -1883,6 +1888,14 @@ func (w *Worker) releaseConcurrencySlots(ctx context.Context, jobID core.UUID, r
 		}
 		// Another run still holds this job's row: hand our names to it and leave
 		// the row alone. It releases the union when it finishes.
+		//
+		// ONE holder, not all of them, and Go's map order makes that one arbitrary
+		// — which is fine, and worth the two lines to show why. Every departing run
+		// merges into SOME remaining holder, so by induction the last run out has
+		// accumulated every name any of them ever held. Which intermediate holder
+		// receives them cannot matter, because that holder either departs (and
+		// passes them on again) or is itself the last one out. Merging into all of
+		// them would only duplicate the names and the DELETEs.
 		other.names = unionSlotNames(other.names, hold.names)
 		w.slotJobID[otherToken] = other
 		return

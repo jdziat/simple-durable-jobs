@@ -690,3 +690,81 @@ func TestReleaseConcurrencySlots_DecisionAndDeleteAreAtomic(t *testing.T) {
 	w.releaseConcurrencySlots(ctx, job.ID, tok2)
 	assert.Zero(t, base.slotCount("customer:acme"), "and the last run out still releases it")
 }
+
+// slowReleaseStorage makes every slot DELETE take real time, which is what a
+// mutex held across I/O actually costs.
+type slowReleaseStorage struct {
+	*capMockStorage
+	delay    time.Duration
+	releases atomic.Int64
+}
+
+func (s *slowReleaseStorage) ReleaseConcurrencySlotOwned(ctx context.Context, slotName string, jobID core.UUID, workerID string) error {
+	time.Sleep(s.delay)
+	s.releases.Add(1)
+	return s.ReleaseConcurrencySlot(ctx, slotName, jobID)
+}
+
+// TestReleaseConcurrencySlots_SlowDeleteDoesNotWedgeDispatch guards the RISK the
+// atomicity fix introduces: slotJobIDMu is now held across a storage call, so
+// every acquire blocks behind every release.
+//
+// The concern is not correctness — holding it is what makes the decision and the
+// delete atomic — but liveness. A slow database must not wedge dispatch, deadlock
+// the worker, or starve acquires indefinitely. This drives many concurrent
+// acquire/release pairs against a storage whose DELETE genuinely sleeps, and fails
+// by TIMEOUT, because a lock-order or liveness failure presents as a hang.
+//
+// Written pre-emptively against my own change rather than in response to a
+// finding: a mutex newly held across I/O is the single riskiest thing in this
+// branch, and four consecutive rounds have found a defect inside the previous
+// round's fix.
+func TestReleaseConcurrencySlots_SlowDeleteDoesNotWedgeDispatch(t *testing.T) {
+	base := newCapMockStorage(nil)
+	store := &slowReleaseStorage{capMockStorage: base, delay: 2 * time.Millisecond}
+	q := queue.New(store)
+	w := NewWorker(q,
+		WorkerQueue("default", Concurrency(64)),
+		ConcurrencyCap("customer", 1000, CapKey(func(j *core.Job) string { return j.UniqueKey })),
+	)
+	w.config.WorkerID = "worker-1"
+	ctx := context.Background()
+
+	const runners = 16
+	const each = 12
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		var wg sync.WaitGroup
+		for i := 0; i < runners; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				for j := 0; j < each; j++ {
+					// A distinct job id per iteration, so these are independent
+					// acquire/release pairs contending on one mutex.
+					job := runningJob(string(core.NewID()), "tenant")
+					tok := w.nextRunToken.Add(1)
+					if w.tryAcquireConcurrencySlots(ctx, job, tok) {
+						w.releaseConcurrencySlots(ctx, job.ID, tok)
+					}
+				}
+			}(i)
+		}
+		wg.Wait()
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(60 * time.Second):
+		t.Fatal("dispatch wedged: holding slotJobIDMu across the storage DELETE must serialise " +
+			"slot bookkeeping, not deadlock it or starve acquires")
+	}
+
+	assert.Equal(t, int64(runners*each), store.releases.Load(),
+		"every acquired slot must be released exactly once under contention")
+	w.slotJobIDMu.Lock()
+	n := len(w.slotJobID)
+	w.slotJobIDMu.Unlock()
+	assert.Zero(t, n, "and no bookkeeping entry may survive")
+}
