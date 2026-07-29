@@ -59,7 +59,9 @@ func TestRunScheduler_BackoffCallSiteThrottlesAFailingSchedule(t *testing.T) {
 
 	attempts := store.attempts.Load()
 	require.Positive(t, attempts, "the scheduler must have tried at least once, or this proves nothing")
-	assert.LessOrEqual(t, attempts, int64(6),
+	// Measured: 4 attempts with the backoff, 14-15 without, so 8 sits clear of both
+	// and leaves headroom for a loaded CI machine ticking at a different rate.
+	assert.LessOrEqual(t, attempts, int64(8),
 		"a persistently failing schedule must BACK OFF (100ms doubling to 30s), not retry on every "+
 			"100ms tick — got %d attempts in ~1.5s, which is the un-throttled rate", attempts)
 }

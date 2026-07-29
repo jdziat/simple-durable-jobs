@@ -389,3 +389,109 @@ func TestReleaseConcurrencySlots_DoesNotDeleteTheRowALaterRunHolds(t *testing.T)
 	assert.Zero(t, store.slotCount("customer:acme"),
 		"the last run out must release the row, or the cap leaks a slot permanently")
 }
+
+// TestReleaseConcurrencySlots_HandoverDoesNotLeakTheRow is the other half of the
+// handover: refusing to release when a later run holds the row must not turn into
+// never releasing it.
+//
+// FALSE-GREEN TRAP: the happy sequence (run #1 hands over, run #2 releases) is
+// already covered. These are the paths where the later run does NOT complete
+// normally — it panics, or a THIRD run replaces it, or the entry is already gone.
+// A leaked row holds a FLEET-wide cap until its TTL expires, throttling every
+// worker in the deployment.
+func TestReleaseConcurrencySlots_HandoverDoesNotLeakTheRow(t *testing.T) {
+	newWorker := func(t *testing.T) (*Worker, *capMockStorage, *core.Job) {
+		t.Helper()
+		job := runningJob("job-1", "acme")
+		store := newCapMockStorage([]*core.Job{job})
+		q := queue.New(store)
+		q.Register(job.Type, func(context.Context, struct{}) error { return nil })
+		w := NewWorker(q,
+			WorkerQueue("default", Concurrency(3)),
+			ConcurrencyCap("customer", 1, CapKey(func(j *core.Job) string { return j.UniqueKey })),
+			DisableRetry(),
+		)
+		w.config.WorkerID = "worker-1"
+		return w, store, job
+	}
+
+	t.Run("a third run takes over before the second releases", func(t *testing.T) {
+		w, store, job := newWorker(t)
+		ctx := context.Background()
+
+		tok1 := w.nextRunToken.Add(1)
+		require.True(t, w.tryAcquireConcurrencySlots(ctx, job, tok1))
+		tok2 := w.nextRunToken.Add(1)
+		w.runningJobsMu.Lock()
+		w.runningJobs[job.ID] = runningJobEntry{cancel: func() {}, token: tok2}
+		w.runningJobsMu.Unlock()
+		require.True(t, w.tryAcquireConcurrencySlots(ctx, job, tok2))
+
+		w.releaseConcurrencySlots(ctx, job.ID, tok1) // hands over to #2
+		tok3 := w.nextRunToken.Add(1)
+		w.runningJobsMu.Lock()
+		w.runningJobs[job.ID] = runningJobEntry{cancel: func() {}, token: tok3}
+		w.runningJobsMu.Unlock()
+		require.True(t, w.tryAcquireConcurrencySlots(ctx, job, tok3))
+		w.releaseConcurrencySlots(ctx, job.ID, tok2) // hands over to #3
+		require.Equal(t, 1, store.slotCount("customer:acme"), "still held by run #3")
+
+		// Run #3 is the last out.
+		w.runningJobsMu.Lock()
+		delete(w.runningJobs, job.ID)
+		w.runningJobsMu.Unlock()
+		w.releaseConcurrencySlots(ctx, job.ID, tok3)
+		assert.Zero(t, store.slotCount("customer:acme"),
+			"the last run out must release, however many handovers preceded it")
+	})
+
+	t.Run("the later run releases first, then the earlier one", func(t *testing.T) {
+		w, store, job := newWorker(t)
+		ctx := context.Background()
+
+		tok1 := w.nextRunToken.Add(1)
+		require.True(t, w.tryAcquireConcurrencySlots(ctx, job, tok1))
+		tok2 := w.nextRunToken.Add(1)
+		w.runningJobsMu.Lock()
+		w.runningJobs[job.ID] = runningJobEntry{cancel: func() {}, token: tok2}
+		w.runningJobsMu.Unlock()
+		require.True(t, w.tryAcquireConcurrencySlots(ctx, job, tok2))
+
+		// #2 finishes first and deregisters, so #1 is now the current entry's owner.
+		w.runningJobsMu.Lock()
+		delete(w.runningJobs, job.ID)
+		w.runningJobsMu.Unlock()
+		w.releaseConcurrencySlots(ctx, job.ID, tok2)
+		w.releaseConcurrencySlots(ctx, job.ID, tok1)
+
+		assert.Zero(t, store.slotCount("customer:acme"),
+			"out-of-order completion must still end with the row released, not held forever")
+	})
+
+	t.Run("the run that panics still releases through its defer", func(t *testing.T) {
+		job := runningJob("job-1", "acme")
+		store := newCapMockStorage([]*core.Job{job})
+		q := queue.New(store)
+		q.Register(job.Type, func(context.Context, struct{}) error { panic("exploded") })
+		w := NewWorker(q,
+			WorkerQueue("default", Concurrency(3)),
+			ConcurrencyCap("customer", 1, CapKey(func(j *core.Job) string { return j.UniqueKey })),
+			DisableRetry(),
+		)
+		w.config.WorkerID = "worker-1"
+
+		ch := make(chan dispatchedJob, 1)
+		dispatched, _ := w.dispatchDequeuedJobs(context.Background(), ch, []*core.Job{job})
+		require.Equal(t, 1, dispatched)
+		dj := <-ch
+		require.Equal(t, 1, store.slotCount("customer:acme"))
+
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		w.processJobRun(ctx, dj.job, dj.token)
+
+		assert.Zero(t, store.slotCount("customer:acme"),
+			"a panicking run must still release its fleet slot — the row is cluster-wide and would "+
+				"otherwise throttle every worker until its TTL expires")
+	})
+}
