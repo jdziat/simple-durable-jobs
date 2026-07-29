@@ -1953,8 +1953,12 @@ func unionSlotNames(a, b []string) []string {
 const slotReleaseTimeout = 5 * time.Second
 
 // minSlotReleaseTimeout keeps the per-slot share usable under an unusually large
-// number of configured caps; the total may then exceed slotReleaseTimeout, which
-// is the right trade — the alternative is deletes that cannot possibly succeed.
+// number of configured caps. Past ten caps the floor binds and the TOTAL grows
+// linearly instead of staying at slotReleaseTimeout: 10 caps = 5s, 20 = 10s,
+// 50 = 25s. That is the right trade — the alternative is deletes that cannot
+// possibly succeed — and it stays safe on the axis that matters, because the
+// worst case is still far inside the 2-minute heartbeat interval, so no beat is
+// missed and no lease approaches the 45-minute StaleLockAge.
 const minSlotReleaseTimeout = 500 * time.Millisecond
 
 func (w *Worker) releaseSlotNames(ctx context.Context, jobID core.UUID, slots []string) {
