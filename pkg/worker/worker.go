@@ -1713,7 +1713,11 @@ func (w *Worker) tryAcquireConcurrencySlots(ctx context.Context, job *core.Job, 
 	//
 	// Recording as we go means every bail-out can route through
 	// releaseConcurrencySlots, which consults the fence and cleans up this run's
-	// entry. There is exactly ONE place that deletes these rows now.
+	// entry. Within this package there is now exactly ONE place that deletes these
+	// rows: releaseSlotNames, called only from releaseConcurrencySlots. (pkg/storage
+	// deletes them too — on batch completion, terminal transitions and aggressive
+	// pause — but every one of those sits in the transaction that also makes the job
+	// unclaimable, so none can race a later run of the same job id.)
 	//
 	// THE RECORD HAPPENS BEFORE THE STORAGE CALL, NOT AFTER. Recording after it
 	// returns left a real window, just a much smaller one than the version before

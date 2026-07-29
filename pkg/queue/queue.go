@@ -324,6 +324,24 @@ func (q *Queue) EnqueueScheduledFire(ctx context.Context, scheduleName string, f
 				jid, e := q.EnqueueTx(ctx, tx, jobName, args, opts...)
 				if e != nil {
 					if errors.Is(e, core.ErrDuplicateJob) {
+						// SCOPE, because this branch is narrower than it looks: only
+						// queue.Unique produces ErrDuplicateJob. IdempotencyKey and
+						// UniqueFor go through EnqueueWithUniqueLockTx, which returns
+						// the EXISTING job id with a nil error, so a deduplicated fire
+						// on those two modes still reaches the success path below and
+						// still stamps last_fired_at — the very thing the marker split
+						// exists to avoid. Reproduced on live Postgres: two boundaries
+						// inside one idempotency window created one job row and advanced
+						// the marker for the boundary at which nothing ran.
+						//
+						// That is not a regression (before this change the marker was
+						// stamped unconditionally, for every mode), and it is left as is
+						// deliberately: distinguishing "deduplicated" from "enqueued" on
+						// the nil-error path needs the storage to say which happened,
+						// which is an exported-signature change under the /v4 api-compat
+						// gate. Options.DedupRequested() tells us dedup was ASKED for,
+						// not that it FIRED, so it is not sufficient on its own.
+						//
 						// Deliberate SKIP, not a failure: the schedule declared
 						// queue.Unique and a previous fire is still live, so enqueuing a
 						// second instance is precisely what the author asked us not to

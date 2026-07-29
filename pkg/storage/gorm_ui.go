@@ -34,7 +34,11 @@ func (s *GormStorage) GetQueueStats(ctx context.Context) ([]*jobsv1.QueueStats, 
 // unfiltered form is a parallel seq scan on Postgres — 4,935 buffers, 32ms — and
 // on MySQL a full scan of idx_jobs_dequeue_eligible, the index the claim path
 // depends on, evicting exactly the buffer-pool pages the dequeue needs.
-// Restricting to the two statuses read gives an index scan: 609 buffers, 0.5ms.
+// Restricting to the two statuses read gives an index scan: 609 buffers, 0.5ms
+// with the live rows clustered at the end of the heap, which is the common shape.
+// Spread the same 300k through the heap instead and it measures ~3,000 buffers /
+// ~12ms — still bounded by LIVE work rather than table size, which is the property
+// that matters, but the headline figure is a best case.
 //
 // The win is that the cost becomes bounded by queue DEPTH rather than by TABLE
 // SIZE, which is what matters when the default retention keeps 30 days of

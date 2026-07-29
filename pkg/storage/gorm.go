@@ -2696,6 +2696,20 @@ func (s *GormStorage) SaveJobResult(ctx context.Context, jobID core.UUID, worker
 // One definition rather than three literals: the three call sites had drifted
 // apart (CancelSubJobs was missing Waiting as well as Paused), which is how the
 // gap survived. A set cannot disagree with itself.
+//
+// KNOWN INCOMPLETE, and stated here rather than implied away. This aligns which
+// STATUSES are cancellable; it does not give every call site the same REACH.
+// CancelJobTerminal walks the fan-out subtree (collectFanOutSubtree);
+// CancelSubJobs does not. So a `waiting` sibling cancelled by the fail-fast path
+// has its own descendants left running — and a `waiting` sibling is, by
+// construction, one suspended on a nested fan-out or Call, i.e. exactly the
+// population that HAS descendants. Reproduced on live Postgres: cancelling the
+// parent fan-out cancelled the waiting child but left its grandchild pending, and
+// a worker will dequeue and run it under a terminal ancestor.
+//
+// Still strictly better than leaving the sibling resumable (it used to wake up and
+// run itself), which is why it ships. Giving CancelSubJobs the same subtree walk
+// is the completion, and it belongs in its own change with its own test.
 var cancellableChildStatuses = []core.JobStatus{
 	core.StatusPending,
 	core.StatusWaiting,
