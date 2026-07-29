@@ -531,3 +531,62 @@ func TestTryAcquireConcurrencySlots_RecordDoesNotDiscardHandedOverNames(t *testi
 				"denying one slot of a FLEET-WIDE cap to every worker in the deployment", n)
 	}
 }
+
+// TestReleaseConcurrencySlots_UnionNeverCrossesJobIDs guards the RISK the union
+// fix introduces. record() and the handover both union now, so a run accumulates
+// names it did not itself acquire — and the obvious way for that to go wrong is
+// for it to accumulate a name belonging to a DIFFERENT job and delete that row on
+// its way out.
+//
+// Also pins that the list stays bounded: a chain of handovers unions the same
+// names repeatedly, so the length must stay at the configured cap count rather
+// than growing once per departing sibling.
+//
+// Written pre-emptively against my own fix rather than in response to a finding —
+// three consecutive rounds have found a defect inside the previous round's fix,
+// so the fix itself is the thing most worth attacking.
+func TestReleaseConcurrencySlots_UnionNeverCrossesJobIDs(t *testing.T) {
+	jobA := runningJob("job-a", "acme")
+	jobB := runningJob("job-b", "globex")
+	store := newCapMockStorage([]*core.Job{jobA, jobB})
+	q := queue.New(store)
+	key := CapKey(func(j *core.Job) string { return j.UniqueKey })
+	w := NewWorker(q,
+		WorkerQueue("default", Concurrency(6)),
+		ConcurrencyCap("customer", 2, key),
+		ConcurrencyCap("region", 2, key),
+	)
+	w.config.WorkerID = "worker-1"
+	ctx := context.Background()
+
+	// Job B holds its own rows throughout.
+	tokB := w.nextRunToken.Add(1)
+	require.True(t, w.tryAcquireConcurrencySlots(ctx, jobB, tokB))
+
+	// Three overlapping runs of job A, each handing over to the next.
+	var toks []uint64
+	for i := 0; i < 3; i++ {
+		tk := w.nextRunToken.Add(1)
+		require.True(t, w.tryAcquireConcurrencySlots(ctx, jobA, tk))
+		toks = append(toks, tk)
+	}
+	for i := 0; i < 2; i++ {
+		w.releaseConcurrencySlots(ctx, jobA.ID, toks[i])
+		require.Equal(t, 1, store.slotCount("customer:acme"), "still held after handover %d", i)
+		require.Equal(t, 1, store.slotCount("customer:globex"), "job B untouched after handover %d", i)
+	}
+	// Name list must not have grown past the number of configured caps.
+	w.slotJobIDMu.Lock()
+	n := len(w.slotJobID[toks[2]].names)
+	w.slotJobIDMu.Unlock()
+	require.LessOrEqual(t, n, 2, "union must not grow past the configured cap count, got %d", n)
+
+	w.releaseConcurrencySlots(ctx, jobA.ID, toks[2])
+	require.Zero(t, store.slotCount("customer:acme"), "job A fully released")
+	require.Equal(t, 1, store.slotCount("customer:globex"),
+		"job B's row must survive job A's releases — a union that crossed job ids would steal it")
+	require.Equal(t, 1, store.slotCount("region:globex"))
+
+	w.releaseConcurrencySlots(ctx, jobB.ID, tokB)
+	require.Zero(t, store.slotCount("customer:globex"))
+}

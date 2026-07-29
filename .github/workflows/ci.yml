@@ -261,10 +261,16 @@ jobs:
             # match NUL in several grep builds, so that silently matches nothing
             # and the check passes on everything — a detector that is inert is
             # worse than none.
-            raw=$(cat -- "$f" | wc -c)
-            stripped=$(cat -- "$f" | tr -d '\000' | wc -c)
+            # Bounded read. The size gate below rejects anything over 1 MiB, so a
+            # file that reaches here is small — but ordering is not a guarantee, and
+            # `cat`ing a hypothetical 300 MB blob twice would stall the Lint job
+            # before the size gate ever ran. head -c bounds it explicitly.
+            sz=$(stat -c%s -- "$f")
+            [ "$sz" -gt 1048576 ] && continue   # the size gate owns these
+            raw=$(head -c 1048576 -- "$f" | wc -c)
+            stripped=$(head -c 1048576 -- "$f" | tr -d '\000' | wc -c)
             if [ "$raw" -ne "$stripped" ]; then
-              found="$found $f($(stat -c%s -- "$f")B)"
+              found="$found $f(${sz}B)"
             fi
           done < <(git ls-files -z)
           if [ -n "$found" ]; then
