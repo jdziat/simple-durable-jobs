@@ -177,16 +177,40 @@ func fillEnqueueDefaults(job *core.Job) {
 // would strand every pre-existing pending job. Local keeps new rows on the same
 // face as old rows and as the binds.
 //
-// TWO RESIDUALS, both SQLite-only and both strictly smaller than the bug this
-// removes. (1) In a DST zone "local" is not ONE offset year-round: Go renders the
-// offset for the instant, so a job scheduled across a boundary is written -05:00
-// while the now-bind renders -04:00, and the lexical compare can still mis-order
-// inside that ~1h fold. (2) Across the upgrade a deployment that consistently
-// passed one foreign zone ends up with MIXED faces in run_at — old rows on the
-// foreign offset, new ones local — which perturbs the COALESCE(run_at,
-// created_at) FIFO ordering until the old rows drain. Neither makes eligibility
-// worse than it was; a full fix needs a stored ordering key, which is a v5
-// schema change.
+// THREE RESIDUALS, all SQLite-only. The first two are strictly smaller than the
+// bug this removes; the THIRD is a genuine trade, and it is the one to know about.
+//
+// (1) In a DST zone "local" is not ONE offset year-round: Go renders the offset
+// for the instant, so a job scheduled across a boundary is written -05:00 while
+// the now-bind renders -04:00, and the lexical compare can still mis-order inside
+// that ~1h fold.
+//
+// (2) Across the upgrade a deployment that consistently passed one foreign zone
+// ends up with MIXED faces in run_at — old rows on the foreign offset, new ones
+// local — which perturbs the COALESCE(run_at, created_at) FIFO ordering until the
+// old rows drain.
+//
+// (3) THIS MAKES CORRECTNESS DEPEND ON THE WRITER'S TZ MATCHING THE READER'S, and
+// unlike (1) and (2) it does not drain. Normalizing to the WRITING process's
+// time.Local is right when one process, or a TZ-homogeneous fleet, does both the
+// enqueue and the dequeue — which is the overwhelmingly common shape, and the one
+// that was BROKEN before this fix whenever the caller supplied a foreign face.
+// But a fleet whose processes run in DIFFERENT zones now stores faces the readers
+// do not share. Reproduced: a TZ=Asia/Tokyo process enqueues with jobs.At(t.UTC())
+// and a TZ=UTC process does not dequeue the job for ~9 hours after it is due; the
+// mirror direction fires early. v4.7.0 stored whatever face the APPLICATION
+// supplied, so a UTC-supplying app with UTC readers happened to be correct there
+// — that specific combination regresses.
+//
+// The same applies to a single process whose host TZ changes between writing and
+// reading a row (a base image bump, adding Environment=TZ=).
+//
+// Removing residual (3) means comparing INSTANTS rather than rendered text, which
+// this package already does for scheduled_fires (see scheduleCursorLess's
+// face-aware predicate). Doing it for run_at means touching the hot dequeue
+// predicate, where created_at is also local-faced and shares the COALESCE — so it
+// is a v5-sized change, not a late edit to a release branch. Documented in
+// UPGRADE.md instead.
 //
 // A no-op on Postgres (timestamptz stores the instant) and MySQL (the driver
 // re-renders in the DSN location), so no dialect gate is needed.

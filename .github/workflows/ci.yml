@@ -224,6 +224,11 @@ jobs:
           # moved from formats to paths. Reproduced with identical ELF bytes under
           # two names: the ASCII one was caught, the accented one passed.
           while IFS= read -r -d '' f; do
+            # SYMLINKS FIRST: -f dereferences, so a link to /bin/ls looks like a
+            # regular file, while `git grep -I` does not search link entries at all
+            # and its "no match" reads as "binary". A committed symlink would red
+            # the release with a message naming the wrong problem.
+            [ -L "$f" ] && continue
             [ -f "$f" ] || continue
             # An EMPTY file has no character to match, so the grep below would call
             # it binary and red the Lint job over a .gitkeep. Skip zero-byte files
@@ -236,7 +241,12 @@ jobs:
             # one git considers binary. The pattern is "^" (start of line), which
             # every line of every text file has -- "." would miss a file that is
             # only blank lines and report it as binary.
-            if ! git grep -Iq "^" -- "$f" 2>/dev/null; then
+            # ":(literal)" because git treats a pathspec as a GLOB: a file named
+            # `*.bin` would also match a sibling TEXT file, and the binary would be
+            # judged text. Third distinct filename evasion of this one guard —
+            # C-quoting, then globbing — which is why it fails closed on anything
+            # it cannot classify rather than trying to enumerate the tricks.
+            if ! git grep -Iq "^" -- ":(literal)$f" 2>/dev/null; then
               found="$found $f($(stat -c%s "$f")B)"
             fi
           done < <(git ls-files -z)
@@ -246,6 +256,26 @@ jobs:
             exit 1
           fi
           echo "no committed binaries outside the asset allowlist"
+
+          # SIZE, not just format. The incident this whole step exists for was
+          # module-zip inflation -- a 14.5 MB binary, 7.7x -- and a committed 14 MB
+          # of TEXT (a JSON dump, a base64 payload, a giant fixture) does the same
+          # damage while passing every check above. Module versions are IMMUTABLE
+          # in the proxy, so it cannot be withdrawn afterwards.
+          big=""
+          while IFS= read -r -d '' f; do
+            [ -L "$f" ] && continue
+            [ -f "$f" ] || continue
+            sz=$(stat -c%s "$f")
+            if [ "$sz" -gt 1048576 ]; then big="$big $f($((sz/1024))KiB)"; fi
+          done < <(git ls-files -z)
+          if [ -n "$big" ]; then
+            echo "::error::files over 1 MiB are committed:$big"
+            echo "Everything tracked here ships in the module zip to every consumer."
+            echo "If one is genuinely needed, raise the threshold in this step deliberately."
+            exit 1
+          fi
+          echo "no committed file over 1 MiB"
 
       - name: Set up Go
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0

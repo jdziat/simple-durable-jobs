@@ -88,11 +88,22 @@ docs/static/demo/
 ui/frontend/playwright-report/
 ui/frontend/test-results/
 
-# Compiled binaries
+# Compiled binaries. ANCHOR every one of these to its path. A bare
+# `e2etestserver` sat here and matched the DIRECTORY ui/cmd/e2etestserver/, so any
+# NEW file added there was silently ignored -- byte-for-byte the `public/` bug
+# fixed a few lines down, which swallowed Vite's static-asset source directory.
+# The already-tracked main.go masked it: `git check-ignore` on a new sibling shows
+# it immediately.
 /jobsui
 ui/cmd/jobsui/jobsui
 ui/cmd/e2etestserver/e2etestserver
-e2etestserver
+# The ROOT-level artifact from `go build ./ui/cmd/e2etestserver/`, anchored with a
+# leading slash like /jobsui and /chaostest above. The pattern here used to be a
+# bare `e2etestserver`, which covered this AND -- accidentally -- the whole
+# ui/cmd/e2etestserver/ SOURCE directory. Removing the bare form without adding
+# this anchored one immediately let a 23 MB ELF into a commit. Both halves are
+# needed; neither is redundant.
+/e2etestserver
 /chaostest
 cmd/chaostest/chaostest
 /sdj

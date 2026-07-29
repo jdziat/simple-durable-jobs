@@ -136,7 +136,7 @@ func TestReleaseConcurrencySlots_HandoverMergesNamesTheSuccessorDoesNotHold(t *t
 	base := newCapMockStorage([]*core.Job{job})
 	store := &gatedErrStorage{
 		capMockStorage: base,
-		failOn:         "region:acme",
+		failOn:         "customer:acme",
 		failFrom:       2,
 		arm:            make(chan struct{}),
 		release:        make(chan struct{}),
@@ -165,16 +165,36 @@ func TestReleaseConcurrencySlots_HandoverMergesNamesTheSuccessorDoesNotHold(t *t
 	go func() { done <- w.tryAcquireConcurrencySlots(ctx, job, tok2) }()
 
 	<-store.arm
+
+	// PREMISE, asserted rather than assumed. The whole point of the merge is that
+	// the successor holds a STRICT SUBSET at the instant the earlier run departs.
+	// An earlier version of this test parked on the LAST cap — and because
+	// record() publishes intent BEFORE each storage call, run #2 had already
+	// recorded BOTH names by then, so the merge had nothing to do and the test
+	// passed with the entire fix reverted. Parking on the FIRST cap is what
+	// reproduces the subset. If this assertion ever fails, the test has stopped
+	// exercising the defect, whatever its later assertions say.
+	w.slotJobIDMu.Lock()
+	names1 := append([]string(nil), w.slotJobID[tok1].names...)
+	names2 := append([]string(nil), w.slotJobID[tok2].names...)
+	w.slotJobIDMu.Unlock()
+	require.Equal(t, []string{"customer:acme", "region:acme"}, names1,
+		"PREMISE: the departing run holds BOTH caps")
+	require.Equal(t, []string{"customer:acme"}, names2,
+		"PREMISE: the successor holds a STRICT SUBSET at the moment of handover — without that "+
+			"there is nothing for the merge to do and this test cannot fail")
+
 	w.releaseConcurrencySlots(ctx, job.ID, tok1) // run #1's deferred cleanup lands
 	close(store.release)
 
-	require.False(t, <-done, "run #2's acquire must be refused: cap B errored")
+	require.False(t, <-done, "run #2's acquire must be refused: its cap errored")
 
-	assert.Zero(t, base.slotCount("customer:acme"), "cap A is released by the rollback")
+	assert.Zero(t, base.slotCount("customer:acme"), "the shared cap is released by the rollback")
 	assert.Zero(t, base.slotCount("region:acme"),
-		"NOBODY holds cap B: run #1 handed the job id over and DROPPED this name, run #2 never "+
-			"recorded it. The row survives to its TTL (45 min default), holding one slot of a "+
-			"FLEET-WIDE cap against every worker in the deployment")
+		"NOBODY would hold region:acme without the merge: run #1 handed the job id over and its "+
+			"names were DROPPED, and run #2 had not recorded that cap yet. The row would survive "+
+			"to its TTL (45 min default), holding one slot of a FLEET-WIDE cap against every "+
+			"worker in the deployment")
 
 	w.slotJobIDMu.Lock()
 	n := len(w.slotJobID)
@@ -231,6 +251,13 @@ func (s *ctxAwareCapStorage) ReleaseConcurrencySlot(ctx context.Context, slotNam
 // FALSE-GREEN TRAP: a mock that ignores ctx cannot see this at all — the release
 // "succeeds" against a cancelled context and the row disappears. The storage here
 // refuses a Done context, which is what a real driver does.
+//
+// SCOPE, stated because an earlier version of this comment got it wrong: the
+// branch actually exercised is the acquire-ERROR path on the FIRST cap (the
+// ctx-aware storage refuses a Done context). It is NOT the capSlotName-refusal
+// path — capSlotName returns false only when a user CapKey panics, and an empty
+// key yields the perfectly valid slot name "region:". The second cap configured
+// below is inert here; it is present so the worker has a multi-cap shape.
 func TestTryAcquireConcurrencySlots_RollbackReleasesOnADetachedContext(t *testing.T) {
 	job := runningJob("job-1", "acme")
 	base := newCapMockStorage([]*core.Job{job})
@@ -345,4 +372,52 @@ func TestProcessJob_UnregistersFromTheQueueRegistryOnCompletion(t *testing.T) {
 		"every finished job must unregister itself, including one whose handler PANICKED — "+
 			"otherwise the registry retains a cancel func per job the process ever ran and "+
 			"Queue.CancelJob/PauseJob start acting on stale entries for finished jobs")
+}
+
+// TestReleaseConcurrencySlots_HolderScanIsScopedToTheSameJobID covers the
+// `other.jobID != jobID` predicate in the holder scan, which was FREE: deleting it
+// left pkg/worker green.
+//
+// Without it, ANY unrelated run holding ANY slot suppresses this run's release —
+// so on a worker running more than one capped job (which is the entire point of a
+// cap) every fleet cap row leaks to its 45-minute TTL. The scan exists to answer
+// "does another token still hold THIS JOB ID", and a scan that answers "is anyone
+// holding anything" is not that question.
+//
+// FALSE-GREEN TRAP: with only ONE job in flight the predicate is unreachable —
+// there is no other holder to confuse it with. It needs two jobs with DIFFERENT
+// cap keys, released independently.
+func TestReleaseConcurrencySlots_HolderScanIsScopedToTheSameJobID(t *testing.T) {
+	jobA := runningJob("job-a", "acme")
+	jobB := runningJob("job-b", "globex")
+	store := newCapMockStorage([]*core.Job{jobA, jobB})
+	q := queue.New(store)
+	q.Register(jobA.Type, func(context.Context, struct{}) error { return nil })
+	w := NewWorker(q,
+		WorkerQueue("default", Concurrency(4)),
+		ConcurrencyCap("customer", 1, CapKey(func(j *core.Job) string { return j.UniqueKey })),
+		DisableRetry(),
+	)
+	w.config.WorkerID = "worker-1"
+	ctx := context.Background()
+
+	tokA := w.nextRunToken.Add(1)
+	require.True(t, w.tryAcquireConcurrencySlots(ctx, jobA, tokA))
+	tokB := w.nextRunToken.Add(1)
+	require.True(t, w.tryAcquireConcurrencySlots(ctx, jobB, tokB))
+	require.Equal(t, 1, store.slotCount("customer:acme"))
+	require.Equal(t, 1, store.slotCount("customer:globex"))
+
+	// Job A finishes while job B is still running. B holds a slot, but it is a
+	// DIFFERENT job id, so it must not suppress A's release.
+	w.releaseConcurrencySlots(ctx, jobA.ID, tokA)
+
+	assert.Zero(t, store.slotCount("customer:acme"),
+		"an unrelated job holding an unrelated cap must not suppress this release — otherwise "+
+			"every fleet cap row leaks to its TTL on any worker running more than one capped job")
+	assert.Equal(t, 1, store.slotCount("customer:globex"),
+		"and job B's own row is untouched")
+
+	w.releaseConcurrencySlots(ctx, jobB.ID, tokB)
+	assert.Zero(t, store.slotCount("customer:globex"))
 }

@@ -296,6 +296,22 @@ func (q *Queue) EnqueueScheduledFire(ctx context.Context, scheduleName string, f
 					//
 					// This is byte-for-byte the insert ClaimScheduledFireTx performs a
 					// moment later, so it adds no semantics and no new lock ordering.
+					//
+					// IT DOES COST LATENCY, and the cost was measured rather than
+					// hand-waved. A poller whose boundary is already claimed used to
+					// run one UPDATE that matched zero rows and return; it now
+					// materialises the row and blocks on the winner's row lock for
+					// the winner's whole transaction (claim + enqueue), and losers
+					// serialise behind each other. On live databases with a fleet
+					// firing the same aligned boundaries — which is what minute-crons
+					// do — p50 roughly DOUBLES: Postgres 12 workers x 20 schedules
+					// 72ms -> 141ms, 24 x 50 205ms -> 426ms; MySQL 12 x 20
+					// 132ms -> 196ms. It is not a wedge (runScheduler is a 100ms
+					// ticker on its own goroutine, boundaries are still claimed
+					// exactly once, and the cost lands only on aligned boundaries),
+					// but it scales with workers x simultaneously-due schedules and
+					// each blocked poller parks a pool connection meanwhile — which
+					// matters if MaxOpenConns is tight.
 					// pkg/storage/tx_enqueue.go documents the same InnoDB hazard for the
 					// unique-key dedup.
 					if e := tx.WithContext(ctx).Clauses(clause.OnConflict{DoNothing: true}).

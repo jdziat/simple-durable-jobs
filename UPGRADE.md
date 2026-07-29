@@ -324,21 +324,25 @@ becomes `1s` — a 2000× jump. Such a window never worked on MySQL anyway.
 The two versions derive different windows for the same `PerSecond`, and
 `window_start` is `now.Truncate(window)`, so the old and new binaries key
 different rows in `rate_limit_windows` and each gets a full independent budget.
-The enforced rate while both are running is the **sum**. Measured against the real
-storage gate at `PerSecond: 0.3`: v4.7.0 alone admits about 0.533/sec (its own
-overshoot) and v4.8.0 alone about 0.333/sec, so a mixed fleet admits roughly the
-**sum** — measured between **0.83 and 0.93/sec, i.e. 2.8× to 3.1×** what you
-configured.
+The enforced rate while both are running is the **sum of the two**.
 
-It is a range, not a constant, because each version's `window_start` is
-`truncate(now, window)` on its own grid and the two grids drift relative to each
-other; where a 30-second sample lands on them changes the count by an admission or
-two. (An earlier draft of this file gave a single figure and explained the
-shortfall as the two grids sharing a `window_start`. That cannot be the reason: the
-4s and 3.333s grids coincide only once every ~3.7 hours.) It clears the moment the rollout completes, but it
-persists indefinitely if you leave a canary on the old version, so if the limit
-exists to protect a third party, finish the rollout promptly or pause it.
-Whole-number rates derive the same window on both versions and are unaffected.
+At `PerSecond: 0.3`, v4.7.0 derives a 4s window and admits `ceil(0.3×4)/4` =
+**0.500/sec**; v4.8.0 derives 3.333s and admits `ceil(0.3×3.333)/3.333` =
+**0.300/sec**. A mixed fleet therefore sustains **0.800/sec — 2.67× what you
+configured** — for as long as both versions are running. Verified over 600-second
+samples across twelve phase offsets: 0.800–0.805/sec, essentially no spread.
+
+A short sample taken right at the start of the overlap reads higher — up to
+0.93/sec — because each version's already-in-progress window still has its full
+budget to spend. That is a measurement artifact of the first ~30 seconds, not a
+property of the rollout; it settles to 2.67×. (Two earlier drafts of this
+paragraph reported that transient as the steady-state figure, once as 2.9× and
+once as a 2.8×–3.1× "range". Both were 30-second samples.)
+
+It clears the moment the rollout completes, but persists indefinitely if you leave
+a canary on the old version, so if the limit exists to protect a third party,
+finish the rollout promptly or pause it. Whole-number rates derive the same window
+on both versions and are unaffected.
 
 ### `NewWorker` reports arguments it cannot use
 
@@ -397,7 +401,26 @@ carries whatever face it was asked about — measured under three host zones. Th
 prefix fixes which *hour* fires, not which face it is stored on.)
 
 **What you may notice:** on SQLite, delayed jobs and non-UTC schedules enqueued
-**after** the upgrade now fire when you asked.
+**after** the upgrade now fire when you asked — **provided every process that
+enqueues and every process that dequeues runs in the same timezone.**
+
+That precondition is new, and on SQLite it is the one thing to check before
+upgrading. `run_at` is re-pointed at the **writing process's** local clock face,
+so a reader in a different zone compares it against a differently-offset string
+and gets the wrong answer — for NEW rows, permanently, not as a backlog that
+drains. Reproduced: a `TZ=Asia/Tokyo` process enqueues with `jobs.At(t.UTC())`,
+and a `TZ=UTC` process does not pick the job up until roughly nine hours after it
+was due; the mirror direction fires early. The same applies to one process whose
+host timezone changes between writing and reading a row — a base-image bump, or
+adding `Environment=TZ=` to a unit file.
+
+v4.7.0 stored whatever face the *application* supplied, so a UTC-supplying app
+read by UTC workers was already correct; **that specific combination regresses.**
+Every other combination is fixed or unchanged, which is why this ships. If your
+SQLite deployment spans timezones, set one `TZ` across the fleet before upgrading
+— that is the only configuration in which both versions are correct.
+
+Postgres and MySQL are unaffected: both store an instant and compare instants.
 
 **Rows already in the database are NOT rewritten**, deliberately — an in-place
 rewrite is what made the original design of this fix dangerous. A `run_at` already

@@ -568,6 +568,23 @@ func TestPause_AggressiveLogsExactlyOneOutcome(t *testing.T) {
 			"the outcome must be reported once, not once per code path that reports it")
 	})
 
+	// The THIRD outcome, which the two cases above never drive. A release that
+	// fails with ErrJobNotOwned means a peer already reclaimed the job — benign,
+	// and NOT the "stays locked until the stale-lock reaper" situation. Collapsing
+	// that branch into the ERROR one was free, and its cost is precisely an
+	// operator grepping a spurious ERROR during an incident, which is what the
+	// whole switch exists to avoid.
+	t.Run("a release refused because a peer already owns it is not an error", func(t *testing.T) {
+		out := run(t, core.ErrJobNotOwned)
+		assert.NotContains(t, out, "stays locked until the stale-lock reaper",
+			"a peer reclaiming the job is not the stuck-lock incident; saying so sends an "+
+				"operator hunting a 45-minute stall that is not happening")
+		assert.Contains(t, out, "already reclaimed by another owner",
+			"and the benign outcome must be reported as what it is")
+		assert.NotContains(t, out, promise,
+			"it was not released by us either, so no resume is promised")
+	})
+
 	t.Run("a failed release does not promise a resume at all", func(t *testing.T) {
 		out := run(t, errors.New("storage unavailable"))
 		assert.NotContains(t, out, promise,
@@ -863,4 +880,56 @@ func TestCancelJob_TravelsTheFailurePathNotThePauseRelease(t *testing.T) {
 	store.mu.Unlock()
 	assert.NotContains(t, released, job.ID,
 		"and it must NOT be Release()d as though it had been paused")
+}
+
+// TestSelfCancelledRequiresBothClauses covers the two discriminating clauses of
+//
+//	selfCancelled = errors.Is(err, context.Canceled) && ctx.Err() == nil && jobCtx.Err() != nil
+//
+// Each was individually FREE: deleting either left pkg/worker green, despite the
+// comment directly above naming exactly those two conditions and explaining why
+// each is needed. Same shape as the takePauseCancelled clause found one round
+// earlier, in the same expression's neighbourhood.
+//
+//   - `jobCtx.Err() != nil` distinguishes THIS worker cancelling the handler from a
+//     handler that returns context.Canceled out of some context of its own (an
+//     HTTP client's, a helper's). Without it, that inner cancellation is forced
+//     down the failure path even when a custom IsFailure says it is not a failure.
+//   - `ctx.Err() == nil` distinguishes a worker-induced cancel from the PARENT
+//     going away. Without it, a parent cancel arriving before shuttingDown is set
+//     is misclassified as a self-cancel.
+func TestSelfCancelledRequiresBothClauses(t *testing.T) {
+	t.Run("a handler's OWN cancelled context is not a self-cancel", func(t *testing.T) {
+		var failCalls atomic.Int64
+		store := &mockStorage{}
+		store.failFunc = func(context.Context, core.UUID, string, string, *time.Time) error {
+			failCalls.Add(1)
+			return nil
+		}
+		q := queue.New(store)
+		// The handler cancels a context of ITS OWN and returns that error. The
+		// worker never cancelled anything, so jobCtx.Err() is nil.
+		q.Register("inner", func(context.Context, struct{}) error {
+			own, cancel := context.WithCancel(context.Background())
+			cancel()
+			return own.Err()
+		})
+		// A custom IsFailure that treats context.Canceled as NOT a failure. With
+		// the jobCtx clause present the error is zeroed and the job COMPLETES;
+		// without it, selfCancelled is true and the job is failed instead.
+		q.SetIsFailure(func(_ *core.Job, err error) bool { return !errors.Is(err, context.Canceled) })
+
+		w := NewWorker(q)
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		w.processJob(ctx, &core.Job{
+			ID: core.NewID(), Type: "inner", Queue: "default",
+			Status: core.StatusRunning, MaxRetries: 2,
+		})
+
+		assert.Zero(t, failCalls.Load(),
+			"the worker cancelled nothing, so a context.Canceled from the handler's OWN context "+
+				"must still be routed through the configured IsFailure — treating it as a "+
+				"self-cancel overrides the caller's explicit policy")
+	})
 }

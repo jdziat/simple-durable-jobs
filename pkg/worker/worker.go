@@ -1742,12 +1742,18 @@ func (w *Worker) tryAcquireConcurrencySlots(ctx context.Context, job *core.Job, 
 		w.slotJobID[runToken] = slotHold{jobID: job.ID, names: append([]string(nil), names...)}
 		w.slotJobIDMu.Unlock()
 	}
-	// A rollback must not release on the context that just failed. On shutdown ctx
-	// is already Done, so the DELETE is refused too and a slot acquired moments
-	// earlier survives to its TTL — a fleet-wide cap slot held by a worker that has
-	// exited. Every other bail-out in dispatchDequeuedJobs already goes through
-	// releaseDequeuedJobOnShutdown, which detaches for exactly this reason; these
-	// three did not.
+	// A rollback must not release on the context that just failed: on shutdown ctx
+	// is already Done, so the DELETE would be refused too and a slot acquired
+	// moments earlier would survive to its TTL.
+	//
+	// HONESTY, because an earlier commit message claimed more than this earns:
+	// tryAcquireConcurrencySlots has exactly ONE production caller, and on a
+	// refusal that caller immediately runs releaseDequeuedJobOnShutdown, whose
+	// release context has ALWAYS been detached. So this closes no leak that was
+	// reachable through dispatch — the row is released a few lines later either
+	// way. It is defence-in-depth for the helper itself, and it means the function
+	// no longer depends on its caller cleaning up after a bail-out it already
+	// reported. Worth keeping; not worth claiming as a fix.
 	rollback := func() {
 		releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer cancel()
