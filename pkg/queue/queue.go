@@ -278,6 +278,30 @@ func (q *Queue) EnqueueScheduledFire(ctx context.Context, scheduleName string, f
 				// error there.
 				var priorFiredAt *time.Time
 				{
+					// Materialise the row BEFORE the locking read, so FOR UPDATE takes
+					// a RECORD lock rather than a gap lock.
+					//
+					// Under REPEATABLE READ — MySQL's default, which this project does
+					// not override — a locking read for a key that does NOT exist takes
+					// a next-key/gap lock. Two transactions firing two different
+					// schedule names that fall in the same InnoDB gap each lock that
+					// gap and then each need an insert-intention lock inside it:
+					// deadlock. Measured on live MySQL 8.0.42 with 12 goroutines firing
+					// 20 fresh schedule names, 6 of 9 runs produced deadlock storms and
+					// 4 of those LOST BOUNDARIES (6-9 claims out of 20) — a scheduled
+					// run that no worker claimed and nobody will retry, which is the
+					// teardown-g8 failure the atomic claim exists to prevent. Postgres
+					// is unaffected (it takes no lock on a non-existent row); so is the
+					// steady state where the row already exists.
+					//
+					// This is byte-for-byte the insert ClaimScheduledFireTx performs a
+					// moment later, so it adds no semantics and no new lock ordering.
+					// pkg/storage/tx_enqueue.go documents the same InnoDB hazard for the
+					// unique-key dedup.
+					if e := tx.WithContext(ctx).Clauses(clause.OnConflict{DoNothing: true}).
+						Create(&core.ScheduledFire{Name: scheduleName, LastFireAt: time.Unix(0, 0).UTC()}).Error; e != nil {
+						return e
+					}
 					q := tx.WithContext(ctx).Where("name = ?", scheduleName)
 					if tx.Name() != "sqlite" {
 						q = q.Clauses(clause.Locking{Strength: "UPDATE"})
