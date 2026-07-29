@@ -388,9 +388,18 @@ proportional to the backlog you actually have, rather than to your entire job
 history.
 
 **What you may notice:** the depth chart's numbers change — upward — on any queue
-that was over the cap; they were an undercount. Which queues appear is
-deliberately unchanged: only queues with pending or running work are sampled, as
-before. Migration **v38** indexes `job_stats(timestamp)`, which the retention
+that was over the cap; they were an undercount.
+
+A whole queue can also **appear** for the first time. The old scan took the first
+10,000 rows per status with no `ORDER BY`, so which rows came back was
+planner-dependent and a small queue could fall entirely outside the cap.
+Reproduced on Postgres and MySQL with 30,000 pending in one queue and 1 in
+another: the old path reported only the large queue, the aggregate reports both. If
+you carry a backlog past 10,000 — the deployment this change exists for — expect
+queues to show up that the chart was silently omitting.
+
+The sampling rule itself is unchanged: only queues with pending or running work are
+sampled, so a fully drained queue still stops being recorded. Migration **v38** indexes `job_stats(timestamp)`, which the retention
 prune and the all-queues history read both scan by and could not previously use.
 
 ### The throughput chart measures one process, and now says so
