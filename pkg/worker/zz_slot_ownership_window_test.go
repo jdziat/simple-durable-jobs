@@ -841,3 +841,77 @@ func TestReleaseConcurrencySlots_HungDeleteCannotHoldTheMutexForever(t *testing.
 			"the parent's, so without one bound here a partitioned database holds a process-wide "+
 			"mutex for as long as it stays silent")
 }
+
+// slowFirstSlotStorage makes the FIRST slot's DELETE slow and the rest instant,
+// which is what a shared release budget punishes.
+type slowFirstSlotStorage struct {
+	*capMockStorage
+	slow     string
+	delay    time.Duration
+	attempts atomic.Int64
+	expired  atomic.Int64
+}
+
+func (s *slowFirstSlotStorage) ReleaseConcurrencySlotOwned(ctx context.Context, slotName string, jobID core.UUID, workerID string) error {
+	s.attempts.Add(1)
+	if slotName == s.slow {
+		select {
+		case <-time.After(s.delay):
+		case <-ctx.Done():
+			s.expired.Add(1)
+			return ctx.Err()
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		// The budget was already gone before this slot got a chance.
+		s.expired.Add(1)
+		return err
+	}
+	return s.ReleaseConcurrencySlot(ctx, slotName, jobID)
+}
+
+// TestReleaseSlotNames_OneSlowSlotDoesNotStarveTheOthers covers the way the
+// release budget is spent.
+//
+// The bound must cap the TOTAL time the mutex is held — that is the whole reason
+// it exists — but a single context created once outside the loop meant the FIRST
+// DELETE could consume all of it, after which every later slot ran on an
+// already-expired context, failed instantly, and left its row to sit until the
+// 45-minute TTL. Each row is one slot of a FLEET-WIDE cap held by nobody.
+//
+// FALSE-GREEN TRAP: with ONE configured cap the loop runs once and a shared budget
+// is indistinguishable from a per-slot one. This needs THREE, with the slow one
+// first.
+func TestReleaseSlotNames_OneSlowSlotDoesNotStarveTheOthers(t *testing.T) {
+	job := runningJob("job-1", "acme")
+	base := newCapMockStorage([]*core.Job{job})
+	// The first slot burns more than the whole shared budget would have allowed.
+	store := &slowFirstSlotStorage{capMockStorage: base, slow: "customer:acme", delay: 8 * time.Second}
+	q := queue.New(store)
+	key := CapKey(func(j *core.Job) string { return j.UniqueKey })
+	w := NewWorker(q,
+		WorkerQueue("default", Concurrency(3)),
+		ConcurrencyCap("customer", 1, key),
+		ConcurrencyCap("region", 1, key),
+		ConcurrencyCap("zone", 1, key),
+		DisableRetry(),
+	)
+	w.config.WorkerID = "worker-1"
+	ctx := context.Background()
+
+	tok := w.nextRunToken.Add(1)
+	require.True(t, w.tryAcquireConcurrencySlots(ctx, job, tok))
+	for _, n := range []string{"customer:acme", "region:acme", "zone:acme"} {
+		require.Equal(t, 1, base.slotCount(n))
+	}
+
+	w.releaseConcurrencySlots(ctx, job.ID, tok)
+
+	require.Equal(t, int64(3), store.attempts.Load(),
+		"every slot must be ATTEMPTED, not skipped once the budget is gone")
+	assert.Zero(t, base.slotCount("region:acme"),
+		"a slot after a slow one must still be released: sharing one budget across the loop lets "+
+			"the first DELETE consume it, and every later row then sits until its 45-minute TTL "+
+			"holding a FLEET-WIDE cap slot that nobody owns")
+	assert.Zero(t, base.slotCount("zone:acme"), "and so must the one after that")
+}

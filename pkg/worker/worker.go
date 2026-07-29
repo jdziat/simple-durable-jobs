@@ -1937,12 +1937,25 @@ func unionSlotNames(a, b []string) []string {
 	return out
 }
 
-// slotReleaseTimeout bounds a single slot DELETE. It exists because
-// releaseConcurrencySlots holds slotJobIDMu across this call: an unbounded query
-// would hold a process-wide mutex for as long as the database takes to answer,
-// which on a partitioned connection (TCP that neither errors nor RSTs) is
-// minutes. database/sql applies no query timeout of its own.
+// slotReleaseTimeout bounds the TOTAL time a release may spend in storage, across
+// every slot it is releasing. It exists because releaseConcurrencySlots holds
+// slotJobIDMu across this call: an unbounded query would hold a process-wide mutex
+// for as long as the database takes to answer, which on a partitioned connection
+// (TCP that neither errors nor RSTs) is minutes. database/sql applies no query
+// timeout of its own.
+//
+// It is a TOTAL, not a per-DELETE budget, because the mutex hold is what needs
+// bounding and that is the sum. But it is DIVIDED among the slots rather than
+// shared: a single context for the whole loop let the first DELETE consume the
+// entire budget, after which every later slot ran on an already-expired context,
+// failed instantly, and left its row to expire at the TTL. Each slot now gets its
+// own fair share, so all of them get a genuine attempt and the total stays capped.
 const slotReleaseTimeout = 5 * time.Second
+
+// minSlotReleaseTimeout keeps the per-slot share usable under an unusually large
+// number of configured caps; the total may then exceed slotReleaseTimeout, which
+// is the right trade — the alternative is deletes that cannot possibly succeed.
+const minSlotReleaseTimeout = 500 * time.Millisecond
 
 func (w *Worker) releaseSlotNames(ctx context.Context, jobID core.UUID, slots []string) {
 	if len(slots) == 0 {
@@ -1966,8 +1979,10 @@ func (w *Worker) releaseSlotNames(ctx context.Context, jobID core.UUID, slots []
 	// Bounding here rather than at one call site means every entry point is capped,
 	// including any added later. A caller that already supplied a tighter deadline
 	// keeps it.
-	ctx, cancel := context.WithTimeout(ctx, slotReleaseTimeout)
-	defer cancel()
+	perSlot := slotReleaseTimeout / time.Duration(len(slots))
+	if perSlot < minSlotReleaseTimeout {
+		perSlot = minSlotReleaseTimeout
+	}
 
 	storage, ok := w.queue.Storage().(concurrencySlotStorage)
 	if !ok {
@@ -1979,16 +1994,30 @@ func (w *Worker) releaseSlotNames(ctx context.Context, jobID core.UUID, slots []
 	// under-counting the cap and admitting an extra concurrent job.
 	owned, fenced := storage.(concurrencySlotOwnedReleaser)
 	for _, slot := range slots {
+		slotCtx, cancel := context.WithTimeout(ctx, perSlot)
 		var err error
 		if fenced {
-			err = owned.ReleaseConcurrencySlotOwned(ctx, slot, jobID, w.config.WorkerID)
+			err = owned.ReleaseConcurrencySlotOwned(slotCtx, slot, jobID, w.config.WorkerID)
 		} else {
-			err = storage.ReleaseConcurrencySlot(ctx, slot, jobID)
+			err = storage.ReleaseConcurrencySlot(slotCtx, slot, jobID)
 		}
+		cancel()
 		if err != nil {
-			w.logger.Warn("failed to release concurrency slot",
+			// Say what actually happens now. The in-memory hold is already gone, so
+			// this worker will not retry: the row survives until its expires_at
+			// lapses, and TryAcquireConcurrencySlot's live count filters on
+			// `expires_at >= now`, so the cap self-heals at the TTL rather than
+			// leaking permanently. That is bounded but not free — it is one slot of
+			// a fleet-wide cap held by nobody for up to concurrencySlotTTL.
+			//
+			// This path became more likely when the DELETE gained a deadline: a
+			// database slow enough to blow slotReleaseTimeout lands here instead of
+			// blocking the worker. That is the better failure, and an operator
+			// should be able to tell the two apart from the log alone.
+			w.logger.Warn("failed to release concurrency slot; it stays held until its TTL expires",
 				"job_id", jobID,
 				"slot", slot,
+				"ttl", w.concurrencySlotTTL(),
 				"error", err)
 		}
 	}
