@@ -3443,6 +3443,11 @@ func (w *Worker) CancelJob(jobID core.UUID) bool {
 // particular run, such as an orphaned heartbeat: since the pause path lets two
 // runs of one id be alive at once, cancelling by id there reaches past the failed
 // run into a healthy later one.
+//
+// The other two CancelJob call sites are by-id ON PURPOSE and should stay that
+// way: the fan-out CancelOnFail sweep cancels CHILD ids the caller holds no token
+// for, and the stale-lock reaper cancels ids whose storage row was reclaimed, so
+// any local run of that id is orphaned regardless of which one it is.
 func (w *Worker) cancelRun(jobID core.UUID, runToken uint64) bool {
 	w.runningJobsMu.Lock()
 	rj, ok := w.runningJobs[jobID]

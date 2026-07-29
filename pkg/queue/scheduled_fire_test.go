@@ -151,3 +151,48 @@ func TestEnqueueScheduledFire_DedupOnFirstEverBoundaryLeavesMarkerNil(t *testing
 	assert.Nil(t, scheduledFireRow(t, store, "sched-N").LastFiredAt,
 		"a schedule that has never actually fired must keep a NULL marker through a skip")
 }
+
+// The deadlock fix materialises the scheduled_fires row BEFORE the locking read,
+// which means a row can now exist for a schedule that has never fired — where
+// previously there was none at all. Two things must remain true.
+//
+// FALSE-GREEN TRAP: asserting the happy path says nothing; the questions are what
+// an OBSERVER sees, and what a rolled-back fire leaves behind.
+func TestEnqueueScheduledFire_PreInsertedRowIsInvisibleAndRollsBack(t *testing.T) {
+	q, store := newSQLiteQueueForFireTest(t)
+	ctx := context.Background()
+
+	t.Run("a never-fired row is not reported as a last run", func(t *testing.T) {
+		// A failed enqueue rolls the whole transaction back, including the
+		// pre-insert — so drive a SUCCESSFUL fire and then check the row it leaves.
+		_, _, err := q.EnqueueScheduledFire(ctx, "visible", time.Now().Truncate(time.Minute), "importjob", nil)
+		require.NoError(t, err)
+
+		// And a bare pre-insert shape: last_fire_at set, last_fired_at still NULL.
+		require.NoError(t, store.DB().Create(&core.ScheduledFire{
+			Name: "never-fired", LastFireAt: time.Unix(0, 0).UTC(),
+		}).Error)
+
+		times, err := store.GetScheduledFireTimes(ctx)
+		require.NoError(t, err)
+		assert.NotContains(t, times, "never-fired",
+			"a row that exists only because the claim path materialised it must not appear as a "+
+				"last run — the dashboard and the overdue indicator both read this map")
+		assert.Contains(t, times, "visible", "a schedule that really fired must still appear")
+	})
+
+	t.Run("a failed fire leaves no row behind", func(t *testing.T) {
+		// A channel cannot be marshalled, so the enqueue inside the claim
+		// transaction fails and the whole transaction — pre-insert included — rolls
+		// back.
+		_, _, err := q.EnqueueScheduledFire(ctx, "rolled-back", time.Now(), "importjob", make(chan int))
+		require.Error(t, err)
+
+		var count int64
+		require.NoError(t, store.DB().Model(&core.ScheduledFire{}).
+			Where("name = ?", "rolled-back").Count(&count).Error)
+		assert.Zero(t, count,
+			"the pre-insert is inside the claim transaction, so a failed fire must leave no "+
+				"schedule row at all")
+	})
+}
