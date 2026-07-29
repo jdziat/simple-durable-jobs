@@ -61,20 +61,39 @@ func TestDeriveRateLimitWindow_EnforcedRateIsExact(t *testing.T) {
 //
 // The bound is a PROPERTY of the derivation, so it is tested as one.
 func TestDeriveRateLimitWindow_EnforcedRateIsExactAcrossTheRange(t *testing.T) {
-	const step = 0.0001
 	worstRel, worstRate := 0.0, 0.0
-	for i := 1; ; i++ {
-		perSecond := float64(i) * step
-		if perSecond > 50 {
-			break
+	consider := func(perSecond float64) {
+		if perSecond <= 0 {
+			return
 		}
-		rel := math.Abs(enforcedRate(perSecond)-perSecond) / perSecond
-		if rel > worstRel {
+		if rel := math.Abs(enforcedRate(perSecond)-perSecond) / perSecond; rel > worstRel {
 			worstRel, worstRate = rel, perSecond
 		}
 	}
+
+	// Several structurally different families, because a single arithmetic
+	// progression can miss a whole class: the one offender this test was written
+	// for (6.25) is a dyadic fraction, and those are exactly the values where a
+	// float64 product lands a hair above an integer.
+	for i := 1; i <= 500000; i++ {
+		consider(float64(i) * 0.0001) // fine progression, 0.0001..50
+	}
+	for i := 1; i <= 200000; i++ {
+		consider(float64(i) * 7e-4) // coarser progression, different alignment
+	}
+	for n := 1; n <= 20000; n++ {
+		consider(1 / float64(n)) // reciprocals: the "already exact" family
+	}
+	for n := 1; n <= 8000; n++ {
+		consider(float64(n) / 8)  // dyadic fractions — where 6.25 lives
+		consider(float64(n) / 16) //
+	}
+	for n := 1; n <= 2000; n++ {
+		consider(float64(n) - 1e-9) // just under an integer
+		consider(float64(n) + 1e-9) // just over
+	}
 	assert.LessOrEqual(t, worstRel, 0.005,
-		"the worst rate in 0.0001..50 is PerSecond=%v, enforced %v (%.4f%% off) — the derivation "+
+		"the worst rate found is PerSecond=%v, enforced %v (%.4f%% off) — the derivation "+
 			"promises 0.5%% and UPGRADE.md advertises it, so it has to hold across the range and "+
 			"not just at the values someone happened to tabulate",
 		worstRate, enforcedRate(worstRate), worstRel*100)
