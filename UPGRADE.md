@@ -325,11 +325,17 @@ The two versions derive different windows for the same `PerSecond`, and
 `window_start` is `now.Truncate(window)`, so the old and new binaries key
 different rows in `rate_limit_windows` and each gets a full independent budget.
 The enforced rate while both are running is the **sum**. Measured against the real
-storage gate at `PerSecond: 0.3` over 30 s: v4.7.0 alone admits 0.533/sec (its own
-overshoot), v4.8.0 alone admits 0.333/sec, and an actually-mixed run admits
-**0.833/sec** — 2.8× what you configured. (The two budgets sum to 0.867; a mixed
-run lands slightly under that because the windows occasionally share a
-`window_start` and one admission is lost to the collision.) It clears the moment the rollout completes, but it
+storage gate at `PerSecond: 0.3`: v4.7.0 alone admits about 0.533/sec (its own
+overshoot) and v4.8.0 alone about 0.333/sec, so a mixed fleet admits roughly the
+**sum** — measured between **0.83 and 0.93/sec, i.e. 2.8× to 3.1×** what you
+configured.
+
+It is a range, not a constant, because each version's `window_start` is
+`truncate(now, window)` on its own grid and the two grids drift relative to each
+other; where a 30-second sample lands on them changes the count by an admission or
+two. (An earlier draft of this file gave a single figure and explained the
+shortfall as the two grids sharing a `window_start`. That cannot be the reason: the
+4s and 3.333s grids coincide only once every ~3.7 hours.) It clears the moment the rollout completes, but it
 persists indefinitely if you leave a canary on the old version, so if the limit
 exists to protect a third party, finish the rollout promptly or pause it.
 Whole-number rates derive the same window on both versions and are unaffected.
@@ -544,11 +550,15 @@ Any further migration is listed here by the packet that adds it.
 *code*, so any behaviour fixed above reverts with it. The one that can cost you
 work rather than just correctness is on **SQLite**: v4.7.0's lexical
 schedule-cursor comparison comes back, so a non-UTC or sub-second schedule can
-start stalling again on rows v4.8.0 had just been advancing correctly. Measured
-across four host zones: 2 schedules stalled under `TZ=Asia/Tokyo` and none under
-UTC, Europe/Berlin or America/Los_Angeles — it takes a host offset far enough from
-the stored face for the lexical comparison to invert, so whether you see it at all
-depends on where your workers run. That is
+start stalling again on rows v4.8.0 had just been advancing correctly.
+
+Whether you see it, and on how many schedules, depends on TWO things: how far the
+host's offset sits from the stored clock face, AND where the wall clock currently
+sits relative to the next boundary. Both matter, and the second is why it is not a
+per-zone property — sampling across the day, Asia/Tokyo stalls 1–2 schedules and
+Europe/Berlin stalls 1 in its morning hours and none later, and a stalled schedule
+self-heals once the boundary's date advances past the cursor's. Do not read "my
+zone was fine when someone measured it" as exemption. That is
 v4.7.0's own pre-existing bug re-entering, not damage the rollback does — but "the
 rollback is safe" is a statement about the schema, not about schedules. Postgres
 and MySQL are unaffected.

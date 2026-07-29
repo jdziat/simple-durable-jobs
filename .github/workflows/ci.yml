@@ -255,8 +255,11 @@ jobs:
       # present, and load-bearing for nobody.
       #
       # The build is deterministic (verified byte-identical across rebuilds, all
-      # seven files) and both lockfiles are committed, so a diff here means the
-      # committed bundle genuinely does not match its source.
+      # seven files) and the single committed lockfile is installed with `npm ci`,
+      # so a diff here means the committed bundle genuinely does not match its
+      # source. (There used to be TWO lockfiles pinning different Svelte
+      # compilers, which would have made this gate fail for whichever maintainer
+      # did not happen to use the same package manager as CI.)
       - name: Committed frontend bundle matches its source
         run: |
           # `git status --porcelain`, NOT `git diff`: diff only sees TRACKED files,

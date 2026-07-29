@@ -313,15 +313,19 @@ func Concurrency(n int) WorkerOption {
 // CapKey derives the partition key for a ConcurrencyCap from the dequeued job.
 // The effective slot name is capName + ":" + key(job).
 //
-// The function must be STABLE for a given job across re-dispatches, not merely
-// bounded in cardinality. A job can be dequeued twice by one worker — an
-// aggressive pause releases it to pending and the poll loop picks it up again,
-// and the stale-lock reaper can do the same — and the two runs then briefly
-// overlap. The slot row is released once the LAST run holding that job id
-// finishes; if the key changed in between, the two runs hold DIFFERENT rows and
-// the earlier one's row is released by nobody, holding a fleet-wide cap until it
-// expires at its TTL. Derive the key from something immutable (tenant, queue, a
-// field of the payload), not from metadata a handler rewrites.
+// Prefer a key that is STABLE for a given job, not merely bounded in
+// cardinality. A job can be dequeued twice by one worker — the stale-lock reaper
+// can release a lock this worker then reclaims — so two runs of one job id
+// briefly overlap. If the key changed in between, they hold DIFFERENT slot rows
+// and the job counts against the cap under both keys at once, which is not what
+// "at most N of these" is meant to mean.
+//
+// It does not leak: the departing run hands its names to the surviving one, so
+// whoever finishes last releases the union. (An aggressive pause is not a route
+// here either — it deletes every slot row for the job id, so the next run starts
+// clean.) But the double-counting is real, so derive the key from something
+// immutable for the life of the job (tenant, queue, a field of the payload)
+// rather than from metadata a handler rewrites.
 func CapKey(fn func(*core.Job) string) CapOption {
 	return func(c *ConcurrencyCapConfig) {
 		c.Key = fn

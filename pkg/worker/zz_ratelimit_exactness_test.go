@@ -234,6 +234,24 @@ func (s *windowCapturingStorage) TryConsumeRate(_ context.Context, limitName str
 	return true, nil
 }
 
+// windowedCapturingStorage additionally implements windowedRateLimiter, which is
+// the branch EVERY production storage takes — GormStorage satisfies it, and
+// capability_guards.go asserts as much. A capturing storage that only implements
+// TryConsumeRate covers the FALLBACK, so the branch that actually runs in
+// production would survive the mutation this test exists to catch.
+type windowedCapturingStorage struct{ *windowCapturingStorage }
+
+func (s *windowedCapturingStorage) TryConsumeRateWindow(_ context.Context, limitName string, _ float64, window time.Duration, _ time.Time) (bool, time.Time, error) {
+	s.mu.Lock()
+	s.windows[limitName] = window
+	s.mu.Unlock()
+	return true, time.Now().Truncate(window), nil
+}
+
+func (s *windowedCapturingStorage) ReleaseRateAt(context.Context, string, time.Time) error {
+	return nil
+}
+
 // TestTryConsumeRateLimits_UsesTheDerivedWindowAtTheCallSite covers the CALL SITE,
 // which was free.
 //
@@ -256,9 +274,29 @@ func (s *windowCapturingStorage) TryConsumeRate(_ context.Context, limitName str
 // gate will enforce, ceil(PerSecond*window)/window, must be within the documented
 // 0.5% of the configured rate.
 func TestTryConsumeRateLimits_UsesTheDerivedWindowAtTheCallSite(t *testing.T) {
-	for _, perSecond := range []float64{0.011, 0.3, 1.01, 1.2, 2.5, 6.25, 7.3} {
-		store := &windowCapturingStorage{mockStorage: &mockStorage{}, windows: map[string]time.Duration{}}
-		q := queue.New(store)
+	// BOTH branches of the consume: the windowed capability that every production
+	// storage implements, and the plain fallback for a third-party core.Storage.
+	// Covering only one leaves the other's call site free.
+	for _, windowed := range []bool{true, false} {
+		for _, perSecond := range []float64{0.011, 0.3, 1.01, 1.2, 2.5, 6.25, 7.3} {
+			base := &windowCapturingStorage{mockStorage: &mockStorage{}, windows: map[string]time.Duration{}}
+			var st core.Storage = base
+			if windowed {
+				st = &windowedCapturingStorage{windowCapturingStorage: base}
+			}
+			assertWindowHonoursTheRate(t, st, base, perSecond, windowed)
+		}
+	}
+}
+
+func assertWindowHonoursTheRate(t *testing.T, st core.Storage, base *windowCapturingStorage, perSecond float64, windowed bool) {
+	t.Helper()
+	{
+		store := base
+		q := queue.New(st)
+		_, isWindowed := st.(windowedRateLimiter)
+		require.Equal(t, windowed, isWindowed,
+			"guard on the premise: this case must exercise the %v branch", windowed)
 		w := NewWorker(q, RateLimit("api", perSecond))
 
 		job := &core.Job{ID: core.NewID(), Type: "t", Queue: "default", Status: core.StatusRunning}

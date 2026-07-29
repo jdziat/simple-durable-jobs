@@ -75,18 +75,22 @@ arbitrary user input) creates a new permanent row per distinct value and grows
 `concurrency_slots` without bound. For "only N of these at a time" use a bounded
 key; do not derive it from `job.ID` or free-form data.
 
-## Keep the cap key stable per job
+## Prefer a cap key that is stable per job
 
-Bounded is not sufficient — the key must also be **stable for a given job across
-re-dispatches**. A job can be dequeued twice by the same worker: an aggressive
-pause releases it to `pending` and the poll loop picks it up again, and the
-stale-lock reaper can do the same. The two runs briefly overlap, and they share one
-slot row, which is released once the last of them finishes.
+Bounded is not quite the whole story — the key should also be **stable for a given
+job across re-dispatches**. A job can be dequeued twice by the same worker: the
+stale-lock reaper can release a lock this worker then reclaims, and the two runs
+briefly overlap.
 
-If the key changed between those two dequeues, the runs hold *different* rows and
-the earlier one's row is released by nobody — it holds a fleet-wide cap slot until
-it expires at its TTL, throttling every worker in the deployment for that window.
+If the key changed between those two dequeues, the runs hold *different* slot rows,
+and the job counts against the cap under both keys at the same time — which is not
+what "at most N of these at a time" is meant to mean.
+
+It does not leak a row: the departing run hands its slot names to the surviving
+one, so whoever finishes last releases the union. (An aggressive pause is not a
+route to this either; it deletes every slot row for the job id, so the next run
+starts clean.) The double-counting is the real cost.
 
 Derive the key from something immutable for the life of the job (its tenant, its
-queue, a field of the payload). Do not derive it from mutable metadata that a
-handler rewrites, or from anything that depends on when the job happened to run.
+queue, a field of the payload) rather than from mutable metadata a handler
+rewrites.

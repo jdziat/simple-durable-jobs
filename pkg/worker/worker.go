@@ -1714,11 +1714,25 @@ func (w *Worker) tryAcquireConcurrencySlots(ctx context.Context, job *core.Job, 
 	// Recording as we go means every bail-out can route through
 	// releaseConcurrencySlots, which consults the fence and cleans up this run's
 	// entry. There is exactly ONE place that deletes these rows now.
-	// Stores a COPY. The local slice is appended to on the next iteration, and
-	// append reuses the backing array while there is capacity — the stored header's
-	// length means it cannot observe that, but "cannot observe it" is a subtlety a
-	// reader should not have to re-derive around fleet-cap bookkeeping. There are
-	// at most a handful of caps.
+	//
+	// THE RECORD HAPPENS BEFORE THE STORAGE CALL, NOT AFTER. Recording after it
+	// returns left a real window, just a much smaller one than the version before
+	// it: between TryAcquireConcurrencySlot committing the row and this run
+	// publishing that it holds it, a concurrent release for an EARLIER run of the
+	// same job id scans the map, sees no other holder, and deletes the row this run
+	// has already joined. Microseconds instead of a blocking channel send, but the
+	// same defect and the same consequence — reproduced, with a second job then
+	// admitted past a cap of 1.
+	//
+	// Publishing INTENT early is safe in the other direction. If the acquire then
+	// fails, the rollback names a row this run never got — and either another token
+	// holds it, in which case the fence skips it, or nobody does, in which case
+	// deleting it harms no one (and ReleaseConcurrencySlotOwned still fences a peer
+	// worker by worker_id). Claiming too much briefly costs nothing; claiming too
+	// little loses a live row.
+	//
+	// Stores a COPY: the local slice is appended to on the next iteration, and
+	// append reuses the backing array while there is capacity.
 	record := func(names []string) {
 		w.slotJobIDMu.Lock()
 		w.slotJobID[runToken] = slotHold{jobID: job.ID, names: append([]string(nil), names...)}
@@ -1731,6 +1745,8 @@ func (w *Worker) tryAcquireConcurrencySlots(ctx context.Context, job *core.Job, 
 			w.releaseConcurrencySlots(ctx, job.ID, runToken)
 			return false
 		}
+		acquiredSlots = append(acquiredSlots, slotName)
+		record(acquiredSlots)
 		acquired, err := storage.TryAcquireConcurrencySlot(ctx, slotName, job.ID, w.config.WorkerID, cap.Limit, ttl)
 		if err != nil {
 			w.logger.Warn("failed to acquire concurrency slot; releasing dequeued job",
@@ -1744,8 +1760,6 @@ func (w *Worker) tryAcquireConcurrencySlots(ctx context.Context, job *core.Job, 
 			w.releaseConcurrencySlots(ctx, job.ID, runToken)
 			return false
 		}
-		acquiredSlots = append(acquiredSlots, slotName)
-		record(acquiredSlots)
 	}
 	return true
 }
@@ -1787,15 +1801,29 @@ func (w *Worker) releaseConcurrencySlots(ctx context.Context, jobID core.UUID, r
 	// job throughput. A jobID-keyed refcount would make it O(1), at the cost of a
 	// second map to keep in sync with this one; that is one more invariant to get
 	// wrong, and getting this one wrong is what produced the bug twice already.
+	// On handover the departing run's names are MERGED INTO the surviving holders,
+	// not discarded. The successor can legitimately hold a strict SUBSET: it is
+	// still walking the cap loop, or it bailed out before reaching the later caps.
+	// Dropping the difference left rows named by nobody — held by no run, released
+	// by no run, and surviving to the slot TTL (45 minutes by default), denying one
+	// slot of a FLEET-WIDE cap to every worker in the deployment. Reproduced with
+	// two caps: run #1 holds customer+region, hands over to a run #2 that has only
+	// recorded customer, and region leaks.
+	//
+	// Merging keeps the invariant exact rather than approximate: the union of every
+	// name any live run of this job id holds is always covered, so whoever is last
+	// out releases all of them.
 	w.slotJobIDMu.Lock()
 	hold := w.slotJobID[runToken]
 	delete(w.slotJobID, runToken)
 	heldByAnother := false
 	for otherToken, other := range w.slotJobID {
-		if otherToken != runToken && other.jobID == jobID {
-			heldByAnother = true
-			break
+		if otherToken == runToken || other.jobID != jobID {
+			continue
 		}
+		heldByAnother = true
+		other.names = unionSlotNames(other.names, hold.names)
+		w.slotJobID[otherToken] = other
 	}
 	w.slotJobIDMu.Unlock()
 
@@ -1803,6 +1831,26 @@ func (w *Worker) releaseConcurrencySlots(ctx context.Context, jobID core.UUID, r
 		return
 	}
 	w.releaseSlotNames(ctx, jobID, hold.names)
+}
+
+// unionSlotNames appends the names of into a that are not already present. Slot
+// lists are at most one entry per configured cap, so the quadratic scan is on a
+// handful of strings.
+func unionSlotNames(a, b []string) []string {
+	out := append([]string(nil), a...)
+	for _, name := range b {
+		found := false
+		for _, existing := range out {
+			if existing == name {
+				found = true
+				break
+			}
+		}
+		if !found {
+			out = append(out, name)
+		}
+	}
+	return out
 }
 
 func (w *Worker) releaseSlotNames(ctx context.Context, jobID core.UUID, slots []string) {

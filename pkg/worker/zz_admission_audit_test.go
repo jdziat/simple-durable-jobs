@@ -423,9 +423,15 @@ func TestReleaseConcurrencySlots_HandoverDoesNotLeakTheRow(t *testing.T) {
 		store := newCapMockStorage([]*core.Job{job})
 		q := queue.New(store)
 		q.Register(job.Type, func(context.Context, struct{}) error { return nil })
+		// TWO caps, deliberately. With ONE, a departing run's name set can never be a
+		// strict SUPERSET of its successor's, so the leak this test is named for is
+		// unreachable and every assertion below is vacuous — the same one-cap
+		// vacuity called out in TestTryAcquireConcurrencySlots_RollbackRespects...,
+		// reintroduced here and caught by review one round later.
 		w := NewWorker(q,
 			WorkerQueue("default", Concurrency(3)),
 			ConcurrencyCap("customer", 1, CapKey(func(j *core.Job) string { return j.UniqueKey })),
+			ConcurrencyCap("region", 1, CapKey(func(j *core.Job) string { return j.UniqueKey })),
 			DisableRetry(),
 		)
 		w.config.WorkerID = "worker-1"

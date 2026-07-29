@@ -763,10 +763,18 @@ func TestProcessJob_LaterRunKeepsItsAdmissionState(t *testing.T) {
 	assert.Equal(t, int32(1), counter.Load(),
 		"run #1's cleanup must decrement exactly once, leaving run #2 counted")
 
+	// CONTAINS, not exact equality. Run #1's cleanup hands its own names OVER to the
+	// surviving run rather than dropping them — the successor can hold a strict
+	// subset, and the difference would otherwise be named by nobody and leak until
+	// its TTL. So run #2's list legitimately grows to the union. An exact-equality
+	// assertion here reds on a CORRECT fix, which is its own kind of bad test: it
+	// pins an implementation detail this test does not own.
+	//
+	// What this test owns is that run #2 does not LOSE what it holds.
 	w.slotJobIDMu.Lock()
 	stillHeld := append([]string(nil), w.slotJobID[tok2].names...)
 	w.slotJobIDMu.Unlock()
-	assert.Equal(t, []string{"cap:run2"}, stillHeld,
+	assert.Contains(t, stillHeld, "cap:run2",
 		"run #2's concurrency slots must survive run #1's cleanup, or the fleet cap is "+
 			"released under a handler that is still executing and admits an extra job")
 
