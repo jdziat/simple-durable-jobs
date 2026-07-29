@@ -1862,9 +1862,23 @@ func (w *Worker) releaseConcurrencySlots(ctx context.Context, jobID core.UUID, r
 	// is still executing. ReleaseConcurrencySlotOwned cannot refuse it — same job
 	// id, same worker id.
 	//
-	// COST, stated rather than hand-waved: slot releases now serialise against each
-	// other and against acquires for the duration of a DELETE. That is bounded and
-	// proportionate — this mutex is touched ONLY when ConcurrencyCaps are
+	// COST, corrected — the first version of this note understated it. Everything
+	// that touches slotJobIDMu now waits on an in-flight DELETE, and that is THREE
+	// paths, not two:
+	//   1. other releases,
+	//   2. acquires (record(), so the dispatch loop, which is sequential), and
+	//   3. renewConcurrencySlots — which runHeartbeat calls after every successful
+	//      Heartbeat for EVERY running job. Measured with a 900ms DELETE: an
+	//      unrelated running job's slot renewal blocked for 851ms.
+	//
+	// (3) is the one that matters, because a heartbeat that does not return to its
+	// select does not send the next Heartbeat, and a lapsed lease is how the
+	// stale-lock reaper hands a still-executing job to a peer. It is why the DELETE
+	// is bounded at slotReleaseTimeout: the worst case is one bounded round trip
+	// per queued release, against a 2-minute heartbeat interval and a 45-minute
+	// StaleLockAge, rather than "as long as the database stays silent".
+	//
+	// Still proportionate: this mutex is touched ONLY when ConcurrencyCaps are
 	// configured (tryAcquireConcurrencySlots returns at the len()==0 guard
 	// otherwise), and a cap exists precisely to keep the number of concurrent
 	// capped jobs small. A worker with no caps never contends here at all.
@@ -1923,10 +1937,38 @@ func unionSlotNames(a, b []string) []string {
 	return out
 }
 
+// slotReleaseTimeout bounds a single slot DELETE. It exists because
+// releaseConcurrencySlots holds slotJobIDMu across this call: an unbounded query
+// would hold a process-wide mutex for as long as the database takes to answer,
+// which on a partitioned connection (TCP that neither errors nor RSTs) is
+// minutes. database/sql applies no query timeout of its own.
+const slotReleaseTimeout = 5 * time.Second
+
 func (w *Worker) releaseSlotNames(ctx context.Context, jobID core.UUID, slots []string) {
 	if len(slots) == 0 {
 		return
 	}
+	// BOUND THE I/O HERE, not at the call sites. Two of the three callers already
+	// passed a 5s context; the hot-path defer in processJobRun passed
+	// context.WithoutCancel(ctx), which strips the DEADLINE as well as the cancel —
+	// so the DELETE under the mutex had no bound at all.
+	//
+	// That mattered only after the mutex started being held across this call. A
+	// hung DELETE used to block one goroutine; it would now block (a) the whole
+	// dispatch loop, since record() takes the same mutex and dispatchDequeuedJobs
+	// is sequential, and (b) renewConcurrencySlots for UNRELATED still-running
+	// jobs — which runHeartbeat calls inside its ticker arm, so that goroutine
+	// never returns to its select and stops sending heartbeats. At StaleLockAge
+	// those leases lapse and the reaper hands still-executing jobs to peers: the
+	// double-execution runHeartbeat exists to prevent, reachable from one hung
+	// query.
+	//
+	// Bounding here rather than at one call site means every entry point is capped,
+	// including any added later. A caller that already supplied a tighter deadline
+	// keeps it.
+	ctx, cancel := context.WithTimeout(ctx, slotReleaseTimeout)
+	defer cancel()
+
 	storage, ok := w.queue.Storage().(concurrencySlotStorage)
 	if !ok {
 		return

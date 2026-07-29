@@ -220,10 +220,29 @@ Reproduced with the real binaries against one SQLite cursor using
 The extra fire is a **catch-up of a genuinely missed local boundary**, which is
 correct behaviour once you accept that the schedule was firing at the wrong hour
 before — but it happens regardless of how you sequence the deploy, so "cut over
-cleanly" is not a mitigation. If a double run would be harmful, declare the job
-`queue.Unique(...)` across the upgrade, or pause the schedule until after the
-first correct boundary has passed. Unprefixed schedules are unaffected, since
-neither version moves them.
+cleanly" is not a mitigation.
+
+**If a double run would be harmful, use a WINDOWED dedup for the cutover:**
+
+```go
+jobs.IdempotencyKey("nightly-report-"+day, 24*time.Hour)   // or jobs.UniqueFor(24*time.Hour)
+```
+
+`queue.Unique` alone does **not** cover this, and an earlier draft of this file
+wrongly said it did. `Unique` means "only one ACTIVE job with this key" — the
+dedup matches `status IN ('pending','running')` — and the two fires here are hours
+apart, so the first has long since completed and the second enqueues normally. A
+windowed dedup is keyed on time rather than liveness, which is what a
+boundary-catch-up needs; the scheduler already forwards these options.
+
+That draft also suggested pausing the schedule, which is not an operation this
+library has (there is `PauseJob`, `PauseQueue` and `Worker.Pause`, but nothing that
+pauses a schedule). Pausing the *queue* does not help either — the scheduler still
+claims and enqueues the boundary — and removing and re-adding the schedule does not
+skip it, because the scheduler deliberately performs one catch-up when it seeds a
+new cursor.
+
+Unprefixed schedules are unaffected, since neither version moves them.
 
 Also adds `CronIn`, `DailyIn`, `WeeklyIn` (and `MustCronIn`) for callers holding a
 `*time.Location` rather than a name. `DailyIn`/`WeeklyIn` advance by rolling the

@@ -768,3 +768,76 @@ func TestReleaseConcurrencySlots_SlowDeleteDoesNotWedgeDispatch(t *testing.T) {
 	w.slotJobIDMu.Unlock()
 	assert.Zero(t, n, "and no bookkeeping entry may survive")
 }
+
+// hangingReleaseStorage blocks in the DELETE until its context expires, which is
+// what a partitioned database looks like: no error, no RST, just silence.
+type hangingReleaseStorage struct {
+	*capMockStorage
+	sawDeadline atomic.Bool
+	hadDeadline atomic.Bool
+}
+
+func (s *hangingReleaseStorage) ReleaseConcurrencySlotOwned(ctx context.Context, _ string, _ core.UUID, _ string) error {
+	if _, ok := ctx.Deadline(); ok {
+		s.hadDeadline.Store(true)
+	}
+	s.sawDeadline.Store(true)
+	<-ctx.Done() // hang until the context gives up
+	return ctx.Err()
+}
+
+// TestReleaseConcurrencySlots_HungDeleteCannotHoldTheMutexForever guards the
+// failure mode the atomicity fix INTRODUCED.
+//
+// Holding slotJobIDMu across the DELETE is what makes the ownership decision
+// atomic — but the hot-path release ran on context.WithoutCancel(ctx), which
+// strips the DEADLINE as well as the cancel. A hung query therefore held a
+// process-wide mutex indefinitely, blocking the entire dispatch loop AND
+// renewConcurrencySlots for unrelated still-running jobs. runHeartbeat calls that
+// inside its ticker arm, so those jobs stop heart-beating, their leases lapse at
+// StaleLockAge, and the reaper hands still-executing work to peers — double
+// execution, from one hung DELETE.
+//
+// FALSE-GREEN TRAP, and my own round-15 test was it:
+// TestReleaseConcurrencySlots_SlowDeleteDoesNotWedgeDispatch uses a 2ms DELETE
+// against a 60-second timeout. That is 150x headroom — it detects a DEADLOCK, and
+// is structurally incapable of detecting an unbounded STALL, which is the actual
+// failure. This one hangs until the context expires and asserts the bound exists.
+func TestReleaseConcurrencySlots_HungDeleteCannotHoldTheMutexForever(t *testing.T) {
+	job := runningJob("job-1", "acme")
+	base := newCapMockStorage([]*core.Job{job})
+	store := &hangingReleaseStorage{capMockStorage: base}
+	q := queue.New(store)
+	q.Register(job.Type, func(context.Context, struct{}) error { return nil })
+	w := NewWorker(q,
+		WorkerQueue("default", Concurrency(4)),
+		ConcurrencyCap("customer", 10, CapKey(func(j *core.Job) string { return j.UniqueKey })),
+		DisableRetry(),
+	)
+	w.config.WorkerID = "worker-1"
+
+	tok := w.nextRunToken.Add(1)
+	require.True(t, w.tryAcquireConcurrencySlots(context.Background(), job, tok))
+
+	// Release on the SAME shape the hot path uses: no cancel, no deadline of its
+	// own. The bound must come from the release path itself.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		w.releaseConcurrencySlots(context.WithoutCancel(context.Background()), job.ID, tok)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("a hung slot DELETE never returned: it is holding slotJobIDMu, which blocks the " +
+			"whole dispatch loop and every heartbeat's slot renewal — at StaleLockAge those leases " +
+			"lapse and the reaper hands still-executing jobs to peers")
+	}
+
+	require.True(t, store.sawDeadline.Load(), "sanity: the storage release must have been reached")
+	assert.True(t, store.hadDeadline.Load(),
+		"the context handed to a slot DELETE must carry a DEADLINE. context.WithoutCancel strips "+
+			"the parent's, so without one bound here a partitioned database holds a process-wide "+
+			"mutex for as long as it stays silent")
+}
