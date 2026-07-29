@@ -1,7 +1,10 @@
 package fanout
 
 import (
+	"bytes"
 	"context"
+	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -205,4 +208,53 @@ func TestFanOut_ReplayAnchorsDelayOnTheFanOutCreation(t *testing.T) {
 	assert.WithinDuration(t, created.Add(time.Hour), *store.seen[0].RunAt, time.Second,
 		"the replay must anchor the Delay on the fan-out's creation: anchoring on the recovery "+
 			"instant makes this child wait an extra 30 minutes, silently")
+}
+
+// TestBuildSubJobs_WarnsOnceWhenDedupOptionsAreIgnored covers the WARN itself.
+//
+// FALSE-GREEN TRAP: TestSub_FlagsDedupOptionsRatherThanAcceptingThem asserts the
+// DedupOptionsIgnored flag on the SubJob — i.e. that Sub() recorded the fact.
+// Deleting the log block entirely left it green, so the only user-visible part of
+// this behaviour (the operator finding out) was uncovered. UPGRADE.md promises
+// exactly one WARN per fan-out, which is also what stops a 10k-wide fan-out
+// emitting 10k lines.
+func TestBuildSubJobs_WarnsOnceWhenDedupOptionsAreIgnored(t *testing.T) {
+	var buf bytes.Buffer
+	jc := literalTestCtx()
+	jc.Logger = slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+
+	cfg := &config{queue: "fan-q", retries: 3}
+	subs := []SubJob{
+		Sub("work", "a", queue.Unique("k1")),
+		Sub("work", "b", queue.Unique("k2")),
+		Sub("work", "c"), // no dedup option
+	}
+	built, err := buildSubJobs(subs, cfg, jc, core.UUID("f-warn"), time.Now())
+	require.NoError(t, err)
+	require.Len(t, built, 3)
+
+	out := buf.String()
+	assert.Equal(t, 1, strings.Count(out, "are ignored on"),
+		"exactly one WARN per fan-out, not one per child — a 10k-wide fan-out must not emit "+
+			"10k lines, and zero lines means the operator never learns the option did nothing")
+	assert.Contains(t, out, "sub_job_indexes",
+		"the warning must name WHICH children carried the ignored option")
+
+	// The children still carry the fan-out-owned key, which is why the option
+	// cannot be honoured in the first place.
+	assert.Contains(t, built[0].UniqueKey, "fanout-",
+		"a child's unique key is fan-out owned, so parent replay stays idempotent")
+}
+
+// TestBuildSubJobs_SilentWhenNoDedupOptionsGiven is the negative control: the WARN
+// must not fire for correct usage, or operators filter it out and it stops working.
+func TestBuildSubJobs_SilentWhenNoDedupOptionsGiven(t *testing.T) {
+	var buf bytes.Buffer
+	jc := literalTestCtx()
+	jc.Logger = slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+
+	_, err := buildSubJobs([]SubJob{Sub("work", "a")}, &config{queue: "q", retries: 3},
+		jc, core.UUID("f-quiet"), time.Now())
+	require.NoError(t, err)
+	assert.NotContains(t, buf.String(), "are ignored on", "correct usage must stay silent")
 }

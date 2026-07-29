@@ -335,3 +335,57 @@ func TestCancelRun_OnlyCancelsItsOwnRun(t *testing.T) {
 	assert.True(t, w.cancelRun(jobID, tok2))
 	assert.True(t, run2Cancelled)
 }
+
+// TestReleaseConcurrencySlots_DoesNotDeleteTheRowALaterRunHolds asserts on the
+// DATABASE ROW, which is the whole point.
+//
+// FALSE-GREEN TRAP, and my own TestProcessJob_LaterRunKeepsItsAdmissionState is
+// exactly it: that test states this defect precisely in its comment and then
+// asserts only on w.slotJobID, the IN-MEMORY list. Re-keying that map by run token
+// does nothing for the row, because concurrency_slots is keyed (slot_name, job_id)
+// and capSlotName is deterministic per (cap, job) — so two runs of one job id
+// derive the SAME row, run #2 lands in TryAcquireConcurrencySlot's
+// idempotent-renewal branch and SHARES it, and run #1's release then deletes the
+// fleet cap under a handler that is still executing. The ownership fence cannot
+// refuse it (same job id, same worker id) and RenewConcurrencySlot cannot repair
+// it (UPDATE-only), so the cap under-counts for run #2's whole remaining runtime.
+func TestReleaseConcurrencySlots_DoesNotDeleteTheRowALaterRunHolds(t *testing.T) {
+	job := runningJob("job-1", "acme")
+	store := newCapMockStorage([]*core.Job{job})
+	q := queue.New(store)
+	q.Register(job.Type, func(context.Context, struct{}) error { return nil })
+	w := NewWorker(q,
+		WorkerQueue("default", Concurrency(3)),
+		ConcurrencyCap("customer", 1, CapKey(func(j *core.Job) string { return j.UniqueKey })),
+		DisableRetry(),
+	)
+	w.config.WorkerID = "worker-1"
+	ctx := context.Background()
+
+	// Run #1 acquires the cap slot.
+	tok1 := w.nextRunToken.Add(1)
+	require.True(t, w.tryAcquireConcurrencySlots(ctx, job, tok1))
+	require.Equal(t, 1, store.slotCount("customer:acme"), "run #1 must hold the row")
+
+	// Run #2 takes over the job id and re-acquires — it SHARES run #1's row.
+	tok2 := w.nextRunToken.Add(1)
+	w.runningJobsMu.Lock()
+	w.runningJobs[job.ID] = runningJobEntry{cancel: func() {}, token: tok2}
+	w.runningJobsMu.Unlock()
+	require.True(t, w.tryAcquireConcurrencySlots(ctx, job, tok2))
+
+	// Run #1's deferred cleanup lands while run #2 is still executing.
+	w.releaseConcurrencySlots(ctx, job.ID, tok1)
+
+	assert.Equal(t, 1, store.slotCount("customer:acme"),
+		"the FLEET cap row must survive an earlier run's cleanup — deleting it lets another job "+
+			"be admitted past the limit while this handler is still running")
+
+	// And when run #2 finishes, the row is finally released.
+	w.runningJobsMu.Lock()
+	delete(w.runningJobs, job.ID)
+	w.runningJobsMu.Unlock()
+	w.releaseConcurrencySlots(ctx, job.ID, tok2)
+	assert.Zero(t, store.slotCount("customer:acme"),
+		"the last run out must release the row, or the cap leaks a slot permanently")
+}

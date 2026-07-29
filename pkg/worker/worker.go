@@ -1723,6 +1723,29 @@ func (w *Worker) releaseConcurrencySlots(ctx context.Context, jobID core.UUID, r
 	slots := w.slotJobID[runToken]
 	delete(w.slotJobID, runToken)
 	w.slotJobIDMu.Unlock()
+
+	// Keying the in-memory list by run is not enough, because the DATABASE row is
+	// not keyed by run: concurrency_slots is (slot_name, job_id) and capSlotName is
+	// deterministic per (cap, job), so two runs of one job id derive the SAME row.
+	// Run #2 re-acquiring lands in TryAcquireConcurrencySlot's idempotent-renewal
+	// branch and shares run #1's row rather than creating its own.
+	//
+	// So if a LATER run of this job id is still registered, the row it is relying on
+	// is this row, and releasing would delete the fleet cap out from under a handler
+	// that is still executing — which the ownership fence cannot refuse, since both
+	// runs share the job id AND the worker id, and which RenewConcurrencySlot cannot
+	// repair because it is UPDATE-only. Hand the row over instead; the later run
+	// releases it under its own token when it finishes.
+	//
+	// If that later run finishes FIRST, it deletes the row and this release becomes
+	// a no-op on an absent row, which is already idempotent.
+	w.runningJobsMu.Lock()
+	cur, stillRegistered := w.runningJobs[jobID]
+	w.runningJobsMu.Unlock()
+	if stillRegistered && cur.token != runToken {
+		return
+	}
+
 	w.releaseSlotNames(ctx, jobID, slots)
 }
 

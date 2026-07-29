@@ -318,3 +318,46 @@ func TestClaimScheduledFire_VariableWidthFractionsCompareByValue(t *testing.T) {
 		})
 	}
 }
+
+// TestClaimScheduledFire_CrossFaceSubSecondBoundaries covers the ONE branch the
+// rest of this file cannot reach.
+//
+// The predicate is face-aware: when the offsets MATCH it compares raw text, which
+// is exact to nanoseconds. Every other sub-second test here is same-face, so it
+// takes that branch and never touches the normalizing expression at all —
+// substituting datetime() for strftime('%f') left the whole file green even though
+// datetime() truncates to whole SECONDS.
+//
+// Only a boundary that is BOTH cross-face AND sub-second apart exercises the
+// normalizer's resolution. That combination is not exotic: it is what a schedule
+// carrying its own location produces against a cursor written elsewhere, at any
+// period below a second.
+//
+// FALSE-GREEN TRAP: same-face sub-second pairs take the text branch; cross-face
+// pairs an hour apart survive second-truncation. Both are needed at once.
+func TestClaimScheduledFire_CrossFaceSubSecondBoundaries(t *testing.T) {
+	s := newTestStorage(t)
+	if !s.isSQLite {
+		t.Skip("the normalizing expression is SQLite-only")
+	}
+	ctx := context.Background()
+
+	east := time.FixedZone("probe+9", 9*3600)
+	base := time.Date(2026, 7, 27, 10, 0, 0, 0, time.UTC)
+
+	// Cursor on one face, boundary 100ms later on ANOTHER face.
+	_, err := s.SeedScheduledFire(ctx, "xf-subsec", base)
+	require.NoError(t, err)
+	won, err := s.ClaimScheduledFire(ctx, "xf-subsec", base.Add(100*time.Millisecond).In(east))
+	require.NoError(t, err)
+	assert.True(t, won,
+		"a boundary 100ms later on a DIFFERENT clock face must claim — an expression that "+
+			"truncates to whole seconds collapses it into the cursor and stalls the schedule")
+
+	// And the negative control: 100ms EARLIER, cross-face, must not claim.
+	_, err = s.SeedScheduledFire(ctx, "xf-subsec-back", base)
+	require.NoError(t, err)
+	won, err = s.ClaimScheduledFire(ctx, "xf-subsec-back", base.Add(-100*time.Millisecond).In(east))
+	require.NoError(t, err)
+	assert.False(t, won, "an earlier boundary must not claim, cross-face or not")
+}
