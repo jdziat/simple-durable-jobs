@@ -75,3 +75,44 @@ func TestSub_FlagsDedupOptionsRatherThanAcceptingThem(t *testing.T) {
 			"dedup MODE rather than the TTL field")
 	assert.False(t, Sub("j", "a").DedupOptionsIgnored, "no dedup option means nothing to warn about")
 }
+
+// TestSub_RetriesAreOnlyStampedWhenExplicitlySet covers the `if sj.RetriesSet`
+// guard in Sub(), which this branch ADDED and which nothing covered: removing the
+// conditional (stamping queueOpts.MaxRetries unconditionally) left the entire
+// repository green, including ./tests.
+//
+// The guard is the whole point of the change. Without it every child carries a
+// Retries value whether or not the caller asked for one, and an unset literal's
+// zero overwrites the fan-out default — which is exactly the "the fan-out default
+// is unreachable" defect this wave set out to fix.
+//
+// FALSE-GREEN TRAP: asserting Retries on a child built WITH queue.Retries(n)
+// passes either way, because the value is stamped correctly in both versions. The
+// discriminating case is a Sub with NO retries option at all, where the flag must
+// stay false and the value must stay zero so buildSubJobs can apply the default.
+func TestSub_RetriesAreOnlyStampedWhenExplicitlySet(t *testing.T) {
+	// No retries option: the flag must be false so the fan-out default applies.
+	unset := Sub("child", "arg")
+	assert.False(t, unset.RetriesSet,
+		"a Sub with no Retries option must not claim one was set, or the fan-out default "+
+			"becomes unreachable")
+	assert.Zero(t, unset.Retries,
+		"and it must not carry a stamped value for buildSubJobs to prefer over the default")
+
+	// Some OTHER option present, so queueOpts is non-nil and the block runs — this
+	// is the case that distinguishes "the block did not run" from "the guard held".
+	other := Sub("child", "arg", queue.Priority(7))
+	assert.False(t, other.RetriesSet,
+		"an unrelated option must not cause a retry count to be stamped")
+	assert.Zero(t, other.Retries)
+	assert.Equal(t, 7, other.Priority, "sanity: the option block really did run")
+
+	// Explicit values still arrive, including an explicit zero.
+	seven := Sub("child", "arg", queue.Retries(7))
+	assert.True(t, seven.RetriesSet)
+	assert.Equal(t, 7, seven.Retries)
+
+	zero := Sub("child", "arg", queue.Retries(0))
+	assert.True(t, zero.RetriesSet, "an explicit Retries(0) means DO NOT RETRY and must be honoured")
+	assert.Zero(t, zero.Retries)
+}

@@ -899,6 +899,60 @@ func TestCancelJob_TravelsTheFailurePathNotThePauseRelease(t *testing.T) {
 //     going away. Without it, a parent cancel arriving before shuttingDown is set
 //     is misclassified as a self-cancel.
 func TestSelfCancelledRequiresBothClauses(t *testing.T) {
+	// THE NAME WAS A LIE FOR ONE ROUND. This test shipped claiming to cover "the
+	// two discriminating clauses" and spelling both out by name, with exactly ONE
+	// subtest — covering only the jobCtx half. `ctx.Err() == nil` stayed free, and
+	// the whole repository was green with it deleted. A test whose comment claims
+	// more than its body is the same defect as a comment that claims more than its
+	// code; it just takes a round longer to notice.
+	t.Run("a PARENT-context cancel is not a self-cancel", func(t *testing.T) {
+		var failCalls, completeCalls atomic.Int64
+		store := &mockStorage{}
+		store.failFunc = func(context.Context, core.UUID, string, string, *time.Time) error {
+			failCalls.Add(1)
+			return nil
+		}
+		store.completeFunc = func(context.Context, core.UUID, string) error {
+			completeCalls.Add(1)
+			return nil
+		}
+
+		q := queue.New(store)
+		started := make(chan struct{})
+		q.Register("obeys", func(hctx context.Context, _ struct{}) error {
+			close(started)
+			<-hctx.Done()
+			return hctx.Err()
+		})
+		// The caller's explicit policy: a cancellation is NOT a failure.
+		q.SetIsFailure(func(_ *core.Job, err error) bool { return !errors.Is(err, context.Canceled) })
+
+		w := NewWorker(q) // NOT shutting down — that branch is tested separately
+		ctx, cancel := context.WithCancel(context.Background())
+		job := &core.Job{ID: core.NewID(), Type: "obeys", Queue: "default", Status: core.StatusRunning, MaxRetries: 2}
+
+		done := make(chan struct{})
+		go func() { defer close(done); w.processJob(ctx, job) }()
+		select {
+		case <-started:
+		case <-time.After(10 * time.Second):
+			t.Fatal("handler never started")
+		}
+		cancel() // the PARENT goes away — not a worker-induced cancel
+		select {
+		case <-done:
+		case <-time.After(15 * time.Second):
+			t.Fatal("processJob never returned")
+		}
+
+		assert.Zero(t, failCalls.Load(),
+			"a parent-context cancel must still be routed through the configured IsFailure — "+
+				"treating it as a self-cancel bypasses the caller's explicit policy and fails a job "+
+				"they said should not be failed")
+		assert.Equal(t, int64(1), completeCalls.Load(),
+			"and with IsFailure saying this is not a failure, the job completes")
+	})
+
 	t.Run("a handler's OWN cancelled context is not a self-cancel", func(t *testing.T) {
 		var failCalls atomic.Int64
 		store := &mockStorage{}
@@ -932,4 +986,49 @@ func TestSelfCancelledRequiresBothClauses(t *testing.T) {
 				"must still be routed through the configured IsFailure — treating it as a "+
 				"self-cancel overrides the caller's explicit policy")
 	})
+}
+
+// TestShutdownReleaseRequiresAnActualCancellation covers the `errors.Is(err,
+// context.Canceled)` half of the shutdown branch, which was FREE: deleting it left
+// the entire repository green, including the 312-second ./tests package.
+//
+// It is structurally identical to the pause-mark defect this campaign fixed two
+// rounds ago, on the neighbouring branch of the same function. Without it, ANY
+// genuine handler error that happens to land while the worker is shutting down is
+// rerouted into the release path: the job goes back to `pending` with its attempt
+// INTACT, no Fail, no JobFailed/JobRetrying, and the error discarded.
+//
+// That is reachable on EVERY graceful shutdown, not in a corner — every in-flight
+// job that fails for a real reason during Stop() takes this branch.
+func TestShutdownReleaseRequiresAnActualCancellation(t *testing.T) {
+	var failCalls atomic.Int64
+	store := &mockStorage{}
+	store.failFunc = func(context.Context, core.UUID, string, string, *time.Time) error {
+		failCalls.Add(1)
+		return nil
+	}
+
+	q := queue.New(store)
+	q.Register("boom", func(context.Context, struct{}) error {
+		return errors.New("a real failure, unrelated to the shutdown")
+	})
+
+	w := NewWorker(q)
+	w.shuttingDown.Store(true) // a Stop() is in progress
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	job := &core.Job{ID: core.NewID(), Type: "boom", Queue: "default", Status: core.StatusRunning, MaxRetries: 3}
+	w.processJob(ctx, job)
+
+	assert.Equal(t, int64(1), failCalls.Load(),
+		"a GENUINE error during shutdown must still travel the failure path — routing it into the "+
+			"shutdown release discards the error and returns the job to pending with its attempt "+
+			"intact, so a real failure silently becomes a free retry")
+
+	store.mu.Lock()
+	released := append([]core.UUID(nil), store.releasedJobIDs...)
+	store.mu.Unlock()
+	assert.NotContains(t, released, job.ID,
+		"and it must not be released as though the shutdown had cancelled it")
 }

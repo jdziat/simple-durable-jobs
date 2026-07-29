@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -279,12 +280,12 @@ func TestTryAcquireConcurrencySlots_RollbackReleasesOnADetachedContext(t *testin
 	// Seed the row on a LIVE context, then drive the acquire on the cancelled one.
 	// The first cap is refused (empty key -> capSlotName fails), which is rollback
 	// exit #1, and it must still remove what a previous run left behind.
+	// No manual slotJobID seed: record-before-acquire means the acquire publishes
+	// the entry itself. An earlier version hand-seeded it, which was dead weight
+	// AND pre-populated a token production always allocates fresh.
 	tok := w.nextRunToken.Add(1)
 	require.True(t, base.TryAcquireConcurrencySlotOK("customer:acme", job.ID, "worker-1"),
-		"seed the row the rollback has to remove")
-	w.slotJobIDMu.Lock()
-	w.slotJobID[tok] = slotHold{jobID: job.ID, names: []string{"customer:acme"}}
-	w.slotJobIDMu.Unlock()
+		"seed the ROW the rollback has to remove")
 
 	require.False(t, w.tryAcquireConcurrencySlots(ctx, job, tok),
 		"an already-cancelled context must not admit the job")
@@ -420,4 +421,113 @@ func TestReleaseConcurrencySlots_HolderScanIsScopedToTheSameJobID(t *testing.T) 
 
 	w.releaseConcurrencySlots(ctx, jobB.ID, tokB)
 	assert.Zero(t, store.slotCount("customer:globex"))
+}
+
+// nthGateStorage parks AFTER the Nth successful acquire of a named slot, without
+// erroring — so the run it parks continues walking its cap loop afterwards. That
+// "afterwards" is the whole point: it is where record() runs again.
+type nthGateStorage struct {
+	*capMockStorage
+	gateFor string
+	nth     int
+	seen    atomic.Int64
+	entered chan struct{}
+	proceed chan struct{}
+	once    sync.Once
+}
+
+func (s *nthGateStorage) TryAcquireConcurrencySlot(ctx context.Context, slotName string, jobID core.UUID, workerID string, limit int, ttl time.Duration) (bool, error) {
+	ok, err := s.capMockStorage.TryAcquireConcurrencySlot(ctx, slotName, jobID, workerID, limit, ttl)
+	if slotName == s.gateFor && ok && int(s.seen.Add(1)) == s.nth {
+		s.once.Do(func() {
+			close(s.entered)
+			<-s.proceed
+		})
+	}
+	return ok, err
+}
+
+// TestTryAcquireConcurrencySlots_RecordDoesNotDiscardHandedOverNames covers the
+// interaction between the two halves of the ownership design, which was broken:
+// releaseConcurrencySlots MERGES a departing run's names into the survivor, and
+// tryAcquireConcurrencySlots' record() then REPLACED that entry wholesale on its
+// next iteration. The handover survived exactly one loop step.
+//
+// FALSE-GREEN TRAP, and my first attempt at this test fell straight into it: I
+// parked the successor inside an ERRORING acquire. The loop then breaks
+// immediately, record() never runs again, the merged entry is still intact, and
+// the rollback releases everything — green with the bug fully present. The defect
+// needs the successor to SUCCEED at the cap it is parked in and keep walking, so
+// that a later record() has something to overwrite.
+//
+// The cap key deliberately DRIFTS between the two runs, so the successor never
+// re-derives the earlier run's names: they are reachable only through the
+// handover, which makes the discard observable rather than masked.
+func TestTryAcquireConcurrencySlots_RecordDoesNotDiscardHandedOverNames(t *testing.T) {
+	job := runningJob("job-1", "acme")
+	base := newCapMockStorage([]*core.Job{job})
+	// Park after the SECOND successful acquire of customer:* — run #1 takes the
+	// first, so this parks the successor mid-loop with one more cap still to go.
+	store := &nthGateStorage{
+		capMockStorage: base,
+		gateFor:        "customer:beta",
+		nth:            1,
+		entered:        make(chan struct{}),
+		proceed:        make(chan struct{}),
+	}
+	q := queue.New(store)
+	q.Register(job.Type, func(context.Context, struct{}) error { return nil })
+
+	var keyN atomic.Int64
+	drifting := CapKey(func(*core.Job) string {
+		if keyN.Load() == 0 {
+			return "acme"
+		}
+		return "beta"
+	})
+	w := NewWorker(q,
+		WorkerQueue("default", Concurrency(3)),
+		ConcurrencyCap("customer", 1, drifting),
+		ConcurrencyCap("region", 1, drifting),
+		DisableRetry(),
+	)
+	w.config.WorkerID = "worker-1"
+	ctx := context.Background()
+
+	tok1 := w.nextRunToken.Add(1)
+	require.True(t, w.tryAcquireConcurrencySlots(ctx, job, tok1))
+	require.Equal(t, 1, base.slotCount("customer:acme"))
+	require.Equal(t, 1, base.slotCount("region:acme"))
+
+	// The same job id, re-dequeued, now deriving a different key.
+	keyN.Store(1)
+	tok2 := w.nextRunToken.Add(1)
+	done := make(chan bool, 1)
+	go func() { done <- w.tryAcquireConcurrencySlots(ctx, job, tok2) }()
+
+	<-store.entered // successor has acquired customer:beta and is parked mid-loop
+	w.releaseConcurrencySlots(ctx, job.ID, tok1)
+
+	// PREMISE: the handover put run #1's names onto the successor, and the
+	// successor still has another cap to acquire — so a later record() is coming.
+	w.slotJobIDMu.Lock()
+	merged := append([]string(nil), w.slotJobID[tok2].names...)
+	w.slotJobIDMu.Unlock()
+	require.ElementsMatch(t, []string{"customer:beta", "customer:acme", "region:acme"}, merged,
+		"PREMISE: the successor must be holding the handed-over names AND still be mid-loop — "+
+			"without that there is no later record() to discard them and this test cannot fail")
+
+	close(store.proceed)
+	require.True(t, <-done, "the successor's acquire succeeds")
+
+	// Both runs are done; the successor was the last one out, so it owed every row.
+	w.releaseConcurrencySlots(ctx, job.ID, tok2)
+
+	for _, n := range []string{"customer:acme", "region:acme", "customer:beta", "region:beta"} {
+		assert.Zero(t, base.slotCount(n),
+			"%s must be released once both runs finish. The earlier run's rows are reachable "+
+				"ONLY through the handover, so a record() that replaces rather than merges strands "+
+				"them — held by nobody, released by nobody, until the 45-minute slot TTL expires, "+
+				"denying one slot of a FLEET-WIDE cap to every worker in the deployment", n)
+	}
 }

@@ -1737,9 +1737,18 @@ func (w *Worker) tryAcquireConcurrencySlots(ctx context.Context, job *core.Job, 
 	//
 	// Stores a COPY: the local slice is appended to on the next iteration, and
 	// append reuses the backing array while there is capacity.
+	// MERGES, it does not replace. A departing run hands its names to this one
+	// (see releaseConcurrencySlots), and that can land at ANY point while this loop
+	// is still walking the caps. A wholesale assignment here would discard
+	// everything handed over on the very next iteration — so the handover survived
+	// exactly one loop step, and the names it rescued leaked to the slot TTL after
+	// all. Reproduced two ways: three caps with a transient error on the second,
+	// and two caps with a CapKey that changed between the runs, the latter on the
+	// PLAIN SUCCESS PATH with no error, refusal or shutdown involved.
 	record := func(names []string) {
 		w.slotJobIDMu.Lock()
-		w.slotJobID[runToken] = slotHold{jobID: job.ID, names: append([]string(nil), names...)}
+		prev := w.slotJobID[runToken]
+		w.slotJobID[runToken] = slotHold{jobID: job.ID, names: unionSlotNames(names, prev.names)}
 		w.slotJobIDMu.Unlock()
 	}
 	// A rollback must not release on the context that just failed: on shutdown ctx

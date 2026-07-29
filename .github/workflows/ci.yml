@@ -201,6 +201,12 @@ jobs:
       # superseded. .gitignore alone cannot prevent this because it only covers
       # names someone predicted.
       #
+      # It classifies by scanning for a NUL byte, which is the same heuristic git
+      # uses but without git's attribute layer on top. HONEST LIMIT: a binary
+      # containing no NUL at all is not detected by content — the size gate below
+      # is the backstop for that, and the extension allowlist means an ELF named
+      # `logo.png` also passes. This is a good filter, not a proof.
+      #
       # The first version of this step matched a LIST of magic bytes (ELF, Mach-O,
       # PE, ar, wasm). That reproduced the very flaw it criticised .gitignore for:
       # one commit later a 221 KB `sqlite.db.tmp` was committed at the module root
@@ -241,13 +247,24 @@ jobs:
             # one git considers binary. The pattern is "^" (start of line), which
             # every line of every text file has -- "." would miss a file that is
             # only blank lines and report it as binary.
-            # ":(literal)" because git treats a pathspec as a GLOB: a file named
-            # `*.bin` would also match a sibling TEXT file, and the binary would be
-            # judged text. Third distinct filename evasion of this one guard —
-            # C-quoting, then globbing — which is why it fails closed on anything
-            # it cannot classify rather than trying to enumerate the tricks.
-            if ! git grep -Iq "^" -- ":(literal)$f" 2>/dev/null; then
-              found="$found $f($(stat -c%s "$f")B)"
+            # Scan the BYTES; do not ask git. `git grep -I` consults the `diff`
+            # gitattribute before its own NUL heuristic, so the same commit that
+            # carries a payload can reclassify it: one line of `* diff` in
+            # .gitattributes made a committed ELF pass cleanly, and `path -diff`
+            # made a 22-byte text file red the build. A guard whose verdict the
+            # committer controls is not a guard. This also removes three separate
+            # filename evasions the git delegation kept producing (C-quoted paths,
+            # glob pathspecs, leading dashes) — `--` and a direct read have no
+            # such surface.
+            #
+            # NUL-in-file is the classifier. NOT `grep -P '\x00'`: PCRE cannot
+            # match NUL in several grep builds, so that silently matches nothing
+            # and the check passes on everything — a detector that is inert is
+            # worse than none.
+            raw=$(cat -- "$f" | wc -c)
+            stripped=$(cat -- "$f" | tr -d '\000' | wc -c)
+            if [ "$raw" -ne "$stripped" ]; then
+              found="$found $f($(stat -c%s -- "$f")B)"
             fi
           done < <(git ls-files -z)
           if [ -n "$found" ]; then
@@ -266,7 +283,7 @@ jobs:
           while IFS= read -r -d '' f; do
             [ -L "$f" ] && continue
             [ -f "$f" ] || continue
-            sz=$(stat -c%s "$f")
+            sz=$(stat -c%s -- "$f")
             if [ "$sz" -gt 1048576 ]; then big="$big $f($((sz/1024))KiB)"; fi
           done < <(git ls-files -z)
           if [ -n "$big" ]; then

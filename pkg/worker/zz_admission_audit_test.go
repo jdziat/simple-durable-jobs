@@ -797,3 +797,86 @@ func TestRunHeartbeat_RenewsTheConcurrencySlot(t *testing.T) {
 		t.Fatal("runHeartbeat did not return after its context was cancelled")
 	}
 }
+
+// TestDispatch_EveryBounceRefundsTheQueueRateToken covers the three
+// refundQueueRateLimit call sites that were FREE. Only the fleet-rate-deny site
+// was guarded; deleting the refund from the concurrency-cap bounce, the
+// shutdown-check bounce or the jobsChan-ctx.Done bounce left the whole package
+// green — under a commit literally titled "audit admission balance on every path".
+//
+// A per-queue rate limit is a token bucket consumed BEFORE admission. A job that
+// consumes a token and is then bounced must hand it back; otherwise the token is
+// burned by a job that never ran, and a configured limit under-delivers for the
+// rest of the process's life. Silent, cumulative, and invisible to every other
+// assertion in the suite.
+//
+// FALSE-GREEN TRAP: a worker with a generous bucket cannot see a lost token — the
+// next admission succeeds regardless. The bucket has to be small enough that the
+// refund is the difference between admitting and not.
+func TestDispatch_EveryBounceRefundsTheQueueRateToken(t *testing.T) {
+	newJob := func() *core.Job { return runningJob(string(core.NewID()), "acme") }
+
+	// A bucket of exactly ONE token per queue: if a bounce fails to refund, the
+	// very next dispatch is refused for lack of a token rather than on its merits.
+	newWorker := func(t *testing.T, store core.Storage, extra ...WorkerOption) *Worker {
+		t.Helper()
+		q := queue.New(store)
+		q.Register("work", func(context.Context, struct{}) error { return nil })
+		opts := append([]WorkerOption{
+			WorkerQueue("default", Concurrency(4)),
+			WithQueueRateLimit("default", 1, 1),
+		}, extra...)
+		w := NewWorker(q, opts...)
+		w.config.WorkerID = "worker-1"
+		return w
+	}
+
+	tokenAvailable := func(w *Worker) bool { return w.tryConsumeQueueRateLimit("default") }
+
+	t.Run("a concurrency-cap refusal refunds", func(t *testing.T) {
+		job := newJob()
+		store := newCapMockStorage([]*core.Job{job})
+		w := newWorker(t, store,
+			ConcurrencyCap("customer", 1, CapKey(func(j *core.Job) string { return j.UniqueKey })))
+		// FILL the cap with a different job id under the same key, so this job is
+		// refused on its merits. (A limit of 0 does not refuse — it is clamped.)
+		require.True(t, store.TryAcquireConcurrencySlotOK("customer:acme", core.NewID(), "other-worker"))
+		ch := make(chan dispatchedJob, 4)
+		dispatched, released := w.dispatchDequeuedJobs(context.Background(), ch, []*core.Job{job})
+		require.Zero(t, dispatched)
+		require.Equal(t, 1, released)
+		assert.True(t, tokenAvailable(w),
+			"the queue rate token consumed before the cap check must be refunded on a cap "+
+				"refusal — a burned token permanently lowers the configured rate")
+	})
+
+	t.Run("a shutdown before dispatch refunds", func(t *testing.T) {
+		job := newJob()
+		store := newCapMockStorage([]*core.Job{job})
+		w := newWorker(t, store)
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel() // ctx.Err() != nil at the shutdown check
+		ch := make(chan dispatchedJob, 4)
+		dispatched, released := w.dispatchDequeuedJobs(ctx, ch, []*core.Job{job})
+		require.Zero(t, dispatched)
+		require.Equal(t, 1, released)
+		assert.True(t, tokenAvailable(w),
+			"a shutdown bounce must refund the queue rate token; the job never ran")
+	})
+
+	t.Run("a blocked jobsChan send during shutdown refunds", func(t *testing.T) {
+		job := newJob()
+		store := newCapMockStorage([]*core.Job{job})
+		w := newWorker(t, store)
+		// An UNBUFFERED channel nobody reads, with a context that is cancelled
+		// while the send is parked: the select takes its ctx.Done() arm.
+		ch := make(chan dispatchedJob)
+		ctx, cancel := context.WithCancel(context.Background())
+		go func() { time.Sleep(50 * time.Millisecond); cancel() }()
+		dispatched, released := w.dispatchDequeuedJobs(ctx, ch, []*core.Job{job})
+		require.Zero(t, dispatched)
+		require.Equal(t, 1, released)
+		assert.True(t, tokenAvailable(w),
+			"a job bounced because the dispatch channel never drained must refund its token")
+	})
+}
