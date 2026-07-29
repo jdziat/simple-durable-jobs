@@ -159,3 +159,142 @@ func TestDispatch_TokensAreUniquePerRun(t *testing.T) {
 	assert.Len(t, seen, len(jobs), "every run must get its own token, even for one job id")
 	assertAdmissionDrained(t, w, "default")
 }
+
+// TestProcessJob_WaitingSuspendReleasesAdmission covers the fan-out / signal-wait
+// path, where the handler parks the job in StatusWaiting and returns without
+// completing OR failing.
+//
+// It is the path most likely to leak admission state, because it returns early
+// from the disposition block rather than falling through — and a fan-out parent
+// can sit in StatusWaiting for the entire runtime of its children. A leaked
+// per-queue slot there would be held for minutes or hours, and a leaked
+// concurrency slot would hold a FLEET-wide cap that whole time.
+//
+// FALSE-GREEN TRAP: asserting the job reached StatusWaiting says nothing about
+// admission; the observation has to be that the counter and both run-keyed maps
+// are back to empty.
+func TestProcessJob_WaitingSuspendReleasesAdmission(t *testing.T) {
+	q := queue.New(&mockStorage{})
+	q.Register("parks", func(context.Context, struct{}) error {
+		return waitingSignal{}
+	})
+	w := NewWorker(q, WorkerQueue("default", Concurrency(3)))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	w.processJob(ctx, &core.Job{
+		ID: core.NewID(), Type: "parks", Queue: "default", Status: core.StatusRunning,
+	})
+
+	assert.Equal(t, int32(0), w.queueRunning["default"].Load(),
+		"a job parked in StatusWaiting must release its queue slot — a fan-out parent waits for "+
+			"the whole runtime of its children, so holding it would stall the queue that long")
+	assertAdmissionDrained(t, w, "default")
+}
+
+// waitingSignal is the self-suspension control-flow error a fan-out or signal wait
+// returns: the handler has already persisted the job as StatusWaiting.
+type waitingSignal struct{}
+
+func (waitingSignal) Error() string         { return "job waiting" }
+func (waitingSignal) WorkflowWaiting() bool { return true }
+
+// TestProcessJobRun_ReleasesAdmissionRegisteredByDispatch is the END-TO-END
+// pairing, and the only test here that can actually see the release defers.
+//
+// FALSE-GREEN TRAP, which the first version of this file fell into: driving
+// processJob directly registers NO admission state, because registration happens
+// in dispatchDequeuedJobs on the far side of the channel. Deleting
+// `defer w.untrackQueueJob(runToken)` therefore left every one of those tests
+// green — there was nothing to untrack. The job has to be admitted the way
+// dispatch admits it and then run under the SAME token dispatch issued.
+func TestProcessJobRun_ReleasesAdmissionRegisteredByDispatch(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		handler func(context.Context, struct{}) error
+	}{
+		{"completes", func(context.Context, struct{}) error { return nil }},
+		{"fails", func(context.Context, struct{}) error { return assert.AnError }},
+		{"panics", func(context.Context, struct{}) error { panic("exploded") }},
+		{"parks in waiting", func(context.Context, struct{}) error { return waitingSignal{} }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			q := queue.New(&mockStorage{})
+			q.Register("t", tc.handler)
+			w := NewWorker(q, WorkerQueue("default", Concurrency(3)))
+			counter := w.queueRunning["default"]
+
+			ch := make(chan dispatchedJob, 1)
+			job := &core.Job{ID: core.NewID(), Type: "t", Queue: "default", Status: core.StatusRunning, MaxRetries: 1}
+			dispatched, _ := w.dispatchDequeuedJobs(context.Background(), ch, []*core.Job{job})
+			require.Equal(t, 1, dispatched)
+			require.Equal(t, int32(1), counter.Load(), "dispatch must have admitted it")
+
+			dj := <-ch
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			w.processJobRun(ctx, dj.job, dj.token)
+
+			assert.Equal(t, int32(0), counter.Load(),
+				"the run must release the queue slot dispatch admitted for it, whatever its "+
+					"outcome — a leak here climbs until the queue refuses every job")
+			assertAdmissionDrained(t, w, "default")
+		})
+	}
+}
+
+// TestProcessJobRun_ReleasesConcurrencySlotsRegisteredByDispatch is the same
+// pairing for the FLEET concurrency slots, which the queue-counter test above
+// cannot see.
+//
+// FALSE-GREEN TRAP, hit while writing the test above: a worker with no
+// ConcurrencyCap configured acquires no slots at all, so slotJobID stays empty and
+// deleting the release defer changes nothing. The cap has to be configured, and
+// the storage has to be one that actually implements slot acquisition.
+//
+// A leak here is worse than the queue counter: the slot row is FLEET-wide, so a
+// held slot throttles every worker in the deployment, not just this one.
+func TestProcessJobRun_ReleasesConcurrencySlotsRegisteredByDispatch(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		handler func(context.Context, struct{}) error
+	}{
+		{"completes", func(context.Context, struct{}) error { return nil }},
+		{"fails", func(context.Context, struct{}) error { return assert.AnError }},
+		{"parks in waiting", func(context.Context, struct{}) error { return waitingSignal{} }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			job := runningJob("job-1", "acme")
+			store := newCapMockStorage([]*core.Job{job})
+			q := queue.New(store)
+			q.Register(job.Type, tc.handler)
+			w := NewWorker(q,
+				WorkerQueue("default", Concurrency(3)),
+				ConcurrencyCap("customer", 1, CapKey(func(j *core.Job) string { return j.UniqueKey })),
+				DisableRetry(),
+			)
+			w.config.WorkerID = "worker-1"
+
+			ch := make(chan dispatchedJob, 1)
+			dispatched, _ := w.dispatchDequeuedJobs(context.Background(), ch, []*core.Job{job})
+			require.Equal(t, 1, dispatched)
+
+			dj := <-ch
+			w.slotJobIDMu.Lock()
+			held := len(w.slotJobID[dj.token])
+			w.slotJobIDMu.Unlock()
+			require.Positive(t, held, "dispatch must have acquired a cap slot, or this proves nothing")
+
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			w.processJobRun(ctx, dj.job, dj.token)
+
+			w.slotJobIDMu.Lock()
+			remaining := len(w.slotJobID)
+			w.slotJobIDMu.Unlock()
+			assert.Zero(t, remaining,
+				"the run must release the FLEET concurrency slot dispatch acquired for it — a "+
+					"held slot throttles every worker in the deployment, not just this one")
+		})
+	}
+}
