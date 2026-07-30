@@ -62,7 +62,7 @@ type CallState struct {
 	LegacySpanWarned bool
 }
 
-// HasLegacyCallSpans reports whether this job carries MORE THAN ONE Call
+// HasLegacyCallSpans reports whether this job carries MORE THAN ONE user Call()
 // checkpoint written before span tracking existed (SpanEnd == 0).
 //
 // Such a job is a candidate for the pre-v4.6 nested-call defect: its indices were
@@ -81,6 +81,12 @@ func (cs *CallState) HasLegacyCallSpans() bool {
 	for key, cp := range cs.Checkpoints {
 		if key.Index < 0 || cp == nil {
 			continue // phase checkpoints use Index == -1
+		}
+		if !core.IsCallCheckpointType(cp.CallType) {
+			// A built-in durable operation (fan-out, signal wait). Only Call()
+			// records a span, so these carry SpanEnd == 0 in every version
+			// including this one — counting them warns about healthy work.
+			continue
 		}
 		if cp.SpanEnd == 0 {
 			legacy++

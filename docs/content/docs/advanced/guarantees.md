@@ -188,6 +188,9 @@ mid-replay. Two consequences:
    FROM jobs j
    INNER JOIN checkpoints c ON c.job_id = j.id
    WHERE c.call_index >= 0 AND c.span_end = 0
+     AND c.call_type <> 'fanout'
+     AND c.call_type NOT LIKE 'signal:%'
+     AND c.call_type NOT LIKE 'signaltimeout:%'
      AND j.status NOT IN ('completed', 'cancelled', 'failed')
    GROUP BY j.id, j.type
    HAVING count(c.id) > 1;
@@ -196,6 +199,12 @@ mid-replay. Two consequences:
    The listing is a deliberate over-approximation: nothing recorded tells us
    whether a legacy call actually nested, so flat workflows with two or more
    calls appear too. Requeue anything you cannot rule out.
+
+   The `call_type` exclusions are load-bearing. Only `Call()` records a span, so
+   a fan-out or signal-wait checkpoint carries `span_end = 0` in every version
+   including the current one. Drop them and this lists healthy work — whose
+   documented repair, a checkpoint-clearing `Requeue`, would discard completed
+   durable operations and re-run their side effects.
 
 A worker replaying pre-span checkpoints also logs one `WARN` per run naming the
 job, so this is visible without running the query.

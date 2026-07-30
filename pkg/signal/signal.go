@@ -155,7 +155,7 @@ func WaitForSignal[T any](ctx context.Context, name string) (T, error) {
 	if err := validateName(name); err != nil {
 		return zero, err
 	}
-	ctype := "signal:" + name
+	ctype := core.CheckpointTypeSignalPrefix + name
 
 	idx, cp, has := nextCheckpoint(cs, ctype)
 	if has {
@@ -262,7 +262,7 @@ func WaitForSignalTimeout[T any](ctx context.Context, name string, d time.Durati
 	if err := validateName(name); err != nil {
 		return zero, false, err
 	}
-	ctype := "signaltimeout:" + name
+	ctype := core.CheckpointTypeSignalTimeoutPrefix + name
 
 	idx, cp, has := nextCheckpoint(cs, ctype)
 	var tc timeoutCheckpoint

@@ -54,6 +54,9 @@ old behaviour — changing it mid-replay would be worse than leaving it. So:
   FROM jobs j
   INNER JOIN checkpoints c ON c.job_id = j.id
   WHERE c.call_index >= 0 AND c.span_end = 0
+    AND c.call_type <> 'fanout'
+    AND c.call_type NOT LIKE 'signal:%'
+    AND c.call_type NOT LIKE 'signaltimeout:%'
     AND j.status NOT IN ('completed', 'cancelled', 'failed')
   GROUP BY j.id, j.type
   HAVING count(c.id) > 1;
@@ -66,6 +69,16 @@ old behaviour — changing it mid-replay would be worse than leaving it. So:
 The listing is a deliberate over-approximation — nothing recorded tells us whether
 a legacy call actually nested, so flat workflows with two or more calls appear
 too. Requeue anything you cannot rule out.
+
+The `call_type` exclusions are not optional, and dropping them is not a
+simplification. Only `Call()` records a span, so a checkpoint written for a
+built-in durable operation — a fan-out, a signal wait — carries `span_end = 0` in
+**every** version including the one you just upgraded to. Without the exclusions
+this query lists healthy current-version workflows, and since the repair for a
+listed job is a checkpoint-clearing `Requeue`, acting on one would discard
+completed work and re-run its side effects. Note also that `checkpoints.span_end`
+is added by the v4.6 migration, so this query only runs *after* upgrading — by
+which point current-version checkpoints are guaranteed to be present.
 
 ### Security: upgrade if you expose the dashboard
 

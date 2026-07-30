@@ -49,7 +49,7 @@ func FanOut[T any](ctx context.Context, subJobs []SubJob, opts ...Option) ([]Res
 	cs.Mu.Lock()
 	callIndex := cs.CallIndex
 	cs.CallIndex++
-	checkpoint, hasCheckpoint := cs.Checkpoints[intctx.CheckpointKey{Index: callIndex, Type: "fanout"}]
+	checkpoint, hasCheckpoint := cs.Checkpoints[intctx.CheckpointKey{Index: callIndex, Type: core.CheckpointTypeFanOut}]
 	cs.Mu.Unlock()
 
 	var fanOutID core.UUID
@@ -134,7 +134,7 @@ func FanOut[T any](ctx context.Context, subJobs []SubJob, opts ...Option) ([]Res
 		ID:        core.NewID(),
 		JobID:     jc.Job.ID,
 		CallIndex: callIndex,
-		CallType:  "fanout",
+		CallType:  core.CheckpointTypeFanOut,
 		Result:    cpData,
 	}
 

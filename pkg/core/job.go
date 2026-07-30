@@ -1,6 +1,7 @@
 package core
 
 import (
+	"strings"
 	"time"
 )
 
@@ -128,6 +129,50 @@ type Checkpoint struct {
 	// already in flight exactly as (in)correct as they were before the upgrade.
 	SpanEnd   int       `gorm:"type:integer;not null;default:0"`
 	CreatedAt time.Time `gorm:"autoCreateTime"`
+}
+
+// Checkpoint CallType values reserved for BUILT-IN durable operations rather
+// than a user Call(). They share the flat call-index counter with Call, so they
+// occupy real (non-negative) call indices, but only Call() records a SpanEnd —
+// these are always written with SpanEnd == 0, by every version.
+//
+// They are defined here, next to the Checkpoint they describe, so the producers
+// and the legacy-span detector read from ONE list. Keeping the detector's
+// exclusions hand-synced against the producers is how span_end itself came to be
+// omitted from a hand-written column list once already.
+const (
+	// CheckpointTypeFanOut is the CallType of a fan-out's checkpoint.
+	CheckpointTypeFanOut = "fanout"
+	// CheckpointTypeSignalPrefix prefixes the CallType of a signal wait,
+	// followed by the signal name.
+	CheckpointTypeSignalPrefix = "signal:"
+	// CheckpointTypeSignalTimeoutPrefix prefixes the CallType of a signal wait
+	// with a timeout, followed by the signal name.
+	CheckpointTypeSignalTimeoutPrefix = "signaltimeout:"
+)
+
+// IsCallCheckpointType reports whether callType belongs to a user Call() rather
+// than one of the built-in durable operations above.
+//
+// This is the discriminator the legacy-span detector needs. SpanEnd == 0 alone
+// does not mean "written before span tracking existed": a built-in operation's
+// checkpoint has SpanEnd == 0 in every version, including the current one, so
+// treating it as legacy flags healthy work as pre-upgrade-corrupt.
+//
+// Residual, accepted: a user Call() named exactly "fanout", or one whose name
+// begins "signal:" or "signaltimeout:", is classified as built-in and so escapes
+// the legacy listing. That is a deliberate trade against the alternative — a
+// systematic false positive on every workflow using two built-in operations,
+// whose documented repair discards completed work.
+func IsCallCheckpointType(callType string) bool {
+	switch {
+	case callType == CheckpointTypeFanOut,
+		strings.HasPrefix(callType, CheckpointTypeSignalPrefix),
+		strings.HasPrefix(callType, CheckpointTypeSignalTimeoutPrefix):
+		return false
+	default:
+		return true
+	}
 }
 
 // FanOutCheckpoint stores fan-out state for job replay.
