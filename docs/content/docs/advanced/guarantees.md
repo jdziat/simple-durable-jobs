@@ -189,8 +189,11 @@ mid-replay. Two consequences:
    INNER JOIN checkpoints c ON c.job_id = j.id
    WHERE c.call_index >= 0 AND c.span_end = 0
      AND c.call_type <> 'fanout'
+     AND c.call_type <> '_sleep'
      AND c.call_type NOT LIKE 'signal:%'
      AND c.call_type NOT LIKE 'signaltimeout:%'
+     AND c.call_type NOT LIKE 'signalpeek:%'
+     AND c.call_type NOT LIKE 'signaldrain:%'
      AND j.status NOT IN ('completed', 'cancelled', 'failed')
    GROUP BY j.id, j.type
    HAVING count(c.id) > 1;
@@ -198,13 +201,22 @@ mid-replay. Two consequences:
 
    The listing is a deliberate over-approximation: nothing recorded tells us
    whether a legacy call actually nested, so flat workflows with two or more
-   calls appear too. Requeue anything you cannot rule out.
+   calls appear too.
+
+   **`Requeue` on a listed job does nothing.** It is the only operation that
+   clears checkpoints, but it accepts only `failed` or `cancelled` jobs, and this
+   listing excludes those statuses — so the two sets are disjoint and it returns
+   `false`. To clear a listed job you must cancel it first
+   (`CancelJobTerminal`, then `Requeue`), which **restarts** the workflow rather
+   than resuming it, and does not un-consume signals a previous run consumed. See
+   [UPGRADE.md](https://github.com/jdziat/simple-durable-jobs/blob/main/UPGRADE.md)
+   for the full procedure and its caveats. Draining before upgrading is the only
+   remedy that loses nothing.
 
    The `call_type` exclusions are load-bearing. Only `Call()` records a span, so
-   a fan-out or signal-wait checkpoint carries `span_end = 0` in every version
-   including the current one. Drop them and this lists healthy work — whose
-   documented repair, a checkpoint-clearing `Requeue`, would discard completed
-   durable operations and re-run their side effects.
+   a fan-out, durable-sleep or signal checkpoint carries `span_end = 0` in every
+   version including the current one. Drop them and this lists healthy work, and
+   a worker logs the pre-upgrade warning for it on every replay.
 
 A worker replaying pre-span checkpoints also logs one `WARN` per run naming the
 job, so this is visible without running the query.

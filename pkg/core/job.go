@@ -149,6 +149,15 @@ const (
 	// CheckpointTypeSignalTimeoutPrefix prefixes the CallType of a signal wait
 	// with a timeout, followed by the signal name.
 	CheckpointTypeSignalTimeoutPrefix = "signaltimeout:"
+	// CheckpointTypeSignalPeekPrefix prefixes the CallType of a non-blocking
+	// signal peek, followed by the signal name.
+	CheckpointTypeSignalPeekPrefix = "signalpeek:"
+	// CheckpointTypeSignalDrainPrefix prefixes the CallType of a signal drain,
+	// followed by the signal name.
+	CheckpointTypeSignalDrainPrefix = "signaldrain:"
+	// CheckpointTypeSleep is the CallType of a durable sleep. pkg/signal
+	// re-exports this as SleepCheckpointType.
+	CheckpointTypeSleep = "_sleep"
 )
 
 // IsCallCheckpointType reports whether callType belongs to a user Call() rather
@@ -167,12 +176,48 @@ const (
 func IsCallCheckpointType(callType string) bool {
 	switch {
 	case callType == CheckpointTypeFanOut,
+		callType == CheckpointTypeSleep,
 		strings.HasPrefix(callType, CheckpointTypeSignalPrefix),
-		strings.HasPrefix(callType, CheckpointTypeSignalTimeoutPrefix):
+		strings.HasPrefix(callType, CheckpointTypeSignalTimeoutPrefix),
+		strings.HasPrefix(callType, CheckpointTypeSignalPeekPrefix),
+		strings.HasPrefix(callType, CheckpointTypeSignalDrainPrefix):
 		return false
 	default:
 		return true
 	}
+}
+
+// builtinCheckpointTypeMatchers is every built-in CallType shape, as an exact
+// value or a LIKE prefix, for callers that must express IsCallCheckpointType in
+// SQL. Kept beside the function so a new built-in operation cannot be added to
+// one and forgotten in the other.
+func builtinCheckpointTypeMatchers() (exact []string, prefixes []string) {
+	return []string{CheckpointTypeFanOut, CheckpointTypeSleep},
+		[]string{
+			CheckpointTypeSignalPrefix,
+			CheckpointTypeSignalTimeoutPrefix,
+			CheckpointTypeSignalPeekPrefix,
+			CheckpointTypeSignalDrainPrefix,
+		}
+}
+
+// BuiltinCheckpointTypeSQLExclusion renders the built-in checkpoint types as a
+// SQL predicate over `col`, together with its bind arguments, so a query can
+// select only user Call() checkpoints. The predicate is the SQL twin of
+// IsCallCheckpointType and is generated from the same lists.
+func BuiltinCheckpointTypeSQLExclusion(col string) (string, []any) {
+	exact, prefixes := builtinCheckpointTypeMatchers()
+	clauses := make([]string, 0, len(exact)+len(prefixes))
+	args := make([]any, 0, len(exact)+len(prefixes))
+	for _, v := range exact {
+		clauses = append(clauses, col+" <> ?")
+		args = append(args, v)
+	}
+	for _, p := range prefixes {
+		clauses = append(clauses, col+" NOT LIKE ?")
+		args = append(args, p+"%")
+	}
+	return strings.Join(clauses, " AND "), args
 }
 
 // FanOutCheckpoint stores fan-out state for job replay.

@@ -55,30 +55,63 @@ old behaviour — changing it mid-replay would be worse than leaving it. So:
   INNER JOIN checkpoints c ON c.job_id = j.id
   WHERE c.call_index >= 0 AND c.span_end = 0
     AND c.call_type <> 'fanout'
+    AND c.call_type <> '_sleep'
     AND c.call_type NOT LIKE 'signal:%'
     AND c.call_type NOT LIKE 'signaltimeout:%'
+    AND c.call_type NOT LIKE 'signalpeek:%'
+    AND c.call_type NOT LIKE 'signaldrain:%'
     AND j.status NOT IN ('completed', 'cancelled', 'failed')
   GROUP BY j.id, j.type
   HAVING count(c.id) > 1;
   ```
 
-  `Requeue` is the only operation that clears checkpoints, so requeueing a listed
-  job is the repair. A worker replaying such checkpoints also logs one `WARN` per
-  run naming the job.
+  A worker replaying such checkpoints also logs one `WARN` per run naming the job.
 
 The listing is a deliberate over-approximation — nothing recorded tells us whether
 a legacy call actually nested, so flat workflows with two or more calls appear
-too. Requeue anything you cannot rule out.
+too.
 
-The `call_type` exclusions are not optional, and dropping them is not a
-simplification. Only `Call()` records a span, so a checkpoint written for a
-built-in durable operation — a fan-out, a signal wait — carries `span_end = 0` in
-**every** version including the one you just upgraded to. Without the exclusions
-this query lists healthy current-version workflows, and since the repair for a
-listed job is a checkpoint-clearing `Requeue`, acting on one would discard
-completed work and re-run its side effects. Note also that `checkpoints.span_end`
-is added by the v4.6 migration, so this query only runs *after* upgrading — by
-which point current-version checkpoints are guaranteed to be present.
+#### Repairing a listed job
+
+**`Requeue` alone does not work here, and earlier revisions of this document were
+wrong to say it did.** `Requeue` is indeed the only operation that clears
+checkpoints, but it accepts a job only when its status is already `failed` or
+`cancelled` — and this listing deliberately excludes exactly those three terminal
+statuses. The two sets are disjoint, so requeueing a listed job returns `false`
+and leaves its checkpoints in place. That holds for genuine positives as much as
+for over-approximated ones, and the per-run `WARN` names the same inoperative
+remedy.
+
+To clear a listed job's checkpoints you must make it terminal first:
+
+```go
+// Restarts the workflow from the beginning.
+if err := storage.CancelJobTerminal(ctx, jobID); err != nil { /* ... */ }
+ok, err := q.Requeue(ctx, jobID)
+```
+
+Two things to weigh before doing that:
+
+- It **restarts** the workflow rather than resuming it. Every completed step runs
+  again, so this is only appropriate where those steps are safe to repeat.
+- Requeueing clears checkpoints but does **not** un-consume signals a previous run
+  already consumed. A signal-driven workflow can therefore re-park on a signal it
+  will never receive again.
+
+Draining nested workflows before you upgrade remains the only remedy that loses
+nothing, which is why it is the first recommendation above.
+
+#### Do not drop the `call_type` exclusions
+
+Only `Call()` records a span, so a checkpoint written for a built-in durable
+operation — a fan-out, a durable sleep, any of the signal operations — carries
+`span_end = 0` in **every** version, including the one you just upgraded to.
+Without the exclusions this query lists healthy current-version workflows and a
+worker logs the pre-upgrade `WARN` for them on every single replay. Note also
+that `checkpoints.span_end` is added by the v4.6 migration, so this query can
+only run *after* upgrading — by which point current-version checkpoints are
+guaranteed to be present, and a workflow that merely calls `Sleep` twice would
+qualify.
 
 ### Security: upgrade if you expose the dashboard
 

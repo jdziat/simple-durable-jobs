@@ -28,7 +28,7 @@ const maxSignalNameLen = security.MaxSignalNameLength
 // SleepCheckpointType is the internal checkpoint CallType used by durable
 // timers. The leading underscore reserves it outside the user Call/phase
 // checkpoint namespace.
-const SleepCheckpointType = "_sleep"
+const SleepCheckpointType = core.CheckpointTypeSleep
 
 // ErrSignalNameReserved indicates a signal name uses a prefix reserved for
 // library-internal workflow primitives.
@@ -453,7 +453,7 @@ func CheckSignal[T any](ctx context.Context, name string) (T, bool, error) {
 	if err := validateName(name); err != nil {
 		return zero, false, err
 	}
-	ctype := "signalpeek:" + name
+	ctype := core.CheckpointTypeSignalPeekPrefix + name
 
 	idx, cp, has := nextCheckpoint(cs, ctype)
 	if has {
@@ -496,7 +496,7 @@ func DrainSignals[T any](ctx context.Context, name string) ([]T, error) {
 	if err := validateName(name); err != nil {
 		return nil, err
 	}
-	ctype := "signaldrain:" + name
+	ctype := core.CheckpointTypeSignalDrainPrefix + name
 
 	idx, cp, has := nextCheckpoint(cs, ctype)
 	if has {
