@@ -314,6 +314,20 @@ jobs:
         working-directory: ui/frontend
         run: npm ci && npm run build
 
+      # svelte-check existed as an npm script and NOTHING ran it, so TypeScript
+      # errors in the dashboard shipped silently — the same "present, and
+      # load-bearing for nobody" shape as the frontend unit tests below. Four real
+      # errors had accumulated in a test file by the time this was added; the tree
+      # is at 0 errors / 0 warnings across 428 files as of this commit, so any
+      # failure here is new.
+      #
+      # `vite build` does NOT typecheck (esbuild strips types without checking
+      # them), so the build passing says nothing about type correctness. This is
+      # the only gate that does.
+      - name: Frontend typecheck
+        working-directory: ui/frontend
+        run: npm run check
+
       # ui/frontend/dist is COMMITTED and //go:embed'd, so it is what consumers
       # actually get — but nothing ever compared it to its own source. A stale
       # bundle would ship silently through go:embed while CI stayed green, because

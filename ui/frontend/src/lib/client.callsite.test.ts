@@ -32,7 +32,7 @@ describe('client.ts RPC base URL', () => {
     await import('./client')
 
     expect(createConnectTransport).toHaveBeenCalledTimes(1)
-    const { baseUrl } = createConnectTransport.mock.calls[0][0] as { baseUrl: string }
+    const [{ baseUrl }] = createConnectTransport.mock.calls[0] as unknown as [{ baseUrl: string }]
     expect(baseUrl).toBe('http://host/jobs/')
     expect(baseUrl).not.toBe('http://host')
   })
@@ -43,7 +43,7 @@ describe('client.ts RPC base URL', () => {
 
     await import('./client')
 
-    const { baseUrl } = createConnectTransport.mock.calls[0][0] as { baseUrl: string }
+    const [{ baseUrl }] = createConnectTransport.mock.calls[0] as unknown as [{ baseUrl: string }]
     expect(baseUrl).toBe('http://host/')
   })
 })
