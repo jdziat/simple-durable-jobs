@@ -164,6 +164,122 @@ func TestScopedMutations_DoNotTouchABystander(t *testing.T) {
 	})
 }
 
+// TestCascadeDeletes_DoNotTouchABystander is the same blast-radius family as
+// above, for the three methods that delete dependent rows by a PLUCKED ID LIST
+// rather than a single job id: retention GC, PurgeJobs, and DeleteWorkflowSubtree.
+// Each resolves a set of job ids and then deletes checkpoints, signals and unique
+// locks `WHERE job_id IN (those ids)`.
+//
+// Those IN-list scopes were free for the same reason as the single-id ones: the
+// existing tests contain only rows belonging to jobs that are being deleted, so
+// "delete the dependent rows of these ids" and "delete every dependent row"
+// cannot be told apart. Neutralized, each of these wipes the checkpoints,
+// buffered signals and dedup locks of jobs that were deliberately SPARED — a
+// surviving job silently loses its replay state, so on its next attempt it
+// re-executes work its checkpoints had already recorded.
+//
+// Each subtest keeps a bystander that the operation is required to spare, and
+// asserts its dependent rows survive alongside it.
+func TestCascadeDeletes_DoNotTouchABystander(t *testing.T) {
+	t.Run("retention GC spares a within-window job's dependent rows", func(t *testing.T) {
+		ctx := context.Background()
+		s := newTestStorage(t)
+		old := time.Now().Add(-2 * time.Hour).UTC()
+		recent := time.Now().Add(-10 * time.Minute).UTC()
+
+		// Purged: terminal and older than the window.
+		purged := core.NewID()
+		require.NoError(t, s.db.Create(&core.Job{
+			ID: purged, Type: "wf", Queue: "default",
+			Status: core.StatusCompleted, CompletedAt: &old,
+		}).Error)
+		seedDependentRows(t, ctx, s, purged, "scope-purged")
+
+		// Spared: terminal but INSIDE the retention window, so it survives — and
+		// so must everything hanging off it.
+		spared := core.NewID()
+		require.NoError(t, s.db.Create(&core.Job{
+			ID: spared, Type: "wf", Queue: "default",
+			Status: core.StatusCompleted, CompletedAt: &recent,
+		}).Error)
+		seedDependentRows(t, ctx, s, spared, "scope-spared")
+
+		deleted, err := s.DeleteTerminalJobsOlderThan(ctx, core.StatusCompleted, time.Hour, 100)
+		require.NoError(t, err)
+		require.Equal(t, int64(1), deleted, "only the out-of-window job should be collected")
+
+		assertDependentRowsSurvive(t, s, spared,
+			"retention collected an out-of-window job and took a within-window job's replay state with it; that job now re-executes work its checkpoints had recorded")
+	})
+
+	t.Run("PurgeJobs spares another queue's dependent rows", func(t *testing.T) {
+		ctx := context.Background()
+		s := newTestStorage(t)
+
+		purged := core.NewID()
+		require.NoError(t, s.db.Create(&core.Job{
+			ID: purged, Type: "wf", Queue: "target-queue", Status: core.StatusFailed,
+		}).Error)
+		seedDependentRows(t, ctx, s, purged, "purge-target")
+
+		spared := core.NewID()
+		require.NoError(t, s.db.Create(&core.Job{
+			ID: spared, Type: "wf", Queue: "other-queue", Status: core.StatusFailed,
+		}).Error)
+		seedDependentRows(t, ctx, s, spared, "purge-spared")
+
+		n, err := s.PurgeJobs(ctx, "target-queue", core.StatusFailed)
+		require.NoError(t, err)
+		require.Equal(t, int64(1), n, "only the target queue should be purged")
+
+		assertDependentRowsSurvive(t, s, spared,
+			"purging one queue deleted another queue's checkpoints, signals or dedup locks")
+	})
+
+	t.Run("DeleteWorkflowSubtree spares an unrelated job's dependent rows", func(t *testing.T) {
+		ctx := context.Background()
+		s := newTestStorage(t)
+
+		root := core.NewID()
+		seedTestJob(t, ctx, s, root, core.StatusCompleted)
+		seedDependentRows(t, ctx, s, root, "subtree-root")
+
+		spared := core.NewID()
+		seedTestJob(t, ctx, s, spared, core.StatusCompleted)
+		seedDependentRows(t, ctx, s, spared, "subtree-spared")
+
+		require.NoError(t, s.DeleteWorkflowSubtree(ctx, root))
+
+		assertDependentRowsSurvive(t, s, spared,
+			"deleting one workflow subtree deleted an unrelated job's checkpoints, signals or dedup locks")
+	})
+}
+
+// seedDependentRows gives a job one of every dependent row the cascade paths
+// delete, so a scope regression shows up whichever table it reaches.
+func seedDependentRows(t *testing.T, ctx context.Context, s *GormStorage, jobID core.UUID, scopeHash string) {
+	t.Helper()
+	require.NoError(t, s.SaveCheckpoint(ctx, &core.Checkpoint{
+		JobID: jobID, CallIndex: 0, CallType: "x", Result: []byte(`"r"`),
+	}))
+	require.NoError(t, s.db.Create(&core.Signal{
+		ID: core.NewID(), JobID: jobID, Name: "sig", Payload: []byte(`"p"`), CreatedAt: time.Now(),
+	}).Error)
+	require.NoError(t, s.db.Create(&core.UniqueLock{
+		ScopeHash: scopeHash, JobID: jobID, ExpiresAt: time.Now().Add(time.Hour),
+	}).Error)
+}
+
+func assertDependentRowsSurvive(t *testing.T, s *GormStorage, jobID core.UUID, msg string) {
+	t.Helper()
+	var jobs int64
+	require.NoError(t, s.db.Model(&core.Job{}).Where("id = ?", jobID).Count(&jobs).Error)
+	require.Equal(t, int64(1), jobs, "the bystander job itself must survive: %s", msg)
+	require.Equal(t, int64(1), countRowsForJob(t, s, &core.Checkpoint{}, jobID), "checkpoints: %s", msg)
+	require.Equal(t, int64(1), countRowsForJob(t, s, &core.Signal{}, jobID), "signals: %s", msg)
+	require.Equal(t, int64(1), countRowsForJob(t, s, &core.UniqueLock{}, jobID), "unique locks: %s", msg)
+}
+
 func countRowsForJob(t *testing.T, s *GormStorage, model any, jobID core.UUID) int64 {
 	t.Helper()
 	var n int64
