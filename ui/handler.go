@@ -231,16 +231,32 @@ func relativeMountRoot(p string) string {
 const maxH2CUpgradeBody = 64 << 10
 
 // isH2CUpgrade reports whether r is an HTTP/1.1 cleartext-HTTP/2 upgrade — the
-// only request shape whose body x/net reads into memory before dispatch. Header
-// tokens are comma-separated and case-insensitive per RFC 9110.
+// only request shape whose body x/net reads into memory before dispatch.
+//
+// This MUST be a superset of whatever x/net treats as an upgrade. Matching it
+// exactly is not good enough and matching it narrowly is a vulnerability: x/net's
+// own isH2CUpgrade requires `Upgrade: h2c` plus the **HTTP2-Settings** token in
+// Connection (golang.org/x/net/http2/h2c, h2c.go), where this function used to
+// require the **upgrade** token. A request sending `Upgrade: h2c` with
+// `Connection: HTTP2-Settings` and no `upgrade` token was therefore an upgrade to
+// x/net — reaching its io.ReadAll(r.Body) — while escaping the cap entirely. That
+// read happens before the connection is hijacked, so it is before cfg.middleware
+// and before the Connect auth interceptor: an unauthenticated client could make
+// the process buffer a body of any size.
+//
+// So the test is now `Upgrade: h2c` alone, ignoring how Connection is spelled.
+// Over-matching is harmless here — the cap applies only to requests claiming an
+// h2c upgrade, and a legitimate large-bodied RPC (BulkDeleteJobs, BulkRetryJobs)
+// never carries that header — whereas under-matching is a pre-auth
+// memory-exhaustion window. Keeping this independent of the Connection spelling
+// also means a future x/net that accepts another token cannot silently reopen it.
+//
+// Header tokens are comma-separated and case-insensitive per RFC 9110.
 func isH2CUpgrade(r *http.Request) bool {
 	if r.ProtoMajor != 1 {
 		return false
 	}
-	if !headerHasToken(r.Header, "Upgrade", "h2c") {
-		return false
-	}
-	return headerHasToken(r.Header, "Connection", "upgrade")
+	return headerHasToken(r.Header, "Upgrade", "h2c")
 }
 
 func headerHasToken(h http.Header, key, token string) bool {

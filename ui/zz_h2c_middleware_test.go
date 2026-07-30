@@ -249,3 +249,97 @@ func itoa(n int) string {
 	}
 	return string(b[i:])
 }
+
+// TestH2CUpgrade_BodyIsCappedForEveryConnectionSpelling closes an evasion of the
+// cap above. That test sends `Connection: Upgrade, HTTP2-Settings`, which carries
+// BOTH tokens, so it could not distinguish which one the cap keyed on.
+//
+// x/net's own isH2CUpgrade requires `Upgrade: h2c` plus the **HTTP2-Settings**
+// token in Connection; the cap used to require the **upgrade** token. A request
+// sending only HTTP2-Settings was therefore an upgrade to x/net — reaching its
+// io.ReadAll(r.Body) — while escaping the cap. The read precedes the hijack, hence
+// precedes cfg.middleware and the Connect auth interceptor, so an unauthenticated
+// client could make the process buffer a body of any size.
+//
+// The cap now keys on `Upgrade: h2c` alone, so it cannot be narrower than x/net
+// however Connection is spelled. Each subtest sends a body four times the cap and
+// requires no 101 and no inner-handler call.
+func TestH2CUpgrade_BodyIsCappedForEveryConnectionSpelling(t *testing.T) {
+	// xnetUpgrades records whether x/net itself treats the shape as an upgrade,
+	// i.e. whether it carries the HTTP2-Settings token in Connection. It decides
+	// only the SECOND assertion: when x/net does not upgrade, the request is an
+	// ordinary POST and correctly reaches the inner handler (with a capped body).
+	// Requiring innerCalls == 0 for those would be asserting the wrong thing —
+	// conflating "the body is capped" with "the request is rejected".
+	for _, tc := range []struct {
+		name         string
+		connection   string
+		xnetUpgrades bool
+	}{
+		// The evasion: exactly what x/net matches, and nothing more.
+		{"HTTP2-Settings only", "Connection: HTTP2-Settings\r\n", true},
+		{"both tokens", "Connection: Upgrade, HTTP2-Settings\r\n", true},
+		{"odd casing and spacing", "Connection:  http2-SETTINGS , Upgrade \r\n", true},
+		// x/net declines these, so they must merely never become a 101.
+		{"upgrade only", "Connection: upgrade\r\n", false},
+		{"no Connection header", "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p, addr := newProbedHandler(t)
+
+			conn, err := net.Dial("tcp", addr)
+			require.NoError(t, err)
+			defer func() { _ = conn.Close() }()
+			require.NoError(t, conn.SetDeadline(time.Now().Add(10*time.Second)))
+
+			body := strings.Repeat("A", 256<<10) // four times the cap
+			req := "POST / HTTP/1.1\r\n" +
+				"Host: " + addr + "\r\n" +
+				tc.connection +
+				"Upgrade: h2c\r\n" +
+				"HTTP2-Settings: AAMAAABkAARAAAAAAAIAAAAA\r\n" +
+				"Content-Length: " + itoa(len(body)) + "\r\n\r\n" + body
+			_, err = conn.Write([]byte(req))
+			require.NoError(t, err)
+
+			br := bufio.NewReader(conn)
+			statusLine, err := br.ReadString('\n')
+			require.NoError(t, err)
+
+			assert.NotContains(t, statusLine, "101",
+				"an oversized upgrade body was buffered and replayed as a stream; x/net keys on the HTTP2-Settings token, so a cap keyed on any narrower condition is a pre-auth memory-exhaustion window")
+			if tc.xnetUpgrades {
+				assert.Equal(t, int64(0), p.innerCalls.Load(),
+					"an over-cap upgrade must never reach the inner handler")
+			}
+		})
+	}
+}
+
+// The cap must not touch ordinary requests: a large body with no h2c upgrade
+// header is a legitimate BulkDeleteJobs/BulkRetryJobs shape and must pass through
+// intact. Without this, "cap everything" would look like a valid fix above.
+func TestH2CUpgrade_CapDoesNotTouchOrdinaryLargeBodies(t *testing.T) {
+	p, addr := newProbedHandler(t)
+
+	conn, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	defer func() { _ = conn.Close() }()
+	require.NoError(t, conn.SetDeadline(time.Now().Add(10*time.Second)))
+
+	body := strings.Repeat("B", 256<<10) // over the h2c cap, but this is not an upgrade
+	req := "POST / HTTP/1.1\r\n" +
+		"Host: " + addr + "\r\n" +
+		"Content-Length: " + itoa(len(body)) + "\r\n\r\n" + body
+	_, err = conn.Write([]byte(req))
+	require.NoError(t, err)
+
+	br := bufio.NewReader(conn)
+	statusLine, err := br.ReadString('\n')
+	require.NoError(t, err)
+
+	assert.NotContains(t, statusLine, "413",
+		"a non-upgrade request must not be capped; the h2c cap exists only for the body x/net buffers before dispatch")
+	assert.Equal(t, int64(1), p.innerCalls.Load(),
+		"an ordinary large-bodied request must still reach the inner handler")
+}
