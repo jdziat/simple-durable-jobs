@@ -200,6 +200,74 @@ reaper handing a still-executing job to a peer, but on graceful shutdown a
 handler that ignores cancellation will hold its lease indefinitely rather than
 letting it lapse.
 
+### A waiting job is only resumed for the signal it is waiting on
+
+**Before:** the signal-resume poll woke a job in `waiting` whenever it had **any**
+unconsumed signal, with no correlation to the name the handler was parked on. A
+pending signal the handler will never consume therefore resumed the job on every
+tick — 5 s by default — for the entire life of the wait: the job was
+re-dispatched, the handler replayed from the top, its wait found nothing and
+re-suspended, and the surplus signal was still pending for the next tick.
+
+No typo was needed to hit it. At-least-once delivery is the documented producer
+contract, so a retried caller could deliver `"a"` twice while the handler had
+moved on to `"b"`; or a signal was simply sent early for a later phase. Each
+replay re-ran handler code not behind a `Call` or phase checkpoint and burned a
+dispatch plus a fleet rate-limit token. A durable `Sleep` was affected the same
+way: any buffered signal replayed the sleeping job every tick until its deadline,
+which the resume query's own doc comment already said must not happen.
+
+**After:** a job records the signal name it suspended on, and the poll wakes it
+only for that name. A durable sleep records a reserved internal name that no user
+signal can match (`validateName` rejects names starting with `_`), so only its
+`run_at` deadline wakes it.
+
+**What you may notice:**
+
+- Nothing, if your producers only ever send signals a handler awaits. The signal
+  you are parked on still wakes you immediately, and a surplus signal alongside it
+  does not suppress that.
+- Handler executions for signal-waiting jobs drop sharply if you were hitting
+  this. What looked like retry churn or an idle-loop cost was this.
+- **If you relied on a signal of one name nudging a handler parked on another**,
+  that no longer happens. It only ever "worked" by replaying the whole handler,
+  so any effect depended on non-checkpointed code re-running.
+
+Migration **v39** adds `jobs.waiting_signal_name` as `NOT NULL DEFAULT ''`. Empty
+means "not recorded" and keeps the old permissive behaviour, so every job already
+parked across the upgrade resumes exactly as it did before — there is no window in
+which a waiting job becomes unwakeable. Only jobs that suspend after the upgrade
+get the correlated treatment. Fan-out suspends deliberately record nothing, since
+they are not waiting on a signal at all and are resumed by the fan-out join.
+
+**On MySQL** the column must share `signals.name`'s collation
+(`utf8mb4_0900_as_cs`) — the resume poll compares the two, and a mismatch fails
+with error 1267 rather than degrading quietly. A pre-AutoMigrate step creates the
+column with that collation directly, so the normal upgrade is a fast
+`ADD COLUMN`. A database that somehow already has the column with the wrong
+collation is repaired by v39 with `ALTER TABLE jobs MODIFY`, and on MySQL a
+collation change is neither `INSTANT` nor `INPLACE` — that repair rebuilds the
+`jobs` table under a lock. You should not hit it on a normal upgrade; if you have
+a very large `jobs` table and want to be certain, check before upgrading:
+
+```sql
+SELECT COLLATION_NAME FROM information_schema.COLUMNS
+WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'jobs'
+  AND COLUMN_NAME = 'waiting_signal_name';
+```
+
+No row means the fast path applies. `utf8mb4_0900_as_cs` means there is nothing
+to do. Anything else means the rebuild will run, so schedule accordingly.
+
+Because signal names are matched case-sensitively (`signals.name` is already
+`as_cs`), a wait on `"Approval"` is **not** satisfied by a signal named
+`"approval"` — unchanged from before, and the correlation deliberately matches the
+consume rather than being looser than it.
+
+For a custom `core.Storage`: recording the name is an **optional capability**
+(`core.SignalWaitMarker`), not a new method on `core.Storage`, so an existing
+implementation still compiles and keeps the previous permissive behaviour.
+
 ### A blocked `Unique` schedule is skipped, not retried at 10 Hz
 
 **Before:** a scheduled job declared with `queue.Unique(key)` dedups against its

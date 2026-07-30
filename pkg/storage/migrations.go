@@ -145,6 +145,48 @@ type preMigration struct {
 
 var preMigrations = []preMigration{
 	{Name: "uuid_binary_conversion", Up: convertLegacyStringUUIDColumns},
+	{Name: "jobs_waiting_signal_name_collation", Up: preMigrateJobsWaitingSignalNameCollation},
+}
+
+// preMigrateJobsWaitingSignalNameCollation creates jobs.waiting_signal_name with
+// the collation it needs, BEFORE AutoMigrate can create it with the wrong one.
+//
+// This is purely to avoid an avoidable table rebuild. AutoMigrate would add the
+// column with the jobs table default (utf8mb4_0900_ai_ci), and migration v39 would
+// then have to ALTER TABLE jobs MODIFY it to utf8mb4_0900_as_cs — and on MySQL a
+// collation change is not an INSTANT or INPLACE operation, so that MODIFY rebuilds
+// the whole jobs table under a lock. On a large deployment that is minutes of
+// blocked dequeues during an upgrade. Creating the column correctly in the first
+// place makes the common upgrade path a fast ADD COLUMN instead.
+//
+// v39 is still required and still runs: it repairs a column that already exists
+// with the wrong collation, which is the case for any database that reached the
+// current schema before this pre-migration existed. Both are idempotent, and on a
+// database where this one wins, v39 reads the collation, finds it already correct,
+// and returns without touching the table.
+//
+// MySQL only. SQLite and Postgres have no equivalent problem, and AutoMigrate's
+// column is correct there.
+func preMigrateJobsWaitingSignalNameCollation(ctx context.Context, db *gorm.DB, dialect string) error {
+	if dialect != dialectMySQL {
+		return nil
+	}
+	// The jobs table may not exist yet on a brand-new database; AutoMigrate will
+	// then create it, and the column comes from the struct tag with the table
+	// default collation, leaving v39 to repair it. Nothing to do here.
+	if !db.Migrator().HasTable(&core.Job{}) {
+		return nil
+	}
+	if db.Migrator().HasColumn(&core.Job{}, "waiting_signal_name") {
+		return nil
+	}
+	if err := db.WithContext(ctx).Exec(
+		"ALTER TABLE jobs ADD COLUMN waiting_signal_name varchar(255) " +
+			"COLLATE utf8mb4_0900_as_cs NOT NULL DEFAULT ''",
+	).Error; err != nil && !isBenignDDLError(err) {
+		return fmt.Errorf("pre-add jobs.waiting_signal_name: %w", err)
+	}
+	return nil
 }
 
 // schemaMigrations is the ordered list of versioned migrations. Append new
@@ -341,6 +383,11 @@ var schemaMigrations = []schemaMigration{
 		Name:    "job_stats_timestamp_index",
 		Up:      migrateJobStatsTimestampIndex,
 	},
+	{
+		Version: 39,
+		Name:    "jobs_waiting_signal_name_column",
+		Up:      migrateJobsWaitingSignalName,
+	},
 }
 
 // jobStatsTimestampIndex is the index name shared by this migration and the UI's
@@ -367,6 +414,68 @@ const jobStatsTimestampIndex = "idx_job_stats_timestamp"
 // is mounted, so the table does not yet exist here and this version is recorded
 // as applied. This one exists because it is the path that holds the fleet lock,
 // and because schema_migrations should record when the index appeared.
+// migrateJobsWaitingSignalName adds jobs.waiting_signal_name, which records the
+// signal a job suspended on so the signal-resume poll can correlate against it
+// instead of waking on any pending signal.
+//
+// A NOT NULL empty-string default is deliberate: every pre-existing waiting job
+// backfills to the empty string, which the poll reads as "not recorded" and
+// handles with the old permissive behaviour. A job parked across the upgrade
+// keeps resuming exactly as it did, and only jobs that suspend after the upgrade
+// get the correlated treatment. There is no window in which a waiting job becomes
+// unwakeable.
+//
+// On MySQL the column must carry the SAME collation as signals.name, which an
+// earlier migration made utf8mb4_0900_as_cs. AutoMigrate creates it with the jobs
+// table default (utf8mb4_0900_ai_ci), and the resume poll's
+// `signals.name = jobs.waiting_signal_name` then fails outright with error 1267,
+// "illegal mix of collations" — every signal-resume query errors, on MySQL only.
+// SQLite and Postgres cannot surface this, so it is caught by the MySQL leg or not
+// at all.
+//
+// as_cs (case-SENSITIVE) is also the semantically required choice rather than a
+// mechanical match. Signals are consumed with `WHERE signals.name = ?` under
+// as_cs, so a wait on "Approval" is NOT satisfied by a signal named "approval".
+// Had this column been forced to ai_ci instead, the poll would have been MORE
+// permissive than the consume: the job would be woken for a signal it then cannot
+// consume, re-suspend, and be woken again — the very hot loop this column exists
+// to close, in a narrower form.
+func migrateJobsWaitingSignalName(ctx context.Context, db *gorm.DB, dialect string) error {
+	m := db.Migrator()
+	if !m.HasColumn(&core.Job{}, "waiting_signal_name") {
+		stmt := "ALTER TABLE jobs ADD COLUMN waiting_signal_name varchar(255) NOT NULL DEFAULT ''"
+		if dialect == dialectMySQL {
+			stmt = "ALTER TABLE jobs ADD COLUMN waiting_signal_name varchar(255) " +
+				"COLLATE utf8mb4_0900_as_cs NOT NULL DEFAULT ''"
+		}
+		if err := db.WithContext(ctx).Exec(stmt).Error; err != nil && !isBenignDDLError(err) {
+			return fmt.Errorf("add jobs.waiting_signal_name (%s): %w", dialect, err)
+		}
+	}
+	if dialect != dialectMySQL {
+		return nil
+	}
+	// AutoMigrate runs BEFORE the versioned migrations and creates the column with
+	// the table's default collation, so the HasColumn branch above is normally
+	// skipped and this repair is what actually sets it. Idempotent: read first,
+	// MODIFY only on mismatch, mirroring the queue/tenant/unique_key repairs.
+	const collation = "utf8mb4_0900_as_cs"
+	current, err := mysqlColumnCollation(ctx, db, "waiting_signal_name")
+	if err != nil {
+		return fmt.Errorf("read waiting_signal_name collation: %w", err)
+	}
+	if current == collation {
+		return nil
+	}
+	if err := db.WithContext(ctx).Exec(
+		"ALTER TABLE jobs MODIFY waiting_signal_name varchar(255) " +
+			"COLLATE utf8mb4_0900_as_cs NOT NULL DEFAULT ''",
+	).Error; err != nil && !isBenignDDLError(err) {
+		return fmt.Errorf("modify waiting_signal_name collation: %w", err)
+	}
+	return nil
+}
+
 func migrateJobStatsTimestampIndex(ctx context.Context, db *gorm.DB, dialect string) error {
 	m := db.Migrator()
 	if !m.HasTable(jobStatsTable) {

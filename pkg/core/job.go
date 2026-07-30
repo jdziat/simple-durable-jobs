@@ -87,6 +87,17 @@ type Job struct {
 	FanOutID    *UUID `gorm:"index:idx_jobs_fan_out_status,priority:1"` // Groups sibling sub-jobs
 	FanOutIndex int   `gorm:"type:integer;default:0"`                   // Position in fan-out batch
 
+	// WaitingSignalName is the signal name this job most recently suspended on,
+	// and is meaningful only while Status is StatusWaiting.
+	//
+	// The signal-resume poll correlates against it so a pending signal the handler
+	// will never consume cannot wake the job on every tick forever. EMPTY means
+	// "not recorded", and the poll then falls back to waking on any pending
+	// signal: fan-out suspends go through plain MarkWaiting, and a third-party
+	// core.Storage need not implement SignalWaitMarker, so permissiveness is what
+	// preserves liveness in both cases.
+	WaitingSignalName string `gorm:"size:255;not null;default:''"`
+
 	// Result storage for parent retrieval
 	Result []byte `gorm:"type:bytes"` // Serialized return value
 

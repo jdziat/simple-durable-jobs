@@ -259,6 +259,7 @@ func TestMySQLSchemaAssertions(t *testing.T) {
 	require.True(t, mysqlIndexExists(t, db, "idx_jobs_tenant"), "idx_jobs_tenant must exist on mysql")
 	requireMySQLCascadeFKs(t, db)
 	requireMySQLUniqueKeyCollations(t, db)
+	requireMySQLWaitingSignalNameCollation(t, db)
 	requireMySQLDispatcherColumnsNotNull(t, db)
 	requireMySQLCheckConstraints(t, db)
 	requireMySQLCheckConstraintsEnforced(t, db)
@@ -271,6 +272,7 @@ func TestMySQLSchemaAssertions(t *testing.T) {
 	require.NoError(t, db.AutoMigrate(&core.Job{}))
 	requireMySQLDispatcherColumnsNotNull(t, db)
 	requireMySQLUniqueKeyCollations(t, db)
+	requireMySQLWaitingSignalNameCollation(t, db)
 	requireMySQLQueueTenantCollations(t, db)
 	requireMySQLIdentifierColumnCollations(t, db)
 }
@@ -1051,4 +1053,38 @@ func TestPostgresDeadLetteredAtMigrateNoFlap(t *testing.T) {
 		require.Falsef(t, strings.Contains(lower, "alter") && strings.Contains(lower, "dead_lettered_at"),
 			"a steady-state 2nd Migrate must not ALTER dead_lettered_at (precision flap reintroduced?): %s", stmt)
 	}
+}
+
+// requireMySQLWaitingSignalNameCollation pins jobs.waiting_signal_name to the SAME
+// collation as signals.name, which the signal-resume poll compares it against.
+//
+// A mismatch is not a style question on MySQL: `signals.name =
+// jobs.waiting_signal_name` fails outright with error 1267, "illegal mix of
+// collations", so EVERY signal-resume query errors and no signal-waiting job ever
+// resumes. AutoMigrate creates the column with the jobs table default
+// (utf8mb4_0900_ai_ci), so migrateJobsWaitingSignalName has to repair it — this is
+// what catches the repair being dropped. SQLite and Postgres cannot surface it.
+//
+// as_cs is also the semantically required side: signals are consumed under as_cs,
+// so a wait on "Approval" is not satisfied by a signal named "approval". An ai_ci
+// column here would make the poll MORE permissive than the consume, waking a job
+// for a signal it cannot consume — the hot loop the column exists to close.
+func requireMySQLWaitingSignalNameCollation(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	var jobsCollation, signalsCollation string
+	require.NoError(t, db.Raw(`
+		SELECT COLLATION_NAME FROM information_schema.COLUMNS
+		WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'jobs'
+		  AND COLUMN_NAME = 'waiting_signal_name'
+	`).Scan(&jobsCollation).Error)
+	require.NoError(t, db.Raw(`
+		SELECT COLLATION_NAME FROM information_schema.COLUMNS
+		WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'signals'
+		  AND COLUMN_NAME = 'name'
+	`).Scan(&signalsCollation).Error)
+
+	require.Equal(t, "utf8mb4_0900_as_cs", jobsCollation,
+		"jobs.waiting_signal_name must be utf8mb4_0900_as_cs; AutoMigrate creates it ai_ci and migrateJobsWaitingSignalName repairs it")
+	require.Equal(t, signalsCollation, jobsCollation,
+		"jobs.waiting_signal_name and signals.name must share a collation, or the resume poll's comparison fails with MySQL error 1267 and no signal-waiting job ever resumes")
 }

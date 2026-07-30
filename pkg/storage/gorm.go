@@ -2182,8 +2182,38 @@ func (s *GormStorage) MarkWaiting(ctx context.Context, jobID core.UUID, workerID
 			// fan-out path also calls MarkWaiting; that resume is run_at-independent
 			// (it keys on the fan_outs join + status), so clearing run_at is safe
 			// there too.
-			"run_at":     nil,
-			"updated_at": time.Now(),
+			"run_at": nil,
+			// No awaited name for this path: the fan-out suspend and any caller
+			// that does not go through MarkWaitingForSignal must leave the field
+			// EMPTY so the signal-resume poll stays permissive for them. Clearing
+			// rather than leaving it also stops a stale name from a previous named
+			// wait narrowing this one.
+			"waiting_signal_name": "",
+			"updated_at":          time.Now(),
+		})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		return core.ErrJobNotOwned
+	}
+	return nil
+}
+
+// MarkWaitingForSignal is MarkWaiting that also records the signal name the job
+// suspended on, so the signal-resume poll can correlate against it instead of
+// waking on any pending signal. It implements core.SignalWaitMarker.
+func (s *GormStorage) MarkWaitingForSignal(ctx context.Context, jobID core.UUID, workerID, signalName string) error {
+	result := s.db.WithContext(ctx).
+		Model(&core.Job{}).
+		Where("id = ? AND locked_by = ? AND status = ?", jobID, workerID, core.StatusRunning).
+		Updates(map[string]any{
+			"status":              core.StatusWaiting,
+			"locked_by":           "",
+			"locked_until":        nil,
+			"run_at":              nil,
+			"waiting_signal_name": signalName,
+			"updated_at":          time.Now(),
 		})
 	if result.Error != nil {
 		return result.Error

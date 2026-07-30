@@ -38,6 +38,10 @@ type fakeSignalStore struct {
 	// (core.ErrJobNotOwned): the checkpoint MUST NOT be recorded (the tx rolled
 	// back), so onCheckpoint is not invoked and suspended is not incremented.
 	markWaitingErr error
+	// awaitedName records the signal name the suspend declared may wake the job.
+	// The signal-resume poll correlates against it, so which name each suspend
+	// path records is behaviour worth asserting.
+	awaitedName string
 }
 
 func (f *fakeSignalStore) SendSignal(_ context.Context, _ core.UUID, name string, payload []byte) error {
@@ -144,7 +148,11 @@ func (f *fakeSignalStore) MarkWaitingWithDeadline(_ context.Context, _ core.UUID
 // markWaitingErr is set it models ownership loss — the whole tx rolls back, so
 // the checkpoint is NOT recorded and the job is NOT suspended. A nil cp means the
 // checkpoint is already durable (a replay), so only the suspend is recorded.
-func (f *fakeSignalStore) SaveCheckpointAndMarkWaiting(_ context.Context, cp *core.Checkpoint, _ core.UUID, _ string, d time.Duration) error {
+func (f *fakeSignalStore) SaveCheckpointAndMarkWaiting(ctx context.Context, cp *core.Checkpoint, jobID core.UUID, workerID string, d time.Duration) error {
+	return f.SaveCheckpointAndMarkWaitingForSignal(ctx, cp, jobID, workerID, d, "")
+}
+
+func (f *fakeSignalStore) SaveCheckpointAndMarkWaitingForSignal(_ context.Context, cp *core.Checkpoint, _ core.UUID, _ string, d time.Duration, signalName string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.markWaitingErr != nil {
@@ -157,6 +165,7 @@ func (f *fakeSignalStore) SaveCheckpointAndMarkWaiting(_ context.Context, cp *co
 	}
 	f.suspended++
 	f.waitDur = d
+	f.awaitedName = signalName
 	return nil
 }
 

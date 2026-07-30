@@ -57,6 +57,14 @@ type signalStorage interface {
 	// when ownership was lost, keeping checkpoint and status consistent. Replaces
 	// the torn-write writeCheckpoint -> MarkWaitingWithDeadline suspend pair.
 	SaveCheckpointAndMarkWaiting(ctx context.Context, cp *core.Checkpoint, jobID core.UUID, workerID string, d time.Duration) error
+	// SaveCheckpointAndMarkWaitingForSignal is SaveCheckpointAndMarkWaiting that
+	// also records, in the same transaction, which signal name may wake the job.
+	// The signal-resume poll correlates against it, so a pending signal the
+	// handler will never consume cannot re-dispatch and fully replay the job on
+	// every tick. Pass SleepCheckpointType for a durable sleep, which no signal
+	// should wake — validateName rejects names starting with "_", so it can never
+	// collide with a real signal.
+	SaveCheckpointAndMarkWaitingForSignal(ctx context.Context, cp *core.Checkpoint, jobID core.UUID, workerID string, d time.Duration, signalName string) error
 }
 
 // WaitingError signals the worker that the job has suspended itself into
@@ -181,7 +189,7 @@ func WaitForSignal[T any](ctx context.Context, name string) (T, error) {
 	if sig == nil {
 		// No signal yet — suspend until one arrives (resumed by the Signal()
 		// fast path or the signal-resume poll). NO checkpoint written.
-		if err := jc.Storage.MarkWaiting(ctx, jc.Job.ID, jc.WorkerID); err != nil {
+		if err := markWaitingForSignal(ctx, jc, name); err != nil {
 			return zero, fmt.Errorf("signal: suspend: %w", err)
 		}
 		return zero, &WaitingError{Name: name}
@@ -338,7 +346,7 @@ func WaitForSignalTimeout[T any](ctx context.Context, name string, d time.Durati
 		}
 	}
 	remaining := max(time.Until(time.Unix(0, tc.DeadlineUnixNano)), 0)
-	if err := ss.SaveCheckpointAndMarkWaiting(ctx, suspendCP, jc.Job.ID, jc.WorkerID, remaining); err != nil {
+	if err := ss.SaveCheckpointAndMarkWaitingForSignal(ctx, suspendCP, jc.Job.ID, jc.WorkerID, remaining, name); err != nil {
 		return zero, false, fmt.Errorf("signal: suspend: %w", err)
 	}
 	return zero, false, &WaitingError{Name: name}
@@ -429,7 +437,12 @@ func sleepUntil(ctx context.Context, deadline time.Time, immediate bool) error {
 		}
 	}
 	remaining := max(time.Until(time.Unix(0, sc.DeadlineUnixNano)), 0)
-	if err := ss.SaveCheckpointAndMarkWaiting(ctx, suspendCP, jc.Job.ID, jc.WorkerID, remaining); err != nil {
+	// A durable sleep waits on the clock, never on a signal. Recording the
+	// reserved sleep type means a buffered user signal cannot wake it early —
+	// which is what GetSignalWaitingJobsToResumeAfter's own doc comment already
+	// claimed ("scan past durable timers that have buffered user signals but
+	// should not be resumed before run_at") but the query did not implement.
+	if err := ss.SaveCheckpointAndMarkWaitingForSignal(ctx, suspendCP, jc.Job.ID, jc.WorkerID, remaining, SleepCheckpointType); err != nil {
 		return fmt.Errorf("signal: sleep suspend: %w", err)
 	}
 	return &WaitingError{Name: SleepCheckpointType}
@@ -573,4 +586,15 @@ func buildCheckpointObj(jc *intctx.JobContext, idx int, ctype string, v any) (*c
 		CallType:  ctype,
 		Result:    data,
 	}, nil
+}
+
+// markWaitingForSignal suspends the job, recording the awaited signal name when
+// the storage supports it so the signal-resume poll can correlate against it.
+// Falls back to a plain MarkWaiting otherwise, which leaves the name empty and
+// keeps the poll permissive for that job — the previous behaviour.
+func markWaitingForSignal(ctx context.Context, jc *intctx.JobContext, name string) error {
+	if marker, ok := jc.Storage.(core.SignalWaitMarker); ok {
+		return marker.MarkWaitingForSignal(ctx, jc.Job.ID, jc.WorkerID, name)
+	}
+	return jc.Storage.MarkWaiting(ctx, jc.Job.ID, jc.WorkerID)
 }
