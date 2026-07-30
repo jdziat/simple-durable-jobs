@@ -300,7 +300,7 @@ func assertWindowHonoursTheRate(t *testing.T, st core.Storage, base *windowCaptu
 		w := NewWorker(q, RateLimit("api", perSecond))
 
 		job := &core.Job{ID: core.NewID(), Type: "t", Queue: "default", Status: core.StatusRunning}
-		allowed, _ := w.tryConsumeRateLimits(context.Background(), job)
+		allowed, _, _ := w.tryConsumeRateLimits(context.Background(), job)
 		require.True(t, allowed, "PerSecond=%v: the capturing storage always allows", perSecond)
 
 		store.mu.Lock()

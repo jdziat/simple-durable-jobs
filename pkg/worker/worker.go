@@ -941,7 +941,8 @@ func (w *Worker) dispatchDequeuedJobs(ctx context.Context, jobsChan chan<- dispa
 			released++
 			continue
 		}
-		if ok, reason := w.tryConsumeRateLimits(ctx, job); !ok {
+		ok, reason, refundFleetRate := w.tryConsumeRateLimits(ctx, job)
+		if !ok {
 			w.recordBounce(reason) // fleet_rate (paid the DB tx) or fleet_rate_cached (cooldown skip)
 			w.refundQueueRateLimit(job.Queue)
 			w.releaseDequeuedJobOnShutdown(ctx, job, runToken)
@@ -954,6 +955,11 @@ func (w *Worker) dispatchDequeuedJobs(ctx context.Context, jobsChan chan<- dispa
 			dispatched++
 		case <-ctx.Done():
 			w.recordBounce(bounceShutdown)
+			// The job is released back to pending UNRUN, so every admission unit it
+			// took must go back too. The queue token was already refunded here; the
+			// FLEET unit was not, so a shutdown-time bail-out permanently spent a
+			// unit of the fleet budget on a job that never ran.
+			refundFleetRate()
 			w.refundQueueRateLimit(job.Queue)
 			w.releaseDequeuedJobOnShutdown(ctx, job, runToken)
 			released++
@@ -1442,16 +1448,21 @@ func (w *Worker) rateLimitName(limit RateLimitConfig, job *core.Job) (name strin
 // tryConsumeRateLimits returns (allowed, reason). reason is meaningful only when
 // allowed is false: bounceFleetRateCached when the per-key cooldown short-circuited
 // the DB transaction, bounceFleetRate when the DB itself denied (or errored).
-func (w *Worker) tryConsumeRateLimits(ctx context.Context, job *core.Job) (bool, bounceReason) {
+// The returned refund releases the fleet-rate units this call consumed. It is a
+// no-op on the deny paths (they refund internally) and on the no-limits path; on
+// SUCCESS the caller owns it and MUST invoke it if the job is then released
+// without running, or the unit stays consumed by a job that never ran and the
+// fleet under-admits for the rest of the window.
+func (w *Worker) tryConsumeRateLimits(ctx context.Context, job *core.Job) (bool, bounceReason, func()) {
 	if len(w.config.RateLimits) == 0 {
-		return true, ""
+		return true, "", func() {}
 	}
 	storage, ok := w.queue.Storage().(rateLimiterStorage)
 	if !ok {
 		if w.rateLimitStorageMissingLogged.CompareAndSwap(false, true) {
 			w.logger.Warn("storage backend does not support fleet-wide rate limits; continuing without RateLimit enforcement")
 		}
-		return true, ""
+		return true, "", func() {}
 	}
 	// Refund support: when a LATER fleet limit denies, the units already consumed
 	// from EARLIER limits must be returned, or every multi-limit bounce permanently
@@ -1473,12 +1484,24 @@ func (w *Worker) tryConsumeRateLimits(ctx context.Context, job *core.Job) (bool,
 		if !useWindowed && !canRelease {
 			return
 		}
+		// DETACHED from ctx, with its own budget. The two situations that make a
+		// refund necessary are (a) a later limit denied, and (b) the dispatcher is
+		// shutting down — and (b) means ctx is ALREADY cancelled, so issuing the
+		// refund on ctx would fail exactly when it is needed and leave the unit
+		// consumed by a job that never ran. Same defect shape as the concurrency-slot
+		// release, which is detached for the same reason.
+		//
+		// WithoutCancel strips the deadline as well as the cancel, so the timeout is
+		// re-imposed rather than inherited; without it a refund could hang a
+		// shutting-down dispatcher indefinitely.
+		refundCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
 		for _, c := range consumed {
 			var err error
 			if useWindowed {
-				err = windowed.ReleaseRateAt(ctx, c.name, c.windowStart)
+				err = windowed.ReleaseRateAt(refundCtx, c.name, c.windowStart)
 			} else {
-				err = releaser.ReleaseRate(ctx, c.name, c.window)
+				err = releaser.ReleaseRate(refundCtx, c.name, c.window)
 			}
 			if err != nil {
 				w.logger.Warn("failed to refund consumed rate limit after a later limit denied",
@@ -1494,7 +1517,7 @@ func (w *Worker) tryConsumeRateLimits(ctx context.Context, job *core.Job) (bool,
 		limitName, nameOK := w.rateLimitName(limit, job)
 		if !nameOK {
 			refund()
-			return false, bounceFleetRate
+			return false, bounceFleetRate, func() {}
 		}
 		// cto-F2 per-key cooldown (KEYED limits only — the gap v1 left): if this
 		// exact bucket was denied by the DB this window, skip the locked
@@ -1510,7 +1533,7 @@ func (w *Worker) tryConsumeRateLimits(ctx context.Context, job *core.Job) (bool,
 		// — short-circuiting it would change v1's proven unkeyed behavior.
 		if limit.Key != nil && w.keyedRateSaturated(limitName, time.Now()) {
 			refund()
-			return false, bounceFleetRateCached
+			return false, bounceFleetRateCached, func() {}
 		}
 		var allowed bool
 		var windowStart time.Time
@@ -1526,7 +1549,7 @@ func (w *Worker) tryConsumeRateLimits(ctx context.Context, job *core.Job) (bool,
 				"limit", limitName,
 				"error", err)
 			refund()
-			return false, bounceFleetRate
+			return false, bounceFleetRate, func() {}
 		}
 		if !allowed {
 			// cto-F2: remember this bucket has no headroom until its window rolls.
@@ -1535,11 +1558,11 @@ func (w *Worker) tryConsumeRateLimits(ctx context.Context, job *core.Job) (bool,
 			// reads it to skip the next DB rate tx (removes the denied-tx churn).
 			w.markRateSaturated(limitName, window)
 			refund()
-			return false, bounceFleetRate
+			return false, bounceFleetRate, func() {}
 		}
 		consumed = append(consumed, consumedRate{name: limitName, window: window, windowStart: windowStart})
 	}
-	return true, ""
+	return true, "", refund
 }
 
 // markRateSaturated records that limitName has no headroom until the END of its
