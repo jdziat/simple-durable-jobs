@@ -268,6 +268,60 @@ For a custom `core.Storage`: recording the name is an **optional capability**
 (`core.SignalWaitMarker`), not a new method on `core.Storage`, so an existing
 implementation still compiles and keeps the previous permissive behaviour.
 
+### `WaitForSignalTimeout` no longer accepts a signal that arrived after its deadline
+
+**Before:** the wait consumed any pending signal *before* checking its own
+deadline. A signal that arrived after the deadline was therefore delivered as
+though it had arrived in time (`timedOut = false`), and nothing bounded how late
+it could be.
+
+This needed something to have prevented the timeout from firing on schedule — a
+worker outage spanning the deadline, a saturated fleet, a paused queue. The job's
+`run_at` fires the timeout only if a worker is there to act on it; otherwise the
+next replay happened later and whatever signal had arrived in the meantime won.
+
+**After:** when the deadline has already passed, only a signal that arrived
+*before* it can satisfy the wait. A later one leaves the wait timed out and stays
+**pending**, so a subsequent `WaitForSignal` on the same name can still consume it.
+
+**What you may notice:**
+
+- A handler that used to receive a late signal after an outage now sees
+  `timedOut = true` for that wait. That is the documented contract; the previous
+  behaviour silently ignored the timeout you asked for.
+- The signal is not lost. It remains pending for the next waiter on that name, so
+  a workflow that re-waits still sees it.
+
+The comparison is deliberately against the **signal's arrival time**, not against
+"now". A signal that genuinely arrived before the deadline is still delivered even
+when the replay only happens afterwards — checking now-vs-deadline instead would
+have wrongly timed those out. Since `created_at` is stamped by the sending process
+and the deadline by the waiting one, a signal within clock skew of the boundary may
+fall either way; that residual is bounded by skew, where the defect it replaces was
+unbounded.
+
+### A fan-out whose parent is already terminal no longer retries the resume
+
+**Before:** when a fan-out completed, the worker tried to resume the waiting
+parent, and if the parent was not resumable it retried four more times on a
+background goroutine and then logged a `WARN` saying it was "relying on the
+stalled-parent backstop".
+
+With `CancelOnFail = false` (the default) that is the ordinary steady state, not an
+error: the fan-out settles early on a failure, the parent runs on to a terminal
+status, and every sibling that then finishes naturally arrives at the same place.
+Each one drove five `ResumeJob` writes that could not succeed and logged a warning
+pointing at a stall that did not exist — for a parent no backstop will ever touch.
+
+**After:** a parent that is already terminal is recognised as never-resumable. One
+inline attempt, no retries, and a `DEBUG` line instead of a `WARN`.
+
+**What you may notice:** the "relying on the stalled-parent backstop" warning stops
+appearing for healthy `CancelOnFail = false` fan-outs. It still fires when a
+non-terminal parent genuinely fails every retry, which is the case it was written
+for. A parent whose status cannot be read is still retried, since a few wasted
+writes are cheaper than stranding a waiting parent.
+
 ### A blocked `Unique` schedule is skipped, not retried at 10 Hz
 
 **Before:** a scheduled job declared with `queue.Unique(key)` dedups against its

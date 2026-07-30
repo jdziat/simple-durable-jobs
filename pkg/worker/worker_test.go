@@ -59,6 +59,7 @@ type mockStorage struct {
 	incrementFailedFunc    func(ctx context.Context, fanOutID core.UUID) (*core.FanOut, error)
 	updateFanOutStatusFunc func(ctx context.Context, fanOutID core.UUID, status core.FanOutStatus) (bool, error)
 	resumeJobFunc          func(ctx context.Context, jobID core.UUID) (bool, error)
+	getJobFunc             func(ctx context.Context, jobID core.UUID) (*core.Job, error)
 	cancelSubJobsFunc      func(ctx context.Context, fanOutID core.UUID) ([]core.UUID, error)
 	findOrphanedFunc       func(jobIDs []core.UUID) ([]core.UUID, error)
 	completablePendingFunc func(ctx context.Context, olderThan time.Time) ([]*core.FanOut, error)
@@ -208,7 +209,12 @@ func (m *mockStorage) FindOrphanedJobs(_ context.Context, jobIDs []core.UUID, _ 
 	return nil, nil
 }
 
-func (m *mockStorage) GetJob(_ context.Context, _ core.UUID) (*core.Job, error) { return nil, nil }
+func (m *mockStorage) GetJob(ctx context.Context, jobID core.UUID) (*core.Job, error) {
+	if m.getJobFunc != nil {
+		return m.getJobFunc(ctx, jobID)
+	}
+	return nil, nil
+}
 
 func (m *mockStorage) GetJobsByStatus(_ context.Context, _ core.JobStatus, _ int) ([]*core.Job, error) {
 	return nil, nil

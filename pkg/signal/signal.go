@@ -289,6 +289,39 @@ func WaitForSignalTimeout[T any](ctx context.Context, name string, d time.Durati
 		tc.DeadlineUnixNano = time.Now().Add(d).UnixNano()
 	}
 
+	// A signal that arrives AFTER the deadline must not satisfy the wait. The
+	// consume below is unconditional, so without this check a job whose deadline
+	// passed while nothing was around to resume it — a worker outage, a saturated
+	// fleet, a paused queue — consumes a late signal on its next replay and reports
+	// it as arrived-in-time. The timeout is then silently not honoured, with no
+	// bound on how late the signal may be.
+	//
+	// The discriminator is the SIGNAL's arrival time, not "now". A signal that did
+	// arrive before the deadline must still be honoured even when this replay only
+	// happens afterwards (poll latency, a busy fleet), so checking now-vs-deadline
+	// first — the obvious fix — would wrongly time those out instead. Both peek and
+	// consume take the OLDEST pending signal of this name, so if the oldest arrived
+	// in time the row the consume takes is that same row.
+	//
+	// Clock note: created_at is stamped by the SENDING process and the deadline by
+	// this one, so a signal within clock skew of the boundary can be classified
+	// either way. That residual is bounded by skew; the defect it replaces was
+	// unbounded.
+	if has && !tc.Resolved && time.Now().UnixNano() >= tc.DeadlineUnixNano {
+		pending, perr := ss.PeekSignal(ctx, jc.Job.ID, name)
+		// On a peek error fall through to the consume. Delivering the signal is the
+		// pre-existing behaviour and the safer direction; inventing a timeout from a
+		// failed read would discard work the caller may have already been told about.
+		if perr == nil && (pending == nil || pending.CreatedAt.UnixNano() > tc.DeadlineUnixNano) {
+			tc.Resolved = true
+			tc.TimedOut = true
+			if err := writeCheckpointObj(ctx, jc, idx, ctype, tc); err != nil {
+				return zero, false, err
+			}
+			return zero, false, nil
+		}
+	}
+
 	// Signal-present branch: consume + write the resolved timeout checkpoint in
 	// one tx. The closure marshals the JSON-wrapped {resolved,payload} object as
 	// the checkpoint Result (NOT the raw signal payload), so replay reconstructs

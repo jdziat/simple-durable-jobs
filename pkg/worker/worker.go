@@ -3031,8 +3031,34 @@ func (w *Worker) completeFanOut(ctx context.Context, fo *core.FanOut, status cor
 	}
 
 	parentID, fanOutID := fo.ParentJobID, fo.ID
+	// A parent that is already TERMINAL is not "not yet resumable", it is never
+	// resumable, and retrying is pure waste. This is the ordinary steady state with
+	// CancelOnFail=false: the fan-out settles early on a failure, the parent runs to
+	// a terminal status, and every sibling that finishes NATURALLY afterwards
+	// arrives here. Without this check each one drove four more doomed ResumeJob
+	// writes and then logged a WARN saying it was "relying on the stalled-parent
+	// backstop" — for a parent no backstop will ever touch, which sends an operator
+	// looking for a stall that does not exist.
+	if terminal, err := w.parentIsTerminal(ctx, parentID); err == nil && terminal {
+		w.logger.Debug("parent job already terminal at fan-out completion; nothing to resume",
+			"parent_job_id", parentID, "fan_out_id", fanOutID, "status", status)
+		return nil
+	}
 	w.goTracked(func() { w.resumeParentWithRetry(ctx, parentID, fanOutID, status) })
 	return nil
+}
+
+// parentIsTerminal reports whether a fan-out parent has already reached a terminal
+// status, i.e. no resume can ever apply to it. A read error is reported as
+// not-terminal so the caller falls back to retrying, which is the safe direction:
+// the cost of a needless retry is four writes, whereas wrongly skipping a resume
+// strands a waiting parent until the stalled-parent backstop notices.
+func (w *Worker) parentIsTerminal(ctx context.Context, parentID core.UUID) (bool, error) {
+	job, err := w.queue.Storage().GetJob(ctx, parentID)
+	if err != nil || job == nil {
+		return false, err
+	}
+	return job.Status.IsTerminal(), nil
 }
 
 // resumeParentWithRetry retries ResumeJob with bounded backoff for a parent that
@@ -3063,6 +3089,14 @@ func (w *Worker) resumeParentWithRetry(ctx context.Context, parentID, fanOutID c
 				"parent_job_id", parentID, "fan_out_id", fanOutID, "status", status)
 			return
 		}
+	}
+	// Same distinction as above: if the parent reached a terminal status while we
+	// were retrying, there is nothing to resume and nothing for the backstop to do,
+	// so a WARN here would be actively misleading.
+	if terminal, err := w.parentIsTerminal(ctx, parentID); err == nil && terminal {
+		w.logger.Debug("parent job reached a terminal status during resume retries; nothing to resume",
+			"parent_job_id", parentID, "fan_out_id", fanOutID)
+		return
 	}
 	w.logger.Warn("parent job not yet resumable after background retries; relying on the stalled-parent backstop",
 		"parent_job_id", parentID, "fan_out_id", fanOutID)
