@@ -3307,6 +3307,38 @@ func (w *Worker) runScheduler(ctx context.Context) {
 					// for the same logical tick (which would double-fire).
 					lastRun[name] = w.establishScheduleBase(ctx, name, sj.Schedule, now)
 				}
+				// Collapse a BACKLOG to a single catch-up fire, the same way the
+				// cold-start path does. establishScheduleBase runs once per schedule
+				// per process, so after it the durable cursor is never re-read and
+				// lastRun[name] is advanced one boundary per successful fire. A storage
+				// outage the worker SURVIVES therefore leaves lastRun stale by
+				// outage/period boundaries, and this loop then fires every one of them
+				// — one per 100ms tick, i.e. at 10 Hz, each a real Enqueue. The
+				// genuine-failure backoff makes it worse, since more boundaries elapse
+				// while it waits.
+				//
+				// seedLastRun is exactly the clamp for this and is pure (no clock, no
+				// storage), so it can run every tick: it returns the cursor unchanged
+				// when zero or one boundary is due, and only when TWO OR MORE are due
+				// does it skip to the most recent, yielding one fire instead of N. Its
+				// own doc already states the intended contract ("causing exactly one
+				// catch-up fire, after which natural cadence resumes") — the cold path
+				// implemented it and the warm path did not.
+				//
+				// Fleet safety is unaffected: the durable claim in EnqueueScheduledFire
+				// remains the authority on which boundary is consumed, so clamping only
+				// reduces how many doomed claims this worker attempts.
+				if cursor, capped := seedLastRun(sj.Schedule, lastRun[name], now); !cursor.Equal(lastRun[name]) {
+					skipped := cursor
+					lastRun[name] = cursor
+					if capped {
+						w.logger.Warn("scheduled job catch-up exceeded the iteration cap after a gap; missed boundaries were dropped and the schedule resumes from now",
+							"job_type", name, "max_catch_up_iterations", maxCatchUpIterations)
+					} else {
+						w.logger.Info("scheduled job fell behind; collapsing the missed boundaries to a single catch-up fire",
+							"job_type", name, "resumed_from", skipped)
+					}
+				}
 				nextRun := sj.Schedule.Next(lastRun[name])
 				if scheduleNeverFires(nextRun) {
 					// The schedule has no future fire (an unsatisfiable cron such as

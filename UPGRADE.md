@@ -322,6 +322,25 @@ non-terminal parent genuinely fails every retry, which is the case it was writte
 for. A parent whose status cannot be read is still retried, since a few wasted
 writes are cheaper than stranding a waiting parent.
 
+### A schedule that falls behind fires once, not once per missed boundary
+
+**Before:** the "at most one catch-up fire" rule was only applied when a worker
+first saw a schedule. After that the durable cursor was never re-read, so a
+storage outage the worker *survived* — a failover, pool exhaustion, a lock-wait
+timeout — left the in-memory cursor stale by one boundary per period. When storage
+came back the scheduler fired **every** missed boundary, one per 100 ms tick, each
+a real enqueue. The failure backoff made it worse, since more boundaries elapsed
+while it waited.
+
+**After:** the same clamp runs on every tick. Zero or one boundary due behaves
+exactly as before; two or more collapse to a single catch-up fire and normal
+cadence resumes. An `INFO` line records that it happened.
+
+**What you may notice:** after an outage, a schedule produces one catch-up job
+instead of a burst proportional to the outage. If you were relying on that burst
+to backfill every missed interval, it was never the documented behaviour — the
+cold-start path has always collapsed them, and this only makes the warm path agree.
+
 ### A blocked `Unique` schedule is skipped, not retried at 10 Hz
 
 **Before:** a scheduled job declared with `queue.Unique(key)` dedups against its
