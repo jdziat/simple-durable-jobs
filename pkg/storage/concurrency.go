@@ -169,7 +169,7 @@ func (s *GormStorage) ReleaseConcurrencySlot(ctx context.Context, slotName strin
 
 // ReleaseConcurrencySlotOwned releases a slot only if this worker still holds it.
 //
-// WHY THIS EXISTS
+// # WHY THIS EXISTS
 //
 // worker_id is WRITTEN on every acquire and renew and was read in NO WHERE
 // clause anywhere in the package, so ReleaseConcurrencySlot keyed on
