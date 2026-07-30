@@ -176,6 +176,18 @@ func splitCronTZ(expr string) (*time.Location, string, error) {
 	if name == "" {
 		return nil, "", fmt.Errorf("jobs: cron expression %q carries an empty timezone name", expr)
 	}
+	// A SECOND timezone prefix is ambiguous and must not be resolved by picking
+	// one. robfig's parser understands TZ=/CRON_TZ= itself, so it would strip the
+	// inner name and set the location from it — and parseCronIn then overwrites
+	// that with the OUTER name. The result is that one of the two timezones the
+	// caller wrote is silently discarded and the job fires in the other, with no
+	// error and no log line. Rejecting is the only answer that cannot be wrong.
+	for _, p := range cronTZPrefixes {
+		if strings.HasPrefix(rest, p) {
+			return nil, "", fmt.Errorf(
+				"jobs: cron expression %q names more than one timezone; use exactly one CRON_TZ= or TZ= prefix", expr)
+		}
+	}
 	loc, err := time.LoadLocation(name)
 	if err != nil {
 		return nil, "", fmt.Errorf("jobs: cron expression %q names an unknown timezone %q: %w", expr, name, err)

@@ -341,6 +341,21 @@ instead of a burst proportional to the outage. If you were relying on that burst
 to backfill every missed interval, it was never the documented behaviour — the
 cold-start path has always collapsed them, and this only makes the warm path agree.
 
+### A cron expression naming two timezones is now rejected
+
+**Before:** `Cron("CRON_TZ=UTC TZ=Asia/Tokyo 0 9 * * *")` was accepted. robfig's
+parser understands `TZ=`/`CRON_TZ=` itself, so it stripped the inner name and set
+the location from it — and this package then overwrote that with the OUTER name.
+One of the two timezones you wrote was silently discarded and the job fired in the
+other, with no error and no log line.
+
+**After:** an expression carrying more than one timezone prefix returns an error
+naming the problem. Exactly one `CRON_TZ=` or `TZ=` prefix, or none, is unchanged.
+
+**What you may notice:** nothing, unless you had such an expression — in which case
+it was already firing in a timezone you did not choose, and now it fails loudly at
+schedule time instead.
+
 ### A blocked `Unique` schedule is skipped, not retried at 10 Hz
 
 **Before:** a scheduled job declared with `queue.Unique(key)` dedups against its
