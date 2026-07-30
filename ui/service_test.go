@@ -16,6 +16,7 @@ import (
 	"connectrpc.com/connect"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/types/known/timestamppb"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
@@ -3284,4 +3285,82 @@ func TestGetStats_FallbackIncludesPausedCount(t *testing.T) {
 	assert.Equal(t, int64(2), resp.Msg.TotalPaused)
 	require.Len(t, resp.Msg.Queues, 1)
 	assert.Equal(t, int64(2), resp.Msg.Queues[0].Paused)
+}
+
+// TestListJobs_ForwardsEveryFilterField asserts the WHOLE JobFilter rather than
+// naming fields one at a time, which is why the omission it covers went unnoticed.
+//
+// ListJobsRequest declares `since` and `until` (proto fields 5 and 6) and
+// SearchJobs honours them (created_at >= / <=), but the handler never copied them
+// into the JobFilter. Omitting a filter does not narrow a query, it WIDENS it: a
+// caller asking for the last hour received every job, and a UI reporting "N jobs
+// in this window" was reporting all of them.
+//
+// TestListJobs_FilterForwarded above checks Status, Queue, Type, Search and Offset
+// individually, so a field that is never forwarded simply is not mentioned and
+// nothing fails. Comparing the entire struct means a NEW field added to
+// ListJobsRequest and JobFilter but not wired between them fails here, without
+// anyone remembering to add an assertion.
+func TestListJobs_ForwardsEveryFilterField(t *testing.T) {
+	since := time.Date(2026, 3, 1, 9, 0, 0, 0, time.UTC)
+	until := time.Date(2026, 3, 2, 9, 0, 0, 0, time.UTC)
+
+	var captured JobFilter
+	store := &mockUIStorage{
+		searchJobsFn: func(_ context.Context, f JobFilter) ([]*core.Job, int64, error) {
+			captured = f
+			return nil, 0, nil
+		},
+	}
+	svc := newServiceWithUIStorage(store)
+	_, err := svc.ListJobs(context.Background(), connect.NewRequest(&jobsv1.ListJobsRequest{
+		Limit:        20,
+		Page:         3,
+		Status:       "failed",
+		Queue:        "emails",
+		Type:         "send-email",
+		Tenant:       "acme",
+		Search:       "foo",
+		SortKey:      "updated_at",
+		SortDir:      "asc",
+		MetaContains: map[string]string{"region": "eu"},
+		Since:        timestamppb.New(since),
+		Until:        timestamppb.New(until),
+	}))
+	require.NoError(t, err)
+
+	require.Equal(t, JobFilter{
+		Status:       "failed",
+		Queue:        "emails",
+		Type:         "send-email",
+		Tenant:       "acme",
+		MetaContains: &core.MetadataMap{"region": "eu"},
+		Search:       "foo",
+		Since:        since,
+		Until:        until,
+		Limit:        20,
+		Offset:       40, // page 3, limit 20
+		SortKey:      "updated_at",
+		SortDir:      "asc",
+	}, captured,
+		"every field the request declares must reach the filter; an unforwarded filter widens the query instead of narrowing it")
+}
+
+// An absent time bound must stay the zero time, which is what SearchJobs reads as
+// "no bound". Converting a nil timestamp to year 1 would silently apply a real
+// lower bound to every unfiltered request.
+func TestListJobs_AbsentTimeWindowIsUnbounded(t *testing.T) {
+	var captured JobFilter
+	store := &mockUIStorage{
+		searchJobsFn: func(_ context.Context, f JobFilter) ([]*core.Job, int64, error) {
+			captured = f
+			return nil, 0, nil
+		},
+	}
+	svc := newServiceWithUIStorage(store)
+	_, err := svc.ListJobs(context.Background(), connect.NewRequest(&jobsv1.ListJobsRequest{Limit: 10}))
+	require.NoError(t, err)
+
+	assert.True(t, captured.Since.IsZero(), "an absent `since` must be the zero time, not year 1")
+	assert.True(t, captured.Until.IsZero(), "an absent `until` must be the zero time, not year 1")
 }

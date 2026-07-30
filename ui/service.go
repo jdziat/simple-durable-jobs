@@ -831,6 +831,10 @@ func (s *jobsService) searchJobs(ctx context.Context, req *jobsv1.ListJobsReques
 
 	// Check if storage implements UIStorage
 	if ui, ok := s.storage.(UIStorage); ok {
+		// Since/Until are declared on the request and honoured by SearchJobs
+		// (created_at >= / <=). Omitting them here did not narrow the query, it
+		// silently WIDENED it: a caller asking for one hour got every job, and a
+		// UI showing "1 job in the last hour" would have been showing all of them.
 		return ui.SearchJobs(ctx, JobFilter{
 			Status:       req.Status,
 			Queue:        req.Queue,
@@ -838,6 +842,8 @@ func (s *jobsService) searchJobs(ctx context.Context, req *jobsv1.ListJobsReques
 			Tenant:       req.Tenant,
 			MetaContains: metadataMapFromProto(req.MetaContains),
 			Search:       req.Search,
+			Since:        timeFromProto(req.Since),
+			Until:        timeFromProto(req.Until),
 			Limit:        limit,
 			Offset:       (page - 1) * limit,
 			SortKey:      req.SortKey,
@@ -1411,3 +1417,17 @@ type deadLetterStorage interface {
 
 // JobFilter is an alias for core.JobFilter for backward compatibility.
 type JobFilter = core.JobFilter
+
+// timeFromProto converts an optional request timestamp to the zero time when it is
+// absent, which is what JobFilter treats as "no bound" (SearchJobs gates each side
+// on IsZero). A nil *timestamppb.Timestamp would otherwise panic on AsTime, and a
+// zero-valued one must not be turned into year 1 and used as a real lower bound.
+func timeFromProto(ts *timestamppb.Timestamp) time.Time {
+	if ts == nil || !ts.IsValid() {
+		return time.Time{}
+	}
+	if t := ts.AsTime(); !t.IsZero() {
+		return t
+	}
+	return time.Time{}
+}
