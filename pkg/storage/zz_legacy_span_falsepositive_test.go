@@ -189,3 +189,47 @@ func TestBuiltinCheckpointTypes_AreExhaustive(t *testing.T) {
 		require.True(t, core.IsCallCheckpointType(ct), "%q is a user Call() name and must not be excluded", ct)
 	}
 }
+
+// TestFindLegacyCallSpanJobs_EachBuiltinTypeIsExcludedIndependently covers each
+// built-in type ON ITS OWN, because the combined test above cannot.
+//
+// That test seeds one checkpoint per built-in type on a single job. Drop ONE type
+// from the exclusion and that job has exactly one non-excluded checkpoint —
+// count = 1, below the query's `HAVING count(c.id) > 1` threshold — so it is still
+// not flagged and the test still passes. The omission only becomes visible when a
+// workflow uses the SAME built-in operation twice, which is ordinary (two Sleeps,
+// two signal waits).
+//
+// So each subtest seeds TWO checkpoints of one type. Dropping that type from the
+// exclusion then yields count = 2, the job is flagged, and the subtest fails —
+// naming exactly which operation lost its exclusion.
+func TestFindLegacyCallSpanJobs_EachBuiltinTypeIsExcludedIndependently(t *testing.T) {
+	ctx := context.Background()
+	for _, ct := range builtinCheckpointTypesUnderTest() {
+		t.Run(ct, func(t *testing.T) {
+			s := newTestStorage(t)
+			job := seedJob(t, s, core.StatusRunning)
+			// TWO of the same built-in operation, which is what a real workflow does
+			// and what pushes the count past the HAVING threshold.
+			seedCheckpoint(t, s, job, 0, ct, 0)
+			seedCheckpoint(t, s, job, 1, ct, 0)
+
+			found, err := s.FindLegacyCallSpanJobs(ctx, 100)
+			require.NoError(t, err)
+			for _, f := range found {
+				require.NotEqual(t, job, f.JobID,
+					"a workflow that used the built-in operation %q twice was reported as pre-upgrade work; that type is missing from the SQL exclusion, and it takes two uses of the SAME operation to see it", ct)
+			}
+
+			// The same job must also be judged built-in by the Go predicate, which is
+			// the other half of the pair and now reads the same list.
+			require.False(t, core.IsCallCheckpointType(ct),
+				"%q is built-in for the SQL exclusion but not for IsCallCheckpointType; the two predicates have diverged", ct)
+
+			// And the operator-facing SQL must agree, since that is what gets pasted
+			// into a shell during an upgrade.
+			require.NotContains(t, runUpgradeDocLegacyQuery(t, s), job,
+				"UPGRADE.md's published query flags a workflow that used %q twice", ct)
+		})
+	}
+}

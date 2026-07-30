@@ -185,23 +185,32 @@ const (
 // systematic false positive on every workflow using two built-in operations,
 // whose documented repair discards completed work.
 func IsCallCheckpointType(callType string) bool {
-	switch {
-	case callType == CheckpointTypeFanOut,
-		callType == CheckpointTypeSleep,
-		strings.HasPrefix(callType, CheckpointTypeSignalPrefix),
-		strings.HasPrefix(callType, CheckpointTypeSignalTimeoutPrefix),
-		strings.HasPrefix(callType, CheckpointTypeSignalPeekPrefix),
-		strings.HasPrefix(callType, CheckpointTypeSignalDrainPrefix):
-		return false
-	default:
-		return true
+	exact, prefixes := builtinCheckpointTypeMatchers()
+	for _, v := range exact {
+		if callType == v {
+			return false
+		}
 	}
+	for _, p := range prefixes {
+		if strings.HasPrefix(callType, p) {
+			return false
+		}
+	}
+	return true
 }
 
 // builtinCheckpointTypeMatchers is every built-in CallType shape, as an exact
-// value or a LIKE prefix, for callers that must express IsCallCheckpointType in
-// SQL. Kept beside the function so a new built-in operation cannot be added to
-// one and forgotten in the other.
+// value or a LIKE prefix. It is the SINGLE source both spellings read:
+// IsCallCheckpointType walks it directly and BuiltinCheckpointTypeSQLExclusion
+// renders it as SQL, so the Go predicate and the SQL predicate cannot disagree.
+//
+// This used to be a second list sitting next to a hand-written switch, with a
+// comment claiming proximity meant one could not be updated without the other.
+// Proximity is not a guarantee: dropping a type from the SQL list alone left
+// IsCallCheckpointType correct while the legacy-span query started flagging that
+// operation, and no test failed — a job with one non-excluded checkpoint sits at
+// count = 1, below the query's `HAVING count > 1` threshold, so the omission was
+// invisible until a workflow used the same operation twice.
 func builtinCheckpointTypeMatchers() (exact []string, prefixes []string) {
 	return []string{CheckpointTypeFanOut, CheckpointTypeSleep},
 		[]string{

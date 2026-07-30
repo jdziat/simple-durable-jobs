@@ -100,3 +100,49 @@ func TestCompleteFanOut_ParentReadFailureStillRetries(t *testing.T) {
 	require.True(t, strings.Contains(buf.String(), "stalled-parent backstop"),
 		"and it must still hand off to the backstop rather than dropping the parent silently")
 }
+
+// The terminal-parent fix has TWO halves: a check before the retry goroutine is
+// spawned, and a second one before the final WARN inside resumeParentWithRetry.
+// Every test above exercises only the FIRST, because a parent that is terminal at
+// spawn time returns before the goroutine exists — so the first half makes the
+// second half's guard unreachable, and it could be deleted with the package green.
+// That is the same "one half of a two-part fix hides the other" shape this campaign
+// keeps finding, here in my own fix.
+//
+// The second half covers a parent that is NOT terminal when the fan-out completes
+// and becomes terminal WHILE the retries run: cancelled by an operator, or failing
+// on another worker. Without it the run ends by warning that it is relying on the
+// stalled-parent backstop for a parent no backstop will ever touch.
+func TestResumeParentWithRetry_ParentGoingTerminalMidRetryDoesNotWarn(t *testing.T) {
+	var resumeCalls atomic.Int64
+	var getCalls atomic.Int64
+	store := &mockStorage{
+		resumeJobFunc: func(context.Context, core.UUID) (bool, error) {
+			resumeCalls.Add(1)
+			return false, nil
+		},
+		getJobFunc: func(_ context.Context, id core.UUID) (*core.Job, error) {
+			// Non-terminal for the pre-spawn check, so the retry goroutine IS
+			// started; terminal by the time the retries give up.
+			status := core.StatusWaiting
+			if getCalls.Add(1) > 1 {
+				status = core.StatusCancelled
+			}
+			return &core.Job{ID: id, Type: "parent", Queue: "default", Status: status}, nil
+		},
+	}
+	w := NewWorker(queue.New(store))
+	var buf bytes.Buffer
+	w.logger = slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	fo := &core.FanOut{ID: core.NewID(), ParentJobID: core.NewID(), TotalCount: 1}
+	require.NoError(t, w.completeFanOut(context.Background(), fo, core.FanOutCompleted))
+	w.wg.Wait()
+
+	require.Greater(t, getCalls.Load(), int64(1),
+		"premise: the pre-spawn check must have passed and the retry goroutine must have run, or the second guard is not being exercised at all")
+	require.Greater(t, resumeCalls.Load(), int64(1),
+		"premise: the bounded retries must have run")
+	require.NotContains(t, buf.String(), "stalled-parent backstop",
+		"the parent reached a terminal status during the retries, so there is nothing to resume and nothing for the backstop to do; warning here sends an operator after a stall that does not exist")
+}
