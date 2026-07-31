@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 
 	"github.com/jdziat/simple-durable-jobs/v4/pkg/core"
 )
@@ -73,8 +74,25 @@ func (s *GormStorage) createUniqueLockedJob(ctx context.Context, db *gorm.DB, jo
 		return core.NilUUID, err
 	}
 	dqReadyFalseIDs, dqReadyFalseRefs := dqReadyFalseJobs([]*core.Job{job})
-	if err := db.WithContext(ctx).Create(row).Error; err != nil {
-		return core.NilUUID, err
+	// A job may carry BOTH a windowed key (IdempotencyKey/UniqueFor, which is the
+	// lock we just won) and an active-only key (queue.Unique), which is enforced by
+	// the partial unique index. Winning the lock says nothing about the index, so a
+	// bare Create surfaced a raw driver constraint error — a 1062/23505/UNIQUE
+	// string the caller cannot match on — where the documented contract for the
+	// same collision on the ordinary enqueue path is core.ErrDuplicateJob.
+	//
+	// Use the same OnConflict + RowsAffected mapping the enqueue backstop uses,
+	// rather than sniffing driver error text, which differs per dialect.
+	//
+	// The lock we hold then references a job that was not inserted. That is
+	// self-healing rather than a leak: the lock carries a TTL, and
+	// stealTerminalUniqueLock already treats a missing referenced job as stealable.
+	result := db.WithContext(ctx).Clauses(clause.OnConflict{DoNothing: true}).Create(row)
+	if result.Error != nil {
+		return core.NilUUID, result.Error
+	}
+	if result.RowsAffected == 0 {
+		return core.NilUUID, core.ErrDuplicateJob
 	}
 	if err := restoreDQReadyFalse(db.WithContext(ctx), dqReadyFalseIDs, dqReadyFalseRefs); err != nil {
 		return core.NilUUID, err
