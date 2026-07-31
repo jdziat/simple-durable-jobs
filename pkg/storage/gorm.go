@@ -5,10 +5,12 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math/rand/v2"
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -143,6 +145,15 @@ type GormStorage struct {
 	// SetDeleteCheckpointsOnComplete) to bound the checkpoints table. Never
 	// affects the failure path — retry replay reads checkpoints.
 	deleteCheckpointsOnComplete atomic.Bool
+
+	// logger is optional; slog.Default() is used when nil. See SetLogger.
+	logger *slog.Logger
+	// poisonPayload* track rows whose payload this storage cannot decode. The
+	// counter is always incremented; the map bounds which ids get named in a log.
+	poisonPayloadDrops  atomic.Int64
+	poisonPayloadMu     sync.Mutex
+	poisonPayloadLogged map[core.UUID]struct{}
+	poisonPayloadCapped bool
 
 	// hotStatsTTL is the TTL (nanoseconds) for the hot-path aggregate cache; <=0
 	// disables it. atomic (comparable) so WithHotStatsCacheTTL and tests can set

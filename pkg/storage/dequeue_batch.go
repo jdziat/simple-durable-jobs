@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"slices"
 	"sort"
 	"time"
@@ -455,11 +456,25 @@ func (s *GormStorage) dequeueBatchLocked(ctx context.Context, queues []string, w
 // stale-lock reaper, ~45m by default) on a single bad payload (teardown g3). The
 // successfully-decoded jobs are returned so good work is never blocked by a poison
 // sibling. The released poison row is re-claimable (and will re-fail decode) — a
-// visible, self-contained symptom of a misconfigured codec, not a fleet-wide stall.
+// self-contained symptom of a misconfigured codec, not a fleet-wide stall.
+//
+// It has to be a VISIBLE symptom, and it was not. This comment claimed visibility
+// while the drop emitted no log, no metric and no hook: the row was claimed,
+// silently excluded, released, re-claimed and re-failed forever, and the only
+// outward sign was a job that never progressed. A whole queue could be poisoned by
+// a key rotation with nothing to point at it.
+//
+// So each drop now increments a counter (PoisonPayloadDrops) and logs once per job
+// id per process. Once-per-job rather than once-per-attempt because the row
+// re-fails on every claim — at the default poll interval that is tens of lines per
+// second per row. The logged set is capped; past the cap one summary line is
+// emitted and further ids are counted but not named, so a mass decode failure
+// cannot itself become the outage.
 func (s *GormStorage) decodeClaimedBatch(ctx context.Context, jobs []*core.Job, workerID string) ([]*core.Job, error) {
 	out := jobs[:0]
 	for _, job := range jobs {
 		if err := s.decodeJobPayloads(job); err != nil {
+			s.reportPoisonPayload(job.ID, err)
 			if rerr := s.Release(ctx, job.ID, workerID); rerr != nil && !errors.Is(rerr, core.ErrJobNotOwned) {
 				return nil, rerr
 			}
@@ -469,6 +484,51 @@ func (s *GormStorage) decodeClaimedBatch(ctx context.Context, jobs []*core.Job, 
 	}
 	return out, nil
 }
+
+// maxPoisonPayloadIDsLogged bounds the set of job ids named in the log. A mass
+// decode failure (a rotated key, a codec misconfiguration) would otherwise emit a
+// line per row per claim.
+const maxPoisonPayloadIDsLogged = 64
+
+// reportPoisonPayload records an undecodable row: always a counter increment, and
+// a log line the first time each id is seen by this process.
+func (s *GormStorage) reportPoisonPayload(jobID core.UUID, cause error) {
+	s.poisonPayloadDrops.Add(1)
+
+	s.poisonPayloadMu.Lock()
+	defer s.poisonPayloadMu.Unlock()
+	if _, seen := s.poisonPayloadLogged[jobID]; seen {
+		return
+	}
+	logger := s.logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	if len(s.poisonPayloadLogged) >= maxPoisonPayloadIDsLogged {
+		if !s.poisonPayloadCapped {
+			s.poisonPayloadCapped = true
+			logger.Warn("too many jobs have undecodable payloads to name individually; further job ids are counted but not logged. Check PoisonPayloadDrops() and your codec configuration",
+				"limit", maxPoisonPayloadIDsLogged, "total_drops", s.poisonPayloadDrops.Load())
+		}
+		return
+	}
+	if s.poisonPayloadLogged == nil {
+		s.poisonPayloadLogged = make(map[core.UUID]struct{}, 8)
+	}
+	s.poisonPayloadLogged[jobID] = struct{}{}
+	logger.Warn("job payload could not be decoded; the job was released and will be re-claimed and re-fail until its codec can read it",
+		"job_id", jobID, "error", cause, "total_drops", s.poisonPayloadDrops.Load())
+}
+
+// PoisonPayloadDrops reports how many times this storage has claimed a job whose
+// payload it could not decode and released it again. A non-zero and RISING value
+// means a codec cannot read rows this deployment wrote — typically a rotated or
+// missing key — and those jobs are not progressing.
+func (s *GormStorage) PoisonPayloadDrops() int64 { return s.poisonPayloadDrops.Load() }
+
+// SetLogger supplies the logger used for storage-level warnings. Optional:
+// slog.Default() is used when unset, so a poison payload is never silent.
+func (s *GormStorage) SetLogger(l *slog.Logger) { s.logger = l }
 
 // releaseClaimedOnAbort returns rows already claimed by this call to pending,
 // then returns cause joined with any release failure.
