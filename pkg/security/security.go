@@ -46,7 +46,17 @@ const (
 var validJobTypeName = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9_\-\.]*$`)
 
 var (
-	authTokenPattern      = regexp.MustCompile(`(?i)\b(authorization|bearer)(\s*[:=]?\s*)\S+`)
+	// The optional scheme group is load-bearing. Without it, `\S+` consumes the
+	// SCHEME WORD rather than the credential, so the canonical HTTP spellings
+	// leaked verbatim into last_error, dead_letter_reason and the dashboard:
+	//   "Authorization: Bearer <token>"  -> "Authorization: [REDACTED] <token>"
+	//   "authorization: Basic <base64>"  -> "authorization: [REDACTED] <base64>"
+	// Only the schemeless forms ("Bearer <token>", "Authorization=<token>") were
+	// ever redacted. Consuming an optional scheme first puts the credential itself
+	// in the match.
+	authTokenPattern = regexp.MustCompile(
+		`(?i)\b((?:proxy-)?authorization|bearer)(\s*[:=]?\s*)` +
+			`(?:(?:bearer|basic|digest|negotiate|ntlm|token|apikey)\s+)?\S+`)
 	passwordKVPattern     = regexp.MustCompile(`(?i)\b(password|pwd)=([^\s&;]+)`)
 	dsnPasswordPattern    = regexp.MustCompile(`(?i)\b([a-z][a-z0-9+.-]*://[^:/\s@]+:)([^@\s/]+)(@)`)
 	stripeTokenPattern    = regexp.MustCompile(`(^|[^A-Za-z0-9_])((?:(?:sk_(?:live|test))|(?:rk_live))_[A-Za-z0-9_-]{16,})([^A-Za-z0-9_-]|$)`)
