@@ -682,6 +682,17 @@ const scheduledJobs: ScheduledJobInfo[] = [
     overdue: false,
     missedFires: i64(0),
   }),
+  // A schedule whose expression can never match. It has no nextRun at all, and
+  // must render as "Never fires" rather than "On track" — the demo carries it so
+  // the third health state is visible without contriving one.
+  new ScheduledJobInfo({
+    name: 'leap-day-audit',
+    schedule: '0 0 30 2 *',
+    queue: 'default',
+    overdue: false,
+    missedFires: i64(0),
+    neverFires: true,
+  }),
 ]
 
 // ---------------------------------------------------------------------------

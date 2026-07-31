@@ -2008,6 +2008,21 @@ export class ScheduledJobInfo extends Message<ScheduledJobInfo> {
    */
   expectedLastRun?: Timestamp;
 
+  /**
+   * never_fires is true when the schedule has NO future boundary at all — an
+   * unsatisfiable cron such as "0 0 30 2 *". The worker detects the same condition
+   * and permanently skips the schedule, logging it once.
+   *
+   * It is a distinct state from overdue, not a special case of it: overdue means
+   * boundaries that SHOULD have fired did not, and a schedule that can never fire
+   * has no such boundaries. Reporting it as overdue would contradict that field's
+   * meaning; reporting it as neither left the dashboard rendering the schedule as
+   * healthy, which is what this field fixes. next_run is unset when it is true.
+   *
+   * @generated from field: bool never_fires = 9;
+   */
+  neverFires = false;
+
   constructor(data?: PartialMessage<ScheduledJobInfo>) {
     super();
     proto3.util.initPartial(data, this);
@@ -2024,6 +2039,7 @@ export class ScheduledJobInfo extends Message<ScheduledJobInfo> {
     { no: 6, name: "overdue", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
     { no: 7, name: "missed_fires", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
     { no: 8, name: "expected_last_run", kind: "message", T: Timestamp },
+    { no: 9, name: "never_fires", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ScheduledJobInfo {

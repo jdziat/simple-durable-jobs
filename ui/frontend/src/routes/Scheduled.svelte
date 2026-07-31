@@ -22,6 +22,7 @@
     overdue: boolean
     missedFires: number
     expectedLastRun: TimeValue
+    neverFires: boolean
   }
 
   const columns: Column[] = [
@@ -101,6 +102,7 @@
         lastRun: toDate(job.lastRun),
         overdue: job.overdue,
         missedFires: Number(job.missedFires),
+        neverFires: job.neverFires,
         expectedLastRun: toDate(job.expectedLastRun),
       }))
     } catch (e) {
@@ -122,6 +124,9 @@
   }
 
   function healthTitle(job: ScheduledJob): string | undefined {
+    if (job.neverFires) {
+      return 'This schedule has no future boundary — the expression can never match. The worker skips it permanently; it is not a worker fault.'
+    }
     if (!job.overdue) return undefined
     const expected = job.expectedLastRun ? `Expected ${absolute(job.expectedLastRun)} · ` : ''
     return `${expected}${missedFireLabel(job.missedFires)} — the scheduler/worker may not be running`
@@ -192,7 +197,11 @@
         <span class="muted">—</span>
       {/if}
     {:else if column.key === 'health'}
-      {#if job.overdue}
+      {#if job.neverFires}
+        <span class="health-badge health-never" title={healthTitle(job)} aria-label={healthTitle(job)}>
+          Never fires
+        </span>
+      {:else if job.overdue}
         <span class="health-badge health-overdue" title={healthTitle(job)} aria-label={healthTitle(job)}>
           {job.missedFires > 0 ? `Overdue · ${missedFireLabel(job.missedFires)}` : 'Overdue'}
         </span>
@@ -309,6 +318,12 @@
 
   .health-ok {
     color: var(--fg-secondary);
+  }
+
+  .health-never {
+    border: 1px solid color-mix(in srgb, var(--sig-danger) 55%, transparent);
+    background: var(--sig-danger-bg);
+    color: var(--sig-danger);
   }
 
   .health-overdue {

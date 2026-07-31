@@ -502,6 +502,14 @@ func (s *jobsService) ListScheduledJobs(ctx context.Context, req *connect.Reques
 				missedFires := 0
 				trackOverdue := s.scheduleOverdueThreshold > 0 && hasLastRun
 				nextRun := sj.Schedule.Next(anchor)
+				// A schedule with NO future boundary — an unsatisfiable cron such as
+				// "0 0 30 2 *" — yields the zero time. The loop below then never runs,
+				// missed_fires stays 0 and overdue stays false, so the dashboard used to
+				// render this as healthy for a schedule the WORKER has already logged as
+				// permanently skipped. Reporting it as overdue instead would contradict
+				// that field's documented meaning (boundaries that should have fired did
+				// not; here there are none), so it gets its own state.
+				info.NeverFires = nextRun.IsZero()
 				for iter := 0; !nextRun.IsZero() && !nextRun.After(now); iter++ {
 					if iter >= nextRunCatchUpCap {
 						// Pathologically dense schedule over a long gap: resume from
