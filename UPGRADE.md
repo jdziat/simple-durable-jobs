@@ -341,6 +341,37 @@ instead of a burst proportional to the outage. If you were relying on that burst
 to backfill every missed interval, it was never the documented behaviour — the
 cold-start path has always collapsed them, and this only makes the warm path agree.
 
+### `Unique` keeps deduplicating while its holder is waiting or paused
+
+**Before:** the guard matched only `pending` or `running` holders, so a job parked
+in `waiting` (on a signal or a fan-out) or sitting in `paused` silently stopped
+deduplicating and a second job with the same key was admitted.
+
+The damage was not two handlers running at once — the partial unique index refuses
+the second row the moment either becomes runnable. The damage is that it refuses
+the WRONG one: the interloper is admitted as `pending`, and when the original
+holder's signal finally arrives, its `waiting` → `pending` resume collides with the
+index and fails. The job actually doing the work is the one that cannot proceed,
+until the interloper it never asked for reaches a terminal status.
+
+**After:** the guard is held in every non-terminal status — `pending`, `running`,
+`retrying`, `waiting`, `paused` — and still releases on `completed`, `failed` and
+`cancelled`, exactly as documented. `IdempotencyKey`/`UniqueFor` have always
+treated a parked job as still in progress; the two mechanisms now agree.
+
+**What you may notice:** an `Enqueue` with `Unique(key)` that previously succeeded
+while the holder was parked now returns `ErrDuplicateJob`. That is the documented
+contract ("the guard releases as soon as the existing job reaches completed,
+failed, or cancelled"); the old behaviour also produced the resume failure above,
+so code relying on it was already racing its own holder. The reference page said
+"pending-or-running" in one sentence and the terminal rule in another — those were
+never the same rule, and the terminal one is now authoritative.
+
+No migration. The partial unique index is unchanged and remains the
+`pending`/`running` backstop it was added for (Postgres's absent-row `FOR UPDATE`
+gap); the application predicate is simply stricter than it now, which is the safe
+direction and is what removes the collision.
+
 ### A cron expression naming two timezones is now rejected
 
 **Before:** `Cron("CRON_TZ=UTC TZ=Asia/Tokyo 0 9 * * *")` was accepted. robfig's

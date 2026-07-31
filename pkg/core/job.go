@@ -37,6 +37,20 @@ func (s JobStatus) IsTerminal() bool {
 	return false
 }
 
+// ActiveDedupStatuses are the statuses in which a job still HOLDS a
+// queue.Unique(key) guard: it has not finished, so a second job with the same key
+// is a duplicate.
+//
+// It is the complement of TerminalJobStatuses (plus retrying, which is a transient
+// spelling of pending), and that is the point: Unique documents its guard as
+// releasing "as soon as the existing job reaches completed, failed, or cancelled".
+// A `waiting` job — parked on a signal or a fan-out — and a `paused` job are
+// neither, so both still hold it. The windowed sibling (unique_locks) already
+// treats them as in-progress; this is what makes the two mechanisms agree.
+var ActiveDedupStatuses = []JobStatus{
+	StatusPending, StatusRunning, StatusRetrying, StatusWaiting, StatusPaused,
+}
+
 // MetadataMap stores queryable string metadata for jobs and job filters.
 type MetadataMap map[string]string
 

@@ -84,7 +84,7 @@ func (s *GormStorage) EnqueueUniqueTx(ctx context.Context, tx *gorm.DB, job *cor
 	db := tx.WithContext(ctx)
 
 	query := db.Where("unique_key = ?", uniqueKey).
-		Where("status IN ?", []core.JobStatus{core.StatusPending, core.StatusRunning})
+		Where("status IN ?", core.ActiveDedupStatuses)
 	query = s.lockForUpdate(query, false)
 
 	var existing core.Job
@@ -239,7 +239,7 @@ func (s *GormStorage) enqueueBatchWithDB(db *gorm.DB, jobs []*core.Job) error {
 		query := db.Model(&core.Job{}).
 			Select("id", "unique_key").
 			Where("unique_key IN ? AND status IN ?", keys,
-				[]core.JobStatus{core.StatusPending, core.StatusRunning})
+				core.ActiveDedupStatuses)
 		query = s.lockForUpdate(query, false)
 
 		var found []struct {

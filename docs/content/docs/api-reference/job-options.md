@@ -71,7 +71,9 @@ serialized fragment can over-match.
 
 ### `Unique(key string) Option`
 
-Ensures only one pending-or-running job with this `key` exists. If a matching job already exists, `Queue.Enqueue` returns `ErrDuplicateJob`. The uniqueness check runs inside a transaction with row-level locking on Postgres/MySQL and relies on SQLite's writer serialization. The key has no TTL — the guard releases as soon as the existing job reaches `completed`, `failed`, or `cancelled`.
+Ensures only one *unfinished* job with this `key` exists. If a matching job already exists, `Queue.Enqueue` returns `ErrDuplicateJob`. The uniqueness check runs inside a transaction with row-level locking on Postgres/MySQL and relies on SQLite's writer serialization. The key has no TTL — the guard releases as soon as the existing job reaches `completed`, `failed`, or `cancelled`, and is held in every other status: `pending`, `running`, `retrying`, and also `waiting` (parked on a signal or fan-out) and `paused`.
+
+This page previously said "pending-or-running" in the first sentence and "releases on completed/failed/cancelled" in the last, which are not the same rule. The implementation followed the first and a `waiting` holder stopped deduplicating; it now follows the second, matching `IdempotencyKey`/`UniqueFor`, which have always treated a parked job as still in progress.
 
 ### `IdempotencyKey(key string, ttl time.Duration) Option`
 

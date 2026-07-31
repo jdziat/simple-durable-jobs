@@ -641,7 +641,7 @@ func (s *GormStorage) EnqueueUnique(ctx context.Context, job *core.Job, uniqueKe
 		// Use transaction with row-level locking to prevent race conditions
 		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 			query := tx.Where("unique_key = ?", uniqueKey).
-				Where("status IN ?", []core.JobStatus{core.StatusPending, core.StatusRunning})
+				Where("status IN ?", core.ActiveDedupStatuses)
 
 			// SQLite doesn't support FOR UPDATE, but its serializable transactions
 			// provide equivalent protection for single-process scenarios
