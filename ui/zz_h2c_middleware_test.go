@@ -3,10 +3,12 @@ package ui
 import (
 	"bufio"
 	"bytes"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -320,7 +322,27 @@ func TestH2CUpgrade_BodyIsCappedForEveryConnectionSpelling(t *testing.T) {
 // header is a legitimate BulkDeleteJobs/BulkRetryJobs shape and must pass through
 // intact. Without this, "cap everything" would look like a valid fix above.
 func TestH2CUpgrade_CapDoesNotTouchOrdinaryLargeBodies(t *testing.T) {
-	p, addr := newProbedHandler(t)
+	// The middleware READS the body, which is what makes this test able to fail.
+	// newProbedHandler's middleware never touches it, so with that probe a cap
+	// applied to EVERY request is undetectable: the handler is still called and no
+	// 413 arises because nothing reads far enough to trip MaxBytesReader. As
+	// written before, "cap everything" passed.
+	var readErr error
+	var readN int
+	var mu sync.Mutex
+	mw := func(http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			b, err := io.ReadAll(r.Body)
+			mu.Lock()
+			readN, readErr = len(b), err
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+		})
+	}
+	srv := httptest.NewServer(Handler(&mockStorage{},
+		WithMiddleware(mw), WithInsecureAllowUnauthenticated()))
+	t.Cleanup(srv.Close)
+	addr := strings.TrimPrefix(srv.URL, "http://")
 
 	conn, err := net.Dial("tcp", addr)
 	require.NoError(t, err)
@@ -340,6 +362,12 @@ func TestH2CUpgrade_CapDoesNotTouchOrdinaryLargeBodies(t *testing.T) {
 
 	assert.NotContains(t, statusLine, "413",
 		"a non-upgrade request must not be capped; the h2c cap exists only for the body x/net buffers before dispatch")
-	assert.Equal(t, int64(1), p.innerCalls.Load(),
-		"an ordinary large-bodied request must still reach the inner handler")
+
+	mu.Lock()
+	gotN, gotErr := readN, readErr
+	mu.Unlock()
+	require.NoError(t, gotErr,
+		"the handler could not read the whole body of a NON-upgrade request, so the h2c cap is being applied to ordinary traffic; a legitimate BulkDeleteJobs/BulkRetryJobs body would be truncated")
+	assert.Equal(t, len(body), gotN,
+		"the handler must receive the entire body of a non-upgrade request (got %d of %d bytes)", gotN, len(body))
 }

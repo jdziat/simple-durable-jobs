@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -3329,6 +3330,13 @@ func TestListJobs_ForwardsEveryFilterField(t *testing.T) {
 	}))
 	require.NoError(t, err)
 
+	// Comparing the whole struct only protects fields this test POPULATES: a new
+	// field added to both ListJobsRequest and JobFilter but left unset here would
+	// be zero on both sides and compare equal. So first require that EVERY field of
+	// the captured filter is non-zero, which fails the moment a field exists that
+	// this test does not exercise — whether or not the handler forwards it.
+	requireEveryFilterFieldPopulated(t, captured)
+
 	require.Equal(t, JobFilter{
 		Status:       "failed",
 		Queue:        "emails",
@@ -3363,4 +3371,20 @@ func TestListJobs_AbsentTimeWindowIsUnbounded(t *testing.T) {
 
 	assert.True(t, captured.Since.IsZero(), "an absent `since` must be the zero time, not year 1")
 	assert.True(t, captured.Until.IsZero(), "an absent `until` must be the zero time, not year 1")
+}
+
+// requireEveryFilterFieldPopulated fails if any JobFilter field is still its zero
+// value. It is the half of TestListJobs_ForwardsEveryFilterField that catches a
+// NEW field: whole-struct equality alone cannot, because an unpopulated new field
+// is zero in both the expected and the actual value and compares equal. Adding a
+// field to JobFilter therefore fails here until the request carries it, the
+// handler forwards it, AND this test sets it.
+func requireEveryFilterFieldPopulated(t *testing.T, f JobFilter) {
+	t.Helper()
+	v := reflect.ValueOf(f)
+	for i := 0; i < v.NumField(); i++ {
+		name := v.Type().Field(i).Name
+		require.False(t, v.Field(i).IsZero(),
+			"JobFilter.%s is zero in the captured filter, so this test does not exercise it and whole-struct equality cannot detect it being dropped; populate it in the request above", name)
+	}
 }

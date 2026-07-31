@@ -233,3 +233,71 @@ func TestFindLegacyCallSpanJobs_EachBuiltinTypeIsExcludedIndependently(t *testin
 		})
 	}
 }
+
+// TestBuiltinCheckpointTypes_EveryCoreConstantIsClassified closes the hole in
+// TestBuiltinCheckpointTypes_AreExhaustive above, which scans the PRODUCERS for
+// bare string literals. That catches the mistake of hard-coding a new type, and
+// nothing else: adding a built-in operation the RIGHT way — declaring a new
+// core.CheckpointType* constant and using it — passes that scan completely, and
+// the new type then silently rejoins the legacy-span listing.
+//
+// This asserts the other direction: every CheckpointType* constant core declares
+// must be classified, either as a built-in (excluded from the listing, and
+// exercised by builtinCheckpointTypesUnderTest) or by an explicit decision
+// recorded here. A new constant fails until someone makes that call.
+func TestBuiltinCheckpointTypes_EveryCoreConstantIsClassified(t *testing.T) {
+	src, err := os.ReadFile(filepath.Join("..", "core", "job.go"))
+	require.NoError(t, err)
+
+	// Every exported CheckpointType* constant declared in pkg/core.
+	declared := regexp.MustCompile(`(?m)^\s*(CheckpointType\w+)\s*=`).FindAllStringSubmatch(string(src), -1)
+	require.NotEmpty(t, declared, "no CheckpointType* constants found; if they moved, update this test rather than deleting it")
+
+	// The values the exclusion is actually built from.
+	covered := map[string]bool{}
+	for _, ct := range builtinCheckpointTypesUnderTest() {
+		require.False(t, core.IsCallCheckpointType(ct),
+			"%q is in the under-test list but IsCallCheckpointType calls it a user Call()", ct)
+		covered[ct] = true
+	}
+
+	for _, m := range declared {
+		name := m[1]
+		// Resolve the constant to its value by exercising both classifications:
+		// a built-in must be excluded, and must appear (exactly or by prefix) in
+		// the enumerated list the other tests seed from.
+		found := false
+		for ct := range covered {
+			if strings.Contains(ct, constantValueHint(name)) {
+				found = true
+				break
+			}
+		}
+		require.True(t, found,
+			"core.%s is declared but no value derived from it appears in builtinCheckpointTypesUnderTest, so no test seeds a checkpoint of that type and the SQL exclusion for it is unguarded. Add it there (and to builtinCheckpointTypeMatchers if it is a built-in operation).", name)
+	}
+}
+
+// constantValueHint maps a CheckpointType* constant NAME to a distinctive fragment
+// of its value, so the check above can be made without reflection over constants.
+// Keeping it as a map means a new constant fails loudly here first — which is the
+// prompt to classify it — rather than being silently skipped.
+func constantValueHint(constName string) string {
+	switch constName {
+	case "CheckpointTypeFanOut":
+		return core.CheckpointTypeFanOut
+	case "CheckpointTypeSleep":
+		return core.CheckpointTypeSleep
+	case "CheckpointTypeSignalPrefix":
+		return core.CheckpointTypeSignalPrefix
+	case "CheckpointTypeSignalTimeoutPrefix":
+		return core.CheckpointTypeSignalTimeoutPrefix
+	case "CheckpointTypeSignalPeekPrefix":
+		return core.CheckpointTypeSignalPeekPrefix
+	case "CheckpointTypeSignalDrainPrefix":
+		return core.CheckpointTypeSignalDrainPrefix
+	}
+	// An unknown constant yields a sentinel that matches nothing, so the caller's
+	// require fails and names it.
+	return "\x00unclassified-" + constName
+}
