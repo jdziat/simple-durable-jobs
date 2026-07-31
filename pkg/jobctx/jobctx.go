@@ -169,6 +169,23 @@ func SavePhaseCheckpoint(ctx context.Context, phaseName string, result any) erro
 // may roll back), so caching it as visible would be unsound. A same-run
 // LoadPhaseCheckpoint therefore will not observe it; the value is read back on
 // the next replay after the caller commits.
+//
+// NOT OWNERSHIP-FENCED. The checkpoint write carries no locked_by/status
+// predicate, so it succeeds even when this worker no longer owns the job — its
+// lease lapsed and the stale-lock reaper handed the job to a peer, or an operator
+// cancelled it. Every checkpoint write in the library behaves this way
+// (SaveCheckpoint too); it is not specific to the transactional form.
+//
+// What that means in practice: the atomic pairing is still honoured — your effect
+// and the checkpoint recording it commit or roll back together — so a peer
+// replaying the job skips a phase whose effect genuinely happened. What it does
+// NOT do is stop a handler that has lost its lease from committing at all. The
+// worker's ownership audit interrupts such a handler within a few seconds
+// (FindOrphanedJobs), but a transaction already in flight can still land.
+//
+// If your phase must not commit after cancellation, check ctx.Err() immediately
+// before committing, and prefer effects that are safe to observe once even if the
+// job is later cancelled.
 func SavePhaseCheckpointTx(ctx context.Context, tx *gorm.DB, phaseName string, result any) error {
 	jc := intctx.GetJobContext(ctx)
 	if jc == nil {
