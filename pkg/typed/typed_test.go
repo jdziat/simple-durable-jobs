@@ -349,6 +349,75 @@ func TestTypedFanOutRunsTypedSubJobs(t *testing.T) {
 	}, got)
 }
 
+// TestLoadReturnsDocumentedSentinelPerStatus pins the error surface Def.Load's
+// godoc promises. Each sentinel is asserted against its OWN status and denied
+// for the others, so swapping two arms or collapsing them onto one sentinel
+// cannot stay green, and the completed leg asserts the decoded value with a nil
+// error so a Load that always errored would not pass either.
+func TestLoadReturnsDocumentedSentinelPerStatus(t *testing.T) {
+	ctx := context.Background()
+	q, store := newTestQueue(t, nil)
+
+	succeed := typed.Define[args, result](q, "sentinelCompleted", func(_ context.Context, a args) (result, error) {
+		return result{Message: a.Name, Total: a.Count}, nil
+	})
+	// NoRetry makes the first handler error terminal, so the row lands in failed
+	// instead of waiting out a retry backoff.
+	fail := typed.Define[args, result](q, "sentinelFailed", func(_ context.Context, _ args) (result, error) {
+		return result{}, core.NoRetry(fmt.Errorf("boom"))
+	})
+
+	completedID, err := succeed.Enqueue(ctx, args{Name: "done", Count: 1})
+	require.NoError(t, err)
+	runWorkerUntilStatus(t, q, store, completedID, core.StatusCompleted)
+
+	failedID, err := fail.Enqueue(ctx, args{Name: "bad", Count: 1})
+	require.NoError(t, err)
+	runWorkerUntilStatus(t, q, store, failedID, core.StatusFailed)
+
+	// Enqueued only now that both workers have stopped, so nothing claims these
+	// two out of the non-terminal state each leg needs.
+	cancelledID, err := succeed.Enqueue(ctx, args{Name: "cancel", Count: 1})
+	require.NoError(t, err)
+	require.NoError(t, q.CancelJob(ctx, cancelledID))
+	requireJobStatus(t, store, cancelledID, core.StatusCancelled)
+
+	pendingID, err := succeed.Enqueue(ctx, args{Name: "pending", Count: 1})
+	require.NoError(t, err)
+	requireJobStatus(t, store, pendingID, core.StatusPending)
+
+	got, err := succeed.Load(ctx, completedID)
+	require.NoError(t, err)
+	assert.Equal(t, result{Message: "done", Total: 1}, got)
+
+	_, err = fail.Load(ctx, failedID)
+	require.ErrorIs(t, err, core.ErrJobFailed)
+	assert.NotErrorIs(t, err, core.ErrJobCancelled)
+	assert.NotErrorIs(t, err, core.ErrJobNotCompleted)
+
+	_, err = succeed.Load(ctx, cancelledID)
+	require.ErrorIs(t, err, core.ErrJobCancelled)
+	assert.NotErrorIs(t, err, core.ErrJobFailed)
+	assert.NotErrorIs(t, err, core.ErrJobNotCompleted)
+
+	_, err = succeed.Load(ctx, pendingID)
+	require.ErrorIs(t, err, core.ErrJobNotCompleted)
+	assert.NotErrorIs(t, err, core.ErrJobFailed)
+	assert.NotErrorIs(t, err, core.ErrJobCancelled)
+
+	_, err = succeed.Load(ctx, core.NewID())
+	require.ErrorIs(t, err, core.ErrJobNotFound)
+}
+
+func requireJobStatus(t *testing.T, store core.Storage, jobID core.UUID, want core.JobStatus) {
+	t.Helper()
+
+	job, err := store.GetJob(context.Background(), jobID)
+	require.NoError(t, err)
+	require.NotNil(t, job)
+	require.Equal(t, want, job.Status)
+}
+
 func TestCompileTimeTypeMismatchFixture(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()

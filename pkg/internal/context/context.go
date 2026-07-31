@@ -56,6 +56,10 @@ type CallState struct {
 	Mu          sync.Mutex
 	CallIndex   int
 	Checkpoints map[CheckpointKey]*core.Checkpoint
+	// phasesSaved holds the phase names THIS execution has written, which is
+	// what tells a duplicate name apart from a legitimate replay: checkpoints
+	// loaded from an earlier run are not in it.
+	phasesSaved map[string]struct{}
 	// LegacySpanWarned records that this execution has already warned about
 	// replaying pre-span checkpoints, so the warning fires once per run rather
 	// than once per call.
@@ -117,6 +121,36 @@ func (cs *CallState) UnconsumedCallCheckpoints() int {
 		}
 	}
 	return n
+}
+
+// ReservePhaseName claims phaseName for this execution and reports whether the
+// claim is new. A phase checkpoint is keyed {Index: -1, Type: name}, so a second
+// phase reusing a name is the SAME checkpoint: it overwrites the first, and
+// afterwards neither phase can be told from the other on replay.
+//
+// Only writes made by this run reserve, so a phase the handler redoes in a later
+// run — its effect rolled back, or the run that recorded it never finished —
+// still saves.
+func (cs *CallState) ReservePhaseName(phaseName string) bool {
+	cs.Mu.Lock()
+	defer cs.Mu.Unlock()
+	if _, dup := cs.phasesSaved[phaseName]; dup {
+		return false
+	}
+	if cs.phasesSaved == nil {
+		cs.phasesSaved = make(map[string]struct{})
+	}
+	cs.phasesSaved[phaseName] = struct{}{}
+	return true
+}
+
+// ReleasePhaseName drops a reservation whose checkpoint write failed, so a
+// handler retrying that same phase in this run is not wedged by a save that
+// persisted nothing.
+func (cs *CallState) ReleasePhaseName(phaseName string) {
+	cs.Mu.Lock()
+	defer cs.Mu.Unlock()
+	delete(cs.phasesSaved, phaseName)
 }
 
 // GetCallState retrieves the call state from a context.Context.

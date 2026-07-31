@@ -31,6 +31,17 @@ var ErrUnsupportedWorkflowVersion = errors.New("jobs: unsupported workflow versi
 // phase sharing it would collide with and clobber a version marker.
 var ErrReservedPhaseName = fmt.Errorf("jobs: phase name uses the reserved %q prefix", versionCheckpointPrefix)
 
+// ErrDuplicatePhaseName is returned by the phase-checkpoint APIs when a run
+// saves a SECOND phase under a name it already saved. The name IS the
+// checkpoint's identity (CallIndex -1 plus the name), so the second save would
+// overwrite the first and leave two distinct phases sharing one record — after
+// which a replay skips both, including one whose body never ran. Calls cannot
+// collide this way: each carries its own ascending CallIndex.
+//
+// Reusing a name across RUNS is replay and stays allowed. The returned error is
+// wrapped NoRetry: see duplicatePhaseNameError.
+var ErrDuplicatePhaseName = errors.New("jobs: phase name already saved in this run")
+
 // JobFromContext returns the current Job from context, or nil if not in a job handler.
 // Use this to get the job ID for logging or progress tracking.
 func JobFromContext(ctx context.Context) *core.Job {
@@ -117,7 +128,8 @@ func GetVersion(ctx context.Context, changeID string, minSupported, maxSupported
 // SavePhaseCheckpoint saves a phase result to the checkpoint store.
 // The phase name is used as the CallType for lookup on resume.
 // Returns nil if not running within a job handler. Returns ErrReservedPhaseName
-// if phaseName uses the reserved "jobs.version:" prefix.
+// if phaseName uses the reserved "jobs.version:" prefix, or
+// ErrDuplicatePhaseName if this run already saved a phase under that name.
 //
 // On success the result is also reflected in the in-memory call state, so a
 // LoadPhaseCheckpoint later in the SAME run returns it (mirroring GetVersion).
@@ -143,14 +155,24 @@ func SavePhaseCheckpoint(ctx context.Context, phaseName string, result any) erro
 		Result:    resultBytes,
 	}
 
+	// Refuse a name this run already used rather than upsert over the earlier
+	// phase, the way Schedule refuses a duplicate schedule name.
+	cs := intctx.GetCallState(ctx)
+	if cs != nil && !cs.ReservePhaseName(phaseName) {
+		return duplicatePhaseNameError(phaseName)
+	}
+
 	if err := jc.SaveCheckpoint(ctx, cp); err != nil {
+		if cs != nil {
+			cs.ReleasePhaseName(phaseName)
+		}
 		return err
 	}
 
 	// Reflect the just-saved checkpoint in the in-memory call state so a same-run
 	// LoadPhaseCheckpoint returns it instead of (zero,false). GetVersion does the
 	// same write-back for its version markers.
-	if cs := intctx.GetCallState(ctx); cs != nil {
+	if cs != nil {
 		cs.Mu.Lock()
 		cs.Checkpoints[intctx.CheckpointKey{Index: -1, Type: phaseName}] = cp
 		cs.Mu.Unlock()
@@ -162,7 +184,14 @@ func SavePhaseCheckpoint(ctx context.Context, phaseName string, result any) erro
 // transaction. Unlike SavePhaseCheckpoint, it returns an error outside a job
 // handler because silently skipping a transactional checkpoint would break the
 // caller's atomicity guarantee. Returns ErrReservedPhaseName if phaseName uses
-// the reserved "jobs.version:" prefix.
+// the reserved "jobs.version:" prefix, or ErrDuplicatePhaseName if this run
+// already saved a phase under that name.
+//
+// The duplicate-name claim is taken when the row is written, which a later
+// ROLLBACK cannot take back — the rollback happens in the caller's transaction,
+// invisible here. Retrying the phase after a rollback therefore has to go
+// through a replay: return the error and let the job run again, which is also
+// what makes the retry see the rolled-back state.
 //
 // Unlike SavePhaseCheckpoint, it does NOT update the in-memory call state: the
 // write is bound to the caller's transaction, which may not be committed yet (or
@@ -213,7 +242,18 @@ func SavePhaseCheckpointTx(ctx context.Context, tx *gorm.DB, phaseName string, r
 		Result:    resultBytes,
 	}
 
-	return txCheckpointer.SaveCheckpointTx(ctx, tx, cp)
+	cs := intctx.GetCallState(ctx)
+	if cs != nil && !cs.ReservePhaseName(phaseName) {
+		return duplicatePhaseNameError(phaseName)
+	}
+
+	if err := txCheckpointer.SaveCheckpointTx(ctx, tx, cp); err != nil {
+		if cs != nil {
+			cs.ReleasePhaseName(phaseName)
+		}
+		return err
+	}
+	return nil
 }
 
 // ErrPhaseCheckpointDecode is returned by LoadPhaseCheckpointErr when a phase
@@ -272,6 +312,15 @@ func LoadPhaseCheckpointErr[T any](ctx context.Context, phaseName string) (T, bo
 		return zero, false, fmt.Errorf("%w: phase %q: %v", ErrPhaseCheckpointDecode, phaseName, err)
 	}
 	return result, true, nil
+}
+
+// duplicatePhaseNameError reports the duplicate as terminal. Retrying cannot
+// help — the name is wrong in the code — and it actively hides the defect: the
+// retry replays the first phase's checkpoint for BOTH phases, skips them both
+// and completes, which is the silent outcome this refusal exists to prevent.
+// Strict determinism's violation reports the same way.
+func duplicatePhaseNameError(phaseName string) error {
+	return core.NoRetry(fmt.Errorf("%w: %q", ErrDuplicatePhaseName, phaseName))
 }
 
 func versionCheckpointType(changeID string) string {

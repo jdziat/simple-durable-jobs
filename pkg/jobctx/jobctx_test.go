@@ -756,3 +756,69 @@ func TestLoadPhaseCheckpoint(t *testing.T) {
 		}
 	})
 }
+
+func TestSavePhaseCheckpoint_DuplicateNameInOneRun(t *testing.T) {
+	// A phase checkpoint is identified by its name alone, so a second phase
+	// reusing a name upserts over the first and is then indistinguishable from
+	// it on replay. The duplicate is refused instead.
+	var saved []*core.Checkpoint
+	ctx := newTestVersionContext("job-1", nil, func(_ context.Context, cp *core.Checkpoint) error {
+		saved = append(saved, cp)
+		return nil
+	})
+
+	require.NoError(t, SavePhaseCheckpoint(ctx, "settle", "first"))
+
+	err := SavePhaseCheckpoint(ctx, "settle", "second")
+	require.ErrorIs(t, err, ErrDuplicatePhaseName)
+	assert.Contains(t, err.Error(), "settle")
+	var noRetry *core.NoRetryError
+	assert.ErrorAs(t, err, &noRetry, "a name that is wrong in the code is not fixed by retrying")
+
+	// The refusal writes nothing and leaves the first phase's result readable.
+	require.Len(t, saved, 1)
+	got, ok := LoadPhaseCheckpoint[string](ctx, "settle")
+	require.True(t, ok)
+	assert.Equal(t, "first", got)
+
+	// A different name in the same run is unaffected.
+	require.NoError(t, SavePhaseCheckpoint(ctx, "notify", "ok"))
+	assert.Len(t, saved, 2)
+}
+
+func TestSavePhaseCheckpoint_SameNameInALaterRun(t *testing.T) {
+	// Replay: the name is claimed per run, so a phase recorded by an earlier run
+	// (here replayed into the call state) can be saved again.
+	prior := []core.Checkpoint{{
+		JobID: "job-1", CallIndex: -1, CallType: "settle", Result: []byte(`"first"`),
+	}}
+	var saved int
+	ctx := newTestVersionContext("job-1", prior, func(context.Context, *core.Checkpoint) error {
+		saved++
+		return nil
+	})
+
+	require.NoError(t, SavePhaseCheckpoint(ctx, "settle", "second"))
+	assert.Equal(t, 1, saved)
+	got, ok := LoadPhaseCheckpoint[string](ctx, "settle")
+	require.True(t, ok)
+	assert.Equal(t, "second", got)
+}
+
+func TestSavePhaseCheckpoint_FailedWriteReleasesTheName(t *testing.T) {
+	// A save that never persisted must not consume the name, or a handler that
+	// retries the phase after a transient storage error is wedged for the rest
+	// of the run.
+	fail := true
+	ctx := newTestVersionContext("job-1", nil, func(context.Context, *core.Checkpoint) error {
+		if fail {
+			return errors.New("storage down")
+		}
+		return nil
+	})
+
+	require.Error(t, SavePhaseCheckpoint(ctx, "settle", "first"))
+
+	fail = false
+	require.NoError(t, SavePhaseCheckpoint(ctx, "settle", "first"))
+}

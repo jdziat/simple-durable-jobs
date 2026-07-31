@@ -73,3 +73,35 @@ func TestSavePhaseCheckpointTx_PersistsThroughCommittedTx(t *testing.T) {
 	}
 	assert.True(t, found, "the committed phase checkpoint is persisted and queryable")
 }
+
+func TestSavePhaseCheckpointTx_DuplicateNameInOneRun(t *testing.T) {
+	// The transactional form shares the phase-name identity, so it refuses a
+	// duplicate too — and it is the form where the duplicate actually reaches
+	// storage, since it does not write back into the call state and a
+	// LoadPhaseCheckpoint guard on the second phase therefore misses.
+	ctx := context.Background()
+	store := newVersionTestStorage(t)
+
+	job := &core.Job{ID: core.NewID(), Type: "wf.run", Queue: "default"}
+	require.NoError(t, store.Enqueue(ctx, job))
+
+	jobCtx := intctx.WithJobContext(ctx, &intctx.JobContext{Job: job, Storage: store})
+	jobCtx = intctx.WithCallState(jobCtx, nil)
+
+	tx := store.DB().Begin()
+	require.NoError(t, SavePhaseCheckpointTx(jobCtx, tx, "settle", "charge"))
+	err := SavePhaseCheckpointTx(jobCtx, tx, "settle", "receipt")
+	require.ErrorIs(t, err, ErrDuplicatePhaseName)
+	// A different name in the same run still saves.
+	require.NoError(t, SavePhaseCheckpointTx(jobCtx, tx, "notify", "receipt"))
+	require.NoError(t, tx.Commit().Error)
+
+	cps, err := store.GetCheckpoints(ctx, job.ID)
+	require.NoError(t, err)
+	byName := map[string]string{}
+	for _, cp := range cps {
+		byName[cp.CallType] = string(cp.Result)
+	}
+	assert.Equal(t, `"charge"`, byName["settle"], "the first phase's result must survive")
+	assert.Equal(t, `"receipt"`, byName["notify"])
+}

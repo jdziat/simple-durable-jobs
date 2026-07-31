@@ -372,6 +372,43 @@ No migration. The partial unique index is unchanged and remains the
 gap); the application predicate is simply stricter than it now, which is the safe
 direction and is what removes the collision.
 
+### Reusing a phase name within one run is now an error
+
+**Before:** a phase checkpoint is identified by `{call_index: -1, call_type:
+phaseName}`, so two different phases sharing a name were the SAME checkpoint. The
+second `SavePhaseCheckpoint` upserted over the first, and on replay BOTH were
+skipped as already-done — including the one whose body never ran. The job completed
+with an effect missing and no error anywhere. Call checkpoints are unaffected: they
+carry a real ascending index.
+
+**After:** saving a second phase under a name the same run has already used returns
+`jobctx.ErrDuplicatePhaseName` and fails the job terminally (wrapped in
+`core.NoRetry` — with retries available, the retry replays the first phase's
+checkpoint for both phases and completes, turning the loud error back into the
+silent corruption). Saving the same name again in a LATER run is replay and remains
+allowed: only names written by the current execution reserve.
+
+**What you may notice:**
+
+- Using one phase name as a progress cursor in a loop (`for … { Save("cursor", i) }`)
+  now fails. That only ever "worked" through the upsert, and every write after the
+  first was destroying the previous one.
+- A child handler that saves a fixed phase name and is invoked twice via `Call` in
+  one run now fails — nested calls share the parent's phase namespace. That case is
+  already broken today (both invocations share one record); the error surfaces it
+  and forces per-invocation names.
+- `SavePhaseCheckpointTx` claims the name when the row is written, and a later
+  ROLLBACK cannot un-claim it. Redo a rolled-back phase by returning the error and
+  letting the job replay, not by retrying inside the same run.
+
+**What it deliberately does not catch:** because `SavePhaseCheckpoint` writes its
+result back into the in-run call state, the most likely copy-paste shape never
+reaches a second save — phase 2's own `LoadPhaseCheckpoint` hits phase 1's
+write-back, so phase 2 is skipped on the very first run and no guard fires. A
+Load-side guard cannot distinguish that from the documented same-run read-back
+pattern. The transactional path (`SavePhaseCheckpointTx`, which has no write-back)
+is fully covered.
+
 ### Registering a handler name twice with different types is now an error
 
 **Before:** `Register`/`RegisterE` — and therefore `typed.Define`/`DefineE` — was

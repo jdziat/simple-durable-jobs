@@ -17,6 +17,7 @@ import (
 	"log/slog"
 	"math"
 	"net/http"
+	"sync"
 	"time"
 
 	prometheusclient "github.com/prometheus/client_golang/prometheus"
@@ -90,10 +91,24 @@ func WithMeterProvider(mp metric.MeterProvider) InstrumentOption {
 	}
 }
 
-// Instrument wires OpenTelemetry metrics into a Queue.
-// It registers lifecycle hooks for job throughput, latency, failures, retries,
-// and an optional observable queue-depth gauge when the storage supports it.
+// instrumentedQueues guards against double-instrumentation: each Instrument call
+// appends a fresh set of lifecycle hooks, so calling it twice on the same Queue
+// would count every job twice. Mirrors pkg/otel's guard.
+var instrumentedQueues sync.Map // *queue.Queue -> struct{}
+
+// Instrument wires OpenTelemetry metrics into a Queue. Call it AT MOST ONCE per
+// Queue: it registers lifecycle hooks for job throughput, latency, failures,
+// retries, and an optional observable queue-depth gauge when the storage
+// supports it, and a second call would double-register the hooks (silently
+// doubling every lifecycle metric). A repeat call on the same Queue is a no-op
+// and logs a warning, matching otel.Instrument — it stays a no-op rather than an
+// error because Instrument returns nothing and misinstrumentation must not be
+// fatal to an opt-in observability helper.
 func Instrument(q *queue.Queue, opts ...InstrumentOption) {
+	if _, loaded := instrumentedQueues.LoadOrStore(q, struct{}{}); loaded {
+		slog.Default().Warn("metrics.Instrument called more than once for the same Queue; ignoring the repeat to avoid double-counted metrics")
+		return
+	}
 	cfg := &instrumentConfig{}
 	for _, opt := range opts {
 		opt(cfg)
