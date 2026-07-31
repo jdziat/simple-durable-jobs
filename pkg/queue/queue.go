@@ -127,6 +127,30 @@ func (q *Queue) RegisterE(name string, fn any, opts ...Option) error {
 
 	q.mu.Lock()
 	defer q.mu.Unlock()
+	// Re-registering a name with a DIFFERENT signature is refused. This was
+	// last-write-wins, and the second registration silently replaced the first —
+	// after which a typed Call through the first definition JSON-round-tripped the
+	// caller's argument into the wrong struct type. With no shared field names that
+	// decodes cleanly to the zero value, the callee sees zero, the result decodes
+	// back to zero, and the job COMPLETES with a nil error on every surface. Silent
+	// wrong data, undetectable at runtime.
+	//
+	// Only Def.Enqueue was protected (ValidateArgs -> ErrJobArgsMismatch); Def.Call,
+	// EnqueueRemote and any job already queued under the old definition were not.
+	//
+	// Scoped to a signature CHANGE rather than any duplicate: re-registering the
+	// same name with the same argument and result types is idempotent and stays
+	// permitted, which is what keeps this from breaking legitimate re-registration
+	// (test setup, a queue rebuilt from the same definitions). Schedule already
+	// refuses its duplicate outright, so handler names were the outlier.
+	if prev, dup := q.handlers[name]; dup {
+		if prev.ArgsType != h.ArgsType || prev.ResultType != h.ResultType {
+			return fmt.Errorf(
+				"jobs: handler %q is already registered with a different signature (have args %v result %v, got args %v result %v); "+
+					"re-registering silently replaces the first and makes typed calls through it return zero values with no error",
+				name, prev.ArgsType, prev.ResultType, h.ArgsType, h.ResultType)
+		}
+	}
 	q.handlers[name] = h
 	return nil
 }

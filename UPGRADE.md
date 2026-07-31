@@ -372,6 +372,31 @@ No migration. The partial unique index is unchanged and remains the
 gap); the application predicate is simply stricter than it now, which is the safe
 direction and is what removes the collision.
 
+### Registering a handler name twice with different types is now an error
+
+**Before:** `Register`/`RegisterE` — and therefore `typed.Define`/`DefineE` — was
+last-write-wins. A second registration under the same name silently replaced the
+first.
+
+That was not merely untidy. After the collision, a typed `Call` through the FIRST
+definition JSON-round-tripped the caller's argument into the SECOND definition's
+argument struct. With no field names in common that decodes cleanly to the zero
+value, so the callee received a zero argument, its result decoded back to a zero
+result, and the job **completed with a nil error on every observable surface**.
+Only `Def.Enqueue` was protected (`ErrJobArgsMismatch`); `Def.Call`,
+`EnqueueRemote`, and any job already queued under the first definition were not.
+
+**After:** re-registering a name whose argument or result type differs returns an
+error naming both signatures. Re-registering with the SAME types is unchanged and
+still allowed, so rebuilding a queue from the same definitions keeps working.
+
+**What you may notice:** a program that registered two different handlers under
+one name now fails at registration instead of at some later, silent point. If you
+see this error, one of the two registrations was already being discarded.
+
+`Schedule` has always refused its duplicate outright ("schedule already registered
+for %q"); handler names were the outlier.
+
 ### A cron expression naming two timezones is now rejected
 
 **Before:** `Cron("CRON_TZ=UTC TZ=Asia/Tokyo 0 9 * * *")` was accepted. robfig's
