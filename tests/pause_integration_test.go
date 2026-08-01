@@ -33,18 +33,32 @@ func TestPauseIntegration_JobLevelPause(t *testing.T) {
 	err = q.PauseJob(ctx, job1ID)
 	require.NoError(t, err)
 
-	// Start worker briefly
+	// Start the worker and WAIT FOR THE OUTCOME rather than for the clock.
+	//
+	// This used to give the worker a fixed 500ms budget and assert the count the
+	// instant it expired. PollInterval defaults to 100ms and time.NewTicker fires
+	// FIRST at 100ms, so that budget bought about four dequeue attempts — and the
+	// worker performs a stale-lock sweep before its first poll. Measured on this
+	// machine, the second assertion failed 3/20 runs here and 1/20 on the previous
+	// commit: a margin that thin fails whenever the box is busy, which is exactly
+	// when CI runs it. A positive outcome must be POLLED FOR, never timed.
 	w := jobs.NewWorker(q)
-	workerCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	workerCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	go func() { _ = w.Start(workerCtx) }()
-	<-workerCtx.Done()
 
-	// Only job2 should be processed (job1 is paused)
-	assert.Equal(t, int32(1), processed.Load())
+	require.Eventually(t, func() bool { return processed.Load() == 1 }, 30*time.Second, 10*time.Millisecond,
+		"the unpaused job should be picked up and run")
 
-	// Job1 should still be paused
+	// Job1 should still be paused. This is an ABSENCE, and an absence cannot be
+	// polled for — it needs a bounded settle window. Kept generous relative to the
+	// 100ms poll so several dequeue rounds go by with the job left alone, and
+	// asserted on the paused flag as well as the count so it cannot pass merely
+	// because the worker was slow.
+	time.Sleep(500 * time.Millisecond)
+	assert.Equal(t, int32(1), processed.Load(), "the paused job must not run while it is paused")
+
 	paused, err := q.IsJobPaused(ctx, job1ID)
 	require.NoError(t, err)
 	assert.True(t, paused)
@@ -53,15 +67,10 @@ func TestPauseIntegration_JobLevelPause(t *testing.T) {
 	err = q.ResumeJob(ctx, job1ID)
 	require.NoError(t, err)
 
-	// Run worker again
-	workerCtx2, cancel2 := context.WithTimeout(ctx, 500*time.Millisecond)
-	defer cancel2()
-	w2 := jobs.NewWorker(q)
-	go func() { _ = w2.Start(workerCtx2) }()
-	<-workerCtx2.Done()
-
-	// Now both should be processed
-	assert.Equal(t, int32(2), processed.Load())
+	// The same worker is still running, so no second worker is needed; the resumed
+	// job simply becomes claimable on a subsequent poll.
+	require.Eventually(t, func() bool { return processed.Load() == 2 }, 30*time.Second, 10*time.Millisecond,
+		"the resumed job should be picked up and run")
 }
 
 func TestPauseIntegration_QueueLevelPause(t *testing.T) {
@@ -90,17 +99,23 @@ func TestPauseIntegration_QueueLevelPause(t *testing.T) {
 	err = q.PauseQueue(ctx, "emails")
 	require.NoError(t, err)
 
-	// Start worker for both queues
+	// Start worker for both queues. Same rule as the job-level test above: poll for
+	// the positive outcome, then use a bounded settle for the absence. A fixed
+	// 500ms budget is only ~4 poll ticks and fails under load.
 	w := jobs.NewWorker(q, jobs.WorkerQueue("emails"), jobs.WorkerQueue("other"))
-	workerCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	workerCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	go func() { _ = w.Start(workerCtx) }()
-	<-workerCtx.Done()
 
-	// Only other queue should be processed
-	assert.Equal(t, int32(0), emailsProcessed.Load())
-	assert.Equal(t, int32(1), othersProcessed.Load())
+	require.Eventually(t, func() bool { return othersProcessed.Load() == 1 }, 30*time.Second, 10*time.Millisecond,
+		"the unpaused queue should be drained")
+
+	// The paused queue must stay untouched — an absence, so it gets a settle
+	// window rather than a poll.
+	time.Sleep(500 * time.Millisecond)
+	assert.Equal(t, int32(0), emailsProcessed.Load(), "the paused queue must not be drained")
+	assert.Equal(t, int32(1), othersProcessed.Load(), "and the unpaused queue must not run twice")
 }
 
 func TestPauseIntegration_WorkerGracefulPause(t *testing.T) {
