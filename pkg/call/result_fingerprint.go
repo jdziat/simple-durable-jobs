@@ -2,10 +2,13 @@ package call
 
 import (
 	"crypto/sha256"
+	"encoding"
 	"encoding/hex"
+	"encoding/json"
 	"reflect"
 	"sort"
 	"strings"
+	"unicode"
 )
 
 // resultFingerprint describes the JSON SHAPE of a Call's result type, so replay
@@ -63,6 +66,7 @@ type shapeField struct {
 	name       string
 	shape      string
 	embedDepth int
+	tagged     bool
 }
 
 // collectShapeFields walks a struct the way encoding/json does, promoting embedded
@@ -96,6 +100,11 @@ func collectShapeFields(t reflect.Type, depth, embedDepth int, out *[]shapeField
 				if o == "string" {
 					asString = true
 				}
+			}
+			// json ignores a tag name that is not a legal tag and falls back to the
+			// Go field name, so the shape has to fall back too.
+			if !isValidJSONTag(tagName) {
+				tagName = ""
 			}
 		}
 
@@ -136,13 +145,22 @@ func collectShapeFields(t reflect.Type, depth, embedDepth int, out *[]shapeField
 		} else {
 			writeShape(&sub, f.Type, depth+1)
 		}
-		*out = append(*out, shapeField{name: name, shape: sub.String(), embedDepth: embedDepth})
+		*out = append(*out, shapeField{
+			name: name, shape: sub.String(), embedDepth: embedDepth, tagged: tagName != "",
+		})
 	}
 }
 
-// resolveShapeFields applies Go's promotion conflict rule: for a given JSON name
-// the shallowest embedding wins, and if two fields tie at that shallowest depth
-// neither is serialized at all.
+// resolveShapeFields applies encoding/json's dominantField rule, which is subtler
+// than "shallowest wins, ties annihilate": among the candidates for one JSON name,
+// json sorts by depth and then by TAGGEDNESS, and drops the name only when the top
+// two are at the same depth AND have the same taggedness. A tagged field therefore
+// BEATS an untagged one at equal depth and is emitted.
+//
+// Getting this wrong is both a false fire and a miss. Deleting a dead, never-
+// serialized field that lost such a tie is byte-identical on the wire but changed
+// the fingerprint; and a type that GAINED a really-serialized tagged field kept the
+// same fingerprint, so replay returned it silently zero.
 func resolveShapeFields(in []shapeField) []shapeField {
 	byName := make(map[string][]shapeField, len(in))
 	order := make([]string, 0, len(in))
@@ -155,26 +173,49 @@ func resolveShapeFields(in []shapeField) []shapeField {
 	out := make([]shapeField, 0, len(order))
 	for _, name := range order {
 		group := byName[name]
-		best := group[0].embedDepth
-		for _, g := range group {
-			if g.embedDepth < best {
-				best = g.embedDepth
+		// Shallowest first, then tagged before untagged — json's own ordering.
+		sort.SliceStable(group, func(i, j int) bool {
+			if group[i].embedDepth != group[j].embedDepth {
+				return group[i].embedDepth < group[j].embedDepth
 			}
+			return group[i].tagged && !group[j].tagged
+		})
+		if len(group) > 1 &&
+			group[0].embedDepth == group[1].embedDepth &&
+			group[0].tagged == group[1].tagged {
+			continue // genuinely ambiguous: json emits nothing for this name
 		}
-		n := 0
-		var winner shapeField
-		for _, g := range group {
-			if g.embedDepth == best {
-				n++
-				winner = g
-			}
-		}
-		if n == 1 {
-			out = append(out, winner)
-		}
-		// n > 1: ambiguous promotion, json emits nothing for this name.
+		out = append(out, group[0])
 	}
 	return out
+}
+
+var (
+	jsonNumberType   = reflect.TypeOf(json.Number(""))
+	jsonMarshalerTyp = reflect.TypeOf((*json.Marshaler)(nil)).Elem()
+	textMarshalerTyp = reflect.TypeOf((*encoding.TextMarshaler)(nil)).Elem()
+)
+
+func implementsEither(t reflect.Type, iface reflect.Type) bool {
+	// encoding/json will use a pointer method when the value is addressable, so
+	// both T and *T count.
+	return t.Implements(iface) || reflect.PointerTo(t).Implements(iface)
+}
+
+// isValidJSONTag mirrors encoding/json's isValidTag.
+func isValidJSONTag(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, c := range s {
+		switch {
+		case strings.ContainsRune("!#$%&()*+-./:;<=>?@[]^_{|}~ ", c):
+			// Punctuation json explicitly allows in a tag name.
+		case !unicode.IsLetter(c) && !unicode.IsDigit(c):
+			return false
+		}
+	}
+	return true
 }
 
 func writeShape(b *strings.Builder, t reflect.Type, depth int) {
@@ -185,6 +226,36 @@ func writeShape(b *strings.Builder, t reflect.Type, depth int) {
 	for t.Kind() == reflect.Pointer {
 		t = t.Elem()
 	}
+
+	// json.Number is declared as a string but encoding/json writes its raw digits,
+	// so on the wire it is a number and must fingerprint as one — otherwise
+	// swapping float64 for json.Number to stop losing precision, which is
+	// byte-identical, would wedge in-flight replays.
+	if t == jsonNumberType {
+		b.WriteString("number")
+		return
+	}
+
+	// A type with its own MarshalJSON serializes something unrelated to its
+	// declared fields, so the fields cannot describe its wire form. Reading them
+	// anyway made a byte-identical refactor of such a type change the fingerprint —
+	// a FALSE FIRE, the one outcome this check must never produce. Every
+	// json.Marshaler therefore shares one opaque shape: changes among them go
+	// undetected, which is the documented and much cheaper failure direction.
+	if implementsEither(t, jsonMarshalerTyp) {
+		b.WriteString("marshaler")
+		return
+	}
+
+	// encoding.TextMarshaler is json's second fallback and always produces a JSON
+	// STRING, whatever the type's fields are. Two TextMarshalers with completely
+	// different fields serialize identically, so reading their fields would false
+	// fire on a refactor that changes nothing on the wire.
+	if implementsEither(t, textMarshalerTyp) {
+		b.WriteString("string")
+		return
+	}
+
 	switch t.Kind() {
 	case reflect.Struct:
 		var fields []shapeField

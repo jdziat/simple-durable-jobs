@@ -396,12 +396,21 @@ the field set does.
 replay with a clear message instead of silently completing with an empty result. If
 you see it, that workflow was already producing wrong data.
 
-**The limit of this check, stated plainly.** Because the fingerprint is the field
-set, a change that keeps the field set but alters the encoding is NOT caught —
-`[]byte` to `json.RawMessage`, swapping one struct whose fields are *all*
-unexported for another (`time.Time` is one such struct, so it fingerprints as the
-empty object), or a rewritten `MarshalJSON`. Those replay exactly as they did
-before this change: no worse, no better. The check is deliberately biased to never reject a
+**The limit of this check, stated plainly.** Some changes keep the fingerprint and
+so are NOT caught:
+
+- `[]byte` to `json.RawMessage` (identical shape, different wire form);
+- swapping one struct whose fields are *all* unexported for another;
+- **any** change to a type that implements `json.MarshalJSON`. Such a type
+  serializes something unrelated to its declared fields, so its fields cannot
+  describe its wire form. Every `json.Marshaler` therefore shares one opaque
+  shape — `time.Time` included — and changes among them go undetected.
+
+Those replay exactly as they did before this change: no worse, no better. The
+last one is a deliberate trade made in the direction the check is biased: reading
+a Marshaler's fields anyway would make a byte-identical refactor of it *false
+fire*, and a false rejection wedges a healthy workflow while a miss only leaves
+the old behaviour in place. The check is deliberately biased to never reject a
 replay it should have accepted, because a false rejection wedges a healthy workflow
 whereas a miss only leaves the old behaviour in place.
 
@@ -926,19 +935,35 @@ Two consequences worth knowing:
 
 ## Rollback
 
-Across the whole v4.6 → v4.8 line there are three forward-only migrations. Only
-the last is new in **v4.8.0**; the other two are already in the releases named:
+Across the whole v4.6 → v4.8 line there are five forward-only migrations. The last
+three are new in **v4.8.0**; the other two are already in the releases named:
 
 | Migration | Adds | First shipped in |
 | --- | --- | --- |
 | **v36** | `checkpoints.span_end` | v4.6.0 |
 | **v37** | `idx_concurrency_slots_job_id` | v4.7.0 |
 | **v38** | `idx_job_stats_timestamp` | v4.8.0 |
+| **v39** | `jobs.waiting_signal_name` | v4.8.0 |
+| **v40** | `checkpoints.result_shape` | v4.8.0 |
 
-All three are additive — one column with a default, and two indexes — so an older
-binary runs correctly against the newer schema. No migration in this line rewrites
-data. Verified in both directions on SQLite, live Postgres and live MySQL: the
-v4.7.0 binary migrates against a v38 ledger and completes a full job lifecycle.
+All five are additive — three columns, each `NOT NULL` with a default, and two
+indexes — so an older binary runs correctly against the newer schema. No migration
+in this line rewrites data.
+
+**How that is verified.** Two different checks, because they cover different
+things. The v4.7.0 binary was run against a **v38** ledger on SQLite, live
+Postgres and live MySQL, migrating in both directions and completing a full job
+lifecycle. For the two columns added after that (v39, v40) the property an older
+binary depends on is narrower and is pinned by a test rather than a manual run:
+`TestOlderBinaryInsertsWithoutTheNewColumns` issues an `INSERT` that does not
+mention the new column — exactly what a binary compiled before it existed emits —
+and requires it to succeed and read back, on all three dialects. That is what
+"additive" has to mean at write time; a `NOT NULL` column without a usable default
+would break it in production rather than at migration time.
+
+**v39 has one dialect caveat**, covered in its own section above: on MySQL the
+column needs an `as_cs` collation to match `signals.name`, and the repair path
+rebuilds the table under lock. Factor that into the maintenance window on MySQL.
 Any further migration is listed here by the packet that adds it.
 
 **One caveat, and it is not about the schema.** Rolling back restores the old
