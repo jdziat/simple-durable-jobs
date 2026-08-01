@@ -121,6 +121,12 @@ func Instrument(q *queue.Queue, opts ...InstrumentOption) {
 	meter := cfg.meterProvider.Meter(instrumentationName)
 	inst, err := newInstruments(meter)
 	if err != nil {
+		// Release the once-guard: this call registered NOTHING, so a later retry
+		// with a working MeterProvider must be allowed to install the hooks rather
+		// than be swallowed as a double-instrument. Without this the queue is
+		// permanently uninstrumentable after one failed attempt, and the retry is
+		// rejected with the actively misleading "called more than once" warning.
+		instrumentedQueues.Delete(q)
 		slog.Default().Warn("jobs metrics instrumentation disabled", "error", err)
 		return
 	}

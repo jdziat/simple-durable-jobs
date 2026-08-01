@@ -14,6 +14,22 @@ import (
 	"github.com/jdziat/simple-durable-jobs/v4/pkg/security"
 )
 
+// staticResultShape fingerprints T's STATIC type.
+//
+// reflect.TypeOf(zeroOfT) would be wrong: for an interface T — Call[any], which
+// Call's godoc explicitly supports — the zero value is a nil interface and
+// reflect.TypeOf returns nil, yielding the EMPTY fingerprint. Empty is the sentinel
+// for "checkpoint written before this column existed", so an interface result would
+// be silently exempted from the check and tightening Call[any] to a concrete struct
+// would replay as an all-zero value with a nil error: precisely the bug this guard
+// exists to catch, on a checkpoint written after the upgrade.
+//
+// Taking the element type of a nil *T gives the declared type in every case,
+// interfaces included, and never returns nil.
+func staticResultShape[T any]() string {
+	return resultFingerprint(reflect.TypeOf((*T)(nil)).Elem())
+}
+
 // checkpointIndexCleaner is an optional storage capability used to clear an
 // orphaned prior-type checkpoint at one call index during a BestEffortReplay
 // type-mismatch re-execution. Storage backends that do not implement it simply
@@ -166,7 +182,7 @@ func CallWithCheckpointCtx[T any](execCtx, checkpointCtx context.Context, name s
 		//
 		// An EMPTY stored shape is a checkpoint written before the column existed:
 		// skipped, so work already in flight replays exactly as before.
-		if want := resultFingerprint(reflect.TypeOf(zero)); checkpoint.ResultShape != "" && checkpoint.ResultShape != want {
+		if want := staticResultShape[T](); checkpoint.ResultShape != "" && checkpoint.ResultShape != want {
 			if !jc.BestEffortReplay {
 				return zero, fmt.Errorf(
 					"jobs.Call determinism violation at index %d: the checkpointed result for call %q was written from a different result type (shape %s, now %s); "+
@@ -262,7 +278,7 @@ func CallWithCheckpointCtx[T any](execCtx, checkpointCtx context.Context, name s
 		SpanEnd:   spanEnd,
 		// Recorded HERE, where the result type is known for certain. Replay cannot
 		// recover this from the stored bytes — see resultFingerprint's comment.
-		ResultShape: resultFingerprint(reflect.TypeOf(zero)),
+		ResultShape: staticResultShape[T](),
 	}
 
 	if err != nil {

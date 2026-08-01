@@ -386,9 +386,11 @@ mismatch is a determinism violation, and under `BestEffortReplay` a warning —
 matching how a name mismatch already behaves.
 
 The fingerprint is **structural**, not nominal: it is the set of JSON field names
-and kinds, so renaming the type, moving it between packages, reordering its fields,
-or adding unexported / `json:"-"` fields does not trip replay. Changing the field
-set does.
+and kinds *as `encoding/json` actually serializes them*, so renaming the type,
+moving it between packages, reordering its fields, promoting fields through an
+embedded struct, renaming or inlining that embedded struct, widening `int` to
+`int64`, or adding unexported / `json:"-"` fields does not trip replay. Changing
+the field set does.
 
 **What you may notice:** a workflow whose handler's return type changed now fails
 replay with a clear message instead of silently completing with an empty result. If
@@ -396,9 +398,10 @@ you see it, that workflow was already producing wrong data.
 
 **The limit of this check, stated plainly.** Because the fingerprint is the field
 set, a change that keeps the field set but alters the encoding is NOT caught —
-`[]byte` to `json.RawMessage`, one all-unexported struct for another (`time.Time`
-included), or a rewritten `MarshalJSON`. Those replay exactly as they did before
-this change: no worse, no better. The check is deliberately biased to never reject a
+`[]byte` to `json.RawMessage`, swapping one struct whose fields are *all*
+unexported for another (`time.Time` is one such struct, so it fingerprints as the
+empty object), or a rewritten `MarshalJSON`. Those replay exactly as they did
+before this change: no worse, no better. The check is deliberately biased to never reject a
 replay it should have accepted, because a false rejection wedges a healthy workflow
 whereas a miss only leaves the old behaviour in place.
 

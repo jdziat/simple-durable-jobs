@@ -32,6 +32,14 @@ import (
 // FIELDS is, and does. Two distinct types with identical shape are deliberately
 // interchangeable — if the shape matches, the stored result reconstructs
 // faithfully, which is the only property replay needs.
+//
+// The rule this file must obey, and got wrong once: the shape has to be what
+// encoding/json ACTUALLY SERIALIZES, not what the Go struct literally declares.
+// Where those differ — embedded fields, which json promotes into the parent — a
+// literal reading makes the fingerprint nominal in disguise (renaming an embedded
+// type changed the shape while the bytes stayed identical) AND blind (an unexported
+// embedded type's promoted fields vanished from the shape entirely, so swapping the
+// whole field set went undetected). See collectShapeFields.
 func resultFingerprint(t reflect.Type) string {
 	if t == nil {
 		return ""
@@ -48,6 +56,107 @@ func resultFingerprint(t reflect.Type) string {
 // never make one type look like it changed.
 const maxShapeDepth = 6
 
+// shapeField is one field as encoding/json would emit it. embedDepth is how many
+// embedded structs were traversed to reach it, which is what Go's promotion
+// conflict rule is decided on.
+type shapeField struct {
+	name       string
+	shape      string
+	embedDepth int
+}
+
+// collectShapeFields walks a struct the way encoding/json does, promoting embedded
+// struct fields into the parent instead of treating them as a field named after
+// their type.
+//
+// Two subtleties, both of which were live defects here:
+//
+//   - An embedded struct whose TYPE is unexported still has its exported fields
+//     promoted and serialized by encoding/json. So the usual "skip PkgPath != in"
+//     test must NOT be applied to it, or the promoted fields disappear from the
+//     shape and a completely different field set fingerprints identically.
+//   - An embedded field WITH a json tag is not promoted; json treats it as an
+//     ordinary field under the tag name.
+func collectShapeFields(t reflect.Type, depth, embedDepth int, out *[]shapeField) {
+	if embedDepth > maxShapeDepth {
+		return // pathological embed chain (or an embedded *T cycle): stop.
+	}
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+
+		tag := f.Tag.Get("json")
+		if tag == "-" {
+			continue // explicitly not serialized
+		}
+		tagName := ""
+		if tag != "" {
+			tagName = strings.Split(tag, ",")[0]
+		}
+
+		ft := f.Type
+		for ft.Kind() == reflect.Pointer {
+			ft = ft.Elem()
+		}
+
+		// Untagged embedded struct: json promotes its fields into this object, so
+		// the shape must too. Deliberately BEFORE the unexported check — an
+		// unexported embedded type still contributes its exported fields.
+		if f.Anonymous && tagName == "" && ft.Kind() == reflect.Struct {
+			collectShapeFields(ft, depth, embedDepth+1, out)
+			continue
+		}
+
+		if f.PkgPath != "" {
+			continue // unexported and not a promoting embed: never serialized
+		}
+
+		name := f.Name
+		if tagName != "" {
+			name = tagName
+		}
+		var sub strings.Builder
+		writeShape(&sub, f.Type, depth+1)
+		*out = append(*out, shapeField{name: name, shape: sub.String(), embedDepth: embedDepth})
+	}
+}
+
+// resolveShapeFields applies Go's promotion conflict rule: for a given JSON name
+// the shallowest embedding wins, and if two fields tie at that shallowest depth
+// neither is serialized at all.
+func resolveShapeFields(in []shapeField) []shapeField {
+	byName := make(map[string][]shapeField, len(in))
+	order := make([]string, 0, len(in))
+	for _, f := range in {
+		if _, seen := byName[f.name]; !seen {
+			order = append(order, f.name)
+		}
+		byName[f.name] = append(byName[f.name], f)
+	}
+	out := make([]shapeField, 0, len(order))
+	for _, name := range order {
+		group := byName[name]
+		best := group[0].embedDepth
+		for _, g := range group {
+			if g.embedDepth < best {
+				best = g.embedDepth
+			}
+		}
+		n := 0
+		var winner shapeField
+		for _, g := range group {
+			if g.embedDepth == best {
+				n++
+				winner = g
+			}
+		}
+		if n == 1 {
+			out = append(out, winner)
+		}
+		// n > 1: ambiguous promotion, json emits nothing for this name.
+	}
+	return out
+}
+
 func writeShape(b *strings.Builder, t reflect.Type, depth int) {
 	if depth > maxShapeDepth {
 		b.WriteString("...")
@@ -58,27 +167,9 @@ func writeShape(b *strings.Builder, t reflect.Type, depth int) {
 	}
 	switch t.Kind() {
 	case reflect.Struct:
-		type field struct{ name, shape string }
-		fields := make([]field, 0, t.NumField())
-		for i := 0; i < t.NumField(); i++ {
-			f := t.Field(i)
-			if f.PkgPath != "" {
-				continue // unexported: never serialized, so not part of the shape
-			}
-			name := f.Name
-			if tag := f.Tag.Get("json"); tag != "" {
-				parts := strings.Split(tag, ",")
-				if parts[0] == "-" {
-					continue // explicitly not serialized
-				}
-				if parts[0] != "" {
-					name = parts[0]
-				}
-			}
-			var sub strings.Builder
-			writeShape(&sub, f.Type, depth+1)
-			fields = append(fields, field{name, sub.String()})
-		}
+		var fields []shapeField
+		collectShapeFields(t, depth, 0, &fields)
+		fields = resolveShapeFields(fields)
 		// Sorted so field ORDER is not part of the identity: reordering a struct's
 		// fields does not change what JSON it accepts.
 		sort.Slice(fields, func(i, j int) bool { return fields[i].name < fields[j].name })
@@ -102,8 +193,17 @@ func writeShape(b *strings.Builder, t reflect.Type, depth int) {
 		b.WriteString("]")
 		writeShape(b, t.Elem(), depth+1)
 	case reflect.Interface:
-		// An interface accepts anything, so it constrains nothing.
+		// An interface accepts anything, so it constrains nothing. Note this is a
+		// real, non-empty shape: an interface result must be distinguishable from
+		// "no shape recorded", or tightening Call[any] to a concrete type would be
+		// mistaken for a pre-upgrade checkpoint and skipped.
 		b.WriteString("any")
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64,
+		reflect.Float32, reflect.Float64:
+		// JSON has ONE number type. Widening int to int64 leaves the wire format and
+		// the decode identical, so it must not read as a type change.
+		b.WriteString("number")
 	default:
 		b.WriteString(t.Kind().String())
 	}

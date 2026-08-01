@@ -6,8 +6,9 @@ toc: true
 
 Simple Durable Jobs can transform payload bytes before they are written to the
 database. This is useful for encrypting job arguments, job results, checkpoint
-results, signal payloads, and handler error text (`last_error` and the
-`dead_letter_reason` suffix) at rest without changing handler code.
+results, signal payloads, and handler error text (`last_error`, the
+`dead_letter_reason` suffix, and a checkpoint's `error` / `error_cause`) at rest
+without changing handler code.
 
 Error text is encrypted selectively: the fixed `dead_letter_reason` label
 (for example `"max retries exhausted: "`) is non-PII and stays plaintext, so the
@@ -43,9 +44,9 @@ bytes unchanged. Nil or empty payloads are not encoded or decoded.
 
 ## What the codec does not cover
 
-The list above is exhaustive. Columns you populate through the API — notably
-`unique_key`, `tenant`, `queue`, and the `metadata` JSON — are stored **as you
-supply them**, in cleartext, under every codec including Secretbox.
+The codec transforms payload and error bytes only. Columns you populate through
+the API — notably `unique_key`, `tenant`, `queue`, and the `metadata` JSON — are
+stored **as you supply them**, in cleartext, under every codec including Secretbox.
 
 For `unique_key` this is structural rather than an oversight: deduplication works
 by an equality lookup against a unique index, so the value has to be stored in a
