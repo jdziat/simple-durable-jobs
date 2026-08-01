@@ -388,6 +388,11 @@ var schemaMigrations = []schemaMigration{
 		Name:    "jobs_waiting_signal_name_column",
 		Up:      migrateJobsWaitingSignalName,
 	},
+	{
+		Version: 40,
+		Name:    "checkpoints_result_shape_column",
+		Up:      migrateCheckpointsResultShape,
+	},
 }
 
 // jobStatsTimestampIndex is the index name shared by this migration and the UI's
@@ -472,6 +477,25 @@ func migrateJobsWaitingSignalName(ctx context.Context, db *gorm.DB, dialect stri
 			"COLLATE utf8mb4_0900_as_cs NOT NULL DEFAULT ''",
 	).Error; err != nil && !isBenignDDLError(err) {
 		return fmt.Errorf("modify waiting_signal_name collation: %w", err)
+	}
+	return nil
+}
+
+// migrateCheckpointsResultShape adds checkpoints.result_shape, the write-time
+// fingerprint of a Call's result type.
+//
+// NOT NULL DEFAULT empty-string is the load-bearing part: every checkpoint written
+// before this column backfills to the empty string, which replay reads as "not
+// recorded" and skips the comparison for. A workflow already mid-replay across the
+// upgrade is therefore untouched — the same degradation SpanEnd == 0 already gets.
+func migrateCheckpointsResultShape(ctx context.Context, db *gorm.DB, dialect string) error {
+	if db.Migrator().HasColumn(&core.Checkpoint{}, "result_shape") {
+		return nil
+	}
+	if err := db.WithContext(ctx).Exec(
+		"ALTER TABLE checkpoints ADD COLUMN result_shape varchar(32) NOT NULL DEFAULT ''",
+	).Error; err != nil && !isBenignDDLError(err) {
+		return fmt.Errorf("add checkpoints.result_shape (%s): %w", dialect, err)
 	}
 	return nil
 }

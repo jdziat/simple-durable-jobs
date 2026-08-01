@@ -41,6 +41,20 @@ store := jobs.NewGormStorage(db, jobs.WithCodec(myCodec))
 If no codec is configured, storage uses `jobs.IdentityCodec`, which returns
 bytes unchanged. Nil or empty payloads are not encoded or decoded.
 
+## What the codec does not cover
+
+The list above is exhaustive. Columns you populate through the API — notably
+`unique_key`, `tenant`, `queue`, and the `metadata` JSON — are stored **as you
+supply them**, in cleartext, under every codec including Secretbox.
+
+For `unique_key` this is structural rather than an oversight: deduplication works
+by an equality lookup against a unique index, so the value has to be stored in a
+form the database can compare. Encrypting it with a nonce would make two identical
+keys store as different ciphertexts and dedup would stop working entirely.
+
+Choose these values accordingly — derive `unique_key` from a hash or an opaque ID
+rather than embedding an email address, account number, or other PII directly.
+
 ## Secretbox encryption
 
 The built-in codec uses NaCl Secretbox:

@@ -372,6 +372,49 @@ No migration. The partial unique index is unchanged and remains the
 gap); the application predicate is simply stricter than it now, which is the safe
 direction and is what removes the collision.
 
+### A `Call` whose result type changed is caught instead of returning zero
+
+**Before:** changing a `Call`'s NAME between runs was caught loudly as a
+determinism violation, but changing its RESULT TYPE was not caught at all. The
+stored JSON decoded into the new type — unknown keys ignored, absent ones left
+zero — so the caller received an empty result with a **nil error** and the workflow
+completed carrying it.
+
+**After:** each checkpoint records a fingerprint of its result type's JSON shape at
+write time (migration **v40** adds `checkpoints.result_shape`). On replay a
+mismatch is a determinism violation, and under `BestEffortReplay` a warning —
+matching how a name mismatch already behaves.
+
+The fingerprint is **structural**, not nominal: it is the set of JSON field names
+and kinds, so renaming the type, moving it between packages, reordering its fields,
+or adding unexported / `json:"-"` fields does not trip replay. Changing the field
+set does.
+
+**What you may notice:** a workflow whose handler's return type changed now fails
+replay with a clear message instead of silently completing with an empty result. If
+you see it, that workflow was already producing wrong data.
+
+**The limit of this check, stated plainly.** Because the fingerprint is the field
+set, a change that keeps the field set but alters the encoding is NOT caught —
+`[]byte` to `json.RawMessage`, one all-unexported struct for another (`time.Time`
+included), or a rewritten `MarshalJSON`. Those replay exactly as they did before
+this change: no worse, no better. The check is deliberately biased to never reject a
+replay it should have accepted, because a false rejection wedges a healthy workflow
+whereas a miss only leaves the old behaviour in place.
+
+Checkpoints written before v40 carry an empty shape and are **not** checked, so work
+already in flight replays exactly as before — the same degradation `span_end = 0`
+already gets.
+
+*Implementation note, because three earlier attempts failed here.* This is
+deliberately a write-time fingerprint rather than an inspection of the stored bytes.
+Strict decoding, per-key probes and null probes each hard-failed replays whose type
+had NOT changed — a dropped field, a nested field under an all-zero value, a
+required-fields `UnmarshalJSON`. That is one problem, not three: a type change and a
+legitimately-different-but-valid payload are indistinguishable in the bytes. Both
+sides now compute the fingerprint from the TYPE, so an unchanged type cannot false
+fire.
+
 ### Reusing a phase name within one run is now an error
 
 **Before:** a phase checkpoint is identified by `{call_index: -1, call_type:

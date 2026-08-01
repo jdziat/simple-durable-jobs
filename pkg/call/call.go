@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"time"
 
 	"github.com/jdziat/simple-durable-jobs/v4/pkg/core"
@@ -156,6 +157,28 @@ func CallWithCheckpointCtx[T any](execCtx, checkpointCtx context.Context, name s
 				time.Duration(checkpoint.ErrorDelayNanos),
 			)
 		}
+		// A result type that CHANGED since the checkpoint was written decodes
+		// cleanly into the new type — unknown fields are ignored and absent ones
+		// stay zero — so without this the caller silently receives an empty result
+		// and a nil error, and the workflow completes carrying it. Changing the call
+		// NAME has always been caught loudly; this closes the same hole for the
+		// result type.
+		//
+		// An EMPTY stored shape is a checkpoint written before the column existed:
+		// skipped, so work already in flight replays exactly as before.
+		if want := resultFingerprint(reflect.TypeOf(zero)); checkpoint.ResultShape != "" && checkpoint.ResultShape != want {
+			if !jc.BestEffortReplay {
+				return zero, fmt.Errorf(
+					"jobs.Call determinism violation at index %d: the checkpointed result for call %q was written from a different result type (shape %s, now %s); "+
+						"decoding it would return a zero value with no error",
+					callIndex, name, checkpoint.ResultShape, want)
+			}
+			if jc.Logger != nil {
+				jc.Logger.Warn("jobs.Call best-effort replay: checkpoint result type changed, decoding anyway",
+					"index", callIndex, "call", name, "job_id", jc.Job.ID,
+					"checkpoint_shape", checkpoint.ResultShape, "requested_shape", want)
+			}
+		}
 		var result T
 		if err := json.Unmarshal(checkpoint.Result, &result); err != nil {
 			return zero, fmt.Errorf("failed to unmarshal checkpoint: %w", err)
@@ -237,6 +260,9 @@ func CallWithCheckpointCtx[T any](execCtx, checkpointCtx context.Context, name s
 		CallIndex: callIndex,
 		CallType:  name,
 		SpanEnd:   spanEnd,
+		// Recorded HERE, where the result type is known for certain. Replay cannot
+		// recover this from the stored bytes — see resultFingerprint's comment.
+		ResultShape: resultFingerprint(reflect.TypeOf(zero)),
 	}
 
 	if err != nil {

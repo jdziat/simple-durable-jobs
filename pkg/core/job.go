@@ -152,8 +152,19 @@ type Checkpoint struct {
 	// less than callIndex+1 and so degrades to the historical +1 behaviour —
 	// making non-nested workflows bit-for-bit unchanged, and leaving workflows
 	// already in flight exactly as (in)correct as they were before the upgrade.
-	SpanEnd   int       `gorm:"type:integer;not null;default:0"`
-	CreatedAt time.Time `gorm:"autoCreateTime"`
+	SpanEnd int `gorm:"type:integer;not null;default:0"`
+	// ResultShape fingerprints the JSON SHAPE of the result type this checkpoint
+	// was written from, so replay can tell "the handler now returns a different
+	// type" from "the stored payload happens to look different". It is structural
+	// (field names and kinds), not nominal, so moving or renaming the type does not
+	// trip replay while changing its fields does.
+	//
+	// EMPTY means "not recorded" — every checkpoint written before this column
+	// existed — and replay then skips the comparison entirely, exactly as SpanEnd
+	// == 0 degrades to the historical behaviour. A workflow already in flight is
+	// therefore unaffected by the upgrade.
+	ResultShape string    `gorm:"size:32;not null;default:''"`
+	CreatedAt   time.Time `gorm:"autoCreateTime"`
 }
 
 // Checkpoint CallType values reserved for BUILT-IN durable operations rather
