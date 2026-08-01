@@ -468,7 +468,15 @@ func TestIntegration_ConcurrentWorkers(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	workerCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	// The workers live until the test stops them, NOT on a fixed deadline.
+	//
+	// This used to give them a 10s timeout while the wait loop below independently
+	// polled for 100 x 100ms — also 10s. The two expired TOGETHER, so a run that
+	// needed a little longer lost its workers at the same moment it ran out of
+	// patience, and the assertions then reported the shortfall as a product bug.
+	// Measured on Postgres under -race: 5 failures in 25 runs, and the SAME 5/25 on
+	// the preceding commit — pre-existing timing fragility, not a regression.
+	workerCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	// Start 3 workers with concurrency 2 each (6 total concurrent processors)
@@ -477,27 +485,32 @@ func TestIntegration_ConcurrentWorkers(t *testing.T) {
 		go func() { _ = worker.Start(workerCtx) }()
 	}
 
-	// Wait for all jobs to complete
-	for i := 0; i < 100; i++ {
-		completed := 0
-		for j := 0; j < 20; j++ {
-			if _, ok := processedJobs.Load(j); ok {
-				completed++
-			}
-		}
-		if completed == 20 {
-			break
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
+	// WAIT ON STORAGE, NOT ON THE HANDLER MAP.
+	//
+	// processedJobs is written by the handler, which returns BEFORE the worker
+	// records the terminal status (and completion may be group-committed), so the
+	// map filling up does NOT imply 20 completed rows. The old code polled the map
+	// and then asserted the row count immediately — a guaranteed race, and the one
+	// that actually fired: the map was full, GetJobsByStatus returned 18 or 19.
+	//
+	// So poll the REAL invariant. Waiting on a proxy for the thing you assert is
+	// the recurring shape of false-green and flake in this repo alike.
+	//
+	// Measured on Postgres under -race: 5 failures in 25 runs before this, and the
+	// SAME 5/25 on the preceding commit — pre-existing, not a regression. The
+	// budget is generous because it bounds a hang; it is not a perf assertion.
+	require.Eventually(t, func() bool {
+		completedJobs, err := store.GetJobsByStatus(context.Background(), jobs.StatusCompleted, 100)
+		return err == nil && len(completedJobs) == 20
+	}, 60*time.Second, 25*time.Millisecond, "all 20 jobs should reach `completed` in storage")
 
-	// Verify all jobs were processed
+	// Every job ran exactly once, by id — the count above cannot show a duplicate
+	// standing in for a missing one.
 	for i := 0; i < 20; i++ {
 		_, ok := processedJobs.Load(i)
 		assert.True(t, ok, "Job %d should have been processed", i)
 	}
 
-	// Verify jobs in storage are completed
 	completedJobs, err := store.GetJobsByStatus(context.Background(), jobs.StatusCompleted, 100)
 	require.NoError(t, err)
 	assert.Len(t, completedJobs, 20, "All 20 jobs should be completed")
