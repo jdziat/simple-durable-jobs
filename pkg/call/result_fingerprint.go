@@ -78,10 +78,22 @@ var fingerprintCache sync.Map
 // determined — a nil type, or one encoding/json refuses (a channel or func field).
 // Both mean "record no shape", which makes replay skip the check: a type whose
 // shape cannot be computed must never be able to wedge a replay.
-func resultShape(t reflect.Type) (string, bool) {
+func resultShape(t reflect.Type) (shape string, ok bool) {
 	if t == nil {
 		return "", false
 	}
+	// A user's MarshalJSON/MarshalText can panic, and synthesize feeds it a value
+	// it has never seen — so a marshaler that is perfectly safe on real data can
+	// still blow up on the probe. This runs inside every nested Call INCLUDING the
+	// replay path, where nothing else would marshal that type, so an escaping panic
+	// would be a new production crash introduced by the guard itself. Treat it as
+	// "no shape", the same fail-open used for a type json cannot marshal: a result
+	// type whose shape cannot be computed must never be able to break a Call.
+	defer func() {
+		if r := recover(); r != nil {
+			shape, ok = "", false
+		}
+	}()
 	v, ok := synthesize(t, 0)
 	if !ok {
 		return "", false
@@ -195,9 +207,10 @@ func synthesize(t reflect.Type, depth int) (reflect.Value, bool) {
 			if !ok {
 				return reflect.Value{}, false
 			}
-			for i := 0; i < t.Len(); i++ {
-				v.Index(i).Set(elem)
-			}
+			// Only element 0: describe reads an array's shape from its first
+			// element, so populating the rest cannot change the result and a large
+			// array would otherwise cost one reflect Set per element.
+			v.Index(0).Set(elem)
 		}
 		return v, true
 
