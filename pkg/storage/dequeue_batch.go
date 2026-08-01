@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"slices"
 	"sort"
+	"sync"
 	"time"
 
 	"gorm.io/gorm"
@@ -490,34 +491,60 @@ func (s *GormStorage) decodeClaimedBatch(ctx context.Context, jobs []*core.Job, 
 // line per row per claim.
 const maxPoisonPayloadIDsLogged = 64
 
+// poisonPayloadLog is the once-per-job-id dedup state behind the poison-payload
+// warning. It hangs off GormStorage by POINTER on purpose: it holds a mutex and a
+// map, neither of which is comparable, and GormStorage is an exported concrete
+// type whose comparability is part of the v4 API surface — gorelease reports a
+// struct that stops being comparable as an INCOMPATIBLE change and the api-compat
+// job fails the release. Keep every non-comparable field of GormStorage indirect.
+type poisonPayloadLog struct {
+	mu     sync.Mutex
+	logged map[core.UUID]struct{}
+	capped bool
+}
+
 // reportPoisonPayload records an undecodable row: always a counter increment, and
 // a log line the first time each id is seen by this process.
 func (s *GormStorage) reportPoisonPayload(jobID core.UUID, cause error) {
 	s.poisonPayloadDrops.Add(1)
 
-	s.poisonPayloadMu.Lock()
-	defer s.poisonPayloadMu.Unlock()
-	if _, seen := s.poisonPayloadLogged[jobID]; seen {
-		return
-	}
 	logger := s.logger
 	if logger == nil {
 		logger = slog.Default()
 	}
-	if len(s.poisonPayloadLogged) >= maxPoisonPayloadIDsLogged {
-		if !s.poisonPayloadCapped {
-			s.poisonPayloadCapped = true
+	dropped := func() {
+		logger.Warn("job payload could not be decoded; the job was released and will be re-claimed and re-fail until its codec can read it",
+			"job_id", jobID, "error", cause, "total_drops", s.poisonPayloadDrops.Load())
+	}
+
+	p := s.poisonPayload
+	if p == nil {
+		// Zero-value storage (no constructor): there is no dedup state to consult.
+		// Log anyway — silence is the exact defect this reporting exists to remove,
+		// and over-logging on a storage nobody built through NewGormStorage is the
+		// strictly safer failure.
+		dropped()
+		return
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if _, seen := p.logged[jobID]; seen {
+		return
+	}
+	if len(p.logged) >= maxPoisonPayloadIDsLogged {
+		if !p.capped {
+			p.capped = true
 			logger.Warn("too many jobs have undecodable payloads to name individually; further job ids are counted but not logged. Check PoisonPayloadDrops() and your codec configuration",
 				"limit", maxPoisonPayloadIDsLogged, "total_drops", s.poisonPayloadDrops.Load())
 		}
 		return
 	}
-	if s.poisonPayloadLogged == nil {
-		s.poisonPayloadLogged = make(map[core.UUID]struct{}, 8)
+	if p.logged == nil {
+		p.logged = make(map[core.UUID]struct{}, 8)
 	}
-	s.poisonPayloadLogged[jobID] = struct{}{}
-	logger.Warn("job payload could not be decoded; the job was released and will be re-claimed and re-fail until its codec can read it",
-		"job_id", jobID, "error", cause, "total_drops", s.poisonPayloadDrops.Load())
+	p.logged[jobID] = struct{}{}
+	dropped()
 }
 
 // PoisonPayloadDrops reports how many times this storage has claimed a job whose

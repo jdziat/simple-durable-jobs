@@ -10,7 +10,6 @@ import (
 	"regexp"
 	"sort"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -148,12 +147,15 @@ type GormStorage struct {
 
 	// logger is optional; slog.Default() is used when nil. See SetLogger.
 	logger *slog.Logger
-	// poisonPayload* track rows whose payload this storage cannot decode. The
-	// counter is always incremented; the map bounds which ids get named in a log.
-	poisonPayloadDrops  atomic.Int64
-	poisonPayloadMu     sync.Mutex
-	poisonPayloadLogged map[core.UUID]struct{}
-	poisonPayloadCapped bool
+	// poisonPayloadDrops counts rows whose payload this storage cannot decode. It
+	// is always incremented, on every storage including a zero-value one.
+	poisonPayloadDrops atomic.Int64
+	// poisonPayload bounds which of those ids get NAMED in a log. Behind a pointer
+	// so GormStorage stays comparable: it holds a mutex and a map, neither of which
+	// is comparable, and an exported concrete type turning non-comparable is an
+	// api-compat break (same reason as hotStats and indexedMetadataKeys — see the
+	// note on hotStatCaches).
+	poisonPayload *poisonPayloadLog
 
 	// hotStatsTTL is the TTL (nanoseconds) for the hot-path aggregate cache; <=0
 	// disables it. atomic (comparable) so WithHotStatsCacheTTL and tests can set
@@ -195,7 +197,7 @@ func NewGormStorage(db *gorm.DB, opts ...GormStorageOption) *GormStorage {
 		dialector := db.Name()
 		isSQLite = strings.Contains(strings.ToLower(dialector), "sqlite")
 	}
-	s := &GormStorage{db: db, isSQLite: isSQLite, codec: core.IdentityCodec, hotStats: &hotStatCaches{}}
+	s := &GormStorage{db: db, isSQLite: isSQLite, codec: core.IdentityCodec, hotStats: &hotStatCaches{}, poisonPayload: &poisonPayloadLog{}}
 	s.lockDuration.Store(int64(defaultLockDuration))
 	s.hotStatsTTL.Store(int64(defaultHotStatsCacheTTL))
 	if s.isSQLite {
