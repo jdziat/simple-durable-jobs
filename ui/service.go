@@ -821,10 +821,29 @@ func (s *jobsService) searchJobs(ctx context.Context, req *jobsv1.ListJobsReques
 			Tenant:       req.Tenant,
 			MetaContains: metadataMapFromProto(req.MetaContains),
 			Search:       req.Search,
-			Limit:        limit,
-			Offset:       (page - 1) * limit,
-			SortKey:      req.SortKey,
-			SortDir:      req.SortDir,
+			// status="dead-lettered" short-circuits ListJobs into a different query,
+			// and until now that query silently DROPPED the request's time window:
+			// eight status values narrowed, the ninth returned the whole table. Every
+			// other field on this request is forwarded, so a caller has no way to see
+			// that this one was not.
+			//
+			// The window lands on dead_lettered_at here, not created_at. This branch
+			// is the DLQ view: it is ordered dead_lettered_at DESC and the question it
+			// answers is "what died in this window", so bounding created_at would drop
+			// a job that died a second ago because it was born two days ago. The
+			// field names say so — see core.DeadLetterFilter.
+			//
+			// The shipped Svelte dashboard sends NO since/until on any ListJobs
+			// request (verified: no reference in ui/frontend/src outside the generated
+			// jobs_pb.ts), so the exposure today is programmatic Connect clients and
+			// any future UI that wires the control up. That is the reason to fix it,
+			// not a reason to skip it: the field is on the public request message.
+			DeadLetteredSince: timeFromProto(req.Since),
+			DeadLetteredUntil: timeFromProto(req.Until),
+			Limit:             limit,
+			Offset:            (page - 1) * limit,
+			SortKey:           req.SortKey,
+			SortDir:           req.SortDir,
 		}
 		jobs, err := deadLettered.ListDeadLettered(ctx, filter)
 		if err != nil {
@@ -1424,12 +1443,44 @@ type deadLetterStorage interface {
 }
 
 // JobFilter is an alias for core.JobFilter for backward compatibility.
+//
+// # RESOLUTION OF THE Since/Until WINDOW ON SQLITE
+//
+// Both bounds are INCLUSIVE and select by INSTANT, whatever timezone the bound and
+// the stored row are expressed in. There is one accepted limit, and it applies
+// only on SQLite:
+//
+// SQLite has no timestamp type, so created_at is TEXT carrying the offset of
+// whichever PROCESS wrote it. When a row's offset differs from the bound's, the
+// two are normalized through strftime(), which renders MILLISECONDS — so a row
+// less than 1ms outside the window can still be returned. The error is bounded by
+// 1ms and is always in the direction of returning MORE: a job whose created_at
+// falls inside the window is never dropped. When the offsets match — a single
+// process, or several sharing a TZ — the comparison is exact to the nanosecond.
+//
+// Postgres and MySQL store a real instant and have neither limit.
+//
+// Widening that 1ms, or making it lose rows instead of admitting them, fails
+// TestSearchJobs_CrossFaceWindowResolvesToMilliseconds in pkg/storage.
 type JobFilter = core.JobFilter
 
 // timeFromProto converts an optional request timestamp to the zero time when it is
 // absent, which is what JobFilter treats as "no bound" (SearchJobs gates each side
 // on IsZero). A nil *timestamppb.Timestamp would otherwise panic on AsTime, and a
 // zero-valued one must not be turned into year 1 and used as a real lower bound.
+//
+// The returned time is UTC-faced, because timestamppb.AsTime is unconditionally
+// UTC, and it is deliberately NOT re-faced here. An instant is an instant. On
+// SQLite a stored timestamp is TEXT carrying its own offset and is compared
+// LEXICALLY, so a bound only compares correctly against a row that happens to
+// wear the same face — and rows wear the face of whichever process wrote them,
+// plus a second face on the other side of a DST transition. There is therefore no
+// face this layer could pick that would be right for every row, and picking one
+// here would merely move which configuration breaks (measured: converting the
+// bound to Local repairs reader==writer and breaks writer=UTC/reader!=UTC, which
+// works today). The comparison itself is made face-independent next to the
+// predicate, in GormStorage.timeBoundPredicate, which also covers every other
+// caller of the exported SearchJobs/ListDeadLettered.
 func timeFromProto(ts *timestamppb.Timestamp) time.Time {
 	if ts == nil || !ts.IsValid() {
 		return time.Time{}

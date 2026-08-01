@@ -1,5 +1,7 @@
 package core
 
+import "time"
+
 // DeadLetterFilter scopes dead-letter triage queries.
 type DeadLetterFilter struct {
 	Queue string
@@ -9,8 +11,39 @@ type DeadLetterFilter struct {
 	// MetaContains requires every key/value pair to appear in the job metadata.
 	MetaContains *MetadataMap
 	Search       string
-	Limit        int
-	Offset       int
+	// DeadLetteredSince/DeadLetteredUntil are the INCLUSIVE bounds of a time
+	// window over dead_lettered_at — WHEN THE JOB DIED, not when it was created.
+	// A zero value means "no bound" on that side.
+	//
+	// The column is named in the FIELD rather than left to a doc comment because
+	// the two candidate columns give different answers and the difference is not
+	// cosmetic: a job created 48h ago and dead-lettered a second ago is exactly
+	// what a "what died in the last hour" triage query is looking for, and
+	// bounding created_at would hide it. dead_lettered_at is also the column this
+	// view is ORDERED by (dead_lettered_at DESC — see ListDeadLettered), so
+	// filtering it keeps the window and the sort talking about the same axis, and
+	// it is indexed (idx_jobs_dead_lettered_at).
+	//
+	// JobFilter.Since/Until bound created_at, and that stays true. ListJobs maps
+	// its request-level since/until onto whichever column the branch it selected
+	// is about; see ui.jobsService.searchJobs.
+	//
+	// Both bounds select by INSTANT, whatever timezone they and the stored row are
+	// expressed in. On SQLITE ONLY there is one accepted limit: dead_lettered_at is
+	// TEXT carrying the offset of whichever process wrote it, and when that offset
+	// differs from the bound's the two are normalized at MILLISECOND resolution, so
+	// a job that died less than 1ms outside the window can still be returned. The
+	// error is bounded by 1ms and always returns MORE — a job that died inside the
+	// window is never dropped. Matching offsets compare exactly, to the nanosecond.
+	// Postgres and MySQL store a real instant and have neither limit.
+	//
+	// These are plain time.Time (comparable) on purpose — DeadLetterFilter is an
+	// exported concrete struct and the release-gating api-compat job treats a
+	// loss of comparability as an incompatible change.
+	DeadLetteredSince time.Time
+	DeadLetteredUntil time.Time
+	Limit             int
+	Offset            int
 	// SortKey/SortDir select a whitelisted order column (see GormStorage). When
 	// SortKey is empty the default dead-letter order (dead_lettered_at DESC) is
 	// kept so the most-recently-dead jobs surface first.

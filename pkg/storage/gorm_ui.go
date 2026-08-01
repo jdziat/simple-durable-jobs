@@ -222,12 +222,7 @@ func (s *GormStorage) SearchJobs(ctx context.Context, filter core.JobFilter) ([]
 	}
 	q = applyMetaContains(s, q, filter.MetaContains)
 	q = applyJobSearch(s, q, filter.Search)
-	if !filter.Since.IsZero() {
-		q = q.Where("created_at >= ?", filter.Since)
-	}
-	if !filter.Until.IsZero() {
-		q = q.Where("created_at <= ?", filter.Until)
-	}
+	q = applyTimeWindow(s, q, "created_at", filter.Since, filter.Until)
 
 	var total int64
 	if err := q.Count(&total).Error; err != nil {
@@ -248,6 +243,336 @@ func (s *GormStorage) SearchJobs(ctx context.Context, filter core.JobFilter) ([]
 		return nil, 0, err
 	}
 	return jobs, total, nil
+}
+
+// maxStoredClockFaceOffset bounds how far a stored timestamp's WALL-CLOCK text
+// can sit from the same instant expressed in UTC.
+//
+// On SQLite a timestamp is TEXT carrying its own offset ("2026-08-01
+// 09:30:08.357431592-07:00"), so a lexical comparison orders rows by their WALL
+// FACE, not by instant. wall = instant + offset, and the widest real offsets in
+// tzdata are -12:00 (Etc/GMT+12) and +14:00 (Pacific/Kiritimati), so a row's wall
+// text can never be more than 14h away from its UTC rendering in either
+// direction. 26h is that maximum with 12h of headroom.
+//
+// It exists so timeBoundPredicate can keep a BARE-COLUMN range clause alongside
+// the exact predicate: the bare clause is deliberately loose (it can admit rows
+// the exact clause then rejects) but it can never REJECT a row the exact clause
+// would admit, and it is the only form SQLite can use to restrict an index range
+// (measured — see timeBoundPredicate).
+//
+// The one input it cannot cover is a row whose stored offset exceeds ±26:00. No
+// tzdata zone produces one; it would take a hand-built time.FixedZone passed as
+// an explicit Job.CreatedAt. Such a row is already beyond repair anyway: SQLite's
+// own date parser hard-caps a timezone suffix at ±14:00 hours, so strftime() and
+// datetime() return NULL for it (measured: '...+15:00' -> NULL, '...+14:00' ->
+// parses). No read-side form can normalize a face SQLite refuses to read.
+const maxStoredClockFaceOffset = 26 * time.Hour
+
+// timeBoundDirection selects which side of a time window a predicate expresses.
+type timeBoundDirection int
+
+const (
+	// boundAtOrAfter is the INCLUSIVE lower bound: column >= bound.
+	boundAtOrAfter timeBoundDirection = iota
+	// boundAtOrBefore is the INCLUSIVE upper bound: column <= bound.
+	boundAtOrBefore
+)
+
+// timeBoundPredicate returns a "column <cmp> bound" predicate, plus its binds,
+// that compares INSTANTS whatever clock face the stored value happens to wear.
+// Both directions are INCLUSIVE, which is what core.JobFilter.Since/Until and
+// core.DeadLetterFilter.DeadLetteredSince/Until document.
+//
+// # WHY THIS IS NOT A BARE `column >= ?`
+//
+// SQLite has no datetime type. mattn/go-sqlite3 renders every bound time.Time
+// with "2006-01-02 15:04:05.999999999-07:00" — on whatever face the value
+// carries, and a UTC value renders "+00:00", never "Z" — and SQLite compares it
+// against the stored TEXT LEXICALLY. A lexical comparison of two differently
+// offset strings orders WALL FACES, not instants, and is wrong by the full delta
+// between the two zones. This is the same hazard clock.go documents for
+// nowWriteValue and gorm.go's scheduleCursorLess, and it is not hypothetical
+// here: timestamppb.AsTime is unconditionally UTC, so every bound arriving
+// through the ListJobs RPC is UTC-faced.
+//
+// # WHY THE BOUND IS NOT SIMPLY CONVERTED TO ONE FACE
+//
+// Converting the bind (e.g. bound.Local()) is only correct when every stored row
+// wears the READER's face. Rows do not:
+//
+//   - created_at is GORM autoCreateTime from time.Now(), so it wears the face of
+//     the process that WROTE it. `sdj --driver sqlite --dsn ./jobs.db` and the
+//     standalone UI binaries are documented second processes against one SQLite
+//     file, and they need not share a TZ with the worker. Measured: normalizing
+//     the bind to Local fixes reader==writer and BREAKS writer=UTC/reader!=UTC,
+//     which the unfixed code got right.
+//   - A single zone still writes TWO faces across a DST transition (-07:00 and
+//     -08:00 for America/Los_Angeles). Whichever face the bind picks is wrong for
+//     rows on the other one, inside the fall-back hour, in one process.
+//   - dead_lettered_at is written from time.Now() in Storage.Fail, so it carries
+//     the same mixture.
+//
+// Normalizing on the WRITE path instead (what bff9da0 did for run_at) is right
+// for a column with two in-package writers and no legacy comparison to honour.
+// It is not available here: it would leave every already-stored row on its
+// original face, and no write-side choice can make one bind face correct for a
+// column that legitimately holds several.
+//
+// # THE FORM, AND WHY IT IS THE ONE ALREADY IN THIS PACKAGE
+//
+// The exact half is scheduleCursorLess (gorm.go) applied to a different column:
+//
+//   - Same trailing offset on both sides -> compare the raw TEXT. Two identically
+//     offset strings sort by instant, and this keeps the driver's full
+//     NANOSECOND precision. This is the common case (one process, one zone, no
+//     DST crossing).
+//   - Different offsets -> strftime() parses each and renders UTC, so the
+//     comparison is on instants for ANY stored face, with no migration and no
+//     dependence on which process wrote the row. Applying strftime()
+//     unconditionally is what an earlier version of scheduleCursorLess did, and it
+//     measurably truncated precision (datetime() is worse still: whole seconds).
+//
+// # THE ACCEPTED LIMIT: CROSS-FACE COMPARISONS RESOLVE TO MILLISECONDS
+//
+// strftime('%f') renders milliseconds, so the cross-face branch — and ONLY that
+// branch — compares at millisecond resolution: a row and a bound that wear
+// DIFFERENT offsets and sit less than 1ms apart collapse and compare EQUAL, so an
+// inclusive bound can admit a row up to 1ms outside the window. The error is
+// bounded by 1ms and is over-inclusion in every case; the predicate never drops a
+// row that belongs in the window. The same-face fast path is exact to the
+// nanosecond, and same-face is what a single-zone deployment always takes, so this
+// needs a genuinely mixed-face column AND a sub-millisecond window bound to reach.
+//
+// This is a deliberate trade, not an oversight: the alternative is normalizing
+// every comparison through strftime(), which costs the same 1ms on the common
+// path too. It is pinned by TestSearchJobs_CrossFaceWindowResolvesToMilliseconds
+// so it cannot silently widen, and it is restated on the public
+// ui.JobFilter and core.DeadLetterFilter godoc where a caller reads it.
+//
+// The "never drops" half of that claim is the load-bearing one, and it is pinned
+// SEPARATELY by TestSearchJobs_SubMillisecondCrossFaceNeverDropsAnInsideRow,
+// because every other cross-face fixture here is millisecond-ALIGNED and so
+// cannot reach a rounding tie at all. It holds because strftime('%f') renders a
+// given instant identically on every face (measured at 1ns granularity around
+// the tie points, -12:00 through +14:00), so both sides round the same way and
+// only collapse-to-equal is reachable. Read that test before weakening this.
+//
+// A migration that rewrote stored timestamp text was tried in this repo and
+// corrupted ordering on every SQLite database. This is read-side only.
+//
+// # THE BARE-COLUMN HALF, AND WHAT IT BUYS
+//
+// strftime()/CASE around the column makes it a computed value, which costs
+// SQLite the index RANGE restriction. created_at IS indexed — the migrations
+// create idx_jobs_status_created (status, created_at DESC) and
+// idx_jobs_queue_created (queue, created_at DESC) — and the dead-letter view has
+// idx_jobs_dead_lettered_at.
+//
+// Measured with EXPLAIN QUERY PLAN and wall-clock timings against the real
+// migrated schema, 200k rows over ~139 days, 8 queues, ANALYZEd, one-day window,
+// mean of 5 runs after 2 warm-ups:
+//
+//	                        bare (pristine)   CASE only    loose+CASE
+//	count  queue=?+window        17us          4.443ms       133us
+//	list   queue=?+window        22us          2.890ms        96us
+//	count  status=?+window       54us         63.062ms       905us
+//	list   status=?+window       28us         35.963ms       416us
+//	count  window only           55us         56.889ms       959us
+//
+//	plan   queue=?+window   bare, loose+CASE: SEARCH jobs USING [COVERING] INDEX
+//	                          idx_jobs_queue_created
+//	                          (queue=? AND created_at>? AND created_at<?)
+//	                        CASE only:        ... (queue=?)            <- range LOST
+//	plan   status=?+window  bare, loose+CASE: SEARCH jobs USING [COVERING] INDEX
+//	                          idx_jobs_status_created
+//	                          (status=? AND created_at>? AND created_at<?)
+//	                        CASE only:        ... (status=?)           <- range LOST
+//	plan   window only      bare, loose+CASE: SEARCH ... idx_jobs_queue_created
+//	                          (ANY(queue) AND created_at>? AND created_at<?)
+//	                        CASE only:        SCAN jobs USING COVERING INDEX
+//
+// So the loose bare clause is emitted FIRST and restores every range restriction
+// the CASE alone loses; the CASE then runs as a residual filter over the narrowed
+// range. Dropping it turns a 0.9ms dashboard count into a 63ms one at 200k rows,
+// and that cost grows with the TABLE while the loose form's grows with the WINDOW.
+// The plan is asserted by TestSearchJobs_WindowKeepsTheIndexRangeRestriction, not
+// left as a claim in this comment.
+//
+// # WHY THE BOUND IS RANGE-CHECKED FIRST
+//
+// Every one of the three binds above is only meaningful inside the range SQLite
+// can actually work with, and a bound outside it fails SILENTLY — as a dropped
+// row, not as an error:
+//
+//   - Both comparisons are LEXICAL, and lexical order tracks instant order only
+//     while the year has FOUR digits. Go's "2006" verb pads but does not truncate,
+//     so year 10000 renders "10000-…", which sorts BELOW every real "2026-…" row.
+//     On the upper bound that inverts the comparison and rejects EVERYTHING.
+//   - strftime() returns NULL for anything SQLite's date parser refuses, and
+//     `NULL <= x` is NULL, which is not true, so the row is dropped. Measured, it
+//     refuses two things a caller can supply: a value that rounds past the end of
+//     its supported range ('9999-12-31 23:59:59.999999999' -> NULL, while
+//     '…59.999' parses) and a timezone suffix beyond ±14:00 ('+15:00' -> NULL,
+//     '+14:00' parses).
+//
+// Both are reachable from the public API. timestamppb.IsValid accepts
+// 9999-12-31T23:59:59.999999999Z, which is the natural "no upper bound" sentinel
+// for a programmatic Connect client, and it hits BOTH: it rounds to NULL under
+// strftime and it overflows the four-digit year once the ±26h prefilter slop is
+// added. Unpatched, that request returns rows; a naive fix returns an empty page.
+//
+// So the bound is normalized before any SQL is built, always in the direction
+// that can only ADMIT more rows, never fewer:
+//
+//	face beyond ±14:00      -> re-faced to UTC. Instant-preserving, and no row
+//	                           SQLite can read wears such a face either, so the
+//	                           same-face fast path is unaffected.
+//	past the far end in the -> the bound restricts nothing storable: emit NO
+//	  direction that would    predicate at all (an absent bound), which is what
+//	  admit everything        an open-ended sentinel means.
+//	past the far end in the -> clamped to that end. It can then admit a row
+//	  other direction         exactly at the end that should have been excluded;
+//	                          over-inclusion, never a lost row.
+//	±26h prefilter shift    -> checked separately: when the shift leaves the
+//	  leaves the year band     four-digit band (or wraps int64), the loose clause
+//	                          is OMITTED for that side. It is a pure prefilter, so
+//	                          dropping it costs an index range and nothing else.
+//
+// Pinned by TestTimeBoundPredicate_BoundsOutsideSQLitesRangeDegradeSafely and
+// TestSearchJobs_OpenEndedFarFutureUntilKeepsEveryRow.
+//
+// Postgres and MySQL store a real instant and already compare instants, so they
+// keep the plain form with the caller's time.Time untouched — and that branch is
+// pinned by a unit test, not by assertion.
+//
+// An empty predicate means "no restriction on this side"; applyTimeWindow skips it.
+func (s *GormStorage) timeBoundPredicate(column string, dir timeBoundDirection, bound time.Time) (string, []any) {
+	cmp := ">="
+	slop := -maxStoredClockFaceOffset
+	if dir == boundAtOrBefore {
+		cmp = "<="
+		slop = maxStoredClockFaceOffset
+	}
+	if !s.isSQLite {
+		return column + " " + cmp + " ?", []any{bound}
+	}
+
+	bound, restricts := sqliteComparableBound(bound, dir)
+	if !restricts {
+		return "", nil
+	}
+
+	const utc = `strftime('%Y-%m-%d %H:%M:%f', `
+	// substr(x, -6) is the trailing "+HH:MM" / "-HH:MM" the driver always writes,
+	// SIGN INCLUDED — "+05:30" and "-05:30" are 11 hours apart and must not take
+	// the raw-text arm together.
+	exact := "CASE WHEN substr(" + column + ", -6) = substr(?, -6) " +
+		"THEN " + column + " " + cmp + " ? " +
+		"ELSE " + utc + column + ") " + cmp + " " + utc + "?) END"
+
+	loose, ok := lexicalPrefilterBound(bound, slop)
+	if !ok {
+		return "(" + exact + ")", []any{bound, bound, bound}
+	}
+	return "(" + column + " " + cmp + " ? AND " + exact + ")", []any{loose, bound, bound, bound}
+}
+
+// sqliteParsableBoundFloor / sqliteParsableBoundCeil are the widest instants
+// whose driver-rendered text BOTH keeps a four-digit year and is accepted by
+// SQLite's date parser. The ceiling stops at millisecond .999 because strftime
+// rounds the fraction and '…59.9999' rounds past the end of the supported range,
+// which yields NULL (measured).
+var (
+	sqliteParsableBoundFloor = time.Date(1, 1, 1, 0, 0, 0, 0, time.UTC)
+	sqliteParsableBoundCeil  = time.Date(9999, 12, 31, 23, 59, 59, 999000000, time.UTC)
+)
+
+// sqliteMaxParsableFaceOffset is the widest timezone suffix SQLite's own date
+// parser accepts (measured: '+15:00' -> NULL, '+14:00' and '-12:00' parse). It is
+// also wider than any tzdata zone, so only a hand-built time.FixedZone reaches it.
+const sqliteMaxParsableFaceOffset = 14 * time.Hour
+
+// sqliteComparableBound moves a bound into the range the SQLite predicate can
+// compare, reporting restricts=false when the bound excludes nothing that SQLite
+// is able to store — in which case the caller must emit no predicate rather than
+// one that would silently reject every row.
+//
+// Every adjustment is in the over-inclusive direction: this function can widen a
+// window, never narrow it.
+func sqliteComparableBound(bound time.Time, dir timeBoundDirection) (time.Time, bool) {
+	if _, offsetSeconds := bound.Zone(); absDuration(time.Duration(offsetSeconds)*time.Second) > sqliteMaxParsableFaceOffset {
+		bound = bound.UTC()
+	}
+	switch {
+	case dir == boundAtOrAfter && bound.Before(sqliteParsableBoundFloor):
+		return time.Time{}, false // "at or after the dawn of time" restricts nothing
+	case dir == boundAtOrBefore && bound.After(sqliteParsableBoundCeil):
+		return time.Time{}, false // the open-ended upper sentinel restricts nothing
+	case bound.Before(sqliteParsableBoundFloor):
+		return sqliteParsableBoundFloor, true
+	case bound.After(sqliteParsableBoundCeil):
+		return sqliteParsableBoundCeil, true
+	}
+	return bound, true
+}
+
+func absDuration(d time.Duration) time.Duration {
+	if d < 0 {
+		return -d
+	}
+	return d
+}
+
+// lexicalPrefilterBound shifts bound by slop for the index-preserving bare-column
+// prefilter, reporting ok=false when the result can no longer be compared
+// LEXICALLY against stored timestamp text — i.e. when the ±26h shift pushes an
+// otherwise-valid bound out of the four-digit year band. Callers then drop the
+// prefilter; the exact predicate alone is already correct, so only the index range
+// is lost, and a bound 8000 years out was never restricting a useful range.
+//
+// The wrap check covers a bound so extreme that Add overflows the internal int64
+// second count, which would otherwise move the bound in the WRONG direction.
+func lexicalPrefilterBound(bound time.Time, slop time.Duration) (time.Time, bool) {
+	shifted := bound.UTC().Add(slop)
+	if slop > 0 && !shifted.After(bound) {
+		return time.Time{}, false
+	}
+	if slop < 0 && !shifted.Before(bound) {
+		return time.Time{}, false
+	}
+	if year := shifted.Year(); year < 1 || year > 9999 {
+		return time.Time{}, false
+	}
+	return shifted, true
+}
+
+// applyTimeWindow adds the INCLUSIVE [since, until] bounds for one timestamp
+// column. A zero value means "no bound" on that side, and so does an empty
+// predicate — timeBoundPredicate returns one for a bound that excludes nothing
+// the backend can store (see sqliteComparableBound).
+//
+// The `pred != ""` guards are for the READER, not for GORM: `Where("")` is a
+// silent no-op that returns a nil error (measured, gorm v1.31.1 — an earlier
+// version of this comment claimed it raises "empty condition", which is false).
+// They are kept because skipping a bound is the INTENT and an unconditional
+// Where would leave that intent resting on an undocumented GORM behaviour. They
+// are deliberately unpinnable: no test can distinguish them from their absence,
+// which is exactly why the reason lives here instead of in a test name.
+//
+// column is a package-internal literal at every call site, never caller data.
+func applyTimeWindow(s *GormStorage, q *gorm.DB, column string, since, until time.Time) *gorm.DB {
+	if !since.IsZero() {
+		if pred, args := s.timeBoundPredicate(column, boundAtOrAfter, since); pred != "" {
+			q = q.Where(pred, args...)
+		}
+	}
+	if !until.IsZero() {
+		if pred, args := s.timeBoundPredicate(column, boundAtOrBefore, until); pred != "" {
+			q = q.Where(pred, args...)
+		}
+	}
+	return q
 }
 
 func applyMetaContains(s *GormStorage, q *gorm.DB, m *core.MetadataMap) *gorm.DB {

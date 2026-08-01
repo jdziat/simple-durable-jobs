@@ -64,6 +64,11 @@ func (s *GormStorage) deadLetterQuery(ctx context.Context, filter core.DeadLette
 	}
 	q = applyMetaContains(s, q, filter.MetaContains)
 	q = applyJobSearch(s, q, filter.Search)
+	// The window bounds dead_lettered_at, the column this view is ordered by and
+	// the one "what died in the last hour" is asking about. SearchJobs bounds
+	// created_at; both go through the same instant-correct helper, which is what
+	// has to be shared here — not the column. See core.DeadLetterFilter.
+	q = applyTimeWindow(s, q, "dead_lettered_at", filter.DeadLetteredSince, filter.DeadLetteredUntil)
 	return q
 }
 
