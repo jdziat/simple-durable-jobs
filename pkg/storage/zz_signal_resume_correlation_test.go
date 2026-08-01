@@ -218,9 +218,12 @@ func TestMigrateJobsWaitingSignalName_UpgradePathKeepsParkedJobsWakeable(t *test
 			}
 
 			parked := core.NewID()
+			// max_retries is listed explicitly: it is NOT NULL and, since
+			// core.Job.MaxRetries dropped its gorm `default:` tag (so an explicit
+			// Retries(0) survives), SQLite's column carries no default.
 			require.NoError(t, s.db.Exec(
-				"INSERT INTO jobs (id, type, queue, status) VALUES (?, ?, ?, ?)",
-				parked, "wf", "default", core.StatusWaiting).Error)
+				"INSERT INTO jobs (id, type, queue, status, max_retries) VALUES (?, ?, ?, ?, ?)",
+				parked, "wf", "default", core.StatusWaiting, 3).Error)
 			seedPendingSignal(t, s, parked, "approval")
 
 			// Upgrade.

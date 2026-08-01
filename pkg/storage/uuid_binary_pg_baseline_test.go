@@ -118,8 +118,11 @@ func TestMigratePostgresLegacyBaselineMissingSignalsAndOrphans(t *testing.T) {
 	// parent job does not exist (blocker #2).
 	const validJob = "11111111-1111-1111-1111-111111111111"
 	const orphanJob = "99999999-9999-9999-9999-999999999999"
+	// max_retries is listed explicitly: it is NOT NULL and carries no column
+	// default, because a default here is exactly what silently turned an explicit
+	// Retries(0) into 3.
 	require.NoError(t, db.Exec(
-		"INSERT INTO jobs (id, type) VALUES (?, 'test')", validJob,
+		"INSERT INTO jobs (id, type, max_retries) VALUES (?, 'test', 3)", validJob,
 	).Error)
 	require.NoError(t, db.Exec(
 		"INSERT INTO checkpoints (id, job_id, call_index, call_type) VALUES (?, ?, 0, 'step')",

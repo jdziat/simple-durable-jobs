@@ -161,8 +161,14 @@ func TestResultShape_MatchesWhatEncodingJSONEmits(t *testing.T) {
 		{"exported embedded struct with a tag is nested", pTaggedExp{pExpInner{"x"}, 1}},
 		{"conflict resolved across two levels of embedding", pDeepConflict{}},
 		{"omitempty with a populated value still appears", pOmitPopulated{"set", "b"}},
-		{"named map type", pNamedMapHolder{pNamedMap{"k": 1}}},
+		// Map fixtures use the key "1" because that is what synthesizeMapKey
+		// produces: a map KEY is data, not type structure, so the comparison is
+		// only like-for-like when both sides use the same entry.
+		{"named map type", pNamedMapHolder{pNamedMap{"1": 1}}},
 		{"slice of structs", pStructSlice{[]pExpInner{{"x"}}}},
+		{"nested containers", pNested{
+			Groups: []pGroup{{Name: "g", Tags: []string{"t"}, Counts: map[string]int{"1": 1}}},
+		}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -204,6 +210,63 @@ func assertValueKinds(t *testing.T, v any, shape string) {
 		if actual := jsonKindOf(raw); actual != predicted {
 			t.Errorf("field %q: shape predicts a %s but encoding/json emitted a %s (%s)\n  shape: %s",
 				name, predicted, actual, raw, shape)
+			continue
+		}
+		// Descend into containers. Checking only the top level let describe's array
+		// branch and synthesize's map branch be gutted with the suite green, which
+		// re-opened exactly the nested blindness this harness exists to prevent.
+		assertNestedKinds(t, name, sub, raw)
+	}
+}
+
+// assertNestedKinds walks a container's shape against the JSON it produced, so an
+// element or value shape cannot silently go missing.
+func assertNestedKinds(t *testing.T, path, shape string, raw json.RawMessage) {
+	t.Helper()
+	switch {
+	case strings.HasPrefix(shape, "["):
+		var elems []json.RawMessage
+		if json.Unmarshal(raw, &elems) != nil || len(elems) == 0 {
+			return
+		}
+		inner := strings.TrimSuffix(strings.TrimPrefix(shape, "["), "]")
+		if inner == "" {
+			t.Errorf("%s: shape describes an array with NO element shape, but json emitted %s",
+				path, elems[0])
+			return
+		}
+		if pred := shapeKindOf(inner); pred != "unconstrained" {
+			if act := jsonKindOf(elems[0]); act != pred {
+				t.Errorf("%s[0]: shape predicts a %s but encoding/json emitted a %s (%s)",
+					path, pred, act, elems[0])
+				return
+			}
+		}
+		assertNestedKinds(t, path+"[0]", inner, elems[0])
+	case strings.HasPrefix(shape, "{"):
+		var members map[string]json.RawMessage
+		if json.Unmarshal(raw, &members) != nil {
+			return
+		}
+		fields := topLevelShapeFields(shape)
+		if len(members) > 0 && len(fields) == 0 {
+			t.Errorf("%s: shape describes an object with NO members, but json emitted %s", path, raw)
+			return
+		}
+		for k, v := range members {
+			sub, ok := fields[k]
+			if !ok {
+				t.Errorf("%s.%s: emitted by encoding/json but absent from the shape", path, k)
+				continue
+			}
+			if pred := shapeKindOf(sub); pred != "unconstrained" {
+				if act := jsonKindOf(v); act != pred {
+					t.Errorf("%s.%s: shape predicts a %s but encoding/json emitted a %s (%s)",
+						path, k, pred, act, v)
+					continue
+				}
+			}
+			assertNestedKinds(t, path+"."+k, sub, v)
 		}
 	}
 }
@@ -433,4 +496,15 @@ type pNamedMapHolder struct {
 }
 type pStructSlice struct {
 	S []pExpInner `json:"s"`
+}
+
+// A fixture with real nesting, so the parity walk exercises element and value
+// shapes rather than only top-level members.
+type pGroup struct {
+	Name   string         `json:"name"`
+	Tags   []string       `json:"tags"`
+	Counts map[string]int `json:"counts"`
+}
+type pNested struct {
+	Groups []pGroup `json:"groups"`
 }

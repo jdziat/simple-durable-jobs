@@ -68,8 +68,14 @@ type Job struct {
 	Status         JobStatus         `gorm:"size:20;default:'pending';not null;index:idx_jobs_fan_out_status,priority:2"`
 	PreviousStatus JobStatus         `gorm:"size:20"` // Status before pause, for restoration
 	Attempt        int               `gorm:"type:integer;default:0;not null"`
-	MaxRetries     int               `gorm:"type:integer;default:3;not null"`
-	Timeout        time.Duration     `gorm:"not null;default:0"`
+	// No gorm `default:` on purpose. GORM omits a zero-valued field from the
+	// INSERT when the field declares a default, so a deliberate Retries(0) was
+	// silently replaced by the column default and a job marked do-not-retry ran
+	// three times. The Go layer already supplies the default (queue.Options starts
+	// at DefaultJobRetries), so the tag was only ever masking the explicit zero.
+	// Migration v41 keeps the DB-level default for writers that omit the column.
+	MaxRetries int           `gorm:"type:integer;not null"`
+	Timeout    time.Duration `gorm:"not null;default:0"`
 	// Determinism is the replay strictness mode
 	// (0=ExplicitCheckpoints,1=Strict,2=BestEffort).
 	// BestEffort relaxes the Call replay type-mismatch guard.

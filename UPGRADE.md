@@ -372,6 +372,28 @@ No migration. The partial unique index is unchanged and remains the
 gap); the application predicate is simply stricter than it now, which is the safe
 direction and is what removes the collision.
 
+### `Retries(0)` now actually means "run once"
+
+**Before:** a job enqueued with `jobs.Retries(0)` was persisted with
+`max_retries = 3` and its handler ran **three times**. `core.Job.MaxRetries`
+declared a GORM `default:3` tag, and GORM substitutes a field's declared default
+for any zero value — `Select()` does not override this. Everything above that layer
+was already correct (`queue.Options` tracks whether `Retries` was applied, and
+fan-out checks it so an explicit 0 is not mistaken for "unset"); all of it was
+inert one layer below.
+
+**After:** the tag is gone, so an explicit 0 is written through. If you enqueued
+non-idempotent work with `Retries(0)` and saw it run more than once, that is why.
+
+**What changes for hand-written SQL.** Because AutoMigrate derives the DDL from the
+struct tag, `jobs.max_retries` no longer carries a column default on any dialect.
+It is still `NOT NULL`, so **a raw `INSERT INTO jobs` must list `max_retries`
+explicitly**. Both examples in the SQL-interop guide already do, and Go clients of
+every version write the column, so this affects only hand-written inserts that
+relied on the default. A versioned migration cannot restore it reliably — a fresh
+database records the ledger as applied without executing it — and a default present
+only on upgraded databases would be worse than none.
+
 ### A `Call` whose result type changed is caught instead of returning zero
 
 **Before:** changing a `Call`'s NAME between runs was caught loudly as a

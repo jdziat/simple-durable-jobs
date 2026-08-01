@@ -1219,6 +1219,7 @@ var checkpointConflictColumns = []string{
 	"error_cause",
 	"error_delay_nanos",
 	"span_end",
+	"result_shape",
 }
 
 // SaveCheckpoint stores a checkpoint for a durable call.

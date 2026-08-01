@@ -104,7 +104,16 @@ func resultShape(t reflect.Type) (shape string, ok bool) {
 	// out the same here as in production.
 	b, err := json.Marshal(v.Interface())
 	if err != nil {
-		return "", false
+		// The populated probe was rejected. This is not necessarily an unshapeable
+		// type: net.IP and friends VALIDATE, and net.IP{1} is not a legal address
+		// even though the type marshals perfectly in production. Falling straight
+		// through to "no shape" silently disabled the guard for every result type
+		// containing one. Retry with the zero value, which validating types
+		// generally accept; it under-reports `omitempty` members, but a degraded
+		// shape beats no shape at all.
+		if b, err = json.Marshal(reflect.Zero(t).Interface()); err != nil {
+			return "", false
+		}
 	}
 	// These two error checks are deliberately double-guarding and only fail
 	// TOGETHER: when Marshal fails, b is nil and Unmarshal fails too. Mutating
@@ -144,7 +153,12 @@ func synthesize(t reflect.Type, depth int) (reflect.Value, bool) {
 	}
 	switch t.Kind() {
 	case reflect.Pointer:
-		elem, ok := synthesize(t.Elem(), depth+1)
+		// A pointer adds NO JSON nesting, so it must not spend depth budget.
+		// Charging for it made []*T truncate two levels sooner than []T, so the
+		// wire-identical refactor []*T -> []T (or T -> *T) moved members across the
+		// cap and CHANGED the fingerprint — a false fire on a change that cannot
+		// alter a single byte.
+		elem, ok := synthesize(t.Elem(), depth)
 		if !ok {
 			return reflect.Value{}, false
 		}
@@ -166,12 +180,12 @@ func synthesize(t reflect.Type, depth int) (reflect.Value, bool) {
 			if !f.CanSet() {
 				// Unexported. A plain unexported field is never serialized, so leave
 				// it alone. An unexported EMBEDDED field is different: encoding/json
-				// still promotes its exported members. A non-pointer embed marshals
-				// fine from its zero value, but a POINTER one must be non-nil or json
-				// has nothing to promote through and the members vanish from the
-				// shape. reflect cannot set an unexported field, so reach the
-				// already-addressable storage directly to populate just that case.
-				if !sf.Anonymous || sf.Type.Kind() != reflect.Pointer || !f.CanAddr() {
+				// promotes its exported members, so it must be populated like any
+				// other — a nil embedded pointer has nothing to promote through, and
+				// a zero embedded struct drops any promoted `omitempty` member and
+				// reports a promoted pointer/slice/map as null. reflect cannot set an
+				// unexported field, so reach its already-addressable storage.
+				if !sf.Anonymous || !f.CanAddr() {
 					continue
 				}
 				f = reflect.NewAt(sf.Type, unsafe.Pointer(f.UnsafeAddr())).Elem()
@@ -215,7 +229,11 @@ func synthesize(t reflect.Type, depth int) (reflect.Value, bool) {
 		return v, true
 
 	case reflect.Map:
-		key, ok := synthesize(t.Key(), depth+1)
+		// A fixed key literal, so the KEY TYPE does not leak into the shape: json
+		// renders every map key as a string, and map[int]V and map[string]V produce
+		// byte-identical JSON for the same entries. Synthesizing "x" for one and 1
+		// for the other made them fingerprint differently for no wire reason.
+		key, ok := synthesizeMapKey(t.Key())
 		if !ok {
 			return reflect.Value{}, false
 		}
@@ -249,6 +267,23 @@ func synthesize(t reflect.Type, depth int) (reflect.Value, bool) {
 	case reflect.Float32, reflect.Float64:
 		return reflect.ValueOf(1.5).Convert(t), true
 
+	default:
+		return reflect.Zero(t), true
+	}
+}
+
+// synthesizeMapKey builds the same key -- "1" -- whatever the key type, so two
+// map types that serialize identically fingerprint identically. A key type json
+// cannot use (a struct, say) still fails, which is caught by the marshal.
+func synthesizeMapKey(t reflect.Type) (reflect.Value, bool) {
+	switch t.Kind() {
+	case reflect.String:
+		return reflect.ValueOf("1").Convert(t), true
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return reflect.ValueOf(int64(1)).Convert(t), true
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64,
+		reflect.Uintptr:
+		return reflect.ValueOf(uint64(1)).Convert(t), true
 	default:
 		return reflect.Zero(t), true
 	}
