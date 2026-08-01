@@ -88,9 +88,15 @@ func collectShapeFields(t reflect.Type, depth, embedDepth int, out *[]shapeField
 		if tag == "-" {
 			continue // explicitly not serialized
 		}
-		tagName := ""
+		tagName, asString := "", false
 		if tag != "" {
-			tagName = strings.Split(tag, ",")[0]
+			parts := strings.Split(tag, ",")
+			tagName = parts[0]
+			for _, o := range parts[1:] {
+				if o == "string" {
+					asString = true
+				}
+			}
 		}
 
 		ft := f.Type
@@ -98,16 +104,24 @@ func collectShapeFields(t reflect.Type, depth, embedDepth int, out *[]shapeField
 			ft = ft.Elem()
 		}
 
-		// Untagged embedded struct: json promotes its fields into this object, so
-		// the shape must too. Deliberately BEFORE the unexported check — an
-		// unexported embedded type still contributes its exported fields.
-		if f.Anonymous && tagName == "" && ft.Kind() == reflect.Struct {
-			collectShapeFields(ft, depth, embedDepth+1, out)
+		// Visibility, mirroring encoding/json's typeFields. An ANONYMOUS field is
+		// skipped for being unexported only when it is not a struct: an unexported
+		// embedded STRUCT still participates, either promoted (untagged) or nested
+		// under its tag name.
+		if f.Anonymous {
+			if f.PkgPath != "" && ft.Kind() != reflect.Struct {
+				continue
+			}
+		} else if f.PkgPath != "" {
 			continue
 		}
 
-		if f.PkgPath != "" {
-			continue // unexported and not a promoting embed: never serialized
+		// Untagged embedded struct: json promotes its fields into this object, so
+		// the shape must too. A TAGGED embedded struct is not promoted — json nests
+		// it under the tag name like any ordinary field — so it falls through.
+		if f.Anonymous && tagName == "" && ft.Kind() == reflect.Struct {
+			collectShapeFields(ft, depth, embedDepth+1, out)
+			continue
 		}
 
 		name := f.Name
@@ -115,7 +129,13 @@ func collectShapeFields(t reflect.Type, depth, embedDepth int, out *[]shapeField
 			name = tagName
 		}
 		var sub strings.Builder
-		writeShape(&sub, f.Type, depth+1)
+		if asString {
+			// The ",string" option puts a number or bool on the wire as a JSON
+			// string, so that is the shape regardless of the Go kind.
+			sub.WriteString("string")
+		} else {
+			writeShape(&sub, f.Type, depth+1)
+		}
 		*out = append(*out, shapeField{name: name, shape: sub.String(), embedDepth: embedDepth})
 	}
 }
@@ -212,3 +232,12 @@ func writeShape(b *strings.Builder, t reflect.Type, depth int) {
 // ResultFingerprintForTest exposes resultFingerprint to the package's external
 // tests. It is not part of the public API surface consumers use.
 func ResultFingerprintForTest(t reflect.Type) string { return resultFingerprint(t) }
+
+// ResultShapeStringForTest exposes the pre-hash shape, so a test can check it
+// against what encoding/json ACTUALLY emits instead of against a hand-written
+// expectation. Not part of the public API surface.
+func ResultShapeStringForTest(t reflect.Type) string {
+	var b strings.Builder
+	writeShape(&b, t, 0)
+	return b.String()
+}
