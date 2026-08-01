@@ -74,7 +74,7 @@ type Job struct {
 	// three times. The Go layer already supplies the default (queue.Options starts
 	// at DefaultJobRetries), so the tag was only ever masking the explicit zero.
 	// Migration v41 keeps the DB-level default for writers that omit the column.
-	MaxRetries int           `gorm:"type:integer;not null"`
+	MaxRetries int           `gorm:"type:integer;default:3;not null"`
 	Timeout    time.Duration `gorm:"not null;default:0"`
 	// Determinism is the replay strictness mode
 	// (0=ExplicitCheckpoints,1=Strict,2=BestEffort).

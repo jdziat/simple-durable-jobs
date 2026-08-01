@@ -539,15 +539,24 @@ func (s *GormStorage) Enqueue(ctx context.Context, job *core.Job) error {
 		return err
 	}
 	db := s.db.WithContext(ctx)
+	zeroRetryIDs := explicitZeroRetryIDs(row)
 	if job.UniqueKey == "" {
 		dqReadyFalseIDs, dqReadyFalseRefs := dqReadyFalseJobs([]*core.Job{job})
 		if err := db.Create(row).Error; err != nil {
+			return err
+		}
+		if err := applyExplicitZeroRetries(db, zeroRetryIDs); err != nil {
 			return err
 		}
 		return restoreDQReadyFalse(db, dqReadyFalseIDs, dqReadyFalseRefs)
 	}
 	dqReadyFalseIDs, dqReadyFalseRefs := dqReadyFalseJobs([]*core.Job{job})
 	result := db.Clauses(clause.OnConflict{DoNothing: true}).Create(row)
+	if result.Error == nil && result.RowsAffected > 0 {
+		if err := applyExplicitZeroRetries(db, zeroRetryIDs); err != nil {
+			return err
+		}
+	}
 	if result.Error != nil {
 		return result.Error
 	}
@@ -678,7 +687,13 @@ func (s *GormStorage) EnqueueUnique(ctx context.Context, job *core.Job, uniqueKe
 				return err
 			}
 			dqReadyFalseIDs, dqReadyFalseRefs := dqReadyFalseJobs([]*core.Job{job})
+			zeroRetryIDs := explicitZeroRetryIDs(row)
 			result := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(row)
+			if result.Error == nil && result.RowsAffected > 0 {
+				if err := applyExplicitZeroRetries(tx, zeroRetryIDs); err != nil {
+					return err
+				}
+			}
 			if result.Error != nil {
 				return result.Error
 			}

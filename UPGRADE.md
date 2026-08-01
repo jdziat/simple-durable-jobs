@@ -385,14 +385,12 @@ inert one layer below.
 **After:** the tag is gone, so an explicit 0 is written through. If you enqueued
 non-idempotent work with `Retries(0)` and saw it run more than once, that is why.
 
-**What changes for hand-written SQL.** Because AutoMigrate derives the DDL from the
-struct tag, `jobs.max_retries` no longer carries a column default on any dialect.
-It is still `NOT NULL`, so **a raw `INSERT INTO jobs` must list `max_retries`
-explicitly**. Both examples in the SQL-interop guide already do, and Go clients of
-every version write the column, so this affects only hand-written inserts that
-relied on the default. A versioned migration cannot restore it reliably — a fresh
-database records the ledger as applied without executing it — and a default present
-only on upgraded databases would be worse than none.
+**Nothing changes for hand-written SQL.** An earlier attempt at this fix removed
+the column's `DEFAULT 3`, which turned out to be far worse than the bug: AutoMigrate
+then sees a changed column definition and REBUILDS the SQLite `jobs` table, taking
+the indexes created by versioned migrations with it — measured at 14 indexes before
+the upgrade and 4 after. The column keeps its default, and storage writes the
+intended 0 back inside the same transaction instead.
 
 ### A `Call` whose result type changed is caught instead of returning zero
 

@@ -87,7 +87,13 @@ func (s *GormStorage) createUniqueLockedJob(ctx context.Context, db *gorm.DB, jo
 	// The lock we hold then references a job that was not inserted. That is
 	// self-healing rather than a leak: the lock carries a TTL, and
 	// stealTerminalUniqueLock already treats a missing referenced job as stealable.
+	zeroRetryIDs := explicitZeroRetryIDs(row)
 	result := db.WithContext(ctx).Clauses(clause.OnConflict{DoNothing: true}).Create(row)
+	if result.Error == nil && result.RowsAffected > 0 {
+		if err := applyExplicitZeroRetries(db.WithContext(ctx), zeroRetryIDs); err != nil {
+			return core.UUID(""), err
+		}
+	}
 	if result.Error != nil {
 		return core.NilUUID, result.Error
 	}
