@@ -2,13 +2,13 @@ package call
 
 import (
 	"crypto/sha256"
-	"encoding"
 	"encoding/hex"
 	"encoding/json"
 	"reflect"
 	"sort"
 	"strings"
-	"unicode"
+	"sync"
+	"unsafe"
 )
 
 // resultFingerprint describes the JSON SHAPE of a Call's result type, so replay
@@ -16,7 +16,7 @@ import (
 // happens to look different".
 //
 // WHY A WRITE-TIME FINGERPRINT AND NOT AN INSPECTION OF THE STORED BYTES. Three
-// earlier attempts tried to infer a type change from checkpoint.Result — strict
+// early attempts tried to infer a type change from checkpoint.Result — strict
 // whole-payload decode, then a per-key probe, then a null probe — and each one
 // hard-failed replays whose type had NOT changed (a dropped field, a nested field
 // under an all-zero value, a required-fields UnmarshalJSON). That is not three
@@ -24,279 +24,266 @@ import (
 // indistinguishable in the bytes. The information exists only where the checkpoint
 // is WRITTEN, so that is where it is recorded.
 //
-// Because both sides compute this from the TYPE, an unchanged type always produces
-// an identical fingerprint. There is no payload involved and therefore no false
-// fire — including for types with a custom UnmarshalJSON, whose accepted shape need
-// not resemble their struct at all.
+// WHY IT MARSHALS INSTEAD OF WALKING reflect. This function used to mirror
+// encoding/json's field-resolution rules by hand: promotion of embedded structs,
+// tagged embeds nesting rather than promoting, dominantField's tie rule, the
+// ",string" option, json.Number, json.Marshaler, encoding.TextMarshaler. Four
+// consecutive review rounds each found a divergence in that mirror, and each fix
+// introduced the next one — because the rules are numerous, interacting, and not
+// where you would guess. ",string" is INERT on a struct field. A pointer-receiver
+// MarshalJSON is never used on the interface-boxed value Call actually marshals.
 //
-// STRUCTURAL, not nominal. The fingerprint is the set of JSON field names and
-// kinds, NOT the type's name or package path. Moving a type between packages or
-// renaming it is not a semantic change and must not trip replay; changing its
-// FIELDS is, and does. Two distinct types with identical shape are deliberately
-// interchangeable — if the shape matches, the stored result reconstructs
-// faithfully, which is the only property replay needs.
+// A divergence is not cosmetic here. It makes a byte-identical refactor FALSE
+// FIRE: replay refuses a checkpoint that would have decoded perfectly, and a live
+// workflow wedges with an error message that is provably untrue.
 //
-// The rule this file must obey, and got wrong once: the shape has to be what
-// encoding/json ACTUALLY SERIALIZES, not what the Go struct literally declares.
-// Where those differ — embedded fields, which json promotes into the parent — a
-// literal reading makes the fingerprint nominal in disguise (renaming an embedded
-// type changed the shape while the bytes stayed identical) AND blind (an unexported
-// embedded type's promoted fields vanished from the shape entirely, so swapping the
-// whole field set went undetected). See collectShapeFields.
+// So the shape is no longer derived from the type by hand. A representative value
+// of the type is marshalled with the REAL encoder, exactly the way Call marshals a
+// result, and the shape is read off the JSON that comes back. The mirror is gone
+// and with it the entire class of divergence: this cannot disagree with
+// encoding/json, because it IS encoding/json.
+//
+// STRUCTURAL, not nominal. The shape is JSON member names and kinds, never a Go
+// type name or package path. Moving a type between packages or renaming it is not
+// a semantic change and must not trip replay; changing what it SERIALIZES is, and
+// does. Two distinct types with identical shape are deliberately interchangeable —
+// if the shape matches, the stored result reconstructs faithfully, which is the
+// only property replay needs.
 func resultFingerprint(t reflect.Type) string {
 	if t == nil {
 		return ""
 	}
-	var b strings.Builder
-	writeShape(&b, t, 0)
-	sum := sha256.Sum256([]byte(b.String()))
-	return hex.EncodeToString(sum[:8])
+	if cached, ok := fingerprintCache.Load(t); ok {
+		return cached.(string)
+	}
+	fp := ""
+	if shape, ok := resultShape(t); ok {
+		sum := sha256.Sum256([]byte(shape))
+		fp = hex.EncodeToString(sum[:8])
+	}
+	fingerprintCache.Store(t, fp)
+	return fp
 }
 
-// maxShapeDepth bounds recursion so a self-referential type (a tree node, a linked
-// list) cannot spin. Beyond it the shape is truncated, which is safe: truncation is
-// applied identically on both sides, so it can only make two types look the same,
-// never make one type look like it changed.
+// fingerprintCache memoizes the shape per result type, the way encoding/json
+// caches its own field resolution. A type's shape cannot change while the process
+// runs, and without this the marshal round-trip would run on both the write and
+// the replay path of EVERY nested Call — measured at 4.5us and 43 allocations,
+// versus 26ns and none once cached. Growth is bounded by the number of distinct
+// result types in the binary. The empty shape is cached too, so a type json
+// cannot marshal is not retried on every call.
+var fingerprintCache sync.Map
+
+// resultShape returns the pre-hash shape string. ok is false when no shape can be
+// determined — a nil type, or one encoding/json refuses (a channel or func field).
+// Both mean "record no shape", which makes replay skip the check: a type whose
+// shape cannot be computed must never be able to wedge a replay.
+func resultShape(t reflect.Type) (string, bool) {
+	if t == nil {
+		return "", false
+	}
+	v, ok := synthesize(t, 0)
+	if !ok {
+		return "", false
+	}
+	// Marshalling the INTERFACE-BOXED value is what makes this faithful: it is
+	// precisely what Call does with a handler's result, so addressability — which
+	// decides whether encoding/json may use a pointer-receiver MarshalJSON — comes
+	// out the same here as in production.
+	b, err := json.Marshal(v.Interface())
+	if err != nil {
+		return "", false
+	}
+	// These two error checks are deliberately double-guarding and only fail
+	// TOGETHER: when Marshal fails, b is nil and Unmarshal fails too. Mutating
+	// either one alone leaves the suite green, which reads like dead code but is
+	// not — removing BOTH makes an unmarshalable type produce a shape, and
+	// TestResultShape_UnmarshalableTypeYieldsNoShape reds. Probe them as a pair.
+	var decoded any
+	if err := json.Unmarshal(b, &decoded); err != nil {
+		return "", false
+	}
+	var sb strings.Builder
+	describe(&sb, decoded)
+	return sb.String(), true
+}
+
+// maxShapeDepth bounds synthesis so a self-referential type (a tree node, a linked
+// list) cannot spin. Beyond it a value is left zero, so a pointer serializes as
+// null. The bound applies identically on both sides, so it can only make two types
+// look the same, never make one type look like it changed.
 const maxShapeDepth = 6
 
-// shapeField is one field as encoding/json would emit it. embedDepth is how many
-// embedded structs were traversed to reach it, which is what Go's promotion
-// conflict rule is decided on.
-type shapeField struct {
-	name       string
-	shape      string
-	embedDepth int
-	tagged     bool
-}
-
-// collectShapeFields walks a struct the way encoding/json does, promoting embedded
-// struct fields into the parent instead of treating them as a field named after
-// their type.
+// synthesize builds a representative value of t with its fields populated, so the
+// marshalled JSON exposes every member the type can emit.
 //
-// Two subtleties, both of which were live defects here:
+// It does NOT pre-screen types encoding/json cannot marshal (a channel or func
+// field). An earlier version did, and a mutation control showed the branch was
+// unreachable in effect: json.Marshal rejects those types anyway, so resultShape's
+// error path already produces "no shape". One tested mechanism beats two where
+// only one can ever fire.
 //
-//   - An embedded struct whose TYPE is unexported still has its exported fields
-//     promoted and serialized by encoding/json. So the usual "skip PkgPath != in"
-//     test must NOT be applied to it, or the promoted fields disappear from the
-//     shape and a completely different field set fingerprints identically.
-//   - An embedded field WITH a json tag is not promoted; json treats it as an
-//     ordinary field under the tag name.
-func collectShapeFields(t reflect.Type, depth, embedDepth int, out *[]shapeField) {
-	if embedDepth > maxShapeDepth {
-		return // pathological embed chain (or an embedded *T cycle): stop.
+// Population matters for two reasons: `omitempty` drops an empty value, and an
+// embedded POINTER must be non-nil for encoding/json to promote through it. A
+// zero-valued probe would silently under-report both.
+func synthesize(t reflect.Type, depth int) (reflect.Value, bool) {
+	if depth > maxShapeDepth {
+		return reflect.Zero(t), true
 	}
-	for i := 0; i < t.NumField(); i++ {
-		f := t.Field(i)
-
-		tag := f.Tag.Get("json")
-		if tag == "-" {
-			continue // explicitly not serialized
+	switch t.Kind() {
+	case reflect.Pointer:
+		elem, ok := synthesize(t.Elem(), depth+1)
+		if !ok {
+			return reflect.Value{}, false
 		}
-		tagName, asString := "", false
-		if tag != "" {
-			parts := strings.Split(tag, ",")
-			tagName = parts[0]
-			for _, o := range parts[1:] {
-				if o == "string" {
-					asString = true
+		p := reflect.New(t.Elem())
+		p.Elem().Set(elem)
+		return p, true
+
+	case reflect.Interface:
+		// Nothing concrete to put here, so it stays nil and serializes as null.
+		// That is a real, stable shape — and crucially NOT the empty sentinel, so
+		// tightening Call[any] to a concrete type is still caught.
+		return reflect.Zero(t), true
+
+	case reflect.Struct:
+		v := reflect.New(t).Elem()
+		for i := 0; i < t.NumField(); i++ {
+			sf := t.Field(i)
+			f := v.Field(i)
+			if !f.CanSet() {
+				// Unexported. A plain unexported field is never serialized, so leave
+				// it alone. An unexported EMBEDDED field is different: encoding/json
+				// still promotes its exported members. A non-pointer embed marshals
+				// fine from its zero value, but a POINTER one must be non-nil or json
+				// has nothing to promote through and the members vanish from the
+				// shape. reflect cannot set an unexported field, so reach the
+				// already-addressable storage directly to populate just that case.
+				if !sf.Anonymous || sf.Type.Kind() != reflect.Pointer || !f.CanAddr() {
+					continue
 				}
+				f = reflect.NewAt(sf.Type, unsafe.Pointer(f.UnsafeAddr())).Elem()
 			}
-			// json ignores a tag name that is not a legal tag and falls back to the
-			// Go field name, so the shape has to fall back too.
-			if !isValidJSONTag(tagName) {
-				tagName = ""
+			sub, ok := synthesize(sf.Type, depth+1)
+			if !ok {
+				return reflect.Value{}, false
+			}
+			f.Set(sub)
+		}
+		return v, true
+
+	case reflect.Slice:
+		// json.RawMessage is a []byte holding arbitrary JSON. Filling it with
+		// arbitrary BYTES produces invalid JSON and the marshal fails, which would
+		// silently disable the guard for any result type containing one. It
+		// constrains nothing, so give it a valid, stable stand-in.
+		if t == jsonRawMessageType {
+			return reflect.ValueOf(json.RawMessage("null")).Convert(t), true
+		}
+		elem, ok := synthesize(t.Elem(), depth+1)
+		if !ok {
+			return reflect.Value{}, false
+		}
+		s := reflect.MakeSlice(t, 1, 1)
+		s.Index(0).Set(elem)
+		return s, true
+
+	case reflect.Array:
+		v := reflect.New(t).Elem()
+		if t.Len() > 0 {
+			elem, ok := synthesize(t.Elem(), depth+1)
+			if !ok {
+				return reflect.Value{}, false
+			}
+			for i := 0; i < t.Len(); i++ {
+				v.Index(i).Set(elem)
 			}
 		}
+		return v, true
 
-		ft := f.Type
-		for ft.Kind() == reflect.Pointer {
-			ft = ft.Elem()
+	case reflect.Map:
+		key, ok := synthesize(t.Key(), depth+1)
+		if !ok {
+			return reflect.Value{}, false
 		}
+		val, ok := synthesize(t.Elem(), depth+1)
+		if !ok {
+			return reflect.Value{}, false
+		}
+		m := reflect.MakeMap(t)
+		m.SetMapIndex(key, val)
+		return m, true
 
-		// Visibility, mirroring encoding/json's typeFields. An ANONYMOUS field is
-		// skipped for being unexported only when it is not a struct: an unexported
-		// embedded STRUCT still participates, either promoted (untagged) or nested
-		// under its tag name.
-		if f.Anonymous {
-			if f.PkgPath != "" && ft.Kind() != reflect.Struct {
-				continue
-			}
-		} else if f.PkgPath != "" {
-			continue
+	case reflect.String:
+		// json.Number is a string whose contents must parse as a number or
+		// encoding/json rejects it. Any other string only needs to be non-empty so
+		// `omitempty` keeps it.
+		if t == jsonNumberType {
+			return reflect.ValueOf(json.Number("1")).Convert(t), true
 		}
+		return reflect.ValueOf("x").Convert(t), true
 
-		// Untagged embedded struct: json promotes its fields into this object, so
-		// the shape must too. A TAGGED embedded struct is not promoted — json nests
-		// it under the tag name like any ordinary field — so it falls through.
-		if f.Anonymous && tagName == "" && ft.Kind() == reflect.Struct {
-			collectShapeFields(ft, depth, embedDepth+1, out)
-			continue
-		}
+	case reflect.Bool:
+		return reflect.ValueOf(true).Convert(t), true
 
-		name := f.Name
-		if tagName != "" {
-			name = tagName
-		}
-		var sub strings.Builder
-		if asString {
-			// The ",string" option puts a number or bool on the wire as a JSON
-			// string, so that is the shape regardless of the Go kind.
-			sub.WriteString("string")
-		} else {
-			writeShape(&sub, f.Type, depth+1)
-		}
-		*out = append(*out, shapeField{
-			name: name, shape: sub.String(), embedDepth: embedDepth, tagged: tagName != "",
-		})
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return reflect.ValueOf(int64(1)).Convert(t), true
+
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64,
+		reflect.Uintptr:
+		return reflect.ValueOf(uint64(1)).Convert(t), true
+
+	case reflect.Float32, reflect.Float64:
+		return reflect.ValueOf(1.5).Convert(t), true
+
+	default:
+		return reflect.Zero(t), true
 	}
-}
-
-// resolveShapeFields applies encoding/json's dominantField rule, which is subtler
-// than "shallowest wins, ties annihilate": among the candidates for one JSON name,
-// json sorts by depth and then by TAGGEDNESS, and drops the name only when the top
-// two are at the same depth AND have the same taggedness. A tagged field therefore
-// BEATS an untagged one at equal depth and is emitted.
-//
-// Getting this wrong is both a false fire and a miss. Deleting a dead, never-
-// serialized field that lost such a tie is byte-identical on the wire but changed
-// the fingerprint; and a type that GAINED a really-serialized tagged field kept the
-// same fingerprint, so replay returned it silently zero.
-func resolveShapeFields(in []shapeField) []shapeField {
-	byName := make(map[string][]shapeField, len(in))
-	order := make([]string, 0, len(in))
-	for _, f := range in {
-		if _, seen := byName[f.name]; !seen {
-			order = append(order, f.name)
-		}
-		byName[f.name] = append(byName[f.name], f)
-	}
-	out := make([]shapeField, 0, len(order))
-	for _, name := range order {
-		group := byName[name]
-		// Shallowest first, then tagged before untagged — json's own ordering.
-		sort.SliceStable(group, func(i, j int) bool {
-			if group[i].embedDepth != group[j].embedDepth {
-				return group[i].embedDepth < group[j].embedDepth
-			}
-			return group[i].tagged && !group[j].tagged
-		})
-		if len(group) > 1 &&
-			group[0].embedDepth == group[1].embedDepth &&
-			group[0].tagged == group[1].tagged {
-			continue // genuinely ambiguous: json emits nothing for this name
-		}
-		out = append(out, group[0])
-	}
-	return out
 }
 
 var (
-	jsonNumberType   = reflect.TypeOf(json.Number(""))
-	jsonMarshalerTyp = reflect.TypeOf((*json.Marshaler)(nil)).Elem()
-	textMarshalerTyp = reflect.TypeOf((*encoding.TextMarshaler)(nil)).Elem()
+	jsonNumberType     = reflect.TypeOf(json.Number(""))
+	jsonRawMessageType = reflect.TypeOf(json.RawMessage(nil))
 )
 
-func implementsEither(t reflect.Type, iface reflect.Type) bool {
-	// encoding/json will use a pointer method when the value is addressable, so
-	// both T and *T count.
-	return t.Implements(iface) || reflect.PointerTo(t).Implements(iface)
-}
-
-// isValidJSONTag mirrors encoding/json's isValidTag.
-func isValidJSONTag(s string) bool {
-	if s == "" {
-		return false
-	}
-	for _, c := range s {
-		switch {
-		case strings.ContainsRune("!#$%&()*+-./:;<=>?@[]^_{|}~ ", c):
-			// Punctuation json explicitly allows in a tag name.
-		case !unicode.IsLetter(c) && !unicode.IsDigit(c):
-			return false
+// describe renders decoded JSON as a canonical shape: object members sorted by
+// name, array element shape taken from the first element, scalars as their JSON
+// kind. Values never appear — only structure — so two runs of the same type always
+// agree, while a changed member set does not.
+func describe(b *strings.Builder, v any) {
+	switch x := v.(type) {
+	case map[string]any:
+		keys := make([]string, 0, len(x))
+		for k := range x {
+			keys = append(keys, k)
 		}
-	}
-	return true
-}
-
-func writeShape(b *strings.Builder, t reflect.Type, depth int) {
-	if depth > maxShapeDepth {
-		b.WriteString("...")
-		return
-	}
-	for t.Kind() == reflect.Pointer {
-		t = t.Elem()
-	}
-
-	// json.Number is declared as a string but encoding/json writes its raw digits,
-	// so on the wire it is a number and must fingerprint as one — otherwise
-	// swapping float64 for json.Number to stop losing precision, which is
-	// byte-identical, would wedge in-flight replays.
-	if t == jsonNumberType {
-		b.WriteString("number")
-		return
-	}
-
-	// A type with its own MarshalJSON serializes something unrelated to its
-	// declared fields, so the fields cannot describe its wire form. Reading them
-	// anyway made a byte-identical refactor of such a type change the fingerprint —
-	// a FALSE FIRE, the one outcome this check must never produce. Every
-	// json.Marshaler therefore shares one opaque shape: changes among them go
-	// undetected, which is the documented and much cheaper failure direction.
-	if implementsEither(t, jsonMarshalerTyp) {
-		b.WriteString("marshaler")
-		return
-	}
-
-	// encoding.TextMarshaler is json's second fallback and always produces a JSON
-	// STRING, whatever the type's fields are. Two TextMarshalers with completely
-	// different fields serialize identically, so reading their fields would false
-	// fire on a refactor that changes nothing on the wire.
-	if implementsEither(t, textMarshalerTyp) {
-		b.WriteString("string")
-		return
-	}
-
-	switch t.Kind() {
-	case reflect.Struct:
-		var fields []shapeField
-		collectShapeFields(t, depth, 0, &fields)
-		fields = resolveShapeFields(fields)
-		// Sorted so field ORDER is not part of the identity: reordering a struct's
-		// fields does not change what JSON it accepts.
-		sort.Slice(fields, func(i, j int) bool { return fields[i].name < fields[j].name })
+		sort.Strings(keys)
 		b.WriteString("{")
-		for i, f := range fields {
+		for i, k := range keys {
 			if i > 0 {
 				b.WriteString(",")
 			}
-			b.WriteString(f.name)
+			b.WriteString(k)
 			b.WriteString(":")
-			b.WriteString(f.shape)
+			describe(b, x[k])
 		}
 		b.WriteString("}")
-	case reflect.Slice, reflect.Array:
+	case []any:
 		b.WriteString("[")
-		writeShape(b, t.Elem(), depth+1)
+		if len(x) > 0 {
+			describe(b, x[0])
+		}
 		b.WriteString("]")
-	case reflect.Map:
-		b.WriteString("map[")
-		writeShape(b, t.Key(), depth+1)
-		b.WriteString("]")
-		writeShape(b, t.Elem(), depth+1)
-	case reflect.Interface:
-		// An interface accepts anything, so it constrains nothing. Note this is a
-		// real, non-empty shape: an interface result must be distinguishable from
-		// "no shape recorded", or tightening Call[any] to a concrete type would be
-		// mistaken for a pre-upgrade checkpoint and skipped.
-		b.WriteString("any")
-	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
-		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64,
-		reflect.Float32, reflect.Float64:
-		// JSON has ONE number type. Widening int to int64 leaves the wire format and
-		// the decode identical, so it must not read as a type change.
+	case string:
+		b.WriteString("string")
+	case float64:
 		b.WriteString("number")
+	case bool:
+		b.WriteString("bool")
+	case nil:
+		b.WriteString("null")
 	default:
-		b.WriteString(t.Kind().String())
+		b.WriteString("unknown")
 	}
 }
 
@@ -305,10 +292,8 @@ func writeShape(b *strings.Builder, t reflect.Type, depth int) {
 func ResultFingerprintForTest(t reflect.Type) string { return resultFingerprint(t) }
 
 // ResultShapeStringForTest exposes the pre-hash shape, so a test can check it
-// against what encoding/json ACTUALLY emits instead of against a hand-written
-// expectation. Not part of the public API surface.
+// against what encoding/json actually emits. Not part of the public API surface.
 func ResultShapeStringForTest(t reflect.Type) string {
-	var b strings.Builder
-	writeShape(&b, t, 0)
-	return b.String()
+	s, _ := resultShape(t)
+	return s
 }

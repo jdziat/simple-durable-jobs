@@ -396,23 +396,34 @@ the field set does.
 replay with a clear message instead of silently completing with an empty result. If
 you see it, that workflow was already producing wrong data.
 
-**The limit of this check, stated plainly.** Some changes keep the fingerprint and
-so are NOT caught:
+**How the shape is computed, and what that means.** The fingerprint is not derived
+from the Go type by hand. A representative value of the result type is marshalled
+with `encoding/json` itself and the shape is read off the JSON that comes back —
+member names, nesting, and scalar kinds. It therefore cannot disagree with the
+encoder about promotion, embedded structs, tags, `,string`, `json.Number`, or a
+custom `MarshalJSON`: whatever the encoder emits is what gets fingerprinted.
 
-- `[]byte` to `json.RawMessage` (identical shape, different wire form);
-- swapping one struct whose fields are *all* unexported for another;
-- **any** change to a type that implements `json.MarshalJSON`. Such a type
-  serializes something unrelated to its declared fields, so its fields cannot
-  describe its wire form. Every `json.Marshaler` therefore shares one opaque
-  shape — `time.Time` included — and changes among them go undetected.
+**The limit, stated plainly.** The shape captures STRUCTURE, not values. Two types
+that serialize to the same structure fingerprint the same, so these changes are
+NOT caught:
+
+- one string-valued form swapped for another — `time.Time` for a `string`, one
+  `MarshalJSON` that emits `"USD:500"` for one that emits `"hello"`, or a
+  `,string` option added to a **string** field (which double-quotes on the wire,
+  but is still a JSON string);
+- swapping one struct whose fields are *all* unexported for another, since both
+  serialize as `{}`;
+- a change nested deeper than six levels, where synthesis stops;
+- a change behind an `interface` member, which has no concrete value to inspect
+  and is recorded as `null`.
 
 Those replay exactly as they did before this change: no worse, no better. The
-last one is a deliberate trade made in the direction the check is biased: reading
-a Marshaler's fields anyway would make a byte-identical refactor of it *false
-fire*, and a false rejection wedges a healthy workflow while a miss only leaves
-the old behaviour in place. The check is deliberately biased to never reject a
-replay it should have accepted, because a false rejection wedges a healthy workflow
-whereas a miss only leaves the old behaviour in place.
+check is deliberately biased this way — a false rejection wedges a healthy
+workflow, whereas a miss only leaves the old behaviour in place.
+
+A result type that `encoding/json` cannot marshal at all (a channel or func
+member) records **no** shape and is skipped entirely, for the same reason: a type
+whose shape cannot be computed must never be able to fail a replay.
 
 Checkpoints written before v40 carry an empty shape and are **not** checked, so work
 already in flight replays exactly as before — the same degradation `span_end = 0`
@@ -950,16 +961,32 @@ All five are additive — three columns, each `NOT NULL` with a default, and two
 indexes — so an older binary runs correctly against the newer schema. No migration
 in this line rewrites data.
 
-**How that is verified.** Two different checks, because they cover different
-things. The v4.7.0 binary was run against a **v38** ledger on SQLite, live
-Postgres and live MySQL, migrating in both directions and completing a full job
-lifecycle. For the two columns added after that (v39, v40) the property an older
-binary depends on is narrower and is pinned by a test rather than a manual run:
-`TestOlderBinaryInsertsWithoutTheNewColumns` issues an `INSERT` that does not
-mention the new column — exactly what a binary compiled before it existed emits —
-and requires it to succeed and read back, on all three dialects. That is what
-"additive" has to mean at write time; a `NOT NULL` column without a usable default
-would break it in production rather than at migration time.
+**How that is verified, and one thing it does NOT cover.** The v4.7.0 binary was
+run against a **v38** ledger on SQLite, live Postgres and live MySQL, migrating in
+both directions and completing a full job lifecycle. For the two columns added
+after that (v39, v40) the schema-level property is pinned by a test rather than a
+manual run: `TestOlderBinaryInsertsWithoutTheNewColumns` issues an `INSERT` that
+does not mention the new column — exactly what a binary compiled before it existed
+emits — and requires it to succeed and read back, on all three dialects. That is
+what "additive" has to mean at write time; a `NOT NULL` column without a usable
+default would break it in production rather than at migration time.
+
+That covers `INSERT`. It does **not** make a pre-v39 binary behave correctly on
+`UPDATE`, and for `jobs.waiting_signal_name` there is a real gap worth planning
+around:
+
+> A v4.8 worker CLEARS `waiting_signal_name` every time it parks a job, precisely
+> so a stale name from an earlier named wait cannot narrow a later one. A pre-v39
+> worker has no such column in its update set, so it physically cannot clear it.
+> In a MIXED fleet the sequence is: a new worker parks a job on
+> `WaitForSignal("approval")`; the signal arrives and the job resumes; an old
+> worker later parks the same job on an UNNAMED wait, leaving `'approval'` in
+> place; a subsequent signal is then matched against the stale name.
+>
+> This needs no rollback — an ordinary rolling upgrade is enough. **Finish
+> upgrading every worker before relying on named signals**, or drain named waits
+> across the upgrade window. Once all workers are v4.8 the column is cleared on
+> every park and the hazard is gone.
 
 **v39 has one dialect caveat**, covered in its own section above: on MySQL the
 column needs an `as_cs` collation to match `signals.name`, and the repair path
