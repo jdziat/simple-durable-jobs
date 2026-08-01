@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"reflect"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 // These pin the cases that a HAND-WRITTEN mirror of encoding/json's rules got
@@ -148,9 +150,8 @@ func TestResultShape_EncoderDerivedInvariants(t *testing.T) {
 		esTieDifferentKinds{}, esTieLoserKind{}, false)
 }
 
-// json.RawMessage holds arbitrary JSON. Synthesizing it from arbitrary bytes makes
-// invalid JSON, the marshal fails, and the guard silently switches itself off for
-// every result type containing one — a fail-open that no other test would notice.
+// json.RawMessage holds ARBITRARY JSON, so its wire form is a property of the
+// VALUE and not of the type — the same situation as an interface member.
 type esRaw struct {
 	B json.RawMessage `json:"b"`
 }
@@ -158,16 +159,53 @@ type esBytes struct {
 	B []byte `json:"b"`
 }
 
-func TestResultShape_RawMessageStillProducesAShape(t *testing.T) {
-	if fp := fingerprintOf(esRaw{}); fp == "" {
-		t.Fatal("a result type containing json.RawMessage produced NO shape, " +
-			"so replay skips the check entirely for it")
-	}
-	// []byte is base64'd into a JSON string; RawMessage is spliced in as raw JSON.
-	// Different wire forms, so they must not be interchangeable.
-	if fingerprintOf(esRaw{}) == fingerprintOf(esBytes{}) {
-		t.Error("[]byte and json.RawMessage have different wire forms and must differ")
-	}
+// esRawTyped is the tightening a RawMessage member invites: "we carried this as
+// raw JSON while the schema settled, now it is typed." It is wire-identical.
+type esRawInner struct {
+	N int `json:"n"`
+}
+type esRawTyped struct {
+	B esRawInner `json:"b"`
+}
+
+// TestResultShape_RawMessageRecordsNoShape pins a DELIBERATE, ACCEPTED MISS, and
+// it replaces an earlier test that asserted the exact opposite.
+//
+// That earlier test required a RawMessage member to still produce a shape, on the
+// reasoning that yielding none would silently switch the guard off. The reasoning
+// was right about the cost and wrong about the alternative: the only way to
+// produce a shape was to substitute the stand-in json.RawMessage("null"), which
+// PINNED the member as `null`. So RawMessage -> a struct, a string or a map — all
+// byte-identical on the wire — were REFUSED on replay. Measured before changing
+// it: both sides emit {"r":{"n":1}}, shapes were {r:null} vs {r:{n:number}}.
+//
+// That is the false-fire direction, and this file's whole bias is that a miss
+// leaves prior behaviour in place while a false fire wedges a live workflow. It
+// is also the same root cause as every other false fire shipped here: a value
+// substituted at a boundary, whose fate encoding/json then decides.
+//
+// So a result type containing a RawMessage now records NO shape and is skipped,
+// exactly as one containing an interface member is. DO NOT "fix" this by
+// substituting a stand-in again.
+func TestResultShape_RawMessageRecordsNoShape(t *testing.T) {
+	a := esRaw{B: json.RawMessage(`{"n":1}`)}
+	b := esRawTyped{B: esRawInner{N: 1}}
+	wa, err := json.Marshal(a)
+	require.NoError(t, err)
+	wb, err := json.Marshal(b)
+	require.NoError(t, err)
+	require.Equal(t, string(wa), string(wb),
+		"FIXTURE BROKEN: the pair must be byte-identical for this to say anything")
+
+	require.Empty(t, fingerprintOf(esRaw{}),
+		"a RawMessage member cannot be described from its type, so the type must fail OPEN "+
+			"— any recorded shape pins it and refuses a wire-identical tightening")
+
+	// []byte is NOT RawMessage: it base64s into a JSON string, which IS knowable
+	// from the type. It must keep its shape — the fail-open is scoped to
+	// RawMessage alone and must not leak to every []byte result.
+	require.NotEmpty(t, fingerprintOf(esBytes{}),
+		"[]byte has a knowable wire form (a base64 string) and must still be guarded")
 }
 
 // A type encoding/json cannot marshal at all must yield NO shape rather than a

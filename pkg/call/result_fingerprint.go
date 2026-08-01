@@ -94,32 +94,63 @@ func resultShape(t reflect.Type) (shape string, ok bool) {
 			shape, ok = "", false
 		}
 	}()
-	v, ok := synthesize(t, 0)
+	v, ok := synthesize(t, 0, nil)
 	if !ok {
 		return "", false
 	}
 	// Marshalling the INTERFACE-BOXED value is what makes this faithful: it is
 	// precisely what Call does with a handler's result, so addressability — which
 	// decides whether encoding/json may use a pointer-receiver MarshalJSON — comes
-	// out the same here as in production.
+	// out the same here as in production, without this file having to model it.
 	b, err := json.Marshal(v.Interface())
 	if err != nil {
-		// The populated probe was rejected. This is not necessarily an unshapeable
-		// type: net.IP and friends VALIDATE, and net.IP{1} is not a legal address
-		// even though the type marshals perfectly in production. Falling straight
-		// through to "no shape" silently disabled the guard for every result type
-		// containing one. Retry with the zero value, which validating types
-		// generally accept; it under-reports `omitempty` members, but a degraded
-		// shape beats no shape at all.
-		if b, err = json.Marshal(reflect.Zero(t).Interface()); err != nil {
-			return "", false
-		}
+		// A REJECTED PROBE RECORDS NO SHAPE. THIS IS THE POLICY, NOT A BACKSTOP.
+		//
+		// A marshaler may VALIDATE: net.IP{1} is not a legal address, and an
+		// ordinary enum's MarshalJSON rejects a value that is not one of its
+		// cases. Both marshal perfectly in production; only the FABRICATED probe
+		// offends them. Two revisions tried to keep a shape anyway by substituting
+		// a value the marshaler would accept — first zeroing the whole type, then
+		// zeroing just the offending member — and BOTH produced a false fire,
+		// because a substituted Go value is then reinterpreted by the encoder and
+		// what it emits depends on the member's REPRESENTATION:
+		//
+		//   - `omitempty` on a slice-backed member (net.IP) makes the zero EMPTY,
+		//     so encoding/json DROPS it and the member vanishes from the shape;
+		//     the same member as a struct (netip.Addr) is never dropped and keeps
+		//     its entry. The net.IP -> netip.Addr modernization, which cannot move
+		//     a byte, therefore moved the fingerprint.
+		//   - a member vanishing is indistinguishable from that member having been
+		//     REMOVED from the type, which is precisely the change this guard
+		//     exists to catch, so the substitution also silently half-disabled it.
+		//   - zeroing reaches through the type: `Sub pDegradeSub` stayed an object
+		//     while `Sub *pDegradeSub` became null, splitting the byte-identical
+		//     refactor `T -> *T` apart the moment a validating marshaler appeared
+		//     anywhere else in the same type.
+		//
+		// There is no third substitution to try. Opacity is not expressible as a
+		// Go value, because the encoder gets to reinterpret any value handed to
+		// it. So the type records NO SHAPE and replay skips the check for it —
+		// which is ALREADY the documented rule for a type encoding/json cannot
+		// marshal at all (UPGRADE.md: "a type whose shape cannot be computed must
+		// never be able to fail a replay"), extended to cover "the probe was
+		// rejected".
+		//
+		// THE COST IS AN ACCEPTED MISS, pinned by
+		// TestResultShape_ValidatingMarshalerIsADeliberateAcceptedMiss: a result
+		// type containing a validating marshaler is not guarded at all, so a real
+		// change to it replays as before this feature existed. That is the cheap
+		// direction. A miss leaves prior behaviour in place; a false fire rejects
+		// a replay that would have succeeded and wedges a live workflow.
+		return "", false
 	}
-	// These two error checks are deliberately double-guarding and only fail
-	// TOGETHER: when Marshal fails, b is nil and Unmarshal fails too. Mutating
-	// either one alone leaves the suite green, which reads like dead code but is
-	// not — removing BOTH makes an unmarshalable type produce a shape, and
-	// TestResultShape_UnmarshalableTypeYieldsNoShape reds. Probe them as a pair.
+	// UNREACHABLE BY CONSTRUCTION, kept rather than discarded with `_`. Every
+	// error path above returns, so b here is always output json.Marshal produced
+	// and therefore always valid JSON. It used to be half of a double-guard with
+	// the Marshal check; now that a Marshal failure returns immediately, no test
+	// can red this branch and none should be written to pretend otherwise. It
+	// stays because silently dropping a returned error is worse than an
+	// unreachable check that fails open the same way everything else here does.
 	var decoded any
 	if err := json.Unmarshal(b, &decoded); err != nil {
 		return "", false
@@ -129,11 +160,102 @@ func resultShape(t reflect.Type) (shape string, ok bool) {
 	return sb.String(), true
 }
 
-// maxShapeDepth bounds synthesis so a self-referential type (a tree node, a linked
-// list) cannot spin. Beyond it a value is left zero, so a pointer serializes as
-// null. The bound applies identically on both sides, so it can only make two types
-// look the same, never make one type look like it changed.
-const maxShapeDepth = 6
+// maxShapeDepth bounds how far the probe descends, so a type that nests without
+// end (a tree node, a linked list, a `map[string]any`-shaped chain) cannot spin.
+//
+// REACHING IT RECORDS NO SHAPE AT ALL. The walk does not substitute a value and
+// carry on; it fails, resultShape returns ok=false, and the type is skipped by
+// replay exactly as a type encoding/json cannot marshal already is. That is the
+// SAME fail-open used everywhere else in this file, and it is the whole reason
+// this constant no longer has a "known residual" paragraph under it.
+//
+// WHY, because four consecutive revisions each shipped one new false fire and
+// every one had this shape: at a boundary where synthesis stops, a VALUE was
+// substituted and encoding/json was left to decide its fate — and that fate turns
+// on the Go REPRESENTATION, not on the wire form.
+//
+//	rev 1  array probe        [N]T probes N elements, []T always probes 1
+//	rev 2  unprobeable member pointer-boxed marshaler selected only when addressable
+//	rev 3  unprobeable member omitempty DROPS zero-of-slice but KEEPS zero-of-struct
+//	rev 4  depth cap          omitempty KEEPS a non-nil *T but DROPS a zero scalar
+//
+// A fifth, older than all of them, sat in build's `case reflect.Interface`: a nil
+// interface is EMPTY to encoding/json, so `omitempty` dropped an interface member
+// that production always populates while its absence recorded null. Same family,
+// same cure, and it is gone the same way.
+//
+// There is no substitute that fixes this, because opacity is not expressible as a
+// Go value: a zero leaks through `omitempty` one way, a non-nil pointer leaks
+// through it the other way, and a nil leaks as JSON null. The predecessor of this
+// comment described a `truncate` helper that allocated through pointer chains to
+// dodge exactly one of those leaks; it dodged one and kept three. Removing the
+// substitution removes the family.
+//
+// THE ASYMMETRY THAT MAKES FAILING OPEN FREE. Call skips the comparison when
+// EITHER side records no shape, so a type that trips this bound can never be
+// refused on replay and can never refuse another type. Tripping it can only
+// downgrade a guarded type to an unguarded one — a miss, which leaves prior
+// behaviour in place. A false fire rejects a replay that would have succeeded and
+// wedges a live workflow.
+//
+// IT COUNTS JSON NESTING LEVELS AND NOTHING ELSE. A pointer and an UNTAGGED
+// EMBEDDED STRUCT each add zero nesting — encoding/json dereferences the one and
+// PROMOTES the other's members straight into the parent object — so neither may
+// spend budget. Charging them made the wire-identical refactors `T -> *T` and
+// "group these members into an embed" (or its inverse, inlining one) shift every
+// member below them a level deeper, across the cap. A TAGGED embed does nest, and
+// does spend.
+//
+// THE NUMBER IS MEASURED, not guessed. An AST walk of every struct type declared
+// in this repository — all packages, all tests, all examples, plus the 264 Go
+// snippets fenced in the Markdown under docs/, README.md and UPGRADE.md; 672
+// struct types in total — scored each one by this same accounting (pointer and
+// untagged embed free, every other field/element/map value one level). The
+// deepest type declared anywhere outside pkg/call's own synthetic cap fixtures is
+// jobsv1.ListWorkflowsResponse at 5 levels
+// (.Workflows[] -> WorkflowSummary.RootJob -> Job.Args[]); the deepest type
+// actually used as a Call result is jobs_test.Order at 2. Thirty-two is more than
+// six times the deepest declared type and sixteen times the deepest real result
+// type, which makes failing open effectively unreachable for real code while
+// still bounding a type that genuinely nests forever.
+const maxShapeDepth = 32
+
+// maxShapeNodes bounds the TOTAL work of one probe, which the depth bound alone
+// does not: a struct with k struct-typed members nested d levels deep costs k^d
+// value constructions, and raising maxShapeDepth from 6 to 32 raises the ceiling
+// on that with it. Exhausting the budget records no shape, the same single
+// outcome every other boundary here has, so it fails open and cannot false-fire
+// for the reason given above. It is per-probe and passed down the walk rather
+// than held in a package variable, because resultShape runs concurrently on every
+// worker goroutine.
+//
+// It is deliberately far above anything real: the deepest measured type in this
+// repository builds well under a thousand nodes, and the whole probe is memoized
+// per type by fingerprintCache, so this is paid at most once per result type per
+// process.
+//
+// THAT IT EVER TRIPS IS PINNED by TestResultShape_NodeBudgetTripsAndFailsOpen. It
+// was not, for one revision: two independent single-line mutations switched the
+// budget off entirely — the check and the decrement — and the whole suite stayed
+// green, which would have let a later maintainer delete it as dead code. Lowering
+// the constant until other tests red proves only that it does not OVER-trip. The
+// pinning fixture separates the two bounds a branching-8 type nested 7 JSON levels
+// (~2.1M nodes, depth far inside the cap), and its controls hold depth and
+// branching fixed one at a time so a green row cannot be the depth cap in
+// disguise.
+const maxShapeNodes = 100000
+
+// nest descends into a member that encoding/json will put one JSON level deeper.
+// Past the budget the WHOLE probe fails; see maxShapeDepth for why nothing is
+// substituted here.
+func nest(t reflect.Type, depth int, budget *int) (reflect.Value, bool) {
+	if depth >= maxShapeDepth {
+		return reflect.Value{}, false
+	}
+	// A fresh free-path: this hop added nesting, so nothing seen above it can
+	// still be part of a zero-progress cycle.
+	return synthesizeWithin(t, depth+1, nil, budget)
+}
 
 // synthesize builds a representative value of t with its fields populated, so the
 // marshalled JSON exposes every member the type can emit.
@@ -147,30 +269,134 @@ const maxShapeDepth = 6
 // Population matters for two reasons: `omitempty` drops an empty value, and an
 // embedded POINTER must be non-nil for encoding/json to promote through it. A
 // zero-valued probe would silently under-report both.
-func synthesize(t reflect.Type, depth int) (reflect.Value, bool) {
-	if depth > maxShapeDepth {
-		return reflect.Zero(t), true
+//
+// TERMINATION IS ITS OWN BOUND, SEPARATE FROM maxShapeDepth. Once pointers and
+// untagged embeds correctly spend no nesting budget, the budget no longer bounds
+// recursion at all: `type T *T`, `type A *B; type B *A`, and two structs that
+// embed pointers to each other are all legal Go that recurse forever while adding
+// zero JSON levels. That is not a caught error — a stack overflow is a runtime
+// FATAL, which resultShape's recover cannot catch, so the guard would kill the
+// worker process on the write AND replay path of every Call using the type.
+//
+// `free` is therefore the list of types entered since the last nesting level was
+// added. Re-entering one means the walk is cycling without making progress, so
+// the value is left zero and the recursion ends. Deliberately a visited-type set
+// and NOT a shared step counter: a counter's trip point depends on how many
+// unrelated siblings were walked first, so adding a field somewhere else in the
+// type could move it — which is the false-fire shape this file exists to avoid.
+//
+// `free` is extended with a plain append, which may let two SIBLING branches
+// write the same index of one backing array. That is harmless and not worth a
+// copy: the walk is strictly depth-first, so no sibling's slice is live while
+// another's is being extended, and the value written is `t` — the shared parent —
+// in both branches anyway.
+//
+// THE CYCLE PATH STILL SUBSTITUTES A ZERO, and it is the one boundary the
+// "delete every value substitution" rule does not reach. The depth cap and the
+// interface case landed on an ARBITRARY member type — chosen by nesting distance,
+// or by a member simply being declared `any` — which is why what they substituted
+// leaked; a free-path hit lands only on a type that reaches ITSELF through
+// pointers and untagged embeds, and the walk has to hand back some value of that
+// exact type or it cannot terminate at all. It is stated here rather than papered
+// over.
+//
+// A ZERO ALSO REACHES THE ENCODER FROM build's `default:` BRANCH, for the kinds
+// no case above claims — chan, func, complex, unsafe.Pointer. encoding/json
+// refuses every one of them, so resultShape's marshal fails and the type records
+// no shape regardless of what was put there; that zero cannot reach a shape.
+// Those two are the whole list. Every other stopping point in this file — an
+// unprobeable marshaler, the depth cap, the node budget, an interface member, a
+// map key this file cannot render — records NO SHAPE instead of substituting.
+func synthesize(t reflect.Type, depth int, free []reflect.Type) (reflect.Value, bool) {
+	budget := maxShapeNodes
+	return synthesizeWithin(t, depth, free, &budget)
+}
+
+// synthesizeWithin is synthesize threading the per-probe node budget. synthesize
+// is the entry point and seeds a fresh budget; every recursive step goes through
+// here so one probe cannot be charged another probe's work.
+func synthesizeWithin(t reflect.Type, depth int, free []reflect.Type, budget *int) (reflect.Value, bool) {
+	if *budget <= 0 {
+		return reflect.Value{}, false
 	}
+	*budget--
+	for _, seen := range free {
+		if seen == t {
+			return reflect.Zero(t), true
+		}
+	}
+	return build(t, depth, free, budget)
+}
+
+// build is synthesize's kind switch, split out so the free-path check and the
+// probe validation apply to every kind without each case repeating them.
+//
+// IT DOES NOT MODEL ADDRESSABILITY, deliberately. Whether encoding/json may take
+// a value's address decides whether a POINTER-receiver MarshalJSON is reachable
+// at that position (condAddrEncoder), and a previous revision threaded an
+// `addressable` flag through here to mirror those rules so a member could be
+// probed in the form the encoder would select. Nothing probes any more — a
+// rejected probe records no shape for the whole type, see resultShape — so the
+// flag had no consumer, and a mirror of an encoder rule with no consumer is a
+// divergence waiting to happen. The real encoder is handed the real value and
+// resolves addressability itself, which is exactly the property this file is
+// built on.
+func build(t reflect.Type, depth int, free []reflect.Type, budget *int) (reflect.Value, bool) {
 	switch t.Kind() {
 	case reflect.Pointer:
-		// A pointer adds NO JSON nesting, so it must not spend depth budget.
-		// Charging for it made []*T truncate two levels sooner than []T, so the
-		// wire-identical refactor []*T -> []T (or T -> *T) moved members across the
-		// cap and CHANGED the fingerprint — a false fire on a change that cannot
-		// alter a single byte.
-		elem, ok := synthesize(t.Elem(), depth)
+		// Dereferenced by encoding/json, so it adds no JSON nesting and spends no
+		// budget; see maxShapeDepth. What a pointer points AT is always
+		// addressable.
+		elem, ok := synthesizeWithin(t.Elem(), depth, append(free, t), budget)
 		if !ok {
 			return reflect.Value{}, false
 		}
 		p := reflect.New(t.Elem())
 		p.Elem().Set(elem)
+		if p.Type() != t {
+			// A NAMED pointer type (`type P *Foo`, or `type T *T`): reflect.New
+			// gives the unnamed *Foo, which is assignable but not identical.
+			p = p.Convert(t)
+		}
 		return p, true
 
 	case reflect.Interface:
-		// Nothing concrete to put here, so it stays nil and serializes as null.
-		// That is a real, stable shape — and crucially NOT the empty sentinel, so
-		// tightening Call[any] to a concrete type is still caught.
-		return reflect.Zero(t), true
+		// AN INTERFACE ANYWHERE IN THE TYPE RECORDS NO SHAPE AT ALL. This was the
+		// LAST place a value was substituted and encoding/json left to decide its
+		// fate, which is the exact mechanism of all four earlier false fires — and
+		// it was live at nesting depth 0.
+		//
+		// The substitution was `reflect.Zero(t)`, a nil interface. encoding/json's
+		// isEmptyValue reports a nil interface as EMPTY, so:
+		//
+		//   - WITHOUT `omitempty` the member is recorded as `null`;
+		//   - WITH `omitempty` the member is DROPPED and disappears from the shape.
+		//
+		// Adding `,omitempty` to an interface member production always populates —
+		// `Meta any `json:"meta"`` -> `Meta any `json:"meta,omitempty"`` — cannot
+		// move a byte, yet it moved the fingerprint and hard-failed replay. That is
+		// a false fire, at depth 0, on an ordinary edit. The same substitution
+		// half-disabled the guard in the other direction too: with `omitempty` the
+		// member vanishes, so DELETING it entirely is invisible.
+		//
+		// There is no value that fixes this, for the reason given at maxShapeDepth:
+		// opacity is not expressible as a Go value. A nil leaks as null, a non-nil
+		// pointer leaks through `omitempty` the other way, and a zero leaks through
+		// it the first way. So the type records NO SHAPE and replay skips it,
+		// exactly as an unprobeable type and an over-cap type already do. One rule,
+		// no exceptions.
+		//
+		// THE COST IS AN ACCEPTED MISS, and a real one: `Call[any]` and any struct
+		// carrying a `Meta any` are now UNGUARDED — not merely unguarded at the
+		// interface member, but unguarded entirely, because the whole type records
+		// nothing. Their non-interface members used to be compared and no longer
+		// are. UPGRADE.md states this plainly and
+		// TestResultShape_InterfaceMemberIsADeliberateAcceptedMiss pins it. It is
+		// still the cheap direction: a miss leaves prior behaviour in place, a false
+		// fire wedges a live workflow. And it is what the docs already promised —
+		// "a change behind an `interface` member, which has no concrete value to
+		// inspect" was already listed among the changes this cannot catch.
+		return reflect.Value{}, false
 
 	case reflect.Struct:
 		v := reflect.New(t).Elem()
@@ -190,7 +416,25 @@ func synthesize(t reflect.Type, depth int) (reflect.Value, bool) {
 				}
 				f = reflect.NewAt(sf.Type, unsafe.Pointer(f.UnsafeAddr())).Elem()
 			}
-			sub, ok := synthesize(sf.Type, depth+1)
+			var sub reflect.Value
+			var ok bool
+			if promotesIntoParent(sf) {
+				// Its members land in THIS object, so it adds no nesting.
+				//
+				// THIS APPEND IS A SECOND CUT, NOT THE LOAD-BEARING ONE, and no
+				// test can kill it — stated here so the next reviewer does not
+				// spend an afternoon looking for one. A zero-nesting cycle is
+				// built only from pointer hops and promoting embeds, and a
+				// struct cannot embed itself by value (illegal Go), so every
+				// such cycle contains at least one pointer. An infinite walk
+				// over a finite type graph must therefore repeat a POINTER type,
+				// which the Pointer case's append catches first. Cutting here as
+				// well only ends the walk one hop earlier on some rings;
+				// termination does not depend on it.
+				sub, ok = synthesizeWithin(sf.Type, depth, append(free, t), budget)
+			} else {
+				sub, ok = nest(sf.Type, depth, budget)
+			}
 			if !ok {
 				return reflect.Value{}, false
 			}
@@ -199,14 +443,26 @@ func synthesize(t reflect.Type, depth int) (reflect.Value, bool) {
 		return v, true
 
 	case reflect.Slice:
-		// json.RawMessage is a []byte holding arbitrary JSON. Filling it with
-		// arbitrary BYTES produces invalid JSON and the marshal fails, which would
-		// silently disable the guard for any result type containing one. It
-		// constrains nothing, so give it a valid, stable stand-in.
+		// json.RawMessage holds ARBITRARY JSON, so its wire form is a property of
+		// the value and not of the type — exactly like an interface member, and it
+		// fails open for exactly the same reason.
+		//
+		// This used to substitute the stand-in json.RawMessage("null"), which
+		// SUBSTITUTION IS THE BUG: it pinned every RawMessage member in the shape
+		// as `null`, so the ordinary tightening "we carried this as raw JSON while
+		// the schema settled, now it is typed" — RawMessage -> a struct, a string
+		// or a map — was REFUSED on replay even though it cannot move a byte.
+		// Verified: {"r":{"n":1}} on both sides, shapes {r:null} vs {r:{n:number}}.
+		//
+		// Substituting a value at a boundary and letting encoding/json decide its
+		// fate is the single root cause of every false fire this file has shipped.
+		// A type whose shape cannot be computed records NO shape and is skipped.
 		if t == jsonRawMessageType {
-			return reflect.ValueOf(json.RawMessage("null")).Convert(t), true
+			return reflect.Value{}, false
 		}
-		elem, ok := synthesize(t.Elem(), depth+1)
+		// A slice's backing array lives on the heap, so its elements are
+		// addressable however the slice itself is held.
+		elem, ok := nest(t.Elem(), depth, budget)
 		if !ok {
 			return reflect.Value{}, false
 		}
@@ -217,7 +473,9 @@ func synthesize(t reflect.Type, depth int) (reflect.Value, bool) {
 	case reflect.Array:
 		v := reflect.New(t).Elem()
 		if t.Len() > 0 {
-			elem, ok := synthesize(t.Elem(), depth+1)
+			// An array is stored inline, so its elements are addressable exactly
+			// when the array itself is.
+			elem, ok := nest(t.Elem(), depth, budget)
 			if !ok {
 				return reflect.Value{}, false
 			}
@@ -237,7 +495,9 @@ func synthesize(t reflect.Type, depth int) (reflect.Value, bool) {
 		if !ok {
 			return reflect.Value{}, false
 		}
-		val, ok := synthesize(t.Elem(), depth+1)
+		// A map value is never addressable — reflect will not hand out its
+		// address, and neither will encoding/json.
+		val, ok := nest(t.Elem(), depth, budget)
 		if !ok {
 			return reflect.Value{}, false
 		}
@@ -272,9 +532,62 @@ func synthesize(t reflect.Type, depth int) (reflect.Value, bool) {
 	}
 }
 
+// promotesIntoParent reports whether encoding/json splices sf's members straight
+// into the PARENT object instead of nesting them under a key of their own — the
+// one struct-field case that adds no JSON nesting level.
+//
+// This is the only encoding/json rule left in this file, and it is deliberately
+// only ever consulted for DEPTH ACCOUNTING: the shape itself still comes from the
+// real encoder, so getting this wrong cannot invent or drop a member — it can
+// only move where truncation lands, which changes what a DEEP type fingerprints
+// to. Saying "nests" when json promotes is exactly the status quo this replaced;
+// saying "promotes" when json nests lets the walk run one level past the budget
+// for every hop it gets wrong, so a chain of them compounds.
+//
+// Its agreement with the encoder is pinned two ways: the promotion fixtures in
+// zz_result_shape_json_parity_test.go compare against real encoder key sets, and
+// TestResultShape_DepthBudgetIsChargedAtEveryNestingSite puts each answer this
+// function can give on the truncation boundary, where a wrong answer moves the
+// shape. THAT SECOND CLAIM WAS FALSE WHEN FIRST WRITTEN and the mutation that
+// proved it is now in the table: the guard below distinguishes an ANONYMOUS field
+// from an ordinary one, and every row that existed had either a tag (which the
+// `name != ""` check short-circuits) or a non-struct member type (which the
+// `ft.Kind()` check short-circuits), so deleting `if !sf.Anonymous` survived the
+// whole suite. The row "untagged NON-ANONYMOUS struct member" is the combination
+// that separates them, and TestResultShape_UntaggedNonAnonymousStructMemberNests
+// asserts both halves of the distinction against the real encoder's output.
+func promotesIntoParent(sf reflect.StructField) bool {
+	if !sf.Anonymous {
+		return false
+	}
+	// A json name of its own makes json nest it rather than promote it; an
+	// explicit "-" drops it, which is not promotion either.
+	if name, _, _ := strings.Cut(sf.Tag.Get("json"), ","); name != "" {
+		return false
+	}
+	ft := sf.Type
+	if ft.Name() == "" && ft.Kind() == reflect.Pointer {
+		ft = ft.Elem()
+	}
+	// Anything that is not a struct is emitted as an ordinary member named after
+	// its type, so it nests like any other member.
+	return ft.Kind() == reflect.Struct
+}
+
 // synthesizeMapKey builds the same key -- "1" -- whatever the key type, so two
-// map types that serialize identically fingerprint identically. A key type json
-// cannot use (a struct, say) still fails, which is caught by the marshal.
+// map types that serialize identically fingerprint identically.
+//
+// ANY OTHER KEY KIND RECORDS NO SHAPE, by the same one rule as everywhere else in
+// this file. The kinds above are the ones whose rendered key this function fully
+// controls; every other kind reaches encoding/json only through an
+// encoding.TextMarshaler, and the key NAME is then whatever that marshaler makes
+// of the value handed to it — which is the substitution family again, and it was
+// live: `map[K]int` and `map[*K]int` for a K with a value-receiver MarshalText
+// both marshal to `{"k":1}`, but zeroing the pointer form gives a nil key whose
+// rendered name is empty, so the two shaped `{k:number}` and `{:number}` and a
+// byte-identical change of one to the other was refused on replay. A key type
+// json cannot use at all (a struct with no TextMarshaler) already recorded no
+// shape via the marshal error; this makes the outcome the same for both.
 func synthesizeMapKey(t reflect.Type) (reflect.Value, bool) {
 	switch t.Kind() {
 	case reflect.String:
@@ -285,7 +598,7 @@ func synthesizeMapKey(t reflect.Type) (reflect.Value, bool) {
 		reflect.Uintptr:
 		return reflect.ValueOf(uint64(1)).Convert(t), true
 	default:
-		return reflect.Zero(t), true
+		return reflect.Value{}, false
 	}
 }
 
@@ -317,6 +630,15 @@ func describe(b *strings.Builder, v any) {
 		}
 		b.WriteString("}")
 	case []any:
+		// ARITY IS DELIBERATELY NOT RECORDED. A fixed-size array's length is part
+		// of its wire form, so `[3]float64 -> [2]float64` replays silently
+		// truncated — an ACCEPTED MISS, pinned by
+		// TestResultShape_ArrayArityIsADeliberateAcceptedMiss. Recording the
+		// length here was tried and reverted: one symmetric equality hash cannot
+		// express "arity 3 is compatible with unconstrained", so it necessarily
+		// made the byte-identical widening `[3]float64 -> []float64` — the single
+		// most common evolution of such a field — hard-fail replay. A miss leaves
+		// prior behaviour alone; a false fire wedges a live workflow.
 		b.WriteString("[")
 		if len(x) > 0 {
 			describe(b, x[0])

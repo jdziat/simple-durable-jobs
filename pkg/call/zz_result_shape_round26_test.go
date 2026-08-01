@@ -135,12 +135,22 @@ type r26Lease struct {
 }
 
 // net.IP.MarshalText rejects any length other than 0, 4 or 16, so a fabricated
-// one-byte address fails to marshal. Falling through to "no shape" silently
-// disabled the guard for every result type containing one.
-func TestResultShape_ValidatingTypeStillGetsAShape(t *testing.T) {
-	if fp := fingerprintOf(r26Lease{}); fp == "" {
-		t.Fatal("a result type containing net.IP produced NO shape, so replay " +
-			"reads every new checkpoint as pre-upgrade and skips the check entirely")
+// one-byte address fails to marshal.
+//
+// THIS TEST WAS INVERTED, DELIBERATELY. It used to demand a shape here, and two
+// revisions were built to supply one by substituting a value the marshaler would
+// accept — zeroing the whole type, then zeroing just the offending member. Both
+// FALSE FIRED, because the encoder reinterprets whatever value it is handed and
+// what it emits then depends on the member's Go representation and its
+// `omitempty`; see resultShape's comment for the three concrete ways. The policy
+// is now the one UPGRADE.md already stated for uncomputable types: no shape, and
+// the guard skips the type. The cost is an accepted MISS, pinned here and by
+// TestResultShape_ValidatingMarshalerIsADeliberateAcceptedMiss.
+func TestResultShape_ValidatingTypeRecordsNoShape(t *testing.T) {
+	if fp := fingerprintOf(r26Lease{}); fp != "" {
+		t.Fatalf("a result type whose probe is rejected must record NO shape so the "+
+			"guard skips it; got %q. A degraded stand-in shape is a false fire waiting "+
+			"to happen — do not reintroduce one", fp)
 	}
 }
 

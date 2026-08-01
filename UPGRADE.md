@@ -433,17 +433,130 @@ NOT caught:
   but is still a JSON string);
 - swapping one struct whose fields are *all* unexported for another, since both
   serialize as `{}`;
-- a change nested deeper than six levels, where synthesis stops;
-- a change behind an `interface` member, which has no concrete value to inspect
-  and is recorded as `null`.
+- **any change to a result type that contains an `interface` member anywhere in
+  it** — including `Call[any]` itself — since an interface has no concrete value
+  to inspect. Such a type records no shape at all and is **not guarded at all**,
+  see below;
+- **any change to a result type that nests deeper than 32 JSON levels** — such a
+  type records no shape at all and is skipped entirely, see below;
+- **any change to a result type containing a `json.RawMessage` member anywhere in
+  it** — a `RawMessage` holds arbitrary JSON, so like an `interface` its wire form
+  belongs to the value rather than the type. Such a type records no shape and is
+  not guarded at all;
+- **any change to a result type containing a marshaler that VALIDATES** — also
+  below.
 
 Those replay exactly as they did before this change: no worse, no better. The
 check is deliberately biased this way — a false rejection wedges a healthy
 workflow, whereas a miss only leaves the old behaviour in place.
 
-A result type that `encoding/json` cannot marshal at all (a channel or func
-member) records **no** shape and is skipped entirely, for the same reason: a type
-whose shape cannot be computed must never be able to fail a replay.
+**Types whose shape cannot be computed are skipped — and "skipped" now means the
+whole type, at every depth.** A result type that `encoding/json` cannot marshal at
+all (a channel or func member) records **no** shape and is skipped entirely: a type
+whose shape cannot be computed must never be able to fail a replay. There is
+exactly one thing that can happen when the shape walk cannot continue, and it is
+this one.
+
+**Depth is one of those cases.** The walk descends at most 32 JSON nesting levels.
+A pointer and an untagged embedded struct add none of their own — `encoding/json`
+dereferences the one and promotes the other's members into the parent — so
+neither spends budget, and the byte-neutral refactors `T` → `*T` and "group these
+members into an embed" cannot move the fingerprint. A type that genuinely nests
+past 32, which in practice means a self-referential one (a tree node, a linked
+list), records **no** shape and is not guarded at all. Thirty-two is measured, not
+guessed: the deepest struct type declared anywhere in this repository — including
+every example and every Go snippet in these docs — is 5 levels, and the deepest
+type actually used as a `Call` result is 2.
+
+Earlier revisions instead *truncated* at the cap, substituting a stand-in value
+for the member that landed on the boundary and letting the encoder decide what to
+emit for it. That produced a **false fire** every time, because what the encoder
+emits depends on the member's Go representation rather than on the wire form: with
+`omitempty`, a substituted zero `int` is DROPPED while a substituted non-nil
+`*int` is KEPT, so boxing a deep member in a pointer — which cannot move a byte —
+moved the fingerprint and replay refused the deploy.
+
+**An `interface` member is the same case, and it is the one that costs you
+coverage.** It used to be recorded as `null`, which meant a nil interface was
+substituted and handed to the encoder — and `encoding/json` treats a nil interface
+as EMPTY, so with `,omitempty` the member was DROPPED from the shape instead.
+Adding `,omitempty` to a `Meta any` field your handler always populates is
+byte-identical on the wire, decodes losslessly, and used to be **refused on
+replay**. The same substitution also hid the member's outright deletion, because a
+dropped member and an absent one look identical.
+
+There is no value that fixes this — a nil leaks as `null`, a zero leaks through
+`omitempty` one way and a non-nil pointer leaks through it the other — so a result
+type containing an interface **anywhere in it** now records no shape and is
+skipped, exactly like a type past the depth cap.
+
+**Be clear about what that costs.** The whole type loses the guard, not just the
+interface member. If your result is
+
+```go
+type Result struct {
+    Meta  any    `json:"meta"`
+    Order string `json:"order"`
+    Total int    `json:"total"`
+}
+```
+
+then renaming `order` to `reference`, or dropping `total`, is no longer caught
+either — before, those members were still compared. `Call[any]` is likewise
+unguarded, so tightening it to a concrete type replays as it did before this
+feature existed. If you want the guard back, move the free-form part out of the
+result type: return a `map[string]string` or a concrete struct instead of an
+`any`. A `json.RawMessage` is **not** a way to get the guard back — it holds
+arbitrary JSON, so like an `any` it is unknowable from the type and its presence
+makes the whole result type unguarded.
+
+The one remaining substitution is a zero-nesting cyclic type, which has to hand
+back *some* value of itself or the walk cannot terminate. Everywhere else the
+walk now stops rather than substituting — because substituting a value at a
+boundary and letting `encoding/json` decide its fate is what produced every false
+rejection this check has ever had: a zero leaks through `omitempty`, a non-nil
+pointer leaks through it the other way, and a nil leaks as `null`, so two types
+that serialize identically could take different paths and disagree.
+
+The same rule applies when a `MarshalJSON` or `MarshalText` **rejects the
+fabricated probe** rather than the type. `net.IP` refuses any length other than
+0, 4 or 16; an enum's `MarshalJSON` refuses a value that is not one of its cases.
+Both marshal perfectly on real data — only the synthesized probe offends them. A
+result type containing one records **no** shape anywhere in it — at any nesting
+depth, including deeper than the probe would otherwise descend — and replay skips
+the check for that type completely.
+
+That is a miss, chosen deliberately over the alternative. Substituting a value
+the marshaler *would* accept was tried twice and both times produced a **false
+fire**, because the encoder reinterprets whatever value it is handed: with
+`omitempty`, a slice-backed member (`net.IP`) drops out of the shape entirely
+while a struct-backed one (`netip.Addr`) does not, so the byte-identical
+`net.IP` → `netip.Addr` modernization moved the fingerprint and rejected replays
+that would have succeeded. A vanished member is also indistinguishable from a
+member that was *removed* from the type, which is the very change the guard
+exists to catch.
+
+The skip is **symmetric**: it applies whether the shape recorded on the
+checkpoint is empty or the shape of the type being replayed *into* is empty. So
+neither direction of such a refactor can wedge a live workflow — and that is what
+makes every "records no shape" case above free of risk. A type that trips one of
+them can neither be refused on replay nor refuse another type; the only cost is
+that it stops being guarded, which leaves it exactly where it was before this
+feature existed.
+
+One smaller case joins the list for the same reason: a **map whose key type is
+neither a string nor an integer** — a key rendered by an
+`encoding.TextMarshaler` — records no shape, because the key name would come from
+whatever value was fabricated for it. `map[K]V` and `map[*K]V` for such a `K`
+serialize identically yet fabricated to different key names, which was another
+false fire. String- and integer-keyed maps, which is nearly all of them, are
+unaffected.
+
+If you want a result type covered by this guard, keep `interface`/`any` members,
+`json.RawMessage` members and validating marshalers out of it — wrap the value in
+a plain struct, or expose the field as a `string` — key your maps by strings or
+integers, and keep it from nesting without end, which for a tree or list result
+usually means returning a flattened form.
 
 Checkpoints written before v40 carry an empty shape and are **not** checked, so work
 already in flight replays exactly as before — the same degradation `span_end = 0`

@@ -2,6 +2,7 @@ package call
 
 import (
 	"context"
+	"encoding/json"
 	"reflect"
 	"strings"
 	"testing"
@@ -172,32 +173,177 @@ func TestResultShape_PromotedFieldsOfUnexportedEmbedAreSeen(t *testing.T) {
 	}
 }
 
-// ---- interface results ------------------------------------------------------
+// ---- interface results: A DELIBERATE ACCEPTED MISS ---------------------------
+//
+// A result type containing an interface ANYWHERE records no shape and is not
+// guarded at all. THESE TESTS ASSERT THE MISS, and they are the inverse of what
+// they asserted before: the old pair required Call[any] to record a real shape and
+// required tightening it to a concrete type to be CAUGHT.
+//
+// WHY IT WAS INVERTED, so nobody re-inverts it. A shape for an interface member
+// could only come from substituting a value — `reflect.Zero`, a nil interface —
+// and encoding/json then decides its fate by the Go REPRESENTATION, not the wire
+// form. isEmptyValue calls a nil interface EMPTY, so with `omitempty` the member
+// was DROPPED and without it recorded as null. Adding `,omitempty` to a `Meta any`
+// production always populates is byte-identical on the wire and was refused on
+// replay: a live false fire at nesting depth 0. The same substitution also hid the
+// member's outright DELETION, because a dropped member and an absent one look the
+// same. There is no third value to try, so the type records nothing — the same
+// fail-open as an unprobeable marshaler and an over-cap type.
+//
+// A MISS LEAVES PRIOR BEHAVIOUR IN PLACE. A FALSE FIRE WEDGES A LIVE WORKFLOW.
+// The cost is real and is stated in UPGRADE.md: Call[any], and any struct with an
+// `any` member, lose the guard on their OTHER members too.
 
-// Call[any] is documented and supported. Its fingerprint must not collide with the
-// empty sentinel that means "written before this column existed", or tightening
-// Call[any] to a concrete type is silently exempted from the check.
-func TestResultShape_InterfaceResultIsNotTheLegacySentinel(t *testing.T) {
-	if s := staticResultShape[any](); s == "" {
-		t.Fatal("Call[any] records the empty shape, which replay reads as a pre-upgrade " +
-			"checkpoint and skips; tightening Call[any] to a concrete type would replay as zero")
+// rsStringerLike is an interface with a NON-EMPTY method set. It exists because
+// the policy above was, for one revision, pinned only for EMPTY interfaces: a
+// mutation narrowing the rule to `if t.NumMethod() > 0 { substitute }` survived
+// the entire suite. That is not a far-fetched mutation — it is the plausible
+// future "optimization" (`any` is opaque, but surely a method-set interface tells
+// us something). It does not: the METHOD set says nothing about the JSON the
+// concrete value will produce, so the substitution and its false fire come back
+// wholesale.
+type rsStringerLike interface {
+	String() string
+}
+
+type rsMethodIfaceHolder struct {
+	V  rsStringerLike `json:"v"`
+	ID string         `json:"id"`
+}
+
+func TestResultShape_InterfaceMemberIsADeliberateAcceptedMiss(t *testing.T) {
+	t.Run("Call[any] records no shape", func(t *testing.T) {
+		if s := staticResultShape[any](); s != "" {
+			t.Fatalf("an interface result must record NO shape, got %q; a shape here can only "+
+				"come from substituting a nil interface, which `omitempty` drops and its "+
+				"absence records as null — the false fire this inversion removed", s)
+		}
+	})
+
+	// The rule is on Kind, NOT on NumMethod. Without this leg, narrowing it to
+	// empty interfaces only is undetectable.
+	t.Run("a NON-EMPTY interface member is treated the same", func(t *testing.T) {
+		if fp := fingerprintOf(rsMethodIfaceHolder{}); fp != "" {
+			t.Fatalf("an interface with a method set must record NO shape either, got %q — a "+
+				"method set constrains the Go type, not the JSON the concrete value emits, "+
+				"so substituting for it reintroduces the omitempty false fire", fp)
+		}
+	})
+
+	// ONE interface member disarms the WHOLE type, including its ordinary members.
+	// This is the coverage the inversion costs, asserted rather than implied.
+	t.Run("one any member disarms the whole type", func(t *testing.T) {
+		if s := ResultShapeStringForTest(reflectTypeOf[ifaceMetaV1]()); s != "" {
+			t.Fatalf("a struct with an `any` member must record NO shape, got %q", s)
+		}
+		a := ResultFingerprintForTest(reflectTypeOf[ifaceMetaV1]())
+		b := ResultFingerprintForTest(reflectTypeOf[ifaceMetaRenamed]())
+		if a != "" || b != "" {
+			t.Fatalf("both must fingerprint empty, got %q and %q", a, b)
+		}
+	})
+
+	// The member at depth, inside a slice element, and inside a map value — the
+	// rule is "anywhere in the type", not "at the top".
+	t.Run("anywhere in the type, not just at the top", func(t *testing.T) {
+		for name, typ := range map[string]reflect.Type{
+			"nested":        reflectTypeOf[ifaceNested](),
+			"slice element": reflect.TypeOf([]ifaceMetaV1(nil)),
+			"map value":     reflect.TypeOf(map[string]ifaceMetaV1(nil)),
+			"pointer":       reflect.TypeOf((*ifaceMetaV1)(nil)),
+		} {
+			if s := ResultShapeStringForTest(typ); s != "" {
+				t.Errorf("%s: an interface reached through it must disarm the whole type, got %q", name, s)
+			}
+		}
+	})
+}
+
+// The wire-neutral edit that used to WEDGE, driven end to end through production.
+// Adding `,omitempty` to a populated interface member cannot move a byte, and
+// replay must accept it.
+func TestResultShape_InterfaceOmitemptyToggleIsNotRefused(t *testing.T) {
+	v1 := ifaceMetaV1{Meta: map[string]any{"k": "v"}, Ref: "r"}
+	v2 := ifaceMetaOmit{Meta: map[string]any{"k": "v"}, Ref: "r"}
+	ba, err := json.Marshal(v1)
+	if err != nil {
+		t.Fatalf("marshal v1: %v", err)
+	}
+	bb, err := json.Marshal(v2)
+	if err != nil {
+		t.Fatalf("marshal v2: %v", err)
+	}
+	if string(ba) != string(bb) {
+		t.Fatalf("the pair is not wire-identical, so it proves nothing: %s vs %s", ba, bb)
+	}
+
+	h, herr := handler.NewHandler(func(_ context.Context, _ string) (ifaceMetaV1, error) { return v1, nil })
+	if herr != nil {
+		t.Fatalf("NewHandler: %v", herr)
+	}
+	saved, _, err := writeThenReplay[ifaceMetaV1, ifaceMetaOmit](t, h, "meta-omitempty")
+	if err != nil {
+		t.Fatalf("FALSE FIRE: adding `,omitempty` to a populated interface member is "+
+			"byte-identical (%s) and decodes losslessly, yet replay refused it: %v", ba, err)
+	}
+	if saved.ResultShape != "" {
+		t.Fatalf("a type with an interface member must persist no shape, got %q", saved.ResultShape)
+	}
+
+	// And the reverse deploy, so the skip is symmetric.
+	h2, herr := handler.NewHandler(func(_ context.Context, _ string) (ifaceMetaOmit, error) { return v2, nil })
+	if herr != nil {
+		t.Fatalf("NewHandler: %v", herr)
+	}
+	if _, _, err := writeThenReplay[ifaceMetaOmit, ifaceMetaV1](t, h2, "meta-omitempty-rev"); err != nil {
+		t.Fatalf("FALSE FIRE (reverse): removing `,omitempty` was refused: %v", err)
 	}
 }
 
-func TestResultShape_AnyThenConcreteIsCaughtEndToEnd(t *testing.T) {
+// THE COST, asserted rather than described. Tightening Call[any] to a concrete
+// type is NO LONGER caught. This test fails if that ever starts being caught
+// again, which is the signal that someone re-introduced a substituted value.
+func TestResultShape_AnyThenConcreteIsNoLongerCaught(t *testing.T) {
 	h, herr := handler.NewHandler(func(_ context.Context, _ string) (e2eV1, error) {
 		return e2eV1{OrderID: "ord_1", Amount: 500}, nil
 	})
 	if herr != nil {
 		t.Fatalf("NewHandler: %v", herr)
 	}
-	saved, got, err := writeThenReplay[any, e2eV2](t, h, "lookup")
-	if saved.ResultShape == "" {
-		t.Fatal("Call[any] persisted the legacy empty sentinel")
+	saved, _, err := writeThenReplay[any, e2eV2](t, h, "lookup")
+	if saved.ResultShape != "" {
+		t.Fatalf("Call[any] must persist no shape, got %q", saved.ResultShape)
 	}
-	if err == nil {
-		t.Fatalf("tightening Call[any] to a concrete type must be caught; got %+v with a nil error", got)
+	if err != nil {
+		t.Fatalf("an interface result is unguarded by design, so replay must not refuse it: %v", err)
 	}
+}
+
+type ifaceMetaV1 struct {
+	Meta any    `json:"meta"`
+	Ref  string `json:"ref"`
+}
+
+type ifaceMetaOmit struct {
+	Meta any    `json:"meta,omitempty"`
+	Ref  string `json:"ref"`
+}
+
+// Same wire-visible members as ifaceMetaV1 but a renamed one: a REAL change that
+// the guard would have caught before, and no longer does. That is the coverage
+// this inversion costs, named here so it cannot be forgotten.
+type ifaceMetaRenamed struct {
+	Meta any    `json:"meta"`
+	Code string `json:"code"`
+}
+
+type ifaceNested struct {
+	Inner struct {
+		Deep struct {
+			M any `json:"m"`
+		} `json:"deep"`
+	} `json:"inner"`
 }
 
 // ---- numeric widening -------------------------------------------------------

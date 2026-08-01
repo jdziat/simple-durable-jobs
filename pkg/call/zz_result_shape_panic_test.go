@@ -42,7 +42,13 @@ type structKeyed struct {
 }
 type structKey struct{ K string }
 
-// Recursive shapes must terminate rather than spin.
+// Recursive shapes must terminate rather than spin. Each of these nests one JSON
+// level per hop, so the depth cap is what stops them — and REACHING the cap now
+// records no shape at all rather than a truncated one, so all three are
+// deliberately unguarded. That is a real, named coverage loss taken in exchange
+// for retiring the false-fire family: see maxShapeDepth. It is the cheap
+// direction — an unguarded type replays exactly as it did before this feature
+// existed, while a false fire wedges a live workflow.
 type recSlice struct {
 	Kids []recSlice `json:"kids"`
 	V    int        `json:"v"`
@@ -60,14 +66,15 @@ func TestResultShape_NeverPanicsAndAlwaysTerminates(t *testing.T) {
 		name    string
 		typ     reflect.Type
 		wantAny bool // true: must produce SOME shape; false: must fail open to ""
+		// Every false row below is a type this guard deliberately does not cover.
 	}{
 		{"MarshalJSON panics", reflect.TypeOf(holdsPanicJSON{}), false},
 		{"MarshalText panics", reflect.TypeOf(holdsPanicText{}), false},
 		{"MarshalJSON errors", reflect.TypeOf(holdsErrJSON{}), false},
 		{"map with a struct key", reflect.TypeOf(structKeyed{}), false},
-		{"recursive via slice", reflect.TypeOf(recSlice{}), true},
-		{"recursive via map", reflect.TypeOf(recMap{}), true},
-		{"recursive via pointer", reflect.TypeOf(recPtr{}), true},
+		{"recursive via slice", reflect.TypeOf(recSlice{}), false},
+		{"recursive via map", reflect.TypeOf(recMap{}), false},
+		{"recursive via pointer", reflect.TypeOf(recPtr{}), false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			defer func() {
