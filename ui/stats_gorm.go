@@ -329,11 +329,49 @@ var (
 // ROW. Clamping expresses the same intent for both and cannot turn a filter into
 // a table wipe.
 func statsRepresentableBound(bound time.Time) time.Time {
+	// RE-FACE FIRST: an offset beyond ±14:00 is one SQLite's own date parser
+	// refuses outright, so "…+15:00" makes julianday() NULL for an instant that is
+	// otherwise perfectly ordinary. Re-facing is INSTANT-PRESERVING, so it changes
+	// no row's membership.
+	if _, offsetSeconds := bound.Zone(); absStatsDuration(time.Duration(offsetSeconds)*time.Second) > statsMaxParsableFaceOffset {
+		bound = bound.UTC()
+	}
+
 	switch {
 	case bound.After(statsRepresentableBoundCeil):
 		return statsRepresentableBoundCeil
 	case bound.Before(statsRepresentableBoundFloor):
 		return statsRepresentableBoundFloor
 	}
+
+	// AND RE-FACE AGAIN AFTER THE CLAMP. The instant is inside the representable
+	// range, but every comparison it feeds is against its RENDERED WALL, and
+	// wall = instant + offset. A positive face pushes an instant inside the LAST
+	// 14 HOURS of year 9999 into a five-digit year: the ceil on a +05:30 face
+	// renders "10000-01-01 05:29:59.999+05:30". The instant checks above cannot
+	// see that — it is not After the ceil — and the offset re-face only fires
+	// beyond ±14:00. Both lexical arms then invert ("10000-" sorts BELOW "2026-")
+	// and julianday() returns NULL, so an upper bound at the end of time returns
+	// an EMPTY page instead of everything.
+	//
+	// Only the HIGH side needs this: a negative face moves the wall EARLIER, and
+	// the earliest reachable wall is floor on -14:00 — still four digits, still
+	// below every real row. That asymmetry is why the symmetric-looking instant
+	// guard hid it.
+	if bound.Year() > 9999 {
+		bound = bound.UTC()
+	}
 	return bound
+}
+
+// statsMaxParsableFaceOffset is the widest timezone suffix SQLite's date parser
+// accepts (measured in pkg/storage: '+15:00' -> NULL, '+14:00' and '-12:00'
+// parse). Same value and same reason as pkg/storage's sqliteMaxParsableFaceOffset.
+const statsMaxParsableFaceOffset = 14 * time.Hour
+
+func absStatsDuration(d time.Duration) time.Duration {
+	if d < 0 {
+		return -d
+	}
+	return d
 }

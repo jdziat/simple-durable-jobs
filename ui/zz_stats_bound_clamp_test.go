@@ -97,3 +97,82 @@ func TestStatsTimestampPredicate_OutOfRangeBoundStillRestrictsTheDelete(t *testi
 		})
 	}
 }
+
+// TestStatsRepresentableBound_ReFacesWhatSQLiteCannotParse pins the two re-faces
+// that a "mirror pkg/storage" rewrite DELETED.
+//
+// The rewrite added an instant clamp and dropped both face guards, so the ui copy
+// ended up mirroring pkg/storage LESS faithfully than the version it replaced —
+// it had neither. Each shape below has a perfectly representable INSTANT and only
+// an unrenderable WALL, which is exactly what an instant-only check cannot see:
+//
+//   - an offset beyond ±14:00, which SQLite's date parser refuses outright;
+//   - an instant in the last 14h of year 9999 on a positive face, whose wall is a
+//     five-digit year — julianday() returns NULL and both lexical arms invert,
+//     because "10000-" sorts BELOW "2026-".
+//
+// Either one made GetStatsHistory return nothing and PruneStats delete nothing,
+// with no error anywhere.
+func TestStatsRepresentableBound_ReFacesWhatSQLiteCannotParse(t *testing.T) {
+	t.Run("offset beyond the parser cap is re-faced", func(t *testing.T) {
+		bound := time.Date(2026, 3, 1, 12, 0, 0, 0, time.FixedZone("plus1500", 15*3600))
+		got := statsRepresentableBound(bound)
+		if _, off := got.Zone(); absStatsDuration(time.Duration(off)*time.Second) > statsMaxParsableFaceOffset {
+			t.Fatalf("bound kept a face SQLite cannot parse (%s); julianday() returns NULL for it, "+
+				"so every foreign-faced row is dropped", got.Format(time.RFC3339Nano))
+		}
+		if !got.Equal(bound) {
+			t.Fatalf("re-facing must be INSTANT-PRESERVING: %s != %s", got, bound)
+		}
+	})
+
+	t.Run("a five-digit WALL is re-faced even though the instant is in range", func(t *testing.T) {
+		// Inside the ceil as an instant, but "10000-..." once rendered on +05:30.
+		bound := time.Date(9999, 12, 31, 20, 0, 0, 0, time.UTC).In(time.FixedZone("plus0530", 5*3600+1800))
+		if bound.After(statsRepresentableBoundCeil) {
+			t.Fatal("FIXTURE BROKEN: this instant must be INSIDE the ceil, or it proves nothing")
+		}
+		got := statsRepresentableBound(bound)
+		if got.Year() > 9999 {
+			t.Fatalf("bound still renders a five-digit year (%s): both lexical arms invert and "+
+				"julianday() goes NULL", got.Format(time.RFC3339Nano))
+		}
+	})
+}
+
+// TestStatsRepresentableBound_MatchesStorageOnEveryShape is the test that would
+// have caught this class at the source: the two copies of the rule must agree.
+//
+// They cannot share code — package ui cannot reach pkg/storage's unexported
+// helper — so the ONLY thing keeping them in step is a test that walks the same
+// bound shapes through this copy and asserts the properties pkg/storage's copy
+// guarantees. Divergence between the two, not any single bug, is what produced
+// both round-31 and round-32 findings.
+func TestStatsRepresentableBound_MatchesStorageOnEveryShape(t *testing.T) {
+	for name, bound := range map[string]time.Time{
+		"proto max":            protobufMaxTimestamp,
+		"julianday null band":  time.Date(9999, 12, 31, 23, 59, 59, 999500000, time.UTC),
+		"five-digit wall":      time.Date(9999, 12, 31, 20, 0, 0, 0, time.UTC).In(time.FixedZone("p0530", 5*3600+1800)),
+		"unparsable face":      time.Date(2026, 3, 1, 12, 0, 0, 0, time.FixedZone("p1500", 15*3600)),
+		"unparsable face west": time.Date(2026, 3, 1, 12, 0, 0, 0, time.FixedZone("m1500", -15*3600)),
+		"far past":             time.Date(-500, 1, 1, 0, 0, 0, 0, time.UTC),
+		"ordinary":             time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC),
+	} {
+		t.Run(name, func(t *testing.T) {
+			got := statsRepresentableBound(bound)
+
+			// 1. renderable as a four-digit year
+			if got.Year() > 9999 || got.Year() < 1 {
+				t.Fatalf("bound renders an unparsable year: %s", got.Format(time.RFC3339Nano))
+			}
+			// 2. on a face SQLite's parser accepts
+			if _, off := got.Zone(); absStatsDuration(time.Duration(off)*time.Second) > statsMaxParsableFaceOffset {
+				t.Fatalf("bound kept an unparsable face: %s", got.Format(time.RFC3339Nano))
+			}
+			// 3. inside the julianday-parsable range
+			if got.After(statsRepresentableBoundCeil) || got.Before(statsRepresentableBoundFloor) {
+				t.Fatalf("bound outside the representable range: %s", got.Format(time.RFC3339Nano))
+			}
+		})
+	}
+}
