@@ -205,7 +205,7 @@ func TestSearchJobs_CreatedAtWindowBoundsAreInclusive(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStorage(t)
 
-	// Millisecond-aligned: the cross-face branch normalizes through strftime('%f'),
+	// Millisecond-aligned: the cross-face branch normalizes through julianday(),
 	// which is millisecond-resolution, so an equal-instant assertion has to be
 	// expressible at that resolution to mean anything.
 	exact := time.Now().Truncate(time.Millisecond)
@@ -245,9 +245,9 @@ func TestSearchJobs_CreatedAtWindowBoundsAreInclusive(t *testing.T) {
 
 // TestSearchJobs_SameFaceWindowKeepsNanosecondPrecision pins the reason the
 // predicate keeps a raw-text fast path instead of normalizing every comparison
-// through strftime().
+// through julianday().
 //
-// strftime('%f') is MILLISECOND resolution, so an unconditional normalization
+// julianday() is MILLISECOND resolution, so an unconditional normalization
 // collapses any two values less than 1ms apart — the same truncation that
 // measurably stalled sub-millisecond schedules when an earlier scheduleCursorLess
 // did it (see gorm.go). When the row and the bound already share a clock face the
@@ -319,7 +319,10 @@ func TestTimeBoundPredicate_NonSQLiteKeepsThePlainForm(t *testing.T) {
 			sqliteStore := &GormStorage{isSQLite: true}
 			sqlitePred, sqliteArgs := sqliteStore.timeBoundPredicate(tc.column, tc.dir, bound)
 			assert.NotEqual(t, tc.want, sqlitePred)
-			assert.Contains(t, sqlitePred, "strftime", "SQLite needs the face-independent comparison")
+			assert.Contains(t, sqlitePred, "julianday", "SQLite needs the face-independent comparison")
+			assert.NotContains(t, sqlitePred, "strftime",
+				"strftime renders one instant differently per face and DROPS rows on an "+
+					"inclusive bound; see TestTimeBoundPredicate_CrossFaceNormalizationIsFaceIndependent")
 			assert.Len(t, sqliteArgs, 4)
 		})
 	}
@@ -639,15 +642,22 @@ func TestSearchJobs_BoundOnAnUnparsableFaceStillCompares(t *testing.T) {
 // is millisecond-ALIGNED (.500000000, or Truncate(time.Millisecond)), so by
 // construction none of them can reach a tie at all.
 //
-// The claim was then measured rather than argued. strftime('%f') was found to render
-// a given instant identically on every face (36,015 comparisons at 1ns granularity
-// around five half-millisecond tie points, offsets from -12:00 to +14:00), so both
-// sides of the comparison round the same way, monotonicity survives, and only
-// collapse-to-equal — over-inclusion — is reachable. This test is the durable form
-// of that measurement: it sweeps genuinely UN-aligned sub-millisecond offsets across
-// the full writer-face x reader-face matrix and asserts no inside row is ever lost.
+// THE MEASUREMENT THAT FIRST ANSWERED THAT REVIEWER WAS WRONG, and this comment
+// used to repeat it. It reported 36,015 comparisons at 1ns granularity around five
+// half-millisecond tie points and concluded strftime('%f') renders a given instant
+// identically on every face. It does not. The sweep ran at second :01 of a minute
+// and never entered either band where the renderings actually diverge, so it
+// measured agreement in the only region where agreement was never in doubt — the
+// classic shape of a correct harness with fixtures too narrow to reach the defect.
+// A later round found the divergence and the predicate was fixed to stop depending
+// on the two renderings agreeing at all (see crossFaceDivergenceBands below, and
+// timeBoundPredicate's julianday arm).
 //
-// If a future change makes the two sides round differently, this reds.
+// So this test no longer carries the invariant on its own: it covers the ordinary
+// sub-millisecond region across the full writer-face x reader-face matrix, and
+// TestSearchJobs_CrossFaceDivergenceBandsKeepTheRow covers the instants it
+// structurally cannot reach. Neither is sufficient alone; do not delete either on
+// the grounds that the other exists.
 func TestSearchJobs_SubMillisecondCrossFaceNeverDropsAnInsideRow(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStorage(t)
@@ -679,6 +689,245 @@ func TestSearchJobs_SubMillisecondCrossFaceNeverDropsAnInsideRow(t *testing.T) {
 				require.Equal(t, int64(1), total,
 					"row at +%dns on %s, bounds on %s: a row inside the window must never be dropped",
 					ns, rowFace, boundFace)
+			}
+		}
+	}
+}
+
+// crossFaceDivergenceBands are the instants on which SQLite's TEXT normalization,
+// strftime('%Y-%m-%d %H:%M:%f', …), renders the SAME instant DIFFERENTLY depending
+// on whether the value's trailing offset is zero or non-zero.
+//
+// They are listed here because the test above cannot reach any of them and the
+// predicate was wrong on all of them. TestSearchJobs_SubMillisecondCrossFaceNeverDropsAnInsideRow
+// sweeps second :01 of a minute and brackets its row by ±5ms — wider than the
+// error — so by construction it never puts a bound ON a diverging instant.
+//
+// SQLite parses the text into a DateTime carrying both the raw Y/M/D h:m:s AND a
+// millisecond integer iJD computed from them. A NON-ZERO offset must be applied to
+// iJD, which invalidates the raw fields, so every rendered component is recomputed
+// from the ROUNDED iJD. A ZERO offset ("+00:00", which is what the driver writes for
+// a UTC value) leaves the raw fields valid, so %H:%M print the raw wall clock and %f
+// prints the raw seconds through "%06.3f", clamped at 59.999. The two renderings
+// therefore disagree in three measured bands:
+//
+//	minute tail   59.9995s+ -> zero offset clamps to :59.999, non-zero rolls to
+//	              the next minute's :00.000                        (1ms apart)
+//	half-ms tie   59.0025s  -> zero offset prints .002, non-zero rounds up to
+//	              .003                                             (1ms apart)
+//	DAY tail      the last 0.5ms of a day whose day-of-month is >= 29: the rounded
+//	              iJD advances the DATE while the raw clock still prints 23:59:59.999,
+//	              so "2026-12-31 23:59:59.9995+00:00" renders "2027-01-01 23:59:59.999"
+//	                                                             (nearly 24 HOURS apart)
+//
+// The day-tail band is why a millisecond of slack on the bound is not a fix: the
+// error there is not bounded by a millisecond. The predicate compares julianday()
+// instead, which is computed from iJD by the same code path on every face and is
+// therefore face-INDEPENDENT — measured by
+// TestTimeBoundPredicate_CrossFaceNormalizationIsFaceIndependent.
+func crossFaceDivergenceBands() []struct {
+	name    string
+	instant time.Time
+} {
+	return []struct {
+		name    string
+		instant time.Time
+	}{
+		// Minute tail: the last ~500us of a minute.
+		{"minute-tail-.9999", time.Date(2026, 8, 1, 12, 34, 59, 999_900_000, time.UTC)},
+		{"minute-tail-.999999999", time.Date(2026, 8, 1, 12, 34, 59, 999_999_999, time.UTC)},
+		{"minute-tail-.9995", time.Date(2026, 8, 1, 12, 34, 59, 999_500_000, time.UTC)},
+		// Exact half-millisecond ties, at the end of a minute and mid-minute.
+		{"half-ms-tie-59.0025", time.Date(2026, 8, 1, 12, 34, 59, 2_500_000, time.UTC)},
+		{"half-ms-tie-17.5005", time.Date(2026, 8, 1, 12, 34, 17, 500_500_000, time.UTC)},
+		// Second :01 at +500us is one of the exact offsets
+		// TestSearchJobs_SubMillisecondCrossFaceNeverDropsAnInsideRow already
+		// sweeps, on the exact second it sweeps. It diverges. That test misses it
+		// only because its window brackets the row by ±5ms.
+		{"half-ms-tie-01.0005", time.Date(2026, 8, 1, 12, 34, 1, 500_000, time.UTC)},
+		// Day tail on a day-of-month >= 29, where the TEXT form is a DAY out.
+		{"day-tail-12-31", time.Date(2026, 12, 31, 23, 59, 59, 999_900_000, time.UTC)},
+		{"day-tail-08-29", time.Date(2026, 8, 29, 23, 59, 59, 999_500_000, time.UTC)},
+	}
+}
+
+// TestTimeBoundPredicate_CrossFaceNormalizationIsFaceIndependent measures the
+// premise the cross-face arm rests on, and is the durable form of the measurement
+// that replaces the one this file used to record.
+//
+// The old premise — "strftime('%f') renders a given instant identically on every
+// face" — was stated as measured fact in three godocs and is FALSE; the first
+// subtest below is its counter-example, kept as a live control so a revert to text
+// normalization cannot pass silently. The predicate normalizes with julianday()
+// instead, whose value is iJD/86400000.0 and whose iJD is built by one arithmetic
+// path (date -> ms, plus h/m/s -> ms with a single half-up rounding of the seconds,
+// minus a whole-minute offset) that cannot depend on the face. The second subtest
+// asserts that, and the third asserts the resolution is genuinely retained rather
+// than collapsed.
+func TestTimeBoundPredicate_CrossFaceNormalizationIsFaceIndependent(t *testing.T) {
+	s := newTestStorage(t)
+	if !s.isSQLite {
+		t.Skip("cross-face normalization is a SQLite storage property")
+	}
+	ctx := context.Background()
+
+	renderText := func(v time.Time) string {
+		var out *string
+		require.NoError(t, s.db.WithContext(ctx).Raw(
+			"SELECT strftime('%Y-%m-%d %H:%M:%f', ?)", v).Scan(&out).Error)
+		require.NotNil(t, out, "strftime returned NULL for %s", v)
+		return *out
+	}
+	renderInstant := func(v time.Time) float64 {
+		var out *float64
+		require.NoError(t, s.db.WithContext(ctx).Raw(
+			"SELECT julianday(?)", v).Scan(&out).Error)
+		require.NotNil(t, out, "julianday returned NULL for %s", v)
+		return *out
+	}
+
+	t.Run("the text form is NOT face-independent", func(t *testing.T) {
+		// Every band must still be a LIVE divergence. Without this, a future SQLite
+		// that renders consistently would leave the bands intact but inert, and the
+		// matrix tests below would go on passing while covering nothing — which is
+		// how this repo shipped the false claim in the first place.
+		for _, band := range crossFaceDivergenceBands() {
+			base := renderText(band.instant.In(time.UTC))
+			diverged := false
+			for _, face := range storedClockFaces() {
+				got := renderText(band.instant.In(face))
+				if got != base {
+					diverged = true
+					t.Logf("%-22s +00:00 -> %q   %s -> %q", band.name, base, face, got)
+					break
+				}
+			}
+			assert.True(t, diverged,
+				"%s no longer renders differently on any face: this band has stopped "+
+					"controlling anything and needs re-deriving against the current SQLite",
+				band.name)
+		}
+	})
+
+	t.Run("julianday is face-independent on every band", func(t *testing.T) {
+		for _, band := range crossFaceDivergenceBands() {
+			want := renderInstant(band.instant.In(time.UTC))
+			for _, face := range storedClockFaces() {
+				got := renderInstant(band.instant.In(face))
+				assert.Equal(t, want, got,
+					"%s on %s: julianday must name one instant on every face (off by %.6fms)",
+					band.name, face, (got-want)*86400000)
+			}
+		}
+	})
+
+	t.Run("julianday keeps millisecond resolution", func(t *testing.T) {
+		// Face-independence would also be satisfied by a normalization that
+		// collapsed everything to a constant. It must still SEPARATE adjacent
+		// milliseconds, at both ends of the representable range.
+		for _, anchor := range []time.Time{
+			time.Date(2026, 8, 1, 12, 34, 59, 0, time.UTC),
+			representableBoundFloor,
+			representableBoundCeil.Add(-time.Second),
+		} {
+			lo := renderInstant(anchor)
+			hi := renderInstant(anchor.Add(time.Millisecond))
+			assert.Less(t, lo, hi,
+				"adjacent milliseconds at %s must stay ordered after normalization", anchor)
+		}
+	})
+}
+
+// TestSearchJobs_CrossFaceBoundExactlyOnARowIsNeverDropped is the user-visible
+// half: a row sitting EXACTLY on an inclusive bound, in a band where the two
+// renderings disagree, must still be returned.
+//
+// This is the case the shipped predicate got wrong. It is the reachable
+// deployment, not a contrivance: a worker in a non-UTC zone stores created_at on
+// that face, and a bound arriving over the RPC is unconditionally UTC-faced
+// (timestamppb.AsTime), so the two sides routinely differ. A caller asking for
+// "everything up to this job's created_at" got an empty page, and CountDeadLettered
+// under-counted.
+//
+// The bound is placed ON the instant rather than a few milliseconds either side,
+// because a bracketed window cannot distinguish a correct predicate from one whose
+// error is smaller than the bracket.
+func TestSearchJobs_CrossFaceBoundExactlyOnARowIsNeverDropped(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+	if !s.isSQLite {
+		t.Skip("cross-face normalization is a SQLite storage property")
+	}
+
+	faces := storedClockFaces()
+	for _, band := range crossFaceDivergenceBands() {
+		for ri, rowFace := range faces {
+			queue := fmt.Sprintf("xf_%s_%d", band.name, ri)
+			seedJobCreatedAt(t, ctx, s, queue, "row", band.instant.In(rowFace))
+
+			for _, boundFace := range faces {
+				_, total, err := s.SearchJobs(ctx, core.JobFilter{
+					Queue: queue, Limit: 10,
+					Until: band.instant.In(boundFace),
+				})
+				require.NoError(t, err)
+				assert.Equal(t, int64(1), total,
+					"%s: row on %s, INCLUSIVE until on %s, bound == the row's own instant",
+					band.name, rowFace, boundFace)
+
+				_, total, err = s.SearchJobs(ctx, core.JobFilter{
+					Queue: queue, Limit: 10,
+					Since: band.instant.In(boundFace),
+				})
+				require.NoError(t, err)
+				assert.Equal(t, int64(1), total,
+					"%s: row on %s, INCLUSIVE since on %s, bound == the row's own instant",
+					band.name, rowFace, boundFace)
+			}
+		}
+	}
+}
+
+// TestDeadLetterQueries_CrossFaceBoundExactlyOnARowIsNeverDropped is the
+// dead-letter mirror, because core.DeadLetterFilter carries the same promise on
+// its own godoc and CountDeadLettered under-counting is how an operator sees this.
+//
+// deadLetter() drives the real terminal-failure path per fixture, so this walks a
+// representative face PAIR per band rather than the full 7x7 matrix; the exhaustive
+// face coverage is above, on the cheaper column.
+func TestDeadLetterQueries_CrossFaceBoundExactlyOnARowIsNeverDropped(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+	if !s.isSQLite {
+		t.Skip("cross-face normalization is a SQLite storage property")
+	}
+
+	// Both directions of the writer/reader face split: a UTC-faced row read with a
+	// non-UTC bound, and the mirror.
+	pairs := []struct{ row, bound *time.Location }{
+		{time.UTC, time.FixedZone("minus0700", -7*3600)},
+		{time.FixedZone("plus0530", 5*3600+1800), time.UTC},
+	}
+	for _, band := range crossFaceDivergenceBands() {
+		for pi, pair := range pairs {
+			queue := fmt.Sprintf("xfdlq_%s_%d", band.name, pi)
+			deadLetter(t, ctx, s, queue, "row", band.instant.Add(-time.Hour), band.instant.In(pair.row))
+
+			for _, filter := range []core.DeadLetterFilter{
+				{Queue: queue, Limit: 10, DeadLetteredUntil: band.instant.In(pair.bound)},
+				{Queue: queue, Limit: 10, DeadLetteredSince: band.instant.In(pair.bound)},
+			} {
+				jobs, err := s.ListDeadLettered(ctx, filter)
+				require.NoError(t, err)
+				assert.Len(t, jobs, 1,
+					"%s: died on %s, bound on %s -- a job that died inside the window is never dropped",
+					band.name, pair.row, pair.bound)
+
+				total, err := s.CountDeadLettered(ctx, filter)
+				require.NoError(t, err)
+				assert.Equal(t, int64(1), total,
+					"%s: died on %s, bound on %s -- CountDeadLettered must not under-count",
+					band.name, pair.row, pair.bound)
 			}
 		}
 	}

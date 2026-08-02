@@ -327,9 +327,46 @@ func pwUnderlying(t reflect.Type) (reflect.Type, bool) {
 	}
 }
 
+// pwRulesMustContribute is the CANONICAL list of the rules this sweep covers,
+// written down here rather than derived from whatever the generator happened to
+// hand back.
+//
+// THAT DISTINCTION IS THE WHOLE POINT. The per-rule accounting below used to
+// build its list of rules FROM the pairs (`for _, p := range pairs { rules[p.rule]
+// = true }`), so it could only ever audit a rule that had already produced at
+// least one pair. A rule that generated NOTHING never entered the map and was
+// reported by no one: neutering the `member-omitempty-toggled` loop with a single
+// `continue` removed 108 armed subtests — the rule this file's header calls
+// "exactly the rev-3 and rev-4 leak", and the only rule that toggles `omitempty`
+// on a populated member — and `go test ./pkg/call/` still printed `ok`. A
+// generator loop whose filter widens, a fixture list that loses an entry, a
+// refactor of structFixtures: any of them silently deletes a rule, and the sweep
+// that exists to stop a false-fire family from shipping quietly stops covering
+// one.
+//
+// Registering a rule here is therefore part of adding one. The accounting reports
+// both directions — a listed rule that generated nothing, and a generated rule
+// that is not listed — so neither the list nor the generator can drift alone.
+var pwRulesMustContribute = []string{
+	"array-vs-slice",
+	"embed-ptr-vs-embed",
+	"embed-ptr-vs-inlined",
+	"embed-vs-inlined",
+	"member-T-vs-ptrT",
+	"member-array-vs-slice",
+	"member-named-vs-underlying",
+	"member-omitempty-toggled",
+	"member-slice-elem-T-vs-ptrT",
+	"named-vs-underlying",
+	"result-T-vs-ptrT",
+	"slice-elem-T-vs-ptrT",
+}
+
 // pwGeneratePairs builds every (typeA, typeB) the rules can produce. Each pair is
 // a claim: "these two serialize identically". Step 1 of the test verifies that
 // claim before anything is asserted on it.
+//
+// EVERY RULE IT IMPLEMENTS MUST BE LISTED IN pwRulesMustContribute.
 func pwGeneratePairs() []pwPair {
 	var pairs []pwPair
 	add := func(rule, name string, a, b reflect.Type, sliceLen int) {
@@ -519,6 +556,61 @@ func pwPlacements() []pwPlacement {
 	}
 }
 
+// pwRuleNames collects the DISTINCT rule names a generator actually emitted, in
+// no particular order. Used only as one half of the audit — never as the list of
+// rules to audit, which is the bug this pair of helpers exists to close.
+func pwRuleNames[P interface{ ruleName() string }](pairs []P) map[string]bool {
+	out := map[string]bool{}
+	for _, p := range pairs {
+		out[p.ruleName()] = true
+	}
+	return out
+}
+
+func (p pwPair) ruleName() string      { return p.rule }
+func (p pwIfacePair) ruleName() string { return p.rule }
+
+// pwAuditedRules reconciles the canonical rule list against what the generator
+// emitted and returns the sorted union to report on, plus the set that really
+// produced pairs.
+//
+// It reports BOTH failures, because each one is a different way for the sweep to
+// go quietly vacuous:
+//
+//   - a CANONICAL rule that generated nothing — the generator lost it, and every
+//     subtest it should have armed is gone with no other signal;
+//   - a GENERATED rule that is not canonical — a rule was added without being
+//     registered, so nothing would notice if IT later stopped generating.
+func pwAuditedRules(t *testing.T, canonical []string, generated map[string]bool) ([]string, map[string]bool) {
+	t.Helper()
+	listed := map[string]bool{}
+	names := make([]string, 0, len(canonical)+len(generated))
+	for _, r := range canonical {
+		if listed[r] {
+			continue // a duplicated entry is cosmetic; report it once
+		}
+		listed[r] = true
+		names = append(names, r)
+		if !generated[r] {
+			t.Errorf("rule %q generated NO pairs at all: the generator emits nothing for it and "+
+				"every subtest it should have armed is gone. Accounting derived from the pairs "+
+				"cannot see this — the rule name simply never appears — which is why the list is "+
+				"written down separately. Either restore the generator or delete the rule from "+
+				"the canonical list deliberately", r)
+		}
+	}
+	for r := range generated {
+		if listed[r] {
+			continue
+		}
+		names = append(names, r)
+		t.Errorf("rule %q produced pairs but is not on the canonical rule list; add it there, or "+
+			"nothing will notice when it stops producing any", r)
+	}
+	sort.Strings(names)
+	return names, generated
+}
+
 // ---- the sweep --------------------------------------------------------------
 
 type pwOutcome int
@@ -605,18 +697,13 @@ func TestResultShape_PairwiseWireIdenticalTypesFingerprintIdentically(t *testing
 	}
 
 	t.Run("every-rule-contributed-a-valid-pair", func(t *testing.T) {
-		rules := map[string]bool{}
-		for _, p := range pairs {
-			rules[p.rule] = true
-		}
-		names := make([]string, 0, len(rules))
-		for r := range rules {
-			names = append(names, r)
-		}
-		sort.Strings(names)
+		names, generated := pwAuditedRules(t, pwRulesMustContribute, pwRuleNames(pairs))
 		for _, r := range names {
 			t.Logf("rule %-32s valid=%d skipped-not-wire-identical=%d both-sides-record-no-shape=%d",
 				r, valid[r], invalid[r], bothEmpty[r])
+			if !generated[r] {
+				continue // already reported by pwAuditedRules; the counts below are all zero
+			}
 			if valid[r] == 0 {
 				t.Errorf("rule %q produced no valid (wire-identical) pair at any placement, so it "+
 					"asserts nothing; a silently vacuous rule is worse than no rule", r)
@@ -1171,6 +1258,24 @@ type pwIfacePair struct {
 	sliceLen int
 }
 
+// pwIfaceRulesMustContribute is the canonical list for the interface sweep, kept
+// for exactly the reason pwRulesMustContribute is: this accounting derived its
+// rules from the pairs too, so a rule that generated nothing was invisible here
+// as well. EVERY RULE pwGenerateInterfacePairs IMPLEMENTS MUST BE LISTED.
+var pwIfaceRulesMustContribute = []string{
+	"iface-any-vs-named-interface",
+	"iface-behind-embed-omitempty-toggled",
+	"iface-behind-pointer-omitempty-toggled",
+	"iface-map-value",
+	"iface-member-omitempty-toggled",
+	"iface-named-member-omitempty-toggled",
+	"iface-result-T-vs-ptrT",
+	"iface-result-any-vs-named",
+	"iface-sibling-T-vs-ptrT",
+	"iface-sibling-omitempty-toggled",
+	"iface-slice-element",
+}
+
 func pwGenerateInterfacePairs() []pwIfacePair {
 	var out []pwIfacePair
 	add := func(rule, name string, a, b, control reflect.Type) {
@@ -1321,17 +1426,12 @@ func TestResultShape_PairwiseInterfaceVariantsRecordNoShape(t *testing.T) {
 	}
 
 	t.Run("every rule is armed somewhere, and at every placement the policy names", func(t *testing.T) {
-		rules := make([]string, 0, len(armed))
-		seen := map[string]bool{}
-		for _, p := range pairs {
-			if !seen[p.rule] {
-				seen[p.rule] = true
-				rules = append(rules, p.rule)
-			}
-		}
-		sort.Strings(rules)
+		rules, generated := pwAuditedRules(t, pwIfaceRulesMustContribute, pwRuleNames(pairs))
 		for _, r := range rules {
 			t.Logf("rule %-42s armed=%d skipped-not-wire-identical=%d", r, armed[r], invalid[r])
+			if !generated[r] {
+				continue // already reported by pwAuditedRules; the counts below are all zero
+			}
 			if armed[r] == 0 {
 				t.Errorf("rule %q is never armed: at every placement the CONTROL also records no "+
 					"shape, so the rule is observing the depth cap rather than the interface "+

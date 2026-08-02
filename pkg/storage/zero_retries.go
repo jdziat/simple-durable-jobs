@@ -18,10 +18,30 @@ import (
 // The tag cannot simply be dropped. AutoMigrate would see a changed column
 // definition and REBUILD the SQLite jobs table, destroying the indexes created by
 // versioned migrations — measured at 14 before the upgrade and 4 after.
+//
+// WHY THE FLAG AND NOT `MaxRetries == 0`
+//
+// The value alone does not carry the intent, and treating it as if it did is a
+// silent breaking change for a documented API. core.Storage is exported, and
+//
+//	store.Enqueue(ctx, &core.Job{Type: "charge", Queue: "default", Args: args})
+//
+// leaves MaxRetries at 0 because the caller never mentioned retries — not because
+// they asked for none. Keying off the value corrects that row to 0 too, so a job
+// that survived a transient failure on every shipped release now dead-letters on
+// the first one, with nothing in the API surface changed to warn anyone.
+//
+// The distinction has to come from the layer that knows: queue.Options already
+// tracked it as retriesSet, and core.Job.MaxRetriesSet is how it reaches here.
+// A caller that constructs a core.Job by hand and genuinely wants zero sets it
+// explicitly; a caller that says nothing keeps the column default, exactly as
+// before. Both halves are pinned, over the same eight enqueue paths, by
+// TestExplicitZeroRetriesSurvivesEveryEnqueuePath and
+// TestOmittedMaxRetriesKeepsTheColumnDefaultOnEveryEnqueuePath.
 func explicitZeroRetryIDs(jobs ...*core.Job) []core.UUID {
 	var ids []core.UUID
 	for _, j := range jobs {
-		if j != nil && j.MaxRetries == 0 {
+		if j != nil && j.MaxRetriesSet && j.MaxRetries == 0 {
 			ids = append(ids, j.ID)
 		}
 	}

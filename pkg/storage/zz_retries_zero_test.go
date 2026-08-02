@@ -24,7 +24,7 @@ func TestEnqueuePreservesAnExplicitZeroRetries(t *testing.T) {
 
 	job := &core.Job{
 		ID: core.NewID(), Type: "charge", Queue: "default",
-		Status: core.StatusPending, MaxRetries: 0,
+		Status: core.StatusPending, MaxRetries: 0, MaxRetriesSet: true,
 	}
 	require.NoError(t, s.Enqueue(context.Background(), job))
 

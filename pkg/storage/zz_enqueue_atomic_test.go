@@ -59,7 +59,7 @@ func TestEnqueue_ZeroRetryRowIsNeverExternallyVisibleCarryingTheDefault(t *testi
 	}))
 	t.Cleanup(func() { _ = s.db.Callback().Create().Remove(cbName) })
 
-	job := &core.Job{Type: "zero-retry", Queue: "atomicq", MaxRetries: 0}
+	job := &core.Job{Type: "zero-retry", Queue: "atomicq", MaxRetries: 0, MaxRetriesSet: true}
 	require.NoError(t, s.Enqueue(ctx, job))
 
 	require.False(t, observed,
@@ -88,7 +88,15 @@ func TestEnqueue_DuplicateUniqueKeyLeavesNothingBehind(t *testing.T) {
 
 	// A second enqueue on the same key asks for ZERO retries. It must be refused
 	// AND must not touch the winner's row.
-	second := &core.Job{Type: "dedup", Queue: "dupq", UniqueKey: "same-key", MaxRetries: 0}
+	//
+	// MaxRetriesSet is load-bearing in this fixture, not decoration: without it the
+	// loser's zero is not a deliberate Retries(0), the corrective UPDATE never arms,
+	// and the guard under test (skip it when OnConflict inserted nothing) would be
+	// green with the guard deleted.
+	second := &core.Job{
+		Type: "dedup", Queue: "dupq", UniqueKey: "same-key",
+		MaxRetries: 0, MaxRetriesSet: true,
+	}
 	require.ErrorIs(t, s.Enqueue(ctx, second), core.ErrDuplicateJob)
 
 	var stored core.Job

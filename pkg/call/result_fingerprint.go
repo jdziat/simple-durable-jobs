@@ -440,6 +440,9 @@ func build(t reflect.Type, depth int, free []reflect.Type, budget *int) (reflect
 			}
 			f.Set(sub)
 		}
+		if !probeSpeaksForType(t, v) {
+			return reflect.Value{}, false
+		}
 		return v, true
 
 	case reflect.Slice:
@@ -532,6 +535,183 @@ func build(t reflect.Type, depth int, free []reflect.Type, budget *int) (reflect
 	}
 }
 
+// probeSpeaksForType reports whether the wire form the probe produces for t can
+// be trusted to describe the type rather than merely the value the probe managed
+// to build. When it cannot, the whole probe fails and t records NO SHAPE — the
+// same single outcome every other boundary in this file has, and for the same
+// reason: a shape that is wrong is a FALSE FIRE, and a false fire wedges a live
+// workflow while a miss only leaves prior behaviour in place.
+//
+// THE HAZARD. build's struct case cannot set a plain unexported field — reflect
+// forbids it and, unlike an unexported EMBEDDED field, there is nothing to
+// promote through, so it is left zero. That is harmless for an ordinary struct:
+// encoding/json never serializes an unexported field, so state the probe could
+// not populate cannot reach the wire. It stops being harmless the moment the
+// type carries its own MARSHALER, because a marshaler may read whatever it likes
+// — and one that reads ONLY unexported state describes the ZERO of that state.
+//
+// That case does not fail open on its own. A VALIDATING marshaler (net.IP, an
+// enum) REJECTS the fabricated probe, resultShape's marshal errors, and the type
+// records no shape. This one ACCEPTS it and returns valid JSON, so a shape IS
+// recorded — the zero's structure, presented as the type's.
+//
+// The idiom that makes it bite is the standard Option/Maybe: an unexported
+// `present bool` beside an unexported value, MarshalJSON emitting null when
+// absent and the payload when present (samber/mo, moznion/go-optional, every
+// hand-rolled equivalent). The probe's Option is ABSENT, so `Opt Option[Inner]`
+// shapes as `{opt:null}`. The ordinary simplification `Option[Inner] -> *Inner`
+// is byte-identical for every value — present emits the object, absent emits
+// null — and shapes as `{opt:{a:number,b:string}}`, so replay refuses a
+// checkpoint that decodes into the new type losslessly. Same mechanism, second
+// wire form: a set backed by an unexported map that marshals as a sorted array
+// probes as an EMPTY array, so `{tags:[]}` and the byte-identical `[]string`
+// form's `{tags:[string]}` split apart too.
+//
+// WHY NOT "ANY TYPE WITH A MARSHALER RECORDS NO SHAPE". That rule is correct and
+// unusable: time.Time carries a marshaler over three unexported fields, so every
+// result with a timestamp — which is most of them — would go unguarded, and the
+// feature would be disarmed for ordinary code rather than for an exotic corner.
+//
+// THE LINE DRAWN INSTEAD: trust the probe's wire form exactly when it is a JSON
+// SCALAR. A scalar has no internal structure for the probe to have got wrong —
+// describe records its KIND and nothing else, and the kind of `""` is the kind
+// of "10.0.0.1". An object, an array or null all carry structure that comes from
+// the state the probe could not set: an object's member set, an array's element
+// shape, and null's everything. So time.Time (a string), netip.Addr (a string,
+// empty at the zero), *big.Int (a number) and a decimal-as-string keep exactly
+// the shapes they had, while the Option (null) and the set ([]) record none.
+//
+// Note the check runs on the built VALUE rather than on a rule about the type,
+// which is what keeps it out of the mirror-encoding/json business this file was
+// rebuilt to escape: the real encoder is handed the real value and its answer is
+// read back.
+//
+// encoding.TextMarshaler IS DELIBERATELY NOT CONSIDERED, and that is not an
+// oversight to be "fixed" later: encoding/json renders a TextMarshaler's output
+// as a JSON STRING, always, so its wire form is scalar by construction and can
+// never misrepresent structure. Naming it here would add a condition no test
+// could ever distinguish from its absence — the redundant-clause failure this
+// file has been through before.
+//
+// RESIDUAL, stated rather than papered over: a marshaler whose ZERO emits a
+// scalar of one kind while populated values emit another — `""` when absent and
+// an object when present — is still described by its zero and can still false
+// fire. Nothing in a probe that cannot populate the state can distinguish that
+// from netip.Addr, and disarming it means disarming time.Time. The second
+// residual is that the unexported state is only looked for on t ITSELF; a
+// marshaler that reaches into an exported member's unexported fields is not
+// detected. Both are narrower than the hazard closed here.
+func probeSpeaksForType(t reflect.Type, v reflect.Value) bool {
+	if !hasUnpopulatedState(t) {
+		return true
+	}
+	// THE POINTER FORM IS READ FOR BOTH RECEIVER KINDS, and that is one branch on
+	// purpose. A VALUE-receiver MarshalJSON is in *T's method set too and produces
+	// the same bytes through it, so a separate value-form branch would be a clause
+	// no fixture could ever distinguish from its absence. A POINTER-receiver one
+	// is reachable ONLY through an address — a slice element, anything behind a
+	// pointer — and is invisible to a value-form probe, which is the half a
+	// value-only check would miss.
+	//
+	// Where a pointer-receiver marshaler is NOT reachable (a plain struct field,
+	// a map value, an array element) encoding/json emits the ordinary struct
+	// encoding and the probe would have been right, so refusing there costs a
+	// miss. This file does not model addressability (see build) and will not start
+	// for this: the cost of being conservative is a miss, the cost of being wrong
+	// is a wedge.
+	pt := reflect.PointerTo(t)
+	if !pt.Implements(jsonMarshalerType) {
+		return true
+	}
+	p := reflect.New(t)
+	p.Elem().Set(v)
+	return marshalsToScalar(p)
+}
+
+// hasUnpopulatedState reports whether build left any state inside t at its zero
+// because reflect cannot write it.
+//
+// A plain unexported field qualifies outright: build skips it entirely.
+//
+// An unexported EMBEDDED field is different and needs recursion, which an earlier
+// version of this function got wrong. build DOES write it — it reaches the
+// addressable storage (see build's struct case) — so the field itself is not the
+// problem. But it writes only what build could produce, and build cannot set that
+// embedded type's OWN plain unexported fields. So a marshaler on the outer type
+// reading through the embed still describes a zero, and the false fire this whole
+// guard exists to stop survives one level down. The earlier godoc asserted the
+// opposite ("an unexported EMBEDDED field is populated through its addressable
+// storage") as though writing the field settled the question; it does not.
+//
+// visited bounds the walk. Mutually-embedded pointer types (`type a struct{ *b }`
+// with `type b struct{ *a }`) are legal Go, and without it this recurses forever
+// on the write path AND the replay path, where recover() cannot catch the stack
+// overflow.
+func hasUnpopulatedState(t reflect.Type) bool {
+	return hasUnpopulatedStateSeen(t, nil)
+}
+
+func hasUnpopulatedStateSeen(t reflect.Type, visited []reflect.Type) bool {
+	if t.Kind() != reflect.Struct {
+		return false
+	}
+	for _, seen := range visited {
+		if seen == t {
+			return false // already accounted for on this path
+		}
+	}
+	visited = append(visited, t)
+
+	for i := 0; i < t.NumField(); i++ {
+		sf := t.Field(i)
+		if sf.PkgPath == "" {
+			continue // exported: build sets it outright
+		}
+		if !sf.Anonymous {
+			return true // plain unexported: build skips it
+		}
+		ft := sf.Type
+		if ft.Kind() == reflect.Pointer {
+			ft = ft.Elem()
+		}
+		if hasUnpopulatedStateSeen(ft, visited) {
+			return true
+		}
+	}
+	return false
+}
+
+// marshalsToScalar reports whether v serializes to a JSON string, number or
+// boolean — a wire form with no internal structure.
+//
+// It is written as a REJECTLIST of the three structured forms rather than an
+// allowlist of the scalar ones, because the rejectlist is provably complete: the
+// first byte of anything json.Marshal produces is one of `{ [ n " t f -` or a
+// digit, so excluding object, array and null leaves exactly the scalars. An
+// allowlist would carry clauses for `-` and each digit that no fixture could
+// distinguish from their absence.
+//
+// THE ERROR BRANCH CANNOT BE KILLED BY A TEST, and is kept anyway — stated here
+// so the next reviewer does not spend an afternoon writing the fixture that
+// would. json.Marshal returns nil bytes with its error, so deleting the branch
+// indexes b[0] on nil, and the resulting panic is caught by resultShape's
+// recover and turned into the SAME "no shape" this returns. The whole suite
+// stays green through that mutation. Reaching the outcome deliberately beats
+// reaching it through a recovered index panic, and nothing checks for EMPTY
+// output beside it: a successful Marshal never returns an empty document, so a
+// length check could not be told apart from this one either.
+func marshalsToScalar(v reflect.Value) bool {
+	b, err := json.Marshal(v.Interface())
+	if err != nil {
+		return false
+	}
+	switch b[0] {
+	case '{', '[', 'n':
+		return false
+	}
+	return true
+}
+
 // promotesIntoParent reports whether encoding/json splices sf's members straight
 // into the PARENT object instead of nesting them under a key of their own — the
 // one struct-field case that adds no JSON nesting level.
@@ -605,6 +785,7 @@ func synthesizeMapKey(t reflect.Type) (reflect.Value, bool) {
 var (
 	jsonNumberType     = reflect.TypeOf(json.Number(""))
 	jsonRawMessageType = reflect.TypeOf(json.RawMessage(nil))
+	jsonMarshalerType  = reflect.TypeOf((*json.Marshaler)(nil)).Elem()
 )
 
 // describe renders decoded JSON as a canonical shape: object members sorted by

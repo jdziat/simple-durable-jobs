@@ -109,9 +109,10 @@ func TestClaimScheduledFire_LegacyUTCCursorStillClaims(t *testing.T) {
 // the schedule silently stopped for the length of the UTC offset before
 // self-healing. Normalizing to local instead breaks the UTC family the same way.
 // The comparison has to be face-independent, which is what the shipped predicate
-// gives: raw text when the two offsets match, strftime-normalized instants when
+// gives: raw text when the two offsets match, julianday()-normalized instants when
 // they differ. (Not datetime() — that truncates to whole SECONDS and stalls
-// sub-second schedules; see scheduleCursorLess.)
+// sub-second schedules; and not strftime(), which is not face-independent at all —
+// see scheduleCursorLess.)
 //
 // FALSE-GREEN TRAP: a fixed zone whose offset is NEGATIVE relative to UTC still
 // sorts correctly as text, so it passes with the bug present. The probe zone must
@@ -141,24 +142,34 @@ func TestClaimScheduledFire_LegacyLocalFacedCursorStillClaims(t *testing.T) {
 // TestScheduleCursorLess_NormalizesEveryStoredShape pins the normalizing
 // expression against every value the column can actually hold.
 //
-// The claim predicate is only correct if strftime() renders the SAME UTC instant
-// for the same moment however it was written — and the driver can have written it
-// on any offset, with or without sub-second digits, and older rows may predate
+// The claim predicate is only correct if the normalizer yields the SAME value for
+// the same moment however it was written — and the driver can have written it on
+// any offset, with or without sub-second digits, and older rows may predate
 // conventions this wave assumes. A shape it silently got wrong would resurrect the
 // stalled-schedule bug for exactly the deployments that have been running longest.
 //
 // FALSE-GREEN TRAP: comparing each rendering to a hardcoded string tests the
 // format, not the property. The property is that equal instants render EQUAL and
 // ordered instants render ORDERED, which is what the claim compares.
+//
+// SECOND FALSE-GREEN TRAP, and it caught this file: every instant below is
+// WHOLE-SECOND, so none of them can reach a rounding boundary. This test passed
+// while the normalizer it exercised rendered one instant TWO DIFFERENT WAYS
+// depending on whether its offset was zero. The predicate no longer uses that
+// expression, and TestClaimScheduledFire_CrossFaceCursorInADivergenceBandStillAdvances
+// covers the instants this one structurally cannot.
 func TestScheduleCursorLess_NormalizesEveryStoredShape(t *testing.T) {
 	s := newTestStorage(t)
 	if !s.isSQLite {
 		t.Skip("the normalizing expression is SQLite-only; PG/MySQL compare real timestamps")
 	}
-	const expr = `strftime('%Y-%m-%d %H:%M:%f', ?)`
+	// The expression the predicate actually normalizes with. It must stay in step
+	// with scheduleCursorLess: pinning a DIFFERENT expression here is how a test
+	// keeps passing after the code under it changed.
+	const expr = `julianday(?)`
 
-	render := func(v any) *string {
-		var out *string
+	render := func(v any) *float64 {
+		var out *float64
 		require.NoError(t, s.DB().Raw("SELECT "+expr, v).Scan(&out).Error)
 		return out
 	}
@@ -201,10 +212,74 @@ func TestScheduleCursorLess_NormalizesEveryStoredShape(t *testing.T) {
 	assert.Nil(t, render(nil), "NULL must stay NULL so the claim fails closed")
 }
 
+// TestClaimScheduledFire_CrossFaceCursorInADivergenceBandStillAdvances is the
+// schedule-side half of the defect that
+// TestTimeBoundPredicate_CrossFaceNormalizationIsFaceIndependent measures.
+//
+// The test above only ever feeds the normalizer WHOLE-SECOND instants, so it
+// cannot see that SQLite's TEXT rendering of one instant depends on whether its
+// offset is zero: it is exactly the blind spot that let the "renders identically
+// on every face" claim ship. scheduleCursorLess ran the same text normalization,
+// so a cursor landing in a divergence band compared wrong against a boundary on a
+// different face — and unlike the read-side window, the consequence here is a
+// SCHEDULE THAT STOPS: the claim matches nothing and simply never fires.
+//
+// The day-tail band is the one to look at. A cursor stored at
+// 2026-12-31 23:59:59.9999 on a UTC face rendered "2027-01-01 23:59:59.999" —
+// the rounded date with the raw clock, nearly 24 HOURS ahead of the instant — so
+// every boundary for the following day compared "not less than" and the schedule
+// was dead until the next midnight.
+func TestClaimScheduledFire_CrossFaceCursorInADivergenceBandStillAdvances(t *testing.T) {
+	s := newTestStorage(t)
+	if !s.isSQLite {
+		t.Skip("the normalizing expression is SQLite-only; PG/MySQL compare real timestamps")
+	}
+	ctx := context.Background()
+
+	// Faces that make the two sides of the comparison differ: the cursor is
+	// written by a UTC-faced process (zero offset, the raw-render arm) and the
+	// boundary carries a schedule's own location (non-zero, the recomputed arm).
+	elsewhere := time.FixedZone("probe-0700", -7*3600)
+
+	for _, band := range crossFaceDivergenceBands() {
+		require.NoError(t, s.DB().Create(&core.ScheduledFire{
+			Name: "stall-" + band.name, LastFireAt: band.instant.In(time.UTC),
+		}).Error)
+
+		// A boundary a full second later is unambiguously after the cursor on any
+		// reading; only a normalization that is a DAY out can refuse it.
+		won, err := s.ClaimScheduledFire(ctx, "stall-"+band.name,
+			band.instant.Add(time.Second).In(elsewhere))
+		require.NoError(t, err)
+		assert.True(t, won,
+			"%s: a cursor stored on +00:00 must not block a boundary one second later "+
+				"expressed on %s — a refused claim is a schedule that silently stops",
+			band.name, elsewhere)
+	}
+
+	// The mirror, and the one the millisecond-scale bands reach: the boundary is
+	// the cursor's OWN instant on another face. `last_fire_at < ?` is STRICT, so
+	// that must not claim. Under text normalization the two sides rendered a
+	// millisecond apart and it did — the same boundary fires TWICE, which for a
+	// job schedule means a duplicate enqueue.
+	for _, band := range crossFaceDivergenceBands() {
+		require.NoError(t, s.DB().Create(&core.ScheduledFire{
+			Name: "dup-" + band.name, LastFireAt: band.instant.In(time.UTC),
+		}).Error)
+
+		won, err := s.ClaimScheduledFire(ctx, "dup-"+band.name, band.instant.In(elsewhere))
+		require.NoError(t, err)
+		assert.False(t, won,
+			"%s: the cursor's OWN instant re-expressed on %s is not strictly after it, "+
+				"so re-claiming it fires the same boundary twice",
+			band.name, elsewhere)
+	}
+}
+
 // TestClaimScheduledFire_SubMillisecondBoundariesStillAdvance guards a regression
 // the instant-normalization introduced.
 //
-// Normalizing BOTH sides truncates to the expression's resolution: strftime('%f')
+// Normalizing BOTH sides truncates to the expression's resolution: julianday()
 // keeps milliseconds, datetime() only whole seconds. Two boundaries inside one
 // millisecond then compare "not less than", the claim matches nothing, and the
 // schedule stops entirely — measured against a released v4.7.0 binary,

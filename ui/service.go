@@ -1452,16 +1452,22 @@ type deadLetterStorage interface {
 //
 // SQLite has no timestamp type, so created_at is TEXT carrying the offset of
 // whichever PROCESS wrote it. When a row's offset differs from the bound's, the
-// two are normalized through strftime(), which renders MILLISECONDS — so a row
-// less than 1ms outside the window can still be returned. The error is bounded by
-// 1ms and is always in the direction of returning MORE: a job whose created_at
-// falls inside the window is never dropped. When the offsets match — a single
-// process, or several sharing a TZ — the comparison is exact to the nanosecond.
+// two are normalized through julianday(), whose value is a MILLISECOND julian-day
+// integer — so a row less than 1ms outside the window can still be returned. The
+// error is bounded by 1ms and is always in the direction of returning MORE: a job
+// whose created_at falls inside the window is never dropped. When the offsets
+// match — a single process, or several sharing a TZ — the comparison is exact to
+// the nanosecond.
 //
 // Postgres and MySQL store a real instant and have neither limit.
 //
-// Widening that 1ms, or making it lose rows instead of admitting them, fails
-// TestSearchJobs_CrossFaceWindowResolvesToMilliseconds in pkg/storage.
+// The never-drops half of that is not a claim about rounding being harmless. An
+// earlier release normalized to TEXT with strftime() on the stated premise that it
+// renders one instant identically on every face; it does not, and rows sitting on
+// an inclusive bound WERE dropped. See timeBoundPredicate in pkg/storage for the
+// measured bands. Widening the 1ms, or making it lose rows instead of admitting
+// them, fails TestSearchJobs_CrossFaceWindowResolvesToMilliseconds and
+// TestSearchJobs_CrossFaceBoundExactlyOnARowIsNeverDropped in pkg/storage.
 type JobFilter = core.JobFilter
 
 // timeFromProto converts an optional request timestamp to the zero time when it is

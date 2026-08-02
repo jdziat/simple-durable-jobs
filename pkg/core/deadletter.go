@@ -31,11 +31,19 @@ type DeadLetterFilter struct {
 	// Both bounds select by INSTANT, whatever timezone they and the stored row are
 	// expressed in. On SQLITE ONLY there is one accepted limit: dead_lettered_at is
 	// TEXT carrying the offset of whichever process wrote it, and when that offset
-	// differs from the bound's the two are normalized at MILLISECOND resolution, so
-	// a job that died less than 1ms outside the window can still be returned. The
-	// error is bounded by 1ms and always returns MORE — a job that died inside the
-	// window is never dropped. Matching offsets compare exactly, to the nanosecond.
-	// Postgres and MySQL store a real instant and have neither limit.
+	// differs from the bound's the two are normalized through julianday(), which
+	// resolves to MILLISECONDS — so a job that died less than 1ms outside the
+	// window can still be returned. The error is bounded by 1ms and always returns
+	// MORE — a job that died inside the window is never dropped. Matching offsets
+	// compare exactly, to the nanosecond. Postgres and MySQL store a real instant
+	// and have neither limit.
+	//
+	// The never-drops half is load-bearing and was WRONG in an earlier release,
+	// which normalized to text with strftime(): SQLite renders one instant
+	// differently depending on whether its offset is zero, so a job sitting exactly
+	// on an inclusive bound was dropped and CountDeadLettered under-counted. See
+	// timeBoundPredicate in pkg/storage for the measured bands and the tests that
+	// now pin it.
 	//
 	// These are plain time.Time (comparable) on purpose — DeadLetterFilter is an
 	// exported concrete struct and the release-gating api-compat job treats a

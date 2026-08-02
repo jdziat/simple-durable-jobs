@@ -583,6 +583,30 @@ the upgrade and 4 after. Keeping the tag is what avoids that, which is why the f
 lives in the write path instead. A writer that omits `max_retries` entirely still
 gets 3 from the column default, exactly as before.
 
+**If you enqueue through `core.Storage` directly, read this.** Go cannot tell an
+`int` field set to 0 from one never touched, so the write path cannot infer intent
+from the value — and inferring it would silently turn retries **off** for every
+application whose enqueue looks like this:
+
+```go
+store.Enqueue(ctx, &core.Job{Type: "charge", Queue: "default", Args: args})
+```
+
+That job's `MaxRetries` is 0 because nobody mentioned retries. It keeps the column
+default of **3**, exactly as on every shipped release. To ask for zero from a
+hand-built `core.Job`, set the companion flag the struct now exports — the same
+idiom `fanout.SubJob{Retries: 0, RetriesSet: true}` already uses:
+
+```go
+store.Enqueue(ctx, &core.Job{Type: "charge", MaxRetries: 0, MaxRetriesSet: true})
+```
+
+`jobs.Retries(0)` and the fan-out builders set it for you, so nothing changes for
+callers going through `queue.Enqueue` or `fanout.Sub`. `MaxRetriesSet` is not
+persisted (`gorm:"-"`), so a job **read back** from the database carries `false`
+with whatever `max_retries` the row holds; re-enqueuing such a job verbatim and
+wanting to keep a stored zero means setting it again.
+
 ### A `Call` whose result type changed is caught instead of returning zero
 
 **Before:** changing a `Call`'s NAME between runs was caught loudly as a
@@ -1262,8 +1286,9 @@ re-pointed; it keeps whatever face the boundary carries. The claim's cursor
 comparison was made face-aware instead: when the stored cursor and the incoming
 boundary carry the same trailing offset the two are compared as raw text, exact
 to the nanoseconds the driver wrote; when the offsets differ, both sides are
-parsed with `strftime('%Y-%m-%d %H:%M:%f', …)` and compared as instants, to
-millisecond resolution. Normalizing writes the way `run_at` is normalized was
+parsed with `julianday(…)` and compared as instants, to millisecond resolution.
+(That expression was `strftime('%Y-%m-%d %H:%M:%f', …)` in an earlier draft of this
+wave and is **not** face-independent — see the note below.) Normalizing writes the way `run_at` is normalized was
 tried and rejected — it truncates to milliseconds and stalled sub-millisecond
 `Every` schedules that v4.7.0 advanced (`Every(100µs)` went 20/20 → 2/20).
 
@@ -1279,9 +1304,26 @@ prefix fixes which *hour* fires, not which face it is stored on.)
 Because that fix is in the predicate and not at write time, it needs no migration
 and does not depend on which constructor wrote the row: **cursors already in the
 database are repaired by upgrading**, unlike `run_at`. The one residual is narrow
-— a cross-face pair less than 1 ms apart collapses in the `strftime` branch,
+— a cross-face pair less than 1 ms apart collapses in the normalizing branch,
 which requires a sub-millisecond schedule whose process timezone changed between
 two fires.
+
+**Why `julianday()` and not `strftime()`.** The first cut of both this comparison
+and the dashboard's `since`/`until` window normalized to TEXT, on the stated
+premise that `strftime('%f')` renders one instant identically whatever offset it
+carries. It does not. SQLite keeps the raw clock it parsed *and* a millisecond
+julian-day integer; a **non-zero** offset has to be applied to the integer, which
+invalidates the raw fields and re-renders everything from the rounded value, while
+a **zero** offset — what the driver writes for a UTC value — prints the raw clock
+as parsed. So the same instant rendered two ways, and three bands measurably
+diverged: the last ~500 µs of a minute (1 ms apart), exact half-millisecond values
+(1 ms apart), and the last ~500 µs of a day whose day-of-month is ≥ 29, where the
+date advances while the clock still prints `23:59:59.999` — **nearly 24 hours**
+apart. `julianday()` is derived from the parsed instant by one arithmetic path and
+is the same number on every face; it accepts and rejects exactly the same inputs.
+If you are on a pre-release build of this wave, the symptoms were a dashboard page
+that came back empty for a `until` bound sitting exactly on a job's `created_at`,
+a `CountDeadLettered` that under-counted, and a schedule that stopped for a day.
 
 **What you may notice:** on SQLite, delayed jobs enqueued **after** the upgrade
 now fire when you asked — **provided every process that enqueues and every

@@ -4,21 +4,26 @@ import (
 	"context"
 	"fmt"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/require"
-	"gorm.io/gorm"
 
 	"github.com/jdziat/simple-durable-jobs/v4/pkg/core"
 )
 
-// core.Job.MaxRetries carries no gorm `default:` tag, because GORM substitutes a
-// declared default for any zero value and that turned an explicit Retries(0) into
-// three attempts. The claim that makes this safe is "every Go write path writes the
-// column explicitly" — which is only worth as much as the paths actually checked.
+// core.Job.MaxRetries keeps its gorm `default:3` tag (dropping it made AutoMigrate
+// rebuild the SQLite jobs table and destroy the migration-created indexes), and
+// GORM substitutes a declared default for any zero value — which turned an explicit
+// Retries(0) into three attempts. The claim that makes this safe is "every Go write
+// path corrects a DELIBERATE zero back, inside the same transaction" — which is
+// only worth as much as the paths actually checked.
 //
 // So check them all. A future path that inserts a job through a narrowed column set
 // would reintroduce the bug for that path alone, and this is what would catch it.
+//
+// The intent flag is what makes the zero deliberate. Its mirror —
+// TestOmittedMaxRetriesKeepsTheColumnDefaultOnEveryEnqueuePath — walks the SAME
+// table asserting the OPPOSITE for a job that never mentioned the field, because a
+// path honouring one and not the other is the exact defect this pair exists for.
 func TestExplicitZeroRetriesSurvivesEveryEnqueuePath(t *testing.T) {
 	db := openTestDB(t)
 	s := NewGormStorage(db)
@@ -28,49 +33,11 @@ func TestExplicitZeroRetriesSurvivesEveryEnqueuePath(t *testing.T) {
 	newJob := func(n string) *core.Job {
 		return &core.Job{
 			ID: core.NewID(), Type: "charge-" + n, Queue: "default",
-			Status: core.StatusPending, MaxRetries: 0,
+			Status: core.StatusPending, MaxRetries: 0, MaxRetriesSet: true,
 		}
 	}
 
-	paths := []struct {
-		name string
-		run  func(t *testing.T, job *core.Job)
-	}{
-		{"Enqueue", func(t *testing.T, j *core.Job) {
-			require.NoError(t, s.Enqueue(ctx, j))
-		}},
-		{"EnqueueUnique", func(t *testing.T, j *core.Job) {
-			require.NoError(t, s.EnqueueUnique(ctx, j, "uk-"+string(j.ID)))
-		}},
-		{"EnqueueBatch", func(t *testing.T, j *core.Job) {
-			require.NoError(t, s.EnqueueBatch(ctx, []*core.Job{j}))
-		}},
-		{"EnqueueWithUniqueLock", func(t *testing.T, j *core.Job) {
-			_, err := s.EnqueueWithUniqueLock(ctx, j, "scope-"+string(j.ID), time.Minute)
-			require.NoError(t, err)
-		}},
-		{"EnqueueTx", func(t *testing.T, j *core.Job) {
-			require.NoError(t, db.Transaction(func(tx *gorm.DB) error { return s.EnqueueTx(ctx, tx, j) }))
-		}},
-		{"EnqueueUniqueTx", func(t *testing.T, j *core.Job) {
-			require.NoError(t, db.Transaction(func(tx *gorm.DB) error {
-				return s.EnqueueUniqueTx(ctx, tx, j, "uk-"+string(j.ID))
-			}))
-		}},
-		{"EnqueueBatchTx", func(t *testing.T, j *core.Job) {
-			require.NoError(t, db.Transaction(func(tx *gorm.DB) error {
-				return s.EnqueueBatchTx(ctx, tx, []*core.Job{j})
-			}))
-		}},
-		{"EnqueueWithUniqueLockTx", func(t *testing.T, j *core.Job) {
-			require.NoError(t, db.Transaction(func(tx *gorm.DB) error {
-				_, err := s.EnqueueWithUniqueLockTx(ctx, tx, j, "scope-"+string(j.ID), time.Minute)
-				return err
-			}))
-		}},
-	}
-
-	for i, p := range paths {
+	for i, p := range enqueuePathsUnderTest(ctx, s, db) {
 		t.Run(p.name, func(t *testing.T) {
 			job := newJob(fmt.Sprintf("%d", i))
 			p.run(t, job)

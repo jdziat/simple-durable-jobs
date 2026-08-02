@@ -191,7 +191,9 @@ func CallWithCheckpointCtx[T any](execCtx, checkpointCtx context.Context, name s
 		// An EMPTY shape for the type being replayed INTO is skipped for the same
 		// reason, and the omission was a false fire. "" is not a shape, it is the
 		// absence of one — a type whose shape could not be computed (a channel
-		// member, a marshaler that rejects or panics on the probe). Comparing it as
+		// member, a marshaler that rejects or panics on the probe, or one whose
+		// wire form is assembled from unexported state the probe cannot populate).
+		// Comparing it as
 		// though it were a shape rejected every replay whose result type merely
 		// STOPPED being computable, e.g. the `netip.Addr -> net.IP` direction of a
 		// modernization that cannot move a byte on the wire. UPGRADE.md's rule is

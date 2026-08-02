@@ -264,9 +264,10 @@ func (s *GormStorage) SearchJobs(ctx context.Context, filter core.JobFilter) ([]
 // The one input it cannot cover is a row whose stored offset exceeds ±26:00. No
 // tzdata zone produces one; it would take a hand-built time.FixedZone passed as
 // an explicit Job.CreatedAt. Such a row is already beyond repair anyway: SQLite's
-// own date parser hard-caps a timezone suffix at ±14:00 hours, so strftime() and
-// datetime() return NULL for it (measured: '...+15:00' -> NULL, '...+14:00' ->
-// parses). No read-side form can normalize a face SQLite refuses to read.
+// own date parser hard-caps a timezone suffix at ±14:00 hours, so julianday(),
+// strftime() and datetime() all return NULL for it (measured: '...+15:00' ->
+// NULL, '...+14:00' -> parses). No read-side form can normalize a face SQLite
+// refuses to read.
 const maxStoredClockFaceOffset = 26 * time.Hour
 
 // timeBoundDirection selects which side of a time window a predicate expresses.
@@ -327,17 +328,57 @@ const (
 //     offset strings sort by instant, and this keeps the driver's full
 //     NANOSECOND precision. This is the common case (one process, one zone, no
 //     DST crossing).
-//   - Different offsets -> strftime() parses each and renders UTC, so the
-//     comparison is on instants for ANY stored face, with no migration and no
-//     dependence on which process wrote the row. Applying strftime()
-//     unconditionally is what an earlier version of scheduleCursorLess did, and it
-//     measurably truncated precision (datetime() is worse still: whole seconds).
+//   - Different offsets -> julianday() parses each into the instant SQLite
+//     computed for it, so the comparison is on instants for ANY stored face, with
+//     no migration and no dependence on which process wrote the row. Applying it
+//     unconditionally is what an earlier version of scheduleCursorLess did with
+//     the equivalent expression, and it measurably truncated precision
+//     (datetime() is worse still: whole seconds).
+//
+// # WHY julianday() AND NOT strftime()
+//
+// This branch used to normalize both sides to TEXT with
+// strftime('%Y-%m-%d %H:%M:%f', …), on the stated premise — repeated on two public
+// godocs — that "strftime('%f') renders a given instant identically on every
+// face". That premise is FALSE, and the predicate DROPPED rows because of it.
+//
+// SQLite parses a timestamp into a struct holding both the raw Y/M/D h:m:s it read
+// and a millisecond integer iJD computed from them. A NON-ZERO offset has to be
+// applied to iJD, which invalidates the raw fields, so every component is
+// re-rendered from the ROUNDED iJD. A ZERO offset — which is exactly what the
+// driver writes for a UTC value, "+00:00" — leaves the raw fields valid, so the
+// clock and the seconds print as parsed. Measured, the two renderings disagree in
+// three bands:
+//
+//	minute tail   ss.9995+ : zero offset clamps to :59.999, non-zero rolls the
+//	                         minute to :00.000                      (1ms apart)
+//	half-ms tie   ss.0025  : zero offset prints .002, non-zero .003 (1ms apart)
+//	DAY tail                 the last 0.5ms of a day whose day-of-month is >= 29:
+//	                         the rounded iJD advances the DATE while the raw clock
+//	                         still prints 23:59:59.999, so
+//	                         "2026-12-31 23:59:59.9995+00:00" renders
+//	                         "2027-01-01 23:59:59.999"       (nearly 24h apart)
+//
+// A row sitting on an inclusive bound in any of those bands was lost — an empty
+// page from ListJobs, an under-count from CountDeadLettered. The day-tail band is
+// also why adding a millisecond of slack to the bound is not the fix: the error
+// there is not bounded by a millisecond.
+//
+// julianday() is iJD/86400000.0. iJD is built by ONE arithmetic path — date to
+// milliseconds, plus h/m/s with a single rounding of the seconds, minus a
+// whole-minute offset — so it cannot depend on the face, and nothing is re-derived
+// from raw fields afterwards. Measured face-independent over 840,042 comparisons
+// (7 faces x 6 anchors x 20,001 sub-second offsets, years 1900-9998, under both
+// TZ=UTC and TZ=America/Los_Angeles), with identical NULL behaviour to strftime on
+// every out-of-range input this file already guards. It is a float64, but adjacent
+// milliseconds stay ~10 ULPs apart across the whole representable range, so
+// ordering survives; that is asserted, not assumed.
 //
 // # THE ACCEPTED LIMIT: CROSS-FACE COMPARISONS RESOLVE TO MILLISECONDS
 //
-// strftime('%f') renders milliseconds, so the cross-face branch — and ONLY that
-// branch — compares at millisecond resolution: a row and a bound that wear
-// DIFFERENT offsets and sit less than 1ms apart collapse and compare EQUAL, so an
+// iJD is a millisecond integer, so the cross-face branch — and ONLY that branch —
+// compares at millisecond resolution: a row and a bound that wear DIFFERENT
+// offsets and sit inside one millisecond collapse and compare EQUAL, so an
 // inclusive bound can admit a row up to 1ms outside the window. The error is
 // bounded by 1ms and is over-inclusion in every case; the predicate never drops a
 // row that belongs in the window. The same-face fast path is exact to the
@@ -345,25 +386,28 @@ const (
 // needs a genuinely mixed-face column AND a sub-millisecond window bound to reach.
 //
 // This is a deliberate trade, not an oversight: the alternative is normalizing
-// every comparison through strftime(), which costs the same 1ms on the common
-// path too. It is pinned by TestSearchJobs_CrossFaceWindowResolvesToMilliseconds
-// so it cannot silently widen, and it is restated on the public
-// ui.JobFilter and core.DeadLetterFilter godoc where a caller reads it.
+// every comparison, which costs the same 1ms on the common path too. It is pinned
+// by TestSearchJobs_CrossFaceWindowResolvesToMilliseconds so it cannot silently
+// widen, and it is restated on the public ui.JobFilter and core.DeadLetterFilter
+// godoc where a caller reads it.
 //
-// The "never drops" half of that claim is the load-bearing one, and it is pinned
-// SEPARATELY by TestSearchJobs_SubMillisecondCrossFaceNeverDropsAnInsideRow,
-// because every other cross-face fixture here is millisecond-ALIGNED and so
-// cannot reach a rounding tie at all. It holds because strftime('%f') renders a
-// given instant identically on every face (measured at 1ns granularity around
-// the tie points, -12:00 through +14:00), so both sides round the same way and
-// only collapse-to-equal is reachable. Read that test before weakening this.
+// The "never drops" half of that claim is the load-bearing one, and the two tests
+// that pin it are chosen so neither can go inert:
+// TestTimeBoundPredicate_CrossFaceNormalizationIsFaceIndependent measures the
+// premise directly (and keeps strftime's divergence as a live control, so a revert
+// to text cannot pass), and
+// TestSearchJobs_CrossFaceBoundExactlyOnARowIsNeverDropped puts a bound EXACTLY on
+// a row inside each band across the full writer-face x reader-face matrix. A
+// window that brackets its row by a few milliseconds cannot distinguish a correct
+// predicate from one whose error is smaller than the bracket — which is precisely
+// how the false premise survived review. Read both before weakening this.
 //
 // A migration that rewrote stored timestamp text was tried in this repo and
 // corrupted ordering on every SQLite database. This is read-side only.
 //
 // # THE BARE-COLUMN HALF, AND WHAT IT BUYS
 //
-// strftime()/CASE around the column makes it a computed value, which costs
+// julianday()/CASE around the column makes it a computed value, which costs
 // SQLite the index RANGE restriction. created_at IS indexed — the migrations
 // create idx_jobs_status_created (status, created_at DESC) and
 // idx_jobs_queue_created (queue, created_at DESC) — and the dead-letter view has
@@ -409,17 +453,18 @@ const (
 //     while the year has FOUR digits. Go's "2006" verb pads but does not truncate,
 //     so year 10000 renders "10000-…", which sorts BELOW every real "2026-…" row.
 //     On the upper bound that inverts the comparison and rejects EVERYTHING.
-//   - strftime() returns NULL for anything SQLite's date parser refuses, and
+//   - julianday() returns NULL for anything SQLite's date parser refuses, and
 //     `NULL <= x` is NULL, which is not true, so the row is dropped. Measured, it
 //     refuses two things a caller can supply: a value that rounds past the end of
 //     its supported range ('9999-12-31 23:59:59.999999999' -> NULL, while
 //     '…59.999' parses) and a timezone suffix beyond ±14:00 ('+15:00' -> NULL,
-//     '+14:00' parses).
+//     '+14:00' parses). strftime() refuses exactly the same inputs, so swapping
+//     the normalizer changed nothing here — re-measured, not assumed.
 //
 // Both are reachable from the public API. timestamppb.IsValid accepts
 // 9999-12-31T23:59:59.999999999Z, which is the natural "no upper bound" sentinel
 // for a programmatic Connect client, and it hits BOTH: it rounds to NULL under
-// strftime and it overflows the four-digit year once the ±26h prefilter slop is
+// julianday and it overflows the four-digit year once the ±26h prefilter slop is
 // added. Unpatched, that request returns rows; a naive fix returns an empty page.
 //
 // So the bound is normalized before any SQL is built, always in the direction
@@ -469,13 +514,17 @@ func (s *GormStorage) timeBoundPredicate(column string, dir timeBoundDirection, 
 		return column + " " + cmp + " ?", []any{bound}
 	}
 
-	const utc = `strftime('%Y-%m-%d %H:%M:%f', `
+	// julianday(), NOT strftime() — see "THE ACCEPTED LIMIT" above. strftime
+	// renders one instant DIFFERENTLY depending on whether its offset is zero, so
+	// normalizing through text drops rows; julianday is computed from the parsed
+	// instant and is face-independent.
+	const instant = `julianday(`
 	// substr(x, -6) is the trailing "+HH:MM" / "-HH:MM" the driver always writes,
 	// SIGN INCLUDED — "+05:30" and "-05:30" are 11 hours apart and must not take
 	// the raw-text arm together.
 	exact := "CASE WHEN substr(" + column + ", -6) = substr(?, -6) " +
 		"THEN " + column + " " + cmp + " ? " +
-		"ELSE " + utc + column + ") " + cmp + " " + utc + "?) END"
+		"ELSE " + instant + column + ") " + cmp + " " + instant + "?) END"
 
 	loose, ok := lexicalPrefilterBound(bound, slop)
 	if !ok {
@@ -490,8 +539,10 @@ func (s *GormStorage) timeBoundPredicate(column string, dir timeBoundDirection, 
 //
 // SQLite sets the shape: they are the widest instants whose driver-rendered text
 // BOTH keeps a four-digit year and is accepted by SQLite's date parser, and the
-// ceiling stops at millisecond .999 because strftime rounds the fraction and
-// '…59.9999' rounds past the end of the supported range, yielding NULL (measured).
+// ceiling stops at millisecond .999 because SQLite rounds the fraction into its
+// millisecond julian-day integer and '…59.9999' rounds past the end of the
+// supported range, yielding NULL from julianday() and strftime() alike (measured
+// on both).
 //
 // MySQL independently needs the SAME ceiling: DATETIME ends at
 // 9999-12-31 23:59:59, so a protobuf-max `until` bound matched ZERO rows and a

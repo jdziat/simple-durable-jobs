@@ -304,22 +304,28 @@ func buildSubJobs(subJobs []SubJob, cfg *config, jc *intctx.JobContext, fanOutID
 		// scope and queryable context flow consistently through the workflow.
 		jobID := core.NewID()
 		jobs[i] = &core.Job{
-			ID:          jobID,
-			Type:        sj.Type,
-			Args:        args,
-			Queue:       queue,
-			Tenant:      jc.Job.Tenant,
-			Metadata:    cloneMetadata(jc.Job.Metadata),
-			Priority:    priority,
-			MaxRetries:  retries,
-			Timeout:     sj.Timeout,
-			Determinism: int(sj.Determinism),
-			RunAt:       runAt,
-			ParentJobID: &parentID,
-			RootJobID:   rootID,
-			FanOutID:    &fanOutID,
-			FanOutIndex: i,
-			UniqueKey:   fmt.Sprintf("fanout-%s-%d", fanOutID, i), // Prevent duplicate sub-jobs on replay
+			ID:         jobID,
+			Type:       sj.Type,
+			Args:       args,
+			Queue:      queue,
+			Tenant:     jc.Job.Tenant,
+			Metadata:   cloneMetadata(jc.Job.Metadata),
+			Priority:   priority,
+			MaxRetries: retries,
+			// `retries` is always resolved above — Sub()'s explicit value when
+			// RetriesSet, otherwise the fan-out config's. A resolved 0 means run
+			// once, and storage cannot tell that from an untouched field, so the
+			// intent has to be stated. Without it, Sub("x", jobs.Retries(0)) and
+			// WithFanOutRetries(0) both silently become three attempts.
+			MaxRetriesSet: true,
+			Timeout:       sj.Timeout,
+			Determinism:   int(sj.Determinism),
+			RunAt:         runAt,
+			ParentJobID:   &parentID,
+			RootJobID:     rootID,
+			FanOutID:      &fanOutID,
+			FanOutIndex:   i,
+			UniqueKey:     fmt.Sprintf("fanout-%s-%d", fanOutID, i), // Prevent duplicate sub-jobs on replay
 		}
 	}
 	// Aggregated once per call, not per child: a 10k-wide fan-out must not emit

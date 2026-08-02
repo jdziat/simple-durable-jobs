@@ -594,17 +594,25 @@ func (q *Queue) buildJob(name string, args any, options *Options) (*core.Job, er
 	}
 
 	job := &core.Job{
-		ID:          core.NewID(),
-		Type:        name,
-		Args:        argsBytes,
-		Queue:       options.Queue,
-		Tenant:      options.Tenant,
-		Metadata:    cloneOptionsMetadata(options.Metadata),
-		Priority:    options.Priority,
-		MaxRetries:  maxRetries,
-		UniqueKey:   options.UniqueKey,
-		Determinism: int(effDet),
-		Status:      core.StatusPending,
+		ID:         core.NewID(),
+		Type:       name,
+		Args:       argsBytes,
+		Queue:      options.Queue,
+		Tenant:     options.Tenant,
+		Metadata:   cloneOptionsMetadata(options.Metadata),
+		Priority:   options.Priority,
+		MaxRetries: maxRetries,
+		// Unconditionally set: whatever maxRetries holds here is deliberate — either
+		// an explicit Retries(n) or the Go-layer default this package supplies
+		// (Options starts at DefaultJobRetries). Storage cannot tell a deliberate 0
+		// from an untouched int field, so without this an explicit Retries(0) is
+		// replaced by the max_retries column default and a do-not-retry handler runs
+		// three times. Gating it on options.RetriesSet() would be equivalent today
+		// only because DefaultJobRetries is non-zero — a value this layer chooses.
+		MaxRetriesSet: true,
+		UniqueKey:     options.UniqueKey,
+		Determinism:   int(effDet),
+		Status:        core.StatusPending,
 	}
 
 	if options.Timeout > 0 {

@@ -68,14 +68,36 @@ type Job struct {
 	Status         JobStatus         `gorm:"size:20;default:'pending';not null;index:idx_jobs_fan_out_status,priority:2"`
 	PreviousStatus JobStatus         `gorm:"size:20"` // Status before pause, for restoration
 	Attempt        int               `gorm:"type:integer;default:0;not null"`
-	// No gorm `default:` on purpose. GORM omits a zero-valued field from the
-	// INSERT when the field declares a default, so a deliberate Retries(0) was
-	// silently replaced by the column default and a job marked do-not-retry ran
-	// three times. The Go layer already supplies the default (queue.Options starts
-	// at DefaultJobRetries), so the tag was only ever masking the explicit zero.
-	// Migration v41 keeps the DB-level default for writers that omit the column.
-	MaxRetries int           `gorm:"type:integer;default:3;not null"`
-	Timeout    time.Duration `gorm:"not null;default:0"`
+	// MaxRetries is the number of RETRIES after the first attempt. Zero means
+	// "run once, never retry" — but ONLY when MaxRetriesSet says the zero was
+	// deliberate. Leave both at their zero values and the row takes the
+	// max_retries column default of 3, which is what every release before this
+	// field existed did for a caller who never mentioned retries.
+	MaxRetries int `gorm:"type:integer;default:3;not null"`
+	// MaxRetriesSet marks MaxRetries as DELIBERATE, so that a zero can be told
+	// apart from a field the caller simply never filled in. Go has no other way to
+	// express that on an int, and the difference is not cosmetic: without it,
+	// `store.Enqueue(ctx, &core.Job{Type: "charge"})` — the documented shape for
+	// enqueuing straight through core.Storage — reads as "do not retry" and its
+	// handler runs exactly once instead of three times.
+	//
+	// It is NOT persisted (`gorm:"-"`): it is write-side intent, not job state, and
+	// a job read back from the database carries MaxRetriesSet=false with whatever
+	// max_retries the row actually holds. Re-enqueuing such a job verbatim and
+	// wanting to keep a stored zero therefore means setting this to true.
+	//
+	// jobs.Retries(n) and the fan-out builders set it for you; this only needs
+	// thinking about when constructing a core.Job by hand.
+	//
+	// The column keeps its `default:3` tag and GORM omits a zero-valued field that
+	// declares a default, so an unset MaxRetries is simply left out of the INSERT
+	// and the database supplies 3. A deliberate zero is written back by a corrective
+	// UPDATE inside the same transaction (see storage.applyExplicitZeroRetries).
+	// Dropping the tag instead was tried: AutoMigrate then saw a changed column
+	// definition and REBUILT the SQLite jobs table, destroying the indexes the
+	// versioned migrations create — measured at 14 before and 4 after.
+	MaxRetriesSet bool          `gorm:"-"`
+	Timeout       time.Duration `gorm:"not null;default:0"`
 	// Determinism is the replay strictness mode
 	// (0=ExplicitCheckpoints,1=Strict,2=BestEffort).
 	// BestEffort relaxes the Call replay type-mismatch guard.
