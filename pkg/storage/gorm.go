@@ -534,38 +534,53 @@ func requireMySQLUTCDriverLoc(ctx context.Context, db *gorm.DB) error {
 }
 
 // Enqueue adds a job to the queue.
+//
+// The whole insert runs in ONE transaction, and that is load-bearing rather than
+// tidiness. GORM substitutes core.Job.MaxRetries's declared `default:3` for an
+// explicit 0, so a Retries(0) job is INSERTED carrying 3 and corrected by a
+// following UPDATE (see applyExplicitZeroRetries, whose contract is that it runs
+// "in the caller's transaction, so the row is never visible carrying a value its
+// author did not ask for"). This function used to pass the root handle, which
+// autocommitted each statement and broke that contract: between the two commits
+// the row was visible, dq_ready, and claimable — so a worker could dequeue a
+// Retries(0) job carrying max_retries=3 and run it three times, which is the
+// exact defect Retries(0) exists to prevent.
+//
+// The unique-key path was already correct on the losing side — both the
+// corrective UPDATE and the dq_ready restore sat behind `RowsAffected > 0`, so a
+// duplicate never touched the winner's row. That is now expressed by an early
+// return inside the transaction rather than by two separate guards, and it is
+// pinned by a test so the restructuring cannot have silently dropped it.
 func (s *GormStorage) Enqueue(ctx context.Context, job *core.Job) error {
 	fillEnqueueDefaults(job)
 	row, err := s.encodedJobForCreate(job)
 	if err != nil {
 		return err
 	}
-	db := s.db.WithContext(ctx)
 	zeroRetryIDs := explicitZeroRetryIDs(row)
-	if job.UniqueKey == "" {
-		dqReadyFalseIDs, dqReadyFalseRefs := dqReadyFalseJobs([]*core.Job{job})
-		if err := db.Create(row).Error; err != nil {
-			return err
-		}
-		if err := applyExplicitZeroRetries(db, zeroRetryIDs); err != nil {
-			return err
-		}
-		return restoreDQReadyFalse(db, dqReadyFalseIDs, dqReadyFalseRefs)
-	}
 	dqReadyFalseIDs, dqReadyFalseRefs := dqReadyFalseJobs([]*core.Job{job})
-	result := db.Clauses(clause.OnConflict{DoNothing: true}).Create(row)
-	if result.Error == nil && result.RowsAffected > 0 {
-		if err := applyExplicitZeroRetries(db, zeroRetryIDs); err != nil {
+
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if job.UniqueKey == "" {
+			if err := tx.Create(row).Error; err != nil {
+				return err
+			}
+		} else {
+			result := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(row)
+			if result.Error != nil {
+				return result.Error
+			}
+			if result.RowsAffected == 0 {
+				// Nothing was inserted, so there is nothing of ours to correct.
+				// Returning the sentinel rolls the (empty) transaction back.
+				return core.ErrDuplicateJob
+			}
+		}
+		if err := applyExplicitZeroRetries(tx, zeroRetryIDs); err != nil {
 			return err
 		}
-	}
-	if result.Error != nil {
-		return result.Error
-	}
-	if result.RowsAffected == 0 {
-		return core.ErrDuplicateJob
-	}
-	return restoreDQReadyFalse(db, dqReadyFalseIDs, dqReadyFalseRefs)
+		return restoreDQReadyFalse(tx, dqReadyFalseIDs, dqReadyFalseRefs)
+	})
 }
 
 // withSerializationRetry runs fn and retries it on transient serialization
