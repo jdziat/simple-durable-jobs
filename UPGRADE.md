@@ -666,6 +666,16 @@ NOT caught:
   it** — a `RawMessage` holds arbitrary JSON, so like an `interface` its wire form
   belongs to the value rather than the type. Such a type records no shape and is
   not guarded at all;
+- **any change to a result type containing a slice, array or map type that
+  declares its own `MarshalJSON`** — such a marshaler renders the container's
+  CONTENTS, and the probe can only ever build one element (an array only ever gets
+  index 0), so the wire form belongs to the value rather than to the type, exactly
+  as for an `interface` member or a `json.RawMessage`. Such a type records no
+  shape and is not guarded at all. A container declaring only `MarshalText` is
+  unaffected — `encoding/json` renders its output as a JSON string whatever the
+  contents — so a `type UUID [16]byte`, a hex `[]byte` and `net.IP` keep their
+  `string` shape, and a container with no marshaler of its own (`[]string`,
+  `map[string]int`, `[2]int`, `[]T`) is untouched;
 - **any change to a result type containing a marshaler that VALIDATES on a member
   `encoding/json` serializes** — also below;
 - **any change to a result type carrying a `,omitzero` member that `encoding/json`
@@ -801,10 +811,12 @@ same is true of a `chan` or `func` member behind such a tag — the rule above i
 about a type `encoding/json` cannot marshal *as written*, not one that merely
 declares such a member.
 
-The `interface` and `json.RawMessage` cases are the exception to that exception:
-they stop the shape WALK itself rather than offending the encoder, so a
-`json:"-"` tag does not rescue them — an exported ``Meta any `json:"-"` `` still
-records no shape. Only a member the walk never enters does, which means an
+The `interface`, `json.RawMessage` and container-with-its-own-`MarshalJSON` cases
+are the exception to that exception: they stop the shape WALK itself rather than
+offending the encoder, so a `json:"-"` tag does not rescue them — an exported
+``Meta any `json:"-"` `` still records no shape, and so does an exported
+``Seen LastSeen `json:"-"` `` whose `LastSeen` is a slice type declaring
+`MarshalJSON`. Only a member the walk never enters does, which means an
 ordinary unexported field: ``struct{ hidden any; Order string `json:"order"` }``
 records `{order:string}` and stays guarded. An unexported **embedded** field is
 still entered by the shape walk — for an embedded struct because `encoding/json`

@@ -372,3 +372,50 @@ func TestZZ_ElementHopDoesNotOverDisarm(t *testing.T) {
 		})
 	}
 }
+
+// r35SelfPtr is `type T *T` — legal Go, and the shape that hangs an unwrap loop
+// which has no bound of its own.
+type r35SelfPtr *r35SelfPtr
+
+// r35MutA / r35MutB are the mutual form, reachable without any struct.
+type r35MutA *r35MutB
+type r35MutB *r35MutA
+
+// r35SelfSlice and r35SelfMap close the remaining container cycles.
+type r35SelfSlice []r35SelfSlice
+type r35SelfMap map[string]r35SelfMap
+
+// TestZZ_UnwrapTerminatesOnIndirectionOnlyCycles pins termination for cycles made
+// ENTIRELY of indirections.
+//
+// The previous termination test routed every self-reference through a STRUCT,
+// which hasUnpopulatedStateSeen's visited set already handled — so it could not
+// reach the unwrap loop's own cycle at all. These four types do, and an unbounded
+// loop hangs on each: not a wrong answer but a HANG, inside Call, on the write and
+// the replay path, where recover() cannot help.
+func TestZZ_UnwrapTerminatesOnIndirectionOnlyCycles(t *testing.T) {
+	types := map[string]reflect.Type{
+		"self pointer":  reflect.TypeOf((*r35SelfPtr)(nil)).Elem(),
+		"mutual A":      reflect.TypeOf((*r35MutA)(nil)).Elem(),
+		"mutual B":      reflect.TypeOf((*r35MutB)(nil)).Elem(),
+		"self slice":    reflect.TypeOf((*r35SelfSlice)(nil)).Elem(),
+		"self map":      reflect.TypeOf((*r35SelfMap)(nil)).Elem(),
+		"ptr to struct": reflect.TypeOf(&egInner{}),
+	}
+	for name, typ := range types {
+		t.Run(name, func(t *testing.T) {
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				_ = hasUnpopulatedState(typ)
+				_ = ResultShapeStringForTest(typ)
+			}()
+			select {
+			case <-done:
+			case <-time.After(10 * time.Second):
+				t.Fatal("hung: a cycle made only of indirections must terminate — this blocks Call " +
+					"on both the write and the replay path, and recover() cannot catch it")
+			}
+		})
+	}
+}

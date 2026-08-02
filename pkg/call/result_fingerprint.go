@@ -468,7 +468,21 @@ func build(t reflect.Type, depth int, free []reflect.Type, budget *int) (reflect
 		// Substituting a value at a boundary and letting encoding/json decide its
 		// fate is the single root cause of every false fire this file has shipped.
 		// A type whose shape cannot be computed records NO shape and is skipped.
+		//
+		// SUBSUMED BY THE NEXT CHECK and kept anyway, stated so the next reviewer
+		// does not spend an afternoon on the fixture that would red it: RawMessage
+		// carries its own MarshalJSON, so probeSpeaksForContainer refuses it too
+		// and no test can distinguish deleting this clause from keeping it
+		// (TestResultShape_RawMessageIsSubsumedByTheContainerRule asserts that
+		// subsumption directly rather than pretending otherwise). It stays because
+		// it is the specific, historically-load-bearing statement about the one
+		// stdlib type, and because a general rule quietly acquiring responsibility
+		// for a named special case is how a later narrowing of that rule reopens a
+		// closed false fire without touching the line that documented it.
 		if t == jsonRawMessageType {
+			return reflect.Value{}, false
+		}
+		if !probeSpeaksForContainer(t) {
 			return reflect.Value{}, false
 		}
 		// A slice's backing array lives on the heap, so its elements are
@@ -482,6 +496,9 @@ func build(t reflect.Type, depth int, free []reflect.Type, budget *int) (reflect
 		return s, true
 
 	case reflect.Array:
+		if !probeSpeaksForContainer(t) {
+			return reflect.Value{}, false
+		}
 		v := reflect.New(t).Elem()
 		if t.Len() > 0 {
 			// An array is stored inline, so its elements are addressable exactly
@@ -509,6 +526,9 @@ func build(t reflect.Type, depth int, free []reflect.Type, budget *int) (reflect
 		// no marshaler's rendering of a fabricated key can reach a shape. See its
 		// doc comment — the claim above was once written as unconditional and was
 		// false for `map[Status]int`.
+		if !probeSpeaksForContainer(t) {
+			return reflect.Value{}, false
+		}
 		key, ok := synthesizeMapKey(t.Key())
 		if !ok {
 			return reflect.Value{}, false
@@ -656,6 +676,100 @@ func probeSpeaksForType(t reflect.Type, v reflect.Value) bool {
 	return marshalsToScalar(p)
 }
 
+// probeSpeaksForContainer is probeSpeaksForType's answer for the case that
+// function cannot reach: a SLICE, ARRAY or MAP type carrying its OWN
+// json.Marshaler. Such a type records NO SHAPE.
+//
+// WHY IT IS A SEPARATE FUNCTION AND NOT THE SAME ONE. probeSpeaksForType asks
+// "is there state inside t that build could not populate", and for a container
+// the answer is usually no — its elements are ordinary values build fills in
+// perfectly. What build cannot fabricate is the container's ARITY: a slice and a
+// map always get exactly ONE entry and an array only ever gets index 0 (see
+// build). A marshaler on the container reads its CONTENTS, so its wire form is a
+// function of the very thing the probe made up.
+//
+// BOTH MECHANISMS, ONE RULE, and this is why merely calling probeSpeaksForType
+// from the container cases would have closed only the first:
+//
+//	unpopulatable elements  `type LastSeen []time.Time` emitting the last sample
+//	                        or null when unset. build's one element is the ZERO
+//	                        time.Time, so the probe sees "unset" and the member
+//	                        shapes as null, while the byte-identical
+//	                        `LastSeen -> *time.Time` shapes as string. Both
+//	                        non-empty, so replay hard-failed a checkpoint that
+//	                        decodes losslessly. The array form (`[2]time.Time`,
+//	                        index 1 never written) and the map form do the same.
+//	arity branching         `type Bounds []int` emitting {"from":b[0],"to":b[1]}
+//	                        when len==2. Every element is populatable, so
+//	                        hasUnpopulatedState reports FALSE and the len==1
+//	                        branch is recorded: `[number]`, against the
+//	                        byte-identical struct form's {from:number,to:number}.
+//
+// The rule is the same one an interface member and a json.RawMessage already
+// take, for the same reason each of them takes it: a wire form that is a
+// property of the VALUE and not of the type is not a shape, so none is recorded
+// and replay skips the type.
+//
+// IT IS ALSO MORE SELF-CONSISTENT THAN BEFORE, BUT NOT FULLY — and the
+// difference is worth stating, because the first draft of this comment claimed
+// the stronger version. For the UNPOPULATABLE-ELEMENT mechanism the two sides
+// now agree: `type LastSeen []time.Time` with a marshaler records no shape, and
+// so does `struct{ Samples []time.Time }` with the identical marshaler one level
+// up, through probeSpeaksForType. For the ARITY-BRANCHING mechanism they do not.
+// A struct wrapping a `[]int` and emitting {"from":b[0],"to":b[1]} still records
+// a shape, because hasUnpopulatedState is false for a container of populatable
+// elements and nothing there asks about arity. That residual is narrower — it
+// needs the marshaler on the WRAPPER and the branch on the INNER length — and it
+// is left open rather than closed by widening probeSpeaksForType, which would
+// disarm every struct holding a slice. Do not "restore consistency" by deleting
+// this paragraph; the asymmetry is real.
+//
+// THE SCALAR EXEMPTION IS DELIBERATELY NOT EXTENDED HERE. probeSpeaksForType
+// trusts a probe whose wire form is a JSON scalar, on the ground that a scalar
+// has no internal structure the probe could have got wrong — and there that
+// holds, because the probe populated every field it could and only unexported
+// state is missing. Here the missing thing is the arity itself, which is exactly
+// what a container marshaler branches on, so the KIND of the scalar can move
+// with it: a marshaler emitting a number for one entry and a string for two is
+// the same defect wearing a scalar. Extending the exemption would reopen the
+// second mechanism above for every container whose one-entry form happens to be
+// scalar, and it would buy very little, because the container families that
+// really do render as a scalar — a uuid `[16]byte`, a hex `[]byte`, net.IP —
+// reach encoding/json through a TEXT marshaler, not this one.
+//
+// encoding.TextMarshaler IS THEREFORE NOT CONSIDERED, exactly as in
+// probeSpeaksForType and for exactly its reason: encoding/json renders a
+// TextMarshaler's output as a JSON STRING, always, whatever the contents, so it
+// cannot misrepresent structure however the probe fabricated them. That is what
+// keeps `type UUID [16]byte`, `type Hex []byte` and net.IP shaped as `string`
+// instead of unguarded. (net.IP records no shape today anyway, but for the
+// unrelated pre-existing reason that its MarshalText VALIDATES and rejects the
+// fabricated probe — see resultShape's marshal error path.)
+//
+// THE POINTER FORM IS READ FOR BOTH RECEIVER KINDS, the same single branch
+// probeSpeaksForType uses and for the same reason: a value-receiver MarshalJSON
+// is in *T's method set too, while a pointer-receiver one is reachable only
+// through an address and is invisible to a value-form check. Where the pointer
+// form is not actually reachable — a map value, an array element — encoding/json
+// would have emitted the ordinary container encoding and refusing costs a MISS.
+// This file does not model addressability (see build) and will not start for
+// this: the cost of being conservative is a miss, the cost of being wrong is a
+// wedge.
+//
+// THE COST, named rather than implied. A named container type that declares its
+// own MarshalJSON now makes the WHOLE result type record no shape, so it replays
+// as it did before this feature existed. That is ordered maps and sets that
+// marshal as objects or sorted arrays, nullable collections, and a `[]byte` that
+// hand-rolls a hex or base64 MarshalJSON instead of a MarshalText. Plain
+// containers are untouched — `[]string`, `[]T` of ordinary structs,
+// `map[string]int`, `[2]int`, `[]time.Time`, a named slice with no marshaler of
+// its own — because none of them carries a marshaler on the container type, and
+// TestResultShape_PlainContainersKeepTheirShape checks that by execution rather
+// than by argument.
+func probeSpeaksForContainer(t reflect.Type) bool {
+	return !reflect.PointerTo(t).Implements(jsonMarshalerType)
+}
+
 // hasUnpopulatedState reports whether build left any state inside t at its zero
 // because reflect cannot write it.
 //
@@ -739,10 +853,29 @@ func hasUnpopulatedStateSeen(t reflect.Type, visited []reflect.Type) bool {
 // A map's VALUE is followed and its KEY is not: a key never reaches the shape
 // through this path — synthesizeMapKey owns that, and refuses any non-string kind
 // carrying a marshaler outright.
+// THE LOOP MUST BOUND ITSELF. `type T *T` is legal Go and its Elem() is T again,
+// so an unguarded walk here spins forever — and it spins BEFORE
+// hasUnpopulatedStateSeen reaches its visited set, so that guard cannot save it.
+// The failure is a HANG inside Call on the write AND the replay path, which is
+// worse than any false fire: recover() cannot catch it and the job never returns.
+//
+// This was shipped once. The termination test that was supposed to prevent it
+// covered `struct{ Kids []T }`, `struct{ M map[string]T }` and `struct{ A [1]*T }`
+// — every self-reference routed THROUGH a struct, which the visited set already
+// handled — and never a bare `type T *T`, the one shape that reaches this loop
+// without touching a struct at all. A correct mechanism with fixtures that could
+// not reach the defect.
 func unwrapToStruct(t reflect.Type) reflect.Type {
+	seen := make(map[reflect.Type]struct{}, 4)
 	for {
 		switch t.Kind() {
 		case reflect.Pointer, reflect.Slice, reflect.Array, reflect.Map:
+			if _, ok := seen[t]; ok {
+				// A cycle made only of indirections reaches no struct, so there is
+				// no unpopulatable state to find down this path.
+				return t
+			}
+			seen[t] = struct{}{}
 			t = t.Elem()
 		default:
 			return t

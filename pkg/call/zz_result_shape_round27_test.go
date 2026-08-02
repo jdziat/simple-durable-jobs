@@ -847,12 +847,81 @@ type r27TagBoxB struct {
 	Tags r27Codes `json:"tags"`
 }
 
-func TestResultShape_CleanMarshalerKeepsItsPopulatedShape(t *testing.T) {
-	requireWireAgreement(t, "changed element type behind a clean value-receiver marshaler",
-		r27TagBoxA{r27Tags{{"n"}}}, r27TagBoxB{r27Codes{{1}}}, false)
+// r27CleanA / r27CleanB are the STRUCT form of the same fixture, and they carry
+// what this section was written to check. See the container pair below for why
+// the check moved off r27Tags.
+type r27CleanA struct {
+	Name string `json:"name"`
+}
 
-	if shape := ResultShapeStringForTest(reflect.TypeOf(r27TagBoxA{})); shape != "{tags:[{name:string}]}" {
+// The local type drops the method, so this does not recurse.
+func (v r27CleanA) MarshalJSON() ([]byte, error) { type raw r27CleanA; return json.Marshal(raw(v)) }
+
+type r27CleanB struct {
+	Code int `json:"code"`
+}
+
+func (v r27CleanB) MarshalJSON() ([]byte, error) { type raw r27CleanB; return json.Marshal(raw(v)) }
+
+type r27CleanBoxA struct {
+	Tag r27CleanA `json:"tag"`
+}
+type r27CleanBoxB struct {
+	Tag r27CleanB `json:"tag"`
+}
+
+func TestResultShape_CleanMarshalerKeepsItsPopulatedShape(t *testing.T) {
+	requireWireAgreement(t, "changed member type behind a clean value-receiver marshaler",
+		r27CleanBoxA{r27CleanA{"n"}}, r27CleanBoxB{r27CleanB{1}}, false)
+
+	if shape := ResultShapeStringForTest(reflect.TypeOf(r27CleanBoxA{})); shape != "{tag:{name:string}}" {
 		t.Errorf("a marshaler that accepts the probe must keep its populated shape, got %s", shape)
+	}
+}
+
+// TestResultShape_CleanContainerMarshalerIsADeliberateAcceptedMiss is what this
+// same assertion became once the marshaler sits on a SLICE, and it is a real
+// loss stated rather than quietly dropped.
+//
+// r27Tags/r27Codes ARE clean pass-throughs: their MarshalJSON emits exactly what
+// the default encoding would, so the probe's `[{name:string}]` described the type
+// correctly and this test used to require it. It no longer holds, because
+// NOTHING AVAILABLE TO A PROBE DISTINGUISHES THIS MARSHALER FROM A HOSTILE ONE.
+// build synthesizes exactly one element, so `type Bounds []int` emitting
+// {"from":b[0],"to":b[1]} at len==2 and the default array otherwise is
+// indistinguishable from r27Tags at the only length the probe can produce — and
+// that one shaped as `[number]` against the byte-identical struct form's
+// {from:number,to:number}, a false fire on a deploy that cannot move a byte.
+// Telling them apart needs a second fabricated arity, which is the "substitute a
+// value at a boundary and let encoding/json decide its fate" family that every
+// false fire in this file has come from.
+//
+// SO THE COST IS PAID HERE: a result type carrying a container type with its own
+// MarshalJSON records no shape and replays exactly as it did before this feature
+// existed. The r27Tags -> r27Codes change below really does serialize
+// differently and really is no longer told apart. That is a MISS, which leaves
+// prior behaviour in place, chosen over a FALSE FIRE, which wedges a live
+// workflow — the same trade the interface member, the depth cap, the validating
+// marshaler and json.RawMessage all already take. See probeSpeaksForContainer.
+func TestResultShape_CleanContainerMarshalerIsADeliberateAcceptedMiss(t *testing.T) {
+	// FIXTURE PREMISE: these two really do serialize differently, so what follows
+	// is a miss and not a vacuous pass.
+	ba, err := json.Marshal(r27TagBoxA{r27Tags{{"n"}}})
+	if err != nil {
+		t.Fatalf("marshal a: %v", err)
+	}
+	bb, err := json.Marshal(r27TagBoxB{r27Codes{{1}}})
+	if err != nil {
+		t.Fatalf("marshal b: %v", err)
+	}
+	if string(ba) == string(bb) {
+		t.Fatalf("FIXTURE BROKEN — the two types must differ on the wire, both gave %s", ba)
+	}
+	for _, typ := range []reflect.Type{reflect.TypeOf(r27TagBoxA{}), reflect.TypeOf(r27TagBoxB{})} {
+		if shape := ResultShapeStringForTest(typ); shape != "" {
+			t.Errorf("%s recorded shape %q; a container carrying its own marshaler "+
+				"cannot be described from its type", typ, shape)
+		}
 	}
 }
 
