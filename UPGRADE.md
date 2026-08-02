@@ -1166,10 +1166,35 @@ Unprefixed schedules are unaffected, since neither version moves them.
 Also adds `CronIn`, `DailyIn`, `WeeklyIn` (and `MustCronIn`) for callers holding a
 `*time.Location` rather than a name. `DailyIn`/`WeeklyIn` advance by rolling the
 calendar **day** rather than the instant, so in a DST zone they fire exactly once
-per day — the old form could fire twice on a spring-forward day. **`Daily` and
-`Weekly` are unchanged**: they are `DailyIn(time.UTC, …)`/`WeeklyIn(time.UTC, …)`,
-and UTC has no DST, so nothing an existing `Daily(9, 0)` caller has observes any
-difference.
+per day — the old form could fire twice on a spring-forward day.
+
+The fire is the **earliest instant on that calendar day whose clock in `loc` has
+reached `hour:minute`**, which pins all three DST cases:
+
+| the requested reading | what fires |
+| --- | --- |
+| exists (the usual case) | that instant |
+| does not exist — the clock jumped over it (spring forward) | the instant of the jump. `DailyIn(newYork, 2, 30)` fires at **03:00 EDT** |
+| exists twice (fall back) | the **first**, earlier occurrence |
+
+Do not reach for `time.Date` to predict any of this. It resolves only the first
+case: for a reading inside a gap it answers an hour *early* in `America/New_York`
+(02:30 → 01:30 EST), an instant on *neither* side of the gap in
+`Australia/Lord_Howe` (02:15 → 02:45), and an instant on the *previous calendar
+day* in the zones whose spring-forward is at midnight (`America/Santiago` 00:00 →
+23:00 the day before); and for a repeated reading it answers the first occurrence
+in `America/New_York` but the second in `Europe/Berlin`. `WeeklyIn` always lands
+on the requested calendar weekday, and `Next` always returns an instant strictly
+after its argument, so a schedule can never stall.
+
+A calendar day that cannot hold the fire at all is skipped rather than pushed onto
+the next day: a location can skip the tail of a day (`Africa/Algiers` jumped
+1971-04-25 23:00 straight to the 26th) or a whole day (`Pacific/Kwajalein` skipped
+1993-08-21 crossing the date line).
+
+**`Daily` and `Weekly` are unchanged**: they are
+`DailyIn(time.UTC, …)`/`WeeklyIn(time.UTC, …)`, and UTC has no DST, so nothing an
+existing `Daily(9, 0)` caller has observes any difference.
 
 ### Fan-out sub-job options are honoured
 

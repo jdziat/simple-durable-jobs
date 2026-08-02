@@ -1043,11 +1043,18 @@ func MustCronIn(loc *time.Location, expr string) Schedule {
 
 // DailyIn is Daily with the hour and minute interpreted in loc, honouring that
 // location's DST rules rather than a fixed UTC offset.
+//
+// Exactly one fire per calendar day at both DST edges: the fire is the earliest
+// instant on that day whose clock in loc has reached hour:minute, so a reading
+// the clock jumps over fires at the jump and a reading that occurs twice fires at
+// the first occurrence. See [schedule.DailyIn] for the full contract.
 func DailyIn(loc *time.Location, hour, minute int) Schedule {
 	return schedule.DailyIn(loc, hour, minute)
 }
 
-// WeeklyIn is Weekly with the day, hour and minute interpreted in loc.
+// WeeklyIn is Weekly with the day, hour and minute interpreted in loc. The fire
+// always lands on the requested calendar weekday in loc; the DST notes on
+// [DailyIn] apply.
 func WeeklyIn(loc *time.Location, day time.Weekday, hour, minute int) Schedule {
 	return schedule.WeeklyIn(loc, day, hour, minute)
 }

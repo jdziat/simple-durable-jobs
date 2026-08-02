@@ -185,8 +185,9 @@ func TestWeeklyIn_RollsSevenCalendarDaysAcrossSpringForward(t *testing.T) {
 		fires = append(fires, from.In(ny))
 	}
 
-	// 2026-03-08 02:30 does not exist (spring forward), so time.Date normalizes
-	// that ONE fire to 01:30 EST. Every fire after it must be back at 02:30.
+	// 2026-03-08 02:30 does not exist (spring forward), so that ONE fire is at the
+	// instant the clock jumps over the reading — 03:00 EDT. Every fire after it
+	// must be back at 02:30.
 	seen := map[string]bool{}
 	for i, f := range fires {
 		assert.Equal(t, time.Sunday, f.Weekday(), "fire %d landed on %s", i+1, f.Weekday())
@@ -196,7 +197,12 @@ func TestWeeklyIn_RollsSevenCalendarDaysAcrossSpringForward(t *testing.T) {
 		seen[date] = true
 
 		if i == 0 {
-			continue // the normalized transition fire
+			// The transition fire. Pinned explicitly rather than skipped: leaving it
+			// unasserted is what let the gap be resolved to 01:30 EST — an hour BEFORE
+			// the reading — without any test noticing.
+			assert.Equal(t, "2026-03-08 03:00 EDT", f.Format("2006-01-02 15:04 MST"),
+				"the fire for a reading the clock jumps over must be at the jump")
+			continue
 		}
 		assert.Equal(t, "02:30", f.Format("15:04"),
 			"fire %d is at %s: rolling the INSTANT rather than the calendar day carries the "+
