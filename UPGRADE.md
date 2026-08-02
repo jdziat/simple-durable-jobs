@@ -677,6 +677,12 @@ NOT caught:
   optional wrapper with an exported value and an unexported `set` flag that
   `IsZero()` reads. Such a type records no shape and is not guarded at all, see
   below.
+- **any change to a result type containing a map whose KEY's rendered name comes
+  from a marshaler** — a key that is not of string, integer or `uintptr` kind, or
+  one of integer/`uintptr` kind that declares `MarshalText` (the ordinary
+  `map[Status]int` enum-keyed count map). Such a type records no shape and is not
+  guarded at all, see below. A string-kind key is unaffected even when it declares
+  `MarshalText`, because `encoding/json` never consults it.
 
 Those replay exactly as they did before this change: no worse, no better. The
 check is deliberately biased this way — a false rejection wedges a healthy
@@ -815,14 +821,28 @@ them can neither be refused on replay nor refuse another type; the only cost is
 that it stops being guarded, which leaves it exactly where it was before this
 feature existed.
 
-One smaller case joins the list for the same reason: a **map whose key type is
-not of string, integer or `uintptr` kind** — a struct, pointer, float, bool or
-array key, which can reach JSON at all only through an `encoding.TextMarshaler` —
-records no shape. For those kinds the rendered key name is whatever the marshaler
-makes of the FABRICATED value rather than a property of the type — a pointer key
-is fabricated nil and renders to an empty name — which was another false-fire
-source. The pointer form now records no shape, so the pair can no longer
-disagree.
+One smaller case joins the list for the same reason: a **map whose rendered key
+name comes from a marshaler rather than from the key itself**. That is two
+groups, and the rule is *not* the key's kind alone:
+
+- a key **not of string, integer or `uintptr` kind** — a struct, pointer, float,
+  bool or array key, which can reach JSON at all only through an
+  `encoding.TextMarshaler`;
+- a key of **integer or `uintptr` kind that declares `MarshalText`** — the
+  ordinary `type Status int` enum behind a count map such as
+  `ByStatus map[Status]int`.
+
+Both record no shape. In both the rendered key name is whatever the marshaler
+makes of the FABRICATED probe value rather than a property of the type — a
+pointer key is fabricated nil and renders to an empty name, and an integer key is
+fabricated `K(1)` and renders whatever `1` happens to spell — which was another
+false-fire source, and the second group was the worst of them: **inserting one
+constant at the front of an enum's `iota` block moved the fingerprint** even
+though every persisted key is written by NAME, every name stayed attached to its
+own state, and the handler emitted byte-identical JSON. The result type
+declaration had not changed and replay was still refused with "written from a
+different result type". Both forms now record no shape, so neither can disagree
+with anything.
 
 Do not read that as `map[K]V` and `map[*K]V` being interchangeable. They are not:
 `encoding/json` resolves a key of string kind by its raw string BEFORE it looks
@@ -830,24 +850,22 @@ for a marshaler, so `map[Currency]int{"USD": 5}` renders `{"USD":5}` while the
 pointer form goes through `MarshalText`. Swapping one for the other changes the
 wire, and is a real type change rather than a refactor.
 
-A key type that IS one of the kept kinds stays guarded **even when it declares a
-`MarshalText`** — the rule is the key's *kind*, not whether a marshaler exists.
-For a string kind `encoding/json` never consults the marshaler at all
-(`map[Currency]int{"USD": 5}` marshals as `{"USD":5}`, not as whatever
-`Currency.MarshalText` returns), and for an integer kind the marshaler does
-render the key, so the fabricated name is simply what lands in the shape: a
-`map[K]int` for an integer `K` whose `MarshalText` emits `N1` fingerprints as
-`{N1:number}` — and as `{m:{N1:number}}` when it is a member named `m` — and is
-still checked on replay. String- and integer-keyed maps,
-which is nearly all of them, are unaffected.
+A **string-kind** key stays guarded even when it declares a `MarshalText`, and
+that boundary is deliberate rather than an oversight: `encoding/json` never
+consults the marshaler for a string key at all (`map[Currency]int{"USD": 5}`
+marshals as `{"USD":5}`, not as whatever `Currency.MarshalText` returns), so
+nothing fabricated can reach the shape and disarming it would buy a larger blind
+spot for no false fire. Plain string- and integer-keyed maps with no `MarshalText`
+on the key — which is nearly all of them — are unaffected and stay guarded.
 
 If you want a result type covered by this guard, keep `interface`/`any` members
 and `json.RawMessage` members out of it entirely — wrap the value in a plain
 struct, or expose the field as a `string` — keep validating marshalers off
 members `encoding/json` serializes (tagging one `json:"-"` is enough; it keeps
-the guard), key your maps by strings or integers, and keep it from nesting
-without end, which for a tree or list result usually means returning a flattened
-form.
+the guard), key your maps by plain strings or integers — a `MarshalText` on an
+integer key type disarms it, one on a string key type does not — and keep it from
+nesting without end, which for a tree or list result usually means returning a
+flattened form.
 
 One further bound is not about nesting at all, and it has no tidy rule of thumb.
 The probe also gives up after constructing 100,000 values (`maxShapeNodes` in

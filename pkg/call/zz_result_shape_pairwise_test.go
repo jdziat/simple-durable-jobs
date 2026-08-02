@@ -175,6 +175,16 @@ func populatePairwise(t reflect.Type, sliceLen, hops int) (reflect.Value, bool) 
 		// One entry under the key that renders as "1" whatever the key type, so
 		// map[int]V and map[string]V produce byte-identical JSON.
 		var key reflect.Value
+		if fill, ok := pwMapKeyFills[t.Key()]; ok {
+			// A key type whose rendered NAME does not follow from its kind: its
+			// encoding.TextMarshaler decides the text, so the value that renders a
+			// given name differs per type and the harness needs a literal, exactly
+			// as pwOpaqueFills supplies one for a type reflect cannot populate.
+			// Without this the two enum tables would render DIFFERENT names, the
+			// pair would be reported not-wire-identical and skipped, and the rule
+			// would assert nothing.
+			return pwFilledMap(t, fill(), sliceLen, hops)
+		}
 		switch t.Key().Kind() {
 		case reflect.String:
 			key = reflect.ValueOf("1").Convert(t.Key())
@@ -305,6 +315,53 @@ type PwGroup struct {
 	G2 int    `json:"g2"`
 }
 
+// ---- map KEYS whose rendered name comes from a MARSHALER ---------------------
+//
+// The rules above vary MEMBERS. A map's KEY TYPE was varied by nothing, and that
+// is the hole the enum-keyed count map fell through: for an integer or uint key
+// encoding/json calls the key's own MarshalText (resolveKeyName short-circuits on
+// reflect.String only), so the rendered NAME — and with it the shape — came from
+// a marshaler's view of a fabricated value rather than from the wire.
+//
+// PwStatusV1 and PwStatusV2 are ONE enum either side of a constant inserted at
+// the FRONT of its iota block: every name stays attached to its own state and
+// only the numbers move, so no persisted byte can change. The pair is the deploy
+// itself.
+type PwStatusV1 int
+type PwStatusV2 int
+
+var (
+	pwStatusV1Names = map[PwStatusV1]string{1: "active", 2: "done"}
+	pwStatusV2Names = map[PwStatusV2]string{1: "pending", 2: "active", 3: "done"}
+)
+
+// TOTAL marshalers: they accept every value including the probe's fabricated one,
+// which is what makes this different from a VALIDATING key (r27Zone) that rejects
+// the probe and already took the no-shape path through the marshal error.
+func (s PwStatusV1) MarshalText() ([]byte, error) { return []byte(pwStatusV1Names[s]), nil }
+func (s PwStatusV2) MarshalText() ([]byte, error) { return []byte(pwStatusV2Names[s]), nil }
+
+// pwMapKeyFills gives the populator the key VALUE that renders a chosen NAME for
+// a key type whose text comes from a marshaler. Both entries render "active", so
+// the two sides of the pair are wire-identical — which is the premise step 1
+// checks, and which the harness self-check subtest "the enum-shifted map-key pair
+// is wire-identical, not silently skipped" pins directly.
+var pwMapKeyFills = map[reflect.Type]func() reflect.Value{
+	reflect.TypeOf(PwStatusV1(0)): func() reflect.Value { return reflect.ValueOf(PwStatusV1(1)) },
+	reflect.TypeOf(PwStatusV2(0)): func() reflect.Value { return reflect.ValueOf(PwStatusV2(2)) },
+}
+
+// pwFilledMap builds the one-entry map for a key type carried by pwMapKeyFills.
+func pwFilledMap(t reflect.Type, key reflect.Value, sliceLen, hops int) (reflect.Value, bool) {
+	val, ok := populatePairwise(t.Elem(), sliceLen, hops+1)
+	if !ok {
+		return reflect.Value{}, false
+	}
+	m := reflect.MakeMap(t)
+	m.SetMapIndex(key.Convert(t.Key()), val)
+	return m, true
+}
+
 // ---- pair generation --------------------------------------------------------
 
 type pwPair struct {
@@ -404,6 +461,7 @@ var pwRulesMustContribute = []string{
 	"embed-ptr-vs-embed",
 	"embed-ptr-vs-inlined",
 	"embed-vs-inlined",
+	"map-key-type-varied",
 	"member-T-vs-ptrT",
 	"member-array-vs-slice",
 	"member-named-vs-underlying",
@@ -570,6 +628,41 @@ func pwGeneratePairs() []pwPair {
 		holderA := reflect.StructOf([]reflect.StructField{{Name: "X", Type: ft, Tag: `json:"x"`}})
 		holderB := reflect.StructOf([]reflect.StructField{{Name: "X", Type: u, Tag: `json:"x"`}})
 		add("member-named-vs-underlying", ft.Name(), holderA, holderB, 1)
+	}
+
+	// RULE: the same map with a DIFFERENT KEY TYPE. json writes every key as a
+	// string, so two maps whose entries render the same names are byte-identical
+	// however their keys are spelled in Go, and the key type must not reach the
+	// shape.
+	//
+	// EVERY OTHER RULE IN THIS GENERATOR VARIES A MEMBER; nothing varied a key,
+	// which is why the enum-keyed count map (`map[Status]int` with a total
+	// MarshalText) shipped a false fire that no sweep could see. The two arms are
+	// deliberately different in what they exercise and BOTH are needed:
+	//
+	//   kind-varied  map[string]V / map[int]V / map[uint16]V — the key text comes
+	//                from this file, both sides record a real shape, so the rule
+	//                lands ARMED pairs and cannot go green by disarming itself.
+	//   enum-shifted the same enum either side of one inserted constant. The names
+	//                are unchanged, so the wire is identical; the numbers moved, so
+	//                a shape read off a FABRICATED key moves with them.
+	for _, elem := range []reflect.Type{reflect.TypeOf(0), reflect.TypeOf(pwLeaf{})} {
+		keyKinds := []reflect.Type{
+			reflect.TypeOf(""),
+			reflect.TypeOf(0),
+			reflect.TypeOf(uint16(0)),
+			reflect.TypeOf(PwName("")),
+		}
+		for i := 1; i < len(keyKinds); i++ {
+			add("map-key-type-varied",
+				fmt.Sprintf("map[%s]%s vs map[%s]%s",
+					keyKinds[0], elem.Name(), keyKinds[i], elem.Name()),
+				reflect.MapOf(keyKinds[0], elem), reflect.MapOf(keyKinds[i], elem), 1)
+		}
+		add("map-key-type-varied",
+			fmt.Sprintf("enum table shifted, map[PwStatus]%s", elem.Name()),
+			reflect.MapOf(reflect.TypeOf(PwStatusV1(0)), elem),
+			reflect.MapOf(reflect.TypeOf(PwStatusV2(0)), elem), 1)
 	}
 
 	// RULE: a fixed-size array [N]T <-> []T holding N elements. Both emit a
@@ -929,6 +1022,32 @@ func TestResultShape_PairwiseHarnessSelfCheck(t *testing.T) {
 			if got := pwClassify(c.fpA, c.fpB); got != c.want {
 				t.Errorf("pwClassify(%q, %q) = %d, want %d", c.fpA, c.fpB, got, c.want)
 			}
+		}
+	})
+
+	t.Run("the enum-shifted map-key pair is wire-identical, not silently skipped", func(t *testing.T) {
+		// map-key-type-varied has two arms and only one of them can go green by
+		// disarming itself, so the accounting cannot tell them apart: the
+		// kind-varied arm alone satisfies "this rule landed an armed pair" while
+		// the enum arm quietly degrades into a skip. If the two fills ever stopped
+		// rendering the SAME name, step 1 would reject the pair as invalid and the
+		// only arm that reaches a marshaler-rendered key would assert nothing.
+		a := reflect.MapOf(reflect.TypeOf(PwStatusV1(0)), reflect.TypeOf(0))
+		b := reflect.MapOf(reflect.TypeOf(PwStatusV2(0)), reflect.TypeOf(0))
+		out, wire, shapeA, shapeB, detail := pwCheckPair(a, b, 1)
+		if out == pwNotWireIdentical || out == pwUnmarshalable {
+			t.Fatalf("the enum-shifted pair must be VALID (both sides render the same key name), "+
+				"got outcome %d: %s", out, detail)
+		}
+		if wire != `{"active":1}` {
+			t.Fatalf("both sides must render the key as \"active\"; got wire %s", wire)
+		}
+		// And it must be armed-or-empty on BOTH sides together: one empty shape
+		// would make the pair half-armed and unable to fail whatever the other
+		// side said.
+		if (shapeA == "") != (shapeB == "") {
+			t.Fatalf("the enum-shifted pair is half-armed (%q vs %q); replay would skip in both "+
+				"directions and the arm asserts nothing", shapeA, shapeB)
 		}
 	})
 

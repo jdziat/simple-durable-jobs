@@ -6,14 +6,25 @@ import (
 	"github.com/jdziat/simple-durable-jobs/v4/pkg/core"
 )
 
-// explicitZeroRetryIDs records which jobs asked for zero retries. It MUST be called
-// BEFORE the insert.
+// explicitZeroRetryIDs records which jobs asked for zero retries. It MUST be
+// called BEFORE the insert, and on a struct GORM has never been handed.
 //
 // core.Job.MaxRetries declares `default:3`, and GORM substitutes a field's declared
 // default whenever the value is zero — then writes the substituted value BACK into
 // the struct. So after Create the caller's job says MaxRetries=3 and the original
 // intent is gone: a check placed after the insert reads state that has already been
 // overwritten and never fires.
+//
+// "Before the insert" is not sufficient on its own, and the second half of the
+// contract is why. GORM performs that substitution while BUILDING the statement
+// and leaves it in place when the statement then FAILS and the transaction rolls
+// back. Every enqueue path is retried on transient serialization failures, so a
+// capture that reads the CALLER's struct is "before the insert" on attempt 2 and
+// AFTER the one on attempt 1 — it re-reads 3, the corrective UPDATE never arms,
+// and the row commits max_retries=3 with a nil error. What makes this safe is
+// that encodedJobForCreate now returns a fresh copy on every call, on every
+// codec, so GORM never touches the struct this reads. See its godoc, and
+// TestExplicitZeroRetriesSurvivesASerializationRetryOnEveryEnqueuePath.
 //
 // The tag cannot simply be dropped. AutoMigrate would see a changed column
 // definition and REBUILD the SQLite jobs table, destroying the indexes created by

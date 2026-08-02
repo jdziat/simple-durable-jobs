@@ -2,6 +2,7 @@ package call
 
 import (
 	"crypto/sha256"
+	"encoding"
 	"encoding/hex"
 	"encoding/json"
 	"reflect"
@@ -501,6 +502,13 @@ func build(t reflect.Type, depth int, free []reflect.Type, budget *int) (reflect
 		// renders every map key as a string, and map[int]V and map[string]V produce
 		// byte-identical JSON for the same entries. Synthesizing "x" for one and 1
 		// for the other made them fingerprint differently for no wire reason.
+		//
+		// THAT INVARIANT IS ONLY TRUE FOR THE KEY TYPES synthesizeMapKey ACCEPTS,
+		// and the accepting is the point: a key type whose rendered text
+		// encoding/json takes from the key's own MarshalText is refused there, so
+		// no marshaler's rendering of a fabricated key can reach a shape. See its
+		// doc comment — the claim above was once written as unconditional and was
+		// false for `map[Status]int`.
 		key, ok := synthesizeMapKey(t.Key())
 		if !ok {
 			return reflect.Value{}, false
@@ -855,7 +863,7 @@ func promotesIntoParent(sf reflect.StructField) bool {
 // map types that serialize identically fingerprint identically.
 //
 // ANY OTHER KEY KIND RECORDS NO SHAPE, by the same one rule as everywhere else in
-// this file. The kinds above are the ones whose rendered key this function fully
+// this file. The kinds below are the ones whose rendered key this function fully
 // controls; every other kind reaches encoding/json only through an
 // encoding.TextMarshaler, and the key NAME is then whatever that marshaler makes
 // of the value handed to it — which is the substitution family again, and it was
@@ -865,7 +873,42 @@ func promotesIntoParent(sf reflect.StructField) bool {
 // byte-identical change of one to the other was refused on replay. A key type
 // json cannot use at all (a struct with no TextMarshaler) already recorded no
 // shape via the marshal error; this makes the outcome the same for both.
+//
+// "WHOSE RENDERED KEY THIS FUNCTION CONTROLS" IS NOT A STATEMENT ABOUT THE KIND.
+// The kind switch alone got that wrong, and the case it got wrong is the enum-
+// keyed count map — `ByStatus map[Status]int` — which is about as ordinary as a
+// result member gets. encoding/json's resolveKeyName short-circuits on
+// reflect.String FIRST and only THEN looks for an encoding.TextMarshaler, so:
+//
+//	map[string]V, map[NamedString]V   the key text is taken verbatim; a
+//	                                  MarshalText on the key type is never called
+//	map[Status]V (Status an int)      the marshaler is ALWAYS called, before the
+//	                                  strconv branch is ever reached
+//
+// So for an integer or uint key that declares MarshalText the shape's key name is
+// MarshalText(K(1)) — "active", only because that is what Status(1) happened to
+// spell that day. Inserting one constant at the FRONT of the same iota block
+// moves every code by one while every name stays attached to its own state: an
+// edit that provably cannot move a byte, because every persisted key is written
+// by NAME. It moved the fingerprint from aaeb546ea684c9ac to 9492bef0fd81f2c5 and
+// refused every in-flight replay with "written from a different result type",
+// about a result type whose declaration had not changed. A shape that is a
+// function of a FABRICATED VALUE rather than of the type is not a shape, so such
+// a key records NO SHAPE, like every other boundary here.
+//
+// THE STRING CASE STAYS, and that boundary is load-bearing rather than a
+// convenience: json never consults a string-kind key's marshaler, so disarming it
+// would buy a strictly larger accepted miss for no false fire at all.
+// TestResultShape_StringKindMapKeyIgnoresItsMarshalText pins both halves.
 func synthesizeMapKey(t reflect.Type) (reflect.Value, bool) {
+	// MIRRORS resolveKeyName'S ORDER, which is the whole of the rule: String is
+	// tested before TextMarshaler there, so it is tested before it here too.
+	if t.Kind() != reflect.String && t.Implements(textMarshalerType) {
+		// The VALUE method set, not the pointer one: a map key reaches
+		// encoding/json through reflect's non-addressable iteration, so only a
+		// value-receiver MarshalText is ever in play.
+		return reflect.Value{}, false
+	}
 	switch t.Kind() {
 	case reflect.String:
 		return reflect.ValueOf("1").Convert(t), true
@@ -883,6 +926,11 @@ var (
 	jsonNumberType     = reflect.TypeOf(json.Number(""))
 	jsonRawMessageType = reflect.TypeOf(json.RawMessage(nil))
 	jsonMarshalerType  = reflect.TypeOf((*json.Marshaler)(nil)).Elem()
+	// Consulted for MAP KEYS ONLY. Elsewhere in this file a TextMarshaler is
+	// deliberately not considered — see probeSpeaksForType — because its output is
+	// always a JSON string and cannot misrepresent structure. A map key is the one
+	// position where that output becomes a member NAME.
+	textMarshalerType = reflect.TypeOf((*encoding.TextMarshaler)(nil)).Elem()
 )
 
 // describe renders decoded JSON as a canonical shape: object members sorted by

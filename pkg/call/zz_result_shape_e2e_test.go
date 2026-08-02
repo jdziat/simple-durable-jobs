@@ -386,38 +386,91 @@ func reflectTypeOf[T any]() reflect.Type { return reflect.TypeOf((*T)(nil)).Elem
 // emitted: for one JSON name the SHALLOWEST embedding wins, and if two fields tie
 // at that shallowest depth encoding/json emits neither.
 
-type embA struct {
+// EmbA and EmbB each carry an `id` — the SAME json name at the SAME promotion
+// depth, which is the whole fixture. Neither declaration repeats a tag on its own,
+// so neither is a diagnostic; the repetition only exists once both are embedded in
+// one struct.
+type EmbA struct {
 	ID   string `json:"id"`
 	Only string `json:"only_a"`
 }
-type embB struct {
+type EmbB struct {
 	ID string `json:"id"`
 }
 
-// Both embeds supply "id" at the same depth, so json emits no "id" at all.
-// nolint:govet // the repeated "id" tag IS the fixture: this is the ambiguous
-// promotion whose field encoding/json declines to emit.
-type ambiguous struct {
-	embA
-	embB
-}
+// THE TWO CONFLICT TYPES ARE BUILT, NOT DECLARED, and that is not cosmetic.
+//
+// The repeated `json:"id"` IS the fixture — it is the promotion conflict — so it
+// must not be weakened to quiet a linter. Written as literal declarations
+// (`type ambiguous struct { embA; embB }`) they made `go vet ./...` exit 1 with
+// two structtag diagnostics for this package, on a branch whose CONTRIBUTING.md
+// requires `go vet ./...` to pass. The `// nolint:govet` they carried is a
+// golangci-lint directive; `go vet` has no such mechanism and ignored it, so the
+// suppression only ever silenced ONE of the two gates and the other was quietly
+// red. Nothing in CI runs `go vet`, and `go test` does not run the structtag
+// analyzer, so the suite stayed green over it.
+//
+// reflect.StructOf produces a type encoding/json cannot distinguish from the
+// declared one — the same two promoted `id` members at the same depth, resolved
+// by the same dominantField rule — and leaves no literal duplicate tag in source
+// for the analyzer to find. zz_result_shape_pairwise_test.go already builds its
+// variants this way. Both tests below assert the conflict against the REAL
+// encoder first, so a StructOf that failed to reproduce it could not pass.
+var (
+	// Both embeds supply "id" at the same depth, so json emits no "id" at all.
+	ambiguousType = reflect.StructOf([]reflect.StructField{
+		{Name: "EmbA", Type: reflect.TypeOf(EmbA{}), Anonymous: true},
+		{Name: "EmbB", Type: reflect.TypeOf(EmbB{}), Anonymous: true},
+	})
 
-// Same two embeds, but the outer struct declares "id" itself: depth 0 beats depth
-// 1, so json emits the outer one.
-// nolint:govet // the repeated "id" tag IS the fixture: the outer field must win
-// the promotion conflict against both embedded ones.
-type shadowed struct {
-	embA
-	embB
-	ID int `json:"id"`
+	// Same two embeds, but the outer struct declares "id" itself: depth 0 beats
+	// depth 1, so json emits the outer one.
+	shadowedType = reflect.StructOf([]reflect.StructField{
+		{Name: "EmbA", Type: reflect.TypeOf(EmbA{}), Anonymous: true},
+		{Name: "EmbB", Type: reflect.TypeOf(EmbB{}), Anonymous: true},
+		{Name: "ID", Type: reflect.TypeOf(0), Tag: `json:"id"`},
+	})
+)
+
+// e2eZeroOf gives a value of a built type, for the fixtures that are consumed as
+// values rather than as reflect.Types.
+func e2eZeroOf(t reflect.Type) any { return reflect.New(t).Elem().Interface() }
+
+// e2eJSONKeys is the PREMISE check both promotion tests run first: what
+// encoding/json really emits for the built type. Without it a StructOf that
+// silently stopped promoting would leave both tests comparing two empty shapes
+// and asserting nothing.
+func e2eJSONKeys(t *testing.T, v any) map[string]json.RawMessage {
+	t.Helper()
+	b, err := json.Marshal(v)
+	if err != nil {
+		t.Fatalf("marshal fixture: %v", err)
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatalf("unmarshal %s: %v", b, err)
+	}
+	return m
 }
 
 func TestResultShape_AmbiguousPromotionDropsTheField(t *testing.T) {
+	// PREMISE: the built type really does exhibit the conflict — "id" is dropped
+	// by the real encoder, "only_a" survives.
+	keys := e2eJSONKeys(t, e2eZeroOf(ambiguousType))
+	if _, present := keys["id"]; present {
+		t.Fatalf("FIXTURE BROKEN: encoding/json emitted \"id\" for %s, so the two embeds are not "+
+			"in conflict and the test below proves nothing", ambiguousType)
+	}
+	if _, present := keys["only_a"]; !present {
+		t.Fatalf("FIXTURE BROKEN: %s promotes nothing at all (%v); the conflict is not being "+
+			"exercised", ambiguousType, keys)
+	}
+
 	// Equivalent to a struct with only "only_a": "id" is ambiguous and not emitted.
 	type onlyA struct {
 		Only string `json:"only_a"`
 	}
-	got := ResultFingerprintForTest(reflectTypeOf[ambiguous]())
+	got := ResultFingerprintForTest(ambiguousType)
 	want := ResultFingerprintForTest(reflectTypeOf[onlyA]())
 	if got != want {
 		t.Fatalf("an ambiguous promoted name must not appear in the shape: %s != %s", got, want)
@@ -425,12 +478,22 @@ func TestResultShape_AmbiguousPromotionDropsTheField(t *testing.T) {
 }
 
 func TestResultShape_ShallowerFieldWinsOverPromoted(t *testing.T) {
+	// PREMISE: the outer "id" really is what the encoder emits, and it is a
+	// NUMBER — the promoted ones are strings, so the kind is what distinguishes
+	// "the outer field won" from "some id was emitted".
+	keys := e2eJSONKeys(t, e2eZeroOf(shadowedType))
+	if string(keys["id"]) != "0" {
+		t.Fatalf("FIXTURE BROKEN: encoding/json emitted id=%s for %s; the outer numeric field "+
+			"must win the promotion conflict or the test below proves nothing",
+			keys["id"], shadowedType)
+	}
+
 	// The outer "id" (a number) wins over both promoted string "id"s.
 	type flat struct {
 		ID   int    `json:"id"`
 		Only string `json:"only_a"`
 	}
-	got := ResultFingerprintForTest(reflectTypeOf[shadowed]())
+	got := ResultFingerprintForTest(shadowedType)
 	want := ResultFingerprintForTest(reflectTypeOf[flat]())
 	if got != want {
 		t.Fatalf("the shallowest field must win a promotion conflict: %s != %s", got, want)
