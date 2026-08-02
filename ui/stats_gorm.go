@@ -211,38 +211,15 @@ const statsFaceSlop = 26 * time.Hour
 // cmp is one of ">=", "<=" or "<"; anything starting with ">" is treated as a
 // lower bound for the purposes of which way the prefilter is loosened.
 func statsTimestampPredicate(isSQLite bool, cmp string, bound time.Time) (string, []any) {
+	// RANGE-CHECK FIRST, ON EVERY DIALECT — before the SQLite branch, not inside
+	// it. MySQL's DATETIME ends at 9999-12-31 23:59:59, so an out-of-range bound
+	// bound raw there returns zero rows or fails the query outright. That is the
+	// same defect, in the same shape, that pkg/storage was fixed for; putting the
+	// check inside the SQLite arm reintroduced it here.
+	bound = statsRepresentableBound(bound)
+
 	if !isSQLite {
 		return "timestamp " + cmp + " ?", []any{bound}
-	}
-	// A face beyond +14:00 can push an in-range instant into a five-digit year,
-	// which inverts every lexical compare and makes julianday() return NULL.
-	// Re-facing to UTC is instant-preserving and always renders four digits for an
-	// instant SQLite can hold at all.
-	if bound.Year() > 9999 {
-		bound = bound.UTC()
-	}
-	// A bound that is out of range as an INSTANT, not merely on an awkward face,
-	// survives that re-face. julianday() returns NULL for it and `NULL <= x` is
-	// not true, so the predicate would silently drop EVERY row. pkg/storage's
-	// timeBoundPredicate range-checks before building any SQL for exactly this
-	// reason; this is the same rule, restated because package ui cannot reach that
-	// helper.
-	//
-	// It CLAMPS rather than emitting no predicate, and that difference is
-	// load-bearing: pkg/storage can safely return "" for a bound that excludes
-	// nothing, because every one of its callers is a SELECT filter where the
-	// failure is over-inclusion. This predicate is also handed to PruneStats'
-	// DELETE, where "excludes nothing" would mean DELETE EVERY ROW. Clamping to
-	// the representable edge expresses the same intent for both and can never turn
-	// a filter into a table wipe.
-	//
-	// Not reachable through the RPC — GetStatsHistory derives its window from
-	// parsePeriod — but StatsStorage is exported, so a library caller can pass any
-	// time.Time.
-	if bound.Year() > 9999 {
-		bound = time.Date(9999, 12, 31, 23, 59, 59, 999000000, time.UTC)
-	} else if bound.Year() < 1 {
-		bound = time.Date(1, 1, 1, 0, 0, 0, 0, time.UTC)
 	}
 
 	// substr(x, -6) is the trailing "+HH:MM"/"-HH:MM" the driver always writes,
@@ -316,4 +293,47 @@ func (s *gormStatsStorage) PruneStats(ctx context.Context, before time.Time) (in
 	pred, args := statsTimestampPredicate(s.isSQLite(), "<", before)
 	result := s.db.WithContext(ctx).Where(pred, args...).Delete(&JobStat{})
 	return result.RowsAffected, result.Error
+}
+
+// statsRepresentableBoundCeil / Floor are the widest instants every supported
+// backend can hold AND compare. They are deliberately the same values as
+// pkg/storage's representableBoundCeil / Floor; package ui cannot import that
+// unexported helper, so the rule is restated rather than shared.
+//
+// The ceiling stops at millisecond .999 because SQLite rounds the seconds
+// fraction into its millisecond julian-day integer, and anything from
+// '…23:59:59.9995' upward rounds past the end of the supported range and yields
+// NULL — measured, with '…59.9994' still parsing. MySQL independently needs the
+// same ceiling: DATETIME ends at 9999-12-31 23:59:59.
+var (
+	statsRepresentableBoundFloor = time.Date(1, 1, 1, 0, 0, 0, 0, time.UTC)
+	statsRepresentableBoundCeil  = time.Date(9999, 12, 31, 23, 59, 59, 999000000, time.UTC)
+)
+
+// statsRepresentableBound clamps a bound into the range the backend can store and
+// compare.
+//
+// IT COMPARES THE INSTANT, NOT THE YEAR, and that distinction is the whole point.
+// An earlier version tested `bound.Year() > 9999`, which every instant in the
+// final half-millisecond of year 9999 passes — including timestamppb's maximum,
+// 9999-12-31T23:59:59.999999999Z, which is exactly the sentinel this repo already
+// treats as the canonical open-ended upper bound. The clamp never fired for it,
+// julianday(?) went NULL, and `julianday(timestamp) <= NULL` dropped every row
+// whose stored clock face differed from the bound's: half the throughput buckets
+// silently missing, and a "prune everything" cutoff that no-ops on most rows.
+//
+// It CLAMPS rather than returning an empty predicate. pkg/storage can safely
+// return "" for a bound that excludes nothing, because all of its callers are
+// SELECT filters where the failure is over-inclusion. This predicate is also
+// handed to PruneStats' DELETE, where "excludes nothing" would mean DELETE EVERY
+// ROW. Clamping expresses the same intent for both and cannot turn a filter into
+// a table wipe.
+func statsRepresentableBound(bound time.Time) time.Time {
+	switch {
+	case bound.After(statsRepresentableBoundCeil):
+		return statsRepresentableBoundCeil
+	case bound.Before(statsRepresentableBoundFloor):
+		return statsRepresentableBoundFloor
+	}
+	return bound
 }
