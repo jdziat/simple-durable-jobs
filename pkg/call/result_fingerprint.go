@@ -439,6 +439,13 @@ func build(t reflect.Type, depth int, free []reflect.Type, budget *int) (reflect
 				return reflect.Value{}, false
 			}
 			f.Set(sub)
+			// A MEMBER THE PARENT IS ABOUT TO DROP RECORDS NO SHAPE FOR THE WHOLE
+			// TYPE. See omitzeroWouldDrop: the value is the one build actually
+			// produced, so this is the same "trust the probe only where it speaks
+			// for the type" rule the struct case already applies to a marshaler.
+			if tagHasOption(sf.Tag, "omitzero") && omitzeroWouldDrop(sub) {
+				return reflect.Value{}, false
+			}
 		}
 		if !probeSpeaksForType(t, v) {
 			return reflect.Value{}, false
@@ -581,6 +588,12 @@ func build(t reflect.Type, depth int, free []reflect.Type, budget *int) (reflect
 // empty at the zero), *big.Int (a number) and a decimal-as-string keep exactly
 // the shapes they had, while the Option (null) and the set ([]) record none.
 //
+// THAT LAST SENTENCE IS ONLY TRUE OF THE MEMBER'S OWN BYTES. Whether the PARENT
+// emits the member at all is a separate question, and `,omitzero` answers it from
+// the very zero this function just decided to trust — so time.Time, netip.Addr
+// and big.Int keep their shapes here and are dropped by the parent there. See
+// omitzeroWouldDrop, which build consults for each member as it is built.
+//
 // Note the check runs on the built VALUE rather than on a rule about the type,
 // which is what keeps it out of the mirror-encoding/json business this file was
 // rebuilt to escape: the real encoder is handed the real value and its answer is
@@ -675,6 +688,90 @@ func hasUnpopulatedStateSeen(t reflect.Type, visited []reflect.Type) bool {
 			ft = ft.Elem()
 		}
 		if hasUnpopulatedStateSeen(ft, visited) {
+			return true
+		}
+	}
+	return false
+}
+
+// omitzeroWouldDrop reports whether encoding/json's `omitzero` option would omit
+// a member holding v — the value build actually produced, not a rule about the
+// member's type.
+//
+// WHY THE PROBE NEEDS THIS AT ALL. build cannot set unexported fields, so a
+// member type made only of them — time.Time, netip.Addr, big.Int, a decimal
+// carried as a struct — is probed at its ZERO. probeSpeaksForType then trusts it,
+// and rightly: its wire form IN ISOLATION is a scalar, and a scalar has no
+// structure the probe could have got wrong. But that is a statement about the
+// MEMBER's own bytes and says nothing about whether the PARENT emits the member
+// at all. With `omitzero` the parent drops it, so the shape loses a member
+// production — which never has a zero timestamp — always writes.
+//
+// The result is the documented false-fire family reaching a new boundary. On a
+// member declared Created time.Time, the tag edit json:"created" ->
+// json:"created,omitzero" is byte-identical for every non-zero timestamp, yet it
+// moves the shape from {created:string,n:number} to {n:number}. Both are
+// non-empty, so call.go's fail-open guard does not skip it, and replay hard-fails
+// on an edit that cannot move a byte.
+//
+// THE ANSWER IS THE FILE'S SETTLED RULE, NOT A LIST OF TYPES. A shape the probe
+// cannot be trusted to have produced is no shape at all, so a dropped member
+// takes the whole type's shape with it. Asking about the VALUE — rather than
+// naming time.Time and netip.Addr — is what keeps this from rotting as the next
+// such type appears, and needs no knowledge of any of them.
+//
+// THIS MIRRORS AN encoding/json RULE, WHICH THIS FILE OTHERWISE REFUSES TO DO,
+// so here is why it is safe to: it is a deliberate OVER-approximation, and every
+// way it can disagree with the encoder costs a MISS, never a fire. json drops the
+// member when the type (or its pointer) has an `IsZero() bool` and that reports
+// true, and otherwise when reflect reports the value zero. This returns true if
+// EITHER holds, which is a superset of json's answer in all four of its cases:
+//
+//   - no IsZero anywhere: both reduce to v.IsZero() — exact;
+//   - T has IsZero: json consults only the method, this also drops a
+//     reflect-zero value whose method says false — a miss;
+//   - only *T has IsZero: json boxes an unaddressable value to call it, which is
+//     what the second box below does — same answer;
+//   - t is a pointer with IsZero: json drops a nil, and so does v.IsZero().
+//
+// So an over-drop records no shape and leaves the guard skipped, which is the
+// direction this file has chosen at every other boundary; an under-drop would
+// wedge a live workflow, and none is reachable.
+//
+// A user's IsZero may panic on a value it has never seen, exactly as a MarshalJSON
+// may; resultShape's recover turns that into the same "no shape".
+func omitzeroWouldDrop(v reflect.Value) bool {
+	if v.IsZero() {
+		// Also the only case where a promoted value-receiver IsZero could be
+		// called on a nil pointer, so the calls below cannot nil-panic.
+		return true
+	}
+	if z, ok := v.Interface().(interface{ IsZero() bool }); ok {
+		return z.IsZero()
+	}
+	// A POINTER-RECEIVER IsZero is not in T's method set but IS in *T's, and
+	// encoding/json boxes an unaddressable value to reach it — so a member whose
+	// state the probe could not set is dropped while reflect still reports the
+	// value non-zero. Reading the pointer form second rather than instead is what
+	// makes the two branches distinguishable: a value-receiver method answers
+	// identically through either form, a pointer-receiver one answers only here.
+	p := reflect.New(v.Type())
+	p.Elem().Set(v)
+	if z, ok := p.Interface().(interface{ IsZero() bool }); ok {
+		return z.IsZero()
+	}
+	return false
+}
+
+// tagHasOption reports whether a json struct tag carries the named option — the
+// comma-separated list after the name, compared whole so that a name or another
+// option merely CONTAINING want does not match.
+func tagHasOption(tag reflect.StructTag, want string) bool {
+	_, opts, _ := strings.Cut(tag.Get("json"), ",")
+	for opts != "" {
+		var opt string
+		opt, opts, _ = strings.Cut(opts, ",")
+		if opt == want {
 			return true
 		}
 	}

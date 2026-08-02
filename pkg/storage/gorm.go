@@ -1016,7 +1016,13 @@ func (s *GormStorage) Fail(ctx context.Context, jobID core.UUID, workerID string
 	} else {
 		updates["status"] = core.StatusFailed
 		updates["completed_at"] = s.nowWriteValue()
-		updates["dead_lettered_at"] = now
+		// nowWriteValue, NOT the bare local `now` above: dead_lettered_at is the
+		// column the dead-letter view is ORDERED by, and on SQLite that ORDER BY is
+		// a lexical compare of offset-suffixed TEXT. A plain time.Now() wears the
+		// writing process's face, which is TWO faces in a DST zone and more across a
+		// mixed-zone fleet, so "newest dead first" inverted. nowWriteValue writes one
+		// face (UTC on SQLite, the DB clock elsewhere) — see deadLetterOrderColumn.
+		updates["dead_lettered_at"] = s.nowWriteValue()
 		// Label stays plaintext (fixed, non-PII); only the error suffix is
 		// encrypted, preserving the attempt>=max_retries CASE in SQL.
 		updates["dead_letter_reason"] = deadLetterReasonExpr(encErr)
@@ -1107,7 +1113,6 @@ func (s *GormStorage) accountTerminalWithFanOut(ctx context.Context, jobID core.
 		fanOutID = ""
 
 		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-			now := time.Now()
 			updates := make(map[string]any, len(jobUpdates)+2)
 			for key, value := range jobUpdates {
 				if key == deadLetterReasonKey {
@@ -1117,7 +1122,9 @@ func (s *GormStorage) accountTerminalWithFanOut(ctx context.Context, jobID core.
 			}
 			updates["completed_at"] = s.nowWriteValue()
 			if lastError, ok := jobUpdates[deadLetterReasonKey].(string); ok {
-				updates["dead_lettered_at"] = now
+				// One clock face, same reason as Fail's terminal branch — this is the
+				// column the DLQ is ordered by. See deadLetterOrderColumn.
+				updates["dead_lettered_at"] = s.nowWriteValue()
 				updates["dead_letter_reason"] = deadLetterReasonExpr(lastError)
 			}
 

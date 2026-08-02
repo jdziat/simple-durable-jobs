@@ -45,6 +45,15 @@ _ = count
 Results are ordered by `dead_lettered_at DESC`. Use `DeadLetterOffset` with
 `DeadLetterLimit` for pagination.
 
+On SQLite that column is stored as text carrying a UTC offset, so the sort is a
+newest-first ordering of instants only when every row shares one clock face. Rows
+dead-lettered by this version do; rows written by releases before this one carry
+the offset of whichever process wrote them, so a mixed-zone fleet — or one worker
+across a daylight-saving fall-back — can leave those legacy rows out of order
+relative to each other. They are still returned, and the `DeadLetteredSince` /
+`DeadLetteredUntil` window selects them by instant regardless. They age out with
+retention. Postgres and MySQL store a real instant and are unaffected.
+
 ## Triage and replay
 
 Dead-lettered jobs keep their original job row, arguments, last error, and DLQ

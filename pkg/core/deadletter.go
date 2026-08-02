@@ -21,8 +21,17 @@ type DeadLetterFilter struct {
 	// what a "what died in the last hour" triage query is looking for, and
 	// bounding created_at would hide it. dead_lettered_at is also the column this
 	// view is ORDERED by (dead_lettered_at DESC — see ListDeadLettered), so
-	// filtering it keeps the window and the sort talking about the same axis, and
-	// it is indexed (idx_jobs_dead_lettered_at).
+	// filtering it keeps the window and the sort talking about the same COLUMN,
+	// and it is indexed (idx_jobs_dead_lettered_at).
+	//
+	// Same column is not automatically the same AXIS. On SQLite the window selects
+	// by instant (julianday) while the ORDER BY compares wall text, so the two
+	// agree only while every row wears one clock face. Every row this release
+	// writes does; rows dead-lettered by an EARLIER release keep the local face
+	// they were written on and can still sort out of order among themselves. They
+	// are never dropped from the window, only mis-placed in the sort, and they
+	// drain with retention. Postgres and MySQL store a real instant and have
+	// neither concern. See storage.deadLetterOrderColumn.
 	//
 	// JobFilter.Since/Until bound created_at, and that stays true. ListJobs maps
 	// its request-level since/until onto whichever column the branch it selected

@@ -311,14 +311,17 @@ const (
 //   - A single zone still writes TWO faces across a DST transition (-07:00 and
 //     -08:00 for America/Los_Angeles). Whichever face the bind picks is wrong for
 //     rows on the other one, inside the fall-back hour, in one process.
-//   - dead_lettered_at is written from time.Now() in Storage.Fail, so it carries
-//     the same mixture.
+//   - dead_lettered_at is written on ONE face NOW (nowWriteValue — see
+//     deadLetterOrderColumn), but rows written by earlier releases carry the same
+//     mixture, so this predicate still has to serve them.
 //
-// Normalizing on the WRITE path instead (what bff9da0 did for run_at) is right
-// for a column with two in-package writers and no legacy comparison to honour.
-// It is not available here: it would leave every already-stored row on its
-// original face, and no write-side choice can make one bind face correct for a
-// column that legitimately holds several.
+// Normalizing on the WRITE path instead (what bff9da0 did for run_at, and what
+// dead_lettered_at now does) is right for a column with in-package writers and no
+// legacy comparison to honour. It is not sufficient HERE: it leaves every
+// already-stored row on its original face, and no write-side choice can make one
+// bind face correct for a column that legitimately holds several. It is also not
+// available to created_at at all — see jobSortOrder for why the dequeue fence
+// pins that column to the local face.
 //
 // # THE FORM, AND WHY IT IS THE ONE ALREADY IN THIS PACKAGE
 //
@@ -580,6 +583,29 @@ func representableBound(bound time.Time, dir timeBoundDirection) (time.Time, boo
 	case bound.After(representableBoundCeil):
 		return representableBoundCeil, true
 	}
+	// The instant is inside the representable range, but every comparison this
+	// bound feeds is against its RENDERED WALL TEXT, and wall = instant + offset.
+	// A positive face pushes an instant inside the LAST 14 HOURS of year 9999 into
+	// a five-digit year: representableBoundCeil.In(+05:30) renders
+	// "10000-01-01 05:29:59.999+05:30". The instant checks above cannot see that —
+	// it is not After the ceil — and the offset re-face above only fires beyond
+	// ±14:00. Both lexical arms then invert ("10000-" sorts BELOW "2026-") and
+	// julianday() returns NULL for a year-10000 text, so an upper bound at the end
+	// of time returned an EMPTY page instead of everything.
+	//
+	// Re-facing to UTC is INSTANT-PRESERVING — it changes no row's membership,
+	// unlike a clamp — and a UTC rendering of any instant in [floor, ceil] is
+	// always a four-digit year by construction, because floor and ceil are
+	// themselves defined on UTC.
+	//
+	// Only the HIGH side needs this. A negative face moves the wall EARLIER, and
+	// the earliest reachable wall is floor on a -14:00 face — "0000-12-31 …",
+	// still four digits, still sorting below every real row and still parsed by
+	// julianday. Anything below that is Before(floor) and was already clamped.
+	// That asymmetry is why the symmetric-looking instant guard hid this.
+	if bound.Year() > 9999 {
+		bound = bound.UTC()
+	}
 	return bound, true
 }
 
@@ -741,6 +767,75 @@ var jobSortColumns = map[string]string{
 // An empty/unknown SortKey falls back to created_at; SortDir is asc or desc
 // (default desc). A created_at,id tiebreak keeps paging stable when the chosen
 // column has ties.
+//
+// # ACCEPTED RESIDUAL: ON SQLITE THIS ORDERS WALL FACES, NOT INSTANTS
+//
+// created_at is TEXT carrying the offset of whichever process wrote it, so a bare
+// `created_at DESC` is a LEXICAL compare — the same hazard timeBoundPredicate's
+// godoc spells out for the WHERE clause.
+//
+// IT IS NOT ONLY created_at, and naming just that one would mislead: run_at and
+// started_at are whitelisted sort keys with the identical defect. run_at is
+// deliberately re-faced to time.Local by normalizeRunAtZone, and started_at is
+// written from dequeueOnce's process-local time.Now(), so `ORDER BY run_at DESC`
+// inverts across a DST fall-back exactly as created_at does. dead_lettered_at is
+// the ONE timestamp here that is now face-independent, because its ORDER BY is
+// the one this round could fix on the write side without touching a correctness
+// fence.
+//
+// Two ways in, neither hypothetical:
+//
+//   - ONE worker in a DST zone renders two offsets across the fall-back hour, so
+//     for that hour every year "newest first" inverts by up to the fold.
+//   - Two processes in different zones against one SQLite file (the CLI and the
+//     standalone UI binaries are documented second processes) diverge by their
+//     full offset delta, and on a page boundary the newest rows land on page 2.
+//
+// Postgres and MySQL store a real instant and are unaffected.
+//
+// # WHY IT IS NOT FIXED HERE, MEASURED
+//
+// Normalizing the ORDER BY through julianday() would be instant-correct, and it
+// costs SQLite the index it was walking in order. Measured on the real migrated
+// schema, 200k rows over ~139 days, 8 queues, ANALYZEd, LIMIT 50, mean of 5 runs
+// after 2 warm-ups (full table in deadLetterOrderColumn):
+//
+//	                       bare ORDER BY   julianday() ORDER BY
+//	list, queue = ?               279us              154.606ms   554x
+//	list, status = ?              531us              258.767ms   487x
+//	list, no filter            55.513ms               68.864ms   1.2x
+//
+//	plan queue = ?   bare: SEARCH … idx_jobs_queue_created
+//	                         | USE TEMP B-TREE FOR RIGHT PART OF ORDER BY
+//	                 jd:   SEARCH … idx_jobs_queue_created
+//	                         | USE TEMP B-TREE FOR ORDER BY
+//
+// The unfiltered list already scans and sorts, so it barely moves; the FILTERED
+// shapes — which is what the dashboard's queue and status pickers produce — are
+// the ones that turn into a full read plus a sort of every matching row.
+//
+// The other route, a single stored clock face, is what dead_lettered_at took (see
+// deadLetterOrderColumn) and what run_at already had (normalizeRunAtZone). It is
+// NOT available to created_at: created_at is half of the dequeue correctness
+// fence, `COALESCE(run_at, created_at) <= <process-local bind>` (gorm.go, and see
+// claimableCandidates on why that gate and not dq_ready is the fence). Storing it
+// on UTC while the bind stays local would read every freshly created job as due
+// hours in the future in a positive-offset zone; moving the bind too breaks every
+// ALREADY-STORED row, including firing scheduled jobs early. That is the v5 change
+// normalizeRunAtZone's residual (3) already describes, not a late edit to a
+// release branch. Rewriting stored text is not on the table either — a migration
+// that did exactly that corrupted ordering on every SQLite database and was
+// deleted.
+//
+// The route that would close it without either cost is an indexed generated
+// column (SQLite VIRTUAL generated columns can be indexed, so no stored text
+// changes and no plan loss) — a schema change, deliberately not made here.
+//
+// Pinned by TestR29_AcceptedResidual_SearchJobsSortsCreatedAtByWallFace and
+// TestR29_AcceptedResidual_SearchJobsSortInvertsAcrossADSTFallBack, which fail if
+// the residual is ever closed so this godoc cannot go stale, and by
+// TestR29_JobsListOrderKeepsTheIndex, which fails if the normalized form is
+// merged without the measurement being redone.
 func jobSortOrder(filter core.JobFilter) string {
 	col, ok := jobSortColumns[filter.SortKey]
 	if !ok {
@@ -1060,6 +1155,8 @@ func (s *GormStorage) GetWorkflowRoots(ctx context.Context, status string, limit
 	limit, offset = clampUIPagination(limit, offset)
 
 	var jobs []*core.Job
+	// Bare created_at, for the same measured reason as jobSortOrder — and carrying
+	// the same accepted residual on SQLite (mixed clock faces sort by wall face).
 	err := q.Order("created_at DESC").
 		Offset(offset).
 		Limit(limit).

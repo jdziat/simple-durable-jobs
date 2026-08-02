@@ -5,11 +5,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math/big"
 	"net"
+	"net/netip"
 	"reflect"
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jdziat/simple-durable-jobs/v4/pkg/internal/handler"
 )
@@ -110,6 +113,16 @@ func populatePairwise(t reflect.Type, sliceLen, hops int) (reflect.Value, bool) 
 		return p, true
 
 	case reflect.Struct:
+		if fill, ok := pwOpaqueFills[t]; ok {
+			// A type made only of UNEXPORTED fields. The ordinary walk below would
+			// leave it at its ZERO, and a zero is exactly what `omitzero` drops —
+			// so the member would vanish from ONE side's wire, the pair would be
+			// reported not-wire-identical and SKIPPED, and the rule that exists to
+			// reach these types would assert nothing at all. Same reason net.IP
+			// carries a literal below: the harness must be able to build a value
+			// the real encoder accepts and keeps.
+			return fill(), true
+		}
 		v := reflect.New(t).Elem()
 		for i := 0; i < t.NumField(); i++ {
 			f := v.Field(i)
@@ -239,6 +252,45 @@ type pwMid struct {
 
 var pwNetIPType = reflect.TypeOf(net.IP(nil))
 
+// ---- members the PROBE cannot populate --------------------------------------
+//
+// Every fixture above is a scalar, slice, map, pointer or ordinary struct, and
+// `build` populates all of them non-zero. That is what made the whole
+// `member-omitzero-toggled` family unreachable: `omitempty` is INERT on a struct
+// member, so the existing toggle rule cannot express the hazard, and no fixture
+// existed whose member the probe leaves at its ZERO.
+//
+// These three are the common shapes of that member — a type made only of
+// unexported fields, whose wire form comes from a marshaler. `build` cannot set
+// unexported fields, so it probes them at the zero value; `omitzero` then drops
+// exactly what the probe produced, while production, which never carries a zero
+// timestamp, always emits it.
+//
+// They are given to the omitzero rule only, not folded into structFixtures: every
+// other rule would acquire a new pair set in the same change, and a sweep whose
+// coverage moves for two reasons at once cannot attribute a failure to either.
+type PwOpaque struct {
+	Created time.Time  `json:"created"`
+	Peer    netip.Addr `json:"peer"`
+	Amount  big.Int    `json:"amount"`
+	N       int        `json:"n"`
+}
+
+// pwOpaqueFills gives the harness a POPULATED value for each — reflect cannot
+// reach their fields either, so the populator needs a literal per type, exactly
+// as it already does for net.IP.
+var pwOpaqueFills = map[reflect.Type]func() reflect.Value{
+	reflect.TypeOf(time.Time{}): func() reflect.Value {
+		return reflect.ValueOf(time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC))
+	},
+	reflect.TypeOf(netip.Addr{}): func() reflect.Value {
+		return reflect.ValueOf(netip.MustParseAddr("10.0.0.1"))
+	},
+	reflect.TypeOf(big.Int{}): func() reflect.Value {
+		return reflect.ValueOf(*big.NewInt(42))
+	},
+}
+
 // Named types whose underlying type is a wire-identical stand-in for them.
 type PwName string
 type PwCount int
@@ -356,6 +408,7 @@ var pwRulesMustContribute = []string{
 	"member-array-vs-slice",
 	"member-named-vs-underlying",
 	"member-omitempty-toggled",
+	"member-omitzero-toggled",
 	"member-slice-elem-T-vs-ptrT",
 	"named-vs-underlying",
 	"result-T-vs-ptrT",
@@ -449,6 +502,36 @@ func pwGeneratePairs() []pwPair {
 			a := reflect.StructOf(pwRetag(fields, i, withoutOpt))
 			b := reflect.StructOf(pwRetag(fields, i, withOpt))
 			add("member-omitempty-toggled",
+				fmt.Sprintf("%s.%s", ft.Name(), f.Name), a, b, 1)
+		}
+	}
+
+	// RULE: `omitzero` toggled on a member. Go 1.24 added the option, and it is
+	// NOT a second spelling of `omitempty`: it drops a member whose value is the
+	// ZERO of its type, or whose `IsZero()` reports true — which `omitempty`, that
+	// only ever looks at emptiness, never does for a struct.
+	//
+	// That difference is the whole reason this rule exists separately.
+	// `member-omitempty-toggled` above is INERT on a struct member, so no amount
+	// of fixtures could have reached the hazard through it; here a fully populated
+	// value is never dropped by either side — so the wire is identical, exactly as
+	// in the omitempty rule — while the PROBE's value may be, which is what moves
+	// the shape.
+	//
+	// PwOpaque is included precisely because build leaves its members at their
+	// zero. On the ordinary fixtures the rule is armed on both sides and asserts
+	// equal shapes; on PwOpaque the omitzero side must record NO shape, which
+	// replay skips.
+	for _, ft := range append(append([]reflect.Type{}, structFixtures...), reflect.TypeOf(PwOpaque{})) {
+		fields := pwFields(ft)
+		for i, f := range fields {
+			if f.Anonymous {
+				continue
+			}
+			name, _ := pwJSONName(f)
+			a := reflect.StructOf(pwRetag(fields, i, fmt.Sprintf("json:%q", name)))
+			b := reflect.StructOf(pwRetag(fields, i, fmt.Sprintf("json:%q", name+",omitzero")))
+			add("member-omitzero-toggled",
 				fmt.Sprintf("%s.%s", ft.Name(), f.Name), a, b, 1)
 		}
 	}
@@ -620,7 +703,28 @@ const (
 	pwDiverged
 	pwNotWireIdentical
 	pwUnmarshalable
+	// Exactly ONE side records a shape. Replay compares only when BOTH the
+	// persisted shape and the replaying type's shape are non-empty (call.go), so
+	// neither direction of the deploy can be refused and this is NOT a false
+	// fire. It is not coverage either — half the pair is unguarded — so it is
+	// counted separately and cannot satisfy the armed-pair requirement below.
+	pwOneSideRecordsNoShape
 )
+
+// pwClassify turns two fingerprints into an outcome. It is a function of its own,
+// rather than three lines inside pwCheckPair, so the ONE relaxation in this
+// harness can be tested over every combination directly: a fixture can only ever
+// exhibit the combinations the current code happens to produce, and the failure
+// mode to guard against is the branch widening to swallow a real divergence.
+func pwClassify(fpA, fpB string) pwOutcome {
+	if (fpA == "") != (fpB == "") {
+		return pwOneSideRecordsNoShape
+	}
+	if fpA != fpB {
+		return pwDiverged
+	}
+	return pwEqual
+}
 
 // pwCheckPair runs the three steps in order and returns what happened.
 func pwCheckPair(a, b reflect.Type, sliceLen int) (out pwOutcome, wire string, shapeA, shapeB string, detail string) {
@@ -640,10 +744,8 @@ func pwCheckPair(a, b reflect.Type, sliceLen int) (out pwOutcome, wire string, s
 		return pwNotWireIdentical, "", shapeA, shapeB, fmt.Sprintf("a=%s\n  b=%s", ba, bb)
 	}
 	wire = string(ba)
-	if ResultFingerprintForTest(a) != ResultFingerprintForTest(b) {
-		return pwDiverged, wire, shapeA, shapeB, ""
-	}
-	return pwEqual, wire, shapeA, shapeB, ""
+	return pwClassify(ResultFingerprintForTest(a), ResultFingerprintForTest(b)),
+		wire, shapeA, shapeB, ""
 }
 
 func TestResultShape_PairwiseWireIdenticalTypesFingerprintIdentically(t *testing.T) {
@@ -659,6 +761,7 @@ func TestResultShape_PairwiseWireIdenticalTypesFingerprintIdentically(t *testing
 	valid := map[string]int{}
 	invalid := map[string]int{}
 	bothEmpty := map[string]int{}
+	oneEmpty := map[string]int{}
 
 	for _, p := range pairs {
 		for _, pl := range placements {
@@ -686,6 +789,16 @@ func TestResultShape_PairwiseWireIdenticalTypesFingerprintIdentically(t *testing
 						"  shapeA: %s\n"+
 						"  shapeB: %s",
 						p.rule, a, b, wire, shapeA, shapeB)
+				case pwOneSideRecordsNoShape:
+					// NOT an assertion either, and NOT a finding: with one shape
+					// empty the guard is skipped in BOTH directions of the deploy,
+					// so nothing can be refused. Recorded so the accounting can
+					// refuse to count it as coverage.
+					valid[p.rule]++
+					oneEmpty[p.rule]++
+					t.Logf("HALF-ARMED (not a finding): one side records no shape, so replay "+
+						"skips the check in both directions.\n  wire:   %s\n  shapeA: %q\n  shapeB: %q",
+						wire, shapeA, shapeB)
 				case pwEqual:
 					valid[p.rule]++
 					if shapeA == "" && shapeB == "" {
@@ -699,8 +812,8 @@ func TestResultShape_PairwiseWireIdenticalTypesFingerprintIdentically(t *testing
 	t.Run("every-rule-contributed-a-valid-pair", func(t *testing.T) {
 		names, generated := pwAuditedRules(t, pwRulesMustContribute, pwRuleNames(pairs))
 		for _, r := range names {
-			t.Logf("rule %-32s valid=%d skipped-not-wire-identical=%d both-sides-record-no-shape=%d",
-				r, valid[r], invalid[r], bothEmpty[r])
+			t.Logf("rule %-32s valid=%d skipped-not-wire-identical=%d both-sides-record-no-shape=%d one-side-records-no-shape=%d",
+				r, valid[r], invalid[r], bothEmpty[r], oneEmpty[r])
 			if !generated[r] {
 				continue // already reported by pwAuditedRules; the counts below are all zero
 			}
@@ -716,9 +829,15 @@ func TestResultShape_PairwiseWireIdenticalTypesFingerprintIdentically(t *testing
 			// one pair with a real shape on both sides. Without this, raising
 			// maxShapeDepth far enough that every placement fell past it would
 			// turn the whole sweep green while testing nothing.
-			if valid[r] == bothEmpty[r] {
-				t.Errorf("every valid pair for rule %q is green only because NEITHER side records "+
-					"a shape; the rule never exercises an armed guard and asserts nothing", r)
+			// A HALF-ARMED PAIR IS FREE IN THE SAME WAY. One empty shape makes
+			// replay skip in both directions, so the pair cannot fail whatever the
+			// other side says. Counting it as coverage would let a rule whose every
+			// pair disarmed one side look fully exercised.
+			if valid[r] == bothEmpty[r]+oneEmpty[r] {
+				t.Errorf("every valid pair for rule %q is green only because at least one side "+
+					"records NO shape (%d both-empty, %d one-empty of %d); the rule never "+
+					"exercises an armed guard and asserts nothing",
+					r, bothEmpty[r], oneEmpty[r], valid[r])
 			}
 		}
 	})
@@ -762,6 +881,54 @@ func TestResultShape_PairwiseHarnessSelfCheck(t *testing.T) {
 		}
 		if wire == "" {
 			t.Fatal("an accepted pair must report the shared wire bytes")
+		}
+	})
+
+	// THE ASYMMETRIC FAIL-OPEN IS A RELAXATION OF STEP 2, so it is pinned from
+	// both sides here. Reporting "one side records no shape" instead of a
+	// divergence is correct only because call.go compares nothing unless BOTH
+	// shapes are non-empty — which
+	// TestResultShape_OmitzeroDeployReplaysTheCheckpointProductionWrote and
+	// TestResultShape_PastTheDepthCapIsFailOpenInProduction drive through the real
+	// Call in both directions. If the relaxation ever widened to cover two
+	// non-empty shapes, the sweep would stop detecting the family it exists for.
+	t.Run("a pair with ONE empty shape is reported as half-armed, not as a divergence", func(t *testing.T) {
+		// PwOpaque.Created carries a member the probe leaves at its zero, so the
+		// omitzero side records no shape while the plain side records one.
+		fields := pwFields(reflect.TypeOf(PwOpaque{}))
+		plain := reflect.StructOf(pwRetag(fields, 0, `json:"created"`))
+		omit := reflect.StructOf(pwRetag(fields, 0, `json:"created,omitzero"`))
+		if s := ResultShapeStringForTest(plain); s == "" {
+			t.Fatalf("FIXTURE BROKEN: the plain side must record a shape, got %q", s)
+		}
+		if s := ResultShapeStringForTest(omit); s != "" {
+			t.Fatalf("FIXTURE BROKEN: the omitzero side must record no shape, got %q", s)
+		}
+		out, _, _, _, detail := pwCheckPair(plain, omit, 1)
+		if out != pwOneSideRecordsNoShape {
+			t.Fatalf("with one shape empty replay skips in both directions, so this is not a "+
+				"divergence; got outcome %d (%s)", out, detail)
+		}
+	})
+
+	t.Run("the relaxation covers exactly the empty cases and nothing else", func(t *testing.T) {
+		// The branch itself, over every combination it can see. A widening of it —
+		// "either empty OR merely different" — is what would silently switch the
+		// detector off, and no fixture could show that, because a fixture can only
+		// exhibit the combinations the current code produces.
+		for _, c := range []struct {
+			fpA, fpB string
+			want     pwOutcome
+		}{
+			{"aa", "aa", pwEqual},
+			{"", "", pwEqual},
+			{"aa", "bb", pwDiverged},
+			{"aa", "", pwOneSideRecordsNoShape},
+			{"", "aa", pwOneSideRecordsNoShape},
+		} {
+			if got := pwClassify(c.fpA, c.fpB); got != c.want {
+				t.Errorf("pwClassify(%q, %q) = %d, want %d", c.fpA, c.fpB, got, c.want)
+			}
 		}
 	})
 

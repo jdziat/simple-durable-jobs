@@ -667,7 +667,16 @@ NOT caught:
   belongs to the value rather than the type. Such a type records no shape and is
   not guarded at all;
 - **any change to a result type containing a marshaler that VALIDATES on a member
-  `encoding/json` serializes** — also below.
+  `encoding/json` serializes** — also below;
+- **any change to a result type carrying a `,omitzero` member that `encoding/json`
+  would DROP at the probe's value** — which is broader than "a type the probe
+  cannot populate". It covers `time.Time`, `netip.Addr`, `big.Int` and anything
+  else made only of unexported fields, but ALSO any member with an `IsZero()`
+  method that reports true for the probe — including a type whose payload fields
+  the probe fills perfectly. The canonical `omitzero` shape is exactly that: an
+  optional wrapper with an exported value and an unexported `set` flag that
+  `IsZero()` reads. Such a type records no shape and is not guarded at all, see
+  below.
 
 Those replay exactly as they did before this change: no worse, no better. The
 check is deliberately biased this way — a false rejection wedges a healthy
@@ -759,6 +768,23 @@ while a struct-backed one (`netip.Addr`) does not, so the byte-identical
 that would have succeeded. A vanished member is also indistinguishable from a
 member that was *removed* from the type, which is the very change the guard
 exists to catch.
+
+**`,omitzero` on a member the probe cannot populate is the same case one level
+out.** Go 1.24's `omitzero` option drops a member whose value is the zero of its
+type — or whose `IsZero()` reports true. The probe cannot set unexported fields,
+so a member made only of them (`time.Time`, `netip.Addr`, `big.Int`, a decimal
+carried as a struct) is built at its ZERO, which is exactly what `omitzero`
+drops: the member vanishes from the probe's JSON while production, which never
+carries a zero timestamp, always emits it. The recorded shape would then describe
+the probe rather than the type, so the type records **no** shape instead.
+
+Without that, the wire-neutral tag edit `json:"created"` →
+`json:"created,omitzero"` on an always-set timestamp moved the fingerprint from
+`{created:string,n:number}` to `{n:number}` — both non-empty, so the fail-open
+skip did not apply — and replay refused a checkpoint that decodes perfectly. The
+same edit on an ordinary member the probe DOES populate (a string, a number, a
+non-nil pointer without an `IsZero`) changes nothing: those keep their shape and
+stay guarded.
 
 **A member the encoder never touches does not disarm the guard.**
 `encoding/json` never hands a `json:"-"` field or a plain unexported one to its
@@ -852,6 +878,39 @@ required-fields `UnmarshalJSON`. That is one problem, not three: a type change a
 legitimately-different-but-valid payload are indistinguishable in the bytes. Both
 sides now compute the fingerprint from the TYPE, so an unchanged type cannot false
 fire.
+
+### The dead-letter list is actually newest-dead-first, and `DeadLetteredAt` reads back in UTC
+
+**Before:** on **SQLite**, `dead_lettered_at` was written with a bare `time.Now()`,
+so it carried the offset of whichever process wrote it. `ListDeadLettered` orders
+by that column, and on SQLite a timestamp column is TEXT — so the ORDER BY was a
+LEXICAL compare across mixed clock faces, not an ordering of instants. A job that
+died an hour LATER could sort below one that died earlier, which for the shipped
+page size pushed the newest dead job off page 1 of the triage view. Two ways in,
+neither hypothetical: one worker rendering two offsets across a DST fall-back, and
+two processes in different zones against one file (the CLI and the standalone UI
+binaries are documented second processes).
+
+**After:** both writers of the column — `Fail`'s retry-exhausted branch and
+`FailTerminalWithResult` — store it on a single face, so the existing ORDER BY
+sorts by instant. Postgres and MySQL store a real instant and were never affected.
+
+**What you may notice.** On SQLite, `core.Job.DeadLetteredAt` now reads back with
+`Location` UTC, while `CreatedAt` and `StartedAt` still read back Local. If you
+format or compare it without `.Local()`, the wall time you print changes after the
+upgrade. The instant is the same; only the face differs.
+
+**Sorting by other timestamps still orders wall faces on SQLite.** `created_at`,
+`run_at` and `started_at` are whitelisted sort keys with the same underlying
+hazard, and they are NOT fixed — `ORDER BY run_at DESC` still inverts across a
+DST fall-back. That is deliberate and measured: normalizing those through
+`julianday()` is instant-correct but costs SQLite the index it was walking in
+order, measured at 487-554x on the filtered dashboard queries (200k rows,
+`LIMIT 50`). `dead_lettered_at` could be fixed on the WRITE side instead;
+`created_at` cannot, because it is half the dequeue eligibility fence
+(`COALESCE(run_at, created_at) <= now`, compared against a process-local bind),
+and changing its face would mis-read every already-stored row.
+
 
 ### Reusing a phase name within one run is now an error
 

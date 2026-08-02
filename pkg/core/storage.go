@@ -156,6 +156,14 @@ type JobFilter struct {
 	// validated against a storage-side whitelist; an empty or unknown value
 	// falls back to the default (created_at). SortDir is "asc" or "desc"
 	// (default desc). Never interpolated raw — see GormStorage.SearchJobs.
+	//
+	// ON SQLITE ONLY, a created_at order (the default, and the tiebreak under every
+	// other key) compares stored WALL TEXT rather than instants, so rows written on
+	// different clock faces can order by face: one worker across a DST fall-back,
+	// or two processes in different zones against one file. Since/Until above are
+	// NOT affected — the window selects by instant. Postgres and MySQL have
+	// neither concern. The measurement behind leaving this as-is, and the route
+	// that would close it, are on storage.jobSortOrder.
 	SortKey string
 	SortDir string
 }

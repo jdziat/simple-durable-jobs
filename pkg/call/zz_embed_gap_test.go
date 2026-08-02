@@ -1,10 +1,13 @@
 package call
 
 import (
+	"context"
 	"encoding/json"
 	"reflect"
 	"testing"
 	"time"
+
+	"github.com/jdziat/simple-durable-jobs/v4/pkg/internal/handler"
 )
 
 type egInner struct {
@@ -67,6 +70,92 @@ func TestZZ_EmbeddedUnexportedStateIsOpaqueToo(t *testing.T) {
 	if s1 != "" {
 		t.Errorf("a marshaler reading state inside an unexported EMBEDDED field is still opaque: "+
 			"the probe cannot populate it, so the type must record NO shape, got %q", s1)
+	}
+}
+
+// ---- the same state one indirection further out ------------------------------
+//
+// egOption above embeds its state BY VALUE, which the walk reaches without ever
+// dereferencing anything. The Option/Maybe idiom is at least as often written
+// with the state behind an unexported EMBEDDED POINTER — that is what makes the
+// absent case a nil check rather than a flag — and reaching it needs
+// hasUnpopulatedStateSeen's pointer deref.
+//
+// THAT DEREF WAS UNPINNED: deleting it left the entire pkg/call suite green,
+// including the pairwise sweep and the parity table, because not one of their
+// generated fixtures declares an unexported field, an embedded pointer or a
+// json.Marshaler. With it deleted the walk stops at *egPtrState (a pointer is
+// not a struct), the probe's `null` is recorded as the TYPE's shape, and the
+// byte-identical simplification `egPtrOption -> *egInner` wedges a live replay.
+
+type egPtrState struct {
+	present bool
+	value   egInner
+}
+
+// egPtrOption embeds it ANONYMOUSLY, unexported, and BEHIND A POINTER.
+type egPtrOption struct{ *egPtrState }
+
+func (o egPtrOption) MarshalJSON() ([]byte, error) {
+	if o.egPtrState == nil || !o.present {
+		return []byte("null"), nil
+	}
+	return json.Marshal(o.value)
+}
+
+type egPtrV1 struct {
+	Opt egPtrOption `json:"opt"`
+	ID  string      `json:"id"`
+}
+type egPtrV2 struct {
+	Opt *egInner `json:"opt"`
+	ID  string   `json:"id"`
+}
+
+func TestZZ_UnexportedEmbeddedPointerStateIsOpaqueToo(t *testing.T) {
+	// Precondition, asserted rather than assumed, in BOTH the present and the
+	// absent case: the deploy cannot move a byte.
+	present := egPtrV1{Opt: egPtrOption{&egPtrState{present: true, value: egInner{A: 5, B: "x"}}}, ID: "o1"}
+	inner := egInner{A: 5, B: "x"}
+	a, _ := json.Marshal(present)
+	b, _ := json.Marshal(egPtrV2{Opt: &inner, ID: "o1"})
+	if string(a) != string(b) {
+		t.Fatalf("FIXTURE BROKEN (present): %s vs %s", a, b)
+	}
+	absentA, _ := json.Marshal(egPtrV1{Opt: egPtrOption{&egPtrState{}}, ID: "o1"})
+	absentB, _ := json.Marshal(egPtrV2{ID: "o1"})
+	if string(absentA) != string(absentB) {
+		t.Fatalf("FIXTURE BROKEN (absent): %s vs %s", absentA, absentB)
+	}
+	t.Logf("wire present (identical): %s", a)
+	t.Logf("wire absent  (identical): %s", absentA)
+
+	s1 := ResultShapeStringForTest(reflect.TypeOf(egPtrV1{}))
+	s2 := ResultShapeStringForTest(reflect.TypeOf(egPtrV2{}))
+	t.Logf("shape(v1 embedded-POINTER Option) = %q", s1)
+	t.Logf("shape(v2 *egInner)                = %q", s2)
+	if s1 != "" {
+		t.Errorf("a marshaler reading state behind an unexported EMBEDDED POINTER is opaque too: "+
+			"the probe cannot populate it, so the type must record NO shape, got %q", s1)
+	}
+
+	// And through the real Call, because a shape that is only read by a test is
+	// not what wedges a workflow: production writes the checkpoint for the Option
+	// form and the deploy replays it as *egInner.
+	h, herr := handler.NewHandler(func(_ context.Context, _ string) (egPtrV1, error) {
+		return present, nil
+	})
+	if herr != nil {
+		t.Fatalf("NewHandler: %v", herr)
+	}
+	saved, got, err := writeThenReplay[egPtrV1, egPtrV2](t, h, "opt-embed-ptr")
+	if err != nil {
+		t.Fatalf("FALSE FIRE: the deploy `egPtrOption -> *egInner` cannot move a byte (%s), yet "+
+			"replay refused the checkpoint production wrote.\n  persisted shape: %q\n  error: %v",
+			a, saved.ResultShape, err)
+	}
+	if got.Opt == nil || *got.Opt != inner || got.ID != "o1" {
+		t.Fatalf("the replayed value must be the checkpointed one, got %+v", got)
 	}
 }
 
