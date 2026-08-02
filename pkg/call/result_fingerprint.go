@@ -618,10 +618,17 @@ func build(t reflect.Type, depth int, free []reflect.Type, budget *int) (reflect
 // scalar of one kind while populated values emit another — `""` when absent and
 // an object when present — is still described by its zero and can still false
 // fire. Nothing in a probe that cannot populate the state can distinguish that
-// from netip.Addr, and disarming it means disarming time.Time. The second
-// residual is that the unexported state is only looked for on t ITSELF; a
-// marshaler that reaches into an exported member's unexported fields is not
-// detected. Both are narrower than the hazard closed here.
+// from netip.Addr, and disarming it means disarming time.Time.
+//
+// THIS PARAGRAPH USED TO NAME A SECOND RESIDUAL — "the unexported state is only
+// looked for on t ITSELF; a marshaler that reaches into an exported member's
+// unexported fields is not detected" — and it is recorded here because the
+// sentence outlived what it described TWICE. Round 33 made the walk recurse
+// through exported members, and round 34 made it follow slice, array and map
+// ELEMENT types; the note stayed, so it simultaneously claimed a gap that was
+// closed and hid the one that was actually open. A residual note is a claim about
+// the code and rots exactly like any other. If the next round closes the scalar
+// residual above, delete the paragraph rather than leaving it.
 func probeSpeaksForType(t reflect.Type, v reflect.Value) bool {
 	if !hasUnpopulatedState(t) {
 		return true
@@ -673,6 +680,7 @@ func hasUnpopulatedState(t reflect.Type) bool {
 }
 
 func hasUnpopulatedStateSeen(t reflect.Type, visited []reflect.Type) bool {
+	t = unwrapToStruct(t)
 	if t.Kind() != reflect.Struct {
 		return false
 	}
@@ -711,15 +719,35 @@ func hasUnpopulatedStateSeen(t reflect.Type, visited []reflect.Type) bool {
 		// probeSpeaksForType only consults it for a type that HAS a marshaler, and
 		// then still trusts a probe whose wire form is a scalar — so
 		// `struct{ time.Time; X int }` with a promoted MarshalJSON keeps its shape.
-		ft := sf.Type
-		if ft.Kind() == reflect.Pointer {
-			ft = ft.Elem()
-		}
-		if hasUnpopulatedStateSeen(ft, visited) {
+		if hasUnpopulatedStateSeen(sf.Type, visited) {
 			return true
 		}
 	}
 	return false
+}
+
+// unwrapToStruct follows the indirections that stand between a field's declared
+// type and a struct whose unexported fields build cannot populate.
+//
+// A POINTER was followed from the start. A SLICE, ARRAY or MAP was not, and that
+// was the round-34 hole: build fills a container with ONE element, and if that
+// element is a struct made of unexported fields the state is just as unreachable
+// as it would be inline. `type FirstSeen struct{ Samples []time.Time }` under a
+// MarshalJSON that reads the first sample recorded its ZERO's shape, so
+// `FirstSeen -> *time.Time` false-fired a replay it should have accepted.
+//
+// A map's VALUE is followed and its KEY is not: a key never reaches the shape
+// through this path — synthesizeMapKey owns that, and refuses any non-string kind
+// carrying a marshaler outright.
+func unwrapToStruct(t reflect.Type) reflect.Type {
+	for {
+		switch t.Kind() {
+		case reflect.Pointer, reflect.Slice, reflect.Array, reflect.Map:
+			t = t.Elem()
+		default:
+			return t
+		}
+	}
 }
 
 // omitzeroWouldDrop reports whether encoding/json's `omitzero` option would omit

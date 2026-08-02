@@ -274,3 +274,101 @@ func TestZZ_ExportedEmbedGuardDoesNotOverDisarm(t *testing.T) {
 			"guarded; disarming it would trade a wedge for a needless blind spot")
 	}
 }
+
+// r34FirstSeen hides time.Time's unexported state one ELEMENT hop out: an
+// exported SLICE of a struct made entirely of unexported fields.
+type r34FirstSeen struct {
+	Samples []time.Time `json:"-"`
+}
+
+func (f r34FirstSeen) MarshalJSON() ([]byte, error) {
+	for _, s := range f.Samples {
+		if !s.IsZero() {
+			return json.Marshal(s)
+		}
+	}
+	return []byte("null"), nil
+}
+
+type r34V1 struct {
+	At r34FirstSeen `json:"at"`
+	ID string       `json:"id"`
+}
+
+// The same state reached through a slice element, a map value and an array
+// element, using this package's OWN pinned Option fixture.
+type r34SliceOpt struct{ S []R33ExportedState }
+type r34MapOpt struct{ M map[string]R33ExportedState }
+type r34ArrOpt struct{ A [1]R33ExportedState }
+
+func (o r34SliceOpt) MarshalJSON() ([]byte, error) { return r34optJSON(o.S[0]) }
+func (o r34MapOpt) MarshalJSON() ([]byte, error)   { return r34optJSON(o.M["k"]) }
+func (o r34ArrOpt) MarshalJSON() ([]byte, error)   { return r34optJSON(o.A[0]) }
+
+func r34optJSON(s R33ExportedState) ([]byte, error) {
+	if !s.present {
+		return []byte("null"), nil
+	}
+	return json.Marshal(s.value)
+}
+
+type r34SliceHolder struct {
+	Opt r34SliceOpt `json:"opt"`
+	ID  string      `json:"id"`
+}
+type r34MapHolder struct {
+	Opt r34MapOpt `json:"opt"`
+	ID  string    `json:"id"`
+}
+type r34ArrHolder struct {
+	Opt r34ArrOpt `json:"opt"`
+	ID  string    `json:"id"`
+}
+
+// TestZZ_ElementHopIsOpaqueToo pins the indirection round 33 did not follow.
+//
+// The walker followed a POINTER but stopped at a slice, array or map. build fills
+// a container with ONE element, so if that element is a struct of unexported
+// fields the state is exactly as unreachable as it would be inline — and a
+// marshaler reading it recorded the shape of its ZERO. `FirstSeen -> *time.Time`
+// then false-fired a replay it should have accepted.
+//
+// Four shapes, because the hole was one `Elem()` wide in each of them.
+func TestZZ_ElementHopIsOpaqueToo(t *testing.T) {
+	for name, typ := range map[string]reflect.Type{
+		"slice of unexported-state structs": reflect.TypeOf(r34V1{}),
+		"slice element":                     reflect.TypeOf(r34SliceHolder{}),
+		"map value":                         reflect.TypeOf(r34MapHolder{}),
+		"array element":                     reflect.TypeOf(r34ArrHolder{}),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := ResultShapeStringForTest(typ); got != "" {
+				t.Errorf("state the probe cannot populate is just as unreachable one element hop "+
+					"out; this must record NO shape, got %q", got)
+			}
+		})
+	}
+}
+
+// TestZZ_ElementHopDoesNotOverDisarm is the other half. Following the element type
+// must not disarm a container whose element IS describable.
+func TestZZ_ElementHopDoesNotOverDisarm(t *testing.T) {
+	type plain struct {
+		A int    `json:"a"`
+		B string `json:"b"`
+	}
+	for name, typ := range map[string]reflect.Type{
+		"slice of plain structs": reflect.TypeOf(struct {
+			S []plain `json:"s"`
+		}{}),
+		"map of plain structs": reflect.TypeOf(struct {
+			M map[string]plain `json:"m"`
+		}{}),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if ResultShapeStringForTest(typ) == "" {
+				t.Error("a container whose element is fully describable must stay guarded")
+			}
+		})
+	}
+}
