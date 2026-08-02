@@ -685,12 +685,32 @@ func hasUnpopulatedStateSeen(t reflect.Type, visited []reflect.Type) bool {
 
 	for i := 0; i < t.NumField(); i++ {
 		sf := t.Field(i)
-		if sf.PkgPath == "" {
-			continue // exported: build sets it outright
+
+		// A PLAIN UNEXPORTED field is the only one build never touches at all.
+		if sf.PkgPath != "" && !sf.Anonymous {
+			return true
 		}
-		if !sf.Anonymous {
-			return true // plain unexported: build skips it
-		}
+
+		// EVERYTHING ELSE IS WRITTEN — and that settles nothing, which is the
+		// mistake this function has now made twice. build writes the field, but
+		// only with what build could produce, so a marshaler on the OUTER type
+		// still reads a zero through it. The first version said that of an
+		// unexported embed; the second said it of anything EXPORTED, skipping the
+		// field with "exported: build sets it outright". Capitalising one letter of
+		// this package's own pinned Option fixture re-opened the bug, and the
+		// textbook `type NullTime struct{ time.Time }` — an exported embed of a
+		// type made entirely of unexported fields — recorded its ZERO's shape, so
+		// `NullTime -> *time.Time` false-fired on a deploy that cannot move a byte.
+		//
+		// So recurse through every written field, exported or not, named or
+		// embedded. Being wrong in this direction costs a MISS: the type records no
+		// shape and replay skips it. Being wrong the other way wedges a live
+		// workflow.
+		//
+		// It does not over-disarm, because this is not the last gate.
+		// probeSpeaksForType only consults it for a type that HAS a marshaler, and
+		// then still trusts a probe whose wire form is a scalar — so
+		// `struct{ time.Time; X int }` with a promoted MarshalJSON keeps its shape.
 		ft := sf.Type
 		if ft.Kind() == reflect.Pointer {
 			ft = ft.Elem()

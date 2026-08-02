@@ -171,3 +171,106 @@ func TestZZ_MutuallyEmbeddedPointersTerminate(t *testing.T) {
 		t.Fatal("hasUnpopulatedState did not terminate on mutually-embedded pointer types")
 	}
 }
+
+// R33NullTime is the textbook nullable wrapper: an EXPORTED embed of a type made
+// entirely of unexported fields, with a marshaler that reads through it.
+type R33NullTime struct{ time.Time }
+
+func (n R33NullTime) MarshalJSON() ([]byte, error) {
+	if n.IsZero() {
+		return []byte("null"), nil
+	}
+	return json.Marshal(n.Time)
+}
+
+type r33V1 struct {
+	At R33NullTime `json:"at"`
+	ID string      `json:"id"`
+}
+type r33V2 struct {
+	At *time.Time `json:"at"`
+	ID string     `json:"id"`
+}
+
+// R33ExportedState is egState with its state type EXPORTED — one capital letter
+// away from the fixture two tests above already pin.
+type R33ExportedState struct {
+	present bool
+	value   egInner
+}
+type R33Option struct{ R33ExportedState }
+
+func (o R33Option) MarshalJSON() ([]byte, error) {
+	if !o.present {
+		return []byte("null"), nil
+	}
+	return json.Marshal(o.value)
+}
+
+type r33OptV1 struct {
+	Opt R33Option `json:"opt"`
+	ID  string    `json:"id"`
+}
+
+// r33NamedOpt reaches the same state through a NAMED exported member rather than
+// an embed — the form the walker's own godoc used to name as a residual.
+type r33NamedOpt struct {
+	Opt R33ExportedState `json:"opt"`
+}
+
+func (o r33NamedOpt) MarshalJSON() ([]byte, error) {
+	if !o.Opt.present {
+		return []byte("null"), nil
+	}
+	return json.Marshal(o.Opt.value)
+}
+
+type r33NamedV1 struct {
+	Opt r33NamedOpt `json:"opt"`
+	ID  string      `json:"id"`
+}
+
+// TestZZ_ExportedEmbedIsOpaqueToo pins the three shapes an EXPORTED field can
+// take while still hiding state the probe cannot populate.
+//
+// The walker skipped every exported field with "exported: build sets it
+// outright" — true of the FIELD, false of what is inside it, which is the exact
+// reasoning its own godoc rejects for the unexported case. All three record the
+// shape of their ZERO, and each one's byte-identical simplification then
+// hard-fails replay.
+func TestZZ_ExportedEmbedIsOpaqueToo(t *testing.T) {
+	at := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	a, _ := json.Marshal(r33V1{At: R33NullTime{at}, ID: "o1"})
+	b, _ := json.Marshal(r33V2{At: &at, ID: "o1"})
+	if string(a) != string(b) {
+		t.Fatalf("FIXTURE BROKEN: %s vs %s", a, b)
+	}
+	t.Logf("wire (identical): %s", a)
+
+	for name, typ := range map[string]reflect.Type{
+		"exported embed of an unexported-state type": reflect.TypeOf(r33V1{}),
+		"exported embedded state type":               reflect.TypeOf(r33OptV1{}),
+		"named exported member":                      reflect.TypeOf(r33NamedV1{}),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := ResultShapeStringForTest(typ); got != "" {
+				t.Errorf("a marshaler reading state the probe cannot populate must record NO shape "+
+					"whether it reaches that state through an unexported field, an EXPORTED embed, or "+
+					"an exported named member — got %q", got)
+			}
+		})
+	}
+}
+
+// TestZZ_ExportedEmbedGuardDoesNotOverDisarm is the other half, and it is why the
+// broad recursion is safe: probeSpeaksForType still trusts a probe whose wire form
+// is a SCALAR, so an ordinary embed of time.Time keeps its shape.
+func TestZZ_ExportedEmbedGuardDoesNotOverDisarm(t *testing.T) {
+	if got := ResultShapeStringForTest(reflect.TypeOf(struct {
+		time.Time
+		X int `json:"x"`
+	}{})); got == "" {
+		t.Error("an embed whose promoted marshaler renders a SCALAR is describable and must stay " +
+			"guarded; disarming it would trade a wedge for a needless blind spot")
+	}
+}
