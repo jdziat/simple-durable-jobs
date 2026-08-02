@@ -442,9 +442,11 @@ const (
 // Pinned by TestTimeBoundPredicate_BoundsOutsideSQLitesRangeDegradeSafely and
 // TestSearchJobs_OpenEndedFarFutureUntilKeepsEveryRow.
 //
-// Postgres and MySQL store a real instant and already compare instants, so they
-// keep the plain form with the caller's time.Time untouched — and that branch is
-// pinned by a unit test, not by assertion.
+// Postgres and MySQL store a real instant and already compare instants, so past
+// the shared range check they keep the plain form with the caller's time.Time
+// untouched. They are NOT exempt from that check: an earlier version of this
+// comment claimed they were unaffected because the SQLite branch gated them out,
+// and live MySQL disproved it — DATETIME ends at 9999-12-31 23:59:59.
 //
 // An empty predicate means "no restriction on this side"; applyTimeWindow skips it.
 func (s *GormStorage) timeBoundPredicate(column string, dir timeBoundDirection, bound time.Time) (string, []any) {
@@ -454,13 +456,17 @@ func (s *GormStorage) timeBoundPredicate(column string, dir timeBoundDirection, 
 		cmp = "<="
 		slop = maxStoredClockFaceOffset
 	}
-	if !s.isSQLite {
-		return column + " " + cmp + " ?", []any{bound}
-	}
-
-	bound, restricts := sqliteComparableBound(bound, dir)
+	// RANGE-CHECK FIRST, ON EVERY DIALECT. An open-ended sentinel bound is not a
+	// SQLite concern: MySQL's DATETIME tops out at 9999-12-31 23:59:59, so binding
+	// a protobuf-max `until` there returns ZERO rows and a year-10000 one fails the
+	// query outright. Verified on live MySQL — both were red before this moved.
+	bound, restricts := representableBound(bound, dir)
 	if !restricts {
 		return "", nil
+	}
+
+	if !s.isSQLite {
+		return column + " " + cmp + " ?", []any{bound}
 	}
 
 	const utc = `strftime('%Y-%m-%d %H:%M:%f', `
@@ -478,14 +484,23 @@ func (s *GormStorage) timeBoundPredicate(column string, dir timeBoundDirection, 
 	return "(" + column + " " + cmp + " ? AND " + exact + ")", []any{loose, bound, bound, bound}
 }
 
-// sqliteParsableBoundFloor / sqliteParsableBoundCeil are the widest instants
-// whose driver-rendered text BOTH keeps a four-digit year and is accepted by
-// SQLite's date parser. The ceiling stops at millisecond .999 because strftime
-// rounds the fraction and '…59.9999' rounds past the end of the supported range,
-// which yields NULL (measured).
+// representableBoundFloor / representableBoundCeil are the widest instants EVERY
+// supported backend can hold and compare, so they bound the predicate on all
+// three dialects rather than on SQLite alone.
+//
+// SQLite sets the shape: they are the widest instants whose driver-rendered text
+// BOTH keeps a four-digit year and is accepted by SQLite's date parser, and the
+// ceiling stops at millisecond .999 because strftime rounds the fraction and
+// '…59.9999' rounds past the end of the supported range, yielding NULL (measured).
+//
+// MySQL independently needs the SAME ceiling: DATETIME ends at
+// 9999-12-31 23:59:59, so a protobuf-max `until` bound matched ZERO rows and a
+// year-10000 one failed the query. Postgres reaches year 294276 and so is never
+// constrained by these — but omitting a bound no stored row could exceed is
+// over-inclusive there, which is the safe direction.
 var (
-	sqliteParsableBoundFloor = time.Date(1, 1, 1, 0, 0, 0, 0, time.UTC)
-	sqliteParsableBoundCeil  = time.Date(9999, 12, 31, 23, 59, 59, 999000000, time.UTC)
+	representableBoundFloor = time.Date(1, 1, 1, 0, 0, 0, 0, time.UTC)
+	representableBoundCeil  = time.Date(9999, 12, 31, 23, 59, 59, 999000000, time.UTC)
 )
 
 // sqliteMaxParsableFaceOffset is the widest timezone suffix SQLite's own date
@@ -493,26 +508,26 @@ var (
 // also wider than any tzdata zone, so only a hand-built time.FixedZone reaches it.
 const sqliteMaxParsableFaceOffset = 14 * time.Hour
 
-// sqliteComparableBound moves a bound into the range the SQLite predicate can
-// compare, reporting restricts=false when the bound excludes nothing that SQLite
-// is able to store — in which case the caller must emit no predicate rather than
-// one that would silently reject every row.
+// representableBound moves a bound into the range the BACKEND can store and
+// compare, reporting restricts=false when the bound excludes nothing the backend
+// could hold — in which case the caller must emit no predicate rather than one
+// that would silently reject every row, or fail the query outright.
 //
 // Every adjustment is in the over-inclusive direction: this function can widen a
 // window, never narrow it.
-func sqliteComparableBound(bound time.Time, dir timeBoundDirection) (time.Time, bool) {
+func representableBound(bound time.Time, dir timeBoundDirection) (time.Time, bool) {
 	if _, offsetSeconds := bound.Zone(); absDuration(time.Duration(offsetSeconds)*time.Second) > sqliteMaxParsableFaceOffset {
 		bound = bound.UTC()
 	}
 	switch {
-	case dir == boundAtOrAfter && bound.Before(sqliteParsableBoundFloor):
+	case dir == boundAtOrAfter && bound.Before(representableBoundFloor):
 		return time.Time{}, false // "at or after the dawn of time" restricts nothing
-	case dir == boundAtOrBefore && bound.After(sqliteParsableBoundCeil):
+	case dir == boundAtOrBefore && bound.After(representableBoundCeil):
 		return time.Time{}, false // the open-ended upper sentinel restricts nothing
-	case bound.Before(sqliteParsableBoundFloor):
-		return sqliteParsableBoundFloor, true
-	case bound.After(sqliteParsableBoundCeil):
-		return sqliteParsableBoundCeil, true
+	case bound.Before(representableBoundFloor):
+		return representableBoundFloor, true
+	case bound.After(representableBoundCeil):
+		return representableBoundCeil, true
 	}
 	return bound, true
 }
@@ -550,7 +565,7 @@ func lexicalPrefilterBound(bound time.Time, slop time.Duration) (time.Time, bool
 // applyTimeWindow adds the INCLUSIVE [since, until] bounds for one timestamp
 // column. A zero value means "no bound" on that side, and so does an empty
 // predicate — timeBoundPredicate returns one for a bound that excludes nothing
-// the backend can store (see sqliteComparableBound).
+// the backend can store (see representableBound).
 //
 // The `pred != ""` guards are for the READER, not for GORM: `Where("")` is a
 // silent no-op that returns a nil error (measured, gorm v1.31.1 — an earlier
