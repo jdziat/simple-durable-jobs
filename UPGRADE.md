@@ -15,9 +15,30 @@ Three releases matter here.
   places, all of them cases where the old behaviour was wrong — but wrong in ways
   a deployment may have been tuned around. Those are listed below.
 
-No API break: `gorelease` reports every change compatible, and the only additions
-are new options, new event aliases and new storage methods. That is *signature*
-compatibility — one exported method's observable behaviour does change:
+No API break: `gorelease` reports every change compatible against a v4.7.0 base.
+The additions are wider than "options and storage methods", so here are the ones
+that matter to callers: five new methods on `*storage.GormStorage`; new checkpoint-type constants
+and helpers on `core` (`IsCallCheckpointType`,
+`BuiltinCheckpointTypeSQLExclusion`, `ActiveDedupStatuses`, `SignalWaitMarker`);
+timezone-aware schedule constructors (`jobs.CronIn`, `MustCronIn`, `DailyIn`,
+`WeeklyIn`, and the same four in `pkg/schedule`); accessors on `queue.Options`
+and `queue.Queue`; `jobctx.ErrDuplicatePhaseName`; and new exported **fields** on
+`fanout.SubJob`, `core.Job`, `core.Checkpoint` and `core.DeadLetterFilter`. There
+is no new `queue.Option` constructor and no new event alias.
+
+`gorelease` additionally reports three names this list omits because they are not
+API you would call: two test-only helpers in `pkg/call`
+(`ResultShapeStringForTest`, `ResultFingerprintForTest`) and one generated getter,
+`(*jobsv1.ScheduledJobInfo).GetNeverFires`.
+
+All of that is additive, but note the one source-level consequence `gorelease`
+does not model: an **unkeyed** composite literal of a struct that gained a field
+stops compiling and has to switch to field names. `fanout.SubJob` gained five
+(`RetriesSet`, `Determinism`, `Delay`, `RunAt`, `DedupOptionsIgnored`), and it is
+the one of those four structs you are most likely to have written unkeyed.
+
+That is *signature* compatibility — one exported method's observable behaviour
+does change:
 `EnqueueScheduledFire` now COMMITS the schedule's claim on a deduplicated fire and
 reports `claimed = true`, where it previously rolled the claim back. (v4.7.0 also
 returned `ErrDuplicateJob` here, so the error value itself is not new; what changed
@@ -50,7 +71,9 @@ old behaviour — changing it mid-replay would be worse than leaving it. So:
   or in SQL:
 
   ```sql
-  SELECT j.id, j.type, count(c.id) AS call_checkpoints
+  SELECT j.id, j.type, count(c.id) AS call_checkpoints   -- Postgres
+  -- MySQL:  SELECT BIN_TO_UUID(j.id), j.type, count(c.id) AS call_checkpoints
+  -- SQLite: SELECT hex(j.id),         j.type, count(c.id) AS call_checkpoints
   FROM jobs j
   INNER JOIN checkpoints c ON c.job_id = j.id
   WHERE c.call_index >= 0 AND c.span_end = 0
@@ -64,6 +87,20 @@ old behaviour — changing it mid-replay would be worse than leaving it. So:
   GROUP BY j.id, j.type
   HAVING count(c.id) > 1;
   ```
+
+  **Pick the right first column for your dialect.** `jobs.id` is a native `uuid`
+  column only on Postgres. On MySQL it is `binary(16)` and on SQLite a `blob`, so
+  a plain `SELECT j.id` hands your client 16 raw bytes rather than
+  `019f...-...` — not something you can paste into the `CancelJobTerminal` /
+  `Requeue` repair below. Use `hex(j.id)` on SQLite; it returns the unhyphenated
+  32-character form, which `core.ParseUUID` accepts as-is (in either case), so it
+  pastes straight in. On MySQL use `BIN_TO_UUID(j.id)` with the **default** swap
+  flag: ids are written with `uuid.MarshalBinary`'s byte order, the same order
+  `UUID_TO_BIN(x)` produces, so `BIN_TO_UUID(j.id, 1)` returns a
+  plausible-looking but **wrong** id.
+
+  The Go helper is unaffected — it scans into `core.UUID`, which decodes to the
+  canonical form, as does the `WARN` a worker logs.
 
   A worker replaying such checkpoints also logs one `WARN` per run naming the job.
 
@@ -82,12 +119,46 @@ and leaves its checkpoints in place. That holds for genuine positives as much as
 for over-approximated ones, and the per-run `WARN` names the same inoperative
 remedy.
 
-To clear a listed job's checkpoints you must make it terminal first:
+To clear a listed job's checkpoints you must make it terminal first — but check
+whether the listed job is a fan-out **sub-job** before you touch it.
+
+`Requeue` refuses a sub-job outright, returning `core.ErrCannotRequeueSubJob`
+before it resets anything ("cannot requeue a fan-out sub-job directly; requeue
+its parent"). So on a sub-job the
+cancel below succeeds and the requeue does not — you terminally cancel live work,
+the legacy checkpoints stay exactly where they were, and the parent is left
+holding a cancelled child. That is strictly worse than doing nothing. Note also
+that the detector will usually list only the sub-job: a parent's `fanout`
+checkpoint is excluded by `call_type`, so the parent rarely reaches the
+`count > 1` threshold and the listing gives you no hint that a tree is involved.
+
+Check first:
+
+```sql
+SELECT id, parent_job_id, fan_out_id FROM jobs WHERE id = ?;
+```
+
+**If `fan_out_id` is NULL**, the job is a root and the two-step below applies to
+it directly.
+
+**If `fan_out_id` is set**, repair the root of its workflow instead. Walk
+`parent_job_id` upward until you reach a job whose `parent_job_id` is NULL
+(fan-outs nest, so this can be more than one hop) and apply the two-step to
+*that* job. Requeueing a root deletes its entire fan-out subtree — every
+descendant fan-out record, sub-job and checkpoint at any depth — and re-dispatches
+a fresh tree. Two consequences to weigh: cancelling the root terminally cancels
+every live descendant, not just the one the listing named; and the requeue
+DELETES the sub-job rows outright, so whatever history they carried is gone.
+
+Either way, both steps are required. `Requeue` accepts a job only when its status
+is already `failed` or `cancelled`, and a fan-out root parked in `waiting` is
+neither — a bare `Requeue` on it returns `(false, nil)`, silently, having done
+nothing:
 
 ```go
 // Restarts the workflow from the beginning.
-if err := storage.CancelJobTerminal(ctx, jobID); err != nil { /* ... */ }
-ok, err := q.Requeue(ctx, jobID)
+if err := storage.CancelJobTerminal(ctx, targetID); err != nil { /* ... */ }
+ok, err := q.Requeue(ctx, targetID) // ok == false means nothing was cleared
 ```
 
 Two things to weigh before doing that:
@@ -121,8 +192,53 @@ an h2c-upgraded connection. An attacker who could reach any path your middleware
 permits (the SPA shell, typically) could upgrade and then issue **every**
 subsequent HTTP/2 stream without your middleware ever being consulted.
 
-If you mount the dashboard, upgrade. If you cannot yet, `ui.WithoutH2C()`
-disables the upgrade handler entirely.
+**Check the fix's scope against your own wiring.** Only middleware passed to
+`ui.WithMiddleware` moved inside the h2c handler. If you authenticate instead by
+wrapping the handler `ui.Handler(...)` **returns** — the ordinary
+`mux.Handle("/jobs/", authMW(ui.Handler(...)))` chain — that wrapper is still
+outside the hijack in v4.6.0, exactly as it was before, and is still consulted
+only on the upgrade request.
+
+Whether that is exploitable depends on the other half of your configuration,
+because the dashboard's own Connect interceptor runs *inside* the hijack:
+
+- With **no auth option at all**, the interceptor denies every RPC, so
+  post-upgrade streams are refused. Upgrading is enough.
+- With **`ui.WithAuthorizer`**, your authorizer runs inside the hijack and *is*
+  consulted on every stream — the upgrade cannot bypass it. But it is consulted
+  without whatever your outer middleware would have put in the context, because
+  that middleware is the thing being bypassed. `Authorize` receives only a
+  context and an `Action`; the principal is optional and arrives via
+  `ui.WithPrincipal`. So check yours fails CLOSED on a missing principal: one
+  that decides from the `Action` alone — "allow the view actions, deny
+  mutations", which the API invites — still allows every read on a hijacked
+  connection.
+- With `ui.WithInsecureAllowUnauthenticated()` — the natural pairing when your
+  auth lives outside the library — the interceptor allows everything, so an
+  attacker who can reach the shell reads every job payload and reaches the
+  mutating RPCs. Upgrading does **not** close this.
+
+If that last shape is yours, move the middleware into `ui.WithMiddleware` or pass
+`ui.WithoutH2C()` — both available once you are on v4.6.0 or later. No release
+closes it for you.
+
+If you mount the dashboard, upgrade — there is no in-library mitigation on
+v4.5.1 or earlier, because the escape hatch (`ui.WithoutH2C()`) ships in v4.6.0
+itself, in the very commit that fixes the bypass. Until you can upgrade, the
+mitigation has to be external: put an authenticating reverse proxy in front of
+the dashboard so requests are authenticated before they reach the library, and/or
+configure that proxy to strip or refuse requests carrying `Upgrade: h2c` (with
+`Connection: Upgrade` and `HTTP2-Settings`). Terminating TLS by itself is *not*
+enough — x/net's h2c handler decides to hijack from the request headers alone and
+does not check whether the connection is encrypted.
+
+On v4.6.0+ the bypass is already closed for middleware passed to
+`ui.WithMiddleware`: the middleware now wraps the handler *inside* h2c, so it
+runs on every stream. `ui.WithoutH2C()` is a separate, optional hardening knob
+for operators who terminate HTTP/2 themselves (TLS, or Go 1.24+
+`srv.Protocols.SetUnencryptedHTTP2`) and want no connection hijacked inside the
+library at all. Its own godoc says so: it is about who owns protocol negotiation,
+not about authentication, and it is not required to get the fix.
 
 v4.6.0 also cleared two reachable advisories: **GO-2026-5970** (`golang.org/x/text`,
 reachable in every default configuration) and **GO-2026-5506** (`go.opentelemetry.io/otel`).
@@ -139,19 +255,43 @@ reachable in every default configuration) and **GO-2026-5506** (`go.opentelemetr
 
 ### Cancelling a workflow now cancels paused and waiting descendants
 
-**Before:** `CancelJob` on a fan-out parent skipped descendants in `paused` or
-`waiting`. A paused child survived its parent's terminal cancellation and stayed
-resumable — the dashboard's Resume button would run work you had explicitly
-cancelled — and the fan-out row permanently violated the documented
+**Before:** `CancelJob` on a fan-out parent skipped descendants in `paused`. (Its
+predicate was `pending`/`waiting`/`running`, so a `waiting` descendant was
+already cancelled.) A paused child survived its parent's terminal cancellation
+and stayed resumable — the dashboard's Resume button would run work you had
+explicitly cancelled — and the fan-out row permanently violated the documented
 `completed + failed + cancelled == total` invariant.
 
-**After:** cancellation reaches the whole subtree.
+The automatic sibling sweep was worse. `core.Storage.CancelSubJobs` — which runs
+when a fan-out ends `failed` and its `CancelOnFail` is set — skipped **both**
+`paused` and `waiting`, so a sibling suspended in a durable `Sleep`, a
+`WaitForSignal`, or its own nested fan-out survived the cancel, woke up later and
+ran.
+
+**After:** `CancelJob` reaches the whole descendant subtree, `paused` and
+`waiting` descendants included. All three predicates now share one
+`cancellableChildStatuses` set.
+
+**One gap this release deliberately does not close.** The widening applies to the
+*statuses* every cancel path treats as cancellable, not to their *reach*. The
+fail-fast sweep a fan-out runs when `CancelOnFail = true` (`CancelSubJobs`) now
+cancels `waiting` and `paused` siblings, but it still only touches a fan-out's
+**direct** children — it does not walk a cancelled sibling's own nested fan-out.
+A `waiting` sibling is, by construction, one suspended on a nested fan-out or
+`Call`, i.e. exactly the population that has descendants, and those grandchildren
+stay `pending`: a worker will dequeue and run them under an already-terminal
+ancestor. This is still strictly better than before, when the sibling itself woke
+up and ran. If you use `CancelOnFail = true` with nested fan-outs, cancel the
+parent with `CancelJob` rather than relying on the fail-fast sweep.
 
 **What you may notice:**
 
 - Jobs that previously lingered after a cancel now end `cancelled`. If you relied
   on pausing a child to *protect* it from a parent cancel, that never worked the
   way it appeared to — the child was only reachable by manual resume.
+- If you set `CancelOnFail = true` on a fan-out, siblings suspended in `waiting`
+  or `paused` when it fails now end `cancelled` instead of waking up later. This
+  applies even if you never call `CancelJob`.
 - `CancelJob` on a **directly paused job** (not part of a fan-out) now succeeds
   and lands `cancelled`, where it previously returned an error. Cancelling a
   paused job is no longer a two-step resume-then-cancel.
@@ -213,14 +353,27 @@ No typo was needed to hit it. At-least-once delivery is the documented producer
 contract, so a retried caller could deliver `"a"` twice while the handler had
 moved on to `"b"`; or a signal was simply sent early for a later phase. Each
 replay re-ran handler code not behind a `Call` or phase checkpoint and burned a
-dispatch plus a fleet rate-limit token. A durable `Sleep` was affected the same
-way: any buffered signal replayed the sleeping job every tick until its deadline,
-which the resume query's own doc comment already said must not happen.
+dispatch plus a fleet rate-limit token.
+
+A durable `Sleep` is covered by the same correlation, but **was not being
+replayed** before it. Both resume paths already skipped a sleeping job whose
+deadline had not passed: the poll checked `signal.WaitingOnFutureSleep` (with a
+memo cache in front of it) on every candidate, and `Signal`'s immediate-wake fast
+path did the same. That guard has been there since durable timers shipped, so no
+released version replayed a sleep on a buffered signal.
 
 **After:** a job records the signal name it suspended on, and the poll wakes it
 only for that name. A durable sleep records a reserved internal name that no user
 signal can match (`validateName` rejects names starting with `_`), so only its
 `run_at` deadline wakes it.
+
+For sleeps that is a saving rather than a fix: the resume query no longer returns
+a sleeping job at all, so the poll skips the per-job checkpoint read it used to
+do on every tick, and the narrow case where that read fails —
+`WaitingOnFutureSleep` reports false on a read error and the job is resumed
+anyway — can no longer be reached. Jobs already parked across the upgrade carry
+the empty, permissive `waiting_signal_name`, so they keep relying on the
+worker-side guard, which stays in place for them.
 
 **What you may notice:**
 
@@ -264,9 +417,38 @@ Because signal names are matched case-sensitively (`signals.name` is already
 `"approval"` — unchanged from before, and the correlation deliberately matches the
 consume rather than being looser than it.
 
-For a custom `core.Storage`: recording the name is an **optional capability**
-(`core.SignalWaitMarker`), not a new method on `core.Storage`, so an existing
-implementation still compiles and keeps the previous permissive behaviour.
+For a custom `core.Storage` there are two separate things here, and only one of
+them is optional.
+
+Recording the name on an **indefinite** wait is an optional capability
+(`core.SignalWaitMarker`), not a method on `core.Storage`. A storage that does
+not implement it records nothing, and the resume poll stays permissive for those
+jobs — the previous behaviour.
+
+**The signal capability set itself, however, gained a required method.**
+Alongside the v4.7 methods, `pkg/signal` now also requires:
+
+```go
+SaveCheckpointAndMarkWaitingForSignal(ctx context.Context, cp *core.Checkpoint,
+    jobID core.UUID, workerID string, d time.Duration, signalName string) error
+```
+
+A storage that implemented v4.7's signal capability but not this method still
+**compiles** — the capability interface is unexported and satisfied
+structurally, so neither the build nor `gorelease` flags it — but it now fails
+the capability check at runtime. `WaitForSignal`, `WaitForSignalTimeout`,
+`CheckSignal`, `DrainSignals`, `Sleep` and `SleepUntil` all return
+`core.ErrStorageNoSignals`. Signals and durable timers stop working entirely for
+that backend, and the optional marker never comes into play, because the
+capability check runs first.
+
+Add the method before upgrading. Forwarding it to your existing
+`SaveCheckpointAndMarkWaiting` and ignoring `signalName` reproduces the previous
+behaviour exactly — an empty recorded name is what "not recorded" means.
+
+A custom `core.Storage` that never implemented the signal capability at all is
+unaffected: it returned `core.ErrStorageNoSignals` before this release and still
+does.
 
 ### `WaitForSignalTimeout` no longer accepts a signal that arrived after its deadline
 
@@ -382,15 +564,24 @@ was already correct (`queue.Options` tracks whether `Retries` was applied, and
 fan-out checks it so an explicit 0 is not mistaken for "unset"); all of it was
 inert one layer below.
 
-**After:** the tag is gone, so an explicit 0 is written through. If you enqueued
-non-idempotent work with `Retries(0)` and saw it run more than once, that is why.
+**After:** the tag stays and the `max_retries` column definition is byte-identical
+to every shipped release — v39 and v40 add columns elsewhere (see the migration
+table below), but nothing touches this one; storage instead records which jobs
+asked for zero retries *before* the
+insert — GORM substitutes the declared default for a zero value and writes it
+back into the caller's struct, so a check made afterwards reads state that has
+already been overwritten — and writes the intended 0 back inside the same
+transaction. The row is never visible carrying a value its author did not ask
+for. If you enqueued non-idempotent work with `Retries(0)` and saw it run more
+than once, that is why.
 
 **Nothing changes for hand-written SQL.** An earlier attempt at this fix removed
 the column's `DEFAULT 3`, which turned out to be far worse than the bug: AutoMigrate
 then sees a changed column definition and REBUILDS the SQLite `jobs` table, taking
 the indexes created by versioned migrations with it — measured at 14 indexes before
-the upgrade and 4 after. The column keeps its default, and storage writes the
-intended 0 back inside the same transaction instead.
+the upgrade and 4 after. Keeping the tag is what avoids that, which is why the fix
+lives in the write path instead. A writer that omits `max_retries` entirely still
+gets 3 from the column default, exactly as before.
 
 ### A `Call` whose result type changed is caught instead of returning zero
 
@@ -431,20 +622,28 @@ NOT caught:
   `MarshalJSON` that emits `"USD:500"` for one that emits `"hello"`, or a
   `,string` option added to a **string** field (which double-quotes on the wire,
   but is still a JSON string);
-- swapping one struct whose fields are *all* unexported for another, since both
-  serialize as `{}`;
-- **any change to a result type that contains an `interface` member anywhere in
-  it** — including `Call[any]` itself — since an interface has no concrete value
-  to inspect. Such a type records no shape at all and is **not guarded at all**,
-  see below;
+- swapping one struct that serializes as `{}` for another that does, since both
+  record the empty shape. Note that "has no exported fields" is *not* the same
+  test: `encoding/json` promotes the exported members of an **unexported
+  embedded** struct — and promotes that embed's `MarshalJSON`, which can make the
+  whole value a JSON string rather than an object — so a struct with no exported
+  field of its own can still have a real shape, and swapping it IS caught. An
+  embed contributes nothing only when it is tagged `json:"-"` or has no exported
+  members of its own;
+- **any change to a result type that contains an `interface` member the shape
+  walk reaches** — including `Call[any]` itself — since an interface has no
+  concrete value to inspect. Such a type records no shape at all and is **not
+  guarded at all**, see below. (A plain *unexported* interface field is not
+  reached and does not disarm the guard; a `json:"-"` tag does not rescue an
+  exported one. Both are spelled out below.);
 - **any change to a result type that nests deeper than 32 JSON levels** — such a
   type records no shape at all and is skipped entirely, see below;
 - **any change to a result type containing a `json.RawMessage` member anywhere in
   it** — a `RawMessage` holds arbitrary JSON, so like an `interface` its wire form
   belongs to the value rather than the type. Such a type records no shape and is
   not guarded at all;
-- **any change to a result type containing a marshaler that VALIDATES** — also
-  below.
+- **any change to a result type containing a marshaler that VALIDATES on a member
+  `encoding/json` serializes** — also below.
 
 Those replay exactly as they did before this change: no worse, no better. The
 check is deliberately biased this way — a false rejection wedges a healthy
@@ -522,9 +721,10 @@ The same rule applies when a `MarshalJSON` or `MarshalText` **rejects the
 fabricated probe** rather than the type. `net.IP` refuses any length other than
 0, 4 or 16; an enum's `MarshalJSON` refuses a value that is not one of its cases.
 Both marshal perfectly on real data — only the synthesized probe offends them. A
-result type containing one records **no** shape anywhere in it — at any nesting
-depth, including deeper than the probe would otherwise descend — and replay skips
-the check for that type completely.
+result type records **no** shape when such a marshaler sits on a member
+`encoding/json` actually serializes — at any nesting depth, including deeper than
+the probe would otherwise descend — and replay then skips the check for that type
+completely.
 
 That is a miss, chosen deliberately over the alternative. Substituting a value
 the marshaler *would* accept was tried twice and both times produced a **false
@@ -536,6 +736,27 @@ that would have succeeded. A vanished member is also indistinguishable from a
 member that was *removed* from the type, which is the very change the guard
 exists to catch.
 
+**A member the encoder never touches does not disarm the guard.**
+`encoding/json` never hands a `json:"-"` field or a plain unexported one to its
+marshaler, so the probe is never rejected, the shape is recorded, and the type
+stays fully guarded. ``struct{ IP net.IP `json:"-"`; Order string `json:"order"` }``
+records `{order:string}`, and renaming `order` there IS refused on replay. The
+same is true of a `chan` or `func` member behind such a tag — the rule above is
+about a type `encoding/json` cannot marshal *as written*, not one that merely
+declares such a member.
+
+The `interface` and `json.RawMessage` cases are the exception to that exception:
+they stop the shape WALK itself rather than offending the encoder, so a
+`json:"-"` tag does not rescue them — an exported ``Meta any `json:"-"` `` still
+records no shape. Only a member the walk never enters does, which means an
+ordinary unexported field: ``struct{ hidden any; Order string `json:"order"` }``
+records `{order:string}` and stays guarded. An unexported **embedded** field is
+still entered by the shape walk — for an embedded struct because `encoding/json`
+promotes its exported members through it, and for anything else simply because
+the walk descends into every embed — so an unexported embedded interface stops
+the walk too, even though `encoding/json` itself ignores it
+(``struct{ ifc; Order string `json:"order"` }`` marshals to `{"order":"x"}`).
+
 The skip is **symmetric**: it applies whether the shape recorded on the
 checkpoint is empty or the shape of the type being replayed *into* is empty. So
 neither direction of such a refactor can wedge a live workflow — and that is what
@@ -545,18 +766,55 @@ that it stops being guarded, which leaves it exactly where it was before this
 feature existed.
 
 One smaller case joins the list for the same reason: a **map whose key type is
-neither a string nor an integer** — a key rendered by an
-`encoding.TextMarshaler` — records no shape, because the key name would come from
-whatever value was fabricated for it. `map[K]V` and `map[*K]V` for such a `K`
-serialize identically yet fabricated to different key names, which was another
-false fire. String- and integer-keyed maps, which is nearly all of them, are
-unaffected.
+not of string, integer or `uintptr` kind** — a struct, pointer, float, bool or
+array key, which can reach JSON at all only through an `encoding.TextMarshaler` —
+records no shape. For those kinds the rendered key name is whatever the marshaler
+makes of the FABRICATED value rather than a property of the type — a pointer key
+is fabricated nil and renders to an empty name — which was another false-fire
+source. The pointer form now records no shape, so the pair can no longer
+disagree.
 
-If you want a result type covered by this guard, keep `interface`/`any` members,
-`json.RawMessage` members and validating marshalers out of it — wrap the value in
-a plain struct, or expose the field as a `string` — key your maps by strings or
-integers, and keep it from nesting without end, which for a tree or list result
-usually means returning a flattened form.
+Do not read that as `map[K]V` and `map[*K]V` being interchangeable. They are not:
+`encoding/json` resolves a key of string kind by its raw string BEFORE it looks
+for a marshaler, so `map[Currency]int{"USD": 5}` renders `{"USD":5}` while the
+pointer form goes through `MarshalText`. Swapping one for the other changes the
+wire, and is a real type change rather than a refactor.
+
+A key type that IS one of the kept kinds stays guarded **even when it declares a
+`MarshalText`** — the rule is the key's *kind*, not whether a marshaler exists.
+For a string kind `encoding/json` never consults the marshaler at all
+(`map[Currency]int{"USD": 5}` marshals as `{"USD":5}`, not as whatever
+`Currency.MarshalText` returns), and for an integer kind the marshaler does
+render the key, so the fabricated name is simply what lands in the shape: a
+`map[K]int` for an integer `K` whose `MarshalText` emits `N1` fingerprints as
+`{N1:number}` — and as `{m:{N1:number}}` when it is a member named `m` — and is
+still checked on replay. String- and integer-keyed maps,
+which is nearly all of them, are unaffected.
+
+If you want a result type covered by this guard, keep `interface`/`any` members
+and `json.RawMessage` members out of it entirely — wrap the value in a plain
+struct, or expose the field as a `string` — keep validating marshalers off
+members `encoding/json` serializes (tagging one `json:"-"` is enough; it keeps
+the guard), key your maps by strings or integers, and keep it from nesting
+without end, which for a tree or list result usually means returning a flattened
+form.
+
+One further bound is not about nesting at all, and it has no tidy rule of thumb.
+The probe also gives up after constructing 100,000 values (`maxShapeNodes` in
+`pkg/call/result_fingerprint.go`), which a **wide** type reaches far inside the
+32-level cap. The cost is the product of the struct-typed member counts down a
+path, so — measured on synthetic types whose every level has the same number of
+struct-typed members — ten members run out at 5 JSON levels, nine, eight or seven
+at 6, six at 7, five at 8, four at 9 and three at 11, every one of them a finite,
+non-recursive
+type well inside the depth cap. Only struct-typed MEMBERS multiply: a slice,
+array or map is probed with a single element, so `[]Sub` and `map[string]Sub`
+cost the same as one `Sub`, and scalar members cost one apiece. Nothing in
+practice comes close — one of the larger generated types in this repository,
+`ui/gen/jobs/v1`'s `ListWorkflowsResponse`, records a 651-character shape — but a
+genuinely wide result type can exhaust it. Like every other case it then records no
+shape and fails open, so it costs coverage rather than correctness: such a type
+is not guarded, and cannot refuse a replay either.
 
 Checkpoints written before v40 carry an empty shape and are **not** checked, so work
 already in flight replays exactly as before — the same degradation `span_end = 0`
@@ -622,31 +880,56 @@ result, and the job **completed with a nil error on every observable surface**.
 Only `Def.Enqueue` was protected (`ErrJobArgsMismatch`); `Def.Call`,
 `EnqueueRemote`, and any job already queued under the first definition were not.
 
-**After:** re-registering a name whose argument or result type differs returns an
-error naming both signatures. Re-registering with the SAME types is unchanged and
-still allowed, so rebuilding a queue from the same definitions keeps working.
+**After:** re-registering a name whose argument or result type differs is
+refused, with an error naming both signatures. `RegisterE` and `typed.DefineE`
+**return** it; `Register` and `typed.Define` **panic** with it, as they already do
+for every other registration error. On the path every example in these docs uses,
+that means a colliding pair now takes the process down where the registration
+runs — for most programs, boot — instead of failing silently much later. There is
+nothing to catch: audit your registrations before you deploy, or move the call to
+`RegisterE`. Re-registering with the SAME types is unchanged and still allowed,
+so rebuilding a queue from the same definitions keeps working.
 
 **What you may notice:** a program that registered two different handlers under
 one name now fails at registration instead of at some later, silent point. If you
-see this error, one of the two registrations was already being discarded.
+hit this, one of the two registrations was already being discarded.
 
 `Schedule` has always refused its duplicate outright ("schedule already registered
 for %q"); handler names were the outlier.
 
 ### A cron expression naming two timezones is now rejected
 
-**Before:** `Cron("CRON_TZ=UTC TZ=Asia/Tokyo 0 9 * * *")` was accepted. robfig's
-parser understands `TZ=`/`CRON_TZ=` itself, so it stripped the inner name and set
-the location from it — and this package then overwrote that with the OUTER name.
-One of the two timezones you wrote was silently discarded and the job fired in the
-other, with no error and no log line.
+**Before:** every released version, v4.7.0 included, rejected
+`Cron("CRON_TZ=UTC TZ=Asia/Tokyo 0 9 * * *")` outright. It handed the whole
+string to robfig's parser, which strips only the FIRST prefix and then fails
+field normalisation with `expected exactly 5 fields, found 6:
+[TZ=Asia/Tokyo 0 9 * * *]`. `MustCron` panicked at startup on it. **No deployed
+schedule was ever firing in an unchosen zone because of this**; the
+accept-and-silently-discard state existed only between two commits on this
+branch, and never in a release.
 
-**After:** an expression carrying more than one timezone prefix returns an error
-naming the problem. Exactly one `CRON_TZ=` or `TZ=` prefix, or none, is unchanged.
+**After:** the prefix support added in this release strips the outer prefix here
+and would hand `TZ=Asia/Tokyo 0 9 * * *` to robfig — which resolves the INNER
+name, only to have it overwritten with the OUTER one, silently discarding one of
+the two. Picking one is not a defensible resolution of ambiguous input, so an
+expression carrying more than one timezone prefix returns an error naming the
+problem.
 
-**What you may notice:** nothing, unless you had such an expression — in which case
-it was already firing in a timezone you did not choose, and now it fails loudly at
-schedule time instead.
+An expression carrying exactly one prefix is still accepted here, but it is
+**not** otherwise unchanged — see *Cron honours an explicit timezone prefix*
+below, which moves such a schedule to the hour it asked for and can make it fire
+twice on the day you upgrade. Expressions with no prefix at all are unchanged:
+`Cron("0 9 * * *").Next` returns the identical instant on both versions. (One
+single-prefix form is newly rejected rather than merely moved:
+`Cron("CRON_TZ=  0 9 * * *")` — an empty name before the fields — returned a nil
+error on v4.7.0 and produced a live 09:00 UTC schedule; it now fails with
+`carries an empty timezone name`, and `MustCron` on it PANICS at startup.)
+
+**What you may notice:** nothing. If you had a two-timezone expression it was
+already failing — `Cron` returned an error and `MustCron` panicked at startup —
+so it never reached production. The only change is the message: robfig's
+misleading `expected exactly 5 fields, found 6` becomes `cron expression ... names
+more than one timezone; use exactly one CRON_TZ= or TZ= prefix`.
 
 ### A blocked `Unique` schedule is skipped, not retried at 10 Hz
 
@@ -716,20 +999,61 @@ correct behaviour once you accept that the schedule was firing at the wrong hour
 before — but it happens regardless of how you sequence the deploy, so "cut over
 cleanly" is not a mitigation.
 
-**If a double run would be harmful, use a WINDOWED dedup for the cutover:**
+**If a double run would be harmful, use a WINDOWED dedup for the cutover — sized
+below the schedule period, and removed once the cutover is past:**
 
 ```go
-jobs.IdempotencyKey("nightly-report-"+day, 24*time.Hour)   // or jobs.UniqueFor(24*time.Hour)
+// TEMPORARY: covers the cutover day only. Remove after the first clean day.
+jobs.IdempotencyKey("nightly-report-cutover", 6*time.Hour) // or jobs.UniqueFor(6*time.Hour)
 ```
 
 `queue.Unique` alone does **not** cover this, and an earlier draft of this file
-wrongly said it did. `Unique` means "only one ACTIVE job with this key" — the
-dedup matches `status IN ('pending','running')` — and the two fires here are hours
-apart, so the first has long since completed and the second enqueues normally. A
-windowed dedup is keyed on time rather than liveness, which is what a
+wrongly said it did. `Unique` means "only one ACTIVE job with this key", and
+active is `core.ActiveDedupStatuses` — `pending`, `running`, `retrying`,
+`waiting` and `paused` — not just `pending`/`running`: a job in retry backoff, or
+a workflow parked on a signal or a fan-out, still holds its key, and only
+`completed`, `failed` and `cancelled` release it. (`status IN ('pending','running')`
+is the narrower predicate of the partial unique *index* that backs the check — a
+generated-column index on MySQL — not the dedup query itself.) In the ordinary
+case the two fires are hours apart and the first has reached a terminal status,
+so the second enqueues normally and `Unique` does nothing for you. If the first
+fire is a long-lived workflow still parked in `waiting`, or still retrying,
+`Unique` swings the other way and *drops* the second fire — also not what you
+want. A windowed dedup is keyed on time rather than liveness, which is what a
 boundary-catch-up needs; the scheduler already forwards these options.
 
-That draft also suggested pausing the schedule, which is not an operation this
+Three things to know before you reach for it.
+
+- **The key does not vary per fire.** `Schedule` materialises its options once at
+  registration and the scheduler forwards the stored literal, so a key built from
+  a date (`"nightly-report-"+day`) is frozen at process start and is a constant
+  for the process's lifetime. Use a fixed key that says what it is.
+
+- **Size the window strictly BELOW the schedule period.** The window is anchored
+  to the previous fire's actual *enqueue* instant — `expires_at` is stamped
+  `now + ttl` at insert — not to the boundary, so a TTL equal to the period
+  silently suppresses a later, legitimate fire whenever the next boundary lands
+  less than a TTL after the last enqueue. On a daily schedule with a 24 h TTL
+  that is roughly a coin flip every day, since the 100 ms scheduler tick's phase
+  relative to the boundary varies, and it is *guaranteed* on a DST spring-forward
+  day, where `CRON_TZ=America/New_York 0 9 * * *` boundaries are only 23 h apart
+  (2026-03-07T14:00Z → 2026-03-08T13:00Z). Pick a TTL that just spans the two
+  cutover fires. That gap is the zone's UTC offset — a few hours for the
+  Americas, up to ~14 h elsewhere — so size it for *your* zone, not from the
+  example.
+
+- **A suppressed fire is silent, and the schedule still reads healthy.** Unlike
+  the `Unique` skip described above, an `IdempotencyKey`/`UniqueFor` dedup
+  returns the original job ID with a **nil error**, so the durable cursor
+  advances *and* the last-fire marker is stamped for a boundary at which nothing
+  ran. Nothing logs, and the dashboard's overdue/health indicator stays green.
+  This is the reason to keep the window short and to take it back out.
+
+One further caveat: the window is released early if the first fire ended `failed`
+or `cancelled` — the lock is stolen so the re-enqueue admits fresh work — so on a
+day where the first fire failed, this does not suppress the second run.
+
+That same earlier draft also suggested pausing the schedule, which is not an operation this
 library has (there is `PauseJob`, `PauseQueue` and `Worker.Pause`, but nothing that
 pauses a schedule). Pausing the *queue* does not help either — the scheduler still
 claims and enqueues the boundary — and removing and re-adding the schedule does not
@@ -773,11 +1097,12 @@ breaking that. What changed is that they are no longer silent: passing one logs 
 - **Hand-written `fanout.SubJob{}` literals** with no explicit `Retries` go from
   3 retries to 2. The fan-out default is now `queue.DefaultJobRetries`, matching
   what `Sub()`-built children already received — chosen so the common path does
-  not move. Set `Retries` explicitly if you relied on 3. A literal that sets `Retries` or
-  `Priority` to a **non-zero** value keeps it; a zero takes the fan-out default,
-  because a plain struct literal cannot express "explicitly zero" — there is no
-  field to distinguish it from an omission. Use `jobs.Sub(..., jobs.Retries(0))`
-  when you mean zero.
+  not move. Set `Retries` explicitly if you relied on 3. A literal that sets
+  `Retries` or `Priority` to a **non-zero** value keeps it; a bare zero takes the
+  fan-out default, because the zero is indistinguishable from an omission. To say
+  "explicitly zero" in a literal, set the companion flag the struct now exports:
+  `SubJob{Retries: 0, RetriesSet: true}` (and `PrioritySet` for priority), which
+  `pkg/fanout` honours. `jobs.Sub(..., jobs.Retries(0))` sets it for you.
 - Passing a dedup option (`Unique`, `IdempotencyKey`, `UniqueFor`) to `Sub` logs
   one `WARN` per fan-out. Those are parent-level concepts and remain ignored:
   children carry a fan-out-owned unique key so parent replay stays idempotent.
@@ -790,8 +1115,15 @@ breaking that. What changed is that they are no longer silent: passing one logs 
 **Before:** the fleet rate limiter derived a window that only required
 `PerSecond * window >= 1`, but the storage gate admits `ceil(PerSecond * window)`
 units per window — which is exact only when that product is a **whole number**.
-Every rate that was neither an integer nor `1/n` therefore ran fast. Measured
-against the real gate on SQLite, Postgres and MySQL:
+Every rate that was neither an integer nor an *exactly representable* `1/n`
+therefore ran fast — and `1/n` is exact less often than it looks, because the old
+formula rounded up on the float representation of `1/n`: `1/(1/49)` is
+`49.000000000000007`, so it derived a **50 s** window and the gate admitted two
+units in it. Over n = 1..20000, 1421 reciprocals (7.1%) ran fast, and there is no
+mild case among them — every one enforced very nearly **double** the configured
+rate, between **+96.0%** (`1/49`: 0.0204/s configured, 0.0400/s enforced) and
+**+99.99%** (`1/16375`). Every round reciprocal an operator actually writes was
+exact. Measured against the real gate on SQLite, Postgres and MySQL:
 
 | Configured | Enforced (before) | Over |
 | --- | --- | --- |
@@ -817,16 +1149,20 @@ deliberately.
 Whole-number rates derive exactly the same window as before and do not move
 (verified for 1..20000).
 
-Some `1/n` rates DO move, by at most one second: the old formula rounded up on the
-float representation of `1/n`, so those were never exact to begin with. Measured
-over n = 1..20000, 2785 of them shift (13.9%); the first is `1/49`, whose window
-goes from 50s to 49s.
+Some `1/n` rates DO move. Measured over n = 1..20000, 2785 shift (13.9%), the
+first being `1/49` (a 50s window becoming 49s). They split into two groups that
+are nothing alike. **1421 are the inexact reciprocals described above** — their
+window shrinks by one second and their enforced rate roughly halves, back onto
+the rate you configured; if you tuned against the old behaviour, these are the
+ones to re-tune. The other 1364 were already exact and stay exact for practical
+purposes, losing at most a millisecond of window.
 
-Those movers split almost evenly — 1421 end closer to the rate you configured and
-1364 end very slightly farther, the first at `1/93` (a 93s window losing one
-millisecond). The worst drift away is **1.1×10⁻⁵**, i.e. 0.001%, which is two
-orders of magnitude inside the 0.5% bound above and far below what any limiter can
-observe. (An earlier draft of this file said "17 movers, around n ≈ 16300, about
+Among those 1364, the worst drift away from the configured rate is
+**1.1×10⁻⁵**, i.e. 0.001% (at `1/93`, a 93s window losing one millisecond) — two
+orders of magnitude inside the 0.5% bound above and far below what any limiter
+can observe. That figure bounds the harmless group only; it says nothing about
+the 1421, whose whole point is that they move by roughly a factor of two.
+(An earlier draft of this file said "17 movers, around n ≈ 16300, about
 6×10⁻⁸". That was wrong in all three numbers; the figures here are measured
 against the shipped derivation.)
 
@@ -908,16 +1244,31 @@ TEXT carrying its offset, and SQLite compares those strings **lexically**. Every
 offset, so a `run_at` supplied on a different clock face (`jobs.At` with a UTC
 time, a parsed RFC 3339 `...Z`, a timestamp from another service) was compared
 character-by-character against a differently-offset string. The job became
-eligible early or late by the full delta between the two zones — up to 14 hours.
+eligible early or late by the full delta between the two clock faces — **up to 26
+hours**, not 14. Both faces are arbitrary (the supplied offset and this process's
+local offset), so they can sit at opposite ends of the range, `+14:00` against
+`-12:00`; 14 hours is the bound only when one of the two faces is UTC. Ordinary
+pairs already exceed it — a `+09:00` value read by a `-07:00` process mis-orders
+by 16 hours.
 
 **After:** `run_at` — from enqueue and from `Storage.Fail`'s `retryAt` — is
 re-pointed at the same instant on this process's local clock face before it is
 written. The instant never changes; only the rendering does. A no-op on
 Postgres and MySQL.
 
-Schedule boundaries get the same treatment. `last_fire_at` is compared the same
-way, and `DailyIn` / `WeeklyIn` produce boundaries in *their* location — so on
-SQLite a `DailyIn(America/New_York, 13, 0)`
+Schedule boundaries have the same bug and are fixed too, but by a **different
+mechanism** — one that carries none of the same caveats. `last_fire_at` is *not*
+re-pointed; it keeps whatever face the boundary carries. The claim's cursor
+comparison was made face-aware instead: when the stored cursor and the incoming
+boundary carry the same trailing offset the two are compared as raw text, exact
+to the nanoseconds the driver wrote; when the offsets differ, both sides are
+parsed with `strftime('%Y-%m-%d %H:%M:%f', …)` and compared as instants, to
+millisecond resolution. Normalizing writes the way `run_at` is normalized was
+tried and rejected — it truncates to milliseconds and stalled sub-millisecond
+`Every` schedules that v4.7.0 advanced (`Every(100µs)` went 20/20 → 2/20).
+
+`last_fire_at` was compared lexically before, and `DailyIn` / `WeeklyIn` produce
+boundaries in *their* location — so on SQLite a `DailyIn(America/New_York, 13, 0)`
 boundary rendered `13:00:00-04:00` sorted **below** a `16:00:00+00:00` cursor it
 was genuinely an hour after, the claim matched nothing, and the schedule silently
 never fired. (A `CRON_TZ=` prefix does *not* produce a foreign face: robfig's
@@ -925,9 +1276,17 @@ never fired. (A `CRON_TZ=` prefix does *not* produce a foreign face: robfig's
 carries whatever face it was asked about — measured under three host zones. The
 prefix fixes which *hour* fires, not which face it is stored on.)
 
-**What you may notice:** on SQLite, delayed jobs and non-UTC schedules enqueued
-**after** the upgrade now fire when you asked — **provided every process that
-enqueues and every process that dequeues runs in the same timezone.**
+Because that fix is in the predicate and not at write time, it needs no migration
+and does not depend on which constructor wrote the row: **cursors already in the
+database are repaired by upgrading**, unlike `run_at`. The one residual is narrow
+— a cross-face pair less than 1 ms apart collapses in the `strftime` branch,
+which requires a sub-millisecond schedule whose process timezone changed between
+two fires.
+
+**What you may notice:** on SQLite, delayed jobs enqueued **after** the upgrade
+now fire when you asked — **provided every process that enqueues and every
+process that dequeues runs in the same timezone.** Non-UTC schedules are fixed
+unconditionally and are not subject to that precondition; see above.
 
 That precondition is new, and on SQLite it is the one thing to check before
 upgrading. `run_at` is re-pointed at the **writing process's** local clock face,
@@ -939,11 +1298,23 @@ was due; the mirror direction fires early. The same applies to one process whose
 host timezone changes between writing and reading a row — a base-image bump, or
 adding `Environment=TZ=` to a unit file.
 
-v4.7.0 stored whatever face the *application* supplied, so a UTC-supplying app
-read by UTC workers was already correct; **that specific combination regresses.**
-Every other combination is fixed or unchanged, which is why this ships. If your
-SQLite deployment spans timezones, set one `TZ` across the fleet before upgrading
-— that is the only configuration in which both versions are correct.
+v4.7.0 stored whatever face the *application* supplied, so it was correct exactly
+when the supplied offset matched the **reading** process's offset — a
+UTC-supplying app read by UTC workers, but equally a `+09:00`-supplying app read
+by `TZ=Asia/Tokyo` workers. v4.8.0 is correct exactly when the **writing**
+process's offset matches the reading process's. **Any deployment whose
+application already supplied the readers' own clock face, but enqueues from a
+process in a different zone, therefore regresses** — an app supplying
+`+09:00`-faced times with workers on `TZ=Asia/Tokyo` and an enqueuer on `TZ=UTC`
+is correct on v4.7.0 and fires nine hours early on v4.8.0; the mirror (a
+UTC-supplying app with UTC workers and a `TZ=Asia/Tokyo` enqueuer) fires nine
+hours late. A deployment whose enqueuing and dequeuing processes share a
+timezone is fixed or unchanged, an all-UTC one included, which is why this ships.
+
+If your SQLite deployment spans timezones, set one `TZ` across the fleet before
+upgrading. Note what that buys: it makes v4.8.0 correct, not both versions —
+v4.7.0 still mis-fires under a single-`TZ` fleet whenever the application
+supplies a face other than that fleet's own.
 
 Postgres and MySQL are unaffected: both store an instant and compare instants.
 
@@ -1003,8 +1374,11 @@ aggregate over every status has no bound on table size — and the default
 retention keeps completed jobs for 30 days, so "a few pending, millions
 completed" is the normal shape. Measured on live databases at 300k rows,
 unfiltered is a parallel sequential scan on Postgres (4,935 buffers, 32 ms) and
-on MySQL a full scan of `idx_jobs_dequeue_eligible`, the index the claim path
-depends on; filtered is an index scan (609 buffers, 0.5 ms). Every 60 seconds, in
+on MySQL a full scan of `idx_jobs_dequeue_eligible`, one of the hot-path indexes
+on the same `jobs` table — note that on MySQL the claim path itself is served by
+`idx_jobs_dq_ready (status, dq_ready, priority DESC, dq_eligible_at, queue)`;
+`idx_jobs_dequeue_eligible` is the claim index only on Postgres and SQLite.
+Filtered is an index scan (609 buffers, 0.5 ms). Every 60 seconds, in
 every process that mounts the dashboard, whether or not anyone is looking at it.
 
 The filter makes the cost proportional to queue **depth** instead of to **table
@@ -1038,14 +1412,20 @@ within that process too: subscribers get a 100-event buffer and `Emit` drops
 rather than blocks when it fills. Queue **depth** is read from the database and
 is fleet-wide. See "What the throughput series does
 and does not measure" in the Embedded UI guide; for fleet-wide throughput use the
-OpenTelemetry metrics, which every process exports.
+OpenTelemetry metrics in `pkg/metrics` and aggregate them at your collector. They
+are **opt-in** — the library never turns them on for you. Each process you want
+counted has to call `jobsmetrics.Instrument(queue)` itself, with a MeterProvider
+configured (`Instrument` otherwise falls back to the global
+`otel.GetMeterProvider()`, which is a no-op if you never set one). A process that
+mounts the dashboard but never calls `Instrument` exports nothing at all. See the
+Metrics guide.
 
 ### The dashboard boots under a sub-path mount
 
 **Before:** the bundled dashboard referenced its assets **root-absolutely**
 (`/assets/index-*.js`) and its RPC client built every call from
-`window.location.origin`. Mounted the way the `Handler` godoc, the README and six
-docs pages all prescribe —
+`window.location.origin`. Mounted the way the `Handler` godoc, the README and
+five docs pages all prescribe —
 
 ```go
 mux.Handle("/jobs/", http.StripPrefix("/jobs", ui.Handler(storage)))
@@ -1108,29 +1488,81 @@ That covers `INSERT`. It does **not** make a pre-v39 binary behave correctly on
 `UPDATE`, and for `jobs.waiting_signal_name` there is a real gap worth planning
 around:
 
-> A v4.8 worker CLEARS `waiting_signal_name` every time it parks a job, precisely
-> so a stale name from an earlier named wait cannot narrow a later one. A pre-v39
-> worker has no such column in its update set, so it physically cannot clear it.
-> In a MIXED fleet the sequence is: a new worker parks a job on
+> A v4.8 worker clears `waiting_signal_name` on every SIGNAL park — `MarkWaiting`
+> (the unnamed wait, and the legacy fan-out re-park) writes `''`, while
+> `MarkWaitingForSignal` and the deadline form write the awaited name — precisely
+> so a stale name from an earlier named wait cannot narrow a later one. The one
+> exception is `SuspendForFanOut`, the atomic fan-out park, which does not write
+> the column at all: a fan-out parent that earlier completed a named wait stays
+> parked with that name, and nothing on the resume or re-claim path clears it
+> either. That costs nothing today — while the fan-out is pending the parent is
+> excluded from the signal-resume poll, and once the fan-out reaches a terminal
+> status the parent is resumed by the fan-out completion path regardless of the
+> stale name — but do not read a non-empty `waiting_signal_name` on a waiting
+> fan-out parent as evidence of an un-upgraded worker.
+>
+> A pre-v39 worker has no such column in its update set, so it physically cannot
+> clear it. In a MIXED fleet the sequence is: a new worker parks a job on
 > `WaitForSignal("approval")`; the signal arrives and the job resumes; an old
 > worker later parks the same job on an UNNAMED wait, leaving `'approval'` in
 > place; a subsequent signal is then matched against the stale name.
 >
 > This needs no rollback — an ordinary rolling upgrade is enough. **Finish
 > upgrading every worker before relying on named signals**, or drain named waits
-> across the upgrade window. Once all workers are v4.8 the column is cleared on
-> every park and the hazard is gone.
+> across the upgrade window. Once all workers are v4.8 every signal park clears
+> the column and the mixed-fleet hazard is gone.
 
 **v39 has one dialect caveat**, covered in its own section above: on MySQL the
-column needs an `as_cs` collation to match `signals.name`, and the repair path
-rebuilds the table under lock. Factor that into the maintenance window on MySQL.
+column must carry an `as_cs` collation to match `signals.name`. A pre-AutoMigrate
+step adds it with that collation, so on any database that already has a `jobs`
+table the upgrade is a fast `ADD COLUMN` and v39 finds nothing to repair — its
+`ALTER TABLE jobs MODIFY` rebuild-under-lock does not run. That rebuild fires
+only on a brand-new database, where `jobs` is empty and it is therefore free, or
+on a database that somehow holds the column with the wrong collation; and since
+v39 and the pre-AutoMigrate step ship together in v4.8.0, no database upgrading
+from a released version can be in that state. **No extra MySQL maintenance window
+is needed for v39.** If you have a very large `jobs` table and want certainty
+before you schedule, run the `information_schema` query in that section: no row
+means the fast path applies.
+
 Any further migration is listed here by the packet that adds it.
 
 **One caveat, and it is not about the schema.** Rolling back restores the old
 *code*, so any behaviour fixed above reverts with it. The one that can cost you
 work rather than just correctness is on **SQLite**: v4.7.0's lexical
-schedule-cursor comparison comes back, so a non-UTC or sub-second schedule can
-start stalling again on rows v4.8.0 had just been advancing correctly.
+schedule-cursor comparison comes back, so any schedule whose next boundary is
+rendered on a **different clock face from its stored cursor** can start stalling
+again on rows v4.8.0 had just been advancing correctly.
+
+The exposure is narrower than it first looks, and it is worth being precise
+because the scary-sounding case is the one that does *not* happen.
+
+**A schedule that has already fired under v4.8.0 is not exposed.**
+`ClaimScheduledFireTx` stores the boundary itself into `last_fire_at`, and
+`Daily`/`Weekly`/`Cron` compute boundaries on UTC's face — so after one fire the
+cursor and the next boundary carry the same offset and the restored lexical
+compare is exact. The host's timezone does not matter. Measured on SQLite under
+`TZ=Asia/Tokyo`, sweeping all 24 hours-of-day: **0/24** `Daily(9, 0)` cursors that
+v4.8.0 had advanced stalled on rollback.
+
+What *can* stall is a schedule still holding the **host-faced anchor written at
+first registration**, which has not fired yet — `SeedScheduledFire` writes
+`time.Now()` on the host's face, and a UTC-pinned boundary does not match it
+(9/24 in the same sweep). That costs at most the first boundary and then
+self-recovers, and it is not something v4.8.0 created: v4.7.0 seeds its own fresh
+rows exactly the same way.
+
+A `DailyIn`/`WeeklyIn` cursor left on a foreign face is the other shape, but those
+constructors do not exist on v4.7.0, so you have to delete them to compile anyway.
+(`CronIn` and a `CRON_TZ=` prefix are *not* exposed — robfig's `Next` returns its
+answer in the cursor's own location, as noted above.)
+
+**Sub-second schedules are not affected**, and were never the trigger: when the
+two faces match — which `Every` guarantees, since it seeds from the host clock
+and its `Next` preserves that location — the lexical compare is exact to the
+nanoseconds the driver wrote. Measured against v4.7.0, `Every(100µs)` advanced
+20/20. (Millisecond truncation was a property of a normalize-always variant that
+was rejected and never shipped.)
 
 Whether you see it, and on how many schedules, depends on TWO things: how far the
 host's offset sits from the stored clock face, AND where the wall clock currently
