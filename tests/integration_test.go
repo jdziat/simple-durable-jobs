@@ -403,9 +403,13 @@ func TestIntegration_SchedulerRecurringJobs(t *testing.T) {
 	// Schedule job to run every 200ms
 	require.NoError(t, queue.Schedule("recurring-task", nil, jobs.Every(200*time.Millisecond)))
 
-	// Worker lifetime is generous so the poll below has room even when a loaded
-	// CI runner is slow to begin dispatching scheduled fires.
-	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	// Worker lifetime must outlive BOTH polls below, not just the first. The
+	// count poll can spend up to 5s on a loaded runner and the gap poll a further
+	// 4s, so a 6s ceiling could kill the schedule while the second poll was still
+	// waiting for a fire — turning a slow start into a failure. Eventually returns
+	// as soon as its condition holds, so a generous ceiling costs nothing when
+	// things are healthy and only bounds a genuine hang.
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
 	// Start worker with scheduler enabled
@@ -423,26 +427,60 @@ func TestIntegration_SchedulerRecurringJobs(t *testing.T) {
 	count := executionCount.Load()
 	assert.GreaterOrEqual(t, count, int32(3), "Should have multiple executions")
 
-	// Verify executions are spaced apart. Startup jitter (worker pickup
-	// latency, first-fire arriving immediately) can compress the very
-	// first gap below the configured interval, so instead of asserting
-	// on the first pair we require at least one steady-state gap at or
-	// above ~180ms (the 200ms interval minus a small jitter budget).
+	// Verify the schedule's RATE, not the existence of one wide gap.
+	//
+	// Two earlier versions of this assertion were both weaker than they looked.
+	// Snapshotting max-gap the instant the count poll saw its third execution
+	// measured a still-running schedule, and failed once on Postgres under -race
+	// when the three handler timestamps happened to land close together — a
+	// schedule that was working. Polling for "some gap >= 180ms" instead was
+	// WORSE: a longer window gives more chances for a spurious gap, so a schedule
+	// firing every 5ms passed it (verified by mutation).
+	//
+	// Elapsed-time-over-N-fires has neither problem. It cannot be satisfied by
+	// jitter, because it constrains the TOTAL, and it does not care which
+	// individual gap is wide. The first fire is excluded: startup can deliver it
+	// immediately, which is expected and says nothing about the interval.
+	// ELEVEN fires, not five, and the threshold carries explicit jitter slack.
+	//
+	// A three-interval span was too tight: the worker polls at 100ms, so delivery
+	// jitter can move each ENDPOINT by up to a poll interval while the underlying
+	// 200ms boundaries stay fixed. A 600ms span can therefore be observed as
+	// ~450ms, and a 540ms floor failed 1 run in 25 on a live database. More
+	// intervals amortise that fixed endpoint error instead of fighting it: nine
+	// intervals span ~1800ms, so subtracting a full 200ms of slack still leaves a
+	// floor a 50ms or 5ms schedule cannot reach (both are poll-bound at ~100ms per
+	// fire, giving ~900ms). Discrimination goes UP and flakiness goes down.
+	const settled = 11 // fires to observe, first one discarded
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(executionTimes) >= settled
+	}, 8*time.Second, 20*time.Millisecond, "schedule should keep firing")
+
 	mu.Lock()
 	times := make([]time.Time, len(executionTimes))
 	copy(times, executionTimes)
 	mu.Unlock()
 
-	if len(times) >= 2 {
-		var maxGap time.Duration
-		for i := 1; i < len(times); i++ {
-			if gap := times[i].Sub(times[i-1]); gap > maxGap {
-				maxGap = gap
-			}
-		}
-		assert.GreaterOrEqual(t, maxGap, 180*time.Millisecond,
-			"at least one execution gap should reflect the ~200ms schedule interval")
+	// times[1]..times[settled-1] is (settled-2) intervals of the real schedule.
+	spanned := times[settled-1].Sub(times[1])
+	// (settled-2) real intervals of 200ms, less one poll interval of jitter at
+	// each endpoint.
+	minSpan := time.Duration(settled-2)*200*time.Millisecond - 200*time.Millisecond
+	assert.GreaterOrEqual(t, spanned, minSpan,
+		"%d scheduled fires after the first should span at least %s at a 200ms interval, took %s "+
+			"(gaps: %v)", settled-1, minSpan, spanned, gapsBetween(times))
+}
+
+// gapsBetween renders the observed intervals, so a failure says what the schedule
+// actually did rather than only that a number was too small.
+func gapsBetween(times []time.Time) []time.Duration {
+	out := make([]time.Duration, 0, len(times))
+	for i := 1; i < len(times); i++ {
+		out = append(out, times[i].Sub(times[i-1]).Round(time.Millisecond))
 	}
+	return out
 }
 
 func TestIntegration_ConcurrentWorkers(t *testing.T) {
