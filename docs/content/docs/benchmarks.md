@@ -25,7 +25,7 @@ The CI benchmark matrix covers SQLite and Postgres. MySQL numbers below are meas
 
 The explicit single-row dequeue path (`WithDequeueBatchSize(1)`) is the conservative claim mode: each storage request claims one job. Pair it with a slower `WithPollInterval(...)` when you want to approximate the older slow-poll behavior during rollback.
 
-`WithDequeueBatchSize(10)` is now the worker default, and for throughput-sensitive deployments raising it further helps. At batch size 10, the same 50ms poll can claim roughly `10 / 0.050s = 200 jobs/sec` before storage and handler work dominate. That arithmetic explains why the default EndToEnd row is similar across backends, while enqueue, batch enqueue, workflow, and SQLite's batched-drain shape are not near-identical.
+The worker default is `WithDequeueBatchSize(50)`, capped at the worker's free concurrency slots — so at the default concurrency of 10, the effective per-poll claim is 10. **The tables below were measured when the default was 10 and have not been re-run since it was raised**, so read them as the batch-size-10 shape. At batch size 10, a 50ms poll can claim roughly `10 / 0.050s = 200 jobs/sec` before storage and handler work dominate. That arithmetic explains why the default EndToEnd row is similar across backends, while enqueue, batch enqueue, workflow, and SQLite's batched-drain shape are not near-identical. Raising concurrency is what unlocks the larger default batch.
 
 ## SQLite Results
 

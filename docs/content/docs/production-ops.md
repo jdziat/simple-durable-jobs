@@ -162,7 +162,7 @@ capacity, stops when no work is dispatched, stops when released jobs reach the
 tick's release budget, stops when the poll-interval wall-clock budget elapses,
 and has a hard iteration cap.
 
-`WithDequeueBatchSize(n)` sets the per-poll claim cap. Default: `10`. Values are
+`WithDequeueBatchSize(n)` sets the per-poll claim cap. Default: `50`. Values are
 clamped to `[1, 1000]`. `WithPollInterval(d)` sets the idle poll interval.
 Default: `100ms`; positive values below `50ms` are clamped up to `50ms`; non-
 positive values are ignored.
@@ -383,9 +383,12 @@ separate archive table.
    ```
 
 Requeue clears DLQ metadata, resets execution state, and deletes checkpoints so
-the workflow starts from the beginning. The dashboard Requeue button instead
-clears the dead-letter state and resumes from existing checkpoints. Handlers
-still must be idempotent. See [Dead-Letter Queue]({{< relref
+the workflow starts from the beginning. The dashboard's Retry button does the
+same thing — it routes through the identical replay-from-scratch reset, so it
+is **not** a way to resume from existing checkpoints. Neither path preserves
+them, and there is no operation that does. Handlers still must be idempotent:
+every step of a requeued workflow runs again, including steps that already
+succeeded. See [Dead-Letter Queue]({{< relref
 "/docs/advanced/dead-letter-queue" >}}) for the full API and retention caveats.
 
 ## Retention And GC

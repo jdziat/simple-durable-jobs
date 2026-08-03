@@ -9,7 +9,7 @@ Sets job priority. Higher values run first. Default is 0.
 
 ### `Retries(n int) Option`
 
-Sets maximum retry attempts. Default is 3.
+Sets maximum retry attempts. Default is 2. `Retries(0)` means run once and do not retry.
 
 ### `Delay(d time.Duration) Option`
 

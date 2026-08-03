@@ -133,8 +133,12 @@ cancelled) stays in `failed` status and is queryable:
 failed, _ := q.Storage().GetJobsByStatus(ctx, jobs.StatusFailed, 100)
 ```
 
-Replay one with `q.Requeue` (checkpoints are preserved, so a workflow resumes
-from its last successful step):
+Replay one with `q.Requeue`. **This is a replay from scratch:** requeueing
+deletes the job's checkpoints, so a workflow re-executes every step, including
+ones that already succeeded. If a completed step had an external side effect —
+a charge, an email, a provisioning call — it happens again unless the handler
+is idempotent. There is no "resume from the last successful step" operation;
+the dashboard's Retry button performs this same full reset:
 
 ```go
 ok, err := q.Requeue(ctx, jobID)

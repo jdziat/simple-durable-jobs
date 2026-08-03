@@ -303,7 +303,7 @@ defer cancel()
 mux.Handle("/jobs/", http.StripPrefix("/jobs", ui.Handler(storage,
     ui.WithQueue(queue),             // Enable event streaming and scheduled jobs view
     ui.WithContext(ctx),             // Lifecycle context for background workers
-    ui.WithStatsRetention(7*24*time.Hour), // How long to keep stats (default: 7 days)
+    ui.WithStatsRetention(7*24*time.Hour), // How long to keep stats (default: 31 days)
     ui.WithMiddleware(authMiddleware),      // Wrap with auth, logging, etc.
 )))
 ```

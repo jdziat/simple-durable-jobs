@@ -112,9 +112,11 @@ Sets how often the worker polls for new jobs. The default is 100ms and the floor
 
 ### `WithDequeueBatchSize(n int) WorkerOption`
 
-Sets the per-poll cap for optional batch dequeue. The default is `10`; values
-are clamped to `[1, 1000]`. Set `WithDequeueBatchSize(1)` to force single-row
-claims.
+Sets the per-poll cap for optional batch dequeue. The default is `50`; values
+are clamped to `[1, 1000]`. The claim is additionally capped at the worker's
+free concurrency slots, so a worker left at the default concurrency (10) never
+claims more than 10 at once — only deployments that raise concurrency see the
+larger batch. Set `WithDequeueBatchSize(1)` to force single-row claims.
 
 ### `WithDrainTimeout(d time.Duration) WorkerOption`
 

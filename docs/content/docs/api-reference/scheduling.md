@@ -46,6 +46,28 @@ above changes what a `Daily` schedule does.
 on the requested **calendar weekday** in `loc`; the DST notes on `DailyIn` apply.
 `loc` must be non-nil.
 
-### `Cron(expr string) Schedule`
+### `Cron(expr string) (Schedule, error)`
 
-Creates a schedule from a cron expression.
+Creates a schedule from a cron expression. It returns an error for an invalid
+expression, so it cannot be used inline where a `Schedule` is expected:
+
+```go
+sched, err := jobs.Cron("0 */2 * * *")
+if err != nil {
+    return err
+}
+```
+
+The default zone is **UTC**, not the host's local zone, so the same expression
+fires at the same instant on every node in a fleet. A `CRON_TZ=Area/City ` or
+`TZ=Area/City ` prefix on the expression is honoured.
+
+### `MustCron(expr string) Schedule`
+
+The same, but panics on an invalid expression. Use it for expressions fixed at
+compile time, where it can be passed inline.
+
+### `CronIn(loc *time.Location, expr string) (Schedule, error)`
+
+Interprets the expression in `loc` rather than UTC — note `loc` comes **first**.
+`loc` must be non-nil. `MustCronIn(loc, expr)` is the panicking variant.

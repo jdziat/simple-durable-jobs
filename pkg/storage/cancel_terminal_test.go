@@ -343,9 +343,15 @@ func TestCancelJobTerminal_ReconcilesOwningFanOutCounts(t *testing.T) {
 // update that page in the same commit.
 //
 // Note the set deliberately omits StatusRetrying, which the dedup set includes.
-// That is not a gap today: no production path ever writes `retrying` (it exists
-// for UI filtering and legacy rows), so no job rests there to be missed. If a
-// path ever starts writing it, this test fails and forces the decision.
+// That is not a gap: `git log -S StatusRetrying -- pkg/storage pkg/worker` is
+// empty, so this library has never written `retrying` in its history — there
+// are not even legacy rows resting there to be missed. It exists for UI
+// filtering only.
+//
+// Be precise about what THIS test does and does not catch. It pins the set; it
+// does not watch production. Adding a `retrying` write would not fail this
+// test — it would fail the retry-path tests in pkg/storage and pkg/worker
+// (measured: 4 and 2 respectively), which is where that decision gets forced.
 func TestCancellableChildStatusesMatchesDocs(t *testing.T) {
 	require.Equal(t, []core.JobStatus{
 		core.StatusPending, core.StatusWaiting, core.StatusRunning, core.StatusPaused,

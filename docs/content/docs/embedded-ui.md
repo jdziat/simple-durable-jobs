@@ -119,7 +119,7 @@ If not provided, `context.Background()` is used and background goroutines run un
 ui.WithStatsRetention(7 * 24 * time.Hour)
 ```
 
-Controls how long historical stats rows are kept in the database. Older rows are pruned automatically during each flush cycle. The default is 7 days.
+Controls how long historical stats rows are kept in the database. Older rows are pruned automatically during each flush cycle. The default is 31 days, which covers the dashboard's longest (30d) throughput window; lower it to reduce stats-table growth if you do not use the longer windows.
 
 ### WithMiddleware
 

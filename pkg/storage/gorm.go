@@ -1965,8 +1965,13 @@ func (s *GormStorage) GetFanOutsByParent(ctx context.Context, parentJobID core.U
 // --- Sub-job operations ---
 
 // EnqueueBatch inserts multiple jobs in a single operation.
-// Jobs carrying a UniqueKey are deduplicated against pending/running/completed
-// rows so a parent workflow that crashes mid fan-out can replay safely. The
+// Jobs carrying a UniqueKey are deduplicated against core.ActiveDedupStatuses —
+// pending, running, retrying, waiting and paused — so a parent workflow that
+// crashes mid fan-out can replay safely. A row that has reached a TERMINAL
+// status (completed, failed, cancelled) no longer holds its key, so replaying a
+// batch whose jobs already completed inserts fresh runnable rows rather than
+// deduplicating against them; that is intentional, and it means a replay is not
+// idempotent with respect to already-finished work. The
 // dedup lookup and insert run inside a single transaction with row-level
 // locking on non-SQLite backends, mirroring EnqueueUnique, so concurrent
 // replays cannot produce duplicate sub-jobs.

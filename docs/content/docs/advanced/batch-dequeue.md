@@ -17,7 +17,7 @@ w := q.NewWorker(
 )
 ```
 
-The default batch size is `10`, so a single worker is no longer capped at the old one-claim-per-poll throughput floor. Set `WithDequeueBatchSize(1)` to force strict single-row claims; pairing that with a slower `WithPollInterval(...)` is the rollback escape hatch for conservative slow-poll behavior.
+The default batch size is `50`, so a single worker is no longer capped at the old one-claim-per-poll throughput floor. The claim is also capped at the worker's free concurrency slots, so at the default concurrency of 10 the effective per-poll claim is 10. Set `WithDequeueBatchSize(1)` to force strict single-row claims; pairing that with a slower `WithPollInterval(...)` is the rollback escape hatch for conservative slow-poll behavior.
 
 ## How it works
 
