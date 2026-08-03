@@ -673,10 +673,22 @@ func cloneOptionsMetadata(m *core.MetadataMap) map[string]string {
 //
 // Note: the in-batch Unique dedup (collapsing two entries in this call that share
 // a key) is computed from each job's UniqueKey BEFORE enqueue middleware runs, so
-// a middleware that rewrites UniqueKey is not reflected in that in-slice
-// collapse. Enqueue middleware on the batch path must therefore not depend on
-// rewriting UniqueKey for dedup; the storage-level unique constraint still
-// applies to the final key.
+// a middleware that rewrites UniqueKey is not reflected in that in-slice collapse.
+// Enqueue middleware on the batch path must therefore not depend on rewriting
+// UniqueKey for dedup.
+//
+// Be concrete about what that costs, because the previous wording ("the
+// storage-level unique constraint still applies to the final key") read as a
+// promise that two entries with distinct final keys both persist. They do not.
+// The collapse assigns the losing entry the WINNER'S primary key and is not
+// undone by a later key rewrite, so the two entries reach storage as two
+// different jobs sharing one primary key — and a primary key holds one row. The
+// second is suppressed and its arguments and options are not persisted at all.
+// Both entries still return the surviving job's id, and that id names a live row.
+//
+// What is guaranteed is that the suppressed entry cannot corrupt the survivor:
+// its options (an explicit Retries(0), a delayed job's dq_ready) are never
+// applied to the row it did not create. See enqueueBatchWithDB.
 func (q *Queue) EnqueueBatch(ctx context.Context, entries []BatchEntry) ([]core.UUID, error) {
 	return q.enqueueBatch(ctx, entries, q.storage.EnqueueBatch)
 }

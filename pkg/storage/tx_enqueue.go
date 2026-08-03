@@ -289,8 +289,28 @@ func (s *GormStorage) enqueueBatchWithDB(db *gorm.DB, jobs []*core.Job) error {
 	if err != nil {
 		return err
 	}
-	dqReadyFalseIDs, dqReadyFalseRefs := dqReadyFalseJobs(toCreate)
-	zeroRetryIDs := explicitZeroRetryIDs(rows...)
+	// The two statements after the insert are blind `UPDATE ... WHERE id IN (...)`,
+	// re-applying an explicit Retries(0) and a delayed job's dq_ready=false over
+	// the column defaults. This insert is ON CONFLICT DO NOTHING, so an id in
+	// those lists may name a row this statement did NOT create — and the UPDATE
+	// would then rewrite a live stranger's configuration. Two narrowings make the
+	// lists safe. Both are LIST-ONLY: the rows inserted, the errors returned and
+	// the ids the caller reads back are all byte-identical to before.
+	//
+	// That property is the point. Two previous fixes tried to prevent the bad
+	// insert instead — one dropped the collapsed job in pkg/queue before storage
+	// could repoint its id (the caller got an id naming no row), the other dropped
+	// it here before the insert (the job was lost outright when its id-claiming
+	// sibling was itself suppressed by the active-unique index). Both predicted
+	// what a later step would do and were wrong. Narrowing an UPDATE predicate
+	// cannot lose a job or dangle an id, because it changes no control flow.
+	preexisting, err := s.batchIDsAlreadyPersisted(db, toCreate)
+	if err != nil {
+		return err
+	}
+	correctable := correctableBatchJobs(toCreate, preexisting)
+	dqReadyFalseIDs, dqReadyFalseRefs := dqReadyFalseJobs(correctable)
+	zeroRetryIDs := explicitZeroRetryIDs(s.encodedSubsetForCorrection(rows, correctable)...)
 	if err := db.Clauses(clause.OnConflict{DoNothing: true}).Create(rows).Error; err != nil {
 		return err
 	}
@@ -298,6 +318,82 @@ func (s *GormStorage) enqueueBatchWithDB(db *gorm.DB, jobs []*core.Job) error {
 		return err
 	}
 	return restoreDQReadyFalse(db, dqReadyFalseIDs, dqReadyFalseRefs)
+}
+
+// batchIDsAlreadyPersisted reads which of the batch's ids already name a row
+// BEFORE the insert runs. Such a row is not ours: either a stranger holding that
+// primary key, or our own row from an at-least-once replay of this same batch.
+// Either way the corrective UPDATEs must not touch it — the stranger because
+// rewriting it is the defect, the replayed row because it already carries the
+// values a previous successful call gave it.
+//
+// A concurrent unique-key dedup is deliberately NOT covered here and does not
+// need to be: that conflict is on the key, not the primary key, so our id was
+// never inserted and simply matches no row, leaving the UPDATE a no-op.
+func (s *GormStorage) batchIDsAlreadyPersisted(db *gorm.DB, jobs []*core.Job) (map[core.UUID]bool, error) {
+	ids := make([]core.UUID, 0, len(jobs))
+	for _, job := range jobs {
+		if job != nil {
+			ids = append(ids, job.ID)
+		}
+	}
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	seen := make(map[core.UUID]bool, len(ids))
+	for _, chunk := range chunkIDs(ids, retentionDeleteChunkSize) {
+		var found []core.UUID
+		if err := db.Model(&core.Job{}).Where("id IN ?", chunk).Pluck("id", &found).Error; err != nil {
+			return nil, err
+		}
+		for _, id := range found {
+			seen[id] = true
+		}
+	}
+	return seen, nil
+}
+
+// correctableBatchJobs returns the jobs whose post-insert corrections may safely
+// run: those whose id did not already exist, keeping only the FIRST job for any
+// id the batch repeats.
+//
+// The first-wins rule mirrors what the database does. A multi-row INSERT ... ON
+// CONFLICT DO NOTHING keeps the first occurrence of a duplicated primary key and
+// suppresses the rest, so the surviving row is the first job's. Taking a later
+// duplicate's intent would write ITS Retries(0) onto the first job's row — which
+// is the reported defect, reachable when queue-level Unique collapse gives two
+// entries one id and enqueue middleware then rewrites their keys apart.
+func correctableBatchJobs(jobs []*core.Job, preexisting map[core.UUID]bool) []*core.Job {
+	out := make([]*core.Job, 0, len(jobs))
+	claimed := make(map[core.UUID]bool, len(jobs))
+	for _, job := range jobs {
+		if job == nil || preexisting[job.ID] || claimed[job.ID] {
+			continue
+		}
+		claimed[job.ID] = true
+		out = append(out, job)
+	}
+	return out
+}
+
+// encodedSubsetForCorrection selects the encoded rows matching the given jobs,
+// preserving the encoded values explicitZeroRetryIDs inspects.
+func (s *GormStorage) encodedSubsetForCorrection(rows []*core.Job, jobs []*core.Job) []*core.Job {
+	if len(jobs) == len(rows) {
+		return rows
+	}
+	keep := make(map[core.UUID]bool, len(jobs))
+	for _, job := range jobs {
+		keep[job.ID] = true
+	}
+	out := make([]*core.Job, 0, len(jobs))
+	for _, row := range rows {
+		if row != nil && keep[row.ID] {
+			out = append(out, row)
+			delete(keep, row.ID)
+		}
+	}
+	return out
 }
 
 func dqReadyFalseJobs(jobs []*core.Job) ([]core.UUID, []*core.Job) {
