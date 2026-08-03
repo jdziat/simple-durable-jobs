@@ -76,12 +76,24 @@ if err := queue.Schedule("cleanup", nil, jobs.Every(5*time.Minute)); err != nil 
 }
 ```
 
-### `(*Queue) NewWorker(opts ...WorkerOption) *Worker`
+### `(*Queue) NewWorker(opts ...any) core.Starter`
 
-Creates a new worker for processing jobs.
+Creates a worker for this queue. Note the return type: it is `core.Starter`,
+whose only method is `Start`. **Use `jobs.NewWorker(q, ...)` instead** unless
+`Start` is genuinely all you need — the facade returns `*Worker`, which is the
+type that carries `Pause`, `Resume`, `WaitForPause`, `CancelJob`, `Health`,
+`IsPaused`, `RunningJobCount` and `HealthHandler`. The `...any` parameter also
+means a mistyped option is not caught by the compiler; the facade takes typed
+`WorkerOption` values.
 
 ```go
-worker := queue.NewWorker(
+// Preferred: returns *Worker, options are type-checked.
+worker := jobs.NewWorker(queue,
+    jobs.WorkerQueue("default", jobs.Concurrency(10)),
+)
+
+// Start-only; cannot be paused, resumed or health-checked.
+starter := queue.NewWorker(
     jobs.WorkerQueue("default", jobs.Concurrency(10)),
 )
 ```

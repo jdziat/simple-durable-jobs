@@ -107,7 +107,7 @@ func tenantFromJob(job *jobs.Job) string {
 	return job.Tenant
 }
 
-worker := queue.NewWorker(
+worker := jobs.NewWorker(queue, 
 	jobs.WorkerQueue("imports", jobs.Concurrency(20)),
 	jobs.ConcurrencyCap("tenant-imports", 2, jobs.CapKey(tenantFromJob)),
 )
@@ -116,7 +116,7 @@ worker := queue.NewWorker(
 Per-key rate limits limit admission rate for each tenant when the storage backend supports rate-limit windows:
 
 ```go
-worker := queue.NewWorker(
+worker := jobs.NewWorker(queue, 
 	jobs.WorkerQueue("imports", jobs.Concurrency(20)),
 	jobs.RateLimit("tenant-import-starts", 1, jobs.RateLimitKey(tenantFromJob)),
 )
@@ -165,7 +165,7 @@ for _, tenantID := range []string{"acme", "globex"} {
 	}
 }
 
-worker := queue.NewWorker(
+worker := jobs.NewWorker(queue, 
 	jobs.WorkerQueue("imports", jobs.Concurrency(20)),
 	jobs.ConcurrencyCap("tenant-imports", 2, jobs.CapKey(tenantFromJob)),
 	jobs.RateLimit("tenant-import-starts", 1, jobs.RateLimitKey(tenantFromJob)),

@@ -91,7 +91,7 @@ the event/hook/metric pipeline — not just `slog` — and are fully alertable:
 Both tuning knobs are set through worker options:
 
 ```go
-worker := queue.NewWorker(
+worker := jobs.NewWorker(queue, 
     jobs.WithStaleLockInterval(5 * time.Minute), // How often to check (default: 5min)
     jobs.WithStaleLockAge(45 * time.Minute),      // Max silence before reclaim (default: 45min)
 )
@@ -104,7 +104,7 @@ so it cannot be disabled. A non-positive `WithStaleLockInterval` keeps the
 default. Positive values below the 1s floor are clamped up to 1s.
 
 ```go
-worker := queue.NewWorker(
+worker := jobs.NewWorker(queue, 
     jobs.WithStaleLockInterval(0), // Keep the default interval
 )
 ```

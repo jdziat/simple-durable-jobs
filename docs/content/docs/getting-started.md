@@ -185,7 +185,7 @@ jobID, err = queue.Enqueue(ctx, "send-email", args,
 
 ```go
 // Create and start worker
-worker := queue.NewWorker()
+worker := jobs.NewWorker(queue)
 worker.Start(ctx) // Blocks until context is cancelled
 ```
 
@@ -206,7 +206,7 @@ cancel()
 Configure worker concurrency and queues:
 
 ```go
-worker := queue.NewWorker(
+worker := jobs.NewWorker(queue, 
     // Process "default" queue with 10 concurrent workers
     jobs.WorkerQueue("default", jobs.Concurrency(10)),
 
@@ -288,7 +288,7 @@ if err := queue.Schedule("hourly", nil, hourly); err != nil {
 }
 
 // Remember to enable scheduler in worker
-worker := queue.NewWorker(jobs.WithScheduler(true))
+worker := jobs.NewWorker(queue, jobs.WithScheduler(true))
 ```
 
 ## Observability

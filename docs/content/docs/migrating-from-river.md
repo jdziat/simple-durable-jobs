@@ -20,7 +20,7 @@ River and Simple Durable Jobs both fit Go applications that want workers close t
 | Unique jobs | `jobs.Unique(key)` |
 | `UniqueOpts.ByPeriod` | `jobs.UniqueFor(ttl)` |
 | Retries | `jobs.Retries(n)` plus worker backoff options |
-| Worker process | `queue.NewWorker(...).Start(ctx)` |
+| Worker process | `jobs.NewWorker(queue, ...).Start(ctx)` |
 
 ## Side-by-Side
 
@@ -92,7 +92,7 @@ if err != nil {
 	return err
 }
 
-worker := queue.NewWorker(jobs.WorkerQueue("default", jobs.Concurrency(10)))
+worker := jobs.NewWorker(queue, jobs.WorkerQueue("default", jobs.Concurrency(10)))
 return worker.Start(ctx)
 ```
 

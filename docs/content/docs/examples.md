@@ -33,7 +33,6 @@ package main
 import (
     "context"
     "fmt"
-    "time"
 
     jobs "github.com/jdziat/simple-durable-jobs/v4"
     "gorm.io/driver/sqlite"
@@ -60,7 +59,7 @@ func main() {
         jobs.Priority(100)) // High priority
 
     // Start worker
-    worker := queue.NewWorker()
+    worker := jobs.NewWorker(queue)
     worker.Start(ctx)
 }
 
@@ -164,7 +163,7 @@ func main() {
     queue.Enqueue(ctx, "process-order", Order{ID: "ORD-001", Total: 99.99},
         jobs.Retries(5))
 
-    worker := queue.NewWorker()
+    worker := jobs.NewWorker(queue)
     worker.Start(ctx)
 }
 
@@ -249,7 +248,7 @@ func main() {
         {ID: "3", URL: "https://example.com/image3.jpg"},
     })
 
-    worker := queue.NewWorker(
+    worker := jobs.NewWorker(queue, 
         jobs.WorkerQueue("default", jobs.Concurrency(5)),
         jobs.WorkerQueue("batch", jobs.Concurrency(10)),
     )
@@ -373,7 +372,7 @@ func main() {
     }
 
     // Start worker with scheduler enabled
-    worker := queue.NewWorker(jobs.WithScheduler(true))
+    worker := jobs.NewWorker(queue, jobs.WithScheduler(true))
     worker.Start(context.Background())
 }
 ```
@@ -419,7 +418,7 @@ func main() {
     queue.Enqueue(ctx, "task", "CRITICAL", jobs.Priority(1000))   // Runs first
 
     // Single worker to demonstrate ordering
-    worker := queue.NewWorker(jobs.WorkerQueue("default", jobs.Concurrency(1)))
+    worker := jobs.NewWorker(queue, jobs.WorkerQueue("default", jobs.Concurrency(1)))
     worker.Start(ctx)
 }
 ```
@@ -475,7 +474,7 @@ func main() {
     queue.Enqueue(ctx, "api-call", "/rate-limited", jobs.Retries(3))
     queue.Enqueue(ctx, "api-call", "/flaky", jobs.Retries(3))
 
-    worker := queue.NewWorker()
+    worker := jobs.NewWorker(queue)
     worker.Start(ctx)
 }
 ```
@@ -528,11 +527,11 @@ func main() {
         for event := range events {
             switch e := event.(type) {
             case *jobs.JobStarted:
-                // Send to metrics system
+                log.Printf("started %s", e.Job.ID) // send to metrics
             case *jobs.JobCompleted:
-                // Update dashboard
+                log.Printf("completed %s in %s", e.Job.ID, e.Duration) // update dashboard
             case *jobs.JobFailed:
-                // Alert on-call
+                log.Printf("failed %s: %v", e.Job.ID, e.Error) // alert on-call
             }
         }
     }()
@@ -579,7 +578,7 @@ func main() {
 
     // Each worker processes jobs independently
     // Jobs are locked to prevent duplicate processing
-    worker := queue.NewWorker(
+    worker := jobs.NewWorker(queue, 
         jobs.WorkerQueue("default", jobs.Concurrency(5)),
     )
 
@@ -818,7 +817,7 @@ func tenantFromJob(job *jobs.Job) string {
 	return args.Tenant
 }
 
-worker := queue.NewWorker(
+worker := jobs.NewWorker(queue, 
 	jobs.WorkerQueue("limited", jobs.Concurrency(6)),
 	jobs.WithQueueRateLimit("limited", 3, 1),
 	jobs.ConcurrencyCap("tenant-work", 2, jobs.CapKey(tenantFromJob)),

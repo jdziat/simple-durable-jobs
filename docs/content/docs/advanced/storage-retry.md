@@ -48,7 +48,7 @@ operations (Complete, Fail, SaveCheckpoint, heartbeat, fan-out counter
 increments):
 
 ```go
-worker := queue.NewWorker(
+worker := jobs.NewWorker(queue, 
     jobs.WithStorageRetry(jobs.RetryConfig{
         MaxAttempts:       10,
         InitialBackoff:    200 * time.Millisecond,
@@ -66,7 +66,7 @@ you typically want longer backoff intervals to avoid hammering it with tight-loo
 queries. Use `WithDequeueRetry` to configure dequeue retry independently:
 
 ```go
-worker := queue.NewWorker(
+worker := jobs.NewWorker(queue, 
     jobs.WithDequeueRetry(jobs.RetryConfig{
         MaxAttempts:    3,
         InitialBackoff: 500 * time.Millisecond,
@@ -92,7 +92,7 @@ If the default backoff timing is fine and you only want to change how many times
 operations are retried, use the shorthand:
 
 ```go
-worker := queue.NewWorker(jobs.WithRetryAttempts(10))
+worker := jobs.NewWorker(queue, jobs.WithRetryAttempts(10))
 ```
 
 This updates the storage retry config while keeping all other fields at their
@@ -105,7 +105,7 @@ example, a connection-pooling proxy like PgBouncer with retry), you can disable
 retry:
 
 ```go
-worker := queue.NewWorker(jobs.DisableRetry())
+worker := jobs.NewWorker(queue, jobs.DisableRetry())
 ```
 
 This sets `MaxAttempts` to 1 for both storage and dequeue operations, meaning

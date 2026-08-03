@@ -14,7 +14,7 @@ Asynq is a Redis-backed Go task queue. Simple Durable Jobs is a SQL-backed Go jo
 | Payload | Typed Go arguments marshaled to JSON |
 | `asynq.Client` | `jobs.New(storage)` queue |
 | `client.Enqueue` | `queue.Enqueue(ctx, name, args, opts...)` |
-| `asynq.Server` | `queue.NewWorker(...).Start(ctx)` |
+| `asynq.Server` | `jobs.NewWorker(queue, ...).Start(ctx)` |
 | `ServeMux.HandleFunc` | `queue.Register("name", handler)` |
 | Queue option | `jobs.QueueOpt("queue")` |
 | `Unique(...)` | `jobs.IdempotencyKey(key, ttl)` or `jobs.UniqueFor(ttl)` |
@@ -105,7 +105,7 @@ if err != nil {
 	return err
 }
 
-worker := queue.NewWorker(
+worker := jobs.NewWorker(queue, 
 	jobs.WorkerQueue("mailers", jobs.Concurrency(10)),
 )
 return worker.Start(ctx)
@@ -125,7 +125,7 @@ if err := queue.Schedule("email.digest", EmailPayload{UserID: "user-123"},
 	return err
 }
 
-worker := queue.NewWorker(
+worker := jobs.NewWorker(queue, 
 	jobs.WorkerQueue("mailers", jobs.Concurrency(10)),
 	jobs.WithScheduler(true),
 )

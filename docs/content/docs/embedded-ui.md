@@ -47,7 +47,7 @@ func main() {
     ctx, cancel := context.WithCancel(context.Background())
     defer cancel()
 
-    worker := queue.NewWorker()
+    worker := jobs.NewWorker(queue)
     go worker.Start(ctx)
 
     // Mount the UI dashboard

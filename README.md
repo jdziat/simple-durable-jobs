@@ -77,7 +77,7 @@ backend support tiers, and crash-recovery tuning.
 - **Rate Limiting** - Per-queue token buckets and an optional fleet-wide limiter (throttle waits don't burn retry attempts)
 - **Retries with Backoff** - Configurable retry logic with exponential backoff and jitter
 - **Dead-Letter Queue** - Explicit dead-letter metadata with list/count/requeue triage
-- **Retention / GC** - Automatic pruning of terminal jobs by per-status age window and consumed signals by opt-in age window; opt-in transactional checkpoint GC (`RetentionDeleteCheckpointsOnComplete`) bounds checkpoint growth, and a worker started with no retention configured logs a one-time WARN
+- **Retention / GC** - **On by default.** A worker built with no retention options prunes completed jobs after 30 days, failed/cancelled after 90, and consumed signals after 7 — none of that is opt-in, so plan external archival inside those windows. A one-time WARN is logged only when retention is explicitly DISABLED. Opt-in transactional checkpoint GC (`RetentionDeleteCheckpointsOnComplete`) additionally bounds checkpoint growth
 - **Execution Middleware** - Interceptors that wrap handler execution
 - **Payload Codec** - Pluggable encryption-at-rest for job arguments, results, checkpoints, and error text (`last_error` and the dead-letter reason suffix) (opt-in; encrypts the listed fields at the application/storage boundary — it is not whole-database encryption and is not a compliance attestation.)
 - **Workflow Versioning** - GetVersion markers to evolve in-flight workflows safely across deploys
@@ -145,7 +145,7 @@ func main() {
     }
 
     // Start worker
-    worker := queue.NewWorker()
+    worker := jobs.NewWorker(queue)
     if err := worker.Start(context.Background()); err != nil {
         log.Fatal(err)
     }
@@ -351,7 +351,7 @@ if err := queue.Schedule("hourly-check", nil, hourly); err != nil {
 }
 
 // Start worker with scheduler enabled
-worker := queue.NewWorker(jobs.WithScheduler(true))
+worker := jobs.NewWorker(queue, jobs.WithScheduler(true))
 ```
 
 ## Job Options
@@ -442,7 +442,7 @@ Span attributes include `job.id`, `job.type`, `job.queue`, `job.attempt`, and `j
 ## Worker Configuration
 
 ```go
-worker := queue.NewWorker(
+worker := jobs.NewWorker(queue, 
     jobs.WorkerQueue("default", jobs.Concurrency(10)),
     jobs.WorkerQueue("critical", jobs.Concurrency(5)),
     jobs.WithScheduler(true),

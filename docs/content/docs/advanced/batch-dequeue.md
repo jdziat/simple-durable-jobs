@@ -11,7 +11,7 @@ import (
 )
 
 q := jobs.New(store)
-w := q.NewWorker(
+w := jobs.NewWorker(q, 
 	jobs.WorkerQueue("default", jobs.Concurrency(50)),
 	jobs.WithDequeueBatchSize(50),
 )
@@ -63,7 +63,7 @@ Set the batch size near the worker concurrency when poll round trips are the bot
 
 ```go
 q := jobs.New(store)
-w := q.NewWorker(
+w := jobs.NewWorker(q, 
 	jobs.WorkerQueue("default", jobs.Concurrency(100)),
 	jobs.WithDequeueBatchSize(100),
 )

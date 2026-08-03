@@ -58,7 +58,7 @@ storage, while `/readyz` calls storage `Ping(ctx)` when the backend implements
 `storage.Healther` and returns `503 Service Unavailable` on ping failure.
 Operator pause does not make `/readyz` fail. See [Production Operations]({{< relref "/docs/production-ops" >}}).
 
-### `(*Worker) CancelJob(jobID string) bool`
+### `(*Worker) CancelJob(jobID core.UUID) bool`
 
 Cancels a specific running job's context. Returns true if the job was found and cancelled, false if the job was not running on this worker.
 
@@ -158,7 +158,7 @@ Overrides the per-dequeue lock duration (default: 45 minutes). Useful when your 
 ```go
 import "github.com/jdziat/simple-durable-jobs/v4/pkg/worker"
 
-w := queue.NewWorker(worker.WithLockDuration(2 * time.Hour))
+w := jobs.NewWorker(queue, worker.WithLockDuration(2 * time.Hour))
 ```
 
 ---
@@ -193,7 +193,7 @@ queues, err := queue.GetPausedQueues(ctx)
 For direct storage operations without a queue instance:
 
 ```go
-jobs.PauseJob(ctx, storage, jobID)
+jobs.PauseJob(ctx, queue, jobID) // takes the *Queue, not the Storage
 jobs.ResumeJob(ctx, storage, jobID)
 jobs.IsJobPaused(ctx, storage, jobID)
 jobs.GetPausedJobs(ctx, storage, "emails")

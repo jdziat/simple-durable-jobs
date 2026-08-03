@@ -57,7 +57,7 @@ The fastest way to get started is to pick a preset that matches your deployment
 profile:
 
 ```go
-storage, err := jobs.NewGormStorageWithPool(db, jobs.HighConcurrencyPoolConfig())
+storage, err := jobs.NewGormStorageWithPool(db, jobs.WithPoolConfig(jobs.HighConcurrencyPoolConfig()))
 if err != nil {
     log.Fatal(err)
 }
