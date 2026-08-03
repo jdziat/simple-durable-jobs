@@ -30,6 +30,11 @@ const (
 	defaultRetentionInterval  = time.Hour
 	minRetentionInterval      = 100 * time.Millisecond
 	defaultRetentionBatchSize = 1000
+	// maxRetentionBatchSize caps how many rows one retention pass may claim.
+	// Retention loops until a pass comes back short, so a bigger batch only trades
+	// round trips for longer write-lock hold times; the cap bounds that, and keeps
+	// a mis-set batch size from turning into an oversized transaction.
+	maxRetentionBatchSize = 10000
 )
 
 const (
@@ -485,10 +490,12 @@ func UniqueLockSweepInterval(d time.Duration) UniqueLockSweepOption {
 }
 
 // UniqueLockSweepBatchSize sets the maximum expired unique-lock rows deleted in
-// one pass. Non-positive values use the default.
+// one pass. Non-positive values use the default (1000); values above
+// maxRetentionBatchSize (10000) are clamped to it, for the same reason
+// RetentionBatchSize is — see there.
 func UniqueLockSweepBatchSize(n int) UniqueLockSweepOption {
 	return func(c *UniqueLockSweepConfig) {
-		c.BatchSize = n
+		c.BatchSize = clampRetentionBatchSize(n)
 	}
 }
 
@@ -547,11 +554,26 @@ func RetentionInterval(d time.Duration) RetentionOption {
 }
 
 // RetentionBatchSize sets the maximum rows deleted in one pass. Non-positive
-// values use the default.
+// values use the default (1000); values above maxRetentionBatchSize (10000) are
+// clamped to it. The sweep already loops until a pass comes back short, so a
+// larger batch buys fewer round trips, not more throughput, while holding write
+// locks proportionally longer — the clamp bounds that hold time. It also keeps
+// the option honest: values in the tens of thousands used to be accepted and then
+// make every pass fail, so retention silently deleted nothing at all.
 func RetentionBatchSize(n int) RetentionOption {
 	return func(c *RetentionConfig) {
-		c.BatchSize = n
+		c.BatchSize = clampRetentionBatchSize(n)
 	}
+}
+
+// clampRetentionBatchSize maps a requested retention batch size onto the
+// supported range. Non-positive means "unset" and is passed through so the
+// caller applies defaultRetentionBatchSize; anything above the ceiling is capped.
+func clampRetentionBatchSize(n int) int {
+	if n > maxRetentionBatchSize {
+		return maxRetentionBatchSize
+	}
+	return n
 }
 
 // RetentionDeleteCheckpointsOnComplete opts in to deleting a successful job's

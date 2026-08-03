@@ -116,6 +116,14 @@ releases only when the holder becomes terminal. `IdempotencyKey` and `UniqueFor`
 are time-window guards: they keep deduplicating until the TTL expires, even if
 the original job completed quickly.
 
+That holds even when retention is more aggressive than the window. Retention
+never deletes a job row that a still-live `unique_locks` row references, so a 90
+day `IdempotencyKey` keeps deduplicating for the full 90 days under a 30 day (or
+`jobs.DefaultRetention()`'s 7 day) completed-job window. The trade is that such a
+job row is retained until its window lapses, after which the ordinary sweep
+collects the job and its lock together — so pick a TTL you actually want to keep
+rows for. See [Retention & GC](/docs/advanced/retention-gc/).
+
 If you set `Unique` together with `IdempotencyKey` or `UniqueFor` on one
 enqueue, the windowed unique-lock path takes precedence. The duplicate returns
 the original job ID rather than `ErrDuplicateJob`.

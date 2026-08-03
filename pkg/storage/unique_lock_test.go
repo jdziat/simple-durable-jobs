@@ -175,7 +175,15 @@ func TestEnqueueWithUniqueLockStillDedupesLiveJob(t *testing.T) {
 	}
 }
 
-func TestEnqueueWithUniqueLockStealsWindowFromMissingJob(t *testing.T) {
+// TestEnqueueWithUniqueLockKeepsDedupingWhenJobMissing pins the reversal of an
+// unsafe inference. A missing job row used to mean "steal the window", on the
+// reasoning that the deduped work could not have run — but the commonest way for
+// a row to vanish is that it COMPLETED and was garbage-collected, so the
+// inference inverted the very guarantee IdempotencyKey/UniqueFor sell and let the
+// guarded work run a second time. A dangling live window now fails CLOSED. It is
+// released by whoever deletes the job (DeleteJob / PurgeJobs / Requeue's subtree
+// replay all delete the lock with the row), or by its own expires_at lapsing.
+func TestEnqueueWithUniqueLockKeepsDedupingWhenJobMissing(t *testing.T) {
 	s := newTestStorage(t)
 	ctx := context.Background()
 	scope := "3333333333333333333333333333333333333333333333333333333333333333"
@@ -185,23 +193,33 @@ func TestEnqueueWithUniqueLockStealsWindowFromMissingJob(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, first.ID, firstID)
 
-	// Delete the job row directly (as retention would), leaving the live lock
-	// dangling at a job that no longer exists.
+	// Delete the job row directly, leaving the still-live lock pointing at a job
+	// that no longer exists.
 	require.NoError(t, s.db.WithContext(ctx).Delete(&core.Job{}, "id = ?", first.ID).Error)
 
 	second := &core.Job{ID: core.NewID(), Type: "work", Queue: "default", Args: []byte(`{"n":2}`)}
 	secondID, err := s.EnqueueWithUniqueLock(ctx, second, scope, time.Hour)
 	require.NoError(t, err)
-	assert.Equal(t, second.ID, secondID, "a missing reference must steal the window")
+	assert.Equal(t, first.ID, secondID, "a live window must keep deduping even with no job row")
 
 	var newJobCount int64
 	require.NoError(t, s.db.WithContext(ctx).Model(&core.Job{}).
 		Where("id = ?", second.ID).Count(&newJobCount).Error)
-	assert.EqualValues(t, 1, newJobCount, "the new job must exist after a steal-on-missing")
+	assert.EqualValues(t, 0, newJobCount, "no duplicate may be admitted inside a live window")
 
 	var lock core.UniqueLock
 	require.NoError(t, s.db.WithContext(ctx).First(&lock, "scope_hash = ?", scope).Error)
-	assert.Equal(t, second.ID, lock.JobID)
+	assert.Equal(t, first.ID, lock.JobID, "the window must not be rewritten")
+
+	// Once the window lapses, the ordinary acquire path admits fresh work — the
+	// scope is not wedged.
+	require.NoError(t, s.db.WithContext(ctx).Model(&core.UniqueLock{}).
+		Where("scope_hash = ?", scope).
+		Update("expires_at", time.Now().Add(-time.Minute).UTC()).Error)
+	third := &core.Job{ID: core.NewID(), Type: "work", Queue: "default", Args: []byte(`{"n":3}`)}
+	thirdID, err := s.EnqueueWithUniqueLock(ctx, third, scope, time.Hour)
+	require.NoError(t, err)
+	assert.Equal(t, third.ID, thirdID, "an expired window admits fresh work")
 }
 
 func TestDeleteExpiredUniqueLocks(t *testing.T) {

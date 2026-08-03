@@ -1088,7 +1088,9 @@ func (w *Worker) runRetention(ctx context.Context) {
 	if interval < minRetentionInterval {
 		interval = minRetentionInterval
 	}
-	batchSize := cfg.BatchSize
+	// Re-clamp here as well as in RetentionBatchSize: WorkerConfig.Retention is an
+	// exported struct an embedder can populate directly, bypassing the option.
+	batchSize := clampRetentionBatchSize(cfg.BatchSize)
 	if batchSize <= 0 {
 		batchSize = defaultRetentionBatchSize
 	}
@@ -1166,7 +1168,9 @@ func (w *Worker) runUniqueLockSweep(ctx context.Context) {
 	if interval < minUniqueLockSweepInterval {
 		interval = minUniqueLockSweepInterval
 	}
-	batchSize := cfg.BatchSize
+	// Re-clamp for the same reason runRetention does: UniqueLockSweep is an
+	// exported config struct an embedder can populate directly.
+	batchSize := clampRetentionBatchSize(cfg.BatchSize)
 	if batchSize <= 0 {
 		batchSize = defaultUniqueLockSweepBatch
 	}

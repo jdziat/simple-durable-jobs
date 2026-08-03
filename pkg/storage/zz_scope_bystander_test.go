@@ -193,7 +193,9 @@ func TestCascadeDeletes_DoNotTouchABystander(t *testing.T) {
 			ID: purged, Type: "wf", Queue: "default",
 			Status: core.StatusCompleted, CompletedAt: &old,
 		}).Error)
-		seedDependentRows(t, ctx, s, purged, "scope-purged")
+		// Expired window: retention pins a job whose dedup window is still live,
+		// so this subject must have a lapsed one to be collectable at all.
+		seedDependentRowsWithWindow(t, ctx, s, purged, "scope-purged", time.Now().Add(-time.Hour))
 
 		// Spared: terminal but INSIDE the retention window, so it survives — and
 		// so must everything hanging off it.
@@ -259,6 +261,15 @@ func TestCascadeDeletes_DoNotTouchABystander(t *testing.T) {
 // delete, so a scope regression shows up whichever table it reaches.
 func seedDependentRows(t *testing.T, ctx context.Context, s *GormStorage, jobID core.UUID, scopeHash string) {
 	t.Helper()
+	seedDependentRowsWithWindow(t, ctx, s, jobID, scopeHash, time.Now().Add(time.Hour))
+}
+
+// seedDependentRowsWithWindow is seedDependentRows with an explicit unique-window
+// expiry. Retention now PINS a job whose window is still live, so a test that
+// wants its subject collected must give it an already-expired window; leaving the
+// default live one silently changes what the test is measuring.
+func seedDependentRowsWithWindow(t *testing.T, ctx context.Context, s *GormStorage, jobID core.UUID, scopeHash string, expires time.Time) {
+	t.Helper()
 	require.NoError(t, s.SaveCheckpoint(ctx, &core.Checkpoint{
 		JobID: jobID, CallIndex: 0, CallType: "x", Result: []byte(`"r"`),
 	}))
@@ -266,7 +277,7 @@ func seedDependentRows(t *testing.T, ctx context.Context, s *GormStorage, jobID 
 		ID: core.NewID(), JobID: jobID, Name: "sig", Payload: []byte(`"p"`), CreatedAt: time.Now(),
 	}).Error)
 	require.NoError(t, s.db.Create(&core.UniqueLock{
-		ScopeHash: scopeHash, JobID: jobID, ExpiresAt: time.Now().Add(time.Hour),
+		ScopeHash: scopeHash, JobID: jobID, ExpiresAt: expires,
 	}).Error)
 }
 

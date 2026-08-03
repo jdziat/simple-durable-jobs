@@ -164,6 +164,28 @@ Larger batches clear backlog faster but hold database write locks longer. Shorte
 intervals reduce how long old rows remain visible after crossing the retention
 window, at the cost of more frequent scans.
 
+`RetentionBatchSize` accepts 1..10000 and clamps anything larger to 10000. The
+loop already drains a backlog within one tick, so a bigger batch buys fewer round
+trips rather than more throughput, and the ceiling bounds how long one pass holds
+write locks.
+
+## Live idempotency windows pin their job rows
+
+Retention never deletes a terminal job that a still-live `unique_locks` row
+references. `jobs.IdempotencyKey` and `jobs.UniqueFor` promise to keep
+deduplicating until their own TTL expires, and an operator who writes
+`jobs.IdempotencyKey("invoice-42", 90*24*time.Hour)` means it — if the sweep
+removed the job at the 30 day (or `jobs.DefaultRetention()`'s 7 day) horizon, the
+replayed request on day 31 would enqueue a second job and do the guarded work
+twice.
+
+So a job row guarded by a window is retained for `max(retention window, window
+TTL)`. Once the window lapses, the next pass collects the job row and the lock
+row together, so growth stays bounded by the TTL you chose — but a long TTL is a
+deliberate decision to keep those rows that long. To remove such a job sooner,
+delete it explicitly: `DeleteJob`, `DeleteWorkflowSubtree` and the dashboard's
+purge all release the job's window along with the row.
+
 ## Windowed unique-lock GC
 
 `jobs.IdempotencyKey` and `jobs.UniqueFor` use a separate `unique_locks` table
@@ -189,6 +211,9 @@ w := jobs.NewWorker(q,
 	),
 )
 ```
+
+`UniqueLockSweepBatchSize` accepts 1..10000 and clamps larger values, like
+`RetentionBatchSize`.
 
 You can disable the sweep if another process owns unique-lock cleanup:
 

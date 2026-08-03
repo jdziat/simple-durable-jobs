@@ -2583,6 +2583,14 @@ func (s *GormStorage) deleteFanOutSubtree(tx *gorm.DB, rootJobID core.UUID) erro
 		if err := tx.Where("job_id IN ?", allSubJobIDs).Delete(&core.Signal{}).Error; err != nil {
 			return err
 		}
+		// Release the discarded sub-jobs' windowed dedup locks
+		// (IdempotencyKey/UniqueFor). unique_locks.job_id has no FK cascade, and a
+		// missing job row is deliberately NOT a steal trigger (see
+		// stealTerminalUniqueLock), so leaving them behind would block re-enqueue of
+		// those scopes for the rest of their TTL against work that no longer exists.
+		if err := tx.Where("job_id IN ?", allSubJobIDs).Delete(&core.UniqueLock{}).Error; err != nil {
+			return err
+		}
 		if err := tx.Where("id IN ?", allSubJobIDs).Delete(&core.Job{}).Error; err != nil {
 			return err
 		}

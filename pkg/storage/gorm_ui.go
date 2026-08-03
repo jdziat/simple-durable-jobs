@@ -1017,6 +1017,16 @@ func (s *GormStorage) DeleteJob(ctx context.Context, jobID core.UUID) error {
 		if err := tx.Where("job_id = ?", jobID).Delete(&core.Signal{}).Error; err != nil {
 			return err
 		}
+		// Release any windowed dedup lock (IdempotencyKey/UniqueFor) the job holds,
+		// as PurgeJobs does. unique_locks.job_id has no FK cascade, so skipping this
+		// would strand a live window pointing at a row that no longer exists — and
+		// since a missing job row is deliberately NOT a steal trigger (see
+		// stealTerminalUniqueLock), that window would keep blocking re-enqueue for
+		// the remainder of its TTL. Deleting a job is an explicit operator act, so
+		// releasing its window with it is the intended meaning.
+		if err := tx.Where("job_id = ?", jobID).Delete(&core.UniqueLock{}).Error; err != nil {
+			return err
+		}
 		return tx.Where("id = ?", jobID).Delete(&core.Job{}).Error
 	})
 }
@@ -1040,6 +1050,11 @@ func (s *GormStorage) DeleteWorkflowSubtree(ctx context.Context, rootJobID core.
 			return err
 		}
 		if err := tx.Where("job_id = ?", rootJobID).Delete(&core.Signal{}).Error; err != nil {
+			return err
+		}
+		// Release the root's own windowed dedup lock; deleteFanOutSubtree released
+		// the descendants'. See DeleteJob for why this must be explicit.
+		if err := tx.Where("job_id = ?", rootJobID).Delete(&core.UniqueLock{}).Error; err != nil {
 			return err
 		}
 		return tx.Where("id = ?", rootJobID).Delete(&core.Job{}).Error

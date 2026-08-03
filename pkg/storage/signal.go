@@ -382,12 +382,23 @@ func (s *GormStorage) DeleteConsumedSignalsOlderThan(ctx context.Context, age ti
 			if len(ids) == 0 {
 				return nil
 			}
-			result := tx.Where("id IN ?", ids).
-				Where("consumed_at IS NOT NULL").
-				Where("consumed_at < ?", cutoff).
-				Delete(&core.Signal{})
-			deleted = result.RowsAffected
-			return result.Error
+			// Bound the literal IN-list, as DeleteTerminalJobsOlderThan and
+			// DeleteExpiredUniqueLocks do. This is the third sweep driven by
+			// RetentionBatchSize; the option is clamped, but this method is
+			// EXPORTED, so a direct caller passing a large limit would otherwise
+			// hit the driver's bind-parameter ceiling (SQLite ~32k, Postgres
+			// 65535) and get deleted=0 on every pass, forever.
+			for _, chunk := range chunkIDs(ids, retentionDeleteChunkSize) {
+				result := tx.Where("id IN ?", chunk).
+					Where("consumed_at IS NOT NULL").
+					Where("consumed_at < ?", cutoff).
+					Delete(&core.Signal{})
+				if result.Error != nil {
+					return result.Error
+				}
+				deleted += result.RowsAffected
+			}
+			return nil
 		})
 	})
 	return deleted, err

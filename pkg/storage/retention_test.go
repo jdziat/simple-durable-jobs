@@ -431,12 +431,21 @@ func TestCleanAbandonedFanOuts_Guards(t *testing.T) {
 	assertRetentionFanOutExists(t, s, "guard-completed-fanout")
 }
 
+// TestDeleteTerminalJobsOlderThan_DeletesDanglingUniqueLock pins that a job's
+// unique_locks row is collected WITH the job, so the table cannot grow unbounded.
+//
+// The fixture deliberately expires the window first. A LIVE window now pins its
+// job row instead (IdempotencyKey/UniqueFor are documented to keep deduplicating
+// until their own TTL, which is routinely far longer than the retention horizon),
+// and that case is pinned by TestRetention_KeepsJobWhileIdempotencyWindowLive.
+// This test previously left the window live and asserted retention deleted it,
+// which is the behaviour that let a replayed request charge a card twice.
 func TestDeleteTerminalJobsOlderThan_DeletesDanglingUniqueLock(t *testing.T) {
 	s := newTestStorage(t)
 	ctx := context.Background()
 	scope := "4444444444444444444444444444444444444444444444444444444444444444"
 
-	// Enqueue a job under a live unique lock, then drive it terminal and age it
+	// Enqueue a job under a unique lock, then drive it terminal and age it
 	// past the retention cutoff so it gets collected.
 	job := &core.Job{ID: core.NewID(), Type: "work", Queue: "default", Args: []byte(`{"n":1}`)}
 	jobID, err := s.EnqueueWithUniqueLock(ctx, job, scope, time.Hour)
@@ -447,6 +456,10 @@ func TestDeleteTerminalJobsOlderThan_DeletesDanglingUniqueLock(t *testing.T) {
 	require.NoError(t, s.db.WithContext(ctx).Model(&core.Job{}).
 		Where("id = ?", job.ID).
 		Updates(map[string]any{"status": core.StatusCompleted, "completed_at": old}).Error)
+	// The dedup window has lapsed, so it no longer pins the job row.
+	require.NoError(t, s.db.WithContext(ctx).Model(&core.UniqueLock{}).
+		Where("job_id = ?", job.ID).
+		Update("expires_at", time.Now().Add(-time.Minute).UTC()).Error)
 
 	var lockBefore int64
 	require.NoError(t, s.db.WithContext(ctx).Model(&core.UniqueLock{}).

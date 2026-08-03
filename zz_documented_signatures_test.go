@@ -30,27 +30,31 @@ func TestDocumentedWorkerSurfaceStillCompiles(t *testing.T) {
 		t.Skip("compile-time assertion only")
 	}
 	var q *Queue
-	var w *Worker
 
 	// README.md, getting-started.md, examples.md — the corrected constructor shapes.
-	w = NewWorker(q)
-	w = NewWorker(q, WorkerQueue("default", Concurrency(10)))
-	w = NewWorker(q, WithScheduler(true))
+	w := NewWorker(q)
+	_ = NewWorker(q, WorkerQueue("default", Concurrency(10)))
+	_ = NewWorker(q, WithScheduler(true))
 	// api-reference/worker.md:161 — a pkg/worker option passed through the facade.
-	w = NewWorker(q, worker.WithLockDuration(2*time.Hour))
+	_ = NewWorker(q, worker.WithLockDuration(2*time.Hour))
 
 	// The *Worker-only surface the pages call after constructing.
-	var _ func(PauseMode) = w.Pause
-	var _ func() = w.Resume
-	var _ func(core.UUID) bool = w.CancelJob
-	var _ func() http.Handler = w.HealthHandler
-	var _ func(context.Context) error = w.Start
+	assertSignature[func(PauseMode)](w.Pause)
+	assertSignature[func()](w.Resume)
+	assertSignature[func(core.UUID) bool](w.CancelJob)
+	assertSignature[func() http.Handler](w.HealthHandler)
+	assertSignature[func(context.Context) error](w.Start)
 
 	// api-reference/worker.md:196 — PauseJob takes the *Queue; the others take Storage.
-	var _ func(context.Context, *Queue, UUID, ...PauseOption) error = PauseJob
-	var _ func(context.Context, Storage, UUID) error = ResumeJob
-	var _ func(context.Context, Storage, UUID) (bool, error) = IsJobPaused
-	var _ func(context.Context, Storage, string) ([]*Job, error) = GetPausedJobs
-	var _ func(context.Context, Storage, string) error = PauseQueue
-	_ = w
+	assertSignature[func(context.Context, *Queue, UUID, ...PauseOption) error](PauseJob)
+	assertSignature[func(context.Context, Storage, UUID) error](ResumeJob)
+	assertSignature[func(context.Context, Storage, UUID) (bool, error)](IsJobPaused)
+	assertSignature[func(context.Context, Storage, string) ([]*Job, error)](GetPausedJobs)
+	assertSignature[func(context.Context, Storage, string) error](PauseQueue)
 }
+
+// assertSignature fails to COMPILE unless fn has exactly type T. Written as a
+// generic rather than `var _ T = fn` because that form is what staticcheck's
+// QF1011 asks you to simplify away — and simplifying it would delete the very
+// assertion this file exists to make.
+func assertSignature[T any](fn T) { _ = fn }

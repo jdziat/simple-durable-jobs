@@ -554,6 +554,52 @@ No migration. The partial unique index is unchanged and remains the
 gap); the application predicate is simply stricter than it now, which is the safe
 direction and is what removes the collision.
 
+### A live `IdempotencyKey`/`UniqueFor` window is no longer ended early by retention
+
+**Before:** retention deleted a terminal job row on its own schedule and took the
+job's `unique_locks` row with it, regardless of how much of the dedup window was
+left. An operator who wrote `jobs.IdempotencyKey("invoice-42", 90*24*time.Hour)`
+to mean "never charge this invoice twice within 90 days" lost the guard on day 30
+under the stock completed-job window — day **7** under the documented
+`jobs.DefaultRetention()` preset. The replayed request was not deduped: `Enqueue`
+returned a new job id, a second job row was inserted, and the handler ran again.
+
+Retaining the lock row alone would not have fixed it. `EnqueueWithUniqueLock`
+treated a lock whose referenced job row was missing as **stealable** — on the
+reasoning that a vanished row meant the deduped work never ran — so a surviving
+window was stolen anyway. The commonest way for a job row to vanish is that it
+succeeded and was collected, which made that inference the exact inverse of the
+guarantee it was protecting.
+
+**After:** two changes, both of which are needed.
+
+1. Retention never deletes a terminal job that a still-live `unique_locks` row
+   references. Once the window lapses, the next pass collects the job row and the
+   lock row together.
+2. A missing job row is no longer a steal trigger. Only a `failed` or `cancelled`
+   reference steals — that work really will never complete. Releasing a window is
+   now an explicit act of whoever removes the job: `DeleteJob`,
+   `DeleteWorkflowSubtree`, `PurgeJobs` and `Requeue`'s subtree replay all delete
+   the lock with the row, and an active-unique collision that prevents the job
+   from being inserted at all releases the window it just took. A dangling live
+   window therefore fails **closed**.
+
+**What you may notice:** a terminal job guarded by a long window is retained for
+`max(retention window, window TTL)` instead of the retention window alone, so
+`jobs` can hold more rows than before if you use long TTLs. Growth is still
+bounded — by the TTL you chose. If you were relying on retention to end windows
+early, shorten the TTL; that is the knob that was always meant to control it.
+Deleting the job explicitly still releases its window immediately.
+
+Two related bounds went in with it: `RetentionBatchSize` and
+`UniqueLockSweepBatchSize` now clamp to 10000 (they accepted any value before),
+and both sweeps chunk their delete statements internally. A batch size above the
+driver's bind-parameter ceiling (SQLite ~32k, Postgres 65535) previously made
+**every** pass fail with `too many SQL variables` and delete nothing, so the sweep
+died silently — worst exactly during the backlog the batch size was raised for.
+
+No migration; no schema change.
+
 ### `Retries(0)` now actually means "run once"
 
 **Before:** a job enqueued with `jobs.Retries(0)` was persisted with
