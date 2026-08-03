@@ -144,8 +144,9 @@ Retry counts map to `jobs.Retries(n)`. Delays map to `jobs.Delay(d)` or `jobs.At
 Asynq's `Unique(ttl)` is a time-window deduplication option. Map a
 caller-supplied key to `jobs.IdempotencyKey(key, ttl)`, or use
 `jobs.UniqueFor(ttl)` when the job's queue, name, and arguments identify the
-work. `jobs.Unique(key)` is narrower: it only prevents another pending or
-running job with the same key.
+work. `jobs.Unique(key)` is narrower: it only prevents another job with the
+same key while the holder is non-terminal (pending, running, retrying, waiting
+or paused).
 
 As of 2026-06-13, there is no first-party workflow checkpointing equivalent in Asynq. If your Asynq task currently chains follow-up tasks manually, consider a Simple Durable Jobs workflow handler with `jobs.Call[T]` checkpoints or `jobs.FanOut[T]`.
 

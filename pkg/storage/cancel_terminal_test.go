@@ -335,3 +335,24 @@ func TestCancelJobTerminal_ReconcilesOwningFanOutCounts(t *testing.T) {
 		reconciled.CompletedCount+reconciled.FailedCount+reconciled.CancelledCount,
 		"owning fan-out persisted counts must reconcile to sum==total after cross-API child cancel")
 }
+
+// TestCancellableChildStatusesMatchesDocs pins the set that
+// docs/content/docs/advanced/cancel-job.md enumerates in prose. That page spent
+// a release naming the pre-branch set after StatusPaused was added here, because
+// nothing failed when the set changed. If you edit cancellableChildStatuses,
+// update that page in the same commit.
+//
+// Note the set deliberately omits StatusRetrying, which the dedup set includes.
+// That is not a gap today: no production path ever writes `retrying` (it exists
+// for UI filtering and legacy rows), so no job rests there to be missed. If a
+// path ever starts writing it, this test fails and forces the decision.
+func TestCancellableChildStatusesMatchesDocs(t *testing.T) {
+	require.Equal(t, []core.JobStatus{
+		core.StatusPending, core.StatusWaiting, core.StatusRunning, core.StatusPaused,
+	}, cancellableChildStatuses)
+
+	for _, status := range cancellableChildStatuses {
+		require.Falsef(t, status.IsTerminal(),
+			"terminal status %q is in the cancellable set", status)
+	}
+}

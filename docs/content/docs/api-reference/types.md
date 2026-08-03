@@ -122,7 +122,7 @@ var (
     ErrQueueNameTooLong   error
     ErrJobArgsTooLarge    error // Marshalled args exceed MaxJobArgsSize
     ErrJobNotOwned        error // Complete/Fail called by a worker that does not hold the lock
-    ErrDuplicateJob       error // Unique()-keyed job already pending/running
+    ErrDuplicateJob       error // Unique()-keyed job already held by a non-terminal job
     ErrUniqueKeyTooLong   error
     ErrJobAlreadyPaused   error
     ErrJobNotPaused       error

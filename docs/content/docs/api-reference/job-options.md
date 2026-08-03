@@ -110,8 +110,9 @@ jobID, err := queue.Enqueue(ctx, "sync-account", args,
 ```
 
 `Unique` and the windowed options solve different problems. `Unique` is an
-active-job guard: it blocks another pending or running job with the same key,
-then releases when that job becomes terminal. `IdempotencyKey` and `UniqueFor`
+active-job guard: it blocks another job with the same key while the holder is in
+ANY non-terminal status — pending, running, retrying, waiting or paused — and
+releases only when the holder becomes terminal. `IdempotencyKey` and `UniqueFor`
 are time-window guards: they keep deduplicating until the TTL expires, even if
 the original job completed quickly.
 
