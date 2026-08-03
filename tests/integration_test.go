@@ -427,50 +427,57 @@ func TestIntegration_SchedulerRecurringJobs(t *testing.T) {
 	count := executionCount.Load()
 	assert.GreaterOrEqual(t, count, int32(3), "Should have multiple executions")
 
-	// Verify the schedule's RATE, not the existence of one wide gap.
+	// Verify the schedule's RATE CEILING: it must not fire FASTER than configured.
 	//
-	// Two earlier versions of this assertion were both weaker than they looked.
-	// Snapshotting max-gap the instant the count poll saw its third execution
-	// measured a still-running schedule, and failed once on Postgres under -race
-	// when the three handler timestamps happened to land close together — a
-	// schedule that was working. Polling for "some gap >= 180ms" instead was
-	// WORSE: a longer window gives more chances for a spurious gap, so a schedule
-	// firing every 5ms passed it (verified by mutation).
+	// Three earlier versions of this assertion were each weaker or flakier than
+	// they looked, and the reasons are worth keeping.
 	//
-	// Elapsed-time-over-N-fires has neither problem. It cannot be satisfied by
-	// jitter, because it constrains the TOTAL, and it does not care which
-	// individual gap is wide. The first fire is excluded: startup can deliver it
-	// immediately, which is expected and says nothing about the interval.
-	// ELEVEN fires, not five, and the threshold carries explicit jitter slack.
+	//  1. Snapshotting max-gap the instant the count poll saw its third execution
+	//     measured a still-running schedule and failed on a healthy one.
+	//  2. Polling for "some gap >= 180ms" was WORSE: a longer window gives more
+	//     chances for a spurious gap, so a schedule firing every 5ms PASSED it.
+	//  3. Elapsed-span over nine intervals fixed the discrimination but failed in
+	//     CI on MySQL: "1.579747029s is not greater than or equal to 1.6s", gaps
+	//     [420ms 0s 226ms 230ms 123ms 200ms 200ms 200ms 216ms 186ms]. A span is
+	//     measured BETWEEN TWO DELIVERED FIRES, so it inherits both delivery
+	//     delays: when the first observed fire is delivered ~420ms late and the
+	//     last on time, the span shrinks by that difference. The 0s gap is the
+	//     scheduler correctly firing a boundary it had missed. Nothing was wrong
+	//     with the schedule; the measurement was the wrong shape, and adding
+	//     slack to it only trades one flake rate for another.
 	//
-	// A three-interval span was too tight: the worker polls at 100ms, so delivery
-	// jitter can move each ENDPOINT by up to a poll interval while the underlying
-	// 200ms boundaries stay fixed. A 600ms span can therefore be observed as
-	// ~450ms, and a 540ms floor failed 1 run in 25 on a live database. More
-	// intervals amortise that fixed endpoint error instead of fighting it: nine
-	// intervals span ~1800ms, so subtracting a full 200ms of slack still leaves a
-	// floor a 50ms or 5ms schedule cannot reach (both are poll-bound at ~100ms per
-	// fire, giving ~900ms). Discrimination goes UP and flakiness goes down.
-	const settled = 11 // fires to observe, first one discarded
-	require.Eventually(t, func() bool {
-		mu.Lock()
-		defer mu.Unlock()
-		return len(executionTimes) >= settled
-	}, 8*time.Second, 20*time.Millisecond, "schedule should keep firing")
+	// A COUNT over a wall-clock window measured by the TEST has neither problem.
+	// The scheduler only fires at boundaries, so delivery jitter and catch-up can
+	// only ever DELAY a fire into the window or out of it — neither can create
+	// extra fires. The ceiling is therefore immune to the noise that broke (3),
+	// while still being unreachable by a schedule that fires too often: over a
+	// 2s window a 200ms schedule yields ~10, a 100ms schedule ~20, a 50ms ~40 and
+	// a 5ms ~400, against a ceiling of 12.
+	//
+	// The count poll above already asserts LIVENESS (the schedule fires at all);
+	// this asserts the other direction, which is the one a bug in the interval
+	// arithmetic would break.
+	const window = 2 * time.Second
+	const interval = 200 * time.Millisecond
+	// Sit in the MIDDLE of the gap rather than hugging the healthy side. A healthy
+	// 200ms schedule yields ~10 here; every faster mutant saturates at ~19-20,
+	// because the worker's 100ms poll bounds delivery no matter how short the
+	// interval (measured: 5ms -> 20, 50ms -> 19, 100ms -> 20). A ceiling of 12
+	// would leave only two fires of headroom for a stall that catches up several
+	// missed boundaries inside the window — which is exactly the boundary-hugging
+	// that made the previous version flake. 15 keeps every mutant caught by four
+	// or more while giving a healthy run half the window's worth of slack.
+	maxFires := int(window/interval) + 5
 
-	mu.Lock()
-	times := make([]time.Time, len(executionTimes))
-	copy(times, executionTimes)
-	mu.Unlock()
+	before := executionCount.Load()
+	windowStart := time.Now()
+	time.Sleep(window)
+	fired := int(executionCount.Load() - before)
+	elapsed := time.Since(windowStart)
 
-	// times[1]..times[settled-1] is (settled-2) intervals of the real schedule.
-	spanned := times[settled-1].Sub(times[1])
-	// (settled-2) real intervals of 200ms, less one poll interval of jitter at
-	// each endpoint.
-	minSpan := time.Duration(settled-2)*200*time.Millisecond - 200*time.Millisecond
-	assert.GreaterOrEqual(t, spanned, minSpan,
-		"%d scheduled fires after the first should span at least %s at a 200ms interval, took %s "+
-			"(gaps: %v)", settled-1, minSpan, spanned, gapsBetween(times))
+	assert.LessOrEqualf(t, fired, maxFires,
+		"a %s schedule fired %d times in %s (ceiling %d): the schedule is running faster than "+
+			"configured", interval, fired, elapsed.Round(time.Millisecond), maxFires)
 }
 
 // gapsBetween renders the observed intervals, so a failure says what the schedule
