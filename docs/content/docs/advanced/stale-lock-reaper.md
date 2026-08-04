@@ -77,7 +77,7 @@ the event/hook/metric pipeline — not just `slog` — and are fully alertable:
   `JobID`, `WorkerID`, `Reason` (`stale_lock` for the reaper) and `Timestamp`.
   See the [Events reference]({{< relref "/docs/api-reference/events" >}}) for the
   full type and the `stale_lock` vs `ownership_audit` distinction.
-- **Hook** -- register `queue.OnJobReclaimed(func(ctx, jobID, reason string))`
+- **Hook** -- register `queue.OnJobReclaimed(func(ctx context.Context, jobID core.UUID, reason string))`
   to react per reclaimed job (page, increment your own counter, etc.).
 - **Metric** -- `jobs.metrics.Instrument` auto-wires the hook into the
   `jobs.leases.reclaimed` counter, labelled by `reason`. See the

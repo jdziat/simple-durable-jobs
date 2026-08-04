@@ -21,9 +21,13 @@ Returns the default retry configuration.
 
 ### `Job`
 
+Abridged — the fields an application normally reads. Run
+`go doc github.com/jdziat/simple-durable-jobs/v4/pkg/core.Job` for the complete
+struct, including the persistence-only and replay-control fields.
+
 ```go
 type Job struct {
-    ID              string
+    ID              UUID        // core.UUID, a defined string type — not string
     Type            string
     Args            []byte      // JSON-encoded arguments
     Queue           string
@@ -104,7 +108,7 @@ Populated on `FanOutError.Failures` when a fan-out returns with at least one fai
 ```go
 type SubJobFailure struct {
     Index   int    // Position in the original subJobs slice
-    JobID   string // Sub-job ID; useful for cross-referencing logs and events
+    JobID   UUID   // Sub-job ID (core.UUID); useful for cross-referencing logs and events
     Error   string // Last error message reported by the sub-job
     Attempt int    // Attempt number that produced Error
 }

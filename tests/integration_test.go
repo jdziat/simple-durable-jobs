@@ -475,9 +475,15 @@ func TestIntegration_SchedulerRecurringJobs(t *testing.T) {
 	fired := int(executionCount.Load() - before)
 	elapsed := time.Since(windowStart)
 
+	mu.Lock()
+	observed := make([]time.Time, len(executionTimes))
+	copy(observed, executionTimes)
+	mu.Unlock()
+
 	assert.LessOrEqualf(t, fired, maxFires,
 		"a %s schedule fired %d times in %s (ceiling %d): the schedule is running faster than "+
-			"configured", interval, fired, elapsed.Round(time.Millisecond), maxFires)
+			"configured (gaps: %v)",
+		interval, fired, elapsed.Round(time.Millisecond), maxFires, gapsBetween(observed))
 }
 
 // gapsBetween renders the observed intervals, so a failure says what the schedule

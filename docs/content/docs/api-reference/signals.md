@@ -24,7 +24,7 @@ bundled `GormStorage` (SQLite/Postgres/MySQL) does. A backend without it returns
 
 ## Producer side (outside the workflow)
 
-### `(*Queue) Signal(ctx context.Context, jobID, name string, payload any) error`
+### `(*Queue) Signal(ctx context.Context, jobID core.UUID, name string, payload any) error`
 
 Delivers a named signal carrying `payload` to a job. The signal is persisted
 durably (so it is **not lost** if sent before the handler waits for it), and if

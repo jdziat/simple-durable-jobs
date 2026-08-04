@@ -17,6 +17,18 @@ The `ui` package provides a full-featured monitoring dashboard that embeds direc
 
 Import the `ui` package and mount the handler on any `http.ServeMux` or router.
 
+{{< callout type="warning" >}}
+**`ui.Handler` fails closed.** Without either [`ui.WithAuthorizer`](#withauthorizer)
+or [`ui.WithInsecureAllowUnauthenticated`](#withinsecureallowunauthenticated),
+*every* RPC returns `PermissionDenied` — the SPA shell loads and then shows
+nothing, with no error on the server side to explain it. The quickstart below
+uses the insecure opt-in and therefore binds explicitly to `127.0.0.1` — note
+that a bare `:8080` would bind every interface and publish the whole dashboard,
+mutating RPCs included. Anything reachable by other people needs a real
+authorizer, not a loopback bind. See
+[Dashboard Authorization]({{< relref "/docs/advanced/authorization" >}}).
+{{< /callout >}}
+
 ```go
 package main
 
@@ -55,7 +67,12 @@ func main() {
     mux.Handle("/jobs/", http.StripPrefix("/jobs", ui.Handler(storage,
         ui.WithQueue(queue),
         ui.WithContext(ctx),
+        // Keeps a week of stats instead of the 31-day default. The 30d (and
+        // the tail of the 7d) throughput chart will render short as a result.
         ui.WithStatsRetention(7 * 24 * time.Hour),
+        // REQUIRED: the handler fails closed. Safe only because this listener
+        // is bound to 127.0.0.1 below. In production use ui.WithAuthorizer.
+        ui.WithInsecureAllowUnauthenticated(),
         ui.WithMiddleware(func(next http.Handler) http.Handler {
             return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
                 // Add authentication, logging, etc.
@@ -64,8 +81,11 @@ func main() {
         }),
     )))
 
-    log.Println("Dashboard available at http://localhost:8080/jobs/")
-    log.Fatal(http.ListenAndServe(":8080", mux))
+    // 127.0.0.1, NOT ":8080". An empty host binds EVERY interface, which would
+    // serve this unauthenticated dashboard — including the mutating RPCs like
+    // CancelJob and PauseQueue — to anyone who can route to the host.
+    log.Println("Dashboard available at http://127.0.0.1:8080/jobs/")
+    log.Fatal(http.ListenAndServe("127.0.0.1:8080", mux))
 }
 ```
 
@@ -88,7 +108,69 @@ The `ui.Handler` function returns an `http.Handler` that serves both the Connect
 
 ## Options
 
-All options are passed to `ui.Handler` as variadic arguments.
+All options are passed to `ui.Handler` as variadic arguments. The full set is
+`WithAuthorizer`, `WithInsecureAllowUnauthenticated`, `WithAllowedOrigins`,
+`WithQueue`, `WithContext`, `WithStatsRetention`, `WithMiddleware`,
+`WithoutH2C`, `WithMetadataRedaction` and `WithScheduleOverdueThreshold`.
+(`WithInsecureAllowUnauthenticatedWrites` is a deprecated alias for
+`WithInsecureAllowUnauthenticated`.)
+
+### WithAuthorizer
+
+```go
+ui.WithAuthorizer(myAuthorizer) // myAuthorizer implements ui.Authorizer
+```
+
+Gates every RPC. The interceptor classifies the procedure into a `ui.Action`
+(`ActionViewStats`, `ActionViewJobs`, `ActionCancelJob`, `ActionPauseQueue`, …)
+and calls `Authorize(ctx, action)`; returning a non-nil error denies the call.
+`ui.Handler` **fails closed**: with neither this option nor
+`WithInsecureAllowUnauthenticated`, every RPC returns `PermissionDenied`. See
+[Dashboard Authorization]({{< relref "/docs/advanced/authorization" >}}) for the
+full action-to-RPC table and worked examples.
+
+`WithMiddleware` does **not** satisfy the gate — HTTP middleware cannot grant
+RPC access.
+
+### WithInsecureAllowUnauthenticated
+
+```go
+ui.WithInsecureAllowUnauthenticated()
+```
+
+Permits every dashboard RPC — reads *and* mutations, including `CancelJob` and
+`PauseQueue` — with no authorization at all. Local development and trusted
+networks only.
+
+### WithAllowedOrigins
+
+```go
+ui.WithAllowedOrigins("https://ops.example.com")
+```
+
+Adds origins that may issue *mutating* RPCs from a browser, on top of the
+default same-origin rule. Requests with no `Origin` header (CLI and
+server-to-server Connect clients) are unaffected.
+
+### WithMetadataRedaction
+
+```go
+ui.WithMetadataRedaction(false)
+```
+
+Controls best-effort redaction of secret-looking job metadata values in
+dashboard responses. **Enabled by default**; pass `false` to see raw values.
+
+### WithScheduleOverdueThreshold
+
+```go
+ui.WithScheduleOverdueThreshold(5 * time.Minute)
+```
+
+Grace period before a scheduled job whose next run has passed is reported
+overdue in the Scheduled Jobs view. The default is 1 minute
+(`ui.DefaultScheduleOverdueThreshold`); a non-positive duration disables overdue
+flagging entirely.
 
 ### WithQueue
 
@@ -211,7 +293,9 @@ Fan-out/fan-in jobs get a dedicated view showing each parent workflow, its strat
 
 ### Historical Charts
 
-When the stats collector is active (requires `WithQueue` and a GORM-backed storage), the dashboard shows time-series charts of completed and failed jobs. The history can be viewed over three periods: 1 hour, 24 hours, and 7 days.
+When the stats collector is active (requires `WithQueue` and a GORM-backed storage), the dashboard shows time-series charts of completed and failed jobs. The history can be viewed over four periods: `1h` (1 hour), `24h` (24 hours), `7d` (7 days), and `30d` (30 days). Each period spans its full window on a period-appropriate bucket width (1 minute, 30 minutes, 3 hours, 12 hours respectively), so the series stays bounded at roughly 48-60 points whichever period is selected. An unrecognised period string falls back to the `1h` window and its 1-minute buckets.
+
+`30d` is the longest window, which is why the default `WithStatsRetention` is 31 days — set it lower and the 30d chart renders short.
 
 ### Real-Time Events
 
@@ -287,21 +371,30 @@ A GORM-backed implementation (`GormStatsStorage`) is provided out of the box and
 
 ## Connect-RPC API
 
-The UI exposes a Connect-RPC service (`jobs.v1.JobsService`) with 12 methods. These can also be called programmatically from any Connect, gRPC, or gRPC-Web client.
+The UI exposes a Connect-RPC service (`jobs.v1.JobsService`) with 19 methods. These can also be called programmatically from any Connect, gRPC, or gRPC-Web client.
+
+**Mounting the handler exposes all 19**, including the terminal and fleet-wide mutations `CancelJob`, `PauseQueue` and `ResumeQueue`. Access is controlled by [`ui.WithAuthorizer`]({{< relref "/docs/advanced/authorization" >}}), which is passed a distinct `Action` per RPC, not by the table below.
 
 | Method              | Type             | Description                                                         |
 |---------------------|------------------|---------------------------------------------------------------------|
 | `GetStats`          | Unary            | Returns aggregate statistics (pending, running, completed, failed) per queue and totals. |
-| `GetStatsHistory`   | Unary            | Returns historical stats data points filtered by period (`1h`, `24h`, `7d`). Returns completed and failed time series. |
-| `ListJobs`          | Unary            | Paginated job listing with filters for status, queue, type, and free-text search. Default page size is 50, maximum is 100. |
+| `GetStatsHistory`   | Unary            | Returns historical stats data points filtered by period (`1h`, `24h`, `7d`, `30d`). Returns completed and failed time series. |
+| `ListJobs`          | Unary            | Paginated job listing with filters for status, queue, type, and free-text search. Default page size is 50, maximum is 100. Requires `UIStorage`. |
 | `GetJob`            | Unary            | Returns a single job with its full details and all associated checkpoints. |
-| `RetryJob`          | Unary            | Resets a failed job back to pending status so it will be picked up again. |
-| `DeleteJob`         | Unary            | Permanently removes a job from storage.                              |
-| `BulkRetryJobs`     | Unary            | Retries multiple jobs by ID. Returns the count of successfully retried jobs. |
-| `BulkDeleteJobs`    | Unary            | Deletes multiple jobs by ID. Returns the count of successfully deleted jobs. |
+| `RetryJob`          | Unary            | Resets a failed job back to pending status so it will be picked up again. Requires `UIStorage`. |
+| `DeleteJob`         | Unary            | Permanently removes a job from storage. Requires `UIStorage`.        |
+| `BulkRetryJobs`     | Unary            | Retries multiple jobs by ID. Returns the count of successfully retried jobs plus a per-ID `skipped` list. |
+| `BulkDeleteJobs`    | Unary            | Deletes multiple jobs by ID. Returns the count of successfully deleted jobs plus a per-ID `skipped` list. |
+| `PauseJob`          | Unary            | Pauses a single job. Requires `WithQueue`.                           |
+| `CancelJob`         | Unary            | **Terminally cancels a job.** Requires `WithQueue`.                  |
+| `ResumeJob`         | Unary            | Resumes a paused job. Requires `WithQueue`.                          |
+| `PauseQueue`        | Unary            | **Pauses an entire queue**, halting dispatch fleet-wide. Requires `WithQueue`. |
+| `ResumeQueue`       | Unary            | Resumes a paused queue. Requires `WithQueue`.                        |
 | `ListQueues`        | Unary            | Returns all queues with per-queue statistics.                        |
-| `PurgeQueue`        | Unary            | Deletes jobs from a named queue filtered by status.                  |
+| `PurgeQueue`        | Unary            | Deletes jobs from a named queue filtered by status. Requires `UIStorage`. |
 | `ListScheduledJobs` | Unary            | Returns all registered scheduled jobs with their schedule expressions and target queues. Requires `WithQueue`. |
+| `GetWorkflow`       | Unary            | Returns one fan-out/fan-in workflow tree, rooted at the job's top-most ancestor. |
+| `ListWorkflows`     | Unary            | Paginated listing of workflow root jobs. Requires `UIStorage`.       |
 | `WatchEvents`       | Server streaming | Streams real-time job events. Supports filtering by queue names. Maximum 50 concurrent streams; additional connections receive a `ResourceExhausted` error. |
 
 ## Advanced Topics
@@ -314,12 +407,24 @@ The dashboard works with any `core.Storage` implementation, but provides enhance
 type UIStorage interface {
     core.Storage
     GetQueueStats(ctx context.Context) ([]*jobsv1.QueueStats, error)
-    SearchJobs(ctx context.Context, filter JobFilter) ([]*core.Job, int64, error)
-    RetryJob(ctx context.Context, jobID string) (*core.Job, error)
-    DeleteJob(ctx context.Context, jobID string) error
+    SearchJobs(ctx context.Context, filter core.JobFilter) ([]*core.Job, int64, error)
+    RetryJob(ctx context.Context, jobID core.UUID) (*core.Job, error)
+    DeleteJob(ctx context.Context, jobID core.UUID) error
     PurgeJobs(ctx context.Context, queue string, status core.JobStatus) (int64, error)
+    GetWorkflowRoots(ctx context.Context, status string, limit, offset int) ([]*core.Job, int64, error)
 }
 ```
+
+`jobsv1` is `github.com/jdziat/simple-durable-jobs/v4/ui/gen/jobs/v1`. Job IDs
+are `core.UUID`, a defined string type — a method that takes `string` does not
+satisfy this interface.
+
+`UIStorage` is discovered by a **type assertion**, not by a compile-time
+requirement, so a storage that gets any member wrong (or omits one) produces no
+build error at the call site. It silently loses the enhanced path instead. If
+your custom backend is meant to satisfy it, add
+`var _ ui.UIStorage = (*YourStorage)(nil)` to your package so the compiler
+checks it for you.
 
 When `UIStorage` is available:
 
@@ -327,8 +432,18 @@ When `UIStorage` is available:
 - **SearchJobs** supports server-side pagination, filtering, and search with no cap on total job count.
 - **RetryJob** and **DeleteJob** perform direct database mutations.
 - **PurgeJobs** deletes jobs from a queue by status in a single query.
+- **GetWorkflowRoots** paginates workflow parent jobs for the Workflows view.
 
-Without `UIStorage`, the service falls back to basic queries using the `core.Storage` interface. These fallback queries are capped at 1000 jobs per status to prevent excessive memory usage, and retry/delete/purge operations return an `Unimplemented` error.
+Without `UIStorage`, only `GetStats`/`ListQueues` degrade gracefully: they fall
+back to `core.Storage` queries capped at 1000 jobs per status to prevent
+excessive memory usage. The rest do not degrade, they fail:
+
+- `ListJobs` returns `Unimplemented` ("ListJobs requires storage with UI search
+  support"), so the whole job browser is empty.
+- `ListWorkflows` returns `Unimplemented`, so the Workflows view is empty.
+- `RetryJob`, `DeleteJob` and `PurgeQueue` return `Unimplemented`.
+- `BulkRetryJobs` / `BulkDeleteJobs` still return `OK`, but with `count = 0` and
+  every requested ID listed in `skipped`.
 
 ### Stream Limits
 

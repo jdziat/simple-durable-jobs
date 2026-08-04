@@ -17,7 +17,7 @@ Removes a subscriber channel. The channel is not closed; callers must stop readi
 
 Emits an event to all subscribers. Non-blocking; drops events if a subscriber's buffer is full.
 
-### `(*Queue) EmitCustomEvent(jobID, kind string, data map[string]any)`
+### `(*Queue) EmitCustomEvent(jobID core.UUID, kind string, data map[string]any)`
 
 Emits a custom ephemeral event (not persisted).
 
@@ -53,7 +53,7 @@ type JobRetrying struct {
 }
 
 type CheckpointSaved struct {
-    JobID     string
+    JobID     UUID
     CallIndex int
     CallType  string  // e.g. "call", "fanout", "phase"
     Timestamp time.Time
@@ -76,14 +76,14 @@ type JobResumed struct {
 // on backstop/recovery wakes. Durable-timer (Sleep) deadline wakes without
 // a pending signal do NOT emit this event.
 type JobResumedBySignal struct {
-    JobID      string
+    JobID      UUID
     SignalName string
     Timestamp  time.Time
 }
 
 // Emitted when a signal is successfully persisted for a job.
 type SignalDelivered struct {
-    JobID     string
+    JobID     UUID
     Name      string
     Timestamp time.Time
 }
@@ -105,7 +105,7 @@ type SignalDelivered struct {
 // by DIFFERENT workers. Keep the two reasons separable and do NOT sum across
 // them when counting reclaims.
 type JobReclaimed struct {
-    JobID     string
+    JobID     UUID
     WorkerID  string
     Reason    string
     Timestamp time.Time
@@ -134,7 +134,7 @@ type WorkerResumed struct {
 
 // Ephemeral / custom
 type CustomEvent struct {
-    JobID     string
+    JobID     UUID
     Kind      string         // "progress", "phase_change", "log", …
     Data      map[string]any
     Timestamp time.Time
@@ -165,6 +165,6 @@ Registers a callback for when a job fails permanently.
 
 Registers a callback for when a job is being retried.
 
-### `(*Queue) OnJobReclaimed(fn func(context.Context, jobID, reason string))`
+### `(*Queue) OnJobReclaimed(fn func(ctx context.Context, jobID core.UUID, reason string))`
 
 Registers a callback for when a job lease is reclaimed. It fires both when this worker's stale-lock reaper recovers a job from a presumed-dead owner and when the ownership audit observes a peer reclaim a job this worker was running. `reason` is `ReclaimReasonStaleLock` (`"stale_lock"`, the actor/crash-leading-indicator side) or `ReclaimReasonOwnershipAudit` (`"ownership_audit"`, the victim side). See the `JobReclaimed` event above — the same caveat applies: do not sum across reasons, since one logical reclaim can fire on both sides on different workers.

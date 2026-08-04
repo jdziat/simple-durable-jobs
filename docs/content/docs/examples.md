@@ -81,9 +81,10 @@ producers compile-time checked arguments and results.
 ```go
 import typed "github.com/jdziat/simple-durable-jobs/v4/pkg/typed"
 
-sendEmail := typed.Define(queue, "send-email", func(ctx context.Context, args EmailArgs) (EmailResult, error) {
-    return EmailResult{MessageID: "msg_123"}, nil
-})
+sendEmail := typed.Define[EmailArgs, EmailResult](queue, "send-email",
+    func(ctx context.Context, args EmailArgs) (EmailResult, error) {
+        return EmailResult{MessageID: "msg_123"}, nil
+    })
 
 jobID, err := sendEmail.Enqueue(ctx, EmailArgs{To: "user@example.com"})
 if err != nil {

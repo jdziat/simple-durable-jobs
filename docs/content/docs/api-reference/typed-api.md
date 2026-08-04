@@ -14,6 +14,10 @@ queue. Routing still uses the registered job name, so it works with the same
 workers, storage, checkpoints, middleware, and payload codec as `Queue.Register`
 and `Queue.Enqueue`.
 
+Job IDs are `core.UUID` (`github.com/jdziat/simple-durable-jobs/v4/pkg/core`),
+a defined string type — not `string`. The root facade re-exports it as
+`jobs.UUID`.
+
 Keep using `Queue.Register`, `Queue.Enqueue`, and `Queue.EnqueueRemote` directly
 when job names are dynamic, configured at runtime, or produced by non-Go
 systems. `Queue.EnqueueRemote` still permits producer-only enqueue, but rejects
@@ -23,16 +27,42 @@ malformed job names.
 
 ## Definitions
 
-### `Define[A any, R any](q *queue.Queue, name string, fn func(context.Context, A) (R, error), opts ...queue.Option) *Def[A, R]`
+### `Define[A any, R any](q *queue.Queue, name string, fn any, opts ...queue.Option) *Def[A, R]`
 
 Registers a typed handler and returns a typed definition handle. Like
 `Queue.Register`, invalid handler registration panics. The result type `R` must
 match the handler's return type.
 
+`fn` is declared as `any` so `Define` accepts every handler shape
+`Queue.Register` accepts (`func(ctx, A) (R, error)`, `func(A) (R, error)`, …)
+and validates it reflectively. The consequence is that **`A` and `R` cannot be
+inferred from the arguments — you must always write the type parameters out**:
+
 ```go
-sendEmail := typed.Define(queue, "send-email", func(ctx context.Context, args SendEmailArgs) (SendEmailResult, error) {
-    return SendEmailResult{MessageID: "msg_123"}, nil
-})
+sendEmail := typed.Define[SendEmailArgs, SendEmailResult](queue, "send-email",
+    func(ctx context.Context, args SendEmailArgs) (SendEmailResult, error) {
+        return SendEmailResult{MessageID: "msg_123"}, nil
+    })
+```
+
+Omitting them is a compile error (`cannot infer A`). Use
+[`DefineE`](#definee) instead of `Define` when the handler name or function is
+configuration-driven and a returned error is preferable to a panic; it has the
+same signature and the same explicit-type-parameter requirement.
+
+### `DefineE[A any, R any](q *queue.Queue, name string, fn any, opts ...queue.Option) (*Def[A, R], error)`
+
+The error-returning form of `Define`. It reports handler/argument/result type
+mismatches and registration failures as an error instead of panicking.
+
+```go
+sendEmail, err := typed.DefineE[SendEmailArgs, SendEmailResult](queue, "send-email",
+    func(ctx context.Context, args SendEmailArgs) (SendEmailResult, error) {
+        return SendEmailResult{MessageID: "msg_123"}, nil
+    })
+if err != nil {
+    return err
+}
 ```
 
 ### `DeclareUnchecked[A any, R any](q *queue.Queue, name string) *Def[A, R]`
@@ -52,6 +82,9 @@ same argument and result types. Keep those types synchronized with the worker.
 
 Registers an error-only handler. The definition uses `struct{}` as the typed
 result so it can still be called and loaded consistently.
+
+Unlike `Define`, `DefineVoid` takes a *typed* `fn`, so `A` is inferred from the
+handler literal and the type parameter can be omitted.
 
 ```go
 cleanup := typed.DefineVoid(queue, "cleanup", func(ctx context.Context, args CleanupArgs) error {
@@ -102,7 +135,7 @@ the deadline wins.
 approval, ok, err := typed.WaitForSignalTimeout[Approval](ctx, "approval", time.Hour)
 ```
 
-### `Signal(ctx context.Context, q *queue.Queue, jobID, name string, payload any) error`
+### `Signal(ctx context.Context, q *queue.Queue, jobID core.UUID, name string, payload any) error`
 
 Sends a signal to a specific job ID. The payload is still accepted as `any`
 because senders often live outside the workflow and may not share a typed
@@ -128,7 +161,7 @@ Returns the string job type used for routing.
 name := sendEmail.Name()
 ```
 
-### `(*Def[A, R]) Enqueue(ctx context.Context, args A, opts ...queue.Option) (string, error)`
+### `(*Def[A, R]) Enqueue(ctx context.Context, args A, opts ...queue.Option) (core.UUID, error)`
 
 Adds a typed job to the queue.
 
@@ -139,7 +172,7 @@ jobID, err := sendEmail.Enqueue(ctx, SendEmailArgs{To: "user@example.com"},
 )
 ```
 
-### `(*Def[A, R]) EnqueueRemote(ctx context.Context, args A, opts ...queue.Option) (string, error)`
+### `(*Def[A, R]) EnqueueRemote(ctx context.Context, args A, opts ...queue.Option) (core.UUID, error)`
 
 Adds a typed job without requiring a local handler registration. This is the
 typed wrapper for `Queue.EnqueueRemote`; malformed job names are rejected.
@@ -148,7 +181,7 @@ typed wrapper for `Queue.EnqueueRemote`; malformed job names are rejected.
 jobID, err := sendEmail.EnqueueRemote(ctx, SendEmailArgs{To: "user@example.com"})
 ```
 
-### `(*Def[A, R]) EnqueueTx(ctx context.Context, tx *gorm.DB, args A, opts ...queue.Option) (string, error)`
+### `(*Def[A, R]) EnqueueTx(ctx context.Context, tx *gorm.DB, args A, opts ...queue.Option) (core.UUID, error)`
 
 Adds a typed job inside a caller-owned GORM transaction.
 
@@ -167,7 +200,7 @@ The call is checkpointed with the same replay behavior as `jobs.Call`.
 receipt, err := chargePayment.Call(ctx, PaymentArgs{OrderID: order.ID, Cents: order.Cents})
 ```
 
-### `(*Def[A, R]) Load(ctx context.Context, jobID string) (R, error)`
+### `(*Def[A, R]) Load(ctx context.Context, jobID core.UUID) (R, error)`
 
 Decodes the persisted result for a completed job. It returns the same sentinel
 errors as `jobs.LoadResult`: `ErrJobNotCompleted`, `ErrJobFailed`,
@@ -214,9 +247,10 @@ func main() {
     }
     queue := jobs.New(storage)
 
-    sendEmail := typed.Define(queue, "send-email", func(ctx context.Context, args SendEmailArgs) (SendEmailResult, error) {
-        return SendEmailResult{MessageID: "msg_" + args.To}, nil
-    })
+    sendEmail := typed.Define[SendEmailArgs, SendEmailResult](queue, "send-email",
+        func(ctx context.Context, args SendEmailArgs) (SendEmailResult, error) {
+            return SendEmailResult{MessageID: "msg_" + args.To}, nil
+        })
 
     jobID, err := sendEmail.Enqueue(ctx, SendEmailArgs{To: "user@example.com"})
     if err != nil {

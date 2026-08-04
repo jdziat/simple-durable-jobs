@@ -39,7 +39,7 @@ Retrieves a previously saved phase checkpoint. Returns the result and true if fo
 
 ## Retrieving Results
 
-### `LoadResult[T any](ctx context.Context, q *Queue, jobID string) (T, error)`
+### `LoadResult[T any](ctx context.Context, q *Queue, jobID core.UUID) (T, error)`
 
 Decodes the persisted return value of a completed job into `T`. This is the primary way to read a job's result from outside its handler — for example, a caller polling for the outcome of a job it enqueued.
 

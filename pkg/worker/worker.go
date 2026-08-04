@@ -515,7 +515,24 @@ func NewWorker(q *queue.Queue, opts ...WorkerOption) *Worker {
 	}
 }
 
-// Start begins processing jobs. Blocks until context is cancelled.
+// Start begins processing jobs. Blocks until ctx is cancelled AND the shutdown
+// drain has finished, then returns ctx.Err().
+//
+// Shutdown runs in three phases, described in full on
+// docs/content/docs/production-ops.md ("Graceful Drain"):
+//
+//  1. Wait DrainTimeout for in-flight handlers to finish ON THEIR OWN. Handler
+//     contexts are deliberately NOT cancelled here (they are built with
+//     context.WithoutCancel), so a handler sees ctx.Done() only in phase 2.
+//     A non-positive DrainTimeout skips this phase entirely.
+//  2. Cancel every remaining handler context and wait at most
+//     forcedHandlerDrainGrace (defaultForcedHandlerDrainGrace, 5s). A handler
+//     still running after that is ABANDONED, not waited for — so Start's return
+//     is not proof that no handler is live. Callers must therefore not assume
+//     it is safe to close the database the instant Start returns.
+//  3. Wait, unbounded, for internal goroutines (reaper, scheduler, retention…)
+//     so none is abandoned mid-write.
+//
 // Per-queue concurrency is enforced: each queue only dequeues up to its
 // configured concurrency limit.
 // The dispatcher drains available work within each poll interval; setting

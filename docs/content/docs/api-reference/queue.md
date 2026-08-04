@@ -39,9 +39,12 @@ queue.Register("send-email", func(ctx context.Context, args EmailArgs) error {
 })
 ```
 
-### `(*Queue) Enqueue(ctx context.Context, name string, args any, opts ...Option) (string, error)`
+### `(*Queue) Enqueue(ctx context.Context, name string, args any, opts ...Option) (core.UUID, error)`
 
-Adds a job to the queue. Returns the job ID.
+Adds a job to the queue. Returns the job ID. `core.UUID` is a defined string
+type (`type UUID string`), re-exported by the root facade as `jobs.UUID`; it is
+**not** interchangeable with `string`, so a variable that holds a job ID must be
+declared `jobs.UUID` (or inferred with `:=`), not `string`.
 
 ```go
 jobID, err := queue.Enqueue(ctx, "send-email", EmailArgs{
@@ -49,7 +52,7 @@ jobID, err := queue.Enqueue(ctx, "send-email", EmailArgs{
 })
 ```
 
-### `(*Queue) EnqueueRemote(ctx context.Context, name string, args any, opts ...Option) (string, error)`
+### `(*Queue) EnqueueRemote(ctx context.Context, name string, args any, opts ...Option) (core.UUID, error)`
 
 Adds a job without requiring a local handler registration. Use this for
 producer-only processes that enqueue work for workers running elsewhere.
@@ -118,6 +121,7 @@ queue.Register("my-job", func(ctx context.Context, args MyArgs) error {
 })
 ```
 
-### `JobIDFromContext(ctx context.Context) string`
+### `JobIDFromContext(ctx context.Context) core.UUID`
 
-Returns the current job ID from context, or empty string if not in a job handler.
+Returns the current job ID from context, or the empty UUID (`core.NilUUID`, the
+zero value of `core.UUID`) if not in a job handler.
