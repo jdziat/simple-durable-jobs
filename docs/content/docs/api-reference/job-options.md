@@ -145,8 +145,22 @@ as an explicit handler-provided delay. See [Job Retry Backoff]({{< relref
 
 Controls how strictly a handler's non-deterministic actions are policed on replay of a checkpointed workflow. Exported modes:
 
-| Mode | Behavior |
-|---|---|
-| `ExplicitCheckpoints` *(default)* | Only values wrapped in `Call()` / `SavePhaseCheckpoint()` are persisted; direct side effects are the handler's responsibility. |
-| `Strict` | Replay panics if a new `Call()` invocation appears that was not present in the checkpoint history — useful for catching accidental non-determinism. |
-| `BestEffort` | Extra calls on replay are tolerated; the engine re-executes them and captures new checkpoints. |
+All three modes persist only what is wrapped in `Call()` /
+`SavePhaseCheckpoint()`; direct side effects are always the handler's
+responsibility. All three also let a replay issue an **extra** `Call()` that was
+not in the checkpoint history: it simply executes fresh and records its own
+checkpoint. What the modes actually differ on is how a replayed `Call` that
+*conflicts* with the recorded history is handled.
+
+| Mode | On a type mismatch at a call index | On recorded checkpoints the replay never reaches |
+|---|---|---|
+| `ExplicitCheckpoints` *(default)* | Returns a determinism-violation error from `Call()`, so the attempt fails and retries. | Tolerated. |
+| `Strict` | Same as the default. | Fails the job **terminally** (non-retryable) after the handler returns: `jobs: strict determinism violation: N recorded Call checkpoint(s) were not replayed`. This is the case where the handler issued **fewer or reordered** `Call`s than the original run. |
+| `BestEffort` | Logs a warning and **re-executes** the call instead of erroring. | Tolerated. |
+
+Note what `Strict` does *not* do. It never panics — every outcome above is a
+returned error — and it does not fire when a replay adds a call that was not
+there before. Its extra guard is the opposite trigger: a replay that drops or
+reorders calls it previously made. If you are trying to catch a handler whose
+`Call` sequence *grows* nondeterministically, no mode reports it; assert on the
+sequence in a test instead.

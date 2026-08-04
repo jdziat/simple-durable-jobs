@@ -123,6 +123,35 @@ func (cs *CallState) UnconsumedCallCheckpoints() int {
 	return n
 }
 
+// HasUnreachedCallCheckpoints reports whether any indexed durable checkpoint
+// recorded by an EARLIER execution sits at or beyond the current call cursor —
+// i.e. a previous run of this job got PAST the point the handler occupies right
+// now, and this run has not replayed that far yet.
+//
+// This is the library's replay signal, and it is sound in both directions
+// because of one invariant: every indexed durable operation (Call, fan-out,
+// signal wait, sleep) RESERVES its index by incrementing CallIndex before it
+// writes, and none of them insert into Checkpoints. So the map holds exactly the
+// rows loaded from storage at run start (plus Index == -1 markers this run
+// wrote, which are excluded), and every row this run has already consumed sits
+// at an index strictly BELOW the cursor.
+//
+//   - A first execution therefore never reports true: it has no loaded rows, and
+//     nothing it writes itself can land at or above the cursor.
+//   - A replay reports true exactly while the earlier run's unreplayed durable
+//     work is still ahead of it.
+//
+// The residual is one-sided and harmless: a replay that passed this point
+// WITHOUT recording any durable step at or after it is indistinguishable from a
+// first execution — but by definition there is then no recorded step for a
+// changed handler shape to collide with.
+//
+// Deliberately delegates to UnconsumedCallCheckpoints rather than repeating the
+// predicate: the two must never disagree about which rows count.
+func (cs *CallState) HasUnreachedCallCheckpoints() bool {
+	return cs.UnconsumedCallCheckpoints() > 0
+}
+
 // ReservePhaseName claims phaseName for this execution and reports whether the
 // claim is new. A phase checkpoint is keyed {Index: -1, Type: name}, so a second
 // phase reusing a name is the SAME checkpoint: it overwrites the first, and

@@ -654,6 +654,13 @@ var ErrPhaseCheckpointDecode = jobctx.ErrPhaseCheckpointDecode
 // GetVersion records or replays a workflow-code version marker for changeID.
 // Use the returned version to branch around changes to Call, fan-out, and signal
 // wait sequences so in-flight runs keep their originally recorded path.
+//
+// A run that was already in flight when the marker was deployed has no marker to
+// replay; it is pinned to DefaultVersion on the evidence of the durable steps it
+// already recorded past this point, so the DefaultVersion branch is the one it
+// takes. Place the marker BEFORE the durable operations it guards — that is what
+// makes the evidence visible. See [jobctx.GetVersion] for the exact rule and its
+// one-sided residual.
 func GetVersion(ctx context.Context, changeID string, minSupported, maxSupported int) (int, error) {
 	return jobctx.GetVersion(ctx, changeID, minSupported, maxSupported)
 }

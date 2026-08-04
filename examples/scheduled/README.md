@@ -52,7 +52,8 @@ Running for 60 seconds (Ctrl+C to stop early)...
 
 ## Tips
 
-- The scheduler is **per-worker**. If you run multiple workers with the scheduler enabled, duplicate scheduled jobs may be enqueued. Use `jobs.Unique()` on your scheduled jobs or enable the scheduler on only one worker.
+- **Run the scheduler on every worker.** Each worker polls its own schedules, but every schedule boundary is claimed exactly once fleet-wide: the claim is an atomic row in `scheduled_fires` (`ClaimScheduledFireTx`), so N workers produce one job per boundary, not N. Enabling it on a single worker is not a safety measure — it just makes recurring work stop when that one worker dies, because no peer will pick the schedules up.
+- **Do not add `jobs.Unique(key)` to a scheduled job to "prevent duplicates".** There are no duplicates to prevent, and `Unique(key)` changes the behaviour: when a previous instance is still live, the boundary is deliberately SKIPPED — the durable cursor advances and nothing runs. That is the right tool for "never overlap two runs of this job", and the wrong tool for fleet safety.
 - Schedule intervals are measured from when the scheduler ticks, not from when the previous job completed.
 - For production, use `jobs.Daily()` or `jobs.Cron()` instead of short `jobs.Every()` intervals to avoid overwhelming your queue.
 - Scheduled job handlers typically take `struct{}` or no meaningful arguments since they're triggered by time, not input data.

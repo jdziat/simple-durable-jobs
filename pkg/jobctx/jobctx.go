@@ -68,6 +68,31 @@ func JobIDFromContext(ctx context.Context) core.UUID {
 // since increased. If the recorded version is outside [minSupported,
 // maxSupported], ErrUnsupportedWorkflowVersion is returned.
 //
+// A run that was ALREADY IN FLIGHT when the marker was deployed has no marker to
+// replay, because the code that produced its checkpoints never called
+// GetVersion. Such a run is pinned to DefaultVersion rather than handed
+// maxSupported: it is detected by the durable evidence it carries — an indexed
+// checkpoint (Call, fan-out, signal wait, sleep) recorded by an earlier
+// execution at or beyond the call cursor GetVersion is standing on, which only a
+// run that already executed past this point can have. DefaultVersion is then
+// recorded like any other, so every later replay of that run reads it back from
+// the marker. This is what lets an in-flight run keep its originally recorded
+// path; handing it maxSupported instead makes it issue the NEW branch's Call at
+// an index whose checkpoint holds the OLD call's type, which is a determinism
+// violation on every attempt until the job dead-letters.
+//
+// If DefaultVersion falls outside [minSupported, maxSupported] — the second
+// deploy, which drops the old branch by raising minSupported — an in-flight run
+// gets ErrUnsupportedWorkflowVersion and nothing is recorded, rather than
+// silently taking a branch its checkpoints cannot support.
+//
+// The detection is evidence-based and one-sided: a run that passed this point
+// without recording ANY indexed durable step at or after it is indistinguishable
+// from a first execution and receives maxSupported. That is harmless — there is
+// no recorded step at those indices for the new branch to collide with. It is
+// also why the marker belongs BEFORE the durable operations it guards, not after
+// them.
+//
 // Version markers are stored at CallIndex -1 with an internal CallType prefix,
 // so they do not collide with phase checkpoints and are ignored by Strict
 // determinism's unconsumed-Call check.
@@ -102,7 +127,20 @@ func GetVersion(ctx context.Context, changeID string, minSupported, maxSupported
 		return recorded, nil
 	}
 
-	resultBytes, err := json.Marshal(maxSupported)
+	// No marker. Either this is genuinely the first execution to reach this
+	// point (record maxSupported), or an earlier execution already ran past it
+	// under code that had no marker to record (pin to DefaultVersion). See the
+	// godoc for why HasUnreachedCallCheckpoints separates the two soundly.
+	record := maxSupported
+	if cs.HasUnreachedCallCheckpoints() {
+		record = DefaultVersion
+		if record < minSupported || record > maxSupported {
+			return 0, fmt.Errorf("%w: change %q is reached by a run whose durable steps predate the marker, which pins it to version %d, outside supported range [%d, %d]",
+				ErrUnsupportedWorkflowVersion, changeID, record, minSupported, maxSupported)
+		}
+	}
+
+	resultBytes, err := json.Marshal(record)
 	if err != nil {
 		return 0, fmt.Errorf("marshal workflow version: %w", err)
 	}
@@ -122,7 +160,7 @@ func GetVersion(ctx context.Context, changeID string, minSupported, maxSupported
 	cs.Checkpoints[key] = cp
 	cs.Mu.Unlock()
 
-	return maxSupported, nil
+	return record, nil
 }
 
 // SavePhaseCheckpoint saves a phase result to the checkpoint store.

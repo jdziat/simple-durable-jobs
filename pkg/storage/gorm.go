@@ -762,10 +762,14 @@ func (s *GormStorage) Dequeue(ctx context.Context, queues []string, workerID str
 // lets the next claim reach past it; the bound is what stops a fully-poisoned
 // queue from turning one Dequeue into an unbounded claim/release storm.
 //
-// A queue with more than this many poison rows ahead of the first healthy job
-// makes no progress on this tick — the same inherent limit the batch path has
-// (it can only step over the poison rows inside ONE batch), and by then
-// PoisonPayloadDrops is rising and the per-id warning names the rows.
+// A queue with this many OR MORE poison rows ahead of the first healthy job
+// makes no progress on this tick. The bound is on the loop guard
+// (`len(*skipped) < maxPoisonSkipsPerDequeue`), so the call gets exactly this
+// many claim attempts: spending all of them on poison rows leaves none for the
+// healthy job behind them. Exactly 16 poison rows already starves; 15 does not.
+// This is the same inherent limit the batch path has (it can only step over the
+// poison rows inside ONE batch), and by then PoisonPayloadDrops is rising and the
+// per-id warning names the rows.
 const maxPoisonSkipsPerDequeue = 16
 
 // dequeueDecoded claims jobs until it gets one whose payload decodes, stepping
@@ -1919,7 +1923,36 @@ func overlayLiveFanOutCountsBatch(db *gorm.DB, fanOuts []*core.FanOut) error {
 	return nil
 }
 
-// GetFanOut retrieves a fan-out by ID.
+// GetFanOut retrieves a fan-out by ID, with its CompletedCount, FailedCount and
+// CancelledCount OVERLAID from a live COUNT of the child jobs by status — not
+// read from the stored columns.
+//
+// This is load-bearing, not an optimisation, and
+// docs/content/docs/storage-durability.md now documents it as one of the two
+// mechanisms a custom backend must reproduce (the other being
+// GetCompletablePendingFanOuts, which
+// docs/content/docs/advanced/guarantees.md names as the stranded-parent
+// recovery sweep). Because the counts are DERIVED from
+// the child rows, an IncrementFanOutCompleted that never ran (a crash between
+// Complete and the increment on the non-atomic completion fallback) cannot leave
+// this backend one short: the child's committed status IS the count. A backend
+// that returns the stored columns instead has a durability hole the required
+// core.Storage interface cannot recover — GetStalledFanOutParents predicates on
+// MISSING CHILD ROWS, not on a short counter, so it selects nothing for that
+// state.
+//
+// The stored columns are still maintained — UpdateFanOutStatus snapshots the same
+// live counts inside the transaction that performs the terminal CAS — but nothing
+// READS them through this type. Every fan-out reader on GormStorage overlays:
+// GetFanOut, GetFanOutsByParent, GetCompletablePendingFanOuts and the dashboard's
+// GetFanOutsByParents all call overlayLiveFanOutCounts(Batch). The stored numbers
+// are visible only to a raw row read, which is why a short counter is unlosable
+// here: it was never the source of truth.
+//
+// That matters to anyone implementing core.Storage themselves. The counters being
+// DERIVED is what makes a lost IncrementFanOutCompleted recoverable; a backend
+// that returns the stored column instead inherits a fan-out that can sit one short
+// forever. See docs/content/docs/storage-durability.md.
 func (s *GormStorage) GetFanOut(ctx context.Context, fanOutID core.UUID) (*core.FanOut, error) {
 	var fanOut core.FanOut
 	err := s.db.WithContext(ctx).First(&fanOut, "id = ?", fanOutID).Error
