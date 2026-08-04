@@ -39,7 +39,11 @@ func (w *Worker) logStorageCapabilities() {
 		inactive = append(inactive, "durable-timers/scheduled-fire-seed")
 	}
 	if _, ok := s.(completeWithResultStorage); !ok {
-		inactive = append(inactive, "result-on-complete")
+		// Completion still happens: processJob falls back to the split
+		// core.Storage sequence (SaveJobResult + Complete + fan-out accounting).
+		// What is inactive is doing all of it in ONE transaction, so name that
+		// rather than "result-on-complete" — results are still stored.
+		inactive = append(inactive, "atomic-complete-with-result")
 	}
 	if _, ok := s.(completablePendingFanOutStorage); !ok {
 		inactive = append(inactive, "fanout-pending-recovery")

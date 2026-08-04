@@ -4,12 +4,15 @@ weight: 7
 toc: true
 ---
 
-Simple Durable Jobs targets **at-least-once** execution. Two of its guarantees
+Simple Durable Jobs targets **at-least-once** execution. Three of its guarantees
 depend on the storage backend implementing an *atomic* capability. `GormStorage`
-(the built-in Postgres / MySQL / SQLite backend) implements both, so the default
-setup is fully durable. A **custom** `core.Storage` that omits one of them still
-runs, but with a reduced crash-durability guarantee — and the worker now says so
-**loudly at startup** instead of degrading silently.
+(the built-in Postgres / MySQL / SQLite backend) implements all of them, so the
+default setup is fully durable. A **custom** `core.Storage` that omits one still
+runs — every path has a `core.Storage`-only fallback — but with a reduced
+crash-durability guarantee. The worker says so at startup, loudly for the two
+that risk data loss or a wide crash window, and in the
+`storage backend missing optional capabilities` line for the rest, instead of
+degrading silently.
 
 ## Atomic scheduled fires (`ScheduledFireTxClaimer` + `TxEnqueuer`)
 
@@ -49,12 +52,32 @@ DEGRADED DURABILITY: storage lacks atomic fan-out suspend (SuspendForFanOut);
 FanOut() uses the legacy non-atomic fallback with a wider crash window ...
 ```
 
+## Atomic completion (`CompleteWithResult`)
+
+Completing a job means three writes: store the handler's result, flip the row to
+`completed`, and — for a fan-out sub-job — increment its fan-out's completed
+count. With `CompleteWithResult` all three land in ONE transaction.
+
+Without it, the worker falls back to the plain `core.Storage` sequence:
+`SaveJobResult`, then `Complete`, then `IncrementFanOutCompleted`. A crash
+between the first two replays the job (the row is still `running`, so the
+stale-lock reaper reclaims it — at-least-once, as designed). A crash between
+`Complete` and the fan-out increment leaves the fan-out one short, so the parent
+stays `waiting` until the stalled-fan-out recovery scan
+(`GetStalledFanOutParents`, `FanOutRecoveryStaleAge`) resumes it. Both are
+**recoverable**; neither loses the completion.
+
+The capability line logged at startup names this one as
+`atomic-complete-with-result`.
+
 ## Summary
 
 | Capability | Interface | Missing → |
 |---|---|---|
 | Atomic scheduled fire | `ScheduledFireTxClaimer` + `TxEnqueuer` | a fire can be **lost** on a crash (data loss) |
 | Atomic fan-out suspend | `SuspendForFanOut` | wider, **recoverable** crash window |
+| Atomic completion | `CompleteWithResult` | split completion writes; **recoverable** crash window (replayed job, or a parent resumed by the recovery scan) |
 
-`GormStorage` implements both. If you write a custom backend and see a `DEGRADED
-DURABILITY` warning, implement the named capability to restore the full guarantee.
+`GormStorage` implements all three. If you write a custom backend and see a
+`DEGRADED DURABILITY` warning, implement the named capability to restore the full
+guarantee.

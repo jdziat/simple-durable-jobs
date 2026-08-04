@@ -2577,14 +2577,21 @@ func (w *Worker) processJobRun(ctx context.Context, job *core.Job, runToken uint
 			}
 		}
 
-		completer, ok := w.queue.Storage().(completeWithResultStorage)
-		if !ok {
-			w.logger.Error("storage does not implement CompleteWithResult; cannot complete job", "job_id", job.ID)
-			cancelHeartbeat()
-			w.releaseAfterTerminalWriteError(ctx, job.ID, "completion")
-			return
+		// CompleteWithResult is an OPTIONAL capability, not part of core.Storage.
+		// When it is absent this falls back to the split core.Storage sequence,
+		// exactly as the terminal-failure path below already falls back from
+		// FailTerminalWithResult to Fail + handleSubJobCompletion. Without the
+		// fallback a storage implementing precisely the documented core.Storage
+		// contract had no completion path at all: every successful handler was
+		// released back to pending and re-executed forever.
+		var fo *core.FanOut
+		var completeErr error
+		completer, hasCompleteWithResult := w.queue.Storage().(completeWithResultStorage)
+		if hasCompleteWithResult {
+			fo, completeErr = w.completeWithResult(ctx, completer, job.ID, resultBytes)
+		} else {
+			completeErr = w.completeViaCoreStorage(ctx, job.ID, resultBytes)
 		}
-		fo, completeErr := w.completeWithResult(ctx, completer, job.ID, resultBytes)
 		cancelHeartbeat()
 		if errors.Is(completeErr, core.ErrJobNotOwned) {
 			w.logger.Warn("job no longer owned at completion; skipping completion handling",
@@ -2599,11 +2606,56 @@ func (w *Worker) processJobRun(ctx context.Context, job *core.Job, runToken uint
 
 		w.queue.CallCompleteHooks(jobCtx, job)
 		w.queue.Emit(&core.JobCompleted{Job: job, Duration: time.Since(startTime), Timestamp: time.Now()})
-		if err := w.checkFanOutCompletion(ctx, fo); err != nil {
-			w.logger.Error("failed to handle sub-job completion", "job_id", job.ID, "error", err)
+		// The atomic path already accounted the sub-job inside its terminal
+		// transaction and handed back the resulting fan-out; the legacy path has
+		// to do that accounting as a separate write. Same split as the terminal
+		// failure path (failTerminalWithResult vs handleSubJobCompletion).
+		var fanOutErr error
+		if hasCompleteWithResult {
+			fanOutErr = w.checkFanOutCompletion(ctx, fo)
+		} else {
+			fanOutErr = w.handleSubJobCompletion(ctx, job, true)
+		}
+		if fanOutErr != nil {
+			w.logger.Error("failed to handle sub-job completion", "job_id", job.ID, "error", fanOutErr)
 		}
 		return
 	}
+}
+
+// completeViaCoreStorage completes a job using ONLY methods in the documented
+// core.Storage contract, for backends that do not implement the optional
+// CompleteWithResult.
+//
+// The order is load-bearing:
+//
+//   - SaveJobResult BEFORE Complete. Both are ownership-fenced, so the result has
+//     to be written while the job is still 'running' and locked by us; and a crash
+//     between the two leaves the job running, which the stale-lock reaper replays
+//     (at-least-once). The reverse order would complete the job and then lose the
+//     result to a crash, with nothing to replay it.
+//   - Fan-out accounting AFTER Complete, and only on success — done by the caller
+//     via handleSubJobCompletion. IncrementFanOutCompleted is not idempotent, so
+//     counting a completion that did not land double-charges the fan-out once the
+//     job is replayed. An under-count stalls the parent until the
+//     GetStalledFanOutParents recovery scan resumes it; an over-count resumes the
+//     parent while sub-jobs are still running, which no scan can undo.
+//
+// What is lost relative to CompleteWithResult is atomicity across those writes —
+// the "reduced crash-durability guarantee" documented for custom backends — not
+// the completion itself.
+func (w *Worker) completeViaCoreStorage(ctx context.Context, jobID core.UUID, result []byte) error {
+	st := w.queue.Storage()
+	if result != nil {
+		if err := retryWithBackoff(ctx, *w.config.StorageRetry, func() error {
+			return st.SaveJobResult(ctx, jobID, w.config.WorkerID, result)
+		}); err != nil {
+			return err
+		}
+	}
+	return retryWithBackoff(ctx, *w.config.StorageRetry, func() error {
+		return st.Complete(ctx, jobID, w.config.WorkerID)
+	})
 }
 
 func (w *Worker) completeWithResult(ctx context.Context, storage completeWithResultStorage, jobID core.UUID, result []byte) (*core.FanOut, error) {

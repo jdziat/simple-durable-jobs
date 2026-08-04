@@ -41,16 +41,28 @@ func TestWorker_GracefulShutdownReleasesRunningJob(t *testing.T) {
 	startReturned := make(chan error, 1)
 	go func() { startReturned <- w.Start(ctx) }()
 
+	// These two budgets are LIVENESS waits, not the thing under test: they only
+	// have to outlast a slow start and a slow drain. They were 2s, and this test
+	// failed once inside a full-package run against Postgres — not because it uses
+	// Postgres (it is SQLite, via newSQLiteQueue) but because its NEIGHBOURS were
+	// hitting a remote database, so everything was slower. Ten seconds costs a
+	// healthy run nothing, since each select returns the moment its channel fires.
+	//
+	// WithDrainTimeout(60ms) below is NOT widened: that one is load-bearing. It has
+	// to expire promptly so the handler is actually cancelled, which is the state
+	// this test exists to observe.
+	const settle = 10 * time.Second
+
 	select {
 	case <-started:
-	case <-time.After(2 * time.Second):
+	case <-time.After(settle):
 		t.Fatal("job did not start")
 	}
 
 	cancel() // begin graceful shutdown → drain timeout → cancel handler
 	select {
 	case <-startReturned:
-	case <-time.After(2 * time.Second):
+	case <-time.After(settle):
 		t.Fatal("Start did not return")
 	}
 

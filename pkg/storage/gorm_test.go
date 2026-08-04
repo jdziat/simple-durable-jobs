@@ -3894,7 +3894,7 @@ func TestDequeueSQLite_QueuePausedMidDequeue(t *testing.T) {
 	// filter by calling dequeueSQLite directly).
 	now := time.Now()
 	lockUntil := now.Add(45 * time.Minute)
-	got, err := s.dequeueSQLite(ctx, []string{"emails"}, "w1", now, lockUntil)
+	got, err := s.dequeueSQLite(ctx, []string{"emails"}, "w1", now, lockUntil, nil)
 	require.NoError(t, err)
 	assert.Nil(t, got, "should return nil because inner re-check finds queue paused")
 }
@@ -3909,7 +3909,7 @@ func TestDequeueSQLite_NoPendingJobs(t *testing.T) {
 	// No jobs enqueued at all.
 	now := time.Now()
 	lockUntil := now.Add(45 * time.Minute)
-	got, err := s.dequeueSQLite(ctx, []string{"default"}, "w1", now, lockUntil)
+	got, err := s.dequeueSQLite(ctx, []string{"default"}, "w1", now, lockUntil, nil)
 	require.NoError(t, err)
 	assert.Nil(t, got)
 }

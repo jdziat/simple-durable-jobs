@@ -157,7 +157,12 @@ per line for scripts. `dlq list --tenant` and repeated `--metadata key=value`
 filters narrow triage to one tenant or metadata slice. `dlq requeue` succeeds
 only when the target job exists and is failed or cancelled; fan-out sub-jobs
 must be handled by requeueing their parent. `dlq requeue --queue` and
-`--tenant` requeue every matching dead-lettered job.
+`--tenant` requeue every matching dead-lettered job that *can* be requeued and
+report the rest: dead-lettered fan-out sub-jobs are counted under
+`skipped N fan-out sub-jobs` (requeue their parent instead) and any row that is no
+longer failed or cancelled (or has since been deleted) under `skipped N jobs
+that could not be requeued`. The `requeued N jobs` summary is printed even when the run
+stops early on a storage error, so a partial run is never silent.
 
 ## Health Probes
 

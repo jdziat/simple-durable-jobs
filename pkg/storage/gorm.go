@@ -731,8 +731,17 @@ func (s *GormStorage) EnqueueUnique(ctx context.Context, job *core.Job, uniqueKe
 // This keeps dequeue correctness independent of the external ready-promoter loop
 // — a storage wrapper that hides the promoter capability, or any window before
 // the loop's next tick, can never leave an eligible job permanently invisible.
+//
+// A row whose payload this storage cannot decode does not fail the call and does
+// not block the queue: it is reported (see PoisonPayloadDrops), released, and
+// stepped over so the next claim reaches the job behind it. Up to
+// maxPoisonSkipsPerDequeue such rows are stepped over per call.
 func (s *GormStorage) Dequeue(ctx context.Context, queues []string, workerID string) (*core.Job, error) {
-	job, err := s.dequeueOnce(ctx, queues, workerID)
+	// One `skipped` list spans BOTH claim attempts. The promote-retry below
+	// re-runs the same ORDER BY, so without sharing it the second attempt would
+	// re-claim, re-release and re-report the poison row this call just skipped.
+	var skipped []core.UUID
+	job, err := s.dequeueDecoded(ctx, queues, workerID, &skipped)
 	if err != nil || job != nil {
 		return job, err
 	}
@@ -740,10 +749,70 @@ func (s *GormStorage) Dequeue(ctx context.Context, queues []string, workerID str
 	if perr != nil || promoted == 0 {
 		return nil, nil
 	}
-	return s.dequeueOnce(ctx, queues, workerID)
+	return s.dequeueDecoded(ctx, queues, workerID, &skipped)
 }
 
-func (s *GormStorage) dequeueOnce(ctx context.Context, queues []string, workerID string) (*core.Job, error) {
+// maxPoisonSkipsPerDequeue bounds how many undecodable rows ONE Dequeue call
+// will claim, report, release and step over before giving up for this tick.
+//
+// The bound exists to make the loop terminate by construction: releaseClaimedOnAbort
+// restores a poison row to status='pending' WITHOUT touching run_at/created_at, so
+// it lands back at the head of `ORDER BY priority DESC, COALESCE(run_at, created_at)`
+// and would be re-selected immediately. The in-call `skipped` exclusion is what
+// lets the next claim reach past it; the bound is what stops a fully-poisoned
+// queue from turning one Dequeue into an unbounded claim/release storm.
+//
+// A queue with more than this many poison rows ahead of the first healthy job
+// makes no progress on this tick — the same inherent limit the batch path has
+// (it can only step over the poison rows inside ONE batch), and by then
+// PoisonPayloadDrops is rising and the per-id warning names the rows.
+const maxPoisonSkipsPerDequeue = 16
+
+// dequeueDecoded claims jobs until it gets one whose payload decodes, stepping
+// over rows it cannot decode.
+//
+// A poison row is REPORTED (PoisonPayloadDrops + a once-per-id warning), RELEASED
+// back to pending and EXCLUDED from the next claim in this call — the same
+// treatment decodeClaimedBatch gives a poison sibling, and for the same reason:
+// good work must never be blocked by one undecodable row. Before this, the single
+// path released the row and returned the decode error, so the row was at the head
+// of the queue again on the next tick and a single-slot worker re-claimed,
+// re-failed and re-released it forever without ever reaching the job behind it.
+//
+// A skipped row yields NO error to the caller (again matching the batch path,
+// which returns healthy siblings and nil): a poison row is a property of one row,
+// not a failure of this dequeue. Returning (nil, nil) when everything reachable is
+// poison means "nothing runnable right now", and the counter/log carry the signal.
+func (s *GormStorage) dequeueDecoded(ctx context.Context, queues []string, workerID string, skipped *[]core.UUID) (*core.Job, error) {
+	for len(*skipped) < maxPoisonSkipsPerDequeue {
+		job, err := s.dequeueOnce(ctx, queues, workerID, *skipped)
+		if err != nil {
+			return nil, err
+		}
+		if job == nil {
+			return nil, nil
+		}
+		decodeErr := s.decodeJobPayloads(job)
+		if decodeErr == nil {
+			return job, nil
+		}
+		s.reportPoisonPayload(job.ID, decodeErr)
+		// The claim is already COMMITTED here, so returning without releasing
+		// leaves the row status='running', locked_by=us and undispatched —
+		// invisible to any queue-depth alert (it reads as healthy work in
+		// progress) and reclaimable only by ReleaseStaleLocks, by default 45
+		// minutes later.
+		if relErr := s.releaseClaimedOnAbort([]core.UUID{job.ID}, workerID, nil); relErr != nil {
+			// The row could not be released, so it IS parked as 'running'. Do not
+			// pretend this dequeue was clean — surface both causes.
+			return nil, errors.Join(decodeErr, relErr)
+		}
+		*skipped = append(*skipped, job.ID)
+	}
+	return nil, nil
+}
+
+func (s *GormStorage) dequeueOnce(ctx context.Context, queues []string, workerID string, skipIDs []core.UUID) (*core.Job, error) {
 	var job core.Job
 	now := time.Now()
 	lockDuration := time.Duration(s.lockDuration.Load())
@@ -751,7 +820,7 @@ func (s *GormStorage) dequeueOnce(ctx context.Context, queues []string, workerID
 
 	// SQLite uses optimistic locking - no row-level locks available
 	if s.isSQLite {
-		return s.dequeueSQLite(ctx, queues, workerID, now, lockUntil)
+		return s.dequeueSQLite(ctx, queues, workerID, now, lockUntil, skipIDs)
 	}
 
 	// PostgreSQL/MySQL: Use FOR UPDATE SKIP LOCKED for proper distributed locking
@@ -779,7 +848,7 @@ func (s *GormStorage) dequeueOnce(ctx context.Context, queues []string, workerID
 		// 1. The selected row is locked for this transaction
 		// 2. Other workers skip locked rows instead of waiting
 		// This prevents duplicate job execution in distributed scenarios
-		result := s.claimableCandidates(s.lockForUpdate(tx, true), queues, nowExpr).First(&job)
+		result := excludeJobIDs(s.claimableCandidates(s.lockForUpdate(tx, true), queues, nowExpr), skipIDs).First(&job)
 
 		if result.Error != nil {
 			if errors.Is(result.Error, gorm.ErrRecordNotFound) {
@@ -830,28 +899,21 @@ func (s *GormStorage) dequeueOnce(ctx context.Context, queues []string, workerID
 	if job.ID == "" {
 		return nil, nil
 	}
-	if err := s.decodeJobPayloads(&job); err != nil {
-		// The claim is already COMMITTED here, so returning without releasing
-		// leaves the row status='running', locked_by=us and undispatched —
-		// invisible to any queue-depth alert (it reads as healthy work in
-		// progress) and reclaimable only by ReleaseStaleLocks, by default 45
-		// minutes later. The BATCH path has released poison rows since the
-		// teardown-g3 fix (decodeClaimedBatch); this single-job path was left
-		// behind. A misconfigured codec should produce a visible, self-contained
-		// symptom on one row, not a silently parked job.
-		return nil, s.releaseClaimedOnAbort([]core.UUID{job.ID}, workerID, err)
-	}
+	// Payload decoding (and the poison-row release) belongs to dequeueDecoded, the
+	// single caller: it is the only layer that can also EXCLUDE the row from the
+	// next claim. Releasing here and returning the error is what starved a
+	// single-slot worker — the released row returns to the head of the ORDER BY.
 	return &job, nil
 }
 
 // dequeueSQLite uses optimistic locking for SQLite (dev/testing only).
 // This is NOT safe for multiple concurrent workers - use PostgreSQL for production.
-func (s *GormStorage) dequeueSQLite(ctx context.Context, queues []string, workerID string, now time.Time, lockUntil time.Time) (*core.Job, error) {
+func (s *GormStorage) dequeueSQLite(ctx context.Context, queues []string, workerID string, now time.Time, lockUntil time.Time, skipIDs []core.UUID) (*core.Job, error) {
 	var job core.Job
 
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		// Find a candidate job
-		result := s.claimableCandidates(tx, queues, now).First(&job)
+		result := excludeJobIDs(s.claimableCandidates(tx, queues, now), skipIDs).First(&job)
 
 		if result.Error != nil {
 			if errors.Is(result.Error, gorm.ErrRecordNotFound) {
@@ -913,17 +975,8 @@ func (s *GormStorage) dequeueSQLite(ctx context.Context, queues []string, worker
 	if job.ID == "" {
 		return nil, nil
 	}
-	if err := s.decodeJobPayloads(&job); err != nil {
-		// The claim is already COMMITTED here, so returning without releasing
-		// leaves the row status='running', locked_by=us and undispatched —
-		// invisible to any queue-depth alert (it reads as healthy work in
-		// progress) and reclaimable only by ReleaseStaleLocks, by default 45
-		// minutes later. The BATCH path has released poison rows since the
-		// teardown-g3 fix (decodeClaimedBatch); this single-job path was left
-		// behind. A misconfigured codec should produce a visible, self-contained
-		// symptom on one row, not a silently parked job.
-		return nil, s.releaseClaimedOnAbort([]core.UUID{job.ID}, workerID, err)
-	}
+	// Decoding + poison handling live in dequeueDecoded; see the note on the
+	// PostgreSQL/MySQL path above.
 	return &job, nil
 }
 
