@@ -238,6 +238,12 @@ func seedRunningLockedJob(t *testing.T, ctx context.Context, s *GormStorage, id 
 // short-circuits the live handler. Clearing locked_by would defer the stop to
 // the ~minutes heartbeat fallback. Exercises both the directly-cancelled root
 // and a subtree-cancelled child (the shared cancelFanOutChildrenAndReconcile).
+//
+// docs/content/docs/advanced/cancel-job.md documents this retention, including
+// the consequence that a terminal row keeps a future locked_until forever. That
+// page spent a release claiming the OPPOSITE — "clears the job's lock" — because
+// this test pinned the code without naming the page. If you change the behaviour
+// here, change the page in the same commit.
 func TestCancelJobTerminal_PreservesLockedByForOwnershipAudit(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStorage(t)

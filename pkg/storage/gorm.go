@@ -2181,19 +2181,28 @@ func (s *GormStorage) cancelFanOutChildrenAndReconcile(tx *gorm.DB, fanOutID cor
 			// non-PII constant; intentionally stored plaintext
 			updates["last_error"] = cancelReason
 		}
-		result := tx.Model(&core.Job{}).
-			Where("id IN ?", cancelled).
-			Where("status IN ?", cancellable).
-			Updates(updates)
-		if result.Error != nil {
-			return nil, result.Error
-		}
+		// CHUNKED: `cancelled` is as large as the fan-out's child count, so an
+		// unchunked list exceeds the driver's bind-parameter ceiling (SQLite 32766,
+		// Postgres 65535) and terminal cancel fails outright — which meant the
+		// biggest workflows, the ones an operator most needs to stop, were exactly
+		// the ones that could not be cancelled. Measured: 33,000 children ->
+		// "too many SQL variables". Both statements stay inside the caller's
+		// transaction, so chunking changes atomicity not at all.
+		for _, chunk := range chunkIDs(cancelled, retentionDeleteChunkSize) {
+			result := tx.Model(&core.Job{}).
+				Where("id IN ?", chunk).
+				Where("status IN ?", cancellable).
+				Updates(updates)
+			if result.Error != nil {
+				return nil, result.Error
+			}
 
-		// Release any fleet concurrency slots held by the cancelled sub-jobs,
-		// atomically with the cancel write, so a worker that dies before its
-		// deferred release cannot orphan a live slot for a now-terminal job.
-		if err := tx.Where("job_id IN ?", cancelled).Delete(&core.ConcurrencySlot{}).Error; err != nil {
-			return nil, err
+			// Release any fleet concurrency slots held by the cancelled sub-jobs,
+			// atomically with the cancel write, so a worker that dies before its
+			// deferred release cannot orphan a live slot for a now-terminal job.
+			if err := tx.Where("job_id IN ?", chunk).Delete(&core.ConcurrencySlot{}).Error; err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -2606,6 +2615,23 @@ func (s *GormStorage) Requeue(ctx context.Context, jobID core.UUID) (bool, error
 	return requeued, nil
 }
 
+// pluckChunked runs a Pluck over a bounded literal IN-list, appending each
+// chunk's rows. Every subtree walk in this file feeds it a list as large as the
+// user's workflow, and an unchunked list exceeds the driver's bind-parameter
+// ceiling (SQLite 32766, Postgres 65535) — which made the biggest workflows the
+// ones that could not be cancelled, replayed or pruned. Measured before this
+// bound: 33,000 descendants -> "too many SQL variables".
+func pluckChunked(tx *gorm.DB, model any, column string, in []core.UUID, out *[]core.UUID) error {
+	for _, chunk := range chunkIDs(in, retentionDeleteChunkSize) {
+		var got []core.UUID
+		if err := tx.Model(model).Where(column+" IN ?", chunk).Pluck("id", &got).Error; err != nil {
+			return err
+		}
+		*out = append(*out, got...)
+	}
+	return nil
+}
+
 // deleteFanOutSubtree deletes the entire fan-out tree rooted at rootJobID: every
 // fan-out it spawned directly or transitively, all of those sub-jobs, and their
 // checkpoints/signals. The root job row itself is NOT touched. Used by Requeue so
@@ -2635,9 +2661,7 @@ func (s *GormStorage) deleteFanOutSubtree(tx *gorm.DB, rootJobID core.UUID) erro
 			return fmt.Errorf("deleteFanOutSubtree: fan-out tree under %s exceeds max depth %d; aborting to avoid orphaning deeper sub-jobs", rootJobID, maxFanOutTreeDepth)
 		}
 		var fanOutIDs []core.UUID
-		if err := tx.Model(&core.FanOut{}).
-			Where("parent_job_id IN ?", frontier).
-			Pluck("id", &fanOutIDs).Error; err != nil {
+		if err := pluckChunked(tx, &core.FanOut{}, "parent_job_id", frontier, &fanOutIDs); err != nil {
 			return err
 		}
 		if len(fanOutIDs) == 0 {
@@ -2645,9 +2669,7 @@ func (s *GormStorage) deleteFanOutSubtree(tx *gorm.DB, rootJobID core.UUID) erro
 		}
 
 		var subJobIDs []core.UUID
-		if err := tx.Model(&core.Job{}).
-			Where("fan_out_id IN ?", fanOutIDs).
-			Pluck("id", &subJobIDs).Error; err != nil {
+		if err := pluckChunked(tx, &core.Job{}, "fan_out_id", fanOutIDs, &subJobIDs); err != nil {
 			return err
 		}
 
@@ -2659,14 +2681,22 @@ func (s *GormStorage) deleteFanOutSubtree(tx *gorm.DB, rootJobID core.UUID) erro
 		frontier = subJobIDs
 	}
 
-	if len(allSubJobIDs) > 0 {
+	// CHUNK every literal IN-list. The subtree is as large as the user's workflow,
+	// so an unchunked list exceeds the driver's bind-parameter ceiling (SQLite
+	// 32766, Postgres 65535) and the whole statement fails — which meant a workflow
+	// big enough to have a deep fan-out could be neither replayed (Requeue, the
+	// dashboard Retry button) nor pruned (DeleteWorkflowSubtree). Measured before
+	// this bound: 33,000 descendants -> "too many SQL variables". Same defect class
+	// as the retention sweep, which bounds its lists the same way; a reviewer
+	// flagged this site as a residual at the time and it was recorded, not fixed.
+	for _, chunk := range chunkIDs(allSubJobIDs, retentionDeleteChunkSize) {
 		// Delete dependents explicitly so the behavior holds on SQLite too (no FK
 		// there). On PG/MySQL deleting the sub-jobs also cascade-removes their
 		// checkpoints/signals/fan_outs, making these deletes idempotent.
-		if err := tx.Where("job_id IN ?", allSubJobIDs).Delete(&core.Checkpoint{}).Error; err != nil {
+		if err := tx.Where("job_id IN ?", chunk).Delete(&core.Checkpoint{}).Error; err != nil {
 			return err
 		}
-		if err := tx.Where("job_id IN ?", allSubJobIDs).Delete(&core.Signal{}).Error; err != nil {
+		if err := tx.Where("job_id IN ?", chunk).Delete(&core.Signal{}).Error; err != nil {
 			return err
 		}
 		// Release the discarded sub-jobs' windowed dedup locks
@@ -2674,17 +2704,17 @@ func (s *GormStorage) deleteFanOutSubtree(tx *gorm.DB, rootJobID core.UUID) erro
 		// missing job row is deliberately NOT a steal trigger (see
 		// stealTerminalUniqueLock), so leaving them behind would block re-enqueue of
 		// those scopes for the rest of their TTL against work that no longer exists.
-		if err := tx.Where("job_id IN ?", allSubJobIDs).Delete(&core.UniqueLock{}).Error; err != nil {
+		if err := tx.Where("job_id IN ?", chunk).Delete(&core.UniqueLock{}).Error; err != nil {
 			return err
 		}
-		if err := tx.Where("id IN ?", allSubJobIDs).Delete(&core.Job{}).Error; err != nil {
+		if err := tx.Where("id IN ?", chunk).Delete(&core.Job{}).Error; err != nil {
 			return err
 		}
 	}
-	if len(allFanOutIDs) > 0 {
-		// Root-level fan_outs (parent_job_id = the untouched root) are not reached
-		// by the sub-job cascade, so delete the collected fan_outs explicitly.
-		if err := tx.Where("id IN ?", allFanOutIDs).Delete(&core.FanOut{}).Error; err != nil {
+	// Root-level fan_outs (parent_job_id = the untouched root) are not reached by
+	// the sub-job cascade, so delete the collected fan_outs explicitly.
+	for _, chunk := range chunkIDs(allFanOutIDs, retentionDeleteChunkSize) {
+		if err := tx.Where("id IN ?", chunk).Delete(&core.FanOut{}).Error; err != nil {
 			return err
 		}
 	}
@@ -3044,13 +3074,24 @@ func (s *GormStorage) CancelJobTerminal(ctx context.Context, jobID core.UUID) er
 			}
 			if len(subJobIDs) > 0 {
 				sort.Slice(subJobIDs, func(i, j int) bool { return subJobIDs[i] < subJobIDs[j] })
-				var locked []core.UUID
-				query := tx.Model(&core.Job{}).
-					Where("id IN ?", subJobIDs).
-					Order("id ASC")
-				query = s.lockForUpdate(query, false)
-				if err := query.Pluck("id", &locked).Error; err != nil {
-					return err
+				// Chunked for the same bind-parameter ceiling as the deletes above:
+				// unchunked, terminally cancelling a workflow whose subtree exceeds
+				// the driver limit failed outright ("too many SQL variables" at
+				// 33,000 descendants), so the biggest workflows — the ones an
+				// operator most needs to stop — were the ones that could not be
+				// cancelled. Chunking is safe here because the locks accumulate in
+				// the surrounding transaction, and the ids are pre-sorted so the
+				// lock ORDER is unchanged across chunks and the deadlock-avoidance
+				// ordering still holds.
+				for _, chunk := range chunkIDs(subJobIDs, retentionDeleteChunkSize) {
+					var locked []core.UUID
+					query := tx.Model(&core.Job{}).
+						Where("id IN ?", chunk).
+						Order("id ASC")
+					query = s.lockForUpdate(query, false)
+					if err := query.Pluck("id", &locked).Error; err != nil {
+						return err
+					}
 				}
 			}
 			sort.Slice(fanOutIDs, func(i, j int) bool { return fanOutIDs[i] < fanOutIDs[j] })
@@ -3083,9 +3124,7 @@ func (s *GormStorage) collectFanOutSubtree(tx *gorm.DB, rootJobID core.UUID) (al
 			break
 		}
 		var fanOutIDs []core.UUID
-		if err := tx.Model(&core.FanOut{}).
-			Where("parent_job_id IN ?", frontier).
-			Pluck("id", &fanOutIDs).Error; err != nil {
+		if err := pluckChunked(tx, &core.FanOut{}, "parent_job_id", frontier, &fanOutIDs); err != nil {
 			return nil, nil, false, err
 		}
 		if len(fanOutIDs) == 0 {
@@ -3106,9 +3145,7 @@ func (s *GormStorage) collectFanOutSubtree(tx *gorm.DB, rootJobID core.UUID) (al
 		}
 
 		var subJobIDs []core.UUID
-		if err := tx.Model(&core.Job{}).
-			Where("fan_out_id IN ?", levelFanOutIDs).
-			Pluck("id", &subJobIDs).Error; err != nil {
+		if err := pluckChunked(tx, &core.Job{}, "fan_out_id", levelFanOutIDs, &subJobIDs); err != nil {
 			return nil, nil, false, err
 		}
 

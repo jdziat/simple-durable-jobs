@@ -60,18 +60,24 @@ a warranty of fitness for any particular use.
   disappear.
 - **Single active owner** — the library is designed so that at any instant at
   most one worker holds a job's lock. Lock timing is anchored to the **database
-  clock** on Postgres/MySQL, and the chaos suite asserts that worker clock skew
-  does not cause a live lock to be reclaimed early.
+  clock** on Postgres/MySQL, so a worker whose own clock is skewed cannot reclaim
+  a live lock early. That anchoring is not covered by a dedicated chaos
+  invariant — the suite's clock-skew handling concerns scheduled fires, not lock
+  reclaim — so treat it as a design property, not an asserted one.
 - **Checkpointed workflows** — completed `Call()` steps are not re-executed on
-  replay (subject to the at-least-once window above), and fan-in counters are
-  updated atomically with the sub-job's terminal transition. The fan-out's
-  *status* advance commits in that same terminal transaction; the library is
-  designed so that a terminal fan-out is not observable as `status=pending` with
-  terminal counts, and the chaos suite asserts that invariant. If a worker
-  crashes between the final sub-job's terminal write and resuming the waiting
-  parent, a recovery sweep (`GetCompletablePendingFanOuts`, gated by
-  `WithFanOutRecoveryStaleAge`, default 2m) heals any parent stranded in
-  `waiting`.
+  replay (subject to the at-least-once window above). The fan-out's *status*
+  advance is a SECOND write that commits **after** the sub-job's terminal
+  transaction, deliberately: counting afterwards is what lets the snapshot see
+  siblings that committed concurrently. So a terminal fan-out **is** briefly
+  observable as `status=pending` while its counts already read terminal — and
+  across a process death in that gap, durably so. Do not alert on that
+  combination as corruption; it is the normal shape of a fan-out completing, and
+  on GormStorage the counts are derived from child rows rather than accumulated,
+  so nothing is lost. A recovery sweep (`GetCompletablePendingFanOuts`, gated by
+  `WithFanOutRecoveryStaleAge`, default 2m) advances the stranded row and resumes
+  any parent left in `waiting`. Note the sweep runs only on the worker holding
+  the recovery lease, so the heal is bounded by that interval rather than
+  immediate.
 - **Atomic signal consumption** — consuming a signal
   (`WaitForSignal`/`WaitForSignalTimeout`/`DrainSignals`) persists the consume
   and its replay checkpoint in a single transaction; the library is designed so
