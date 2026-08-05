@@ -1661,8 +1661,8 @@ Two consequences worth knowing:
 
 ## Rollback
 
-Across the whole v4.6 → v4.8 line there are five forward-only migrations. The last
-three are new in **v4.8.0**; the other two are already in the releases named:
+Across the whole v4.6 → v4.8 line there are six forward-only migrations. The last
+four are new in **v4.8.0**; the other two are already in the releases named:
 
 | Migration | Adds | First shipped in |
 | --- | --- | --- |
@@ -1671,10 +1671,27 @@ three are new in **v4.8.0**; the other two are already in the releases named:
 | **v38** | `idx_job_stats_timestamp` | v4.8.0 |
 | **v39** | `jobs.waiting_signal_name` | v4.8.0 |
 | **v40** | `checkpoints.result_shape` | v4.8.0 |
+| **v41** | `idx_jobs_unique_key` (Postgres/SQLite; MySQL already had it) | v4.8.0 |
 
-All five are additive — three columns, each `NOT NULL` with a default, and two
+All six are additive — three columns, each `NOT NULL` with a default, and three
 indexes — so an older binary runs correctly against the newer schema. No migration
 in this line rewrites data.
+
+**Plan v41 on a large `jobs` table.** It builds a plain index on `jobs(unique_key)`
+to make `Unique`/`IdempotencyKey` dedup lookups index-served instead of scanning
+the active set (measured on SQLite at 300k rows with 1% key density: 76ms → 0.05ms
+per lookup). On **Postgres a standard index build locks out writes to `jobs` until
+it completes** — reads are unaffected — so on a large table schedule the upgrade
+in a window where a write pause is acceptable, or create the index yourself
+concurrently before deploying:
+
+```sql
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_jobs_unique_key ON jobs (unique_key);
+```
+
+Migration 41 uses `CREATE INDEX IF NOT EXISTS`, so a pre-created index makes it a
+no-op. SQLite is single-writer regardless, and MySQL has carried this index since
+migration 12, so neither is affected.
 
 **How that is verified, and one thing it does NOT cover.** The v4.7.0 binary was
 run against a **v38** ledger on SQLite, live Postgres and live MySQL, migrating in
