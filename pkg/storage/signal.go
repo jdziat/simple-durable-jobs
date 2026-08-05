@@ -139,10 +139,20 @@ func (s *GormStorage) DrainSignals(ctx context.Context, jobID core.UUID, name st
 				ids[i] = sg.ID
 				sg.ConsumedAt = &now
 			}
-			if err := tx.Model(&core.Signal{}).
-				Where("id IN ?", ids).
-				Update("consumed_at", s.nowWriteValue()).Error; err != nil {
-				return err
+			// CHUNKED: `ids` is every pending signal of this name, which is
+			// user-data-unbounded — nothing caps how many signals may buffer for a
+			// job. Unchunked, a backlog past the driver's bind-parameter ceiling
+			// (SQLite 32766, Postgres/MySQL 65535) fails the statement outright, and
+			// because DrainSignals is the ONLY bulk consume the backlog can never be
+			// cleared: the handler errors, retries, fails identically and dead-letters.
+			// Measured: the threshold is ~32765, and single-signal ConsumeSignal on
+			// the same backlog still works, which isolates the IN-list as the cause.
+			for _, chunk := range chunkIDs(ids, retentionDeleteChunkSize) {
+				if err := tx.Model(&core.Signal{}).
+					Where("id IN ?", chunk).
+					Update("consumed_at", s.nowWriteValue()).Error; err != nil {
+					return err
+				}
 			}
 			if err := s.decodeSignalPayloads(sigs); err != nil {
 				return err
@@ -304,10 +314,15 @@ func (s *GormStorage) drainSignalsTx(ctx context.Context, jobID core.UUID, worke
 					ids[i] = sg.ID
 					sg.ConsumedAt = &now
 				}
-				if err := tx.Model(&core.Signal{}).
-					Where("id IN ?", ids).
-					Update("consumed_at", s.nowWriteValue()).Error; err != nil {
-					return err
+				// Chunked for the same bind-parameter ceiling as the sibling above;
+				// this is the handler-facing path (jobs.DrainSignals ->
+				// DrainSignalsTxOwned), so it is the one a user actually hits.
+				for _, chunk := range chunkIDs(ids, retentionDeleteChunkSize) {
+					if err := tx.Model(&core.Signal{}).
+						Where("id IN ?", chunk).
+						Update("consumed_at", s.nowWriteValue()).Error; err != nil {
+						return err
+					}
 				}
 				if err := s.decodeSignalPayloads(sigs); err != nil {
 					return err

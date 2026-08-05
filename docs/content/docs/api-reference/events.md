@@ -66,6 +66,11 @@ type JobPaused struct {
     Timestamp time.Time
 }
 
+type JobCancelled struct {
+    Job       *Job
+    Timestamp time.Time
+}
+
 type JobResumed struct {
     Job       *Job
     Timestamp time.Time
@@ -164,6 +169,13 @@ Registers a callback for when a job fails permanently.
 ### `(*Queue) OnRetry(fn func(context.Context, *Job, int, error))`
 
 Registers a callback for when a job is being retried.
+
+### `(*Queue) OnJobWaiting(fn func(context.Context, *Job))`
+
+Registers a callback for when a job suspends into `waiting` — parking on a
+signal, a durable sleep, or a fan-out. It fires on every suspension, so a
+workflow that waits several times fires it several times; it is not a
+once-per-job hook.
 
 ### `(*Queue) OnJobReclaimed(fn func(ctx context.Context, jobID core.UUID, reason string))`
 
