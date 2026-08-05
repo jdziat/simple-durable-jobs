@@ -29,7 +29,7 @@ test.describe('Operator Surface', () => {
     await expect(rows).toHaveCount(20)
   })
 
-  test('dead-lettered detail requeue preserves checkpoint semantics', async ({ page }) => {
+  test('dead-lettered detail requeue warns it replays from scratch', async ({ page }) => {
     await page.goto(`/#/jobs/${JOBS.DEADLETTERED_REQUEUE}`)
     await page.waitForSelector('.job-detail .header', { timeout: 10000 })
 
@@ -38,7 +38,11 @@ test.describe('Operator Surface', () => {
 
     const dialog = page.getByRole('dialog')
     await expect(dialog).toBeVisible()
-    await expect(dialog).toContainText('preserving existing checkpoints')
+    // The dialog must warn that this is a replay from scratch: RetryJob routes through
+    // applyRequeueResetTx, which deletes every checkpoint. This assertion previously
+    // pinned the OPPOSITE claim and so protected the falsehood rather than the user.
+    await expect(dialog).toContainText('replays the job FROM SCRATCH')
+    await expect(dialog).toContainText('already succeeded')
     await dialog.getByRole('textbox').fill('REQUEUE')
     await dialog.getByRole('button', { name: 'Requeue' }).click()
 

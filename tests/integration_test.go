@@ -403,9 +403,13 @@ func TestIntegration_SchedulerRecurringJobs(t *testing.T) {
 	// Schedule job to run every 200ms
 	require.NoError(t, queue.Schedule("recurring-task", nil, jobs.Every(200*time.Millisecond)))
 
-	// Worker lifetime is generous so the poll below has room even when a loaded
-	// CI runner is slow to begin dispatching scheduled fires.
-	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	// Worker lifetime must outlive BOTH polls below, not just the first. The
+	// count poll can spend up to 5s on a loaded runner and the gap poll a further
+	// 4s, so a 6s ceiling could kill the schedule while the second poll was still
+	// waiting for a fire — turning a slow start into a failure. Eventually returns
+	// as soon as its condition holds, so a generous ceiling costs nothing when
+	// things are healthy and only bounds a genuine hang.
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
 	// Start worker with scheduler enabled
@@ -423,26 +427,73 @@ func TestIntegration_SchedulerRecurringJobs(t *testing.T) {
 	count := executionCount.Load()
 	assert.GreaterOrEqual(t, count, int32(3), "Should have multiple executions")
 
-	// Verify executions are spaced apart. Startup jitter (worker pickup
-	// latency, first-fire arriving immediately) can compress the very
-	// first gap below the configured interval, so instead of asserting
-	// on the first pair we require at least one steady-state gap at or
-	// above ~180ms (the 200ms interval minus a small jitter budget).
+	// Verify the schedule's RATE CEILING: it must not fire FASTER than configured.
+	//
+	// Three earlier versions of this assertion were each weaker or flakier than
+	// they looked, and the reasons are worth keeping.
+	//
+	//  1. Snapshotting max-gap the instant the count poll saw its third execution
+	//     measured a still-running schedule and failed on a healthy one.
+	//  2. Polling for "some gap >= 180ms" was WORSE: a longer window gives more
+	//     chances for a spurious gap, so a schedule firing every 5ms PASSED it.
+	//  3. Elapsed-span over nine intervals fixed the discrimination but failed in
+	//     CI on MySQL: "1.579747029s is not greater than or equal to 1.6s", gaps
+	//     [420ms 0s 226ms 230ms 123ms 200ms 200ms 200ms 216ms 186ms]. A span is
+	//     measured BETWEEN TWO DELIVERED FIRES, so it inherits both delivery
+	//     delays: when the first observed fire is delivered ~420ms late and the
+	//     last on time, the span shrinks by that difference. The 0s gap is the
+	//     scheduler correctly firing a boundary it had missed. Nothing was wrong
+	//     with the schedule; the measurement was the wrong shape, and adding
+	//     slack to it only trades one flake rate for another.
+	//
+	// A COUNT over a wall-clock window measured by the TEST has neither problem.
+	// The scheduler only fires at boundaries, so delivery jitter and catch-up can
+	// only ever DELAY a fire into the window or out of it — neither can create
+	// extra fires. The ceiling is therefore immune to the noise that broke (3),
+	// while still being unreachable by a schedule that fires too often: over a
+	// 2s window a 200ms schedule yields ~10, a 100ms schedule ~20, a 50ms ~40 and
+	// a 5ms ~400, against a ceiling of 12.
+	//
+	// The count poll above already asserts LIVENESS (the schedule fires at all);
+	// this asserts the other direction, which is the one a bug in the interval
+	// arithmetic would break.
+	const window = 2 * time.Second
+	const interval = 200 * time.Millisecond
+	// Sit in the MIDDLE of the gap rather than hugging the healthy side. A healthy
+	// 200ms schedule yields ~10 here; every faster mutant saturates at ~19-20,
+	// because the worker's 100ms poll bounds delivery no matter how short the
+	// interval (measured: 5ms -> 20, 50ms -> 19, 100ms -> 20). A ceiling of 12
+	// would leave only two fires of headroom for a stall that catches up several
+	// missed boundaries inside the window — which is exactly the boundary-hugging
+	// that made the previous version flake. 15 keeps every mutant caught by four
+	// or more while giving a healthy run half the window's worth of slack.
+	maxFires := int(window/interval) + 5
+
+	before := executionCount.Load()
+	windowStart := time.Now()
+	time.Sleep(window)
+	fired := int(executionCount.Load() - before)
+	elapsed := time.Since(windowStart)
+
 	mu.Lock()
-	times := make([]time.Time, len(executionTimes))
-	copy(times, executionTimes)
+	observed := make([]time.Time, len(executionTimes))
+	copy(observed, executionTimes)
 	mu.Unlock()
 
-	if len(times) >= 2 {
-		var maxGap time.Duration
-		for i := 1; i < len(times); i++ {
-			if gap := times[i].Sub(times[i-1]); gap > maxGap {
-				maxGap = gap
-			}
-		}
-		assert.GreaterOrEqual(t, maxGap, 180*time.Millisecond,
-			"at least one execution gap should reflect the ~200ms schedule interval")
+	assert.LessOrEqualf(t, fired, maxFires,
+		"a %s schedule fired %d times in %s (ceiling %d): the schedule is running faster than "+
+			"configured (gaps: %v)",
+		interval, fired, elapsed.Round(time.Millisecond), maxFires, gapsBetween(observed))
+}
+
+// gapsBetween renders the observed intervals, so a failure says what the schedule
+// actually did rather than only that a number was too small.
+func gapsBetween(times []time.Time) []time.Duration {
+	out := make([]time.Duration, 0, len(times))
+	for i := 1; i < len(times); i++ {
+		out = append(out, times[i].Sub(times[i-1]).Round(time.Millisecond))
 	}
+	return out
 }
 
 func TestIntegration_ConcurrentWorkers(t *testing.T) {
@@ -468,7 +519,15 @@ func TestIntegration_ConcurrentWorkers(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	workerCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	// The workers live until the test stops them, NOT on a fixed deadline.
+	//
+	// This used to give them a 10s timeout while the wait loop below independently
+	// polled for 100 x 100ms — also 10s. The two expired TOGETHER, so a run that
+	// needed a little longer lost its workers at the same moment it ran out of
+	// patience, and the assertions then reported the shortfall as a product bug.
+	// Measured on Postgres under -race: 5 failures in 25 runs, and the SAME 5/25 on
+	// the preceding commit — pre-existing timing fragility, not a regression.
+	workerCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	// Start 3 workers with concurrency 2 each (6 total concurrent processors)
@@ -477,27 +536,32 @@ func TestIntegration_ConcurrentWorkers(t *testing.T) {
 		go func() { _ = worker.Start(workerCtx) }()
 	}
 
-	// Wait for all jobs to complete
-	for i := 0; i < 100; i++ {
-		completed := 0
-		for j := 0; j < 20; j++ {
-			if _, ok := processedJobs.Load(j); ok {
-				completed++
-			}
-		}
-		if completed == 20 {
-			break
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
+	// WAIT ON STORAGE, NOT ON THE HANDLER MAP.
+	//
+	// processedJobs is written by the handler, which returns BEFORE the worker
+	// records the terminal status (and completion may be group-committed), so the
+	// map filling up does NOT imply 20 completed rows. The old code polled the map
+	// and then asserted the row count immediately — a guaranteed race, and the one
+	// that actually fired: the map was full, GetJobsByStatus returned 18 or 19.
+	//
+	// So poll the REAL invariant. Waiting on a proxy for the thing you assert is
+	// the recurring shape of false-green and flake in this repo alike.
+	//
+	// Measured on Postgres under -race: 5 failures in 25 runs before this, and the
+	// SAME 5/25 on the preceding commit — pre-existing, not a regression. The
+	// budget is generous because it bounds a hang; it is not a perf assertion.
+	require.Eventually(t, func() bool {
+		completedJobs, err := store.GetJobsByStatus(context.Background(), jobs.StatusCompleted, 100)
+		return err == nil && len(completedJobs) == 20
+	}, 60*time.Second, 25*time.Millisecond, "all 20 jobs should reach `completed` in storage")
 
-	// Verify all jobs were processed
+	// Every job ran exactly once, by id — the count above cannot show a duplicate
+	// standing in for a missing one.
 	for i := 0; i < 20; i++ {
 		_, ok := processedJobs.Load(i)
 		assert.True(t, ok, "Job %d should have been processed", i)
 	}
 
-	// Verify jobs in storage are completed
 	completedJobs, err := store.GetJobsByStatus(context.Background(), jobs.StatusCompleted, 100)
 	require.NoError(t, err)
 	assert.Len(t, completedJobs, 20, "All 20 jobs should be completed")

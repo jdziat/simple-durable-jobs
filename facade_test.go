@@ -766,3 +766,49 @@ func TestQueueDeadLetterMethods_ListAndCount(t *testing.T) {
 	require.Len(t, got, 1)
 	assert.Equal(t, id, got[0].ID)
 }
+
+// TestScheduleFacade_ForwardsItsArgumentsFaithfully covers the four timezone-aware
+// schedule re-exports added in this wave.
+//
+// FALSE-GREEN TRAP: a facade function is the easiest thing in a codebase to test
+// vacuously, because "it returns non-nil" passes however the arguments are wired.
+// These four were worse than that — they had NO test at all, and every one could
+// be MIS-WIRED (loc dropped for time.UTC, hour and minute swapped, the weekday
+// ignored) with the root package, ./pkg/... and ./ui/... all green. A facade that
+// silently drops the *time.Location is precisely the bug the underlying fix exists
+// to remove: the schedule runs, at the wrong hour, and nothing says so.
+//
+// So each assertion is on a FIRE INSTANT computed in a zone whose offset makes a
+// dropped or swapped argument arithmetically impossible to miss.
+func TestScheduleFacade_ForwardsItsArgumentsFaithfully(t *testing.T) {
+	ny, err := time.LoadLocation("America/New_York")
+	require.NoError(t, err)
+	// Noon UTC on 2026-07-20 is 08:00 in New York, so the next 09:00 New York is
+	// later that SAME day — 13:00Z. Dropping loc for UTC yields 09:00Z, four hours
+	// and (for the daily/weekly cases) a different day.
+	from := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
+	want := time.Date(2026, 7, 20, 9, 0, 0, 0, ny).UTC()
+
+	cron, err := jobs.CronIn(ny, "0 9 * * *")
+	require.NoError(t, err)
+	assert.Equal(t, want, cron.Next(from).UTC(), "CronIn must forward the location")
+
+	assert.Equal(t, want, jobs.MustCronIn(ny, "0 9 * * *").Next(from).UTC(),
+		"MustCronIn must forward the location")
+
+	assert.Equal(t, want, jobs.DailyIn(ny, 9, 0).Next(from).UTC(),
+		"DailyIn must forward the location, the hour and the minute in that order")
+
+	// 2026-07-20 is a Monday; the next Tuesday 09:00 New York is 2026-07-21 13:00Z.
+	assert.Equal(t, time.Date(2026, 7, 21, 9, 0, 0, 0, ny).UTC(),
+		jobs.WeeklyIn(ny, time.Tuesday, 9, 0).Next(from).UTC(),
+		"WeeklyIn must forward the location, the weekday, the hour and the minute")
+
+	// A minute that differs from the hour, so a swap is visible.
+	assert.Equal(t, time.Date(2026, 7, 20, 9, 30, 0, 0, ny).UTC(),
+		jobs.DailyIn(ny, 9, 30).Next(from).UTC(),
+		"DailyIn(hour, minute) must not be transposed")
+
+	_, err = jobs.CronIn(nil, "0 9 * * *")
+	assert.Error(t, err, "CronIn must surface the nil-location error rather than swallowing it")
+}

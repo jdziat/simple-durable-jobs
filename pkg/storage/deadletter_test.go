@@ -31,10 +31,11 @@ func TestDeadLetterMetadata_TerminalFailureOnlyAndRequeueClears(t *testing.T) {
 	assert.Contains(t, failed.DeadLetterReason, "max retries exhausted:")
 	assert.NotContains(t, failed.DeadLetterReason, "password=secret")
 	require.NotNil(t, failed.CompletedAt)
-	// completed_at is now written on the DB clock (retention parity) while
-	// dead_lettered_at remains wall-clock; both are set in the same terminal
-	// UPDATE, so a generous tolerance absorbs any worker<->DB skew without
-	// asserting two distinct clocks agree to the second.
+	// Both are now written through nowWriteValue in the same terminal UPDATE — the
+	// DB clock on Postgres/MySQL, UTC on SQLite (see deadLetterOrderColumn for why
+	// dead_lettered_at joined it). The generous tolerance stays: on the DB-clock
+	// backends NOW() is evaluated per statement inside one transaction, and this
+	// asserts they describe the same event, not that two reads agree to the second.
 	assert.WithinDuration(t, *failed.CompletedAt, *failed.DeadLetteredAt, time.Minute)
 
 	retryable := &core.Job{Type: "dlq.retryable", Queue: "critical", MaxRetries: 2}

@@ -2417,8 +2417,18 @@ type ScheduledJobInfo struct {
 	// expected_last_run is the most-recent boundary that should have fired but did
 	// not. Set only when overdue; unset when healthy or never-fired.
 	ExpectedLastRun *timestamppb.Timestamp `protobuf:"bytes,8,opt,name=expected_last_run,json=expectedLastRun,proto3" json:"expected_last_run,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// never_fires is true when the schedule has NO future boundary at all — an
+	// unsatisfiable cron such as "0 0 30 2 *". The worker detects the same condition
+	// and permanently skips the schedule, logging it once.
+	//
+	// It is a distinct state from overdue, not a special case of it: overdue means
+	// boundaries that SHOULD have fired did not, and a schedule that can never fire
+	// has no such boundaries. Reporting it as overdue would contradict that field's
+	// meaning; reporting it as neither left the dashboard rendering the schedule as
+	// healthy, which is what this field fixes. next_run is unset when it is true.
+	NeverFires    bool `protobuf:"varint,9,opt,name=never_fires,json=neverFires,proto3" json:"never_fires,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *ScheduledJobInfo) Reset() {
@@ -2505,6 +2515,13 @@ func (x *ScheduledJobInfo) GetExpectedLastRun() *timestamppb.Timestamp {
 		return x.ExpectedLastRun
 	}
 	return nil
+}
+
+func (x *ScheduledJobInfo) GetNeverFires() bool {
+	if x != nil {
+		return x.NeverFires
+	}
+	return false
 }
 
 type GetWorkflowRequest struct {
@@ -3062,7 +3079,7 @@ const file_jobs_v1_jobs_proto_rawDesc = "" +
 	"\adeleted\x18\x01 \x01(\x03R\adeleted\"\x1a\n" +
 	"\x18ListScheduledJobsRequest\"J\n" +
 	"\x19ListScheduledJobsResponse\x12-\n" +
-	"\x04jobs\x18\x01 \x03(\v2\x19.jobs.v1.ScheduledJobInfoR\x04jobs\"\xcb\x02\n" +
+	"\x04jobs\x18\x01 \x03(\v2\x19.jobs.v1.ScheduledJobInfoR\x04jobs\"\xec\x02\n" +
 	"\x10ScheduledJobInfo\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x1a\n" +
 	"\bschedule\x18\x02 \x01(\tR\bschedule\x12\x14\n" +
@@ -3071,7 +3088,9 @@ const file_jobs_v1_jobs_proto_rawDesc = "" +
 	"\blast_run\x18\x05 \x01(\v2\x1a.google.protobuf.TimestampR\alastRun\x12\x18\n" +
 	"\aoverdue\x18\x06 \x01(\bR\aoverdue\x12!\n" +
 	"\fmissed_fires\x18\a \x01(\x03R\vmissedFires\x12F\n" +
-	"\x11expected_last_run\x18\b \x01(\v2\x1a.google.protobuf.TimestampR\x0fexpectedLastRun\"+\n" +
+	"\x11expected_last_run\x18\b \x01(\v2\x1a.google.protobuf.TimestampR\x0fexpectedLastRun\x12\x1f\n" +
+	"\vnever_fires\x18\t \x01(\bR\n" +
+	"neverFires\"+\n" +
 	"\x12GetWorkflowRequest\x12\x15\n" +
 	"\x06job_id\x18\x01 \x01(\tR\x05jobId\"\xab\x01\n" +
 	"\x13GetWorkflowResponse\x12 \n" +

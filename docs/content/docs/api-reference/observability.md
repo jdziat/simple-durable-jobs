@@ -5,7 +5,7 @@ weight: 10
 
 ## OpenTelemetry Tracing
 
-### `otel.Instrument(q *Queue, opts ...otel.Option)`
+### `otel.Instrument(q *queue.Queue, opts ...otel.InstrumentOption)`
 
 Imports:
 

@@ -31,6 +31,17 @@ var ErrUnsupportedWorkflowVersion = errors.New("jobs: unsupported workflow versi
 // phase sharing it would collide with and clobber a version marker.
 var ErrReservedPhaseName = fmt.Errorf("jobs: phase name uses the reserved %q prefix", versionCheckpointPrefix)
 
+// ErrDuplicatePhaseName is returned by the phase-checkpoint APIs when a run
+// saves a SECOND phase under a name it already saved. The name IS the
+// checkpoint's identity (CallIndex -1 plus the name), so the second save would
+// overwrite the first and leave two distinct phases sharing one record — after
+// which a replay skips both, including one whose body never ran. Calls cannot
+// collide this way: each carries its own ascending CallIndex.
+//
+// Reusing a name across RUNS is replay and stays allowed. The returned error is
+// wrapped NoRetry: see duplicatePhaseNameError.
+var ErrDuplicatePhaseName = errors.New("jobs: phase name already saved in this run")
+
 // JobFromContext returns the current Job from context, or nil if not in a job handler.
 // Use this to get the job ID for logging or progress tracking.
 func JobFromContext(ctx context.Context) *core.Job {
@@ -56,6 +67,31 @@ func JobIDFromContext(ctx context.Context) core.UUID {
 // On replay it returns the previously recorded version, even if maxSupported has
 // since increased. If the recorded version is outside [minSupported,
 // maxSupported], ErrUnsupportedWorkflowVersion is returned.
+//
+// A run that was ALREADY IN FLIGHT when the marker was deployed has no marker to
+// replay, because the code that produced its checkpoints never called
+// GetVersion. Such a run is pinned to DefaultVersion rather than handed
+// maxSupported: it is detected by the durable evidence it carries — an indexed
+// checkpoint (Call, fan-out, signal wait, sleep) recorded by an earlier
+// execution at or beyond the call cursor GetVersion is standing on, which only a
+// run that already executed past this point can have. DefaultVersion is then
+// recorded like any other, so every later replay of that run reads it back from
+// the marker. This is what lets an in-flight run keep its originally recorded
+// path; handing it maxSupported instead makes it issue the NEW branch's Call at
+// an index whose checkpoint holds the OLD call's type, which is a determinism
+// violation on every attempt until the job dead-letters.
+//
+// If DefaultVersion falls outside [minSupported, maxSupported] — the second
+// deploy, which drops the old branch by raising minSupported — an in-flight run
+// gets ErrUnsupportedWorkflowVersion and nothing is recorded, rather than
+// silently taking a branch its checkpoints cannot support.
+//
+// The detection is evidence-based and one-sided: a run that passed this point
+// without recording ANY indexed durable step at or after it is indistinguishable
+// from a first execution and receives maxSupported. That is harmless — there is
+// no recorded step at those indices for the new branch to collide with. It is
+// also why the marker belongs BEFORE the durable operations it guards, not after
+// them.
 //
 // Version markers are stored at CallIndex -1 with an internal CallType prefix,
 // so they do not collide with phase checkpoints and are ignored by Strict
@@ -91,7 +127,20 @@ func GetVersion(ctx context.Context, changeID string, minSupported, maxSupported
 		return recorded, nil
 	}
 
-	resultBytes, err := json.Marshal(maxSupported)
+	// No marker. Either this is genuinely the first execution to reach this
+	// point (record maxSupported), or an earlier execution already ran past it
+	// under code that had no marker to record (pin to DefaultVersion). See the
+	// godoc for why HasUnreachedCallCheckpoints separates the two soundly.
+	record := maxSupported
+	if cs.HasUnreachedCallCheckpoints() {
+		record = DefaultVersion
+		if record < minSupported || record > maxSupported {
+			return 0, fmt.Errorf("%w: change %q is reached by a run whose durable steps predate the marker, which pins it to version %d, outside supported range [%d, %d]",
+				ErrUnsupportedWorkflowVersion, changeID, record, minSupported, maxSupported)
+		}
+	}
+
+	resultBytes, err := json.Marshal(record)
 	if err != nil {
 		return 0, fmt.Errorf("marshal workflow version: %w", err)
 	}
@@ -111,13 +160,14 @@ func GetVersion(ctx context.Context, changeID string, minSupported, maxSupported
 	cs.Checkpoints[key] = cp
 	cs.Mu.Unlock()
 
-	return maxSupported, nil
+	return record, nil
 }
 
 // SavePhaseCheckpoint saves a phase result to the checkpoint store.
 // The phase name is used as the CallType for lookup on resume.
 // Returns nil if not running within a job handler. Returns ErrReservedPhaseName
-// if phaseName uses the reserved "jobs.version:" prefix.
+// if phaseName uses the reserved "jobs.version:" prefix, or
+// ErrDuplicatePhaseName if this run already saved a phase under that name.
 //
 // On success the result is also reflected in the in-memory call state, so a
 // LoadPhaseCheckpoint later in the SAME run returns it (mirroring GetVersion).
@@ -143,14 +193,24 @@ func SavePhaseCheckpoint(ctx context.Context, phaseName string, result any) erro
 		Result:    resultBytes,
 	}
 
+	// Refuse a name this run already used rather than upsert over the earlier
+	// phase, the way Schedule refuses a duplicate schedule name.
+	cs := intctx.GetCallState(ctx)
+	if cs != nil && !cs.ReservePhaseName(phaseName) {
+		return duplicatePhaseNameError(phaseName)
+	}
+
 	if err := jc.SaveCheckpoint(ctx, cp); err != nil {
+		if cs != nil {
+			cs.ReleasePhaseName(phaseName)
+		}
 		return err
 	}
 
 	// Reflect the just-saved checkpoint in the in-memory call state so a same-run
 	// LoadPhaseCheckpoint returns it instead of (zero,false). GetVersion does the
 	// same write-back for its version markers.
-	if cs := intctx.GetCallState(ctx); cs != nil {
+	if cs != nil {
 		cs.Mu.Lock()
 		cs.Checkpoints[intctx.CheckpointKey{Index: -1, Type: phaseName}] = cp
 		cs.Mu.Unlock()
@@ -162,13 +222,37 @@ func SavePhaseCheckpoint(ctx context.Context, phaseName string, result any) erro
 // transaction. Unlike SavePhaseCheckpoint, it returns an error outside a job
 // handler because silently skipping a transactional checkpoint would break the
 // caller's atomicity guarantee. Returns ErrReservedPhaseName if phaseName uses
-// the reserved "jobs.version:" prefix.
+// the reserved "jobs.version:" prefix, or ErrDuplicatePhaseName if this run
+// already saved a phase under that name.
+//
+// The duplicate-name claim is taken when the row is written, which a later
+// ROLLBACK cannot take back — the rollback happens in the caller's transaction,
+// invisible here. Retrying the phase after a rollback therefore has to go
+// through a replay: return the error and let the job run again, which is also
+// what makes the retry see the rolled-back state.
 //
 // Unlike SavePhaseCheckpoint, it does NOT update the in-memory call state: the
 // write is bound to the caller's transaction, which may not be committed yet (or
 // may roll back), so caching it as visible would be unsound. A same-run
 // LoadPhaseCheckpoint therefore will not observe it; the value is read back on
 // the next replay after the caller commits.
+//
+// NOT OWNERSHIP-FENCED. The checkpoint write carries no locked_by/status
+// predicate, so it succeeds even when this worker no longer owns the job — its
+// lease lapsed and the stale-lock reaper handed the job to a peer, or an operator
+// cancelled it. Every checkpoint write in the library behaves this way
+// (SaveCheckpoint too); it is not specific to the transactional form.
+//
+// What that means in practice: the atomic pairing is still honoured — your effect
+// and the checkpoint recording it commit or roll back together — so a peer
+// replaying the job skips a phase whose effect genuinely happened. What it does
+// NOT do is stop a handler that has lost its lease from committing at all. The
+// worker's ownership audit interrupts such a handler within a few seconds
+// (FindOrphanedJobs), but a transaction already in flight can still land.
+//
+// If your phase must not commit after cancellation, check ctx.Err() immediately
+// before committing, and prefer effects that are safe to observe once even if the
+// job is later cancelled.
 func SavePhaseCheckpointTx(ctx context.Context, tx *gorm.DB, phaseName string, result any) error {
 	jc := intctx.GetJobContext(ctx)
 	if jc == nil {
@@ -196,7 +280,18 @@ func SavePhaseCheckpointTx(ctx context.Context, tx *gorm.DB, phaseName string, r
 		Result:    resultBytes,
 	}
 
-	return txCheckpointer.SaveCheckpointTx(ctx, tx, cp)
+	cs := intctx.GetCallState(ctx)
+	if cs != nil && !cs.ReservePhaseName(phaseName) {
+		return duplicatePhaseNameError(phaseName)
+	}
+
+	if err := txCheckpointer.SaveCheckpointTx(ctx, tx, cp); err != nil {
+		if cs != nil {
+			cs.ReleasePhaseName(phaseName)
+		}
+		return err
+	}
+	return nil
 }
 
 // ErrPhaseCheckpointDecode is returned by LoadPhaseCheckpointErr when a phase
@@ -255,6 +350,15 @@ func LoadPhaseCheckpointErr[T any](ctx context.Context, phaseName string) (T, bo
 		return zero, false, fmt.Errorf("%w: phase %q: %v", ErrPhaseCheckpointDecode, phaseName, err)
 	}
 	return result, true, nil
+}
+
+// duplicatePhaseNameError reports the duplicate as terminal. Retrying cannot
+// help — the name is wrong in the code — and it actively hides the defect: the
+// retry replays the first phase's checkpoint for BOTH phases, skips them both
+// and completes, which is the silent outcome this refusal exists to prevent.
+// Strict determinism's violation reports the same way.
+func duplicatePhaseNameError(phaseName string) error {
+	return core.NoRetry(fmt.Errorf("%w: %q", ErrDuplicatePhaseName, phaseName))
 }
 
 func versionCheckpointType(changeID string) string {

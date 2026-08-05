@@ -574,8 +574,8 @@
   {:else if confirmState?.kind === 'requeue'}
     <ConfirmDialog
       title="Requeue dead-lettered job"
-      body="Requeue this dead-lettered job? This clears the dead-letter state and queues it again while preserving existing checkpoints. The CLI sdj dlq requeue command replays from scratch; this dashboard action resumes from checkpoints."
-      blastRadius={`Requeues ${confirmState.id}. Previously saved checkpoints remain available for replay.`}
+      body="Requeue this dead-lettered job? This clears the dead-letter state and replays the job FROM SCRATCH: its saved checkpoints are deleted, so every step runs again — including steps that already succeeded. If a completed step had an external side effect, such as a charge or an email, it happens again unless the handler is idempotent. The CLI sdj dlq requeue command does exactly the same thing."
+      blastRadius={`Requeues ${confirmState.id}. Deletes its saved checkpoints — already-completed steps will run again.`}
       confirmWord="REQUEUE"
       confirmLabel="Requeue"
       onConfirm={confirmRequeue}

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"time"
 
 	"github.com/jdziat/simple-durable-jobs/v4/pkg/core"
@@ -12,6 +13,27 @@ import (
 	"github.com/jdziat/simple-durable-jobs/v4/pkg/internal/handler"
 	"github.com/jdziat/simple-durable-jobs/v4/pkg/security"
 )
+
+// staticResultShape fingerprints T's STATIC type.
+//
+// reflect.TypeOf(zeroOfT) would be wrong: for an interface T — Call[any], which
+// Call's godoc explicitly supports — the zero value is a nil interface and
+// reflect.TypeOf returns nil, so the STATIC type never reaches the fingerprint at
+// all and this function could not tell an interface result from a nil type.
+//
+// Taking the element type of a nil *T gives the declared type in every case,
+// interfaces included, and never returns nil. The DECISION about interfaces then
+// belongs to one place — result_fingerprint.go's `case reflect.Interface`, which
+// records no shape and is documented in UPGRADE.md as an accepted miss — instead
+// of being an accident of which reflect call this line happens to use.
+//
+// Both routes currently produce "" for an interface result. That is not a reason
+// to simplify this: the empty fingerprint here would then be a coincidence of a
+// nil type rather than a stated policy, and the next change to that policy would
+// have to be made in two places to take effect.
+func staticResultShape[T any]() string {
+	return resultFingerprint(reflect.TypeOf((*T)(nil)).Elem())
+}
 
 // checkpointIndexCleaner is an optional storage capability used to clear an
 // orphaned prior-type checkpoint at one call index during a BestEffortReplay
@@ -156,6 +178,40 @@ func CallWithCheckpointCtx[T any](execCtx, checkpointCtx context.Context, name s
 				time.Duration(checkpoint.ErrorDelayNanos),
 			)
 		}
+		// A result type that CHANGED since the checkpoint was written decodes
+		// cleanly into the new type — unknown fields are ignored and absent ones
+		// stay zero — so without this the caller silently receives an empty result
+		// and a nil error, and the workflow completes carrying it. Changing the call
+		// NAME has always been caught loudly; this closes the same hole for the
+		// result type.
+		//
+		// An EMPTY stored shape is a checkpoint written before the column existed:
+		// skipped, so work already in flight replays exactly as before.
+		//
+		// An EMPTY shape for the type being replayed INTO is skipped for the same
+		// reason, and the omission was a false fire. "" is not a shape, it is the
+		// absence of one — a type whose shape could not be computed (a channel
+		// member, a marshaler that rejects or panics on the probe, or one whose
+		// wire form is assembled from unexported state the probe cannot populate).
+		// Comparing it as
+		// though it were a shape rejected every replay whose result type merely
+		// STOPPED being computable, e.g. the `netip.Addr -> net.IP` direction of a
+		// modernization that cannot move a byte on the wire. UPGRADE.md's rule is
+		// symmetric and this now is too: a type whose shape cannot be computed must
+		// never be able to fail a replay, on either side of the comparison.
+		if want := staticResultShape[T](); want != "" && checkpoint.ResultShape != "" && checkpoint.ResultShape != want {
+			if !jc.BestEffortReplay {
+				return zero, fmt.Errorf(
+					"jobs.Call determinism violation at index %d: the checkpointed result for call %q was written from a different result type (shape %s, now %s); "+
+						"decoding it would return a zero value with no error",
+					callIndex, name, checkpoint.ResultShape, want)
+			}
+			if jc.Logger != nil {
+				jc.Logger.Warn("jobs.Call best-effort replay: checkpoint result type changed, decoding anyway",
+					"index", callIndex, "call", name, "job_id", jc.Job.ID,
+					"checkpoint_shape", checkpoint.ResultShape, "requested_shape", want)
+			}
+		}
 		var result T
 		if err := json.Unmarshal(checkpoint.Result, &result); err != nil {
 			return zero, fmt.Errorf("failed to unmarshal checkpoint: %w", err)
@@ -237,6 +293,9 @@ func CallWithCheckpointCtx[T any](execCtx, checkpointCtx context.Context, name s
 		CallIndex: callIndex,
 		CallType:  name,
 		SpanEnd:   spanEnd,
+		// Recorded HERE, where the result type is known for certain. Replay cannot
+		// recover this from the stored bytes — see resultFingerprint's comment.
+		ResultShape: staticResultShape[T](),
 	}
 
 	if err != nil {

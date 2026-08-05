@@ -32,11 +32,17 @@ Thumbs.db
 .env.local
 *.local
 
-# Database files (test artifacts)
+# Database files (test artifacts). `*.db` alone is not enough: a scratch DB named
+# `sqlite.db.tmp` matched none of these patterns and was committed at the module
+# root, 221 KB of it, one commit after the CI guard for exactly this was added.
 *.db
 *.db-journal
 *.db-shm
 *.db-wal
+*.db.*
+*.sqlite
+*.sqlite3
+*.tmp
 
 # Build output
 /dist/
@@ -51,9 +57,21 @@ bin/
 ui/frontend/buf.yaml
 ui/frontend/proto
 
-# Hugo build output
-public/
-resources/
+# Compiled binaries from `go build ./...` at the repo root. This is a LIBRARY:
+# a Go module zip contains every file under the module root, so a stray binary is
+# downloaded by every `go get` and, because module versions are IMMUTABLE in the
+# proxy, cannot be withdrawn afterwards. One slipped in this way and inflated the
+# published zip 7.7x before it was caught.
+/upgradematrix
+/simple-durable-jobs
+/sdj
+
+# Hugo build output. Anchored to docs/ on purpose: a bare `public/` also matched
+# ui/frontend/public/, which is Vite's static-asset directory and IS source --
+# so the dashboard's favicon was silently excluded from the repo and reappeared
+# missing in every clean build.
+docs/public/
+docs/resources/
 .hugo_build.lock
 
 # Temporary files
@@ -70,11 +88,22 @@ docs/static/demo/
 ui/frontend/playwright-report/
 ui/frontend/test-results/
 
-# Compiled binaries
+# Compiled binaries. ANCHOR every one of these to its path. A bare
+# `e2etestserver` sat here and matched the DIRECTORY ui/cmd/e2etestserver/, so any
+# NEW file added there was silently ignored -- byte-for-byte the `public/` bug
+# fixed a few lines down, which swallowed Vite's static-asset source directory.
+# The already-tracked main.go masked it: `git check-ignore` on a new sibling shows
+# it immediately.
 /jobsui
 ui/cmd/jobsui/jobsui
 ui/cmd/e2etestserver/e2etestserver
-e2etestserver
+# The ROOT-level artifact from `go build ./ui/cmd/e2etestserver/`, anchored with a
+# leading slash like /jobsui and /chaostest above. The pattern here used to be a
+# bare `e2etestserver`, which covered this AND -- accidentally -- the whole
+# ui/cmd/e2etestserver/ SOURCE directory. Removing the bare form without adding
+# this anchored one immediately let a 23 MB ELF into a commit. Both halves are
+# needed; neither is redundant.
+/e2etestserver
 /chaostest
 cmd/chaostest/chaostest
 /sdj

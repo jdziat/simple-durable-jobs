@@ -26,7 +26,7 @@ mux.Handle("/jobs/", http.StripPrefix("/jobs", ui.Handler(storage,
 |--------|-------------|
 | `WithQueue(q)` | Provides queue for event streaming and scheduled jobs view |
 | `WithContext(ctx)` | Lifecycle context for background goroutines; when cancelled, workers flush and exit |
-| `WithStatsRetention(d)` | How long stats rows are kept (default: 7 days) |
+| `WithStatsRetention(d)` | How long stats rows are kept (default: 31 days, covering the dashboard's longest 30d window) |
 | `WithMiddleware(mw)` | Wraps handler with middleware (auth, logging, etc.) |
 
 ---

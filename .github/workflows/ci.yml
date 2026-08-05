@@ -121,7 +121,7 @@ jobs:
 
       - name: Build frontend
         working-directory: ui/frontend
-        run: npm install && npm run build
+        run: npm ci && npm run build
 
       - name: Download Go dependencies
         run: go mod download
@@ -146,7 +146,159 @@ jobs:
     name: Lint
     runs-on: ubuntu-latest
     steps:
+      # fetch-depth: 0 so the upgrade-matrix step below can resolve the previous
+      # release tag; the default shallow clone carries no tags at all.
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+
+      # A committed conflict marker had NO gate: `go build/vet/test ./...` covers
+      # only the root module, so docs/ (its own go.mod) is never compiled, and
+      # Hugo renders a conflict marker as ordinary text without erroring — so
+      # pages.yml would have published it to the live docs site on merge. It
+      # happened: markers survived a release-branch merge into two published
+      # pages, and one of them put `return err` inside `func main()`.
+      #
+      # The pattern is anchored to line start, and is BUILT rather than written
+      # literally so this file is scanned like any other — an earlier version
+      # excluded this workflow to stop the comment self-tripping, which meant a
+      # real marker here would never have been found.
+      #
+      # FAILS CLOSED: git grep exits 0 on a match, 1 on none, and >1 on an actual
+      # error. Only 1 is a pass; anything else fails the build rather than being
+      # silently read as "clean".
+      #
+      # KNOWN FALSE POSITIVE, accepted knowingly: a Markdown setext heading
+      # underlined with EXACTLY seven `=` is indistinguishable from a conflict
+      # marker at this level, and the Hugo docs this gate protects are Markdown.
+      # Eight or more is fine, which will look arbitrary to whoever hits it. It
+      # fails closed (a confusing red build, never a silent pass), so it is left as
+      # is rather than made cleverer; if you hit it, use a `##` heading.
+      - name: No committed conflict markers
+        run: |
+          set -uo pipefail
+          pat="^($(printf '<%.0s' $(seq 7))|$(printf '=%.0s' $(seq 7))|$(printf '>%.0s' $(seq 7)))( |$)"
+          # errexit OFF around the scan: GitHub runs steps as `bash -e`, and
+          # git grep exits 1 for "no match", which would kill the step before
+          # $? could be read — reporting a clean tree as a failure.
+          set +e
+          # ui/frontend/dist is NOT excluded. It is tracked and //go:embed'd, so a
+          # marker there ships inside the module zip and breaks the dashboard
+          # bundle for every consumer — the one place a marker does the most damage
+          # is the last place to skip.
+          git grep -nE "$pat" -- .
+          status=$?
+          set -e
+          case "$status" in
+            0) echo "::error::unresolved merge-conflict markers are committed (listed above)"; exit 1 ;;
+            1) echo "no conflict markers" ;;
+            *) echo "::error::conflict-marker scan failed (git grep exit $status)"; exit "$status" ;;
+          esac
+
+      # A Go module zip contains EVERY file under the module root, so anything
+      # tracked here is downloaded by every `go get` -- and module versions are
+      # IMMUTABLE in the proxy, so a mistake cannot be withdrawn afterwards, only
+      # superseded. .gitignore alone cannot prevent this because it only covers
+      # names someone predicted.
+      #
+      # It classifies by scanning for a NUL byte, which is the same heuristic git
+      # uses but without git's attribute layer on top. HONEST LIMIT: a binary
+      # containing no NUL at all is not detected by content — the size gate below
+      # is the backstop for that, and the extension allowlist means an ELF named
+      # `logo.png` also passes. This is a good filter, not a proof.
+      #
+      # The first version of this step matched a LIST of magic bytes (ELF, Mach-O,
+      # PE, ar, wasm). That reproduced the very flaw it criticised .gitignore for:
+      # one commit later a 221 KB `sqlite.db.tmp` was committed at the module root
+      # and this step passed green, because "SQLite format 3" was not a format
+      # anyone had thought to list.
+      #
+      # So it is INVERTED: git itself decides what is binary (`git grep -I`, the
+      # same NUL-byte heuristic used for diffs), and only an explicit allowlist of
+      # asset extensions is permitted. An unrecognised binary format is now a
+      # failure by default rather than a pass by default. Adding a genuine new
+      # asset type means adding it here, on purpose.
+      - name: No committed binaries outside the asset allowlist
+        run: |
+          set -uo pipefail
+          found=""
+          # -z / read -d '': without them git C-QUOTES any path containing a
+          # non-ASCII or control character, emitting the literal "sub/caf\303\251.bin".
+          # [ -f "$f" ] then fails on that string and the loop skips the file --
+          # so the guard was evadable by FILENAME, which is the same
+          # "only covers what someone predicted" flaw it was rewritten to fix,
+          # moved from formats to paths. Reproduced with identical ELF bytes under
+          # two names: the ASCII one was caught, the accented one passed.
+          while IFS= read -r -d '' f; do
+            # SYMLINKS FIRST: -f dereferences, so a link to /bin/ls looks like a
+            # regular file, while `git grep -I` does not search link entries at all
+            # and its "no match" reads as "binary". A committed symlink would red
+            # the release with a message naming the wrong problem.
+            [ -L "$f" ] && continue
+            [ -f "$f" ] || continue
+            # An EMPTY file has no character to match, so the grep below would call
+            # it binary and red the Lint job over a .gitkeep. Skip zero-byte files
+            # explicitly: they cannot be a compiled artifact.
+            [ -s "$f" ] || continue
+            case "$f" in
+              *.png|*.jpg|*.jpeg|*.gif|*.ico|*.webp|*.woff|*.woff2|*.ttf|*.otf|*.eot) continue ;;
+            esac
+            # -I treats binary files as non-matching, so a file with NO match is
+            # one git considers binary. The pattern is "^" (start of line), which
+            # every line of every text file has -- "." would miss a file that is
+            # only blank lines and report it as binary.
+            # Scan the BYTES; do not ask git. `git grep -I` consults the `diff`
+            # gitattribute before its own NUL heuristic, so the same commit that
+            # carries a payload can reclassify it: one line of `* diff` in
+            # .gitattributes made a committed ELF pass cleanly, and `path -diff`
+            # made a 22-byte text file red the build. A guard whose verdict the
+            # committer controls is not a guard. This also removes three separate
+            # filename evasions the git delegation kept producing (C-quoted paths,
+            # glob pathspecs, leading dashes) — `--` and a direct read have no
+            # such surface.
+            #
+            # NUL-in-file is the classifier. NOT `grep -P '\x00'`: PCRE cannot
+            # match NUL in several grep builds, so that silently matches nothing
+            # and the check passes on everything — a detector that is inert is
+            # worse than none.
+            # Bounded read. The size gate below rejects anything over 1 MiB, so a
+            # file that reaches here is small — but ordering is not a guarantee, and
+            # `cat`ing a hypothetical 300 MB blob twice would stall the Lint job
+            # before the size gate ever ran. head -c bounds it explicitly.
+            sz=$(stat -c%s -- "$f")
+            [ "$sz" -gt 1048576 ] && continue   # the size gate owns these
+            raw=$(head -c 1048576 -- "$f" | wc -c)
+            stripped=$(head -c 1048576 -- "$f" | tr -d '\000' | wc -c)
+            if [ "$raw" -ne "$stripped" ]; then
+              found="$found $f(${sz}B)"
+            fi
+          done < <(git ls-files -z)
+          if [ -n "$found" ]; then
+            echo "::error::binary files are committed outside the asset allowlist:$found"
+            echo "If one is a genuine asset, add its extension to the allowlist in this step."
+            exit 1
+          fi
+          echo "no committed binaries outside the asset allowlist"
+
+          # SIZE, not just format. The incident this whole step exists for was
+          # module-zip inflation -- a 14.5 MB binary, 7.7x -- and a committed 14 MB
+          # of TEXT (a JSON dump, a base64 payload, a giant fixture) does the same
+          # damage while passing every check above. Module versions are IMMUTABLE
+          # in the proxy, so it cannot be withdrawn afterwards.
+          big=""
+          while IFS= read -r -d '' f; do
+            [ -L "$f" ] && continue
+            [ -f "$f" ] || continue
+            sz=$(stat -c%s -- "$f")
+            if [ "$sz" -gt 1048576 ]; then big="$big $f($((sz/1024))KiB)"; fi
+          done < <(git ls-files -z)
+          if [ -n "$big" ]; then
+            echo "::error::files over 1 MiB are committed:$big"
+            echo "Everything tracked here ships in the module zip to every consumer."
+            echo "If one is genuinely needed, raise the threshold in this step deliberately."
+            exit 1
+          fi
+          echo "no committed file over 1 MiB"
 
       - name: Set up Go
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
@@ -160,7 +312,69 @@ jobs:
 
       - name: Build frontend
         working-directory: ui/frontend
-        run: npm install && npm run build
+        run: npm ci && npm run build
+
+      # svelte-check existed as an npm script and NOTHING ran it, so TypeScript
+      # errors in the dashboard shipped silently — the same "present, and
+      # load-bearing for nobody" shape as the frontend unit tests below. Four real
+      # errors had accumulated in a test file by the time this was added; the tree
+      # is at 0 errors / 0 warnings across 428 files as of this commit, so any
+      # failure here is new.
+      #
+      # `vite build` does NOT typecheck (esbuild strips types without checking
+      # them), so the build passing says nothing about type correctness. This is
+      # the only gate that does.
+      - name: Frontend typecheck
+        working-directory: ui/frontend
+        run: npm run check
+
+      # ui/frontend/dist is COMMITTED and //go:embed'd, so it is what consumers
+      # actually get — but nothing ever compared it to its own source. A stale
+      # bundle would ship silently through go:embed while CI stayed green, because
+      # CI rebuilds from source and tests the REBUILT copy, never the committed
+      # one. Same shape as the frontend unit tests that existed but were never run:
+      # present, and load-bearing for nobody.
+      #
+      # The build is deterministic (verified byte-identical across rebuilds, all
+      # seven files) and the single committed lockfile is installed with `npm ci`,
+      # so a diff here means the committed bundle genuinely does not match its
+      # source. (There used to be TWO lockfiles pinning different Svelte
+      # compilers, which would have made this gate fail for whichever maintainer
+      # did not happen to use the same package manager as CI.)
+      - name: Committed frontend bundle matches its source
+        run: |
+          # `git status --porcelain`, NOT `git diff`: diff only sees TRACKED files,
+          # so a brand-new asset the build emits (a favicon, a font) shows up as
+          # untracked and the check would pass while go:embed ships the bundle
+          # WITHOUT it. That is the exact shape of the favicon bug this same wave
+          # fixed, one layer up.
+          drift="$(git status --porcelain -- ui/frontend/dist)"
+          if [ -n "$drift" ]; then
+            echo "::error::ui/frontend/dist does not match a fresh build of its source."
+            echo "It is committed and go:embed'd, so the dashboard consumers get is the stale one."
+            echo "Fix: (cd ui/frontend && npm run build) and commit the result."
+            echo "$drift"
+            exit 1
+          fi
+          echo "committed bundle matches a fresh build"
+
+      # The frontend unit tests existed but NOTHING RAN THEM: no workflow invoked
+      # vitest, so every assertion in ui/frontend/src/**/*.test.ts was decorative
+      # in CI and a regression there was invisible. That included the RPC base-URL
+      # resolution the dashboard's sub-path mount depends on.
+      - name: Frontend unit tests
+        working-directory: ui/frontend
+        run: npm run test:unit
+
+      # Cross-version upgrade guard. Two review rounds running, the worst defects
+      # in this line were fixes that were correct against a FRESH database and
+      # silently broke deployments whose rows an older binary had written — every
+      # ordinary test starts from an empty database, so none of them could see it.
+      # This builds the previous release, lets it populate a SQLite file, then
+      # points this tree's binary at that same file and checks the schedules still
+      # fire. The job's checkout uses fetch-depth 0 so the baseline tag resolves.
+      - name: Upgrade matrix (previous release -> HEAD)
+        run: ./scripts/upgrade-matrix.sh
 
       - name: golangci-lint
         uses: golangci/golangci-lint-action@9fae48acfc02a90574d7c304a1758ef9895495fa # v7.0.1
@@ -290,7 +504,7 @@ jobs:
 
       - name: Build frontend
         working-directory: ui/frontend
-        run: npm install && npm run build
+        run: npm ci && npm run build
 
       - name: Build
         run: go build -v ./...

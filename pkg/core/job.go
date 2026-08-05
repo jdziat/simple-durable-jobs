@@ -1,6 +1,7 @@
 package core
 
 import (
+	"strings"
 	"time"
 )
 
@@ -36,6 +37,20 @@ func (s JobStatus) IsTerminal() bool {
 	return false
 }
 
+// ActiveDedupStatuses are the statuses in which a job still HOLDS a
+// queue.Unique(key) guard: it has not finished, so a second job with the same key
+// is a duplicate.
+//
+// It is the complement of TerminalJobStatuses (plus retrying, which is a transient
+// spelling of pending), and that is the point: Unique documents its guard as
+// releasing "as soon as the existing job reaches completed, failed, or cancelled".
+// A `waiting` job — parked on a signal or a fan-out — and a `paused` job are
+// neither, so both still hold it. The windowed sibling (unique_locks) already
+// treats them as in-progress; this is what makes the two mechanisms agree.
+var ActiveDedupStatuses = []JobStatus{
+	StatusPending, StatusRunning, StatusRetrying, StatusWaiting, StatusPaused,
+}
+
 // MetadataMap stores queryable string metadata for jobs and job filters.
 type MetadataMap map[string]string
 
@@ -53,8 +68,36 @@ type Job struct {
 	Status         JobStatus         `gorm:"size:20;default:'pending';not null;index:idx_jobs_fan_out_status,priority:2"`
 	PreviousStatus JobStatus         `gorm:"size:20"` // Status before pause, for restoration
 	Attempt        int               `gorm:"type:integer;default:0;not null"`
-	MaxRetries     int               `gorm:"type:integer;default:3;not null"`
-	Timeout        time.Duration     `gorm:"not null;default:0"`
+	// MaxRetries is the number of RETRIES after the first attempt. Zero means
+	// "run once, never retry" — but ONLY when MaxRetriesSet says the zero was
+	// deliberate. Leave both at their zero values and the row takes the
+	// max_retries column default of 3, which is what every release before this
+	// field existed did for a caller who never mentioned retries.
+	MaxRetries int `gorm:"type:integer;default:3;not null"`
+	// MaxRetriesSet marks MaxRetries as DELIBERATE, so that a zero can be told
+	// apart from a field the caller simply never filled in. Go has no other way to
+	// express that on an int, and the difference is not cosmetic: without it,
+	// `store.Enqueue(ctx, &core.Job{Type: "charge"})` — the documented shape for
+	// enqueuing straight through core.Storage — reads as "do not retry" and its
+	// handler runs exactly once instead of three times.
+	//
+	// It is NOT persisted (`gorm:"-"`): it is write-side intent, not job state, and
+	// a job read back from the database carries MaxRetriesSet=false with whatever
+	// max_retries the row actually holds. Re-enqueuing such a job verbatim and
+	// wanting to keep a stored zero therefore means setting this to true.
+	//
+	// jobs.Retries(n) and the fan-out builders set it for you; this only needs
+	// thinking about when constructing a core.Job by hand.
+	//
+	// The column keeps its `default:3` tag and GORM omits a zero-valued field that
+	// declares a default, so an unset MaxRetries is simply left out of the INSERT
+	// and the database supplies 3. A deliberate zero is written back by a corrective
+	// UPDATE inside the same transaction (see storage.applyExplicitZeroRetries).
+	// Dropping the tag instead was tried: AutoMigrate then saw a changed column
+	// definition and REBUILT the SQLite jobs table, destroying the indexes the
+	// versioned migrations create — measured at 14 before and 4 after.
+	MaxRetriesSet bool          `gorm:"-"`
+	Timeout       time.Duration `gorm:"not null;default:0"`
 	// Determinism is the replay strictness mode
 	// (0=ExplicitCheckpoints,1=Strict,2=BestEffort).
 	// BestEffort relaxes the Call replay type-mismatch guard.
@@ -85,6 +128,17 @@ type Job struct {
 	// Fan-out tracking
 	FanOutID    *UUID `gorm:"index:idx_jobs_fan_out_status,priority:1"` // Groups sibling sub-jobs
 	FanOutIndex int   `gorm:"type:integer;default:0"`                   // Position in fan-out batch
+
+	// WaitingSignalName is the signal name this job most recently suspended on,
+	// and is meaningful only while Status is StatusWaiting.
+	//
+	// The signal-resume poll correlates against it so a pending signal the handler
+	// will never consume cannot wake the job on every tick forever. EMPTY means
+	// "not recorded", and the poll then falls back to waking on any pending
+	// signal: fan-out suspends go through plain MarkWaiting, and a third-party
+	// core.Storage need not implement SignalWaitMarker, so permissiveness is what
+	// preserves liveness in both cases.
+	WaitingSignalName string `gorm:"size:255;not null;default:''"`
 
 	// Result storage for parent retrieval
 	Result []byte `gorm:"type:bytes"` // Serialized return value
@@ -126,8 +180,117 @@ type Checkpoint struct {
 	// less than callIndex+1 and so degrades to the historical +1 behaviour —
 	// making non-nested workflows bit-for-bit unchanged, and leaving workflows
 	// already in flight exactly as (in)correct as they were before the upgrade.
-	SpanEnd   int       `gorm:"type:integer;not null;default:0"`
-	CreatedAt time.Time `gorm:"autoCreateTime"`
+	SpanEnd int `gorm:"type:integer;not null;default:0"`
+	// ResultShape fingerprints the JSON SHAPE of the result type this checkpoint
+	// was written from, so replay can tell "the handler now returns a different
+	// type" from "the stored payload happens to look different". It is structural
+	// (field names and kinds), not nominal, so moving or renaming the type does not
+	// trip replay while changing its fields does.
+	//
+	// EMPTY means "not recorded" — every checkpoint written before this column
+	// existed — and replay then skips the comparison entirely, exactly as SpanEnd
+	// == 0 degrades to the historical behaviour. A workflow already in flight is
+	// therefore unaffected by the upgrade.
+	ResultShape string    `gorm:"size:32;not null;default:''"`
+	CreatedAt   time.Time `gorm:"autoCreateTime"`
+}
+
+// Checkpoint CallType values reserved for BUILT-IN durable operations rather
+// than a user Call(). They share the flat call-index counter with Call, so they
+// occupy real (non-negative) call indices, but only Call() records a SpanEnd —
+// these are always written with SpanEnd == 0, by every version.
+//
+// They are defined here, next to the Checkpoint they describe, so the producers
+// and the legacy-span detector read from ONE list. Keeping the detector's
+// exclusions hand-synced against the producers is how span_end itself came to be
+// omitted from a hand-written column list once already.
+const (
+	// CheckpointTypeFanOut is the CallType of a fan-out's checkpoint.
+	CheckpointTypeFanOut = "fanout"
+	// CheckpointTypeSignalPrefix prefixes the CallType of a signal wait,
+	// followed by the signal name.
+	CheckpointTypeSignalPrefix = "signal:"
+	// CheckpointTypeSignalTimeoutPrefix prefixes the CallType of a signal wait
+	// with a timeout, followed by the signal name.
+	CheckpointTypeSignalTimeoutPrefix = "signaltimeout:"
+	// CheckpointTypeSignalPeekPrefix prefixes the CallType of a non-blocking
+	// signal peek, followed by the signal name.
+	CheckpointTypeSignalPeekPrefix = "signalpeek:"
+	// CheckpointTypeSignalDrainPrefix prefixes the CallType of a signal drain,
+	// followed by the signal name.
+	CheckpointTypeSignalDrainPrefix = "signaldrain:"
+	// CheckpointTypeSleep is the CallType of a durable sleep. pkg/signal
+	// re-exports this as SleepCheckpointType.
+	CheckpointTypeSleep = "_sleep"
+)
+
+// IsCallCheckpointType reports whether callType belongs to a user Call() rather
+// than one of the built-in durable operations above.
+//
+// This is the discriminator the legacy-span detector needs. SpanEnd == 0 alone
+// does not mean "written before span tracking existed": a built-in operation's
+// checkpoint has SpanEnd == 0 in every version, including the current one, so
+// treating it as legacy flags healthy work as pre-upgrade-corrupt.
+//
+// Residual, accepted: a user Call() named exactly "fanout", or one whose name
+// begins "signal:" or "signaltimeout:", is classified as built-in and so escapes
+// the legacy listing. That is a deliberate trade against the alternative — a
+// systematic false positive on every workflow using two built-in operations,
+// whose documented repair discards completed work.
+func IsCallCheckpointType(callType string) bool {
+	exact, prefixes := builtinCheckpointTypeMatchers()
+	for _, v := range exact {
+		if callType == v {
+			return false
+		}
+	}
+	for _, p := range prefixes {
+		if strings.HasPrefix(callType, p) {
+			return false
+		}
+	}
+	return true
+}
+
+// builtinCheckpointTypeMatchers is every built-in CallType shape, as an exact
+// value or a LIKE prefix. It is the SINGLE source both spellings read:
+// IsCallCheckpointType walks it directly and BuiltinCheckpointTypeSQLExclusion
+// renders it as SQL, so the Go predicate and the SQL predicate cannot disagree.
+//
+// This used to be a second list sitting next to a hand-written switch, with a
+// comment claiming proximity meant one could not be updated without the other.
+// Proximity is not a guarantee: dropping a type from the SQL list alone left
+// IsCallCheckpointType correct while the legacy-span query started flagging that
+// operation, and no test failed — a job with one non-excluded checkpoint sits at
+// count = 1, below the query's `HAVING count > 1` threshold, so the omission was
+// invisible until a workflow used the same operation twice.
+func builtinCheckpointTypeMatchers() (exact []string, prefixes []string) {
+	return []string{CheckpointTypeFanOut, CheckpointTypeSleep},
+		[]string{
+			CheckpointTypeSignalPrefix,
+			CheckpointTypeSignalTimeoutPrefix,
+			CheckpointTypeSignalPeekPrefix,
+			CheckpointTypeSignalDrainPrefix,
+		}
+}
+
+// BuiltinCheckpointTypeSQLExclusion renders the built-in checkpoint types as a
+// SQL predicate over `col`, together with its bind arguments, so a query can
+// select only user Call() checkpoints. The predicate is the SQL twin of
+// IsCallCheckpointType and is generated from the same lists.
+func BuiltinCheckpointTypeSQLExclusion(col string) (string, []any) {
+	exact, prefixes := builtinCheckpointTypeMatchers()
+	clauses := make([]string, 0, len(exact)+len(prefixes))
+	args := make([]any, 0, len(exact)+len(prefixes))
+	for _, v := range exact {
+		clauses = append(clauses, col+" <> ?")
+		args = append(args, v)
+	}
+	for _, p := range prefixes {
+		clauses = append(clauses, col+" NOT LIKE ?")
+		args = append(args, p+"%")
+	}
+	return strings.Join(clauses, " AND "), args
 }
 
 // FanOutCheckpoint stores fan-out state for job replay.

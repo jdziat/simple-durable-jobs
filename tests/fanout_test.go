@@ -124,8 +124,13 @@ func TestSub_DefaultValues(t *testing.T) {
 
 	assert.Equal(t, "testJob", subJob.Type)
 	assert.Equal(t, map[string]int{"key": 42}, subJob.Args)
-	// Default retries comes from queue.DefaultJobRetries which is 2
-	assert.Equal(t, 2, subJob.Retries)
+	// Sub() no longer pre-stamps Retries. Stamping a non-zero value made
+	// buildSubJobs' fallback unreachable, which is what killed WithFanOutRetries
+	// for every Sub()-built child. Unset here means the fan-out default (also
+	// queue.DefaultJobRetries) is applied at build time, so the EFFECTIVE retries
+	// for this sub-job are unchanged.
+	assert.Equal(t, 0, subJob.Retries)
+	assert.False(t, subJob.RetriesSet, "unset, so the fan-out default governs")
 	assert.Empty(t, subJob.Queue) // Empty means inherit from parent
 }
 

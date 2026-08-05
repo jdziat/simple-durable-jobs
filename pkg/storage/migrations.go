@@ -145,6 +145,48 @@ type preMigration struct {
 
 var preMigrations = []preMigration{
 	{Name: "uuid_binary_conversion", Up: convertLegacyStringUUIDColumns},
+	{Name: "jobs_waiting_signal_name_collation", Up: preMigrateJobsWaitingSignalNameCollation},
+}
+
+// preMigrateJobsWaitingSignalNameCollation creates jobs.waiting_signal_name with
+// the collation it needs, BEFORE AutoMigrate can create it with the wrong one.
+//
+// This is purely to avoid an avoidable table rebuild. AutoMigrate would add the
+// column with the jobs table default (utf8mb4_0900_ai_ci), and migration v39 would
+// then have to ALTER TABLE jobs MODIFY it to utf8mb4_0900_as_cs — and on MySQL a
+// collation change is not an INSTANT or INPLACE operation, so that MODIFY rebuilds
+// the whole jobs table under a lock. On a large deployment that is minutes of
+// blocked dequeues during an upgrade. Creating the column correctly in the first
+// place makes the common upgrade path a fast ADD COLUMN instead.
+//
+// v39 is still required and still runs: it repairs a column that already exists
+// with the wrong collation, which is the case for any database that reached the
+// current schema before this pre-migration existed. Both are idempotent, and on a
+// database where this one wins, v39 reads the collation, finds it already correct,
+// and returns without touching the table.
+//
+// MySQL only. SQLite and Postgres have no equivalent problem, and AutoMigrate's
+// column is correct there.
+func preMigrateJobsWaitingSignalNameCollation(ctx context.Context, db *gorm.DB, dialect string) error {
+	if dialect != dialectMySQL {
+		return nil
+	}
+	// The jobs table may not exist yet on a brand-new database; AutoMigrate will
+	// then create it, and the column comes from the struct tag with the table
+	// default collation, leaving v39 to repair it. Nothing to do here.
+	if !db.Migrator().HasTable(&core.Job{}) {
+		return nil
+	}
+	if db.Migrator().HasColumn(&core.Job{}, "waiting_signal_name") {
+		return nil
+	}
+	if err := db.WithContext(ctx).Exec(
+		"ALTER TABLE jobs ADD COLUMN waiting_signal_name varchar(255) " +
+			"COLLATE utf8mb4_0900_as_cs NOT NULL DEFAULT ''",
+	).Error; err != nil && !isBenignDDLError(err) {
+		return fmt.Errorf("pre-add jobs.waiting_signal_name: %w", err)
+	}
+	return nil
 }
 
 // schemaMigrations is the ordered list of versioned migrations. Append new
@@ -336,16 +378,247 @@ var schemaMigrations = []schemaMigration{
 		Name:    "concurrency_slots_job_id_index",
 		Up:      migrateConcurrencySlotsJobIDIndex,
 	},
+	{
+		Version: 38,
+		Name:    "job_stats_timestamp_index",
+		Up:      migrateJobStatsTimestampIndex,
+	},
+	{
+		Version: 39,
+		Name:    "jobs_waiting_signal_name_column",
+		Up:      migrateJobsWaitingSignalName,
+	},
+	{
+		Version: 40,
+		Name:    "checkpoints_result_shape_column",
+		Up:      migrateCheckpointsResultShape,
+	},
+	{
+		Version: 41,
+		Name:    "unique_key_lookup_index",
+		Up:      migrateUniqueKeyLookupIndex,
+	},
 }
+
+// migrateUniqueKeyLookupIndex restores the plain jobs(unique_key) index on
+// Postgres and SQLite. MySQL has carried it since migration 12; this brings the
+// other two dialects back to parity.
+//
+// WHY IT IS NOT REDUNDANT. Migration 12 dropped it on Postgres/SQLite on the
+// theory that the partial UNIQUE idx_jobs_active_unique
+//
+//	ON jobs (unique_key) WHERE unique_key <> '' AND status IN ('pending','running')
+//
+// already covered every unique_key lookup. It does not, and after fc8c227 it
+// provably cannot. The dedup pre-check behind queue.Unique / EnqueueUnique /
+// EnqueueUniqueTx / EnqueueBatch runs
+//
+//	SELECT * FROM jobs WHERE unique_key = ? AND status IN ?   -- core.ActiveDedupStatuses
+//
+// and ActiveDedupStatuses is FIVE statuses (pending, running, retrying, waiting,
+// paused). The partial index's predicate covers two of them. That is a strict
+// SUBSET, so no planner on any engine is permitted to use the index: a duplicate
+// sitting in `waiting` is simply not in it, and answering from it would return a
+// wrong answer (a missed duplicate). The lookup therefore degraded to a scan of
+// the whole active set, growing linearly with the backlog. Measured on SQLite
+// with 400k pending jobs: the dedup SELECT alone went 44.9ms -> 52us and a full
+// EnqueueUnique 58.0ms -> 172us once this index existed (EXPLAIN QUERY PLAN goes
+// from `SEARCH jobs USING INDEX idx_jobs_status_created (status=?)` — every
+// pending row — to `SEARCH jobs USING INDEX idx_jobs_unique_key (unique_key=?)`).
+//
+// WHY A PLAIN INDEX RATHER THAN A WIDER PARTIAL ONE. Widening
+// idx_jobs_active_unique's predicate to all five statuses would serve the lookup
+// too, but that index is also the CONSTRAINT that makes a second active job with
+// the same key impossible, and widening a UNIQUE predicate is not a safe
+// migration: any existing database that legitimately holds, say, one `waiting`
+// and one `pending` job with the same key (allowed under the shipped
+// constraint) would fail to create the wider index and the upgrade would abort
+// mid-migration. It would also fork the constraint away from MySQL's
+// active_unique_key generated column, which spells the same two statuses. So the
+// constraint is left exactly as it is and the LOOKUP gets its own additive,
+// non-unique index — the shape MySQL has been running in production all along.
+//
+// Idempotent and re-runnable: Postgres and SQLite take CREATE INDEX IF NOT
+// EXISTS; MySQL has no such clause, so it is gated on Migrator().HasIndex, the
+// same way migration 12 creates it.
+func migrateUniqueKeyLookupIndex(ctx context.Context, db *gorm.DB, dialect string) error {
+	if dialect == dialectMySQL {
+		m := db.Migrator()
+		if m.HasIndex(&core.Job{}, "idx_jobs_unique_key") {
+			return nil
+		}
+		if err := db.WithContext(ctx).Exec(
+			"CREATE INDEX idx_jobs_unique_key ON jobs (unique_key)",
+		).Error; err != nil && !isBenignDDLError(err) {
+			return fmt.Errorf("create idx_jobs_unique_key: %w", err)
+		}
+		return nil
+	}
+	if err := db.WithContext(ctx).Exec(
+		"CREATE INDEX IF NOT EXISTS idx_jobs_unique_key ON jobs (unique_key)",
+	).Error; err != nil {
+		return fmt.Errorf("create idx_jobs_unique_key: %w", err)
+	}
+	return nil
+}
+
+// jobStatsTimestampIndex is the index name shared by this migration and the UI's
+// own stats bootstrap. Both create it; whichever runs first wins and the other
+// no-ops.
+const jobStatsTimestampIndex = "idx_job_stats_timestamp"
+
+// migrateJobStatsTimestampIndex indexes job_stats(timestamp).
+//
+// job_stats carries one unique index, on (queue, timestamp). Its LEADING column
+// is queue, so neither of the two queries that scan by time alone can use it:
+// the retention prune (DELETE ... WHERE timestamp < ?) and the dashboard's
+// all-queues history read. Both therefore scanned the whole table, which grows
+// by one row per queue per minute and is only ever trimmed by the very prune
+// that cannot use an index.
+//
+// The table is owned by the ui package, which imports this one — so it is named
+// as a string here rather than by model. It is created by the UI's AutoMigrate
+// and does not exist at all in a process that never mounts the dashboard, hence
+// the HasTable guard.
+//
+// The mirror of this lives in ui.gormStatsStorage.MigrateStats, which covers the
+// case this cannot: a first-ever boot where Migrate() runs BEFORE the dashboard
+// is mounted, so the table does not yet exist here and this version is recorded
+// as applied. This one exists because it is the path that holds the fleet lock,
+// and because schema_migrations should record when the index appeared.
+// migrateJobsWaitingSignalName adds jobs.waiting_signal_name, which records the
+// signal a job suspended on so the signal-resume poll can correlate against it
+// instead of waking on any pending signal.
+//
+// A NOT NULL empty-string default is deliberate: every pre-existing waiting job
+// backfills to the empty string, which the poll reads as "not recorded" and
+// handles with the old permissive behaviour. A job parked across the upgrade
+// keeps resuming exactly as it did, and only jobs that suspend after the upgrade
+// get the correlated treatment. There is no window in which a waiting job becomes
+// unwakeable.
+//
+// On MySQL the column must carry the SAME collation as signals.name, which an
+// earlier migration made utf8mb4_0900_as_cs. AutoMigrate creates it with the jobs
+// table default (utf8mb4_0900_ai_ci), and the resume poll's
+// `signals.name = jobs.waiting_signal_name` then fails outright with error 1267,
+// "illegal mix of collations" — every signal-resume query errors, on MySQL only.
+// SQLite and Postgres cannot surface this, so it is caught by the MySQL leg or not
+// at all.
+//
+// as_cs (case-SENSITIVE) is also the semantically required choice rather than a
+// mechanical match. Signals are consumed with `WHERE signals.name = ?` under
+// as_cs, so a wait on "Approval" is NOT satisfied by a signal named "approval".
+// Had this column been forced to ai_ci instead, the poll would have been MORE
+// permissive than the consume: the job would be woken for a signal it then cannot
+// consume, re-suspend, and be woken again — the very hot loop this column exists
+// to close, in a narrower form.
+func migrateJobsWaitingSignalName(ctx context.Context, db *gorm.DB, dialect string) error {
+	m := db.Migrator()
+	if !m.HasColumn(&core.Job{}, "waiting_signal_name") {
+		stmt := "ALTER TABLE jobs ADD COLUMN waiting_signal_name varchar(255) NOT NULL DEFAULT ''"
+		if dialect == dialectMySQL {
+			stmt = "ALTER TABLE jobs ADD COLUMN waiting_signal_name varchar(255) " +
+				"COLLATE utf8mb4_0900_as_cs NOT NULL DEFAULT ''"
+		}
+		if err := db.WithContext(ctx).Exec(stmt).Error; err != nil && !isBenignDDLError(err) {
+			return fmt.Errorf("add jobs.waiting_signal_name (%s): %w", dialect, err)
+		}
+	}
+	if dialect != dialectMySQL {
+		return nil
+	}
+	// AutoMigrate runs BEFORE the versioned migrations and creates the column with
+	// the table's default collation, so the HasColumn branch above is normally
+	// skipped and this repair is what actually sets it. Idempotent: read first,
+	// MODIFY only on mismatch, mirroring the queue/tenant/unique_key repairs.
+	const collation = "utf8mb4_0900_as_cs"
+	current, err := mysqlColumnCollation(ctx, db, "waiting_signal_name")
+	if err != nil {
+		return fmt.Errorf("read waiting_signal_name collation: %w", err)
+	}
+	if current == collation {
+		return nil
+	}
+	if err := db.WithContext(ctx).Exec(
+		"ALTER TABLE jobs MODIFY waiting_signal_name varchar(255) " +
+			"COLLATE utf8mb4_0900_as_cs NOT NULL DEFAULT ''",
+	).Error; err != nil && !isBenignDDLError(err) {
+		return fmt.Errorf("modify waiting_signal_name collation: %w", err)
+	}
+	return nil
+}
+
+// migrateCheckpointsResultShape adds checkpoints.result_shape, the write-time
+// fingerprint of a Call's result type.
+//
+// NOT NULL DEFAULT empty-string is the load-bearing part: every checkpoint written
+// before this column backfills to the empty string, which replay reads as "not
+// recorded" and skips the comparison for. A workflow already mid-replay across the
+// upgrade is therefore untouched — the same degradation SpanEnd == 0 already gets.
+func migrateCheckpointsResultShape(ctx context.Context, db *gorm.DB, dialect string) error {
+	if db.Migrator().HasColumn(&core.Checkpoint{}, "result_shape") {
+		return nil
+	}
+	if err := db.WithContext(ctx).Exec(
+		"ALTER TABLE checkpoints ADD COLUMN result_shape varchar(32) NOT NULL DEFAULT ''",
+	).Error; err != nil && !isBenignDDLError(err) {
+		return fmt.Errorf("add checkpoints.result_shape (%s): %w", dialect, err)
+	}
+	return nil
+}
+
+func migrateJobStatsTimestampIndex(ctx context.Context, db *gorm.DB, dialect string) error {
+	m := db.Migrator()
+	if !m.HasTable(jobStatsTable) {
+		return nil
+	}
+	if m.HasIndex(jobStatsTable, jobStatsTimestampIndex) {
+		return nil
+	}
+	return createJobStatsTimestampIndex(ctx, db, dialect)
+}
+
+// createJobStatsTimestampIndex issues the CREATE and tolerates losing the race.
+//
+// The HasIndex guard in the caller is a check-then-act, and the mirror in
+// ui.gormStatsStorage.MigrateStats runs WITHOUT the fleet lock this migration
+// holds — so a dashboard mounting concurrently with Migrate() can create the
+// index between that check and this CREATE. Losing the race must not abort the
+// migration: re-check, and fail only if the index genuinely is not there.
+// (CREATE INDEX IF NOT EXISTS would cover SQLite and Postgres but not MySQL, so
+// the re-check is the portable form.)
+//
+// Split from the caller so the recovery is reachable from a test: through the
+// caller the leading HasIndex guard short-circuits before the CREATE, so no
+// sequential test can enter this path and a concurrency test can only reach it
+// probabilistically.
+func createJobStatsTimestampIndex(ctx context.Context, db *gorm.DB, dialect string) error {
+	if err := db.WithContext(ctx).Exec(
+		"CREATE INDEX " + jobStatsTimestampIndex + " ON " + jobStatsTable + " (timestamp)",
+	).Error; err != nil {
+		if db.Migrator().HasIndex(jobStatsTable, jobStatsTimestampIndex) {
+			return nil
+		}
+		return fmt.Errorf("create %s (%s): %w", jobStatsTimestampIndex, dialect, err)
+	}
+	return nil
+}
+
+// jobStatsTable is the dashboard stats table, owned by the ui package.
+const jobStatsTable = "job_stats"
 
 // migrateConcurrencySlotsJobIDIndex adds the index every slot release needs.
 //
 // concurrency_slots is keyed on (slot_name, job_id) with no index on job_id
-// alone, yet the release path deletes by (slot_name, job_id) and the terminal
-// job write deletes by job_id — so each one scanned the whole table. On MySQL
-// under REPEATABLE READ an unindexed DELETE also takes a next-key lock across
-// the scanned range, which serializes releases against every other slot holder
-// rather than just the row's own.
+// alone. The release path deletes by (slot_name, job_id), which is the primary
+// key and was always an index lookup — an earlier version of this comment claimed
+// it scanned too, which is wrong and contradicted its own opening clause
+// (EXPLAINed at 20k rows: Postgres "Index Scan using concurrency_slots_pkey",
+// MySQL "type=range key=PRIMARY rows=1"). It is the TERMINAL JOB WRITE, which
+// deletes by job_id alone, that scanned the whole table — Postgres Seq Scan,
+// MySQL type=ALL. On MySQL under REPEATABLE READ that unindexed DELETE also takes
+// a next-key lock across the scanned range, which serializes it against every
+// other slot holder rather than just the row's own.
 //
 // The table is deliberately unbounded (one live row per held slot plus a
 // permanent per-slot sentinel), so the scan cost grows with concurrency — worst

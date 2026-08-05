@@ -22,7 +22,11 @@ func TestSub_SetsTypeAndArgs(t *testing.T) {
 
 func TestSub_DefaultRetries(t *testing.T) {
 	sj := Sub("job", "args")
-	assert.Equal(t, queue.DefaultJobRetries, sj.Retries)
+	// Sub() no longer pre-stamps Retries: stamping made buildSubJobs' fallback
+	// unreachable, which is what killed WithFanOutRetries. Unset means the
+	// fan-out default applies at build time.
+	assert.Equal(t, 0, sj.Retries)
+	assert.False(t, sj.RetriesSet, "no queue.Retries option means unset")
 }
 
 func TestSub_WithQueueOption(t *testing.T) {
@@ -69,7 +73,10 @@ func TestSub_ZeroRetriesOptionIsHonored(t *testing.T) {
 }
 
 func TestSub_RetriesOptions(t *testing.T) {
-	assert.Equal(t, queue.DefaultJobRetries, Sub("job", "args").Retries)
+	assert.Equal(t, 0, Sub("job", "args").Retries)
+	assert.False(t, Sub("job", "args").RetriesSet)
+	assert.True(t, Sub("job", "args", queue.Retries(0)).RetriesSet,
+		"an explicit Retries(0) is a choice, not an absence — that distinction is the packet")
 	assert.Equal(t, 0, Sub("job", "args", queue.Retries(0)).Retries)
 	assert.Equal(t, 5, Sub("job", "args", queue.Retries(5)).Retries)
 }

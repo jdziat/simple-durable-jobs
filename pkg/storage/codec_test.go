@@ -184,6 +184,49 @@ func TestGormStoragePayloadCodecRoundTrip(t *testing.T) {
 	}
 }
 
+// TestGormStorageCodecEncryptsBatchCompleteResult covers BatchComplete's own
+// encode loop. It does not go through CompleteWithResult — it encodes the batch
+// up front and hands the bytes to a dialect-specific bulk UPDATE — so dropping
+// the codec there alone leaves every other codec test green. The batch tests
+// themselves run under the identity codec and only round-trip, which a missing
+// encode survives, so this asserts on the at-rest bytes.
+func TestGormStorageCodecEncryptsBatchCompleteResult(t *testing.T) {
+	for name, db := range openCodecTestDBs(t) {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			s := NewGormStorage(db, WithCodec(markerXORCodec{}))
+			require.NoError(t, s.Migrate(ctx))
+			t.Cleanup(func() { cleanupCodecExternalDB(t, db) })
+
+			job := &core.Job{Type: "codec.batch", Args: []byte(`{"n":1}`)}
+			require.NoError(t, s.Enqueue(ctx, job))
+			running, err := s.Dequeue(ctx, []string{"default"}, "worker-batch")
+			require.NoError(t, err)
+			require.NotNil(t, running)
+
+			result := []byte(`{"secret":"batch-plaintext"}`)
+			committed, err := s.BatchComplete(ctx, "worker-batch", []BatchCompleteItem{
+				{JobID: running.ID, Result: result},
+			})
+			require.NoError(t, err)
+			require.Equal(t, []core.UUID{running.ID}, committed)
+
+			rawResult := rawJobBytes(t, db, running.ID, "result")
+			// An unwritten column would satisfy the cleartext assertions vacuously.
+			require.NotEmpty(t, rawResult)
+			assert.NotEqual(t, result, rawResult)
+			assert.NotContains(t, string(rawResult), "batch-plaintext")
+
+			// Positive leg: the stored ciphertext really is this result.
+			got, err := s.GetJob(ctx, running.ID)
+			require.NoError(t, err)
+			require.NotNil(t, got)
+			assert.Equal(t, core.StatusCompleted, got.Status)
+			assert.Equal(t, result, got.Result)
+		})
+	}
+}
+
 func TestGormStorageSecretboxReadsLegacyPlaintextJob(t *testing.T) {
 	for name, db := range openCodecTestDBs(t) {
 		t.Run(name, func(t *testing.T) {

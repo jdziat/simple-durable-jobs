@@ -1,6 +1,7 @@
 package fanout
 
 import (
+	"github.com/jdziat/simple-durable-jobs/v4/pkg/queue"
 	"time"
 
 	"github.com/jdziat/simple-durable-jobs/v4/pkg/core"
@@ -29,7 +30,7 @@ func defaultConfig() *config {
 	return &config{
 		strategy:  core.StrategyFailFast,
 		threshold: 1.0,
-		retries:   3,
+		retries:   queue.DefaultJobRetries,
 	}
 }
 

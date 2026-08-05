@@ -50,18 +50,55 @@ type Worker struct {
 	shuttingDown atomic.Bool
 
 	// Running job cancellation (for aggressive pause)
-	runningJobs   map[core.UUID]context.CancelFunc
-	runningJobsMu sync.Mutex
+	// runningJobs maps a job id to the run currently executing it. The value
+	// carries a per-run token because a job can legitimately be running under a
+	// LATER run while an earlier one is still unwinding: the aggressive-pause path
+	// releases to `pending` while this worker is still polling, so the same job can
+	// be re-dequeued before the first run's deferred cleanup fires.
+	runningJobs map[core.UUID]runningJobEntry
+	// nextRunToken issues the per-run identity above.
+	nextRunToken atomic.Uint64
+	// pauseCancelled marks jobs whose handler context was cancelled by
+	// Pause(PauseModeAggressive) rather than by a genuine failure or shutdown.
+	// Guarded by runningJobsMu, which already guards the cancel funcs the pause
+	// invokes, so the mark and the cancel cannot be observed out of order.
+	// pauseCancelled holds the RUN TOKENS whose handler an aggressive pause
+	// cancelled — keyed by RUN, not by job id.
+	//
+	// Two runs of the same job id can be alive at once now that the pause path
+	// releases to `pending` while this worker still polls, and a map keyed by job
+	// id is a single shared slot between them — whichever run reads or writes it
+	// last wins, so one run steals or clobbers the other's mark and that run's
+	// cancellation falls through to the ordinary failure path and burns an
+	// attempt. Both directions of that were reproduced before this was keyed by
+	// run. A token is unique to one run, so there is nothing to share.
+	pauseCancelled map[uint64]struct{}
+	runningJobsMu  sync.Mutex
 
 	// Per-queue concurrency tracking
 	queueRunning map[string]*atomic.Int32 // queue name -> active count
-	queueJobID   map[core.UUID]string     // job ID -> queue name (for decrement on completion)
+	// queueJobID and slotJobID are keyed by RUN TOKEN, not job id, for the same
+	// reason pauseCancelled is: the pause path releases to `pending` while this
+	// worker still polls, so two runs of ONE job id can be alive at once. Keyed by
+	// job id they are a single shared slot — run #2 overwrites run #1's entry, and
+	// whichever cleans up first deletes it, so the other's decrement or release
+	// never happens. Measured: a permanent +1 leak on the per-queue counter (which
+	// eventually bounces 100% of that queue's work while the worker looks healthy)
+	// and a fleet concurrency slot released out from under a still-running handler,
+	// which under-counts the cap and admits an extra concurrent job.
+	queueJobID   map[uint64]string // run token -> queue name (for decrement on completion)
 	queueJobIDMu sync.Mutex
 
 	// DB-backed concurrency slots acquired for dequeued jobs. Only populated
 	// when the storage backend implements concurrencySlotStorage.
+	//
+	// The value carries the job id as well as the slot names, because the DATABASE
+	// row is keyed (slot_name, job_id) while this map is keyed by run token: two
+	// runs of one job id SHARE a row, so deciding whether a release may delete it
+	// requires asking "does any OTHER token still hold this job id?", which needs
+	// the job id on the value side. See releaseConcurrencySlots.
 	slotJobIDMu sync.Mutex
-	slotJobID   map[core.UUID][]string
+	slotJobID   map[uint64]slotHold // run token -> the row that run holds
 
 	// Per-worker queue rate-limit buckets. Only populated for queues configured
 	// with WithQueueRateLimit.
@@ -465,10 +502,11 @@ func NewWorker(q *queue.Queue, opts ...WorkerOption) *Worker {
 		config:                  config,
 		logger:                  slog.Default(),
 		forcedHandlerDrainGrace: defaultForcedHandlerDrainGrace,
-		runningJobs:             make(map[core.UUID]context.CancelFunc),
+		runningJobs:             make(map[core.UUID]runningJobEntry),
+		pauseCancelled:          make(map[uint64]struct{}),
 		queueRunning:            queueRunning,
-		queueJobID:              make(map[core.UUID]string),
-		slotJobID:               make(map[core.UUID][]string),
+		queueJobID:              make(map[uint64]string),
+		slotJobID:               make(map[uint64]slotHold),
 		queueRateBuckets:        queueRateBuckets,
 		rateSaturatedUntil:      make(map[string]time.Time),
 		allRateLimitsUnkeyed:    allRateLimitsUnkeyed,
@@ -477,7 +515,24 @@ func NewWorker(q *queue.Queue, opts ...WorkerOption) *Worker {
 	}
 }
 
-// Start begins processing jobs. Blocks until context is cancelled.
+// Start begins processing jobs. Blocks until ctx is cancelled AND the shutdown
+// drain has finished, then returns ctx.Err().
+//
+// Shutdown runs in three phases, described in full on
+// docs/content/docs/production-ops.md ("Graceful Drain"):
+//
+//  1. Wait DrainTimeout for in-flight handlers to finish ON THEIR OWN. Handler
+//     contexts are deliberately NOT cancelled here (they are built with
+//     context.WithoutCancel), so a handler sees ctx.Done() only in phase 2.
+//     A non-positive DrainTimeout skips this phase entirely.
+//  2. Cancel every remaining handler context and wait at most
+//     forcedHandlerDrainGrace (defaultForcedHandlerDrainGrace, 5s). A handler
+//     still running after that is ABANDONED, not waited for — so Start's return
+//     is not proof that no handler is live. Callers must therefore not assume
+//     it is safe to close the database the instant Start returns.
+//  3. Wait, unbounded, for internal goroutines (reaper, scheduler, retention…)
+//     so none is abandoned mid-write.
+//
 // Per-queue concurrency is enforced: each queue only dequeues up to its
 // configured concurrency limit.
 // The dispatcher drains available work within each poll interval; setting
@@ -507,7 +562,7 @@ func (w *Worker) Start(ctx context.Context) error {
 		totalConcurrency += c
 	}
 
-	jobsChan := make(chan *core.Job, totalConcurrency)
+	jobsChan := make(chan dispatchedJob, totalConcurrency)
 	handlerBase, cancelHandlers := context.WithCancel(context.WithoutCancel(ctx))
 	defer cancelHandlers()
 
@@ -661,7 +716,7 @@ func (w *Worker) warnDegradedStorageDurability(storage core.Storage) {
 	}
 }
 
-func (w *Worker) drainDequeuedJobs(ctx context.Context, jobsChan chan<- *core.Job, totalConcurrency int) {
+func (w *Worker) drainDequeuedJobs(ctx context.Context, jobsChan chan<- dispatchedJob, totalConcurrency int) {
 	deadline := time.Now().Add(w.config.PollInterval)
 	initialQueues := w.queuesWithCapacity()
 	releaseBudget := w.dequeueSlots(initialQueues, totalConcurrency)
@@ -867,52 +922,63 @@ func (w *Worker) dequeueQueueBudgets(queues []string, limit int) map[string]int 
 	return budgets
 }
 
-func (w *Worker) dispatchDequeuedJobs(ctx context.Context, jobsChan chan<- *core.Job, jobs []*core.Job) (dispatched int, released int) {
+func (w *Worker) dispatchDequeuedJobs(ctx context.Context, jobsChan chan<- dispatchedJob, jobs []*core.Job) (dispatched int, released int) {
 	for _, job := range jobs {
 		if job == nil {
 			continue
 		}
-		if !w.tryTrackQueueJob(job.ID, job.Queue) {
+		// The run token is allocated HERE, not in processJob, because admission
+		// state (the per-queue counter and the concurrency slots) is registered on
+		// this side of the channel and has to be keyed by the same run that will
+		// later release it.
+		runToken := w.nextRunToken.Add(1)
+		if !w.tryTrackQueueJob(runToken, job.Queue) {
 			w.recordBounce(bounceQueueCap)
-			w.releaseDequeuedJobOnShutdown(ctx, job)
+			w.releaseDequeuedJobOnShutdown(ctx, job, runToken)
 			released++
 			continue
 		}
 		if !w.tryConsumeQueueRateLimit(job.Queue) {
 			w.recordBounce(bounceQueueRate)
-			w.releaseDequeuedJobOnShutdown(ctx, job)
+			w.releaseDequeuedJobOnShutdown(ctx, job, runToken)
 			released++
 			continue
 		}
-		if ok := w.tryAcquireConcurrencySlots(ctx, job); !ok {
+		if ok := w.tryAcquireConcurrencySlots(ctx, job, runToken); !ok {
 			w.recordBounce(bounceConcurrency)
 			w.refundQueueRateLimit(job.Queue)
-			w.releaseDequeuedJobOnShutdown(ctx, job)
+			w.releaseDequeuedJobOnShutdown(ctx, job, runToken)
 			released++
 			continue
 		}
 		if ctx.Err() != nil {
 			w.recordBounce(bounceShutdown)
 			w.refundQueueRateLimit(job.Queue)
-			w.releaseDequeuedJobOnShutdown(ctx, job)
+			w.releaseDequeuedJobOnShutdown(ctx, job, runToken)
 			released++
 			continue
 		}
-		if ok, reason := w.tryConsumeRateLimits(ctx, job); !ok {
+		ok, reason, refundFleetRate := w.tryConsumeRateLimits(ctx, job)
+		if !ok {
 			w.recordBounce(reason) // fleet_rate (paid the DB tx) or fleet_rate_cached (cooldown skip)
 			w.refundQueueRateLimit(job.Queue)
-			w.releaseDequeuedJobOnShutdown(ctx, job)
+			w.releaseDequeuedJobOnShutdown(ctx, job, runToken)
 			released++
 			continue
 		}
 
 		select {
-		case jobsChan <- job:
+		case jobsChan <- dispatchedJob{job: job, token: runToken}:
 			dispatched++
 		case <-ctx.Done():
 			w.recordBounce(bounceShutdown)
+			// The job is released back to pending UNRUN, so every admission unit it
+			// took must go back too. The queue token was already refunded here; the
+			// FLEET unit was not, so a shutdown-time bail-out permanently spent a
+			// unit of the fleet budget on a job that never ran.
+			refundFleetRate()
 			w.refundQueueRateLimit(job.Queue)
-			w.releaseDequeuedJobOnShutdown(ctx, job)
+			w.releaseDequeuedJobOnShutdown(ctx, job, runToken)
 			released++
 		}
 	}
@@ -940,17 +1006,37 @@ func (w *Worker) releaseClaimedJobs(ctx context.Context, jobs []*core.Job) {
 	}
 }
 
-func (w *Worker) releaseDequeuedJobOnShutdown(ctx context.Context, job *core.Job) {
-	releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-	defer cancel()
+func (w *Worker) releaseDequeuedJobOnShutdown(ctx context.Context, job *core.Job, runToken uint64) {
+	// TWO budgets, not one shared between them. These are independent pieces of
+	// cleanup — the job row and the fleet-cap rows — and neither should be able to
+	// starve the other.
+	//
+	// Sharing one context meant a slow job Release consumed the whole 5s, after
+	// which every slot DELETE ran on an already-Done parent. releaseSlotNames
+	// divides slotReleaseTimeout among the slots, but it divides a CONSTANT rather
+	// than the parent's REMAINING budget, so `WithTimeout(donePparent, perSlot)`
+	// returns children that are already expired and NOT ONE row is deleted. That is
+	// the same defect the per-slot division was written to fix, moved one layer up,
+	// and strictly worse: the earlier version leaked slots 2..N, this leaked all of
+	// them.
+	//
+	// The path that matters is graceful shutdown, which releases every in-flight
+	// job at once — so the connection pool is at its most contended exactly when
+	// Release is asked to finish inside 5s, and database/sql charges pool wait to
+	// the same context.
+	jobCtx, cancelJob := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancelJob()
 
-	if err := w.queue.Storage().Release(releaseCtx, job.ID, w.config.WorkerID); err != nil && !errors.Is(err, core.ErrJobNotOwned) {
+	if err := w.queue.Storage().Release(jobCtx, job.ID, w.config.WorkerID); err != nil && !errors.Is(err, core.ErrJobNotOwned) {
 		w.logger.Warn("failed to release dequeued job during shutdown",
 			"job_id", job.ID,
 			"error", err)
 	}
-	w.releaseConcurrencySlots(releaseCtx, job.ID)
-	w.untrackQueueJob(job.ID)
+
+	slotCtx, cancelSlots := context.WithTimeout(context.WithoutCancel(ctx), w.slotReleaseBudget())
+	defer cancelSlots()
+	w.releaseConcurrencySlots(slotCtx, job.ID, runToken)
+	w.untrackQueueJob(runToken)
 }
 
 // waitHandlers waits up to timeout for all in-flight job handlers to finish,
@@ -1019,7 +1105,9 @@ func (w *Worker) runRetention(ctx context.Context) {
 	if interval < minRetentionInterval {
 		interval = minRetentionInterval
 	}
-	batchSize := cfg.BatchSize
+	// Re-clamp here as well as in RetentionBatchSize: WorkerConfig.Retention is an
+	// exported struct an embedder can populate directly, bypassing the option.
+	batchSize := clampRetentionBatchSize(cfg.BatchSize)
 	if batchSize <= 0 {
 		batchSize = defaultRetentionBatchSize
 	}
@@ -1097,7 +1185,9 @@ func (w *Worker) runUniqueLockSweep(ctx context.Context) {
 	if interval < minUniqueLockSweepInterval {
 		interval = minUniqueLockSweepInterval
 	}
-	batchSize := cfg.BatchSize
+	// Re-clamp for the same reason runRetention does: UniqueLockSweep is an
+	// exported config struct an embedder can populate directly.
+	batchSize := clampRetentionBatchSize(cfg.BatchSize)
 	if batchSize <= 0 {
 		batchSize = defaultUniqueLockSweepBatch
 	}
@@ -1259,13 +1349,14 @@ func (w *Worker) refundQueueRateLimit(queueName string) {
 	bucket.refund(time.Now())
 }
 
-// trackQueueJob increments the running counter for a queue and records the job→queue mapping.
-func (w *Worker) trackQueueJob(jobID core.UUID, queueName string) {
+// trackQueueJob increments the running counter for a queue and records the
+// run→queue mapping.
+func (w *Worker) trackQueueJob(runToken uint64, queueName string) {
 	if counter, ok := w.queueRunning[queueName]; ok {
 		counter.Add(1)
 	}
 	w.queueJobIDMu.Lock()
-	w.queueJobID[jobID] = queueName
+	w.queueJobID[runToken] = queueName
 	w.queueJobIDMu.Unlock()
 }
 
@@ -1273,15 +1364,15 @@ func (w *Worker) trackQueueJob(jobID core.UUID, queueName string) {
 // CAS is not advisory: once a queue is at its configured cap, dispatch must
 // release the dequeued job instead of letting it borrow capacity from another
 // queue.
-func (w *Worker) tryTrackQueueJob(jobID core.UUID, queueName string) bool {
+func (w *Worker) tryTrackQueueJob(runToken uint64, queueName string) bool {
 	counter, ok := w.queueRunning[queueName]
 	if !ok {
-		w.trackQueueJob(jobID, queueName)
+		w.trackQueueJob(runToken, queueName)
 		return true
 	}
 	maxConcurrency, ok := w.config.Queues[queueName]
 	if !ok {
-		w.trackQueueJob(jobID, queueName)
+		w.trackQueueJob(runToken, queueName)
 		return true
 	}
 	for {
@@ -1291,19 +1382,20 @@ func (w *Worker) tryTrackQueueJob(jobID core.UUID, queueName string) bool {
 		}
 		if counter.CompareAndSwap(current, current+1) {
 			w.queueJobIDMu.Lock()
-			w.queueJobID[jobID] = queueName
+			w.queueJobID[runToken] = queueName
 			w.queueJobIDMu.Unlock()
 			return true
 		}
 	}
 }
 
-// untrackQueueJob decrements the running counter for a job's queue.
-func (w *Worker) untrackQueueJob(jobID core.UUID) {
+// untrackQueueJob decrements the running counter for THIS RUN's queue. Keyed by
+// run token so a second run of the same job id cannot consume this one's entry.
+func (w *Worker) untrackQueueJob(runToken uint64) {
 	w.queueJobIDMu.Lock()
-	queueName, ok := w.queueJobID[jobID]
+	queueName, ok := w.queueJobID[runToken]
 	if ok {
-		delete(w.queueJobID, jobID)
+		delete(w.queueJobID, runToken)
 	}
 	w.queueJobIDMu.Unlock()
 
@@ -1377,16 +1469,21 @@ func (w *Worker) rateLimitName(limit RateLimitConfig, job *core.Job) (name strin
 // tryConsumeRateLimits returns (allowed, reason). reason is meaningful only when
 // allowed is false: bounceFleetRateCached when the per-key cooldown short-circuited
 // the DB transaction, bounceFleetRate when the DB itself denied (or errored).
-func (w *Worker) tryConsumeRateLimits(ctx context.Context, job *core.Job) (bool, bounceReason) {
+// The returned refund releases the fleet-rate units this call consumed. It is a
+// no-op on the deny paths (they refund internally) and on the no-limits path; on
+// SUCCESS the caller owns it and MUST invoke it if the job is then released
+// without running, or the unit stays consumed by a job that never ran and the
+// fleet under-admits for the rest of the window.
+func (w *Worker) tryConsumeRateLimits(ctx context.Context, job *core.Job) (bool, bounceReason, func()) {
 	if len(w.config.RateLimits) == 0 {
-		return true, ""
+		return true, "", func() {}
 	}
 	storage, ok := w.queue.Storage().(rateLimiterStorage)
 	if !ok {
 		if w.rateLimitStorageMissingLogged.CompareAndSwap(false, true) {
 			w.logger.Warn("storage backend does not support fleet-wide rate limits; continuing without RateLimit enforcement")
 		}
-		return true, ""
+		return true, "", func() {}
 	}
 	// Refund support: when a LATER fleet limit denies, the units already consumed
 	// from EARLIER limits must be returned, or every multi-limit bounce permanently
@@ -1408,12 +1505,24 @@ func (w *Worker) tryConsumeRateLimits(ctx context.Context, job *core.Job) (bool,
 		if !useWindowed && !canRelease {
 			return
 		}
+		// DETACHED from ctx, with its own budget. The two situations that make a
+		// refund necessary are (a) a later limit denied, and (b) the dispatcher is
+		// shutting down — and (b) means ctx is ALREADY cancelled, so issuing the
+		// refund on ctx would fail exactly when it is needed and leave the unit
+		// consumed by a job that never ran. Same defect shape as the concurrency-slot
+		// release, which is detached for the same reason.
+		//
+		// WithoutCancel strips the deadline as well as the cancel, so the timeout is
+		// re-imposed rather than inherited; without it a refund could hang a
+		// shutting-down dispatcher indefinitely.
+		refundCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
 		for _, c := range consumed {
 			var err error
 			if useWindowed {
-				err = windowed.ReleaseRateAt(ctx, c.name, c.windowStart)
+				err = windowed.ReleaseRateAt(refundCtx, c.name, c.windowStart)
 			} else {
-				err = releaser.ReleaseRate(ctx, c.name, c.window)
+				err = releaser.ReleaseRate(refundCtx, c.name, c.window)
 			}
 			if err != nil {
 				w.logger.Warn("failed to refund consumed rate limit after a later limit denied",
@@ -1429,7 +1538,7 @@ func (w *Worker) tryConsumeRateLimits(ctx context.Context, job *core.Job) (bool,
 		limitName, nameOK := w.rateLimitName(limit, job)
 		if !nameOK {
 			refund()
-			return false, bounceFleetRate
+			return false, bounceFleetRate, func() {}
 		}
 		// cto-F2 per-key cooldown (KEYED limits only — the gap v1 left): if this
 		// exact bucket was denied by the DB this window, skip the locked
@@ -1445,7 +1554,7 @@ func (w *Worker) tryConsumeRateLimits(ctx context.Context, job *core.Job) (bool,
 		// — short-circuiting it would change v1's proven unkeyed behavior.
 		if limit.Key != nil && w.keyedRateSaturated(limitName, time.Now()) {
 			refund()
-			return false, bounceFleetRateCached
+			return false, bounceFleetRateCached, func() {}
 		}
 		var allowed bool
 		var windowStart time.Time
@@ -1461,7 +1570,7 @@ func (w *Worker) tryConsumeRateLimits(ctx context.Context, job *core.Job) (bool,
 				"limit", limitName,
 				"error", err)
 			refund()
-			return false, bounceFleetRate
+			return false, bounceFleetRate, func() {}
 		}
 		if !allowed {
 			// cto-F2: remember this bucket has no headroom until its window rolls.
@@ -1470,11 +1579,11 @@ func (w *Worker) tryConsumeRateLimits(ctx context.Context, job *core.Job) (bool,
 			// reads it to skip the next DB rate tx (removes the denied-tx churn).
 			w.markRateSaturated(limitName, window)
 			refund()
-			return false, bounceFleetRate
+			return false, bounceFleetRate, func() {}
 		}
 		consumed = append(consumed, consumedRate{name: limitName, window: window, windowStart: windowStart})
 	}
-	return true, ""
+	return true, "", refund
 }
 
 // markRateSaturated records that limitName has no headroom until the END of its
@@ -1638,7 +1747,7 @@ func (w *Worker) DequeueRateSaturationCacheSize() int64 {
 	return int64(len(w.rateSaturatedUntil))
 }
 
-func (w *Worker) tryAcquireConcurrencySlots(ctx context.Context, job *core.Job) bool {
+func (w *Worker) tryAcquireConcurrencySlots(ctx context.Context, job *core.Job, runToken uint64) bool {
 	if len(w.config.ConcurrencyCaps) == 0 {
 		return true
 	}
@@ -1647,46 +1756,359 @@ func (w *Worker) tryAcquireConcurrencySlots(ctx context.Context, job *core.Job) 
 		return true
 	}
 	ttl := w.concurrencySlotTTL()
+	// Ownership is recorded INCREMENTALLY, one slot at a time, rather than once at
+	// the end. Two reasons, and the second is a bug this cost us:
+	//
+	//  1. Ownership of a row transfers at the instant this run JOINS it — not when
+	//     the run later registers in runningJobs. Those are different moments: this
+	//     function runs in dispatchDequeuedJobs, the job then crosses jobsChan
+	//     (which BLOCKS while every processLoop goroutine is busy), and only then
+	//     does processJobRun register. A release that inferred ownership from
+	//     runningJobs was blind for that whole window.
+	//
+	//  2. THE ROLLBACK PATHS BELOW ARE RELEASES TOO. They used to call
+	//     releaseSlotNames directly, which has no run-token awareness, so a partial
+	//     acquire deleted rows an EARLIER run of the same job id was still holding
+	//     — the exact over-admission the ownership fence exists to prevent, on the
+	//     one path that did not consult it. Reachable with two or more caps: run #2
+	//     renews cap A idempotently (SHARING run #1's row), then errors or is
+	//     refused on cap B, and its rollback deletes A out from under run #1. The
+	//     ownership fence cannot refuse it — same job id, same worker id.
+	//
+	// Recording as we go means every bail-out can route through
+	// releaseConcurrencySlots, which consults the fence and cleans up this run's
+	// entry. Within this package there is now exactly ONE place that deletes these
+	// rows: releaseSlotNames, called only from releaseConcurrencySlots. (pkg/storage
+	// deletes them too — on batch completion, terminal transitions and aggressive
+	// pause — but every one of those sits in the transaction that also makes the job
+	// unclaimable, so none can race a later run of the same job id.)
+	//
+	// THE RECORD HAPPENS BEFORE THE STORAGE CALL, NOT AFTER. Recording after it
+	// returns left a real window, just a much smaller one than the version before
+	// it: between TryAcquireConcurrencySlot committing the row and this run
+	// publishing that it holds it, a concurrent release for an EARLIER run of the
+	// same job id scans the map, sees no other holder, and deletes the row this run
+	// has already joined. Microseconds instead of a blocking channel send, but the
+	// same defect and the same consequence — reproduced, with a second job then
+	// admitted past a cap of 1.
+	//
+	// Publishing INTENT early is safe in the other direction. If the acquire then
+	// fails, the rollback names a row this run never got — and either another token
+	// holds it, in which case the fence skips it, or nobody does, in which case
+	// deleting it harms no one (and ReleaseConcurrencySlotOwned still fences a peer
+	// worker by worker_id). Claiming too much briefly costs nothing; claiming too
+	// little loses a live row.
+	//
+	// Stores a COPY: the local slice is appended to on the next iteration, and
+	// append reuses the backing array while there is capacity.
+	// MERGES, it does not replace. A departing run hands its names to this one
+	// (see releaseConcurrencySlots), and that can land at ANY point while this loop
+	// is still walking the caps. A wholesale assignment here would discard
+	// everything handed over on the very next iteration — so the handover survived
+	// exactly one loop step, and the names it rescued leaked to the slot TTL after
+	// all. Reproduced two ways: three caps with a transient error on the second,
+	// and two caps with a CapKey that changed between the runs, the latter on the
+	// PLAIN SUCCESS PATH with no error, refusal or shutdown involved.
+	record := func(names []string) {
+		w.slotJobIDMu.Lock()
+		prev := w.slotJobID[runToken]
+		w.slotJobID[runToken] = slotHold{jobID: job.ID, names: unionSlotNames(names, prev.names)}
+		w.slotJobIDMu.Unlock()
+	}
+	// A rollback must not release on the context that just failed: on shutdown ctx
+	// is already Done, so the DELETE would be refused too and a slot acquired
+	// moments earlier would survive to its TTL.
+	//
+	// HONESTY, because an earlier commit message claimed more than this earns:
+	// tryAcquireConcurrencySlots has exactly ONE production caller, and on a
+	// refusal that caller immediately runs releaseDequeuedJobOnShutdown, whose
+	// release context has ALWAYS been detached. So this closes no leak that was
+	// reachable through dispatch — the row is released a few lines later either
+	// way. It is defence-in-depth for the helper itself, and it means the function
+	// no longer depends on its caller cleaning up after a bail-out it already
+	// reported. Worth keeping; not worth claiming as a fix.
+	rollback := func() {
+		releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		w.releaseConcurrencySlots(releaseCtx, job.ID, runToken)
+	}
 	acquiredSlots := make([]string, 0, len(w.config.ConcurrencyCaps))
 	for _, cap := range w.config.ConcurrencyCaps {
 		slotName, ok := w.capSlotName(cap, job)
 		if !ok {
-			w.releaseSlotNames(ctx, job.ID, acquiredSlots)
+			rollback()
 			return false
 		}
+		acquiredSlots = append(acquiredSlots, slotName)
+		record(acquiredSlots)
 		acquired, err := storage.TryAcquireConcurrencySlot(ctx, slotName, job.ID, w.config.WorkerID, cap.Limit, ttl)
 		if err != nil {
 			w.logger.Warn("failed to acquire concurrency slot; releasing dequeued job",
 				"job_id", job.ID,
 				"slot", slotName,
 				"error", err)
-			w.releaseSlotNames(ctx, job.ID, acquiredSlots)
+			rollback()
 			return false
 		}
 		if !acquired {
-			w.releaseSlotNames(ctx, job.ID, acquiredSlots)
+			rollback()
 			return false
 		}
-		acquiredSlots = append(acquiredSlots, slotName)
 	}
-	w.slotJobIDMu.Lock()
-	w.slotJobID[job.ID] = acquiredSlots
-	w.slotJobIDMu.Unlock()
 	return true
 }
 
-func (w *Worker) releaseConcurrencySlots(ctx context.Context, jobID core.UUID) {
+// releaseConcurrencySlots releases the slots THIS RUN acquired. Keyed by run
+// token: releasing by job id alone let an earlier run delete the slot row a later
+// run of the same job is still relying on, and the ownership fence cannot catch
+// that because both runs share the job id AND the worker id.
+func (w *Worker) releaseConcurrencySlots(ctx context.Context, jobID core.UUID, runToken uint64) {
+	// Keying the in-memory list by run is not enough, because the DATABASE row is
+	// not keyed by run: concurrency_slots is (slot_name, job_id) and capSlotName is
+	// deterministic per (cap, job), so two runs of one job id derive the SAME row.
+	// Run #2 re-acquiring lands in TryAcquireConcurrencySlot's idempotent-renewal
+	// branch and SHARES run #1's row rather than creating its own.
+	//
+	// Deleting that row while another run still holds it drops the fleet cap out
+	// from under a handler that is still executing — which the ownership fence
+	// cannot refuse (both runs share the job id AND the worker id) and which
+	// RenewConcurrencySlot cannot repair (it is UPDATE-only, so it silently
+	// resurrects nothing).
+	//
+	// The invariant is therefore: THE ROW SURVIVES WHILE ANY TOKEN HOLDS IT, and
+	// the last holder to finish is the one that deletes it. That is decided here,
+	// under a single mutex, by asking whether any OTHER token still holds this job
+	// id — which is why slotHold carries the job id.
+	//
+	// An earlier attempt asked runningJobs instead. That is the wrong map: a run
+	// joins the row in tryAcquireConcurrencySlots (dispatch side) but only appears
+	// in runningJobs later, in processJobRun, with a blocking channel send in
+	// between. Between those two moments the later run was invisible and its row
+	// was deleted — the exact over-admission this exists to prevent. Keying on the
+	// map written at ACQUIRE time has no such window, and it covers the reverse
+	// direction too: a later run that finishes FIRST still sees the earlier holder
+	// and leaves the row for it.
+	//
+	// The scan is linear in the number of runs currently HOLDING slots, which is
+	// bounded by this worker's total configured concurrency (a slot is only ever
+	// recorded for a dispatched, not-yet-finished run) — tens to low hundreds, not
+	// job throughput. A jobID-keyed refcount would make it O(1), at the cost of a
+	// second map to keep in sync with this one; that is one more invariant to get
+	// wrong, and getting this one wrong is what produced the bug twice already.
+	// On handover the departing run's names are MERGED INTO the surviving holders,
+	// not discarded. The successor can legitimately hold a strict SUBSET: it is
+	// still walking the cap loop, or it bailed out before reaching the later caps.
+	// Dropping the difference left rows named by nobody — held by no run, released
+	// by no run, and surviving to the slot TTL (45 minutes by default), denying one
+	// slot of a FLEET-WIDE cap to every worker in the deployment. Reproduced with
+	// two caps: run #1 holds customer+region, hands over to a run #2 that has only
+	// recorded customer, and region leaks.
+	//
+	// Merging keeps the invariant exact rather than approximate: the union of every
+	// name any live run of this job id holds is always covered, so whoever is last
+	// out releases all of them.
+	// THE LOCK IS HELD ACROSS THE DELETE. That is deliberate, and it is the whole
+	// point of this function.
+	//
+	// The decision "no other run holds this row" is only meaningful if no run can
+	// JOIN the row between making it and acting on it. Ownership is published under
+	// this mutex (record(), before the storage call), so holding it across
+	// releaseSlotNames makes the two atomic with respect to every acquire: a later
+	// run either publishes BEFORE the scan and is seen, or lands AFTER the delete
+	// and creates a fresh row. Neither loses a row it believes it holds.
+	//
+	// Making the decision under the lock and then releasing it before the DELETE —
+	// which is what this did — leaves a window a full DB ROUND TRIP wide, orders of
+	// magnitude larger than the acquire-side window a previous round called a real
+	// defect and fixed. Reproduced: run #2 renews the row through
+	// TryAcquireConcurrencySlot's idempotent branch, run #1's in-flight DELETE then
+	// removes it, and a further job is admitted past a FLEET-WIDE cap while run #2
+	// is still executing. ReleaseConcurrencySlotOwned cannot refuse it — same job
+	// id, same worker id.
+	//
+	// COST, corrected — the first version of this note understated it. Everything
+	// that touches slotJobIDMu now waits on an in-flight DELETE, and that is THREE
+	// paths, not two:
+	//   1. other releases,
+	//   2. acquires (record(), so the dispatch loop, which is sequential), and
+	//   3. renewConcurrencySlots — which runHeartbeat calls after every successful
+	//      Heartbeat for EVERY running job. Measured with a 900ms DELETE: an
+	//      unrelated running job's slot renewal blocked for 851ms.
+	//
+	// (3) is the one that matters, because a heartbeat that does not return to its
+	// select does not send the next Heartbeat, and a lapsed lease is how the
+	// stale-lock reaper hands a still-executing job to a peer. It is why the DELETE
+	// is bounded at slotReleaseTimeout: the worst case is one bounded round trip
+	// per queued release, against a 2-minute heartbeat interval and a 45-minute
+	// StaleLockAge, rather than "as long as the database stays silent".
+	//
+	// Still proportionate: this mutex is touched ONLY when ConcurrencyCaps are
+	// configured (tryAcquireConcurrencySlots returns at the len()==0 guard
+	// otherwise), and a cap exists precisely to keep the number of concurrent
+	// capped jobs small. A worker with no caps never contends here at all.
+	//
+	// Safe to hold across I/O: this mutex is a LEAF. releaseSlotNames touches only
+	// the storage interface and a read-only config field, GormStorage's release is
+	// a single DELETE with no callback, and no path in this package acquires
+	// another worker mutex beneath it — verified by a static scan of every w.*Mu
+	// site. The honest residual is a THIRD-PARTY core.Storage (or a custom slog
+	// handler on the warn path) that calls back into this worker while the mutex is
+	// held; nothing in-tree does, and liveness under a genuinely slow DELETE is
+	// covered by TestReleaseConcurrencySlots_SlowDeleteDoesNotWedgeDispatch.
 	w.slotJobIDMu.Lock()
-	slots := w.slotJobID[jobID]
-	delete(w.slotJobID, jobID)
-	w.slotJobIDMu.Unlock()
-	w.releaseSlotNames(ctx, jobID, slots)
+	defer w.slotJobIDMu.Unlock()
+
+	hold := w.slotJobID[runToken]
+	delete(w.slotJobID, runToken)
+	for otherToken, other := range w.slotJobID {
+		if otherToken == runToken || other.jobID != jobID {
+			continue
+		}
+		// Another run still holds this job's row: hand our names to it and leave
+		// the row alone. It releases the union when it finishes.
+		//
+		// ONE holder, not all of them, and Go's map order makes that one arbitrary
+		// — which is fine, and worth the two lines to show why. Every departing run
+		// merges into SOME remaining holder, so by induction the last run out has
+		// accumulated every name any of them ever held. Which intermediate holder
+		// receives them cannot matter, because that holder either departs (and
+		// passes them on again) or is itself the last one out. Merging into all of
+		// them would only duplicate the names and the DELETEs.
+		other.names = unionSlotNames(other.names, hold.names)
+		w.slotJobID[otherToken] = other
+		return
+	}
+	w.releaseSlotNames(ctx, jobID, hold.names)
+}
+
+// unionSlotNames appends the names of into a that are not already present. Slot
+// lists are at most one entry per configured cap, so the quadratic scan is on a
+// handful of strings.
+func unionSlotNames(a, b []string) []string {
+	out := append([]string(nil), a...)
+	for _, name := range b {
+		found := false
+		for _, existing := range out {
+			if existing == name {
+				found = true
+				break
+			}
+		}
+		if !found {
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
+// slotReleaseTimeout bounds the TOTAL time a release may spend in storage, across
+// every slot it is releasing. It exists because releaseConcurrencySlots holds
+// slotJobIDMu across this call: an unbounded query would hold a process-wide mutex
+// for as long as the database takes to answer, which on a partitioned connection
+// (TCP that neither errors nor RSTs) is minutes. database/sql applies no query
+// timeout of its own.
+//
+// It is a TOTAL, not a per-DELETE budget, because the mutex hold is what needs
+// bounding and that is the sum. But it is DIVIDED among the slots rather than
+// shared: a single context for the whole loop let the first DELETE consume the
+// entire budget, after which every later slot ran on an already-expired context,
+// failed instantly, and left its row to expire at the TTL. Each slot now gets its
+// own fair share, so all of them get a genuine attempt and the total stays capped.
+const slotReleaseTimeout = 5 * time.Second
+
+// slotReleaseBudget is the TOTAL time a release may spend in storage while holding
+// slotJobIDMu.
+//
+// It is derived from the heartbeat interval rather than being a constant, because
+// the safety argument depends on it. runHeartbeat calls renewConcurrencySlots
+// synchronously in its ticker arm, and that takes this same mutex — so a release
+// that outlives a heartbeat interval delays the next Heartbeat write. The reaper
+// reclaims a job whose last heartbeat is older than StaleLockAge, and
+// hbInterval = StaleLockAge/3, so delaying at most ONE beat still leaves two
+// beats of margin. Exceeding StaleLockAge means a still-executing job is handed to
+// a peer: double execution, the thing runHeartbeat exists to prevent.
+//
+// An earlier version used a flat 5s and justified it as "far inside the 2-minute
+// heartbeat interval". Both of those are DEFAULTS, not invariants: WithStaleLockAge
+// is a public option, and at StaleLockAge=2s the interval is ~667ms, so a 5s hold
+// was 7.4x the interval and 2.5x StaleLockAge — reclaimable while the handler was
+// still running. The chaos harness configures exactly that shape.
+//
+// WHICH PROPERTY WINS, stated because the two genuinely conflict at extreme
+// configurations: bounding the TOTAL beats giving every slot a comfortable share.
+// A slot whose DELETE is cut short leaks one cap row until its TTL, which
+// self-heals; a lease that lapses double-executes a job, which does not.
+//
+// WHERE THAT BITES, computed rather than left implicit. The per-slot share is
+// budget/len(caps):
+//
+//	default (2m interval):        5s budget  -> 5s at 1 cap, 250ms at 20
+//	StaleLockAge 2s (~667ms):     333ms      -> 333ms at 1 cap, 17ms at 20
+//	StaleLockAge <=600ms (200ms): 100ms      -> 100ms at 1 cap, 5ms at 20
+//
+// So a sub-second StaleLockAge combined with many caps means slot rows are
+// effectively reclaimed by TTL expiry rather than by explicit release. That is the
+// correct end of the trade — such a deployment has asked for aggressive
+// reclamation and gets it — but it is a real consequence and not a rounding error.
+// A worker built by NewWorker always has a heartbeat interval (floored at 200ms),
+// so the 5s ceiling only applies when the interval exceeds 10s; the `> 0` guard
+// below is for a zero-valued struct in tests, not a production path.
+//
+// One further cost of giving the job release and the slot release INDEPENDENT
+// budgets: a worst-case shutdown release is now their sum rather than a shared 5s.
+// That is the right direction — the shared budget's failure mode was releasing no
+// slot rows at all — but it is more wall time, bounded and paid only when storage
+// is already unresponsive.
+func (w *Worker) slotReleaseBudget() time.Duration {
+	budget := slotReleaseTimeout
+	// HALF an interval, not a whole one: the hold must leave room for the beat it
+	// is delaying to still land inside its own interval. Budgeting a full interval
+	// means the next Heartbeat lands exactly one interval late in the worst case,
+	// which eats a third of the StaleLockAge margin outright.
+	if w.heartbeatInterval > 0 {
+		if half := w.heartbeatInterval / 2; half < budget {
+			budget = half
+		}
+	}
+	return budget
 }
 
 func (w *Worker) releaseSlotNames(ctx context.Context, jobID core.UUID, slots []string) {
 	if len(slots) == 0 {
 		return
 	}
+	// BOUND THE I/O HERE, not at the call sites. Two of the three callers already
+	// passed a 5s context; the hot-path defer in processJobRun passed
+	// context.WithoutCancel(ctx), which strips the DEADLINE as well as the cancel —
+	// so the DELETE under the mutex had no bound at all.
+	//
+	// That mattered only after the mutex started being held across this call. A
+	// hung DELETE used to block one goroutine; it would now block (a) the whole
+	// dispatch loop, since record() takes the same mutex and dispatchDequeuedJobs
+	// is sequential, and (b) renewConcurrencySlots for UNRELATED still-running
+	// jobs — which runHeartbeat calls inside its ticker arm, so that goroutine
+	// never returns to its select and stops sending heartbeats. At StaleLockAge
+	// those leases lapse and the reaper hands still-executing jobs to peers: the
+	// double-execution runHeartbeat exists to prevent, reachable from one hung
+	// query.
+	//
+	// Bounding here rather than at one call site means every entry point is capped,
+	// including any added later. A caller that already supplied a tighter deadline
+	// keeps it.
+	// NO FLOOR. An earlier version clamped the per-slot share to a minimum, which
+	// quietly contradicted the priority stated on slotReleaseBudget: at 20 caps and
+	// an aggressive StaleLockAge the clamp pushed the TOTAL to 500ms against a
+	// 333ms budget, so the bound that exists to protect the heartbeat was not
+	// actually being honoured. It was also a constant no test could fail on — the
+	// clamp only binds past ~11 caps, and removing it left the suite green.
+	//
+	// Dividing exactly means the total is the budget, full stop. A very large cap
+	// count therefore gives each slot a small share, and a DELETE that cannot
+	// finish in it leaves its row to expire at the TTL. That is the trade this
+	// function already declares: a leaked row self-heals, a lapsed lease
+	// double-executes a job.
+	perSlot := w.slotReleaseBudget() / time.Duration(len(slots))
+
 	storage, ok := w.queue.Storage().(concurrencySlotStorage)
 	if !ok {
 		return
@@ -1697,24 +2119,38 @@ func (w *Worker) releaseSlotNames(ctx context.Context, jobID core.UUID, slots []
 	// under-counting the cap and admitting an extra concurrent job.
 	owned, fenced := storage.(concurrencySlotOwnedReleaser)
 	for _, slot := range slots {
+		slotCtx, cancel := context.WithTimeout(ctx, perSlot)
 		var err error
 		if fenced {
-			err = owned.ReleaseConcurrencySlotOwned(ctx, slot, jobID, w.config.WorkerID)
+			err = owned.ReleaseConcurrencySlotOwned(slotCtx, slot, jobID, w.config.WorkerID)
 		} else {
-			err = storage.ReleaseConcurrencySlot(ctx, slot, jobID)
+			err = storage.ReleaseConcurrencySlot(slotCtx, slot, jobID)
 		}
+		cancel()
 		if err != nil {
-			w.logger.Warn("failed to release concurrency slot",
+			// Say what actually happens now. The in-memory hold is already gone, so
+			// this worker will not retry: the row survives until its expires_at
+			// lapses, and TryAcquireConcurrencySlot's live count filters on
+			// `expires_at >= now`, so the cap self-heals at the TTL rather than
+			// leaking permanently. That is bounded but not free — it is one slot of
+			// a fleet-wide cap held by nobody for up to concurrencySlotTTL.
+			//
+			// This path became more likely when the DELETE gained a deadline: a
+			// database slow enough to blow slotReleaseTimeout lands here instead of
+			// blocking the worker. That is the better failure, and an operator
+			// should be able to tell the two apart from the log alone.
+			w.logger.Warn("failed to release concurrency slot; it stays held until its TTL expires",
 				"job_id", jobID,
 				"slot", slot,
+				"ttl", w.concurrencySlotTTL(),
 				"error", err)
 		}
 	}
 }
 
-func (w *Worker) renewConcurrencySlots(ctx context.Context, jobID core.UUID) {
+func (w *Worker) renewConcurrencySlots(ctx context.Context, jobID core.UUID, runToken uint64) {
 	w.slotJobIDMu.Lock()
-	slots := append([]string(nil), w.slotJobID[jobID]...)
+	slots := append([]string(nil), w.slotJobID[runToken].names...)
 	w.slotJobIDMu.Unlock()
 	if len(slots) == 0 {
 		return
@@ -1776,15 +2212,30 @@ func (w *Worker) dequeueBatchPerQueueWithRetry(ctx context.Context, storage perQ
 	return jobs, err
 }
 
-func (w *Worker) processLoop(ctx context.Context, jobs <-chan *core.Job) {
+// dispatchedJob carries a dequeued job together with the run token allocated for
+// it at admission, so the run that registered the per-queue counter and the
+// concurrency slots is the run that releases them.
+type dispatchedJob struct {
+	job   *core.Job
+	token uint64
+}
+
+func (w *Worker) processLoop(ctx context.Context, jobs <-chan dispatchedJob) {
 	defer w.handlerWG.Done()
 
-	for job := range jobs {
-		w.processJob(ctx, job)
+	for dj := range jobs {
+		w.processJobRun(ctx, dj.job, dj.token)
 	}
 }
 
+// processJob runs a job under a freshly allocated run token. Callers that already
+// hold one (the dispatch path, which registered admission state against it) use
+// processJobRun instead.
 func (w *Worker) processJob(ctx context.Context, job *core.Job) {
+	w.processJobRun(ctx, job, w.nextRunToken.Add(1))
+}
+
+func (w *Worker) processJobRun(ctx context.Context, job *core.Job, runToken uint64) {
 	// Defense-in-depth: no panic may escape processJob and crash the processLoop
 	// goroutine (an unrecovered goroutine panic terminates the whole process).
 	// User callbacks are individually recovered (queue.safeUserCallback,
@@ -1814,8 +2265,8 @@ func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 	}()
 
 	// Ensure per-queue concurrency counter is decremented when job finishes
-	defer w.untrackQueueJob(job.ID)
-	defer w.releaseConcurrencySlots(context.WithoutCancel(ctx), job.ID)
+	defer w.untrackQueueJob(runToken)
+	defer w.releaseConcurrencySlots(context.WithoutCancel(ctx), job.ID, runToken)
 
 	startTime := time.Now()
 
@@ -1870,14 +2321,60 @@ func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 
 	// Track this running job for aggressive pause (worker-local + queue-level registry)
 	w.runningJobsMu.Lock()
-	w.runningJobs[job.ID] = cancelJob
+	w.runningJobs[job.ID] = runningJobEntry{cancel: cancelJob, token: runToken}
 	w.runningJobsMu.Unlock()
 	w.queue.RegisterRunningJob(job.ID, cancelJob)
 	defer func() {
 		w.runningJobsMu.Lock()
-		delete(w.runningJobs, job.ID)
+		// KEYED delete: only remove the entry if it is still OURS.
+		//
+		// The aggressive-pause path is the first that releases a job to `pending`
+		// while this worker is still alive and polling, so the same job can be
+		// re-dequeued into a second processJob before this deferred cleanup runs.
+		// An unconditional delete would then remove the SECOND run's registration,
+		// leaving it invisible to Pause(Aggressive), Queue.CancelJob's local cancel
+		// and the ownership audit for its whole duration. The per-run token keeps
+		// each run responsible for exactly its own entry — see runningJobEntry for
+		// why the cancel func itself cannot serve as that identity.
+		//
+		// BOTH deletes are inside the guard. The pause mark needs it for the same
+		// reason and more urgently: Pause(Aggressive) marks by JOB ID from
+		// runningJobs, so once a later run has replaced the entry a new mark
+		// belongs to THAT run. An unconditional delete here let run #1's cleanup
+		// eat run #2's mark, after which run #2's pause cancellation fell through
+		// to the ordinary failure path and called Fail — the precise
+		// attempt-burning this packet exists to prevent, reintroduced by the fix
+		// for a different race.
+		if cur, ok := w.runningJobs[job.ID]; ok && cur.token == runToken {
+			delete(w.runningJobs, job.ID)
+			// Unregister WITHOUT dropping runningJobsMu, so the two registries are
+			// torn down as one step. Dropping it here would reopen the window the
+			// token closes, one level down: a later run that both registered in
+			// runningJobs AND registered with the queue inside the gap would have
+			// its QUEUE-level entry deleted by this one, leaving a live handler
+			// invisible to Queue.CancelJob and Queue.PauseJob for its whole
+			// duration.
+			//
+			// HONESTY: unlike the token guard above, that interleave is ARGUED, not
+			// reproduced. It needs another run to complete both registrations inside
+			// a window of a few instructions, and nothing outside this function can
+			// schedule that, so no test here fails when the lock is narrowed — do
+			// not read the surrounding tests as covering it. The lock is held
+			// because it costs nothing and closes the window by construction, which
+			// is a better trade than a race that would be invisible in production.
+			//
+			// Safe because q.runningJobsMu is a LEAF: all five of its sites
+			// (queue.go RegisterRunningJob / UnregisterRunningJob / PauseJob /
+			// CancelJob / the resume path) are Lock, read-or-write, Unlock, copying
+			// the cancel func out before invoking it, so nothing acquires THIS mutex
+			// while holding that one and the nesting cannot invert.
+			w.queue.UnregisterRunningJob(job.ID)
+		}
+		// Drop this run's mark if it went unconsumed — which happens when the
+		// handler finished without ever surfacing the cancellation. The key is our
+		// own token, so this can never touch another run's.
+		delete(w.pauseCancelled, runToken)
 		w.runningJobsMu.Unlock()
-		w.queue.UnregisterRunningJob(job.ID)
 	}()
 
 	// Call start hooks
@@ -1889,12 +2386,25 @@ func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 	// Emit start event
 	w.queue.Emit(&core.JobStarted{Job: job, Timestamp: startTime})
 
-	// Create a cancellable context for the heartbeat goroutine
-	heartbeatCtx, cancelHeartbeat := context.WithCancel(jobCtx)
+	// The heartbeat is DETACHED from jobCtx on purpose.
+	//
+	// It used to be a child of it, so anything that cancelled the handler also
+	// killed the lease renewal — including an aggressive pause and a shutdown.
+	// But cancelling a handler does not stop it: a handler mid-I/O, or one that
+	// ignores ctx entirely, keeps running and keeps holding the job. With the
+	// lease no longer renewed it lapses, the stale-lock reaper hands the job to a
+	// peer, and the original handler is still executing it — cancellation causing
+	// DOUBLE EXECUTION, which is the one thing the lease exists to prevent.
+	//
+	// The lease must track whether the handler is still RUNNING, not whether it
+	// has been asked to stop. The deferred cancelHeartbeat below ends it when
+	// processJob actually returns, which is the moment we genuinely stop holding
+	// the job.
+	heartbeatCtx, cancelHeartbeat := context.WithCancel(context.WithoutCancel(jobCtx))
 	defer cancelHeartbeat()
 
 	// Start heartbeat goroutine to extend lock during long-running jobs
-	go w.runHeartbeat(heartbeatCtx, job)
+	go w.runHeartbeat(heartbeatCtx, job, runToken)
 
 	resultBytes, err := w.queue.RunExecutionMiddleware(jobCtx, job, func(ctx context.Context, j *core.Job) ([]byte, error) {
 		return w.executeHandler(ctx, j, h)
@@ -1911,6 +2421,9 @@ func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 		resultBytes = nil
 	}
 
+	// Declared outside the block: the pause-cancel branch below needs it to
+	// distinguish this worker's own cancellation from a genuine handler failure.
+	var selfCancelled bool
 	if err != nil {
 		// Self-suspension signal — the handler moved its job to StatusWaiting
 		// (fan-out or signal wait) and returned. Not a failure: just stop.
@@ -1935,7 +2448,7 @@ func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 		// silently mark a shutdown-interrupted job COMPLETED (dropping its
 		// unfinished phases). Only this worker's own shutdown-cancel qualifies.
 		if w.shuttingDown.Load() && errors.Is(err, context.Canceled) {
-			w.releaseDequeuedJobOnShutdown(ctx, job)
+			w.releaseDequeuedJobOnShutdown(ctx, job, runToken)
 			cancelHeartbeat()
 			return
 		}
@@ -1949,13 +2462,91 @@ func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 		// path instead — exactly what the default IsFailure does — so the job re-runs.
 		// Shutdown is handled above; a timeout yields DeadlineExceeded (not Canceled)
 		// so it is unaffected.
-		selfCancelled := errors.Is(err, context.Canceled) && ctx.Err() == nil && jobCtx.Err() != nil
+		selfCancelled = errors.Is(err, context.Canceled) && ctx.Err() == nil && jobCtx.Err() != nil
 		if !selfCancelled && !w.queue.IsFailure(job, err) {
 			err = nil
 		}
 	}
 
-	if err != nil {
+	// The mark alone is NOT sufficient. Pause marks every id in runningJobs, and
+	// processJob only removes its own id in the deferred cleanup — so a handler
+	// that returns a GENUINE error at the instant a pause lands would also be
+	// marked. Releasing on that would drop a real failure on the floor: no Fail,
+	// no JobFailed, no attempt burned, error discarded. Require the error to
+	// actually BE this worker's self-cancel.
+	if err != nil && selfCancelled && w.takePauseCancelled(runToken) {
+		// An aggressive pause cancelled this handler. That is an OPERATOR
+		// instruction to stop, not a job failure, so it must not travel the
+		// failure path: doing so burned an attempt and — at the default
+		// MaxRetries, with the attempt already advanced — permanently
+		// dead-lettered a job that the docs present as the reversible half of
+		// Pause/Resume. It also emitted JobFailed/JobRetrying for an outcome
+		// nobody chose.
+		//
+		// Release to pending with the attempt intact so Resume simply re-dispatches
+		// it. Released on a detached context because ctx is frequently already
+		// cancelled by the time we get here.
+		cancelHeartbeat()
+		releaseCtx, cancelRelease := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		// RETRIED, like every other disposition write in this function. A
+		// single-shot release loses to ordinary contention — most often this
+		// worker's OWN poll loop, which holds an open dequeue transaction while
+		// Pause fires from outside. On shared-cache SQLite that surfaces as
+		// SQLITE_LOCKED, which busy_timeout does not retry; on Postgres/MySQL the
+		// equivalents are a serialization failure and a lock-wait timeout.
+		//
+		// Losing it is expensive: Release is the ONLY write on this path, so the
+		// row stays 'running' with our lock and NOTHING re-dispatches it until the
+		// stale-lock reaper fires at StaleLockAge — 45 MINUTES by default. Resume()
+		// re-dispatches PENDING rows, so it does not help.
+		//
+		// retryWithBackoff gets releaseCtx, NOT ctx: it returns immediately on a
+		// context error, so handing it the frequently-already-cancelled parent
+		// would quietly collapse it back to a single attempt.
+		relErr := retryWithBackoff(releaseCtx, *w.config.StorageRetry, func() error {
+			return w.queue.Storage().Release(releaseCtx, job.ID, w.config.WorkerID)
+		})
+		cancelRelease()
+		// End the attempt's observability span BEFORE reporting the outcome, so it
+		// is closed on every branch below. Without this the pause path is the one
+		// disposition that ends no span at all: complete, fail, retry and waiting
+		// each have a hook, so an aggressively-paused job leaked a span that was
+		// never exported — on EVERY paused job, and pausing a busy worker leaks one
+		// per in-flight job at once.
+		//
+		// The waiting hooks are the right shape and are reused deliberately: this
+		// attempt completed neither successfully nor with failure, and the resume
+		// starts a brand-new attempt with a fresh span, which is exactly the
+		// fan-out/signal case they were written for. Span consumers therefore see
+		// job.disposition="waiting" on this path as well as on a genuine fan-out
+		// wait; the log line below is what distinguishes them. (Not JobPaused: that
+		// is emitted only by Queue.PauseJob, which sets no pause mark and so never
+		// reaches this branch — Worker.Pause emits WorkerPaused.)
+		w.queue.CallWaitingHooks(jobCtx, job)
+
+		// EXACTLY ONE of these fires. An earlier version added this switch but left
+		// the original unconditional Info below it, so the failure branch logged an
+		// error and then immediately promised a resume that was not coming.
+		switch {
+		case relErr != nil && !errors.Is(relErr, core.ErrJobNotOwned):
+			// Say what actually happens now, not what the happy path would have
+			// done. The row is still 'running' holding our lock, and NOTHING
+			// re-dispatches it until the stale-lock reaper fires at StaleLockAge —
+			// 45 minutes by default. Resume() re-dispatches PENDING rows, so it
+			// does not help. This is the line an operator greps for during exactly
+			// that incident, and it used to be followed by an unconditional Info
+			// promising a resume that was not coming.
+			w.logger.Error("failed to release job cancelled by aggressive pause; it will NOT re-dispatch on resume and stays locked until the stale-lock reaper reclaims it",
+				"job_id", job.ID, "stale_lock_age", w.config.StaleLockAge, "error", relErr)
+		case errors.Is(relErr, core.ErrJobNotOwned):
+			// Another worker already owns it — the reaper or an ownership audit got
+			// there first. Not our job to re-dispatch, and not an error.
+			w.logger.Info("job cancelled by aggressive pause was already reclaimed by another owner",
+				"job_id", job.ID)
+		default:
+			w.logger.Info("job released by aggressive pause; it will re-dispatch on resume", "job_id", job.ID)
+		}
+	} else if err != nil {
 		w.queue.CallErrorHandler(jobCtx, job, err)
 		w.handleError(ctx, jobCtx, job, err)
 		cancelHeartbeat()
@@ -1986,14 +2577,21 @@ func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 			}
 		}
 
-		completer, ok := w.queue.Storage().(completeWithResultStorage)
-		if !ok {
-			w.logger.Error("storage does not implement CompleteWithResult; cannot complete job", "job_id", job.ID)
-			cancelHeartbeat()
-			w.releaseAfterTerminalWriteError(ctx, job.ID, "completion")
-			return
+		// CompleteWithResult is an OPTIONAL capability, not part of core.Storage.
+		// When it is absent this falls back to the split core.Storage sequence,
+		// exactly as the terminal-failure path below already falls back from
+		// FailTerminalWithResult to Fail + handleSubJobCompletion. Without the
+		// fallback a storage implementing precisely the documented core.Storage
+		// contract had no completion path at all: every successful handler was
+		// released back to pending and re-executed forever.
+		var fo *core.FanOut
+		var completeErr error
+		completer, hasCompleteWithResult := w.queue.Storage().(completeWithResultStorage)
+		if hasCompleteWithResult {
+			fo, completeErr = w.completeWithResult(ctx, completer, job.ID, resultBytes)
+		} else {
+			completeErr = w.completeViaCoreStorage(ctx, job.ID, resultBytes)
 		}
-		fo, completeErr := w.completeWithResult(ctx, completer, job.ID, resultBytes)
 		cancelHeartbeat()
 		if errors.Is(completeErr, core.ErrJobNotOwned) {
 			w.logger.Warn("job no longer owned at completion; skipping completion handling",
@@ -2008,11 +2606,56 @@ func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 
 		w.queue.CallCompleteHooks(jobCtx, job)
 		w.queue.Emit(&core.JobCompleted{Job: job, Duration: time.Since(startTime), Timestamp: time.Now()})
-		if err := w.checkFanOutCompletion(ctx, fo); err != nil {
-			w.logger.Error("failed to handle sub-job completion", "job_id", job.ID, "error", err)
+		// The atomic path already accounted the sub-job inside its terminal
+		// transaction and handed back the resulting fan-out; the legacy path has
+		// to do that accounting as a separate write. Same split as the terminal
+		// failure path (failTerminalWithResult vs handleSubJobCompletion).
+		var fanOutErr error
+		if hasCompleteWithResult {
+			fanOutErr = w.checkFanOutCompletion(ctx, fo)
+		} else {
+			fanOutErr = w.handleSubJobCompletion(ctx, job, true)
+		}
+		if fanOutErr != nil {
+			w.logger.Error("failed to handle sub-job completion", "job_id", job.ID, "error", fanOutErr)
 		}
 		return
 	}
+}
+
+// completeViaCoreStorage completes a job using ONLY methods in the documented
+// core.Storage contract, for backends that do not implement the optional
+// CompleteWithResult.
+//
+// The order is load-bearing:
+//
+//   - SaveJobResult BEFORE Complete. Both are ownership-fenced, so the result has
+//     to be written while the job is still 'running' and locked by us; and a crash
+//     between the two leaves the job running, which the stale-lock reaper replays
+//     (at-least-once). The reverse order would complete the job and then lose the
+//     result to a crash, with nothing to replay it.
+//   - Fan-out accounting AFTER Complete, and only on success — done by the caller
+//     via handleSubJobCompletion. IncrementFanOutCompleted is not idempotent, so
+//     counting a completion that did not land double-charges the fan-out once the
+//     job is replayed. An under-count stalls the parent until the
+//     GetStalledFanOutParents recovery scan resumes it; an over-count resumes the
+//     parent while sub-jobs are still running, which no scan can undo.
+//
+// What is lost relative to CompleteWithResult is atomicity across those writes —
+// the "reduced crash-durability guarantee" documented for custom backends — not
+// the completion itself.
+func (w *Worker) completeViaCoreStorage(ctx context.Context, jobID core.UUID, result []byte) error {
+	st := w.queue.Storage()
+	if result != nil {
+		if err := retryWithBackoff(ctx, *w.config.StorageRetry, func() error {
+			return st.SaveJobResult(ctx, jobID, w.config.WorkerID, result)
+		}); err != nil {
+			return err
+		}
+	}
+	return retryWithBackoff(ctx, *w.config.StorageRetry, func() error {
+		return st.Complete(ctx, jobID, w.config.WorkerID)
+	})
 }
 
 func (w *Worker) completeWithResult(ctx context.Context, storage completeWithResultStorage, jobID core.UUID, result []byte) (*core.FanOut, error) {
@@ -2096,8 +2739,8 @@ const orphanHeartbeatThreshold = 3
 // If the heartbeat repeatedly receives core.ErrJobNotOwned, the handler
 // is presumed orphaned (the stale-lock reaper at line 708 has released
 // the lock and another worker has picked the job up). In that case
-// runHeartbeat cancels the handler's context via CancelJob and returns,
-// so:
+// runHeartbeat cancels THIS RUN's handler via cancelRun and returns, so:
+//
 //  1. The handler stops doing wasted work against a job it doesn't own.
 //  2. The "heartbeat failed after retries / jobs: job not owned by this
 //     worker" log line stops repeating forever — observed in production
@@ -2110,7 +2753,16 @@ const orphanHeartbeatThreshold = 3
 // Non-ownership errors (DB unreachable, retry exhaustion on a transient
 // error) are logged but don't trip the counter — those are operational
 // issues to fix elsewhere, not orphaning.
-func (w *Worker) runHeartbeat(ctx context.Context, job *core.Job) {
+//
+// The cancel is by RUN TOKEN, not by job id. Cancelling by id would let an
+// orphaned heartbeat kill whichever run currently owns the id — including
+// the healthy run that REPLACED this one after a pause-release, which would
+// then fail and burn an attempt it never earned.
+//
+// It also RENEWS this run's fleet concurrency slot on every successful beat.
+// Without that the row expires at its TTL while the handler is still running,
+// another worker acquires the same cap slot, and the fleet cap over-admits.
+func (w *Worker) runHeartbeat(ctx context.Context, job *core.Job, runToken uint64) {
 	// Heartbeat every 2 minutes (lock is 45 minutes, so plenty of buffer).
 	// Tests override w.heartbeatInterval directly to drive the loop at
 	// sub-second speed.
@@ -2128,10 +2780,14 @@ func (w *Worker) runHeartbeat(ctx context.Context, job *core.Job) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			// Stop heartbeat if aggressively paused
-			if w.IsPaused() && w.PauseMode() == core.PauseModeAggressive {
-				return
-			}
+			// The heartbeat deliberately CONTINUES under an aggressive pause. It
+			// used to return here, which dropped the lease of a job that is still
+			// running — the handler may not observe cancellation for some time,
+			// and a handler that ignores ctx entirely never does. Once the lease
+			// lapses the stale-lock reaper hands the job to a peer while the
+			// original handler is still executing it: a pause that causes
+			// double-execution. Ownership is released explicitly when the
+			// pause-cancelled job returns, not by letting the lease rot.
 
 			err := retryWithBackoff(ctx, *w.config.StorageRetry, func() error {
 				return w.queue.Storage().Heartbeat(ctx, job.ID, w.config.WorkerID)
@@ -2139,7 +2795,7 @@ func (w *Worker) runHeartbeat(ctx context.Context, job *core.Job) {
 			switch {
 			case err == nil:
 				consecutiveOrphanErrs = 0
-				w.renewConcurrencySlots(ctx, job.ID)
+				w.renewConcurrencySlots(ctx, job.ID, runToken)
 				w.logger.Debug("heartbeat sent", "job_id", job.ID)
 			case errors.Is(err, core.ErrJobNotOwned):
 				consecutiveOrphanErrs++
@@ -2151,7 +2807,13 @@ func (w *Worker) runHeartbeat(ctx context.Context, job *core.Job) {
 					w.logger.Error("heartbeat abandoning orphaned job — cancelling handler",
 						"job_id", job.ID,
 						"consecutive_orphan_errs", consecutiveOrphanErrs)
-					w.CancelJob(job.ID)
+					// Cancel THIS run, not whichever run currently owns the job id.
+					// The pause path deliberately allows two runs of one id to be
+					// alive at once, and the orphan condition belongs to the run whose
+					// heartbeat failed — cancelling by id alone reaches into a
+					// healthy later run and kills it, which then travels the failure
+					// path and burns an attempt it never earned.
+					w.cancelRun(job.ID, runToken)
 					return
 				}
 			default:
@@ -2465,8 +3127,34 @@ func (w *Worker) completeFanOut(ctx context.Context, fo *core.FanOut, status cor
 	}
 
 	parentID, fanOutID := fo.ParentJobID, fo.ID
+	// A parent that is already TERMINAL is not "not yet resumable", it is never
+	// resumable, and retrying is pure waste. This is the ordinary steady state with
+	// CancelOnFail=false: the fan-out settles early on a failure, the parent runs to
+	// a terminal status, and every sibling that finishes NATURALLY afterwards
+	// arrives here. Without this check each one drove four more doomed ResumeJob
+	// writes and then logged a WARN saying it was "relying on the stalled-parent
+	// backstop" — for a parent no backstop will ever touch, which sends an operator
+	// looking for a stall that does not exist.
+	if terminal, err := w.parentIsTerminal(ctx, parentID); err == nil && terminal {
+		w.logger.Debug("parent job already terminal at fan-out completion; nothing to resume",
+			"parent_job_id", parentID, "fan_out_id", fanOutID, "status", status)
+		return nil
+	}
 	w.goTracked(func() { w.resumeParentWithRetry(ctx, parentID, fanOutID, status) })
 	return nil
+}
+
+// parentIsTerminal reports whether a fan-out parent has already reached a terminal
+// status, i.e. no resume can ever apply to it. A read error is reported as
+// not-terminal so the caller falls back to retrying, which is the safe direction:
+// the cost of a needless retry is four writes, whereas wrongly skipping a resume
+// strands a waiting parent until the stalled-parent backstop notices.
+func (w *Worker) parentIsTerminal(ctx context.Context, parentID core.UUID) (bool, error) {
+	job, err := w.queue.Storage().GetJob(ctx, parentID)
+	if err != nil || job == nil {
+		return false, err
+	}
+	return job.Status.IsTerminal(), nil
 }
 
 // resumeParentWithRetry retries ResumeJob with bounded backoff for a parent that
@@ -2497,6 +3185,14 @@ func (w *Worker) resumeParentWithRetry(ctx context.Context, parentID, fanOutID c
 				"parent_job_id", parentID, "fan_out_id", fanOutID, "status", status)
 			return
 		}
+	}
+	// Same distinction as above: if the parent reached a terminal status while we
+	// were retrying, there is nothing to resume and nothing for the backstop to do,
+	// so a WARN here would be actively misleading.
+	if terminal, err := w.parentIsTerminal(ctx, parentID); err == nil && terminal {
+		w.logger.Debug("parent job reached a terminal status during resume retries; nothing to resume",
+			"parent_job_id", parentID, "fan_out_id", fanOutID)
+		return
 	}
 	w.logger.Warn("parent job not yet resumable after background retries; relying on the stalled-parent backstop",
 		"parent_job_id", parentID, "fan_out_id", fanOutID)
@@ -2639,11 +3335,46 @@ func (w *Worker) establishScheduleBase(ctx context.Context, name string, sched s
 	return now
 }
 
+// Per-schedule retry backoff for a GENUINE scheduled-fire failure. The scheduler
+// ticks at 10Hz; without a backoff every failing schedule costs one transaction
+// and one ERROR log per tick for as long as the failure lasts. The first retry is
+// still one tick later, so a transient blip recovers as fast as before.
+const (
+	scheduleFireRetryBase = 100 * time.Millisecond
+	scheduleFireRetryMax  = 30 * time.Second
+)
+
+// scheduleFireRetryDelay doubles from scheduleFireRetryBase and saturates at
+// scheduleFireRetryMax. Deliberately jitter-free: a fire claim is a single-row
+// transaction, the fleet-wide herd is bounded by the worker count, and
+// determinism keeps it testable.
+func scheduleFireRetryDelay(consecutiveFailures int) time.Duration {
+	if consecutiveFailures < 1 {
+		consecutiveFailures = 1
+	}
+	delay := scheduleFireRetryBase
+	for i := 1; i < consecutiveFailures; i++ {
+		if delay >= scheduleFireRetryMax {
+			break
+		}
+		delay *= 2
+	}
+	if delay > scheduleFireRetryMax {
+		return scheduleFireRetryMax
+	}
+	return delay
+}
+
 func (w *Worker) runScheduler(ctx context.Context) {
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 
 	lastRun := make(map[string]time.Time)
+	// Per-schedule backoff state for GENUINE fire failures, and a once-per-name
+	// latch for schedules that can never fire.
+	fireFailures := make(map[string]int)
+	fireRetryAt := make(map[string]time.Time)
+	neverFiresLogged := make(map[string]bool)
 
 	for {
 		select {
@@ -2658,6 +3389,13 @@ func (w *Worker) runScheduler(ctx context.Context) {
 
 			now := time.Now()
 			for name, sj := range scheduled {
+				// A schedule whose last attempt failed for a GENUINE reason is backing
+				// off. lastRun is not advanced while it does, so the due boundary is
+				// still due when the backoff expires — nothing is dropped, it is just
+				// not re-attempted at the tick rate.
+				if scheduleIsBackingOff(fireRetryAt, name, now) {
+					continue
+				}
 				if _, ok := lastRun[name]; !ok {
 					// First sight of this schedule: establish a fire-boundary base
 					// that every worker in the fleet agrees on, so skewed wall
@@ -2665,7 +3403,53 @@ func (w *Worker) runScheduler(ctx context.Context) {
 					// for the same logical tick (which would double-fire).
 					lastRun[name] = w.establishScheduleBase(ctx, name, sj.Schedule, now)
 				}
+				// Collapse a BACKLOG to a single catch-up fire, the same way the
+				// cold-start path does. establishScheduleBase runs once per schedule
+				// per process, so after it the durable cursor is never re-read and
+				// lastRun[name] is advanced one boundary per successful fire. A storage
+				// outage the worker SURVIVES therefore leaves lastRun stale by
+				// outage/period boundaries, and this loop then fires every one of them
+				// — one per 100ms tick, i.e. at 10 Hz, each a real Enqueue. The
+				// genuine-failure backoff makes it worse, since more boundaries elapse
+				// while it waits.
+				//
+				// seedLastRun is exactly the clamp for this and is pure (no clock, no
+				// storage), so it can run every tick: it returns the cursor unchanged
+				// when zero or one boundary is due, and only when TWO OR MORE are due
+				// does it skip to the most recent, yielding one fire instead of N. Its
+				// own doc already states the intended contract ("causing exactly one
+				// catch-up fire, after which natural cadence resumes") — the cold path
+				// implemented it and the warm path did not.
+				//
+				// Fleet safety is unaffected: the durable claim in EnqueueScheduledFire
+				// remains the authority on which boundary is consumed, so clamping only
+				// reduces how many doomed claims this worker attempts.
+				if cursor, capped := seedLastRun(sj.Schedule, lastRun[name], now); !cursor.Equal(lastRun[name]) {
+					skipped := cursor
+					lastRun[name] = cursor
+					if capped {
+						w.logger.Warn("scheduled job catch-up exceeded the iteration cap after a gap; missed boundaries were dropped and the schedule resumes from now",
+							"job_type", name, "max_catch_up_iterations", maxCatchUpIterations)
+					} else {
+						w.logger.Info("scheduled job fell behind; collapsing the missed boundaries to a single catch-up fire",
+							"job_type", name, "resumed_from", skipped)
+					}
+				}
 				nextRun := sj.Schedule.Next(lastRun[name])
+				if scheduleNeverFires(nextRun) {
+					// The schedule has no future fire (an unsatisfiable cron such as
+					// "0 0 30 2 *"; cron.SpecSchedule.Next returns the zero time when
+					// nothing matches within five years). Next is pure in its input and
+					// lastRun is not advanced, so this is permanent. Without the guard
+					// the zero time is "due" — every instant is after it — and every
+					// tick runs a doomed claim transaction forever, silently.
+					if !neverFiresLogged[name] {
+						neverFiresLogged[name] = true
+						w.logger.Error("scheduled job never fires: its schedule has no future boundary, so it is skipped",
+							"name", name, "cursor", lastRun[name])
+					}
+					continue
+				}
 				if now.After(nextRun) || now.Equal(nextRun) {
 					// Build the enqueue options first, then claim the fire boundary
 					// and enqueue the job ATOMICALLY via EnqueueScheduledFire: if the
@@ -2714,17 +3498,11 @@ func (w *Worker) runScheduler(ctx context.Context) {
 					} else if sj.Options.UniqueForTTL > 0 {
 						opts = append(opts, queue.UniqueFor(sj.Options.UniqueForTTL))
 					}
-					if _, _, err := w.queue.EnqueueScheduledFire(ctx, name, nextRun, sj.Name, sj.Args, opts...); err != nil {
-						// Claim+enqueue are atomic: this failure rolled back the
-						// claim, so the boundary stays re-claimable. Do NOT advance
-						// lastRun — retry it next tick instead of dropping the fire (g8).
-						w.logger.Error("failed to claim+enqueue scheduled fire; will retry boundary",
-							"name", name, "fire_time", nextRun, "error", err)
-						continue
-					}
-					// Either we claimed and enqueued, or a peer already claimed this
-					// boundary; in both cases this worker is done with it.
-					lastRun[name] = nextRun
+					_, _, err := w.queue.EnqueueScheduledFire(ctx, name, nextRun, sj.Name, sj.Args, opts...)
+					w.applyScheduleFireDisposition(scheduleFireOutcome{
+						name: name, nextRun: nextRun, now: now, err: err,
+						failures: fireFailures, retryAt: fireRetryAt, lastRun: lastRun,
+					})
 				}
 			}
 		}
@@ -3131,16 +3909,41 @@ func (w *Worker) runOwnershipAudit(ctx context.Context) {
 	}
 }
 
+// takePauseCancelled reports whether this job's handler was cancelled by an
+// aggressive pause, clearing the mark so it is consumed exactly once.
+//
+// takePauseCancelled reports whether THIS run's handler was cancelled by an
+// aggressive pause, consuming the mark if so.
+//
+// Consuming it matters: a job released by a pause is re-dispatched on resume, and
+// a surviving mark would make a genuine failure on that later run look like "just
+// a pause" and be released forever.
+func (w *Worker) takePauseCancelled(runToken uint64) bool {
+	w.runningJobsMu.Lock()
+	defer w.runningJobsMu.Unlock()
+	if _, ok := w.pauseCancelled[runToken]; !ok {
+		return false
+	}
+	delete(w.pauseCancelled, runToken)
+	return true
+}
+
 // Pause pauses the worker.
 func (w *Worker) Pause(mode core.PauseMode) {
 	w.pauseMode.Store(mode)
 	w.paused.Store(true)
 
 	if mode == core.PauseModeAggressive {
-		// Cancel all running jobs
+		// Cancel every running handler, and MARK each one first. Without the mark
+		// the resulting context.Canceled is indistinguishable from a handler that
+		// failed, so it fell through the normal failure path: the attempt was
+		// burned and — at the default MaxRetries, with the attempt already
+		// advanced — the job was permanently DEAD-LETTERED by an operation
+		// documented as the reversible half of Pause/Resume.
 		w.runningJobsMu.Lock()
-		for _, cancel := range w.runningJobs {
-			cancel()
+		for _, rj := range w.runningJobs {
+			w.pauseCancelled[rj.token] = struct{}{}
+			rj.cancel()
 		}
 		w.runningJobsMu.Unlock()
 	}
@@ -3157,7 +3960,8 @@ func (w *Worker) Pause(mode core.PauseMode) {
 // Returns true if the job was found and cancelled.
 func (w *Worker) CancelJob(jobID core.UUID) bool {
 	w.runningJobsMu.Lock()
-	cancel, ok := w.runningJobs[jobID]
+	rj, ok := w.runningJobs[jobID]
+	cancel := rj.cancel
 	w.runningJobsMu.Unlock()
 	if ok {
 		cancel()
@@ -3165,7 +3969,39 @@ func (w *Worker) CancelJob(jobID core.UUID) bool {
 	return ok
 }
 
-// Resume resumes the worker.
+// cancelRun cancels a SPECIFIC run of a job, and does nothing if that run is no
+// longer the one registered for the id.
+//
+// CancelJob is the right tool for an operator cancelling "that job" — whichever
+// run is current. It is the wrong tool for a condition that belongs to one
+// particular run, such as an orphaned heartbeat: since the pause path lets two
+// runs of one id be alive at once, cancelling by id there reaches past the failed
+// run into a healthy later one.
+//
+// The other two CancelJob call sites are by-id ON PURPOSE and should stay that
+// way: the fan-out CancelOnFail sweep cancels CHILD ids the caller holds no token
+// for, and the stale-lock reaper cancels ids whose storage row was reclaimed, so
+// any local run of that id is orphaned regardless of which one it is.
+func (w *Worker) cancelRun(jobID core.UUID, runToken uint64) bool {
+	w.runningJobsMu.Lock()
+	rj, ok := w.runningJobs[jobID]
+	w.runningJobsMu.Unlock()
+	if !ok || rj.token != runToken {
+		return false
+	}
+	rj.cancel()
+	return true
+}
+
+// Resume lifts the pause and lets the poll loop dispatch again.
+//
+// It deliberately does NOT clear the pause-cancel marks. It used to, and that
+// bulk clear reintroduced the very bug the marks exist to prevent: a handler
+// still blocked in I/O has not yet surfaced its cancellation, so an operator who
+// resumes promptly wiped its mark, and the context.Canceled that arrived a moment
+// later fell through to the ordinary failure path — attempt burned, and
+// dead-lettered on the last one. Marks are now dropped per job in processJob's
+// own cleanup, which is exact and covers the same leak.
 func (w *Worker) Resume() {
 	w.paused.Store(false)
 
@@ -3283,4 +4119,98 @@ func (w *Worker) WaitForPause(timeout time.Duration) error {
 
 		time.Sleep(pollInterval)
 	}
+}
+
+// runningJobEntry is one execution of a job on this worker.
+//
+// token identifies THAT run. Go cannot compare funcs, and every closure from a
+// single context.WithCancel call site shares a code pointer, so the cancel func
+// itself cannot serve as identity — an explicit monotonic token can.
+type runningJobEntry struct {
+	cancel context.CancelFunc
+	token  uint64
+}
+
+// slotHold is the concurrency-slot row one RUN holds. jobID is carried alongside
+// the names because the row is keyed (slot_name, job_id) in the database while
+// this map is keyed by run token — see Worker.slotJobID and releaseConcurrencySlots.
+type slotHold struct {
+	jobID core.UUID
+	names []string
+}
+
+// scheduleFireOutcome is one EnqueueScheduledFire attempt plus the scheduler's
+// local bookkeeping.
+type scheduleFireOutcome struct {
+	name     string
+	nextRun  time.Time
+	now      time.Time
+	err      error
+	failures map[string]int
+	retryAt  map[string]time.Time
+	lastRun  map[string]time.Time
+}
+
+// applyScheduleFireDisposition records the outcome of one scheduled-fire attempt.
+//
+// Extracted from runScheduler's loop so it can be tested: driving the loop itself
+// requires real time to pass, so the three dispositions previously had no
+// coverage at all and swapping any of them for the old log-and-continue behaviour
+// left the suite green. The distinction between them is the whole point of the
+// change — whether a boundary is skipped once or retried at 10 Hz forever.
+func (w *Worker) applyScheduleFireDisposition(o scheduleFireOutcome) {
+	switch {
+	case errors.Is(o.err, core.ErrDuplicateJob):
+		// DELIBERATE SKIP, not a failure: the schedule declared queue.Unique and a
+		// previous fire is still live, so running a second instance is exactly what
+		// the author asked us not to do. EnqueueScheduledFire COMMITTED the claim,
+		// so the durable cursor already advanced and peers will not re-attempt this
+		// boundary. Advance locally too, and log at Info — a normal outcome.
+		w.logger.Info("scheduled fire skipped: a job with this schedule's unique key is still active",
+			"name", o.name, "fire_time", o.nextRun)
+		delete(o.failures, o.name)
+		delete(o.retryAt, o.name)
+		o.lastRun[o.name] = o.nextRun
+	case o.err != nil:
+		// GENUINE failure. Claim+enqueue are atomic, so this rolled back the claim
+		// and the boundary stays re-claimable. Do NOT advance lastRun — retry the
+		// same boundary rather than drop the fire — but back off, so a persistent
+		// failure does not cost one transaction and one ERROR log every 100ms tick.
+		o.failures[o.name]++
+		delay := scheduleFireRetryDelay(o.failures[o.name])
+		o.retryAt[o.name] = o.now.Add(delay)
+		w.logger.Error("failed to claim+enqueue scheduled fire; will retry boundary",
+			"name", o.name, "fire_time", o.nextRun, "error", o.err,
+			"consecutive_failures", o.failures[o.name], "retry_in", delay)
+	default:
+		// Either we claimed and enqueued, or a peer already claimed this boundary;
+		// in both cases this worker is done with it.
+		delete(o.failures, o.name)
+		delete(o.retryAt, o.name)
+		o.lastRun[o.name] = o.nextRun
+	}
+}
+
+// scheduleIsBackingOff reports whether this schedule is inside a failure backoff
+// window and must not be re-attempted on this tick.
+//
+// This is the gate that actually CONSUMES the delay applyScheduleFireDisposition
+// records — the only thing standing between a persistently failing schedule and
+// one claim transaction plus one ERROR log every 100ms tick. It is a named
+// function rather than an inline condition so that consuming the delay can be
+// tested, not just computing it.
+func scheduleIsBackingOff(fireRetryAt map[string]time.Time, name string, now time.Time) bool {
+	retryAt, backingOff := fireRetryAt[name]
+	return backingOff && now.Before(retryAt)
+}
+
+// scheduleNeverFires reports whether a schedule has no future fire at all.
+//
+// cron.SpecSchedule.Next returns the ZERO time when nothing matches within five
+// years — an unsatisfiable expression such as "0 0 30 2 *". Next is pure in its
+// input and lastRun is not advanced, so the condition is permanent, and without
+// this gate the zero time reads as "due" (every instant is after it) and every
+// tick runs a doomed claim transaction forever, silently.
+func scheduleNeverFires(nextRun time.Time) bool {
+	return nextRun.IsZero()
 }

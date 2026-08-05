@@ -443,3 +443,87 @@ func seedDeadLetteredJob(t *testing.T, store *storage.GormStorage, id, queueName
 	require.NotNil(t, job)
 	require.NoError(t, store.Fail(ctx, job.ID, "worker-1", "boom", nil))
 }
+
+// TestInstrument_SecondCallIsNoop proves a repeat Instrument on the same Queue
+// does not double-register the lifecycle hooks, which would silently double every
+// job counter, while a first Instrument on a *different* Queue still instruments
+// it (the guard is per-Queue, not process-wide).
+func TestInstrument_SecondCallIsNoop(t *testing.T) {
+	ctx := context.Background()
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	defer func() { _ = mp.Shutdown(ctx) }()
+
+	q := queue.New(noDepthStorage{})
+	Instrument(q, WithMeterProvider(mp))
+	Instrument(q, WithMeterProvider(mp)) // repeat must not register a second set of hooks
+
+	startedAt := time.Now().Add(-2 * time.Second)
+	job := &core.Job{
+		ID:        core.NewID(),
+		Type:      "email",
+		Queue:     "critical",
+		CreatedAt: startedAt.Add(-3 * time.Second),
+		StartedAt: &startedAt,
+		Attempt:   1,
+	}
+
+	q.CallStartHooks(ctx, job)
+	q.CallRetryHooks(ctx, job, 1, errors.New("temporary failure"))
+	q.CallCompleteHooks(ctx, job)
+	q.CallFailHooks(ctx, job, errors.New("terminal failure"))
+	q.CallJobReclaimedHooks(ctx, job.ID, "stale_lock")
+
+	rm := collectMetrics(t, reader)
+	assertCounterPoint(t, rm, metricJobsStarted, 1, map[string]string{
+		attrQueue: "critical", attrJobType: "email", attrOutcome: outcomeStarted,
+	})
+	assertCounterPoint(t, rm, metricJobsRetried, 1, map[string]string{
+		attrQueue: "critical", attrJobType: "email", attrOutcome: outcomeRetried,
+	})
+	assertCounterPoint(t, rm, metricJobsCompleted, 1, map[string]string{
+		attrQueue: "critical", attrJobType: "email", attrOutcome: outcomeCompleted,
+	})
+	assertCounterPoint(t, rm, metricJobsFailed, 1, map[string]string{
+		attrQueue: "critical", attrJobType: "email", attrOutcome: outcomeFailed,
+	})
+	assertCounterPoint(t, rm, metricLeasesReclaimed, 1, map[string]string{
+		attrReason: "stale_lock",
+	})
+	assertHistogramPointCount(t, rm, metricJobWaitDuration, 1, map[string]string{
+		attrQueue: "critical", attrJobType: "email", attrOutcome: outcomeStarted,
+	})
+
+	// Positive leg: the surviving registration is still live (a guard that
+	// disabled instrumentation entirely would also show 1 above), and the guard is
+	// keyed per-Queue so a different Queue is still instrumented.
+	q.CallStartHooks(ctx, job)
+	other := queue.New(noDepthStorage{})
+	Instrument(other, WithMeterProvider(mp))
+	other.CallStartHooks(ctx, &core.Job{ID: core.NewID(), Type: "report", Queue: "bulk"})
+
+	rm = collectMetrics(t, reader)
+	assertCounterPoint(t, rm, metricJobsStarted, 2, map[string]string{
+		attrQueue: "critical", attrJobType: "email", attrOutcome: outcomeStarted,
+	})
+	assertCounterPoint(t, rm, metricJobsStarted, 1, map[string]string{
+		attrQueue: "bulk", attrJobType: "report", attrOutcome: outcomeStarted,
+	})
+}
+
+// assertHistogramPointCount asserts the sample count on a histogram point, so a
+// double-registered latency hook (two samples for one job) is caught.
+func assertHistogramPointCount(t *testing.T, rm metricdata.ResourceMetrics, name string, count uint64, attrs map[string]string) {
+	t.Helper()
+	m := findMetric(rm, name)
+	require.NotNil(t, m, "metric %s not found", name)
+	hist, ok := m.Data.(metricdata.Histogram[float64])
+	require.True(t, ok, "metric %s has type %T", name, m.Data)
+	for _, point := range hist.DataPoints {
+		if attributesMatch(point.Attributes, attrs) {
+			assert.Equal(t, count, point.Count)
+			return
+		}
+	}
+	t.Fatalf("metric %s missing histogram point with attributes %v", name, attrs)
+}

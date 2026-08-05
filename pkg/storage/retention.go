@@ -10,6 +10,31 @@ import (
 	"github.com/jdziat/simple-durable-jobs/v4/pkg/core"
 )
 
+// retentionDeleteChunkSize bounds the literal IN-list of every DELETE the
+// retention sweep issues, independently of the caller's batch size, so a large
+// RetentionBatchSize can never exceed the driver's bind-parameter ceiling
+// (SQLite ~32k, Postgres 65535). It matches PurgeJobs' purgeBatchSize.
+const retentionDeleteChunkSize = 1000
+
+// chunkIDs splits ids into consecutive slices of at most size elements, so a
+// literal SQL IN-list built from one chunk stays within the driver's
+// bind-parameter ceiling. The returned slices alias ids; callers must not retain
+// them past the statement.
+func chunkIDs[T any](ids []T, size int) [][]T {
+	if size <= 0 || len(ids) <= size {
+		return [][]T{ids}
+	}
+	chunks := make([][]T, 0, (len(ids)+size-1)/size)
+	for start := 0; start < len(ids); start += size {
+		end := start + size
+		if end > len(ids) {
+			end = len(ids)
+		}
+		chunks = append(chunks, ids[start:end])
+	}
+	return chunks
+}
+
 func quotedTerminalJobStatuses() string {
 	quoted := make([]string, 0, len(core.TerminalJobStatuses))
 	for _, status := range core.TerminalJobStatuses {
@@ -63,6 +88,59 @@ func (s *GormStorage) DeleteTerminalJobsOlderThan(ctx context.Context, status co
 	fanOutParentGuard := "NOT EXISTS (SELECT 1 FROM fan_outs f JOIN jobs pp ON pp.id = f.parent_job_id " +
 		"WHERE f.id = jobs.fan_out_id AND pp.status NOT IN (" + terminalStatuses + "))"
 
+	// Never GC a job that a STILL-LIVE windowed dedup lock (IdempotencyKey /
+	// UniqueFor) references. Those windows are documented to keep deduplicating
+	// until their own expires_at, independently of how fast the job finished, and
+	// an operator sets a 90-day idempotency TTL precisely so a replayed request
+	// cannot charge a card twice. Retention windows are much shorter (the stock
+	// completed window is 30 days; jobs.DefaultRetention() lowers it to 7), so
+	// without this guard the sweep ended every idempotency window at the retention
+	// horizon and the replay ran the guarded work a second time.
+	//
+	// Deleting only the job row and keeping the lock is NOT sufficient either: a
+	// live lock whose referenced job row is gone is a broken invariant, and it
+	// leaves Enqueue returning a dedup id that resolves to nothing. Releasing a
+	// window is an explicit act of whoever deletes the job (DeleteJob / PurgeJobs /
+	// Requeue's subtree replay all delete the lock with the row); automatic
+	// retention must simply wait.
+	//
+	// The pin is bounded by the lock's OWN expires_at, not held forever: the moment
+	// the window lapses this guard stops matching and the next pass collects the job
+	// and its lock together. Worst case a job row outlives its retention window by
+	// the TTL the operator chose. unique_locks.job_id is indexed
+	// (idx_unique_locks_job_id, migration v34), so this is an index probe per
+	// already status/age-limited candidate row. It lives in the id-SELECT only,
+	// never in the DELETE, so MySQL's 1093 self-reference rule is not triggered.
+	var lockNow any
+	var liveUniqueLockGuard string
+	var lockBinds []any
+	if s.useDBClock() {
+		lockNow = s.nowExpr()
+		liveUniqueLockGuard = "NOT EXISTS (SELECT 1 FROM unique_locks ul WHERE ul.job_id = jobs.id AND ul.expires_at > ?)"
+		lockBinds = []any{lockNow}
+	} else {
+		// SQLite stores timestamps as offset-suffixed TEXT and compares them
+		// LEXICALLY, so `expires_at > ?` is only meaningful while the stored row
+		// and the bound value carry the SAME trailing offset. Production writes
+		// expires_at UTC-faced, but a row written on any other face — a legacy
+		// row, a different tool, a direct Create — compares as garbage, and the
+		// failure is silent and one-directional: the guard stops matching, the
+		// job is collected, and a live idempotency window is destroyed. That is
+		// precisely the double charge this guard exists to prevent, so it must
+		// not depend on the writer's clock face.
+		//
+		// julianday() (not strftime, which is itself face-dependent here) parses
+		// each value to a number, giving the same result on every face. Measured:
+		// with the bare comparison, a live 1h window written local-faced failed to
+		// pin its job on SQLite while pinning correctly on Postgres and MySQL.
+		// Pinned by TestRetentionPinIsFaceIndependent.
+		lockNow = time.Now().UTC()
+		liveUniqueLockGuard = "NOT EXISTS (SELECT 1 FROM unique_locks ul WHERE ul.job_id = jobs.id " +
+			"AND (CASE WHEN substr(ul.expires_at, -6) = substr(?, -6) THEN ul.expires_at > ? " +
+			"ELSE julianday(ul.expires_at) > julianday(?) END))"
+		lockBinds = []any{lockNow, lockNow, lockNow}
+	}
+
 	var deleted int64
 	err := s.withSerializationRetry(ctx, func() error {
 		deleted = 0
@@ -76,6 +154,7 @@ func (s *GormStorage) DeleteTerminalJobsOlderThan(ctx context.Context, status co
 				Where(rootChildGuard).
 				Where("NOT EXISTS (SELECT 1 FROM fan_outs f WHERE f.parent_job_id = jobs.id AND f.status = 'pending')").
 				Where(fanOutParentGuard).
+				Where(liveUniqueLockGuard, lockBinds...).
 				Order("completed_at ASC, id ASC").
 				Limit(limit)
 			query = s.lockForUpdate(query, true)
@@ -85,25 +164,38 @@ func (s *GormStorage) DeleteTerminalJobsOlderThan(ctx context.Context, status co
 			if len(ids) == 0 {
 				return nil
 			}
-			if err := tx.Where("parent_job_id IN ?", ids).Delete(&core.FanOut{}).Error; err != nil {
-				return err
+			// Delete by literal id list in bounded chunks. `limit` comes straight
+			// from RetentionBatchSize, which an operator with a backlog is actively
+			// encouraged to raise; an unchunked IN-list of that width blows past the
+			// driver's bind-parameter ceiling (SQLite ~32k, Postgres 65535) and makes
+			// EVERY pass fail with deleted=0, so the sweep dies silently exactly when
+			// it is needed most. PurgeJobs bounds the same list the same way.
+			for _, chunk := range chunkIDs(ids, retentionDeleteChunkSize) {
+				if err := tx.Where("parent_job_id IN ?", chunk).Delete(&core.FanOut{}).Error; err != nil {
+					return err
+				}
+				if err := tx.Where("job_id IN ?", chunk).Delete(&core.Checkpoint{}).Error; err != nil {
+					return err
+				}
+				if err := tx.Where("job_id IN ?", chunk).Delete(&core.Signal{}).Error; err != nil {
+					return err
+				}
+				// Only EXPIRED locks can reach here: liveUniqueLockGuard excluded
+				// every job a live window still references.
+				if err := tx.Where("job_id IN ?", chunk).Delete(&core.UniqueLock{}).Error; err != nil {
+					return err
+				}
+				result := tx.Where("id IN ?", chunk).
+					Where("status = ?", status).
+					Where("completed_at IS NOT NULL").
+					Where("completed_at < ?", cutoff).
+					Delete(&core.Job{})
+				if result.Error != nil {
+					return result.Error
+				}
+				deleted += result.RowsAffected
 			}
-			if err := tx.Where("job_id IN ?", ids).Delete(&core.Checkpoint{}).Error; err != nil {
-				return err
-			}
-			if err := tx.Where("job_id IN ?", ids).Delete(&core.Signal{}).Error; err != nil {
-				return err
-			}
-			if err := tx.Where("job_id IN ?", ids).Delete(&core.UniqueLock{}).Error; err != nil {
-				return err
-			}
-			result := tx.Where("id IN ?", ids).
-				Where("status = ?", status).
-				Where("completed_at IS NOT NULL").
-				Where("completed_at < ?", cutoff).
-				Delete(&core.Job{})
-			deleted = result.RowsAffected
-			return result.Error
+			return nil
 		})
 	})
 	return deleted, err

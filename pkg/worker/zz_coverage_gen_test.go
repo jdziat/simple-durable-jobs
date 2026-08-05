@@ -149,7 +149,7 @@ func TestGen_RunOwnershipAudit_QueryError(t *testing.T) {
 	_, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	w.runningJobsMu.Lock()
-	w.runningJobs["job-a"] = cancel
+	w.runningJobs["job-a"] = runningJobEntry{cancel: cancel}
 	w.runningJobsMu.Unlock()
 
 	ctx, ctxCancel := context.WithCancel(context.Background())

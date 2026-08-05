@@ -60,18 +60,24 @@ a warranty of fitness for any particular use.
   disappear.
 - **Single active owner** — the library is designed so that at any instant at
   most one worker holds a job's lock. Lock timing is anchored to the **database
-  clock** on Postgres/MySQL, and the chaos suite asserts that worker clock skew
-  does not cause a live lock to be reclaimed early.
+  clock** on Postgres/MySQL, so a worker whose own clock is skewed cannot reclaim
+  a live lock early. That anchoring is not covered by a dedicated chaos
+  invariant — the suite's clock-skew handling concerns scheduled fires, not lock
+  reclaim — so treat it as a design property, not an asserted one.
 - **Checkpointed workflows** — completed `Call()` steps are not re-executed on
-  replay (subject to the at-least-once window above), and fan-in counters are
-  updated atomically with the sub-job's terminal transition. The fan-out's
-  *status* advance commits in that same terminal transaction; the library is
-  designed so that a terminal fan-out is not observable as `status=pending` with
-  terminal counts, and the chaos suite asserts that invariant. If a worker
-  crashes between the final sub-job's terminal write and resuming the waiting
-  parent, a recovery sweep (`GetCompletablePendingFanOuts`, gated by
-  `WithFanOutRecoveryStaleAge`, default 2m) heals any parent stranded in
-  `waiting`.
+  replay (subject to the at-least-once window above). The fan-out's *status*
+  advance is a SECOND write that commits **after** the sub-job's terminal
+  transaction, deliberately: counting afterwards is what lets the snapshot see
+  siblings that committed concurrently. So a terminal fan-out **is** briefly
+  observable as `status=pending` while its counts already read terminal — and
+  across a process death in that gap, durably so. Do not alert on that
+  combination as corruption; it is the normal shape of a fan-out completing, and
+  on GormStorage the counts are derived from child rows rather than accumulated,
+  so nothing is lost. A recovery sweep (`GetCompletablePendingFanOuts`, gated by
+  `WithFanOutRecoveryStaleAge`, default 2m) advances the stranded row and resumes
+  any parent left in `waiting`. Note the sweep runs only on the worker holding
+  the recovery lease, so the heal is bounded by that interval rather than
+  immediate.
 - **Atomic signal consumption** — consuming a signal
   (`WaitForSignal`/`WaitForSignalTimeout`/`DrainSignals`) persists the consume
   and its replay checkpoint in a single transaction; the library is designed so
@@ -133,8 +139,12 @@ cancelled) stays in `failed` status and is queryable:
 failed, _ := q.Storage().GetJobsByStatus(ctx, jobs.StatusFailed, 100)
 ```
 
-Replay one with `q.Requeue` (checkpoints are preserved, so a workflow resumes
-from its last successful step):
+Replay one with `q.Requeue`. **This is a replay from scratch:** requeueing
+deletes the job's checkpoints, so a workflow re-executes every step, including
+ones that already succeeded. If a completed step had an external side effect —
+a charge, an email, a provisioning call — it happens again unless the handler
+is idempotent. There is no "resume from the last successful step" operation;
+the dashboard's Retry button performs this same full reset:
 
 ```go
 ok, err := q.Requeue(ctx, jobID)
@@ -188,6 +198,12 @@ mid-replay. Two consequences:
    FROM jobs j
    INNER JOIN checkpoints c ON c.job_id = j.id
    WHERE c.call_index >= 0 AND c.span_end = 0
+     AND c.call_type <> 'fanout'
+     AND c.call_type <> '_sleep'
+     AND c.call_type NOT LIKE 'signal:%'
+     AND c.call_type NOT LIKE 'signaltimeout:%'
+     AND c.call_type NOT LIKE 'signalpeek:%'
+     AND c.call_type NOT LIKE 'signaldrain:%'
      AND j.status NOT IN ('completed', 'cancelled', 'failed')
    GROUP BY j.id, j.type
    HAVING count(c.id) > 1;
@@ -195,7 +211,22 @@ mid-replay. Two consequences:
 
    The listing is a deliberate over-approximation: nothing recorded tells us
    whether a legacy call actually nested, so flat workflows with two or more
-   calls appear too. Requeue anything you cannot rule out.
+   calls appear too.
+
+   **`Requeue` on a listed job does nothing.** It is the only operation that
+   clears checkpoints, but it accepts only `failed` or `cancelled` jobs, and this
+   listing excludes those statuses — so the two sets are disjoint and it returns
+   `false`. To clear a listed job you must cancel it first
+   (`CancelJobTerminal`, then `Requeue`), which **restarts** the workflow rather
+   than resuming it, and does not un-consume signals a previous run consumed. See
+   [UPGRADE.md](https://github.com/jdziat/simple-durable-jobs/blob/main/UPGRADE.md)
+   for the full procedure and its caveats. Draining before upgrading is the only
+   remedy that loses nothing.
+
+   The `call_type` exclusions are load-bearing. Only `Call()` records a span, so
+   a fan-out, durable-sleep or signal checkpoint carries `span_end = 0` in every
+   version including the current one. Drop them and this lists healthy work, and
+   a worker logs the pre-upgrade warning for it on every replay.
 
 A worker replaying pre-span checkpoints also logs one `WARN` per run naming the
 job, so this is visible without running the query.

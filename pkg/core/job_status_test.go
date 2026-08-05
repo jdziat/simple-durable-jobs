@@ -36,3 +36,37 @@ func TestTerminalJobStatusesClassifyAllStatuses(t *testing.T) {
 
 	require.Len(t, classified, len(terminal)+len(nonTerminal), "AllJobStatuses drifted without terminal/non-terminal classification")
 }
+
+// TestActiveDedupStatusesIsEveryNonTerminalStatus pins the set that four docs
+// pages enumerate in prose:
+//
+//	docs/content/docs/api-reference/job-options.md
+//	docs/content/docs/api-reference/types.md
+//	docs/content/docs/migrating-from-river.md
+//	docs/content/docs/migrating-from-asynq.md
+//
+// Those pages spent four releases asserting the OLD rule ("pending or running")
+// after the set was widened, because nothing failed when the set changed. This
+// test is that missing signal: if you edit ActiveDedupStatuses, update the four
+// pages above in the same commit.
+func TestActiveDedupStatusesIsEveryNonTerminalStatus(t *testing.T) {
+	require.Equal(t, []JobStatus{
+		StatusPending, StatusRunning, StatusRetrying, StatusWaiting, StatusPaused,
+	}, ActiveDedupStatuses)
+
+	// The prose does not just list statuses, it states a RULE: the key is held in
+	// every non-terminal status and released only at terminal. Assert the rule,
+	// so adding a new non-terminal status fails here too.
+	held := make(map[JobStatus]bool, len(ActiveDedupStatuses))
+	for _, status := range ActiveDedupStatuses {
+		require.Falsef(t, held[status], "duplicate status in ActiveDedupStatuses: %q", status)
+		require.Falsef(t, status.IsTerminal(), "terminal status %q holds the unique key", status)
+		held[status] = true
+	}
+	for _, status := range AllJobStatuses {
+		if !status.IsTerminal() {
+			require.Truef(t, held[status], "non-terminal status %q does not hold the unique key, "+
+				"contradicting the four docs pages that say every non-terminal status does", status)
+		}
+	}
+}

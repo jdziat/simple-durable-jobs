@@ -863,3 +863,48 @@ func TestFanOut_AssignsIdempotencyKeyToSubJobs(t *testing.T) {
 	}
 	assert.Len(t, seen, 3, "expected one UniqueKey per sub-job index")
 }
+
+// TestFanOut_ReleasesTheCallStateLockForLaterOperations covers the `cs.Mu.Unlock()`
+// in FanOut's call-index block, which was a FREE statement: deleting it left EVERY
+// package in the repository green.
+//
+// Without it the call-state mutex stays locked for the rest of the handler, so the
+// NEXT durable operation — another FanOut, or a Call on the resume path — blocks
+// on cs.Mu.Lock() forever. The job's handler never returns, its heartbeat keeps
+// renewing the lease (the worker cannot tell a wedged handler from a slow one), so
+// the stale-lock reaper never reclaims it either. A workflow that continues past
+// its fan-out simply stops, silently.
+//
+// FALSE-GREEN TRAP, and it is why this survived: EVERY existing fan-out test calls
+// FanOut exactly ONCE and then stops. A single call cannot observe a lock that is
+// never released — the handler returns and the state is discarded. The
+// discriminating shape is a SECOND durable operation in the same handler, which is
+// the ordinary shape of any workflow that does something with its children's
+// results.
+//
+// Fails by TIMEOUT rather than assertion, because a lost unlock presents as a
+// hang, not a wrong value.
+func TestFanOut_ReleasesTheCallStateLockForLaterOperations(t *testing.T) {
+	store := newMinimalStorage()
+	jc := makeJobCtx(store, "parent-lockrelease", "default")
+	ctx := buildCtx(jc, nil)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		// First fan-out: suspends the job and returns the sentinel. It must leave
+		// the call-state mutex UNLOCKED for whatever the handler does next.
+		_, _ = FanOut[string](ctx, []SubJob{{Type: "do-work", Args: "item-1"}})
+		// Second durable operation in the same handler. This is the line that
+		// deadlocks if the first one kept the lock.
+		_, _ = FanOut[string](ctx, []SubJob{{Type: "do-work", Args: "item-2"}})
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("a second durable operation after FanOut deadlocked on the call-state mutex — " +
+			"FanOut must release cs.Mu before returning, or any workflow that continues past its " +
+			"fan-out hangs forever while its heartbeat keeps the lease alive")
+	}
+}

@@ -44,19 +44,69 @@ w := jobs.NewWorker(q,
 
 ## Graceful Drain
 
-`Worker.Start(ctx)` blocks until `ctx` is cancelled. On cancellation the worker
-stops dispatching new jobs, closes the internal dispatch channel, and waits for
-in-flight handlers to finish for `DrainTimeout`.
+`Worker.Start(ctx)` blocks until `ctx` is cancelled **and the drain has
+finished**. Wait for its return before tearing down anything a handler uses (see
+[Shutting down correctly](#shutting-down-correctly)).
 
-`WithDrainTimeout(d)` controls that grace window. The default is 30 seconds. A
-non-positive value aborts immediately by cancelling handler contexts. If the
-timeout expires, the worker cancels remaining handlers and waits for them to
-return.
+On cancellation the worker runs three phases:
 
-Use a drain timeout long enough for normal handlers to observe `ctx.Done()`,
-finish idempotently, and persist results or checkpoints. Handlers should pass
-their context into outbound calls; a handler that ignores cancellation can still
-hold shutdown until the drain timeout is reached.
+| Phase | What happens | Bounded by |
+|---|---|---|
+| 1. Drain | Stop dispatching, close the dispatch channel, wait for in-flight handlers to finish **on their own**. Handler contexts are *not* cancelled here. | `DrainTimeout` — default 30s, set with `WithDrainTimeout(d)` |
+| 2. Force-cancel | Cancel every remaining handler context, wait again. | A fixed 5-second forced-drain grace, then the worker logs `in-flight handlers did not exit within the forced-drain grace; abandoning them` and moves on **while they are still executing** |
+| 3. Background wait | Wait for the reaper, scheduler, retention and other internal goroutines. | Unbounded — none is abandoned mid-write |
+
+Two consequences that are easy to get wrong:
+
+{{< callout type="warning" >}}
+**Handlers do not see `ctx.Done()` during phase 1.** Worker-context cancellation
+is deliberately *not* propagated to running handlers while the drain window is
+open — that is what gives a handler its full `DrainTimeout` to finish the work it
+already started. `ctx.Done()` fires only in phase 2, i.e. after the whole
+`DrainTimeout` has elapsed. So a lengthening `DrainTimeout` does not give a
+cancellation-aware handler more warning; it delays the warning, and delays
+shutdown by exactly that much whenever any handler is still running.
+{{< /callout >}}
+
+Size `DrainTimeout` as *the longest a normal handler needs to run to completion*,
+not as "time to notice cancellation". Keep it comfortably under your
+orchestrator's kill deadline: with Kubernetes' default 30s
+`terminationGracePeriodSeconds` and the 30s default `DrainTimeout`, a pod with a
+long-running handler is `SIGKILL`ed at the very moment the worker would have
+force-cancelled it, so the shutdown-release path never runs and the job stays
+`running`, holding the dead pod's lock until the stale-lock reaper reclaims it at
+`StaleLockAge` (45 minutes by default). Either lower `DrainTimeout` or raise
+`terminationGracePeriodSeconds` above `DrainTimeout + 5s`.
+
+`WithDrainTimeout(0)` (or any non-positive value) skips phase 1 entirely and
+force-cancels handlers immediately.
+
+### Shutting down correctly
+
+`Start` returns after phase 3, but **phase 2 is bounded**: a handler that ignores
+its context is abandoned, not waited for, so it may still be executing after
+`Start` returns. Do not treat `Start`'s return as proof that no handler is live —
+closing the `*sql.DB`, flushing tracing, or calling `os.Exit` immediately can
+yank the pool out from under an abandoned handler mid-transaction. Make handlers
+context-aware and keep them shorter than `DrainTimeout`; that, not the return of
+`Start`, is what makes the guarantee real.
+
+```go
+ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+defer stop()
+
+w := jobs.NewWorker(q,
+	jobs.WorkerQueue("default", jobs.Concurrency(20)),
+	jobs.WithDrainTimeout(20*time.Second), // < terminationGracePeriodSeconds - 5s
+)
+
+// Start BLOCKS until the drain completes. Do not launch it with `go` and then
+// exit on the signal: that abandons the drain instead of waiting for it.
+if err := w.Start(ctx); err != nil && !errors.Is(err, context.Canceled) {
+	return err
+}
+// Only now is it safe to close the database, flush traces, and exit.
+```
 
 ## The `sdj` CLI
 
@@ -107,7 +157,12 @@ per line for scripts. `dlq list --tenant` and repeated `--metadata key=value`
 filters narrow triage to one tenant or metadata slice. `dlq requeue` succeeds
 only when the target job exists and is failed or cancelled; fan-out sub-jobs
 must be handled by requeueing their parent. `dlq requeue --queue` and
-`--tenant` requeue every matching dead-lettered job.
+`--tenant` requeue every matching dead-lettered job that *can* be requeued and
+report the rest: dead-lettered fan-out sub-jobs are counted under
+`skipped N fan-out sub-jobs` (requeue their parent instead) and any row that is no
+longer failed or cancelled (or has since been deleted) under `skipped N jobs
+that could not be requeued`. The `requeued N jobs` summary is printed even when the run
+stops early on a storage error, so a partial run is never silent.
 
 ## Health Probes
 
@@ -162,7 +217,7 @@ capacity, stops when no work is dispatched, stops when released jobs reach the
 tick's release budget, stops when the poll-interval wall-clock budget elapses,
 and has a hard iteration cap.
 
-`WithDequeueBatchSize(n)` sets the per-poll claim cap. Default: `10`. Values are
+`WithDequeueBatchSize(n)` sets the per-poll claim cap. Default: `50`. Values are
 clamped to `[1, 1000]`. `WithPollInterval(d)` sets the idle poll interval.
 Default: `100ms`; positive values below `50ms` are clamped up to `50ms`; non-
 positive values are ignored.
@@ -383,9 +438,12 @@ separate archive table.
    ```
 
 Requeue clears DLQ metadata, resets execution state, and deletes checkpoints so
-the workflow starts from the beginning. The dashboard Requeue button instead
-clears the dead-letter state and resumes from existing checkpoints. Handlers
-still must be idempotent. See [Dead-Letter Queue]({{< relref
+the workflow starts from the beginning. The dashboard's Retry button does the
+same thing — it routes through the identical replay-from-scratch reset, so it
+is **not** a way to resume from existing checkpoints. Neither path preserves
+them, and there is no operation that does. Handlers still must be idempotent:
+every step of a requeued workflow runs again, including steps that already
+succeeded. See [Dead-Letter Queue]({{< relref
 "/docs/advanced/dead-letter-queue" >}}) for the full API and retention caveats.
 
 ## Retention And GC

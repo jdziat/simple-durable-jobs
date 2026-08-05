@@ -154,3 +154,50 @@ func TestRetentionDocMatchesDefaultRetentionPreset(t *testing.T) {
 	require.LessOrEqualf(t, cfg.Retention.ConsumedSignalsAfter, defaultRetentionConsumedSignalsAfter,
 		"the page tells operators DefaultRetention() is tighter than the stock windows; make it true or reword %s", retentionDocPath)
 }
+
+// readmePath is the OTHER page that describes retention to an operator, and the
+// one most of them read first.
+const readmePath = "../../README.md"
+
+// TestReadmeRetentionBulletMatchesTheCode extends the retention-doc guard to the
+// README. Round 40 found the README still carrying the pre-fix inversion long
+// after retention-gc.md was corrected: it told operators that consumed-signal
+// pruning is "opt-in" and that "a worker started with no retention configured
+// logs a one-time WARN", implying the default keeps everything. Both are false —
+// an unconfigured worker prunes on the stock windows and logs INFO "retention GC
+// enabled"; the WARN fires only when retention is explicitly DISABLED. An
+// operator who believed the README would schedule external archival that arrives
+// after the rows are already gone.
+//
+// TestRetentionDocMatchesStockWindows guarded only retention-gc.md, which is why
+// the README copy survived. Guard the pages together.
+func TestReadmeRetentionBulletMatchesTheCode(t *testing.T) {
+	b, err := os.ReadFile(readmePath)
+	require.NoErrorf(t, err, "cannot read %s", readmePath)
+	md := string(b)
+
+	// The behaviour the bullet must not contradict.
+	w := NewWorker(queue.New(&mockStorage{}), WithOwnershipAuditInterval(0))
+	require.True(t, w.config.Retention.enabled(),
+		"an unconfigured worker must have retention enabled, or the README bullet needs rewriting")
+
+	require.NotContainsf(t, md, "consumed signals by opt-in age window",
+		"%s calls consumed-signal pruning opt-in; ConsumedSignalsAfter defaults to %v on every worker",
+		readmePath, defaultRetentionConsumedSignalsAfter)
+	require.NotContainsf(t, md, "a worker started with no retention configured logs a one-time WARN",
+		"%s says an unconfigured worker WARNs; it logs INFO and prunes. The WARN is the DISABLED case", readmePath)
+
+	// And it must state the windows an operator plans archival around.
+	for _, want := range []struct {
+		days int
+		what string
+	}{
+		{int(defaultRetentionCompletedAfter / (24 * time.Hour)), "completed"},
+		{int(defaultRetentionFailedAfter / (24 * time.Hour)), "failed/cancelled"},
+		{int(defaultRetentionConsumedSignalsAfter / (24 * time.Hour)), "consumed signals"},
+	} {
+		require.Containsf(t, md, strconv.Itoa(want.days),
+			"%s must state the %s retention window (%d days) so archival is planned inside it",
+			readmePath, want.what, want.days)
+	}
+}

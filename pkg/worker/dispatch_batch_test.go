@@ -86,7 +86,7 @@ func TestWorkerBatchDequeueRequestsFreeCapacityBoundedByOption(t *testing.T) {
 		WithDequeueBatchSize(3),
 		DisableRetry(),
 	)
-	w.trackQueueJob("running-1", "default")
+	w.trackQueueJob(1, "default")
 
 	jobs, err := w.dequeueAvailableJobs(context.Background(), []string{"default"}, 5)
 	require.NoError(t, err)
@@ -109,8 +109,14 @@ func TestWorkerBatchDequeuePrefersPerQueueBudgets(t *testing.T) {
 		WithDequeueBatchSize(2),
 		DisableRetry(),
 	)
-	w.trackQueueJob("running-1", "hot")
-	w.trackQueueJob("running-2", "hot")
+	// DISTINCT tokens. Registering two runs under ONE token is an ordering
+	// dispatch cannot produce (TestDispatch_TokensAreUniquePerRun pins that), and
+	// it passes here only because the assertion reads the atomic counter, which
+	// double-increments, rather than the token-keyed map, which would hold one
+	// entry. Move the budget computation to the map and this test silently
+	// changes meaning without failing.
+	w.trackQueueJob(1, "hot")
+	w.trackQueueJob(2, "hot")
 
 	jobs, err := w.dequeueAvailableJobs(context.Background(), []string{"hot", "idle"}, 5)
 	require.NoError(t, err)
@@ -184,7 +190,7 @@ func TestWorkerBatchDispatchReleasesUndeliveredJobsOnShutdown(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	jobsChan := make(chan *core.Job, 1)
+	jobsChan := make(chan dispatchedJob, 1)
 	cancelled := make(chan struct{})
 	go func() {
 		for {
@@ -201,7 +207,7 @@ func TestWorkerBatchDispatchReleasesUndeliveredJobsOnShutdown(t *testing.T) {
 	<-cancelled
 
 	delivered := <-jobsChan
-	assert.Equal(t, core.UUID("job-1"), delivered.ID)
+	assert.Equal(t, core.UUID("job-1"), delivered.job.ID)
 	assert.Equal(t, core.StatusRunning, jobs[0].Status)
 	assert.Equal(t, "worker-1", jobs[0].LockedBy)
 

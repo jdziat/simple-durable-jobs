@@ -29,6 +29,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -52,10 +53,27 @@ func init() {
 	// Register the worker factory to enable queue.NewWorker()
 	queue.WorkerFactory = func(q *queue.Queue, opts ...any) core.Starter {
 		workerOpts := make([]worker.WorkerOption, 0, len(opts))
-		for _, opt := range opts {
+		for i, opt := range opts {
 			if wo, ok := opt.(worker.WorkerOption); ok {
 				workerOpts = append(workerOpts, wo)
+				continue
 			}
+			// Queue.NewWorker takes ...any because the facade cannot name
+			// worker.WorkerOption without an import cycle. That made every
+			// mistyped or misplaced argument a SILENT no-op: passing a
+			// queue.Option, a bare value, or an option from the wrong
+			// constructor left the worker running on defaults with no
+			// indication anything was ignored — the kind of misconfiguration
+			// that is only discovered from production behaviour.
+			//
+			// Logged rather than panicked in v4: turning a currently-working
+			// (if wrongly-configured) process into a startup crash on a patch
+			// upgrade would convert a latent bug into an outage. v5 replaces
+			// this with a typed signature, where the compiler catches it.
+			slog.Default().Error(
+				"jobs: ignoring argument to NewWorker that is not a jobs.WorkerOption; "+
+					"the worker is running WITHOUT it",
+				"index", i, "type", fmt.Sprintf("%T", opt))
 		}
 		return worker.NewWorker(q, workerOpts...)
 	}
@@ -117,7 +135,13 @@ type (
 	// JobReclaimed is emitted when a worker reclaims a job from a presumed-dead owner.
 	JobReclaimed = core.JobReclaimed
 
-	// CheckpointSaved is emitted when a checkpoint is saved.
+	// CheckpointSaved describes a checkpoint write.
+	//
+	// DECLARED BUT NOT CURRENTLY EMITTED: nothing in this module constructs one,
+	// so a `case *jobs.CheckpointSaved:` arm in a Queue.Events() subscriber never
+	// fires. Poll q.Storage().GetCheckpoints(ctx, jobID) for workflow progress
+	// instead — it is a Storage method, not a Queue one. See
+	// core.CheckpointSaved for the full note.
 	CheckpointSaved = core.CheckpointSaved
 
 	// SignalDelivered is emitted when a signal is persisted for a job.
@@ -636,6 +660,13 @@ var ErrPhaseCheckpointDecode = jobctx.ErrPhaseCheckpointDecode
 // GetVersion records or replays a workflow-code version marker for changeID.
 // Use the returned version to branch around changes to Call, fan-out, and signal
 // wait sequences so in-flight runs keep their originally recorded path.
+//
+// A run that was already in flight when the marker was deployed has no marker to
+// replay; it is pinned to DefaultVersion on the evidence of the durable steps it
+// already recorded past this point, so the DefaultVersion branch is the one it
+// takes. Place the marker BEFORE the durable operations it guards — that is what
+// makes the evidence visible. See [jobctx.GetVersion] for the exact rule and its
+// one-sided residual.
 func GetVersion(ctx context.Context, changeID string, minSupported, maxSupported int) (int, error) {
 	return jobctx.GetVersion(ctx, changeID, minSupported, maxSupported)
 }
@@ -652,35 +683,45 @@ func RetryAfter(d time.Duration, err error) error {
 
 // ValidateJobTypeName validates a job type name.
 //
-// Deprecated: internal helper; will be unexported in v3.
+// Deprecated: internal helper. Slated for unexporting in a future major (it was
+// NOT unexported in v3 or v4, despite what this notice used to say — the module
+// is at /v4 and this function is still exported). Prefer not to depend on it.
 func ValidateJobTypeName(name string) error {
 	return security.ValidateJobTypeName(name)
 }
 
 // ValidateQueueName validates a queue name.
 //
-// Deprecated: internal helper; will be unexported in v3.
+// Deprecated: internal helper. Slated for unexporting in a future major (it was
+// NOT unexported in v3 or v4, despite what this notice used to say — the module
+// is at /v4 and this function is still exported). Prefer not to depend on it.
 func ValidateQueueName(name string) error {
 	return security.ValidateQueueName(name)
 }
 
 // SanitizeErrorMessage truncates and sanitizes error messages for storage.
 //
-// Deprecated: internal helper; will be unexported in v3.
+// Deprecated: internal helper. Slated for unexporting in a future major (it was
+// NOT unexported in v3 or v4, despite what this notice used to say — the module
+// is at /v4 and this function is still exported). Prefer not to depend on it.
 func SanitizeErrorMessage(msg string) string {
 	return security.SanitizeErrorMessage(msg)
 }
 
 // ClampRetries ensures retry count is within limits.
 //
-// Deprecated: internal helper; will be unexported in v3.
+// Deprecated: internal helper. Slated for unexporting in a future major (it was
+// NOT unexported in v3 or v4, despite what this notice used to say — the module
+// is at /v4 and this function is still exported). Prefer not to depend on it.
 func ClampRetries(n int) int {
 	return security.ClampRetries(n)
 }
 
 // ClampConcurrency ensures concurrency is within limits.
 //
-// Deprecated: internal helper; will be unexported in v3.
+// Deprecated: internal helper. Slated for unexporting in a future major (it was
+// NOT unexported in v3 or v4, despite what this notice used to say — the module
+// is at /v4 and this function is still exported). Prefer not to depend on it.
 func ClampConcurrency(n int) int {
 	return security.ClampConcurrency(n)
 }
@@ -1012,7 +1053,42 @@ func Weekly(day time.Weekday, hour, minute int) Schedule {
 	return schedule.Weekly(day, hour, minute)
 }
 
+// CronIn is Cron with the evaluation location supplied separately, for callers
+// holding a *time.Location rather than a timezone name.
+func CronIn(loc *time.Location, expr string) (Schedule, error) {
+	return schedule.CronIn(loc, expr)
+}
+
+// MustCronIn is CronIn but panics on an invalid expression or location.
+func MustCronIn(loc *time.Location, expr string) Schedule {
+	return schedule.MustCronIn(loc, expr)
+}
+
+// DailyIn is Daily with the hour and minute interpreted in loc, honouring that
+// location's DST rules rather than a fixed UTC offset.
+//
+// Exactly one fire per calendar day at both DST edges: the fire is the earliest
+// instant on that day whose clock in loc has reached hour:minute, so a reading
+// the clock jumps over fires at the jump and a reading that occurs twice fires at
+// the first occurrence. See [schedule.DailyIn] for the full contract.
+func DailyIn(loc *time.Location, hour, minute int) Schedule {
+	return schedule.DailyIn(loc, hour, minute)
+}
+
+// WeeklyIn is Weekly with the day, hour and minute interpreted in loc. The fire
+// always lands on the requested calendar weekday in loc; the DST notes on
+// [DailyIn] apply.
+func WeeklyIn(loc *time.Location, day time.Weekday, hour, minute int) Schedule {
+	return schedule.WeeklyIn(loc, day, hour, minute)
+}
+
 // Cron creates a schedule from a cron expression.
+//
+// The expression is evaluated in UTC unless it carries an explicit
+// "CRON_TZ=Area/City " or "TZ=Area/City " prefix, which is honoured. Note that
+// the default is UTC and not the host's local zone, so the same expression fires
+// at the same instant on every node in a fleet. Use [CronIn] to supply a
+// *time.Location directly.
 func Cron(expr string) (Schedule, error) {
 	return schedule.Cron(expr)
 }

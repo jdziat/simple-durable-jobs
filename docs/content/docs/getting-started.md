@@ -125,10 +125,13 @@ type SendEmailResult struct {
     MessageID string `json:"message_id"`
 }
 
-sendEmail := typed.Define(queue, "send-email", func(ctx context.Context, args SendEmailArgs) (SendEmailResult, error) {
-    fmt.Printf("Sending email to %s\n", args.To)
-    return SendEmailResult{MessageID: "msg_123"}, nil
-})
+// Define's fn parameter is `any`, so A and R are never inferred:
+// always write the type parameters out.
+sendEmail := typed.Define[SendEmailArgs, SendEmailResult](queue, "send-email",
+    func(ctx context.Context, args SendEmailArgs) (SendEmailResult, error) {
+        fmt.Printf("Sending email to %s\n", args.To)
+        return SendEmailResult{MessageID: "msg_123"}, nil
+    })
 
 cleanup := typed.DefineVoid(queue, "cleanup", func(ctx context.Context, _ struct{}) error {
     fmt.Println("Cleaning up")
@@ -185,28 +188,40 @@ jobID, err = queue.Enqueue(ctx, "send-email", args,
 
 ```go
 // Create and start worker
-worker := queue.NewWorker()
-worker.Start(ctx) // Blocks until context is cancelled
+worker := jobs.NewWorker(queue)
+worker.Start(ctx) // Blocks until ctx is cancelled AND in-flight handlers drain
 ```
 
-For graceful shutdown:
+For graceful shutdown, cancel the context on a signal and then **wait for
+`Start` to return** — that return is the only indication the drain has finished:
 
 ```go
-ctx, cancel := context.WithCancel(context.Background())
+ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+defer stop()
 
-// Start worker in goroutine
-go worker.Start(ctx)
+worker := jobs.NewWorker(queue)
 
-// On shutdown signal
-cancel()
+// Start BLOCKS until ctx is cancelled AND in-flight handlers have drained
+// (up to WithDrainTimeout, 30s by default).
+if err := worker.Start(ctx); err != nil && !errors.Is(err, context.Canceled) {
+    log.Fatal(err)
+}
+// Safe to close the database and exit only after Start has returned.
 ```
+
+Do **not** write `go worker.Start(ctx)` and exit once `cancel()` returns: that
+throws away the only handle on the drain, so the process dies with handlers
+mid-flight. Those jobs stay `running`, holding the dead process's lock until the
+stale-lock reaper reclaims them (45 minutes by default). See
+[Graceful Drain]({{< relref "/docs/production-ops#graceful-drain" >}}) for the
+phases and their timeouts.
 
 ## Worker Configuration
 
 Configure worker concurrency and queues:
 
 ```go
-worker := queue.NewWorker(
+worker := jobs.NewWorker(queue, 
     // Process "default" queue with 10 concurrent workers
     jobs.WorkerQueue("default", jobs.Concurrency(10)),
 
@@ -288,7 +303,7 @@ if err := queue.Schedule("hourly", nil, hourly); err != nil {
 }
 
 // Remember to enable scheduler in worker
-worker := queue.NewWorker(jobs.WithScheduler(true))
+worker := jobs.NewWorker(queue, jobs.WithScheduler(true))
 ```
 
 ## Observability

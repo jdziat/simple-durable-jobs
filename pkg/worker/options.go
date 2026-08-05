@@ -30,6 +30,11 @@ const (
 	defaultRetentionInterval  = time.Hour
 	minRetentionInterval      = 100 * time.Millisecond
 	defaultRetentionBatchSize = 1000
+	// maxRetentionBatchSize caps how many rows one retention pass may claim.
+	// Retention loops until a pass comes back short, so a bigger batch only trades
+	// round trips for longer write-lock hold times; the cap bounds that, and keeps
+	// a mis-set batch size from turning into an oversized transaction.
+	maxRetentionBatchSize = 10000
 )
 
 const (
@@ -312,6 +317,20 @@ func Concurrency(n int) WorkerOption {
 
 // CapKey derives the partition key for a ConcurrencyCap from the dequeued job.
 // The effective slot name is capName + ":" + key(job).
+//
+// Prefer a key that is STABLE for a given job, not merely bounded in
+// cardinality. A job can be dequeued twice by one worker — the stale-lock reaper
+// can release a lock this worker then reclaims — so two runs of one job id
+// briefly overlap. If the key changed in between, they hold DIFFERENT slot rows
+// and the job counts against the cap under both keys at once, which is not what
+// "at most N of these" is meant to mean.
+//
+// It does not leak: the departing run hands its names to the surviving one, so
+// whoever finishes last releases the union. (An aggressive pause is not a route
+// here either — it deletes every slot row for the job id, so the next run starts
+// clean.) But the double-counting is real, so derive the key from something
+// immutable for the life of the job (tenant, queue, a field of the payload)
+// rather than from metadata a handler rewrites.
 func CapKey(fn func(*core.Job) string) CapOption {
 	return func(c *ConcurrencyCapConfig) {
 		c.Key = fn
@@ -471,10 +490,12 @@ func UniqueLockSweepInterval(d time.Duration) UniqueLockSweepOption {
 }
 
 // UniqueLockSweepBatchSize sets the maximum expired unique-lock rows deleted in
-// one pass. Non-positive values use the default.
+// one pass. Non-positive values use the default (1000); values above
+// maxRetentionBatchSize (10000) are clamped to it, for the same reason
+// RetentionBatchSize is — see there.
 func UniqueLockSweepBatchSize(n int) UniqueLockSweepOption {
 	return func(c *UniqueLockSweepConfig) {
-		c.BatchSize = n
+		c.BatchSize = clampRetentionBatchSize(n)
 	}
 }
 
@@ -533,11 +554,26 @@ func RetentionInterval(d time.Duration) RetentionOption {
 }
 
 // RetentionBatchSize sets the maximum rows deleted in one pass. Non-positive
-// values use the default.
+// values use the default (1000); values above maxRetentionBatchSize (10000) are
+// clamped to it. The sweep already loops until a pass comes back short, so a
+// larger batch buys fewer round trips, not more throughput, while holding write
+// locks proportionally longer — the clamp bounds that hold time. It also keeps
+// the option honest: values in the tens of thousands used to be accepted and then
+// make every pass fail, so retention silently deleted nothing at all.
 func RetentionBatchSize(n int) RetentionOption {
 	return func(c *RetentionConfig) {
-		c.BatchSize = n
+		c.BatchSize = clampRetentionBatchSize(n)
 	}
+}
+
+// clampRetentionBatchSize maps a requested retention batch size onto the
+// supported range. Non-positive means "unset" and is passed through so the
+// caller applies defaultRetentionBatchSize; anything above the ceiling is capped.
+func clampRetentionBatchSize(n int) int {
+	if n > maxRetentionBatchSize {
+		return maxRetentionBatchSize
+	}
+	return n
 }
 
 // RetentionDeleteCheckpointsOnComplete opts in to deleting a successful job's

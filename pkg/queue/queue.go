@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 
 	"github.com/jdziat/simple-durable-jobs/v4/pkg/core"
 	"github.com/jdziat/simple-durable-jobs/v4/pkg/internal/handler"
@@ -88,7 +89,25 @@ func New(s core.Storage) *Queue {
 }
 
 // Register registers a job handler function.
-// The function must have signature: func(ctx context.Context, args T) error
+//
+// fn takes ONE or TWO parameters — an OPTIONAL leading context.Context, then an
+// OPTIONAL args value — and returns either error or (R, error). T is the
+// argument struct and R the result; both are encoded with the queue's payload
+// codec. Every combination is accepted, so all six of these work:
+//
+//	func(ctx context.Context, args T) error
+//	func(ctx context.Context, args T) (R, error)
+//	func(args T) error
+//	func(args T) (R, error)
+//	func(ctx context.Context) error
+//	func(ctx context.Context) (R, error)
+//
+// A zero-parameter func() error is rejected.
+//
+// This godoc used to name only the first form, which was wrong in a way that
+// contradicted the library's own typed API: Define[A, R] / DefineE register
+// through RegisterE and REQUIRE the (R, error) form.
+//
 // Job type names must be alphanumeric (starting with a letter), max 255 chars.
 // Register panics on invalid input; use RegisterE for configuration-driven
 // registration that should return validation errors instead.
@@ -101,7 +120,17 @@ func (q *Queue) Register(name string, fn any, opts ...Option) {
 // RegisterE registers a job handler function and returns validation errors
 // instead of panicking.
 //
-// The function must have signature: func(ctx context.Context, args T) error.
+// fn takes ONE or TWO parameters — an OPTIONAL leading context.Context, then an
+// OPTIONAL args value — and returns either error or (R, error), exactly as
+// listed on Register. All six combinations are accepted:
+//
+//	func(ctx context.Context, args T) error
+//	func(ctx context.Context, args T) (R, error)
+//	func(args T) error
+//	func(args T) (R, error)
+//	func(ctx context.Context) error
+//	func(ctx context.Context) (R, error)
+//
 // Job type names must be alphanumeric (starting with a letter), max 255 chars.
 func (q *Queue) RegisterE(name string, fn any, opts ...Option) error {
 	// Validate job type name
@@ -126,6 +155,30 @@ func (q *Queue) RegisterE(name string, fn any, opts ...Option) error {
 
 	q.mu.Lock()
 	defer q.mu.Unlock()
+	// Re-registering a name with a DIFFERENT signature is refused. This was
+	// last-write-wins, and the second registration silently replaced the first —
+	// after which a typed Call through the first definition JSON-round-tripped the
+	// caller's argument into the wrong struct type. With no shared field names that
+	// decodes cleanly to the zero value, the callee sees zero, the result decodes
+	// back to zero, and the job COMPLETES with a nil error on every surface. Silent
+	// wrong data, undetectable at runtime.
+	//
+	// Only Def.Enqueue was protected (ValidateArgs -> ErrJobArgsMismatch); Def.Call,
+	// EnqueueRemote and any job already queued under the old definition were not.
+	//
+	// Scoped to a signature CHANGE rather than any duplicate: re-registering the
+	// same name with the same argument and result types is idempotent and stays
+	// permitted, which is what keeps this from breaking legitimate re-registration
+	// (test setup, a queue rebuilt from the same definitions). Schedule already
+	// refuses its duplicate outright, so handler names were the outlier.
+	if prev, dup := q.handlers[name]; dup {
+		if prev.ArgsType != h.ArgsType || prev.ResultType != h.ResultType {
+			return fmt.Errorf(
+				"jobs: handler %q is already registered with a different signature (have args %v result %v, got args %v result %v); "+
+					"re-registering silently replaces the first and makes typed calls through it return zero values with no error",
+				name, prev.ArgsType, prev.ResultType, h.ArgsType, h.ResultType)
+		}
+	}
 	q.handlers[name] = h
 	return nil
 }
@@ -247,10 +300,87 @@ func (q *Queue) EnqueueScheduledFire(ctx context.Context, scheduleName string, f
 		// in the storage's serialization-retry so a scheduled fire of a Unique/
 		// IdempotencyKey schedule under contention is retried rather than failing the
 		// tick. claimed/id are reset per attempt so a rolled-back attempt never leaks.
+		deduped := false
 		runTx := func() error {
 			claimed = false
 			id = core.NilUUID
+			deduped = false
 			return dbp.DB().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+				// Capture the schedule's last REAL fire before claiming. The claim
+				// stamps last_fire_at (the cursor) and last_fired_at (the real-fire
+				// marker) together, but a deliberate skip must advance only the
+				// cursor: last_fired_at feeds the dashboard's per-schedule last-run
+				// and its overdue/health indicator, so stamping it on a skip would
+				// render a schedule blocked for hours by a stuck unique job as
+				// perfectly healthy. Restored below if the fire turns out to be a skip.
+				// The read takes the SAME row lock the claim is about to take, rather
+				// than reading first and locking after. Without it this is a lock-free
+				// read-modify-write: a peer committing a real fire for an EARLIER
+				// boundary between our SELECT and our claim is invisible to us, our
+				// claim still succeeds (its cursor guard only rejects boundaries at or
+				// past ours), and the restore below then writes back a marker from
+				// before their fire — losing it. That errs pessimistic rather than
+				// dangerous, since the overdue indicator only ever reads older, but it
+				// is silent and avoidable. Locking here just starts the window a few
+				// microseconds earlier on the one row the claim already serialises on,
+				// so it introduces no new lock ordering.
+				//
+				// SQLite has no row locks; its transactions already serialise (the
+				// storage opens with _txlock=immediate), and FOR UPDATE is a syntax
+				// error there.
+				var priorFiredAt *time.Time
+				{
+					// Materialise the row BEFORE the locking read, so FOR UPDATE takes
+					// a RECORD lock rather than a gap lock.
+					//
+					// Under REPEATABLE READ — MySQL's default, which this project does
+					// not override — a locking read for a key that does NOT exist takes
+					// a next-key/gap lock. Two transactions firing two different
+					// schedule names that fall in the same InnoDB gap each lock that
+					// gap and then each need an insert-intention lock inside it:
+					// deadlock. Measured on live MySQL 8.0.42 with 12 goroutines firing
+					// 20 fresh schedule names, 6 of 9 runs produced deadlock storms and
+					// 4 of those LOST BOUNDARIES (6-9 claims out of 20) — a scheduled
+					// run that no worker claimed and nobody will retry, which is the
+					// teardown-g8 failure the atomic claim exists to prevent. Postgres
+					// is unaffected (it takes no lock on a non-existent row); so is the
+					// steady state where the row already exists.
+					//
+					// This is byte-for-byte the insert ClaimScheduledFireTx performs a
+					// moment later, so it adds no semantics and no new lock ordering.
+					//
+					// IT DOES COST LATENCY, and the cost was measured rather than
+					// hand-waved. A poller whose boundary is already claimed used to
+					// run one UPDATE that matched zero rows and return; it now
+					// materialises the row and blocks on the winner's row lock for
+					// the winner's whole transaction (claim + enqueue), and losers
+					// serialise behind each other. On live databases with a fleet
+					// firing the same aligned boundaries — which is what minute-crons
+					// do — p50 roughly DOUBLES: Postgres 12 workers x 20 schedules
+					// 72ms -> 141ms, 24 x 50 205ms -> 426ms; MySQL 12 x 20
+					// 132ms -> 196ms. It is not a wedge (runScheduler is a 100ms
+					// ticker on its own goroutine, boundaries are still claimed
+					// exactly once, and the cost lands only on aligned boundaries),
+					// but it scales with workers x simultaneously-due schedules and
+					// each blocked poller parks a pool connection meanwhile — which
+					// matters if MaxOpenConns is tight.
+					// pkg/storage/tx_enqueue.go documents the same InnoDB hazard for the
+					// unique-key dedup.
+					if e := tx.WithContext(ctx).Clauses(clause.OnConflict{DoNothing: true}).
+						Create(&core.ScheduledFire{Name: scheduleName, LastFireAt: time.Unix(0, 0).UTC()}).Error; e != nil {
+						return e
+					}
+					q := tx.WithContext(ctx).Where("name = ?", scheduleName)
+					if tx.Name() != "sqlite" {
+						q = q.Clauses(clause.Locking{Strength: "UPDATE"})
+					}
+					var prior core.ScheduledFire
+					if e := q.First(&prior).Error; e == nil {
+						priorFiredAt = prior.LastFiredAt
+					} else if !errors.Is(e, gorm.ErrRecordNotFound) {
+						return e
+					}
+				}
 				won, e := txClaimer.ClaimScheduledFireTx(ctx, tx, scheduleName, fireTime)
 				if e != nil {
 					return e
@@ -261,6 +391,45 @@ func (q *Queue) EnqueueScheduledFire(ctx context.Context, scheduleName string, f
 				}
 				jid, e := q.EnqueueTx(ctx, tx, jobName, args, opts...)
 				if e != nil {
+					if errors.Is(e, core.ErrDuplicateJob) {
+						// SCOPE, because this branch is narrower than it looks: only
+						// queue.Unique produces ErrDuplicateJob. IdempotencyKey and
+						// UniqueFor go through EnqueueWithUniqueLockTx, which returns
+						// the EXISTING job id with a nil error, so a deduplicated fire
+						// on those two modes still reaches the success path below and
+						// still stamps last_fired_at — the very thing the marker split
+						// exists to avoid. Reproduced on live Postgres: two boundaries
+						// inside one idempotency window created one job row and advanced
+						// the marker for the boundary at which nothing ran.
+						//
+						// That is not a regression (before this change the marker was
+						// stamped unconditionally, for every mode), and it is left as is
+						// deliberately: distinguishing "deduplicated" from "enqueued" on
+						// the nil-error path needs the storage to say which happened,
+						// which is an exported-signature change under the /v4 api-compat
+						// gate. Options.DedupRequested() tells us dedup was ASKED for,
+						// not that it FIRED, so it is not sufficient on its own.
+						//
+						// Deliberate SKIP, not a failure: the schedule declared
+						// queue.Unique and a previous fire is still live, so enqueuing a
+						// second instance is precisely what the author asked us not to
+						// do. COMMIT the claim (return nil) so the durable cursor
+						// advances past a boundary that was evaluated and intentionally
+						// not run, and peers stop re-attempting it. Rolling back instead
+						// left the boundary re-claimable, so a polling caller retried it
+						// every tick for the ENTIRE runtime of the previous instance —
+						// one transaction and one ERROR log per 100ms. Reported to the
+						// caller via the sentinel returned below.
+						// Advance the cursor but NOT the real-fire marker: nothing ran.
+						if e := tx.WithContext(ctx).
+							Model(&core.ScheduledFire{}).
+							Where("name = ?", scheduleName).
+							Update("last_fired_at", priorFiredAt).Error; e != nil {
+							return e
+						}
+						deduped = true
+						return nil
+					}
 					return e // rolls back the claim so the boundary stays re-claimable
 				}
 				id = jid
@@ -277,6 +446,13 @@ func (q *Queue) EnqueueScheduledFire(ctx context.Context, scheduleName string, f
 		}
 		if txErr != nil {
 			return false, core.NilUUID, txErr
+		}
+		if deduped {
+			// claimed=true with a nil id and this sentinel means "boundary consumed,
+			// deliberately not run" — distinct from both a peer's claim
+			// (claimed=false, nil error) and a genuine failure (non-nil error with
+			// the claim rolled back).
+			return claimed, core.NilUUID, core.ErrDuplicateJob
 		}
 		return claimed, id, nil
 	}
@@ -446,17 +622,25 @@ func (q *Queue) buildJob(name string, args any, options *Options) (*core.Job, er
 	}
 
 	job := &core.Job{
-		ID:          core.NewID(),
-		Type:        name,
-		Args:        argsBytes,
-		Queue:       options.Queue,
-		Tenant:      options.Tenant,
-		Metadata:    cloneOptionsMetadata(options.Metadata),
-		Priority:    options.Priority,
-		MaxRetries:  maxRetries,
-		UniqueKey:   options.UniqueKey,
-		Determinism: int(effDet),
-		Status:      core.StatusPending,
+		ID:         core.NewID(),
+		Type:       name,
+		Args:       argsBytes,
+		Queue:      options.Queue,
+		Tenant:     options.Tenant,
+		Metadata:   cloneOptionsMetadata(options.Metadata),
+		Priority:   options.Priority,
+		MaxRetries: maxRetries,
+		// Unconditionally set: whatever maxRetries holds here is deliberate — either
+		// an explicit Retries(n) or the Go-layer default this package supplies
+		// (Options starts at DefaultJobRetries). Storage cannot tell a deliberate 0
+		// from an untouched int field, so without this an explicit Retries(0) is
+		// replaced by the max_retries column default and a do-not-retry handler runs
+		// three times. Gating it on options.RetriesSet() would be equivalent today
+		// only because DefaultJobRetries is non-zero — a value this layer chooses.
+		MaxRetriesSet: true,
+		UniqueKey:     options.UniqueKey,
+		Determinism:   int(effDet),
+		Status:        core.StatusPending,
 	}
 
 	if options.Timeout > 0 {
@@ -517,10 +701,22 @@ func cloneOptionsMetadata(m *core.MetadataMap) map[string]string {
 //
 // Note: the in-batch Unique dedup (collapsing two entries in this call that share
 // a key) is computed from each job's UniqueKey BEFORE enqueue middleware runs, so
-// a middleware that rewrites UniqueKey is not reflected in that in-slice
-// collapse. Enqueue middleware on the batch path must therefore not depend on
-// rewriting UniqueKey for dedup; the storage-level unique constraint still
-// applies to the final key.
+// a middleware that rewrites UniqueKey is not reflected in that in-slice collapse.
+// Enqueue middleware on the batch path must therefore not depend on rewriting
+// UniqueKey for dedup.
+//
+// Be concrete about what that costs, because the previous wording ("the
+// storage-level unique constraint still applies to the final key") read as a
+// promise that two entries with distinct final keys both persist. They do not.
+// The collapse assigns the losing entry the WINNER'S primary key and is not
+// undone by a later key rewrite, so the two entries reach storage as two
+// different jobs sharing one primary key — and a primary key holds one row. The
+// second is suppressed and its arguments and options are not persisted at all.
+// Both entries still return the surviving job's id, and that id names a live row.
+//
+// What is guaranteed is that the suppressed entry cannot corrupt the survivor:
+// its options (an explicit Retries(0), a delayed job's dq_ready) are never
+// applied to the row it did not create. See enqueueBatchWithDB.
 func (q *Queue) EnqueueBatch(ctx context.Context, entries []BatchEntry) ([]core.UUID, error) {
 	return q.enqueueBatch(ctx, entries, q.storage.EnqueueBatch)
 }
@@ -1154,6 +1350,22 @@ func (q *Queue) UnregisterRunningJob(jobID core.UUID) {
 	q.runningJobsMu.Lock()
 	delete(q.runningJobs, jobID)
 	q.runningJobsMu.Unlock()
+}
+
+// RunningJobCount reports how many jobs this process currently has registered as
+// locally running — the registry CancelJob and PauseJob consult to reach a live
+// handler.
+//
+// It exists because the invariant "a finished job unregisters itself" had no
+// observable: a worker that stopped calling UnregisterRunningJob left the whole
+// test suite green while this map grew by one retained context.CancelFunc per job
+// the process ever ran, and CancelJob/PauseJob began acting on stale entries for
+// long-finished jobs. Steady-state this should track in-flight work, not total
+// work done; a number that only ever climbs is that leak.
+func (q *Queue) RunningJobCount() int {
+	q.runningJobsMu.Lock()
+	defer q.runningJobsMu.Unlock()
+	return len(q.runningJobs)
 }
 
 // --- Job Pause Operations ---

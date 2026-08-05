@@ -84,6 +84,10 @@ phase, and does not insert a second ledger entry.
 - `SavePhaseCheckpointTx` must be called from inside a job handler. Outside a
   handler it returns an error instead of silently skipping the write, because a
   skipped transactional checkpoint would break atomicity.
+- A phase name may be saved only once per run; a second phase reusing it gets
+  `jobctx.ErrDuplicatePhaseName`. The claim is taken when the row is written and
+  a later rollback cannot take it back, so redo a rolled-back phase by returning
+  the error and letting the job replay, not by retrying inside the same run.
 
 ## When not to bother
 

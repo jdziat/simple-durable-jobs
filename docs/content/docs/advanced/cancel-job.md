@@ -11,16 +11,27 @@ weight: 12
 err := jobs.CancelJob(ctx, q, jobID)
 ```
 
-A pending, waiting, or running job moves to a terminal `cancelled` state. Unlike
-a paused job, a cancelled job is **not resumable** — `ResumeJob` will not bring
-it back, and `UnpauseJob` returns `ErrJobNotPaused`. To replay a cancelled job
-from scratch, use `Requeue`.
+A job in any live status — pending, running, waiting or **paused** — moves to a
+terminal `cancelled` state. Paused is deliberately in that set: leaving it out
+meant a paused child survived its parent's cancellation and stayed resumable, so
+the dashboard's Resume button would run work an operator had explicitly
+cancelled. A cancelled job is **not resumable** — `ResumeJob` will not bring it
+back, and `UnpauseJob` returns `ErrJobNotPaused`. To replay a cancelled job from
+scratch, use `Requeue`.
 
 Cancellation is a dedicated storage operation (`CancelJobTerminal`), not an
-alias for aggressive pause. It durably records the terminal status, clears the
-job's lock, releases any fleet concurrency slot the job held, sets
-`last_error` to `cancelled by user`, stamps `completed_at`, and emits a
-`JobCancelled` event.
+alias for aggressive pause. It durably records the terminal status, releases any
+fleet concurrency slot the job held, sets `last_error` to `cancelled by user`,
+stamps `completed_at`, and emits a `JobCancelled` event.
+
+It deliberately does **not** clear `locked_by`/`locked_until`. A running job
+keeps its owning worker's lock so that worker's ownership audit short-circuits
+the live handler in about 5 seconds instead of waiting for the multi-minute
+heartbeat fallback. A cancelled row therefore still carries a `locked_by` and a
+future `locked_until`, and nothing clears them later — the stale-lock reaper only
+reclaims `running` rows, so the values persist until retention deletes the job.
+If you monitor `locked_by <> ''` to mean "a worker is actively holding this job",
+exclude terminal statuses or you will misclassify every cancelled row.
 
 ## Fan-out subtrees
 

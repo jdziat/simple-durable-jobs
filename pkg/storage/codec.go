@@ -105,17 +105,57 @@ func (s *GormStorage) decodeErrorText(kind, id, stored string) (string, error) {
 	return prefix + string(decoded), nil
 }
 
+// encodedJobForCreate builds the row handed to GORM's Create. It ALWAYS returns
+// a fresh struct, never the caller's pointer, and that is load-bearing rather
+// than tidiness.
+//
+// GORM treats the struct it is given as its own scratch space: while building the
+// INSERT it substitutes each zero-valued field's declared column default and
+// writes the substituted value BACK into that struct — and it leaves it there
+// when the statement then FAILS and the transaction rolls back. core.Job declares
+// two such defaults that carry caller INTENT in their zero value:
+//
+//	MaxRetries `default:3`   an explicit jobs.Retries(0) becomes 3
+//	DQReady    `default:true` a delayed job's false becomes true
+//
+// Both are corrected by a follow-up write inside the same transaction
+// (applyExplicitZeroRetries, restoreDQReadyFalse), and both of those derive the
+// correction from the caller's struct. Every enqueue path is retried on transient
+// serialization failures — SQLITE_BUSY, MySQL 1213, Postgres 40001, all of which
+// this package documents as EXPECTED — either internally by withSerializationRetry
+// or, for the Tx forms, by the caller's documented WithSerializationRetry wrapper,
+// which re-enters the function. So if GORM can reach the caller's struct, attempt
+// N reads the state attempt N-1 destroyed: the correction never arms and the row
+// commits max_retries=3, silently, with a nil error and a do-not-retry handler
+// that runs three times.
+//
+// This used to short-circuit to `return job, nil` whenever the codec left the args
+// unchanged — which is the IDENTITY codec, i.e. every unencrypted deployment, i.e.
+// the default. Copying unconditionally is what makes the correction read a value
+// GORM has never touched, on every attempt, on every path, without each of those
+// paths having to remember. Pinned by
+// TestExplicitZeroRetriesSurvivesASerializationRetryOnEveryEnqueuePath and
+// TestRowForCreateNeverHandsGORMTheCallersJob.
+//
+// The cost of no longer aliasing is that GORM's post-insert write-back —
+// autoCreateTime/autoUpdateTime — lands on the copy, so the caller's job keeps its
+// zero CreatedAt/UpdatedAt. That was ALREADY the behaviour under any non-identity
+// codec, so this makes it uniform rather than introducing it; ID, Status and Queue
+// are filled by fillEnqueueDefaults on the caller's struct before we are called,
+// and those are what a caller reads back.
+//
+// Args is assigned unconditionally rather than only when the codec changed it.
+// encodePayload returns its input verbatim for an empty payload and IdentityCodec
+// returns it verbatim otherwise, so the two forms are byte-identical on every
+// input — a guard here would be a clause no test could distinguish.
 func (s *GormStorage) encodedJobForCreate(job *core.Job) (*core.Job, error) {
 	encodedArgs, err := s.encodePayload("job args", string(job.ID), job.Args)
 	if err != nil {
 		return nil, err
 	}
-	if len(job.Args) == 0 || bytes.Equal(encodedArgs, job.Args) {
-		return job, nil
-	}
-	cp := *job
-	cp.Args = encodedArgs
-	return &cp, nil
+	row := *job
+	row.Args = encodedArgs
+	return &row, nil
 }
 
 func (s *GormStorage) encodedJobsForCreate(jobs []*core.Job) ([]*core.Job, error) {

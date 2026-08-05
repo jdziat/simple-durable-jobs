@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math/rand/v2"
 	"regexp"
 	"sort"
@@ -144,6 +145,18 @@ type GormStorage struct {
 	// affects the failure path — retry replay reads checkpoints.
 	deleteCheckpointsOnComplete atomic.Bool
 
+	// logger is optional; slog.Default() is used when nil. See SetLogger.
+	logger *slog.Logger
+	// poisonPayloadDrops counts rows whose payload this storage cannot decode. It
+	// is always incremented, on every storage including a zero-value one.
+	poisonPayloadDrops atomic.Int64
+	// poisonPayload bounds which of those ids get NAMED in a log. Behind a pointer
+	// so GormStorage stays comparable: it holds a mutex and a map, neither of which
+	// is comparable, and an exported concrete type turning non-comparable is an
+	// api-compat break (same reason as hotStats and indexedMetadataKeys — see the
+	// note on hotStatCaches).
+	poisonPayload *poisonPayloadLog
+
 	// hotStatsTTL is the TTL (nanoseconds) for the hot-path aggregate cache; <=0
 	// disables it. atomic (comparable) so WithHotStatsCacheTTL and tests can set
 	// it without breaking GormStorage comparability.
@@ -184,7 +197,7 @@ func NewGormStorage(db *gorm.DB, opts ...GormStorageOption) *GormStorage {
 		dialector := db.Name()
 		isSQLite = strings.Contains(strings.ToLower(dialector), "sqlite")
 	}
-	s := &GormStorage{db: db, isSQLite: isSQLite, codec: core.IdentityCodec, hotStats: &hotStatCaches{}}
+	s := &GormStorage{db: db, isSQLite: isSQLite, codec: core.IdentityCodec, hotStats: &hotStatCaches{}, poisonPayload: &poisonPayloadLog{}}
 	s.lockDuration.Store(int64(defaultLockDuration))
 	s.hotStatsTTL.Store(int64(defaultHotStatsCacheTTL))
 	if s.isSQLite {
@@ -439,7 +452,7 @@ func requireMySQLUTCSession(ctx context.Context, db *gorm.DB) error {
 // requireMySQLUTF8MB4 refuses to migrate a MySQL database whose default
 // character set cannot carry the utf8mb4_0900_* collations the schema pins.
 //
-// WHY THIS IS A PREFLIGHT AND NOT A FIX
+// # WHY THIS IS A PREFLIGHT AND NOT A FIX
 //
 // Every collation-bearing migration writes `... COLLATE utf8mb4_0900_as_cs`
 // with NO accompanying CHARACTER SET. On a utf8mb4 database that is correct and
@@ -521,29 +534,53 @@ func requireMySQLUTCDriverLoc(ctx context.Context, db *gorm.DB) error {
 }
 
 // Enqueue adds a job to the queue.
+//
+// The whole insert runs in ONE transaction, and that is load-bearing rather than
+// tidiness. GORM substitutes core.Job.MaxRetries's declared `default:3` for an
+// explicit 0, so a Retries(0) job is INSERTED carrying 3 and corrected by a
+// following UPDATE (see applyExplicitZeroRetries, whose contract is that it runs
+// "in the caller's transaction, so the row is never visible carrying a value its
+// author did not ask for"). This function used to pass the root handle, which
+// autocommitted each statement and broke that contract: between the two commits
+// the row was visible, dq_ready, and claimable — so a worker could dequeue a
+// Retries(0) job carrying max_retries=3 and run it three times, which is the
+// exact defect Retries(0) exists to prevent.
+//
+// The unique-key path was already correct on the losing side — both the
+// corrective UPDATE and the dq_ready restore sat behind `RowsAffected > 0`, so a
+// duplicate never touched the winner's row. That is now expressed by an early
+// return inside the transaction rather than by two separate guards, and it is
+// pinned by a test so the restructuring cannot have silently dropped it.
 func (s *GormStorage) Enqueue(ctx context.Context, job *core.Job) error {
 	fillEnqueueDefaults(job)
 	row, err := s.encodedJobForCreate(job)
 	if err != nil {
 		return err
 	}
-	db := s.db.WithContext(ctx)
-	if job.UniqueKey == "" {
-		dqReadyFalseIDs, dqReadyFalseRefs := dqReadyFalseJobs([]*core.Job{job})
-		if err := db.Create(row).Error; err != nil {
+	zeroRetryIDs := explicitZeroRetryIDs(row)
+	dqReadyFalseIDs, dqReadyFalseRefs := dqReadyFalseJobs([]*core.Job{job})
+
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if job.UniqueKey == "" {
+			if err := tx.Create(row).Error; err != nil {
+				return err
+			}
+		} else {
+			result := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(row)
+			if result.Error != nil {
+				return result.Error
+			}
+			if result.RowsAffected == 0 {
+				// Nothing was inserted, so there is nothing of ours to correct.
+				// Returning the sentinel rolls the (empty) transaction back.
+				return core.ErrDuplicateJob
+			}
+		}
+		if err := applyExplicitZeroRetries(tx, zeroRetryIDs); err != nil {
 			return err
 		}
-		return restoreDQReadyFalse(db, dqReadyFalseIDs, dqReadyFalseRefs)
-	}
-	dqReadyFalseIDs, dqReadyFalseRefs := dqReadyFalseJobs([]*core.Job{job})
-	result := db.Clauses(clause.OnConflict{DoNothing: true}).Create(row)
-	if result.Error != nil {
-		return result.Error
-	}
-	if result.RowsAffected == 0 {
-		return core.ErrDuplicateJob
-	}
-	return restoreDQReadyFalse(db, dqReadyFalseIDs, dqReadyFalseRefs)
+		return restoreDQReadyFalse(tx, dqReadyFalseIDs, dqReadyFalseRefs)
+	})
 }
 
 // withSerializationRetry runs fn and retries it on transient serialization
@@ -641,7 +678,7 @@ func (s *GormStorage) EnqueueUnique(ctx context.Context, job *core.Job, uniqueKe
 		// Use transaction with row-level locking to prevent race conditions
 		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 			query := tx.Where("unique_key = ?", uniqueKey).
-				Where("status IN ?", []core.JobStatus{core.StatusPending, core.StatusRunning})
+				Where("status IN ?", core.ActiveDedupStatuses)
 
 			// SQLite doesn't support FOR UPDATE, but its serializable transactions
 			// provide equivalent protection for single-process scenarios
@@ -667,7 +704,13 @@ func (s *GormStorage) EnqueueUnique(ctx context.Context, job *core.Job, uniqueKe
 				return err
 			}
 			dqReadyFalseIDs, dqReadyFalseRefs := dqReadyFalseJobs([]*core.Job{job})
+			zeroRetryIDs := explicitZeroRetryIDs(row)
 			result := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(row)
+			if result.Error == nil && result.RowsAffected > 0 {
+				if err := applyExplicitZeroRetries(tx, zeroRetryIDs); err != nil {
+					return err
+				}
+			}
 			if result.Error != nil {
 				return result.Error
 			}
@@ -688,8 +731,17 @@ func (s *GormStorage) EnqueueUnique(ctx context.Context, job *core.Job, uniqueKe
 // This keeps dequeue correctness independent of the external ready-promoter loop
 // — a storage wrapper that hides the promoter capability, or any window before
 // the loop's next tick, can never leave an eligible job permanently invisible.
+//
+// A row whose payload this storage cannot decode does not fail the call and does
+// not block the queue: it is reported (see PoisonPayloadDrops), released, and
+// stepped over so the next claim reaches the job behind it. Up to
+// maxPoisonSkipsPerDequeue such rows are stepped over per call.
 func (s *GormStorage) Dequeue(ctx context.Context, queues []string, workerID string) (*core.Job, error) {
-	job, err := s.dequeueOnce(ctx, queues, workerID)
+	// One `skipped` list spans BOTH claim attempts. The promote-retry below
+	// re-runs the same ORDER BY, so without sharing it the second attempt would
+	// re-claim, re-release and re-report the poison row this call just skipped.
+	var skipped []core.UUID
+	job, err := s.dequeueDecoded(ctx, queues, workerID, &skipped)
 	if err != nil || job != nil {
 		return job, err
 	}
@@ -697,10 +749,74 @@ func (s *GormStorage) Dequeue(ctx context.Context, queues []string, workerID str
 	if perr != nil || promoted == 0 {
 		return nil, nil
 	}
-	return s.dequeueOnce(ctx, queues, workerID)
+	return s.dequeueDecoded(ctx, queues, workerID, &skipped)
 }
 
-func (s *GormStorage) dequeueOnce(ctx context.Context, queues []string, workerID string) (*core.Job, error) {
+// maxPoisonSkipsPerDequeue bounds how many undecodable rows ONE Dequeue call
+// will claim, report, release and step over before giving up for this tick.
+//
+// The bound exists to make the loop terminate by construction: releaseClaimedOnAbort
+// restores a poison row to status='pending' WITHOUT touching run_at/created_at, so
+// it lands back at the head of `ORDER BY priority DESC, COALESCE(run_at, created_at)`
+// and would be re-selected immediately. The in-call `skipped` exclusion is what
+// lets the next claim reach past it; the bound is what stops a fully-poisoned
+// queue from turning one Dequeue into an unbounded claim/release storm.
+//
+// A queue with this many OR MORE poison rows ahead of the first healthy job
+// makes no progress on this tick. The bound is on the loop guard
+// (`len(*skipped) < maxPoisonSkipsPerDequeue`), so the call gets exactly this
+// many claim attempts: spending all of them on poison rows leaves none for the
+// healthy job behind them. Exactly 16 poison rows already starves; 15 does not.
+// This is the same inherent limit the batch path has (it can only step over the
+// poison rows inside ONE batch), and by then PoisonPayloadDrops is rising and the
+// per-id warning names the rows.
+const maxPoisonSkipsPerDequeue = 16
+
+// dequeueDecoded claims jobs until it gets one whose payload decodes, stepping
+// over rows it cannot decode.
+//
+// A poison row is REPORTED (PoisonPayloadDrops + a once-per-id warning), RELEASED
+// back to pending and EXCLUDED from the next claim in this call — the same
+// treatment decodeClaimedBatch gives a poison sibling, and for the same reason:
+// good work must never be blocked by one undecodable row. Before this, the single
+// path released the row and returned the decode error, so the row was at the head
+// of the queue again on the next tick and a single-slot worker re-claimed,
+// re-failed and re-released it forever without ever reaching the job behind it.
+//
+// A skipped row yields NO error to the caller (again matching the batch path,
+// which returns healthy siblings and nil): a poison row is a property of one row,
+// not a failure of this dequeue. Returning (nil, nil) when everything reachable is
+// poison means "nothing runnable right now", and the counter/log carry the signal.
+func (s *GormStorage) dequeueDecoded(ctx context.Context, queues []string, workerID string, skipped *[]core.UUID) (*core.Job, error) {
+	for len(*skipped) < maxPoisonSkipsPerDequeue {
+		job, err := s.dequeueOnce(ctx, queues, workerID, *skipped)
+		if err != nil {
+			return nil, err
+		}
+		if job == nil {
+			return nil, nil
+		}
+		decodeErr := s.decodeJobPayloads(job)
+		if decodeErr == nil {
+			return job, nil
+		}
+		s.reportPoisonPayload(job.ID, decodeErr)
+		// The claim is already COMMITTED here, so returning without releasing
+		// leaves the row status='running', locked_by=us and undispatched —
+		// invisible to any queue-depth alert (it reads as healthy work in
+		// progress) and reclaimable only by ReleaseStaleLocks, by default 45
+		// minutes later.
+		if relErr := s.releaseClaimedOnAbort([]core.UUID{job.ID}, workerID, nil); relErr != nil {
+			// The row could not be released, so it IS parked as 'running'. Do not
+			// pretend this dequeue was clean — surface both causes.
+			return nil, errors.Join(decodeErr, relErr)
+		}
+		*skipped = append(*skipped, job.ID)
+	}
+	return nil, nil
+}
+
+func (s *GormStorage) dequeueOnce(ctx context.Context, queues []string, workerID string, skipIDs []core.UUID) (*core.Job, error) {
 	var job core.Job
 	now := time.Now()
 	lockDuration := time.Duration(s.lockDuration.Load())
@@ -708,7 +824,7 @@ func (s *GormStorage) dequeueOnce(ctx context.Context, queues []string, workerID
 
 	// SQLite uses optimistic locking - no row-level locks available
 	if s.isSQLite {
-		return s.dequeueSQLite(ctx, queues, workerID, now, lockUntil)
+		return s.dequeueSQLite(ctx, queues, workerID, now, lockUntil, skipIDs)
 	}
 
 	// PostgreSQL/MySQL: Use FOR UPDATE SKIP LOCKED for proper distributed locking
@@ -736,7 +852,7 @@ func (s *GormStorage) dequeueOnce(ctx context.Context, queues []string, workerID
 		// 1. The selected row is locked for this transaction
 		// 2. Other workers skip locked rows instead of waiting
 		// This prevents duplicate job execution in distributed scenarios
-		result := s.claimableCandidates(s.lockForUpdate(tx, true), queues, nowExpr).First(&job)
+		result := excludeJobIDs(s.claimableCandidates(s.lockForUpdate(tx, true), queues, nowExpr), skipIDs).First(&job)
 
 		if result.Error != nil {
 			if errors.Is(result.Error, gorm.ErrRecordNotFound) {
@@ -787,28 +903,21 @@ func (s *GormStorage) dequeueOnce(ctx context.Context, queues []string, workerID
 	if job.ID == "" {
 		return nil, nil
 	}
-	if err := s.decodeJobPayloads(&job); err != nil {
-		// The claim is already COMMITTED here, so returning without releasing
-		// leaves the row status='running', locked_by=us and undispatched —
-		// invisible to any queue-depth alert (it reads as healthy work in
-		// progress) and reclaimable only by ReleaseStaleLocks, by default 45
-		// minutes later. The BATCH path has released poison rows since the
-		// teardown-g3 fix (decodeClaimedBatch); this single-job path was left
-		// behind. A misconfigured codec should produce a visible, self-contained
-		// symptom on one row, not a silently parked job.
-		return nil, s.releaseClaimedOnAbort([]core.UUID{job.ID}, workerID, err)
-	}
+	// Payload decoding (and the poison-row release) belongs to dequeueDecoded, the
+	// single caller: it is the only layer that can also EXCLUDE the row from the
+	// next claim. Releasing here and returning the error is what starved a
+	// single-slot worker — the released row returns to the head of the ORDER BY.
 	return &job, nil
 }
 
 // dequeueSQLite uses optimistic locking for SQLite (dev/testing only).
 // This is NOT safe for multiple concurrent workers - use PostgreSQL for production.
-func (s *GormStorage) dequeueSQLite(ctx context.Context, queues []string, workerID string, now time.Time, lockUntil time.Time) (*core.Job, error) {
+func (s *GormStorage) dequeueSQLite(ctx context.Context, queues []string, workerID string, now time.Time, lockUntil time.Time, skipIDs []core.UUID) (*core.Job, error) {
 	var job core.Job
 
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		// Find a candidate job
-		result := s.claimableCandidates(tx, queues, now).First(&job)
+		result := excludeJobIDs(s.claimableCandidates(tx, queues, now), skipIDs).First(&job)
 
 		if result.Error != nil {
 			if errors.Is(result.Error, gorm.ErrRecordNotFound) {
@@ -870,17 +979,8 @@ func (s *GormStorage) dequeueSQLite(ctx context.Context, queues []string, worker
 	if job.ID == "" {
 		return nil, nil
 	}
-	if err := s.decodeJobPayloads(&job); err != nil {
-		// The claim is already COMMITTED here, so returning without releasing
-		// leaves the row status='running', locked_by=us and undispatched —
-		// invisible to any queue-depth alert (it reads as healthy work in
-		// progress) and reclaimable only by ReleaseStaleLocks, by default 45
-		// minutes later. The BATCH path has released poison rows since the
-		// teardown-g3 fix (decodeClaimedBatch); this single-job path was left
-		// behind. A misconfigured codec should produce a visible, self-contained
-		// symptom on one row, not a silently parked job.
-		return nil, s.releaseClaimedOnAbort([]core.UUID{job.ID}, workerID, err)
-	}
+	// Decoding + poison handling live in dequeueDecoded; see the note on the
+	// PostgreSQL/MySQL path above.
 	return &job, nil
 }
 
@@ -961,7 +1061,11 @@ func (s *GormStorage) Fail(ctx context.Context, jobID core.UUID, workerID string
 
 	if retryAt != nil {
 		updates["status"] = core.StatusPending
-		updates["run_at"] = retryAt
+		// Same clock-face normalization as fillEnqueueDefaults: on SQLite run_at is
+		// compared as TEXT against a process-local bind, so a retryAt handed in from
+		// another zone would mis-order. A no-op on Postgres and MySQL.
+		localRetryAt := retryAt.In(time.Local)
+		updates["run_at"] = &localRetryAt
 		// retryAt is non-nil in this branch, so readiness is simply retryAt<=now.
 		// Compute it in Go: a bound "? IS NULL" parameter has no inferable type on
 		// Postgres (SQLSTATE 42P18), and a map Update writes an explicit bool fine.
@@ -969,7 +1073,13 @@ func (s *GormStorage) Fail(ctx context.Context, jobID core.UUID, workerID string
 	} else {
 		updates["status"] = core.StatusFailed
 		updates["completed_at"] = s.nowWriteValue()
-		updates["dead_lettered_at"] = now
+		// nowWriteValue, NOT the bare local `now` above: dead_lettered_at is the
+		// column the dead-letter view is ORDERED by, and on SQLite that ORDER BY is
+		// a lexical compare of offset-suffixed TEXT. A plain time.Now() wears the
+		// writing process's face, which is TWO faces in a DST zone and more across a
+		// mixed-zone fleet, so "newest dead first" inverted. nowWriteValue writes one
+		// face (UTC on SQLite, the DB clock elsewhere) — see deadLetterOrderColumn.
+		updates["dead_lettered_at"] = s.nowWriteValue()
 		// Label stays plaintext (fixed, non-PII); only the error suffix is
 		// encrypted, preserving the attempt>=max_retries CASE in SQL.
 		updates["dead_letter_reason"] = deadLetterReasonExpr(encErr)
@@ -1060,7 +1170,6 @@ func (s *GormStorage) accountTerminalWithFanOut(ctx context.Context, jobID core.
 		fanOutID = ""
 
 		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-			now := time.Now()
 			updates := make(map[string]any, len(jobUpdates)+2)
 			for key, value := range jobUpdates {
 				if key == deadLetterReasonKey {
@@ -1070,7 +1179,9 @@ func (s *GormStorage) accountTerminalWithFanOut(ctx context.Context, jobID core.
 			}
 			updates["completed_at"] = s.nowWriteValue()
 			if lastError, ok := jobUpdates[deadLetterReasonKey].(string); ok {
-				updates["dead_lettered_at"] = now
+				// One clock face, same reason as Fail's terminal branch — this is the
+				// column the DLQ is ordered by. See deadLetterOrderColumn.
+				updates["dead_lettered_at"] = s.nowWriteValue()
 				updates["dead_letter_reason"] = deadLetterReasonExpr(lastError)
 			}
 
@@ -1204,6 +1315,7 @@ var checkpointConflictColumns = []string{
 	"error_cause",
 	"error_delay_nanos",
 	"span_end",
+	"result_shape",
 }
 
 // SaveCheckpoint stores a checkpoint for a durable call.
@@ -1318,6 +1430,74 @@ func (s *GormStorage) ClaimScheduledFire(ctx context.Context, name string, fireT
 	return s.ClaimScheduledFireTx(ctx, s.db, name, fireTime)
 }
 
+// scheduleCursorLess returns the "cursor is before this boundary" predicate.
+//
+// SQLite has no datetime type: the driver writes every timestamp as TEXT with a
+// trailing offset, and a bare `last_fire_at < ?` therefore compares two clock
+// FACES lexically rather than two instants. That is wrong in both directions, and
+// it cannot be fixed by choosing a face at write time, because existing databases
+// already hold a MIXTURE — Daily/Weekly/Cron pin UTC so their cursors are
+// UTC-faced, while Every seeds from time.Now() and everySchedule.Next preserves
+// that location, so its cursors are LOCAL-faced. Normalizing writes to either one
+// silently stalls the other family on upgrade for the length of the UTC offset.
+// Both directions were measured against databases written by a real v4.7.0 build.
+//
+// It is FACE-AWARE, and both halves are load-bearing:
+//
+//   - When the stored cursor and the incoming boundary carry the SAME offset —
+//     which is the normal case, since both derive from one anchor — they are
+//     compared as raw text. That is exact to the full precision the driver wrote
+//     (nanoseconds), so a sub-millisecond schedule still advances.
+//
+//   - When the offsets DIFFER, julianday() parses each into a NUMBER, so the
+//     comparison is on instants whatever face the row was stored on — no
+//     migration, and no dependence on which constructor wrote it. That branch is
+//     correct to MILLISECOND resolution and no finer: a CROSS-FACE pair less than
+//     1 ms apart collapses and the schedule stalls. Reaching that needs a
+//     sub-millisecond schedule whose process timezone CHANGED between two fires,
+//     since a stable zone always takes the exact raw-text branch above — narrow,
+//     but real, and stated here rather than implied away.
+//
+//     It is julianday and NOT strftime, and that is a correction rather than a
+//     preference: an earlier version of this comment claimed strftime renders one
+//     instant identically on every face. It does not — a zero offset keeps the raw
+//     parsed clock while a non-zero one recomputes from the millisecond-rounded
+//     julian day, so the two round differently and this comparison was mis-ordered.
+//     See the body below.
+//
+// Normalizing unconditionally is what an earlier version did, and it truncated to
+// the expression's resolution: %f keeps milliseconds, which silently stalled
+// sub-millisecond Every schedules that a released binary advanced (measured
+// against v4.7.0: Every(100µs) went 20/20 -> 2/20, Every(1ns) -> 0/20). datetime()
+// is worse still, truncating to whole SECONDS. Falling back to raw text ONLY when
+// the faces match keeps precision without reintroducing the cross-face bug, since
+// a lexical comparison of two identically-offset timestamps is exact.
+//
+// Postgres and MySQL store a real timestamp and already compare instants, so they
+// keep the native form.
+//
+// Returns the predicate and the binds it needs, because the SQLite form
+// references the boundary three times.
+func (s *GormStorage) scheduleCursorLess(fireTime time.Time) (string, []any) {
+	if !s.isSQLite {
+		return "last_fire_at < ?", []any{fireTime}
+	}
+	// julianday(), NOT strftime(): SQLite renders one instant to DIFFERENT text
+	// depending on whether its trailing offset is zero (a zero offset keeps the raw
+	// parsed clock, a non-zero one recomputes from the millisecond-rounded julian
+	// day), so text normalization is not face-independent and mis-ordered this
+	// comparison — a stalled schedule on one side, a boundary fired twice on the
+	// other. julianday is derived from the parsed instant and is the same number on
+	// every face, at the same millisecond resolution. Measured by
+	// TestTimeBoundPredicate_CrossFaceNormalizationIsFaceIndependent and pinned by
+	// TestClaimScheduledFire_CrossFaceCursorInADivergenceBandStillAdvances.
+	const instant = `julianday(`
+	// substr(x, -6) is the trailing "+HH:MM" / "-HH:MM" the driver always writes.
+	pred := "CASE WHEN substr(last_fire_at, -6) = substr(?, -6) THEN last_fire_at < ? " +
+		"ELSE " + instant + "last_fire_at) < " + instant + "?) END"
+	return pred, []any{fireTime, fireTime, fireTime}
+}
+
 // ClaimScheduledFireTx is ClaimScheduledFire performed within a caller-owned
 // transaction, so the boundary claim can be committed ATOMICALLY with the
 // enqueue of the fired job (and rolled back together on failure). Without this,
@@ -1329,9 +1509,11 @@ func (s *GormStorage) ClaimScheduledFireTx(ctx context.Context, tx *gorm.DB, nam
 		return false, err
 	}
 
+	cursorLess, cursorArgs := s.scheduleCursorLess(fireTime)
+	whereArgs := append([]any{name}, cursorArgs...)
 	result := tx.WithContext(ctx).
 		Model(&core.ScheduledFire{}).
-		Where("name = ? AND last_fire_at < ?", name, fireTime).
+		Where("name = ? AND "+cursorLess, whereArgs...).
 		Updates(map[string]any{
 			"last_fire_at":  fireTime,
 			"last_fired_at": fireTime,
@@ -1741,7 +1923,36 @@ func overlayLiveFanOutCountsBatch(db *gorm.DB, fanOuts []*core.FanOut) error {
 	return nil
 }
 
-// GetFanOut retrieves a fan-out by ID.
+// GetFanOut retrieves a fan-out by ID, with its CompletedCount, FailedCount and
+// CancelledCount OVERLAID from a live COUNT of the child jobs by status — not
+// read from the stored columns.
+//
+// This is load-bearing, not an optimisation, and
+// docs/content/docs/storage-durability.md now documents it as one of the two
+// mechanisms a custom backend must reproduce (the other being
+// GetCompletablePendingFanOuts, which
+// docs/content/docs/advanced/guarantees.md names as the stranded-parent
+// recovery sweep). Because the counts are DERIVED from
+// the child rows, an IncrementFanOutCompleted that never ran (a crash between
+// Complete and the increment on the non-atomic completion fallback) cannot leave
+// this backend one short: the child's committed status IS the count. A backend
+// that returns the stored columns instead has a durability hole the required
+// core.Storage interface cannot recover — GetStalledFanOutParents predicates on
+// MISSING CHILD ROWS, not on a short counter, so it selects nothing for that
+// state.
+//
+// The stored columns are still maintained — UpdateFanOutStatus snapshots the same
+// live counts inside the transaction that performs the terminal CAS — but nothing
+// READS them through this type. Every fan-out reader on GormStorage overlays:
+// GetFanOut, GetFanOutsByParent, GetCompletablePendingFanOuts and the dashboard's
+// GetFanOutsByParents all call overlayLiveFanOutCounts(Batch). The stored numbers
+// are visible only to a raw row read, which is why a short counter is unlosable
+// here: it was never the source of truth.
+//
+// That matters to anyone implementing core.Storage themselves. The counters being
+// DERIVED is what makes a lost IncrementFanOutCompleted recoverable; a backend
+// that returns the stored column instead inherits a fan-out that can sit one short
+// forever. See docs/content/docs/storage-durability.md.
 func (s *GormStorage) GetFanOut(ctx context.Context, fanOutID core.UUID) (*core.FanOut, error) {
 	var fanOut core.FanOut
 	err := s.db.WithContext(ctx).First(&fanOut, "id = ?", fanOutID).Error
@@ -1840,8 +2051,13 @@ func (s *GormStorage) GetFanOutsByParent(ctx context.Context, parentJobID core.U
 // --- Sub-job operations ---
 
 // EnqueueBatch inserts multiple jobs in a single operation.
-// Jobs carrying a UniqueKey are deduplicated against pending/running/completed
-// rows so a parent workflow that crashes mid fan-out can replay safely. The
+// Jobs carrying a UniqueKey are deduplicated against core.ActiveDedupStatuses —
+// pending, running, retrying, waiting and paused — so a parent workflow that
+// crashes mid fan-out can replay safely. A row that has reached a TERMINAL
+// status (completed, failed, cancelled) no longer holds its key, so replaying a
+// batch whose jobs already completed inserts fresh runnable rows rather than
+// deduplicating against them; that is intentional, and it means a replay is not
+// idempotent with respect to already-finished work. The
 // dedup lookup and insert run inside a single transaction with row-level
 // locking on non-SQLite backends, mirroring EnqueueUnique, so concurrent
 // replays cannot produce duplicate sub-jobs.
@@ -1918,7 +2134,12 @@ func (s *GormStorage) CancelSubJobs(ctx context.Context, fanOutID core.UUID) ([]
 			var err error
 			// Empty reason: the original CancelSubJobs (CancelOnFail path) did not
 			// write last_error on peer-cancelled siblings; preserve that.
-			cancelled, err = s.cancelFanOutChildrenAndReconcile(tx, fanOutID, []core.JobStatus{core.StatusPending, core.StatusRunning}, true, nil, "")
+			// Waiting and Paused belong here. A sibling suspended in `waiting`
+			// (durable Sleep, WaitForSignal, or its own nested fan-out) and a
+			// sibling an operator paused are both LIVE, resumable work — skipping
+			// them left a cancelled fan-out with children that later woke up and
+			// ran, and left completed+failed+cancelled < total forever.
+			cancelled, err = s.cancelFanOutChildrenAndReconcile(tx, fanOutID, cancellableChildStatuses, true, nil, "")
 			return err
 		})
 	})
@@ -1960,19 +2181,28 @@ func (s *GormStorage) cancelFanOutChildrenAndReconcile(tx *gorm.DB, fanOutID cor
 			// non-PII constant; intentionally stored plaintext
 			updates["last_error"] = cancelReason
 		}
-		result := tx.Model(&core.Job{}).
-			Where("id IN ?", cancelled).
-			Where("status IN ?", cancellable).
-			Updates(updates)
-		if result.Error != nil {
-			return nil, result.Error
-		}
+		// CHUNKED: `cancelled` is as large as the fan-out's child count, so an
+		// unchunked list exceeds the driver's bind-parameter ceiling (SQLite 32766,
+		// Postgres 65535) and terminal cancel fails outright — which meant the
+		// biggest workflows, the ones an operator most needs to stop, were exactly
+		// the ones that could not be cancelled. Measured: 33,000 children ->
+		// "too many SQL variables". Both statements stay inside the caller's
+		// transaction, so chunking changes atomicity not at all.
+		for _, chunk := range chunkIDs(cancelled, retentionDeleteChunkSize) {
+			result := tx.Model(&core.Job{}).
+				Where("id IN ?", chunk).
+				Where("status IN ?", cancellable).
+				Updates(updates)
+			if result.Error != nil {
+				return nil, result.Error
+			}
 
-		// Release any fleet concurrency slots held by the cancelled sub-jobs,
-		// atomically with the cancel write, so a worker that dies before its
-		// deferred release cannot orphan a live slot for a now-terminal job.
-		if err := tx.Where("job_id IN ?", cancelled).Delete(&core.ConcurrencySlot{}).Error; err != nil {
-			return nil, err
+			// Release any fleet concurrency slots held by the cancelled sub-jobs,
+			// atomically with the cancel write, so a worker that dies before its
+			// deferred release cannot orphan a live slot for a now-terminal job.
+			if err := tx.Where("job_id IN ?", chunk).Delete(&core.ConcurrencySlot{}).Error; err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -2119,8 +2349,38 @@ func (s *GormStorage) MarkWaiting(ctx context.Context, jobID core.UUID, workerID
 			// fan-out path also calls MarkWaiting; that resume is run_at-independent
 			// (it keys on the fan_outs join + status), so clearing run_at is safe
 			// there too.
-			"run_at":     nil,
-			"updated_at": time.Now(),
+			"run_at": nil,
+			// No awaited name for this path: the fan-out suspend and any caller
+			// that does not go through MarkWaitingForSignal must leave the field
+			// EMPTY so the signal-resume poll stays permissive for them. Clearing
+			// rather than leaving it also stops a stale name from a previous named
+			// wait narrowing this one.
+			"waiting_signal_name": "",
+			"updated_at":          time.Now(),
+		})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		return core.ErrJobNotOwned
+	}
+	return nil
+}
+
+// MarkWaitingForSignal is MarkWaiting that also records the signal name the job
+// suspended on, so the signal-resume poll can correlate against it instead of
+// waking on any pending signal. It implements core.SignalWaitMarker.
+func (s *GormStorage) MarkWaitingForSignal(ctx context.Context, jobID core.UUID, workerID, signalName string) error {
+	result := s.db.WithContext(ctx).
+		Model(&core.Job{}).
+		Where("id = ? AND locked_by = ? AND status = ?", jobID, workerID, core.StatusRunning).
+		Updates(map[string]any{
+			"status":              core.StatusWaiting,
+			"locked_by":           "",
+			"locked_until":        nil,
+			"run_at":              nil,
+			"waiting_signal_name": signalName,
+			"updated_at":          time.Now(),
 		})
 	if result.Error != nil {
 		return result.Error
@@ -2196,15 +2456,30 @@ func (s *GormStorage) SuspendForFanOut(ctx context.Context, parentID core.UUID, 
 // and the job exhausts max_retries before completing.
 // Returns (true, nil) if resumed, (false, nil) if job was not in a resumable status.
 func (s *GormStorage) ResumeJob(ctx context.Context, jobID core.UUID) (bool, error) {
-	// Accept both waiting and paused status — paused jobs should also be
-	// resumable when their fan-out completes. run_at is deliberately left
-	// untouched so a delayed job that was paused before its run_at and then
-	// resumed still honors its original schedule. (Signal-waiting jobs use
-	// ResumeSignalWaitingJob instead, which clears the timeout wake deadline.)
+	// WAITING ONLY. This previously also accepted `paused`, on the reasoning that
+	// "paused jobs should also be resumable when their fan-out completes" — a
+	// deliberate decision, now overturned, because the two states mean different
+	// things and only one of them is this function's business.
+	//
+	// `waiting` is the machine's own suspension: a parent that called FanOut/Call
+	// and yielded. `paused` is an OPERATOR's instruction. Every caller of this
+	// method is an automatic fan-out-completion path
+	// (Queue.resumeOwningFanOutAfterChildTerminal, Queue.CancelSubJob,
+	// fanout completion, and the worker's recovery polls), so accepting `paused`
+	// meant a background event silently cancelled a human's decision: an operator
+	// paused a workflow parent, an unrelated child finished, and the parent ran.
+	//
+	// The operator's own Resume is unaffected — Queue.ResumeJob (what the
+	// dashboard calls) goes through UnpauseJob, not here.
+	//
+	// run_at is deliberately left untouched so a delayed job that was paused
+	// before its run_at and then resumed still honors its original schedule.
+	// (Signal-waiting jobs use ResumeSignalWaitingJob instead, which clears the
+	// timeout wake deadline.)
 	now := time.Now()
 	result := s.db.WithContext(ctx).
 		Model(&core.Job{}).
-		Where("id = ? AND status IN (?, ?)", jobID, core.StatusWaiting, core.StatusPaused).
+		Where("id = ? AND status = ?", jobID, core.StatusWaiting).
 		Updates(map[string]any{
 			"status":     core.StatusPending,
 			"attempt":    gorm.Expr("CASE WHEN attempt > 0 THEN attempt - 1 ELSE 0 END"),
@@ -2217,9 +2492,12 @@ func (s *GormStorage) ResumeJob(ctx context.Context, jobID core.UUID) (bool, err
 	return result.RowsAffected > 0, nil
 }
 
-// ResumeSignalWaitingJob resumes a job that is waiting on a signal. Unlike the
-// general ResumeJob it matches StatusWaiting ONLY (never paused — a producer
-// must not be able to un-pause an operator-paused job), and it clears run_at:
+// ResumeSignalWaitingJob resumes a job that is waiting on a signal. It matches
+// StatusWaiting ONLY — never paused, because a producer must not be able to
+// un-pause an operator-paused job. (This used to read "unlike the general
+// ResumeJob"; ResumeJob was narrowed to waiting-only in the same wave, so the
+// contrast is gone and the two now agree on which statuses they accept.) It also
+// clears run_at:
 // WaitForSignalTimeout parks a future run_at as its wake deadline, so when a
 // signal arrives early the resume must not leave a future run_at that would
 // block Dequeue until that deadline. Returns whether a row was resumed.
@@ -2337,6 +2615,23 @@ func (s *GormStorage) Requeue(ctx context.Context, jobID core.UUID) (bool, error
 	return requeued, nil
 }
 
+// pluckChunked runs a Pluck over a bounded literal IN-list, appending each
+// chunk's rows. Every subtree walk in this file feeds it a list as large as the
+// user's workflow, and an unchunked list exceeds the driver's bind-parameter
+// ceiling (SQLite 32766, Postgres 65535) — which made the biggest workflows the
+// ones that could not be cancelled, replayed or pruned. Measured before this
+// bound: 33,000 descendants -> "too many SQL variables".
+func pluckChunked(tx *gorm.DB, model any, column string, in []core.UUID, out *[]core.UUID) error {
+	for _, chunk := range chunkIDs(in, retentionDeleteChunkSize) {
+		var got []core.UUID
+		if err := tx.Model(model).Where(column+" IN ?", chunk).Pluck("id", &got).Error; err != nil {
+			return err
+		}
+		*out = append(*out, got...)
+	}
+	return nil
+}
+
 // deleteFanOutSubtree deletes the entire fan-out tree rooted at rootJobID: every
 // fan-out it spawned directly or transitively, all of those sub-jobs, and their
 // checkpoints/signals. The root job row itself is NOT touched. Used by Requeue so
@@ -2366,9 +2661,7 @@ func (s *GormStorage) deleteFanOutSubtree(tx *gorm.DB, rootJobID core.UUID) erro
 			return fmt.Errorf("deleteFanOutSubtree: fan-out tree under %s exceeds max depth %d; aborting to avoid orphaning deeper sub-jobs", rootJobID, maxFanOutTreeDepth)
 		}
 		var fanOutIDs []core.UUID
-		if err := tx.Model(&core.FanOut{}).
-			Where("parent_job_id IN ?", frontier).
-			Pluck("id", &fanOutIDs).Error; err != nil {
+		if err := pluckChunked(tx, &core.FanOut{}, "parent_job_id", frontier, &fanOutIDs); err != nil {
 			return err
 		}
 		if len(fanOutIDs) == 0 {
@@ -2376,9 +2669,7 @@ func (s *GormStorage) deleteFanOutSubtree(tx *gorm.DB, rootJobID core.UUID) erro
 		}
 
 		var subJobIDs []core.UUID
-		if err := tx.Model(&core.Job{}).
-			Where("fan_out_id IN ?", fanOutIDs).
-			Pluck("id", &subJobIDs).Error; err != nil {
+		if err := pluckChunked(tx, &core.Job{}, "fan_out_id", fanOutIDs, &subJobIDs); err != nil {
 			return err
 		}
 
@@ -2390,24 +2681,40 @@ func (s *GormStorage) deleteFanOutSubtree(tx *gorm.DB, rootJobID core.UUID) erro
 		frontier = subJobIDs
 	}
 
-	if len(allSubJobIDs) > 0 {
+	// CHUNK every literal IN-list. The subtree is as large as the user's workflow,
+	// so an unchunked list exceeds the driver's bind-parameter ceiling (SQLite
+	// 32766, Postgres 65535) and the whole statement fails — which meant a workflow
+	// big enough to have a deep fan-out could be neither replayed (Requeue, the
+	// dashboard Retry button) nor pruned (DeleteWorkflowSubtree). Measured before
+	// this bound: 33,000 descendants -> "too many SQL variables". Same defect class
+	// as the retention sweep, which bounds its lists the same way; a reviewer
+	// flagged this site as a residual at the time and it was recorded, not fixed.
+	for _, chunk := range chunkIDs(allSubJobIDs, retentionDeleteChunkSize) {
 		// Delete dependents explicitly so the behavior holds on SQLite too (no FK
 		// there). On PG/MySQL deleting the sub-jobs also cascade-removes their
 		// checkpoints/signals/fan_outs, making these deletes idempotent.
-		if err := tx.Where("job_id IN ?", allSubJobIDs).Delete(&core.Checkpoint{}).Error; err != nil {
+		if err := tx.Where("job_id IN ?", chunk).Delete(&core.Checkpoint{}).Error; err != nil {
 			return err
 		}
-		if err := tx.Where("job_id IN ?", allSubJobIDs).Delete(&core.Signal{}).Error; err != nil {
+		if err := tx.Where("job_id IN ?", chunk).Delete(&core.Signal{}).Error; err != nil {
 			return err
 		}
-		if err := tx.Where("id IN ?", allSubJobIDs).Delete(&core.Job{}).Error; err != nil {
+		// Release the discarded sub-jobs' windowed dedup locks
+		// (IdempotencyKey/UniqueFor). unique_locks.job_id has no FK cascade, and a
+		// missing job row is deliberately NOT a steal trigger (see
+		// stealTerminalUniqueLock), so leaving them behind would block re-enqueue of
+		// those scopes for the rest of their TTL against work that no longer exists.
+		if err := tx.Where("job_id IN ?", chunk).Delete(&core.UniqueLock{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("id IN ?", chunk).Delete(&core.Job{}).Error; err != nil {
 			return err
 		}
 	}
-	if len(allFanOutIDs) > 0 {
-		// Root-level fan_outs (parent_job_id = the untouched root) are not reached
-		// by the sub-job cascade, so delete the collected fan_outs explicitly.
-		if err := tx.Where("id IN ?", allFanOutIDs).Delete(&core.FanOut{}).Error; err != nil {
+	// Root-level fan_outs (parent_job_id = the untouched root) are not reached by
+	// the sub-job cascade, so delete the collected fan_outs explicitly.
+	for _, chunk := range chunkIDs(allFanOutIDs, retentionDeleteChunkSize) {
+		if err := tx.Where("id IN ?", chunk).Delete(&core.FanOut{}).Error; err != nil {
 			return err
 		}
 	}
@@ -2426,6 +2733,11 @@ func (s *GormStorage) deleteFanOutSubtree(tx *gorm.DB, rootJobID core.UUID) erro
 // The NOT EXISTS guard restricts the result to parents that have at least
 // one terminated fan-out AND no pending fan-outs. DISTINCT keeps the
 // result one-row-per-parent when there are multiple terminated fan-outs.
+// FanOutCancelled is in the terminal set deliberately. Cancellation now reaches
+// paused and waiting descendants, so a descendant fan-out can end `cancelled`
+// where before it could only complete or fail. A waiting parent of such a
+// fan-out has nothing left to wait for; omitting the status would leave it
+// suspended forever with no backstop, trading one stuck-job bug for another.
 func (s *GormStorage) GetWaitingJobsToResume(ctx context.Context) ([]*core.Job, error) {
 	var jobs []*core.Job
 	// Select only j.id: the recovery caller consumes nothing but job.ID, so
@@ -2435,14 +2747,14 @@ func (s *GormStorage) GetWaitingJobsToResume(ctx context.Context) ([]*core.Job, 
 		SELECT DISTINCT j.id FROM jobs j
 		INNER JOIN fan_outs f ON j.id = f.parent_job_id
 		WHERE j.status = ?
-		AND f.status IN (?, ?)
+		AND f.status IN (?, ?, ?)
 		AND NOT EXISTS (
 			SELECT 1 FROM fan_outs f2
 			WHERE f2.parent_job_id = j.id
 			AND f2.status = ?
 		)
 		LIMIT ?
-	`, core.StatusWaiting, core.FanOutCompleted, core.FanOutFailed, core.FanOutPending, maxResumeBatch).Scan(&jobs).Error
+	`, core.StatusWaiting, core.FanOutCompleted, core.FanOutFailed, core.FanOutCancelled, core.FanOutPending, maxResumeBatch).Scan(&jobs).Error
 	if err != nil {
 		return nil, err
 	}
@@ -2594,6 +2906,43 @@ func (s *GormStorage) SaveJobResult(ctx context.Context, jobID core.UUID, worker
 	return nil
 }
 
+// cancellableChildStatuses is the single definition of "not yet finished, so
+// still cancellable", shared by CancelJobTerminal's target predicate, its
+// descendant subtree walk, and CancelSubJobs.
+//
+// Paused and Waiting are in the set because both are LIVE, resumable states.
+// Leaving them out meant a terminal cancel skipped them: a paused child survived
+// its parent's cancellation and stayed resumable — the dashboard's Resume button
+// would run work an operator had explicitly cancelled — and a child suspended in
+// `waiting` (durable Sleep, WaitForSignal, or its own nested fan-out) woke up
+// later and ran. Both also froze the fan-out row below its total, permanently
+// violating the completed+failed+cancelled == total invariant that
+// docs/content/docs/advanced/cancel-job.md promises is restored.
+//
+// One definition rather than three literals: the three call sites had drifted
+// apart (CancelSubJobs was missing Waiting as well as Paused), which is how the
+// gap survived. A set cannot disagree with itself.
+//
+// KNOWN INCOMPLETE, and stated here rather than implied away. This aligns which
+// STATUSES are cancellable; it does not give every call site the same REACH.
+// CancelJobTerminal walks the fan-out subtree (collectFanOutSubtree);
+// CancelSubJobs does not. So a `waiting` sibling cancelled by the fail-fast path
+// has its own descendants left running — and a `waiting` sibling is, by
+// construction, one suspended on a nested fan-out or Call, i.e. exactly the
+// population that HAS descendants. Reproduced on live Postgres: cancelling the
+// parent fan-out cancelled the waiting child but left its grandchild pending, and
+// a worker will dequeue and run it under a terminal ancestor.
+//
+// Still strictly better than leaving the sibling resumable (it used to wake up and
+// run itself), which is why it ships. Giving CancelSubJobs the same subtree walk
+// is the completion, and it belongs in its own change with its own test.
+var cancellableChildStatuses = []core.JobStatus{
+	core.StatusPending,
+	core.StatusWaiting,
+	core.StatusRunning,
+	core.StatusPaused,
+}
+
 // --- Job pause operations ---
 
 // PauseJob pauses a job, preventing it from being picked up.
@@ -2665,7 +3014,7 @@ func (s *GormStorage) CancelJobTerminal(ctx context.Context, jobID core.UUID) er
 			// audit (FindOrphanedJobs) short-circuits the live handler in ~5s
 			// rather than waiting for the ~minutes heartbeat fallback.
 			result := tx.Model(&core.Job{}).
-				Where("id = ? AND status IN ?", jobID, []core.JobStatus{core.StatusPending, core.StatusWaiting, core.StatusRunning}).
+				Where("id = ? AND status IN ?", jobID, cancellableChildStatuses).
 				Updates(map[string]any{
 					"status":       core.StatusCancelled,
 					"completed_at": s.nowWriteValue(),
@@ -2725,19 +3074,30 @@ func (s *GormStorage) CancelJobTerminal(ctx context.Context, jobID core.UUID) er
 			}
 			if len(subJobIDs) > 0 {
 				sort.Slice(subJobIDs, func(i, j int) bool { return subJobIDs[i] < subJobIDs[j] })
-				var locked []core.UUID
-				query := tx.Model(&core.Job{}).
-					Where("id IN ?", subJobIDs).
-					Order("id ASC")
-				query = s.lockForUpdate(query, false)
-				if err := query.Pluck("id", &locked).Error; err != nil {
-					return err
+				// Chunked for the same bind-parameter ceiling as the deletes above:
+				// unchunked, terminally cancelling a workflow whose subtree exceeds
+				// the driver limit failed outright ("too many SQL variables" at
+				// 33,000 descendants), so the biggest workflows — the ones an
+				// operator most needs to stop — were the ones that could not be
+				// cancelled. Chunking is safe here because the locks accumulate in
+				// the surrounding transaction, and the ids are pre-sorted so the
+				// lock ORDER is unchanged across chunks and the deadlock-avoidance
+				// ordering still holds.
+				for _, chunk := range chunkIDs(subJobIDs, retentionDeleteChunkSize) {
+					var locked []core.UUID
+					query := tx.Model(&core.Job{}).
+						Where("id IN ?", chunk).
+						Order("id ASC")
+					query = s.lockForUpdate(query, false)
+					if err := query.Pluck("id", &locked).Error; err != nil {
+						return err
+					}
 				}
 			}
 			sort.Slice(fanOutIDs, func(i, j int) bool { return fanOutIDs[i] < fanOutIDs[j] })
 			for _, fanOutID := range fanOutIDs {
 				status := core.FanOutCancelled
-				if _, err := s.cancelFanOutChildrenAndReconcile(tx, fanOutID, []core.JobStatus{core.StatusPending, core.StatusWaiting, core.StatusRunning}, false, &status, "cancelled by user"); err != nil {
+				if _, err := s.cancelFanOutChildrenAndReconcile(tx, fanOutID, cancellableChildStatuses, false, &status, "cancelled by user"); err != nil {
 					return err
 				}
 			}
@@ -2764,9 +3124,7 @@ func (s *GormStorage) collectFanOutSubtree(tx *gorm.DB, rootJobID core.UUID) (al
 			break
 		}
 		var fanOutIDs []core.UUID
-		if err := tx.Model(&core.FanOut{}).
-			Where("parent_job_id IN ?", frontier).
-			Pluck("id", &fanOutIDs).Error; err != nil {
+		if err := pluckChunked(tx, &core.FanOut{}, "parent_job_id", frontier, &fanOutIDs); err != nil {
 			return nil, nil, false, err
 		}
 		if len(fanOutIDs) == 0 {
@@ -2787,9 +3145,7 @@ func (s *GormStorage) collectFanOutSubtree(tx *gorm.DB, rootJobID core.UUID) (al
 		}
 
 		var subJobIDs []core.UUID
-		if err := tx.Model(&core.Job{}).
-			Where("fan_out_id IN ?", levelFanOutIDs).
-			Pluck("id", &subJobIDs).Error; err != nil {
+		if err := pluckChunked(tx, &core.Job{}, "fan_out_id", levelFanOutIDs, &subJobIDs); err != nil {
 			return nil, nil, false, err
 		}
 

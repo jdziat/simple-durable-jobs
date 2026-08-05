@@ -201,8 +201,8 @@ func TestStatsCollector_PruneZeroRetention(t *testing.T) {
 }
 
 func TestStatsCollector_SnapshotStorageError(t *testing.T) {
-	// snapshot silently ignores GetJobsByStatus errors via continue; this test
-	// verifies snapshot does not panic or return an error when storage fails.
+	// snapshot logs and skips the sample when a depth read fails; this test
+	// verifies it does not panic when storage fails on every call.
 	_, _, _ = setupCollectorTest(t)
 	ctx := context.Background()
 

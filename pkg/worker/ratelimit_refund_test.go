@@ -33,10 +33,10 @@ func TestTryConsumeRateLimits_RefundsEarlierLimitOnLaterDenial(t *testing.T) {
 	job := &core.Job{ID: core.NewID(), Type: "t", Queue: "default"}
 
 	// Call 1: A and B both admit.
-	ok, _ := w.tryConsumeRateLimits(ctx, job)
+	ok, _, _ := w.tryConsumeRateLimits(ctx, job)
 	require.True(t, ok)
 	// Call 2: B is exhausted and denies; A's consume from THIS call must be refunded.
-	ok2, reason := w.tryConsumeRateLimits(ctx, job)
+	ok2, reason, _ := w.tryConsumeRateLimits(ctx, job)
 	require.False(t, ok2)
 	require.Equal(t, bounceFleetRate, reason)
 
@@ -88,7 +88,7 @@ func TestTryConsumeRateLimits_PanickingKeyBouncesWithoutCrash(t *testing.T) {
 		RateLimit("A", 100, RateLimitKey(func(*core.Job) string { panic("rate key boom") })))
 	job := &core.Job{ID: core.NewID(), Type: "t", Queue: "default"}
 
-	ok, reason := w.tryConsumeRateLimits(context.Background(), job)
+	ok, reason, _ := w.tryConsumeRateLimits(context.Background(), job)
 	assert.False(t, ok, "a panicking RateLimitKey must bounce the job, not crash the worker")
 	assert.Equal(t, bounceFleetRate, reason)
 }

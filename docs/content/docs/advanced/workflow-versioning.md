@@ -37,6 +37,34 @@ On first execution for a `changeID`, `GetVersion` records `maxSupported` and
 returns it. On replay, it returns the recorded version even if a later deploy
 increases `maxSupported`.
 
+## Runs That Were Already In Flight
+
+A run that was mid-flight when you deployed the marker has no marker to replay —
+the code that produced its checkpoints never called `GetVersion`. Those are
+exactly the runs the branch exists to protect, so they are **pinned to
+`DefaultVersion`** rather than handed `maxSupported`.
+
+The pin is decided on durable evidence, not a guess. When `GetVersion` finds no
+marker it looks for an indexed checkpoint — a `Call`, fan-out, signal wait, or
+timer — that an **earlier** execution recorded **at or beyond the call position
+the handler is standing on**. Only a run that already executed past this point
+can carry one. `DefaultVersion` is then recorded like any other version, so every
+later replay of that run reads it straight back from the marker.
+
+Two consequences worth knowing:
+
+- **Put the marker before the durable operations it guards.** That is what makes
+  the evidence visible. A marker placed *after* the changed `Call` sees nothing
+  and records `maxSupported`.
+- **A run that passed the marker's position without recording any durable step at
+  or after it is indistinguishable from a first execution** and gets
+  `maxSupported`. This is harmless: there is no recorded step at those positions
+  for the new branch to collide with. It does mean the branch is a guard for
+  *durable shape*, not a way to freeze non-durable behaviour for old runs.
+
+`q.Requeue` clears checkpoints, so a requeued run is a first execution again and
+records the current `maxSupported`.
+
 Each distinct `changeID` records exactly one checkpoint row, which persists for
 the life of the run (cleared only by `q.Requeue` or job deletion). The
 `jobs.version:` checkpoint-type prefix is reserved: do not pass a
@@ -73,6 +101,12 @@ func ProcessOrder(ctx context.Context, order Order) error {
 }
 ```
 
+An in-flight run reaching this handler takes the `jobs.DefaultVersion` arm and
+replays its recorded `quote-shipping` checkpoint; a job enqueued after the deploy
+takes the `case 1:` arm. Keep the `DefaultVersion` arm as long as any run that
+predates the deploy can still be retried, resumed, or is sitting in the
+dead-letter queue awaiting requeue.
+
 After every in-flight run that could have recorded `DefaultVersion` has
 completed or been requeued, a later deploy can raise `minSupported` and remove
 the old branch:
@@ -81,8 +115,12 @@ the old branch:
 version, err := jobs.GetVersion(ctx, "shipping-v2", 1, 1)
 ```
 
-If an old run still has `DefaultVersion` recorded, this returns
-`jobs.ErrUnsupportedWorkflowVersion` instead of silently taking the wrong branch.
+If an old run still has `DefaultVersion` recorded — or is pinned to it by the
+checkpoints it carries — this returns `jobs.ErrUnsupportedWorkflowVersion`
+instead of silently taking the wrong branch. Removing the old arm while such runs
+exist therefore fails them loudly on the sentinel; wrap it in `jobs.NoRetry` (as
+the pattern above does) if you would rather they dead-letter for triage than
+retry.
 
 ## Determinism Modes
 

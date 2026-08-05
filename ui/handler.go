@@ -33,6 +33,13 @@ var (
 // Usage:
 //
 //	mux.Handle("/jobs/", http.StripPrefix("/jobs", ui.Handler(storage)))
+//
+// The handler works at any mount path. Its assets and its RPC calls are
+// addressed relative to the document, so nothing needs to be told the prefix.
+// The one requirement is that the mount root is reachable with a TRAILING SLASH
+// (/jobs/, not /jobs) — net/http's ServeMux redirects the bare form for the
+// pattern above; a router that serves the shell at /jobs without redirecting
+// will not resolve the assets.
 func Handler(storage core.Storage, opts ...Option) http.Handler {
 	cfg := &config{
 		ctx:                      context.Background(),
@@ -114,9 +121,27 @@ func Handler(storage core.Storage, opts ...Option) http.Handler {
 	} else {
 		fileServer := http.FileServer(http.FS(staticFS))
 		mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-			// For SPA routing, serve index.html for non-file requests
+			// The SPA shell is served ONLY at the mount root; unknown
+			// extension-less paths are redirected there.
+			//
+			// The shell's script/stylesheet/font references are relative to the
+			// document, which is what lets this handler work under
+			// http.StripPrefix at any prefix. The flip side is that the shell is
+			// only correct when the document URL IS the mount root: served at
+			// /queues/detail the browser would resolve ./assets/index-*.js to
+			// /queues/assets/index-*.js and get a blank page. The app is
+			// hash-routed (/jobs/#/queues), so the mount root is the only URL it
+			// ever needs.
+			//
+			// The Location is deliberately RELATIVE and computed from the request
+			// depth. http.Redirect(w, r, "/", ...) would emit the POST-StripPrefix
+			// path and send the browser to the OPERATOR'S site root, outside the
+			// mount — this handler cannot know its own prefix, because
+			// StripPrefix already removed it.
 			if !strings.Contains(r.URL.Path, ".") && r.URL.Path != "/" {
-				r.URL.Path = "/"
+				w.Header().Set("Location", relativeMountRoot(r.URL.Path))
+				w.WriteHeader(http.StatusFound)
+				return
 			}
 			fileServer.ServeHTTP(w, r)
 		})
@@ -181,22 +206,57 @@ func Handler(storage core.Storage, opts ...Option) http.Handler {
 	})
 }
 
+// relativeMountRoot returns a relative URL that, resolved by a browser against a
+// request for p, addresses the mount root. p is the request path AFTER any
+// http.StripPrefix, so its DEPTH — not its text — is what matters:
+//
+// A browser resolves a relative reference against the request's DIRECTORY, so a
+// trailing slash counts as one more level:
+//
+//	"/queues" -> "./"     (base "/jobs/"     -> "/jobs/")
+//	"/a/b"    -> "../"    (base "/jobs/a/"   -> "/jobs/")
+//	"/a/b/"   -> "../../" (base "/jobs/a/b/" -> "/jobs/")
+//	"/a/b/c"  -> "../../" (base "/jobs/a/b/" -> "/jobs/")
+func relativeMountRoot(p string) string {
+	up := strings.Count(strings.TrimPrefix(p, "/"), "/")
+	if up == 0 {
+		return "./"
+	}
+	return strings.Repeat("../", up)
+}
+
 // maxH2CUpgradeBody bounds the body x/net buffers while replaying an h2c upgrade
 // as the connection's first stream. Dashboard RPCs that legitimately carry large
 // bodies do not arrive as upgrade requests.
 const maxH2CUpgradeBody = 64 << 10
 
 // isH2CUpgrade reports whether r is an HTTP/1.1 cleartext-HTTP/2 upgrade — the
-// only request shape whose body x/net reads into memory before dispatch. Header
-// tokens are comma-separated and case-insensitive per RFC 9110.
+// only request shape whose body x/net reads into memory before dispatch.
+//
+// This MUST be a superset of whatever x/net treats as an upgrade. Matching it
+// exactly is not good enough and matching it narrowly is a vulnerability: x/net's
+// own isH2CUpgrade requires `Upgrade: h2c` plus the **HTTP2-Settings** token in
+// Connection (golang.org/x/net/http2/h2c, h2c.go), where this function used to
+// require the **upgrade** token. A request sending `Upgrade: h2c` with
+// `Connection: HTTP2-Settings` and no `upgrade` token was therefore an upgrade to
+// x/net — reaching its io.ReadAll(r.Body) — while escaping the cap entirely. That
+// read happens before the connection is hijacked, so it is before cfg.middleware
+// and before the Connect auth interceptor: an unauthenticated client could make
+// the process buffer a body of any size.
+//
+// So the test is now `Upgrade: h2c` alone, ignoring how Connection is spelled.
+// Over-matching is harmless here — the cap applies only to requests claiming an
+// h2c upgrade, and a legitimate large-bodied RPC (BulkDeleteJobs, BulkRetryJobs)
+// never carries that header — whereas under-matching is a pre-auth
+// memory-exhaustion window. Keeping this independent of the Connection spelling
+// also means a future x/net that accepts another token cannot silently reopen it.
+//
+// Header tokens are comma-separated and case-insensitive per RFC 9110.
 func isH2CUpgrade(r *http.Request) bool {
 	if r.ProtoMajor != 1 {
 		return false
 	}
-	if !headerHasToken(r.Header, "Upgrade", "h2c") {
-		return false
-	}
-	return headerHasToken(r.Header, "Connection", "upgrade")
+	return headerHasToken(r.Header, "Upgrade", "h2c")
 }
 
 func headerHasToken(h http.Header, key, token string) bool {

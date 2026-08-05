@@ -11,13 +11,13 @@ import (
 )
 
 q := jobs.New(store)
-w := q.NewWorker(
+w := jobs.NewWorker(q, 
 	jobs.WorkerQueue("default", jobs.Concurrency(50)),
 	jobs.WithDequeueBatchSize(50),
 )
 ```
 
-The default batch size is `10`, so a single worker is no longer capped at the old one-claim-per-poll throughput floor. Set `WithDequeueBatchSize(1)` to force strict single-row claims; pairing that with a slower `WithPollInterval(...)` is the rollback escape hatch for conservative slow-poll behavior.
+The default batch size is `50`, so a single worker is no longer capped at the old one-claim-per-poll throughput floor. The claim is also capped at the worker's free concurrency slots, so at the default concurrency of 10 the effective per-poll claim is 10. Set `WithDequeueBatchSize(1)` to force strict single-row claims; pairing that with a slower `WithPollInterval(...)` is the rollback escape hatch for conservative slow-poll behavior.
 
 ## How it works
 
@@ -63,7 +63,7 @@ Set the batch size near the worker concurrency when poll round trips are the bot
 
 ```go
 q := jobs.New(store)
-w := q.NewWorker(
+w := jobs.NewWorker(q, 
 	jobs.WorkerQueue("default", jobs.Concurrency(100)),
 	jobs.WithDequeueBatchSize(100),
 )

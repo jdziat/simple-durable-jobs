@@ -43,10 +43,28 @@ type LegacyCallSpanJob struct {
 //
 // Phase checkpoints (call_index < 0) are excluded — they are not Call
 // checkpoints and never participate in index assignment.
+//
+// Built-in durable operations are excluded too, and that exclusion is
+// load-bearing rather than tidiness. Only Call() records a SpanEnd, so a fan-out
+// or signal-wait checkpoint carries span_end = 0 in EVERY version including this
+// one. Without the exclusion this listed healthy current-version workflows as
+// pre-upgrade suspects — and since the documented repair for a listed job is a
+// checkpoint-clearing Requeue, acting on one discarded completed work and
+// re-ran its side effects. The exclusion is built from the core.CheckpointType*
+// constants the producers themselves write, so the two cannot drift.
+//
+// Note this is necessarily a POST-upgrade query: checkpoints.span_end is added by
+// the v4.6 migration, so it cannot be run against a pre-upgrade database, which
+// is exactly why current-version rows are guaranteed to be present when it runs.
 func (s *GormStorage) FindLegacyCallSpanJobs(ctx context.Context, limit int) ([]LegacyCallSpanJob, error) {
 	if limit <= 0 {
 		limit = 100
 	}
+	builtinExclusion, builtinArgs := core.BuiltinCheckpointTypeSQLExclusion("c.call_type")
+	args := make([]any, 0, len(builtinArgs)+4)
+	args = append(args, builtinArgs...)
+	args = append(args, core.StatusCompleted, core.StatusCancelled, core.StatusFailed, limit)
+
 	var out []LegacyCallSpanJob
 	err := s.db.WithContext(ctx).Raw(`
 		SELECT j.id AS job_id,
@@ -57,14 +75,12 @@ func (s *GormStorage) FindLegacyCallSpanJobs(ctx context.Context, limit int) ([]
 		INNER JOIN checkpoints c ON c.job_id = j.id
 		WHERE c.call_index >= 0
 		  AND c.span_end = 0
+		  AND `+builtinExclusion+`
 		  AND j.status NOT IN (?, ?, ?)
 		GROUP BY j.id, j.type, j.status
 		HAVING count(c.id) > 1
 		ORDER BY count(c.id) DESC
-		LIMIT ?`,
-		core.StatusCompleted, core.StatusCancelled, core.StatusFailed,
-		limit,
-	).Scan(&out).Error
+		LIMIT ?`, args...).Scan(&out).Error
 	if err != nil {
 		return nil, err
 	}

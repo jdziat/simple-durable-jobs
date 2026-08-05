@@ -77,7 +77,7 @@ the event/hook/metric pipeline — not just `slog` — and are fully alertable:
   `JobID`, `WorkerID`, `Reason` (`stale_lock` for the reaper) and `Timestamp`.
   See the [Events reference]({{< relref "/docs/api-reference/events" >}}) for the
   full type and the `stale_lock` vs `ownership_audit` distinction.
-- **Hook** -- register `queue.OnJobReclaimed(func(ctx, jobID, reason string))`
+- **Hook** -- register `queue.OnJobReclaimed(func(ctx context.Context, jobID core.UUID, reason string))`
   to react per reclaimed job (page, increment your own counter, etc.).
 - **Metric** -- `jobs.metrics.Instrument` auto-wires the hook into the
   `jobs.leases.reclaimed` counter, labelled by `reason`. See the
@@ -91,7 +91,7 @@ the event/hook/metric pipeline — not just `slog` — and are fully alertable:
 Both tuning knobs are set through worker options:
 
 ```go
-worker := queue.NewWorker(
+worker := jobs.NewWorker(queue, 
     jobs.WithStaleLockInterval(5 * time.Minute), // How often to check (default: 5min)
     jobs.WithStaleLockAge(45 * time.Minute),      // Max silence before reclaim (default: 45min)
 )
@@ -104,7 +104,7 @@ so it cannot be disabled. A non-positive `WithStaleLockInterval` keeps the
 default. Positive values below the 1s floor are clamped up to 1s.
 
 ```go
-worker := queue.NewWorker(
+worker := jobs.NewWorker(queue, 
     jobs.WithStaleLockInterval(0), // Keep the default interval
 )
 ```

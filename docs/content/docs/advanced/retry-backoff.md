@@ -41,7 +41,7 @@ With `JitterFraction: 0`, the default curve is the legacy job retry sequence:
 10% jitter so workers that fail at the same time do not all retry in lockstep.
 
 ```go
-worker := queue.NewWorker(jobs.WithBackoff(jobs.ExponentialBackoff{
+worker := jobs.NewWorker(queue, jobs.WithBackoff(jobs.ExponentialBackoff{
     InitialInterval: 5 * time.Second,
     Multiplier:      2,
     MaxInterval:     5 * time.Minute,
@@ -56,7 +56,7 @@ worker := queue.NewWorker(jobs.WithBackoff(jobs.ExponentialBackoff{
 Use `BackoffFunc` for small policies or River/Asynq-style closures:
 
 ```go
-worker := queue.NewWorker(jobs.WithBackoff(jobs.BackoffFunc(
+worker := jobs.NewWorker(queue, jobs.WithBackoff(jobs.BackoffFunc(
     func(attempt int, err error) time.Duration {
         if errors.Is(err, ErrRateLimited) {
             return 30 * time.Second
@@ -72,7 +72,7 @@ worker := queue.NewWorker(jobs.WithBackoff(jobs.BackoffFunc(
 does not affect storage-operation retry.
 
 ```go
-worker := queue.NewWorker(jobs.WithBackoff(jobs.ExponentialBackoff{
+worker := jobs.NewWorker(queue, jobs.WithBackoff(jobs.ExponentialBackoff{
     InitialInterval: time.Second,
     Multiplier:      1.5,
     MaxInterval:     time.Minute,

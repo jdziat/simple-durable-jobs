@@ -49,7 +49,7 @@ func FanOut[T any](ctx context.Context, subJobs []SubJob, opts ...Option) ([]Res
 	cs.Mu.Lock()
 	callIndex := cs.CallIndex
 	cs.CallIndex++
-	checkpoint, hasCheckpoint := cs.Checkpoints[intctx.CheckpointKey{Index: callIndex, Type: "fanout"}]
+	checkpoint, hasCheckpoint := cs.Checkpoints[intctx.CheckpointKey{Index: callIndex, Type: core.CheckpointTypeFanOut}]
 	cs.Mu.Unlock()
 
 	var fanOutID core.UUID
@@ -77,7 +77,8 @@ func FanOut[T any](ctx context.Context, subJobs []SubJob, opts ...Option) ([]Res
 			return nil, fmt.Errorf("fan-out not found: %s", fanOutID)
 		}
 
-		jobs, err := buildSubJobs(subJobs, cfg, jc, fanOutID)
+		// Replay: anchor relative delays to the fan-out's creation, not to now.
+		jobs, err := buildSubJobs(subJobs, cfg, jc, fanOutID, fanOut.CreatedAt)
 		if err != nil {
 			return nil, err
 		}
@@ -104,7 +105,7 @@ func FanOut[T any](ctx context.Context, subJobs []SubJob, opts ...Option) ([]Res
 
 	// First execution: create fan-out and sub-jobs
 	fanOutID = core.NewID()
-	jobs, err := buildSubJobs(subJobs, cfg, jc, fanOutID)
+	jobs, err := buildSubJobs(subJobs, cfg, jc, fanOutID, time.Now())
 	if err != nil {
 		return nil, err
 	}
@@ -133,7 +134,7 @@ func FanOut[T any](ctx context.Context, subJobs []SubJob, opts ...Option) ([]Res
 		ID:        core.NewID(),
 		JobID:     jc.Job.ID,
 		CallIndex: callIndex,
-		CallType:  "fanout",
+		CallType:  core.CheckpointTypeFanOut,
 		Result:    cpData,
 	}
 
@@ -208,8 +209,18 @@ func FanOut[T any](ctx context.Context, subJobs []SubJob, opts ...Option) ([]Res
 	return nil, &WaitingError{FanOutID: fanOutID}
 }
 
-func buildSubJobs(subJobs []SubJob, cfg *config, jc *intctx.JobContext, fanOutID core.UUID) ([]*core.Job, error) {
+// buildSubJobs materialises the child rows. `now` is the reference instant a
+// relative Delay is measured from, and it is a PARAMETER rather than time.Now()
+// because this runs on the replay path too: after a crash between creating the
+// fan-out and persisting its children, calling time.Now() here would re-anchor
+// every delayed child to the recovery instant, so a child asked to wait an hour
+// would wait an hour FROM THE REPLAY — drifting by the whole crash-to-recovery
+// gap, silently, on the one path where the caller cannot see it. The replay
+// passes the fan-out's own CreatedAt so it reproduces the original schedule.
+// An absolute RunAt is unaffected either way; only Delay is relative.
+func buildSubJobs(subJobs []SubJob, cfg *config, jc *intctx.JobContext, fanOutID core.UUID, now time.Time) ([]*core.Job, error) {
 	jobs := make([]*core.Job, len(subJobs))
+	var dedupIgnored []int
 	for i, sj := range subJobs {
 		if err := security.ValidateJobTypeName(sj.Type); err != nil {
 			return nil, fmt.Errorf("invalid sub-job type %q: %w", sj.Type, err)
@@ -242,17 +253,46 @@ func buildSubJobs(subJobs []SubJob, cfg *config, jc *intctx.JobContext, fanOutID
 			return nil, fmt.Errorf("invalid sub-job queue name %q: %w", queue, err)
 		}
 
+		// The fan-out default applies only when the field is BOTH unmarked and
+		// zero, which keeps two different callers working at once:
+		//
+		//   Sub("t", a, queue.Retries(0))  -> marked, value 0   -> stays 0
+		//   SubJob{Type: "t", Retries: 5}  -> unmarked, value 5 -> stays 5
+		//
+		// The *Set flags exist because Sub() cannot otherwise distinguish an
+		// explicit zero from an absence. But they are only set by the OPTION path,
+		// and SubJob is an exported struct with exported fields that callers build
+		// as a literal (the api-reference docs show the slice form, and the
+		// package's own tests use bare literals). Testing the flag ALONE would
+		// therefore discard a literal's explicit non-zero value in favour of the
+		// fan-out default — silently, since nothing reads back the child's config.
 		priority := sj.Priority
-		if !sj.PrioritySet {
+		if !sj.PrioritySet && priority == 0 {
 			priority = cfg.priority
 		}
 
-		// Determine retries with fallback, then clamp to security limits
 		retries := sj.Retries
-		if retries == 0 {
+		if !sj.RetriesSet && retries == 0 {
 			retries = cfg.retries
 		}
 		retries = security.ClampRetries(retries)
+
+		if sj.DedupOptionsIgnored {
+			dedupIgnored = append(dedupIgnored, i)
+		}
+
+		// Delay/RunAt precedence mirrors queue.buildJob: Delay first, then an
+		// absolute RunAt overrides it. The *time.Time is copied so the child never
+		// aliases the caller's SubJob.
+		var runAt *time.Time
+		if sj.Delay > 0 {
+			t := now.Add(sj.Delay)
+			runAt = &t
+		}
+		if sj.RunAt != nil {
+			t := *sj.RunAt
+			runAt = &t
+		}
 
 		parentID := jc.Job.ID
 		rootID := jc.Job.RootJobID
@@ -264,21 +304,38 @@ func buildSubJobs(subJobs []SubJob, cfg *config, jc *intctx.JobContext, fanOutID
 		// scope and queryable context flow consistently through the workflow.
 		jobID := core.NewID()
 		jobs[i] = &core.Job{
-			ID:          jobID,
-			Type:        sj.Type,
-			Args:        args,
-			Queue:       queue,
-			Tenant:      jc.Job.Tenant,
-			Metadata:    cloneMetadata(jc.Job.Metadata),
-			Priority:    priority,
-			MaxRetries:  retries,
-			Timeout:     sj.Timeout,
-			ParentJobID: &parentID,
-			RootJobID:   rootID,
-			FanOutID:    &fanOutID,
-			FanOutIndex: i,
-			UniqueKey:   fmt.Sprintf("fanout-%s-%d", fanOutID, i), // Prevent duplicate sub-jobs on replay
+			ID:         jobID,
+			Type:       sj.Type,
+			Args:       args,
+			Queue:      queue,
+			Tenant:     jc.Job.Tenant,
+			Metadata:   cloneMetadata(jc.Job.Metadata),
+			Priority:   priority,
+			MaxRetries: retries,
+			// `retries` is always resolved above — Sub()'s explicit value when
+			// RetriesSet, otherwise the fan-out config's. A resolved 0 means run
+			// once, and storage cannot tell that from an untouched field, so the
+			// intent has to be stated. Without it, Sub("x", jobs.Retries(0)) and
+			// WithFanOutRetries(0) both silently become three attempts.
+			MaxRetriesSet: true,
+			Timeout:       sj.Timeout,
+			Determinism:   int(sj.Determinism),
+			RunAt:         runAt,
+			ParentJobID:   &parentID,
+			RootJobID:     rootID,
+			FanOutID:      &fanOutID,
+			FanOutIndex:   i,
+			UniqueKey:     fmt.Sprintf("fanout-%s-%d", fanOutID, i), // Prevent duplicate sub-jobs on replay
 		}
+	}
+	// Aggregated once per call, not per child: a 10k-wide fan-out must not emit
+	// 10k lines. Warn, never error — turning a silently-wrong call into a hard
+	// failure on upgrade would convert a latent bug into an outage. v5 errors.
+	if len(dedupIgnored) > 0 && jc.Logger != nil {
+		jc.Logger.Warn(
+			"fanout.Sub: enqueue-deduplication options (Unique/IdempotencyKey/UniqueFor) are ignored on "+
+				"fan-out sub-jobs; children carry a fan-out-owned UniqueKey so parent replay stays idempotent",
+			"job_id", jc.Job.ID, "fan_out_id", fanOutID, "sub_job_indexes", dedupIgnored)
 	}
 	return jobs, nil
 }

@@ -75,7 +75,7 @@ func main() {
 
 	// Enqueue work and start processing.
 	queue.Enqueue(context.Background(), "greet", "world")
-	queue.NewWorker().Start(context.Background())
+	jobs.NewWorker(queue).Start(context.Background())
 }
 ```
 

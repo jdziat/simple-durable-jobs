@@ -117,12 +117,31 @@ func TestPostgresSchemaAssertions(t *testing.T) {
 	require.Contains(t, signalsPendingDef, "where", "idx_signals_pending must be partial on postgres:\n%s", signalsPendingDef)
 	require.Contains(t, signalsPendingDef, "consumed_at is null", "idx_signals_pending must be partial on consumed_at IS NULL:\n%s", signalsPendingDef)
 
+	// idx_jobs_unique_key USED to be pinned "must not exist" here. That assertion
+	// was wrong and migration 41 reverses it. It was added when the dedup
+	// pre-check filtered on status IN ('pending','running') — exactly the
+	// predicate of the partial UNIQUE idx_jobs_active_unique, which could
+	// therefore serve the lookup. fc8c227 widened core.ActiveDedupStatuses to
+	// five statuses (adding retrying, waiting, paused); the partial index's
+	// predicate became a strict SUBSET of what the query asks for, so no planner
+	// may use it, and every idempotent enqueue degraded to a scan of the whole
+	// active set (measured on SQLite at 400k pending jobs: 58.0ms per
+	// EnqueueUnique, 172us with the index). MySQL kept the plain index all along
+	// and was never affected; this restores parity, it does not invent a shape.
+	require.True(t, postgresIndexExists(t, db, "idx_jobs_unique_key"),
+		"idx_jobs_unique_key must exist on postgres: the five-status dedup lookup cannot use the two-status partial unique index")
+	uniqueKeyDef := strings.ToLower(postgresIndexDef(t, db, "idx_jobs_unique_key"))
+	require.Contains(t, uniqueKeyDef, "unique_key", "idx_jobs_unique_key definition:\n%s", uniqueKeyDef)
+	require.NotContains(t, uniqueKeyDef, " where ",
+		"idx_jobs_unique_key must NOT be partial — a predicate the dedup query does not restate is exactly what made the old index unusable:\n%s", uniqueKeyDef)
+	require.False(t, strings.HasPrefix(uniqueKeyDef, "create unique index"),
+		"idx_jobs_unique_key must stay NON-unique; idx_jobs_active_unique is the constraint:\n%s", uniqueKeyDef)
+
 	for _, indexName := range []string{
 		"idx_jobs_priority",
 		"idx_jobs_queue",
 		"idx_jobs_locked_until",
 		"idx_jobs_dequeue",
-		"idx_jobs_unique_key",
 		"idx_jobs_dequeue_order",
 		"idx_jobs_status",
 		"idx_jobs_run_at",
@@ -259,6 +278,7 @@ func TestMySQLSchemaAssertions(t *testing.T) {
 	require.True(t, mysqlIndexExists(t, db, "idx_jobs_tenant"), "idx_jobs_tenant must exist on mysql")
 	requireMySQLCascadeFKs(t, db)
 	requireMySQLUniqueKeyCollations(t, db)
+	requireMySQLWaitingSignalNameCollation(t, db)
 	requireMySQLDispatcherColumnsNotNull(t, db)
 	requireMySQLCheckConstraints(t, db)
 	requireMySQLCheckConstraintsEnforced(t, db)
@@ -271,6 +291,7 @@ func TestMySQLSchemaAssertions(t *testing.T) {
 	require.NoError(t, db.AutoMigrate(&core.Job{}))
 	requireMySQLDispatcherColumnsNotNull(t, db)
 	requireMySQLUniqueKeyCollations(t, db)
+	requireMySQLWaitingSignalNameCollation(t, db)
 	requireMySQLQueueTenantCollations(t, db)
 	requireMySQLIdentifierColumnCollations(t, db)
 }
@@ -1051,4 +1072,38 @@ func TestPostgresDeadLetteredAtMigrateNoFlap(t *testing.T) {
 		require.Falsef(t, strings.Contains(lower, "alter") && strings.Contains(lower, "dead_lettered_at"),
 			"a steady-state 2nd Migrate must not ALTER dead_lettered_at (precision flap reintroduced?): %s", stmt)
 	}
+}
+
+// requireMySQLWaitingSignalNameCollation pins jobs.waiting_signal_name to the SAME
+// collation as signals.name, which the signal-resume poll compares it against.
+//
+// A mismatch is not a style question on MySQL: `signals.name =
+// jobs.waiting_signal_name` fails outright with error 1267, "illegal mix of
+// collations", so EVERY signal-resume query errors and no signal-waiting job ever
+// resumes. AutoMigrate creates the column with the jobs table default
+// (utf8mb4_0900_ai_ci), so migrateJobsWaitingSignalName has to repair it — this is
+// what catches the repair being dropped. SQLite and Postgres cannot surface it.
+//
+// as_cs is also the semantically required side: signals are consumed under as_cs,
+// so a wait on "Approval" is not satisfied by a signal named "approval". An ai_ci
+// column here would make the poll MORE permissive than the consume, waking a job
+// for a signal it cannot consume — the hot loop the column exists to close.
+func requireMySQLWaitingSignalNameCollation(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	var jobsCollation, signalsCollation string
+	require.NoError(t, db.Raw(`
+		SELECT COLLATION_NAME FROM information_schema.COLUMNS
+		WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'jobs'
+		  AND COLUMN_NAME = 'waiting_signal_name'
+	`).Scan(&jobsCollation).Error)
+	require.NoError(t, db.Raw(`
+		SELECT COLLATION_NAME FROM information_schema.COLUMNS
+		WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'signals'
+		  AND COLUMN_NAME = 'name'
+	`).Scan(&signalsCollation).Error)
+
+	require.Equal(t, "utf8mb4_0900_as_cs", jobsCollation,
+		"jobs.waiting_signal_name must be utf8mb4_0900_as_cs; AutoMigrate creates it ai_ci and migrateJobsWaitingSignalName repairs it")
+	require.Equal(t, signalsCollation, jobsCollation,
+		"jobs.waiting_signal_name and signals.name must share a collation, or the resume poll's comparison fails with MySQL error 1267 and no signal-waiting job ever resumes")
 }

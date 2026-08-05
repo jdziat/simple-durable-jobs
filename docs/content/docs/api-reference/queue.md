@@ -23,14 +23,20 @@ queue := jobs.New(storage)
 
 ### `(*Queue) Register(name string, fn any, opts ...Option)`
 
-Registers a job handler function. The function must have one of these signatures:
+Registers a job handler function. The function takes **one or two** parameters —
+an optional leading `context.Context`, then an optional args value — and returns
+either `error` or `(R, error)`. Every combination is accepted:
 
 ```go
 func(ctx context.Context, args T) error
 func(ctx context.Context, args T) (R, error)
 func(args T) error
 func(args T) (R, error)
+func(ctx context.Context) error          // no args
+func(ctx context.Context) (R, error)     // no args
 ```
+
+A zero-parameter `func() error` is rejected (`handler must have 1-2 arguments`).
 
 Example:
 ```go
@@ -39,9 +45,12 @@ queue.Register("send-email", func(ctx context.Context, args EmailArgs) error {
 })
 ```
 
-### `(*Queue) Enqueue(ctx context.Context, name string, args any, opts ...Option) (string, error)`
+### `(*Queue) Enqueue(ctx context.Context, name string, args any, opts ...Option) (core.UUID, error)`
 
-Adds a job to the queue. Returns the job ID.
+Adds a job to the queue. Returns the job ID. `core.UUID` is a defined string
+type (`type UUID string`), re-exported by the root facade as `jobs.UUID`; it is
+**not** interchangeable with `string`, so a variable that holds a job ID must be
+declared `jobs.UUID` (or inferred with `:=`), not `string`.
 
 ```go
 jobID, err := queue.Enqueue(ctx, "send-email", EmailArgs{
@@ -49,7 +58,7 @@ jobID, err := queue.Enqueue(ctx, "send-email", EmailArgs{
 })
 ```
 
-### `(*Queue) EnqueueRemote(ctx context.Context, name string, args any, opts ...Option) (string, error)`
+### `(*Queue) EnqueueRemote(ctx context.Context, name string, args any, opts ...Option) (core.UUID, error)`
 
 Adds a job without requiring a local handler registration. Use this for
 producer-only processes that enqueue work for workers running elsewhere.
@@ -76,12 +85,24 @@ if err := queue.Schedule("cleanup", nil, jobs.Every(5*time.Minute)); err != nil 
 }
 ```
 
-### `(*Queue) NewWorker(opts ...WorkerOption) *Worker`
+### `(*Queue) NewWorker(opts ...any) core.Starter`
 
-Creates a new worker for processing jobs.
+Creates a worker for this queue. Note the return type: it is `core.Starter`,
+whose only method is `Start`. **Use `jobs.NewWorker(q, ...)` instead** unless
+`Start` is genuinely all you need — the facade returns `*Worker`, which is the
+type that carries `Pause`, `Resume`, `WaitForPause`, `CancelJob`, `Health`,
+`IsPaused`, `RunningJobCount` and `HealthHandler`. The `...any` parameter also
+means a mistyped option is not caught by the compiler; the facade takes typed
+`WorkerOption` values.
 
 ```go
-worker := queue.NewWorker(
+// Preferred: returns *Worker, options are type-checked.
+worker := jobs.NewWorker(queue,
+    jobs.WorkerQueue("default", jobs.Concurrency(10)),
+)
+
+// Start-only; cannot be paused, resumed or health-checked.
+starter := queue.NewWorker(
     jobs.WorkerQueue("default", jobs.Concurrency(10)),
 )
 ```
@@ -106,6 +127,7 @@ queue.Register("my-job", func(ctx context.Context, args MyArgs) error {
 })
 ```
 
-### `JobIDFromContext(ctx context.Context) string`
+### `JobIDFromContext(ctx context.Context) core.UUID`
 
-Returns the current job ID from context, or empty string if not in a job handler.
+Returns the current job ID from context, or the empty UUID (`core.NilUUID`, the
+zero value of `core.UUID`) if not in a job handler.

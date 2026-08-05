@@ -58,7 +58,7 @@ storage, while `/readyz` calls storage `Ping(ctx)` when the backend implements
 `storage.Healther` and returns `503 Service Unavailable` on ping failure.
 Operator pause does not make `/readyz` fail. See [Production Operations]({{< relref "/docs/production-ops" >}}).
 
-### `(*Worker) CancelJob(jobID string) bool`
+### `(*Worker) CancelJob(jobID core.UUID) bool`
 
 Cancels a specific running job's context. Returns true if the job was found and cancelled, false if the job was not running on this worker.
 
@@ -112,9 +112,11 @@ Sets how often the worker polls for new jobs. The default is 100ms and the floor
 
 ### `WithDequeueBatchSize(n int) WorkerOption`
 
-Sets the per-poll cap for optional batch dequeue. The default is `10`; values
-are clamped to `[1, 1000]`. Set `WithDequeueBatchSize(1)` to force single-row
-claims.
+Sets the per-poll cap for optional batch dequeue. The default is `50`; values
+are clamped to `[1, 1000]`. The claim is additionally capped at the worker's
+free concurrency slots, so a worker left at the default concurrency (10) never
+claims more than 10 at once — only deployments that raise concurrency see the
+larger batch. Set `WithDequeueBatchSize(1)` to force single-row claims.
 
 ### `WithDrainTimeout(d time.Duration) WorkerOption`
 
@@ -156,7 +158,7 @@ Overrides the per-dequeue lock duration (default: 45 minutes). Useful when your 
 ```go
 import "github.com/jdziat/simple-durable-jobs/v4/pkg/worker"
 
-w := queue.NewWorker(worker.WithLockDuration(2 * time.Hour))
+w := jobs.NewWorker(queue, worker.WithLockDuration(2 * time.Hour))
 ```
 
 ---
@@ -191,7 +193,7 @@ queues, err := queue.GetPausedQueues(ctx)
 For direct storage operations without a queue instance:
 
 ```go
-jobs.PauseJob(ctx, storage, jobID)
+jobs.PauseJob(ctx, queue, jobID) // takes the *Queue, not the Storage
 jobs.ResumeJob(ctx, storage, jobID)
 jobs.IsJobPaused(ctx, storage, jobID)
 jobs.GetPausedJobs(ctx, storage, "emails")

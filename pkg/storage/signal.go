@@ -139,10 +139,20 @@ func (s *GormStorage) DrainSignals(ctx context.Context, jobID core.UUID, name st
 				ids[i] = sg.ID
 				sg.ConsumedAt = &now
 			}
-			if err := tx.Model(&core.Signal{}).
-				Where("id IN ?", ids).
-				Update("consumed_at", s.nowWriteValue()).Error; err != nil {
-				return err
+			// CHUNKED: `ids` is every pending signal of this name, which is
+			// user-data-unbounded — nothing caps how many signals may buffer for a
+			// job. Unchunked, a backlog past the driver's bind-parameter ceiling
+			// (SQLite 32766, Postgres/MySQL 65535) fails the statement outright, and
+			// because DrainSignals is the ONLY bulk consume the backlog can never be
+			// cleared: the handler errors, retries, fails identically and dead-letters.
+			// Measured: the threshold is ~32765, and single-signal ConsumeSignal on
+			// the same backlog still works, which isolates the IN-list as the cause.
+			for _, chunk := range chunkIDs(ids, retentionDeleteChunkSize) {
+				if err := tx.Model(&core.Signal{}).
+					Where("id IN ?", chunk).
+					Update("consumed_at", s.nowWriteValue()).Error; err != nil {
+					return err
+				}
 			}
 			if err := s.decodeSignalPayloads(sigs); err != nil {
 				return err
@@ -304,10 +314,15 @@ func (s *GormStorage) drainSignalsTx(ctx context.Context, jobID core.UUID, worke
 					ids[i] = sg.ID
 					sg.ConsumedAt = &now
 				}
-				if err := tx.Model(&core.Signal{}).
-					Where("id IN ?", ids).
-					Update("consumed_at", s.nowWriteValue()).Error; err != nil {
-					return err
+				// Chunked for the same bind-parameter ceiling as the sibling above;
+				// this is the handler-facing path (jobs.DrainSignals ->
+				// DrainSignalsTxOwned), so it is the one a user actually hits.
+				for _, chunk := range chunkIDs(ids, retentionDeleteChunkSize) {
+					if err := tx.Model(&core.Signal{}).
+						Where("id IN ?", chunk).
+						Update("consumed_at", s.nowWriteValue()).Error; err != nil {
+						return err
+					}
 				}
 				if err := s.decodeSignalPayloads(sigs); err != nil {
 					return err
@@ -382,12 +397,23 @@ func (s *GormStorage) DeleteConsumedSignalsOlderThan(ctx context.Context, age ti
 			if len(ids) == 0 {
 				return nil
 			}
-			result := tx.Where("id IN ?", ids).
-				Where("consumed_at IS NOT NULL").
-				Where("consumed_at < ?", cutoff).
-				Delete(&core.Signal{})
-			deleted = result.RowsAffected
-			return result.Error
+			// Bound the literal IN-list, as DeleteTerminalJobsOlderThan and
+			// DeleteExpiredUniqueLocks do. This is the third sweep driven by
+			// RetentionBatchSize; the option is clamped, but this method is
+			// EXPORTED, so a direct caller passing a large limit would otherwise
+			// hit the driver's bind-parameter ceiling (SQLite ~32k, Postgres
+			// 65535) and get deleted=0 on every pass, forever.
+			for _, chunk := range chunkIDs(ids, retentionDeleteChunkSize) {
+				result := tx.Where("id IN ?", chunk).
+					Where("consumed_at IS NOT NULL").
+					Where("consumed_at < ?", cutoff).
+					Delete(&core.Signal{})
+				if result.Error != nil {
+					return result.Error
+				}
+				deleted += result.RowsAffected
+			}
+			return nil
 		})
 	})
 	return deleted, err
@@ -422,6 +448,13 @@ func (s *GormStorage) MarkWaitingWithDeadline(ctx context.Context, jobID core.UU
 // the DB clock (offsetExpr) on multi-worker backends and the caller's clock on
 // SQLite, exactly as MarkWaitingWithDeadline documents.
 func (s *GormStorage) markWaitingWithDeadlineTx(tx *gorm.DB, jobID core.UUID, workerID string, d time.Duration) (int64, error) {
+	return s.markWaitingWithDeadlineForSignalTx(tx, jobID, workerID, d, "")
+}
+
+// markWaitingWithDeadlineForSignalTx is markWaitingWithDeadlineTx that also
+// records which signal name may wake the job. An empty name means "not recorded"
+// and leaves the resume poll permissive for this job.
+func (s *GormStorage) markWaitingWithDeadlineForSignalTx(tx *gorm.DB, jobID core.UUID, workerID string, d time.Duration, signalName string) (int64, error) {
 	var runAt any
 	if s.useDBClock() {
 		runAt = s.offsetExpr(d)
@@ -432,11 +465,12 @@ func (s *GormStorage) markWaitingWithDeadlineTx(tx *gorm.DB, jobID core.UUID, wo
 		Model(&core.Job{}).
 		Where("id = ? AND locked_by = ? AND status = ?", jobID, workerID, core.StatusRunning).
 		Updates(map[string]any{
-			"status":       core.StatusWaiting,
-			"locked_by":    "",
-			"locked_until": nil,
-			"run_at":       runAt,
-			"updated_at":   time.Now(),
+			"status":              core.StatusWaiting,
+			"locked_by":           "",
+			"locked_until":        nil,
+			"run_at":              runAt,
+			"waiting_signal_name": signalName,
+			"updated_at":          time.Now(),
 		})
 	if result.Error != nil {
 		return 0, result.Error
@@ -462,6 +496,19 @@ func (s *GormStorage) markWaitingWithDeadlineTx(tx *gorm.DB, jobID core.UUID, wo
 // mark waiting atomically" — no checkpoint write is attempted. The whole tx runs
 // under withSerializationRetry so a 40001/1213 retry re-runs both writes together.
 func (s *GormStorage) SaveCheckpointAndMarkWaiting(ctx context.Context, cp *core.Checkpoint, jobID core.UUID, workerID string, d time.Duration) error {
+	return s.SaveCheckpointAndMarkWaitingForSignal(ctx, cp, jobID, workerID, d, "")
+}
+
+// SaveCheckpointAndMarkWaitingForSignal is SaveCheckpointAndMarkWaiting that also
+// records, in the SAME transaction, which signal name may wake the job. Recording
+// it atomically with the status transition matters: a job that reached waiting
+// without its name recorded would fall back to the permissive resume and could be
+// re-dispatched and fully replayed on every poll tick by a signal it will never
+// consume.
+//
+// Pass signal.SleepCheckpointType for a durable sleep, which no signal should
+// wake. An empty name records nothing and keeps the permissive behaviour.
+func (s *GormStorage) SaveCheckpointAndMarkWaitingForSignal(ctx context.Context, cp *core.Checkpoint, jobID core.UUID, workerID string, d time.Duration, signalName string) error {
 	return s.withSerializationRetry(ctx, func() error {
 		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 			if cp != nil {
@@ -469,7 +516,7 @@ func (s *GormStorage) SaveCheckpointAndMarkWaiting(ctx context.Context, cp *core
 					return err
 				}
 			}
-			rowsAffected, err := s.markWaitingWithDeadlineTx(tx, jobID, workerID, d)
+			rowsAffected, err := s.markWaitingWithDeadlineForSignalTx(tx, jobID, workerID, d, signalName)
 			if err != nil {
 				return err
 			}
@@ -517,7 +564,16 @@ func (s *GormStorage) GetSignalWaitingJobsToResumeAfter(ctx context.Context, aft
 			s.db.Where("EXISTS (?)",
 				s.db.Model(&core.Signal{}).
 					Select("1").
-					Where("signals.job_id = jobs.id AND signals.consumed_at IS NULL"),
+					Where("signals.job_id = jobs.id AND signals.consumed_at IS NULL").
+					// Correlate on the name the job actually suspended on. Without
+					// this, a pending signal the handler will never consume wakes
+					// the job on EVERY tick forever: it re-dispatches, replays,
+					// re-suspends, and the surplus signal is still pending for the
+					// next tick. jobs.waiting_signal_name = '' means "not
+					// recorded" (fan-out suspends, or a core.Storage that does not
+					// implement SignalWaitMarker) and keeps the permissive
+					// behaviour so such a wait still resumes.
+					Where("(jobs.waiting_signal_name = '' OR signals.name = jobs.waiting_signal_name)"),
 			).Or("run_at IS NOT NULL AND run_at <= ?", nowVal),
 		).
 		// Exclude parents still waiting on a pending fan-out: resuming one before

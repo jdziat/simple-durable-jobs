@@ -154,6 +154,24 @@ func (s *GormStorage) claimableCandidates(q *gorm.DB, queues []string, now any) 
 		Order("priority DESC, " + eligExpr + " ASC")
 }
 
+// excludeJobIDs removes specific rows from a claim query. It is used by the
+// single-job dequeue to step past rows it has just claimed, failed to decode and
+// released — without it, releaseClaimedOnAbort puts the poison row back at the
+// head of the ORDER BY and the very next claim picks it again.
+//
+// It is a NO-OP for an empty list ON PURPOSE: the healthy dequeue (the hot path,
+// riding idx_jobs_dequeue_eligible / idx_jobs_dq_ready) then emits SQL that is
+// byte-identical to before, so no plan can regress on a queue with no poison
+// rows. The IN-list is bounded by maxPoisonSkipsPerDequeue, and the ids are a
+// literal set — not a correlated subquery — so it filters after the ordered index
+// scan instead of replacing it.
+func excludeJobIDs(q *gorm.DB, ids []core.UUID) *gorm.DB {
+	if len(ids) == 0 {
+		return q
+	}
+	return q.Where("id NOT IN ?", ids)
+}
+
 // PromoteReadyJobs is the wedge-backstop for the dq_ready hint: it flips
 // dq_ready=true for any pending job that has become eligible (run_at passed) but
 // is still flagged not-ready. Returns the number of rows promoted. Safe to call

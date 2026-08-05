@@ -27,6 +27,8 @@ queue.Register("workflow", func(ctx context.Context, input Input) error {
 
 Manually saves a checkpoint for a named phase within a job handler.
 
+The name identifies the checkpoint, so each phase in a handler needs its own. Saving a second phase under a name the same run already used is refused with `jobctx.ErrDuplicatePhaseName` and fails the job terminally: the two phases would share one record, and every later replay would skip both — including one whose body never ran. Saving the same name again in a *later* run is replay and stays allowed.
+
 Use `SavePhaseCheckpointTx(ctx, tx, phaseName, result)` when the phase's business write and checkpoint must commit atomically in the same GORM transaction; see [Transactional Checkpoints]({{< relref "/docs/advanced/transactional-checkpoints" >}}).
 
 ### `LoadPhaseCheckpoint[T any](ctx context.Context, phaseName string) (T, bool)`
@@ -37,7 +39,7 @@ Retrieves a previously saved phase checkpoint. Returns the result and true if fo
 
 ## Retrieving Results
 
-### `LoadResult[T any](ctx context.Context, q *Queue, jobID string) (T, error)`
+### `LoadResult[T any](ctx context.Context, q *Queue, jobID core.UUID) (T, error)`
 
 Decodes the persisted return value of a completed job into `T`. This is the primary way to read a job's result from outside its handler — for example, a caller polling for the outcome of a job it enqueued.
 

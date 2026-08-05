@@ -20,7 +20,7 @@ River and Simple Durable Jobs both fit Go applications that want workers close t
 | Unique jobs | `jobs.Unique(key)` |
 | `UniqueOpts.ByPeriod` | `jobs.UniqueFor(ttl)` |
 | Retries | `jobs.Retries(n)` plus worker backoff options |
-| Worker process | `queue.NewWorker(...).Start(ctx)` |
+| Worker process | `jobs.NewWorker(queue, ...).Start(ctx)` |
 
 ## Side-by-Side
 
@@ -92,7 +92,7 @@ if err != nil {
 	return err
 }
 
-worker := queue.NewWorker(jobs.WorkerQueue("default", jobs.Concurrency(10)))
+worker := jobs.NewWorker(queue, jobs.WorkerQueue("default", jobs.Concurrency(10)))
 return worker.Start(ctx)
 ```
 
@@ -130,7 +130,9 @@ Retry counts map to `jobs.Retries(n)`. Worker retry timing maps to `jobs.WithBac
 River uniqueness by period maps to `jobs.UniqueFor(ttl)` when the job arguments
 identify the work. If your River key is caller-supplied, use
 `jobs.IdempotencyKey(key, ttl)` instead. `jobs.Unique(key)` is only an
-active-job guard and releases when the first job leaves pending/running.
+active-job guard: it holds while the first job is in any non-terminal status
+(pending, running, retrying, waiting or paused) and releases when it becomes
+terminal.
 
 There is no direct equivalent for River's Postgres-specialized low-latency wakeup path. Workers poll; lower `jobs.WithPollInterval(...)` reduces latency at the cost of more database traffic, and `jobs.WithDequeueBatchSize(...)` improves drain throughput.
 

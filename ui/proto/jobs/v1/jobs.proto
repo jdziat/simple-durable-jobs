@@ -287,6 +287,16 @@ message ScheduledJobInfo {
   // expected_last_run is the most-recent boundary that should have fired but did
   // not. Set only when overdue; unset when healthy or never-fired.
   google.protobuf.Timestamp expected_last_run = 8;
+  // never_fires is true when the schedule has NO future boundary at all — an
+  // unsatisfiable cron such as "0 0 30 2 *". The worker detects the same condition
+  // and permanently skips the schedule, logging it once.
+  //
+  // It is a distinct state from overdue, not a special case of it: overdue means
+  // boundaries that SHOULD have fired did not, and a schedule that can never fire
+  // has no such boundaries. Reporting it as overdue would contradict that field's
+  // meaning; reporting it as neither left the dashboard rendering the schedule as
+  // healthy, which is what this field fixes. next_run is unset when it is true.
+  bool never_fires = 9;
 }
 
 message GetWorkflowRequest {

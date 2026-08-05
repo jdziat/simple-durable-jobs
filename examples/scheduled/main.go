@@ -80,8 +80,16 @@ func main() {
 	// Weekly backup on Sunday at 2:00 AM
 	// queue.Schedule("backup-database", nil, jobs.Weekly(time.Sunday, 2, 0))
 	//
-	// Using cron expression (every hour at minute 0)
-	// queue.Schedule("health-check", nil, jobs.Cron("0 * * * *"))
+	// Using cron expression (every hour at minute 0). Cron returns
+	// (Schedule, error) because the expression is parsed, so it needs two
+	// values; jobs.MustCron panics on an invalid expression if you would
+	// rather not handle it here.
+	//
+	// hourly, err := jobs.Cron("0 * * * *")
+	// if err != nil {
+	// 	log.Fatal(err)
+	// }
+	// queue.Schedule("health-check", nil, hourly)
 
 	// For demo, schedule these more frequently
 	if err := queue.Schedule("send-daily-report", nil, jobs.Every(15*time.Second)); err != nil {

@@ -44,8 +44,14 @@ var (
 	// ErrStorageNoTxCheckpoint is returned when the storage backend does not
 	// implement caller-supplied transaction checkpoints.
 	ErrStorageNoTxCheckpoint = errors.New("jobs: storage backend does not support transactional checkpoints")
-	// ErrStorageNoBatchDequeue is returned when the storage backend does not
-	// implement batch dequeue.
+	// ErrStorageNoBatchDequeue exists for symmetry with the other capability
+	// sentinels but is NOT currently returned by anything: batch dequeue is an
+	// optional capability that degrades silently to single-row Dequeue when the
+	// backend lacks it, and the worker only logs it as an inactive capability.
+	// Do not branch on it expecting to detect that fallback — the branch is dead.
+	// It is retained rather than removed because it is re-exported as
+	// jobs.ErrStorageNoBatchDequeue and deleting it would be an incompatible
+	// change within this major version.
 	ErrStorageNoBatchDequeue = errors.New("jobs: storage backend does not support batch dequeue")
 	// ErrStorageNoUniqueLocks is returned when the storage backend does not
 	// implement windowed enqueue deduplication.

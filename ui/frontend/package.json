@@ -23,7 +23,7 @@
     "svelte": "^5.0.0",
     "svelte-check": "^4.0.0",
     "typescript": "^5.6.0",
-    "uuid": "^14.0.0",
+    "uuid": "^14.0.1",
     "vite": "^5.0.0",
     "vitest": "^2.1.9"
   },
@@ -31,5 +31,6 @@
     "@bufbuild/protobuf": "^1.10.0",
     "@connectrpc/connect": "^1.6.1",
     "@connectrpc/connect-web": "^1.6.1"
-  }
+  },
+  "//lockfile": "package-lock.json is the ONE lockfile: CI runs `npm ci`, and the committed go:embed'd dist is gated on matching a fresh build from it. A pnpm-lock.yaml was also committed and pinned a DIFFERENT Svelte compiler (5.56.2 vs 5.51.3), so the two managers produced different bundle bytes and different hashed filenames — whichever one a maintainer used, the other would have tripped that gate. Do not reintroduce a second lockfile."
 }

@@ -22,6 +22,12 @@ import (
 
 // TestDequeue_ReleasesClaimOnPayloadDecodeFailure is the headline guard. Before
 // the fix the job stays 'running' and locked forever.
+//
+// The RETURN contract changed with the poison-skip fix: a row this dequeue could
+// not decode is reported (PoisonPayloadDrops) and skipped, not surfaced as the
+// call's error — the same shape decodeClaimedBatch has always had, and what lets
+// the next claim reach the job behind it. Nothing runnable was found here because
+// the only row is poison, so (nil, nil) is the correct "nothing to do".
 func TestDequeue_ReleasesClaimOnPayloadDecodeFailure(t *testing.T) {
 	s := newTestStorage(t)
 	ctx := context.Background()
@@ -33,9 +39,12 @@ func TestDequeue_ReleasesClaimOnPayloadDecodeFailure(t *testing.T) {
 	// committed and only then fails to decode.
 	s.codec = failingDecodeCodec{}
 
+	before := s.PoisonPayloadDrops()
 	got, err := s.Dequeue(ctx, []string{"default"}, "worker-A")
-	require.Error(t, err, "a poison payload must surface as an error")
+	require.NoError(t, err, "a poison row must not fail the dequeue that steps over it")
 	assert.Nil(t, got)
+	assert.Equal(t, before+1, s.PoisonPayloadDrops(),
+		"the drop must be counted; the counter is what operators alert on")
 
 	// The claim must have been undone.
 	s.codec = nil

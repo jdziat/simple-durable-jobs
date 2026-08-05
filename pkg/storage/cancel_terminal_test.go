@@ -238,6 +238,12 @@ func seedRunningLockedJob(t *testing.T, ctx context.Context, s *GormStorage, id 
 // short-circuits the live handler. Clearing locked_by would defer the stop to
 // the ~minutes heartbeat fallback. Exercises both the directly-cancelled root
 // and a subtree-cancelled child (the shared cancelFanOutChildrenAndReconcile).
+//
+// docs/content/docs/advanced/cancel-job.md documents this retention, including
+// the consequence that a terminal row keeps a future locked_until forever. That
+// page spent a release claiming the OPPOSITE — "clears the job's lock" — because
+// this test pinned the code without naming the page. If you change the behaviour
+// here, change the page in the same commit.
 func TestCancelJobTerminal_PreservesLockedByForOwnershipAudit(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStorage(t)
@@ -334,4 +340,31 @@ func TestCancelJobTerminal_ReconcilesOwningFanOutCounts(t *testing.T) {
 	assert.Equal(t, reconciled.TotalCount,
 		reconciled.CompletedCount+reconciled.FailedCount+reconciled.CancelledCount,
 		"owning fan-out persisted counts must reconcile to sum==total after cross-API child cancel")
+}
+
+// TestCancellableChildStatusesMatchesDocs pins the set that
+// docs/content/docs/advanced/cancel-job.md enumerates in prose. That page spent
+// a release naming the pre-branch set after StatusPaused was added here, because
+// nothing failed when the set changed. If you edit cancellableChildStatuses,
+// update that page in the same commit.
+//
+// Note the set deliberately omits StatusRetrying, which the dedup set includes.
+// That is not a gap: `git log -S StatusRetrying -- pkg/storage pkg/worker` is
+// empty, so this library has never written `retrying` in its history — there
+// are not even legacy rows resting there to be missed. It exists for UI
+// filtering only.
+//
+// Be precise about what THIS test does and does not catch. It pins the set; it
+// does not watch production. Adding a `retrying` write would not fail this
+// test — it would fail the retry-path tests in pkg/storage and pkg/worker
+// (measured: 4 and 2 respectively), which is where that decision gets forced.
+func TestCancellableChildStatusesMatchesDocs(t *testing.T) {
+	require.Equal(t, []core.JobStatus{
+		core.StatusPending, core.StatusWaiting, core.StatusRunning, core.StatusPaused,
+	}, cancellableChildStatuses)
+
+	for _, status := range cancellableChildStatuses {
+		require.Falsef(t, status.IsTerminal(),
+			"terminal status %q is in the cancellable set", status)
+	}
 }

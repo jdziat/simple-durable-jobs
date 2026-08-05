@@ -173,6 +173,84 @@ func TestDeleteTerminalJobsOlderThan_RootChildGuardBlocksDeletion(t *testing.T) 
 	assertRetentionExists(t, s, "ret-root-only-live-child")
 }
 
+// A mid-tree fan-out parent is protected by parentChildGuard ALONE. The other
+// three live-descendant guards are each inert for this shape:
+//
+//   - rootChildGuard keys on c.root_job_id = jobs.id, but fanout.go propagates the
+//     TOP-LEVEL root to every descendant, so a grandchild's root_job_id points past
+//     its mid-tree parent and never matches it.
+//   - the pending-fan-out guard keys on fan_outs.status = 'pending', and a fan-out
+//     goes 'failed' BEFORE its siblings are cancelled (worker.go completeFanOut
+//     flips the status, then cancels only when CancelOnFail is set) — so with
+//     CancelOnFail=false the fan-out sits terminal while siblings still run.
+//   - fanOutParentGuard keys on the candidate's OWN fan_out's parent, which is the
+//     top-level root here, and that root is terminal.
+//
+// Removing parentChildGuard therefore deletes a failed mid-tree parent out from
+// under a still-running child, orphaning the sub-tree: the child's eventual
+// completeFanOut resolves fo.ParentJobID to a row that no longer exists. The
+// premise assertions below fail loudly if a future seed change makes one of the
+// other guards cover this case, which would silently turn the test vacuous.
+func TestDeleteTerminalJobsOlderThan_ParentChildGuardProtectsAMidTreeParent(t *testing.T) {
+	s := newTestStorage(t)
+	ctx := context.Background()
+	old := time.Now().Add(-2 * time.Hour).UTC()
+
+	rootID, midID, upperFanOut, lowerFanOut := "pcg-root", "pcg-mid", "pcg-upper-fo", "pcg-lower-fo"
+
+	// Top-level root: terminal, so fanOutParentGuard cannot protect the mid parent.
+	seedRetentionJob(t, s, rootID, core.StatusCompleted, old)
+	require.NoError(t, s.CreateFanOut(ctx, &core.FanOut{
+		ID:          retentionUUID(upperFanOut),
+		ParentJobID: retentionUUID(rootID),
+		TotalCount:  1,
+		Status:      core.FanOutCompleted,
+	}))
+	// The mid-tree parent: failed and old, so it IS a retention candidate.
+	seedRetentionWorkflowJob(t, s, midID, core.StatusFailed, old, &rootID, &rootID, &upperFanOut)
+	// Its fan-out already went terminal (CancelOnFail=false), so the
+	// pending-fan-out guard cannot protect it.
+	require.NoError(t, s.CreateFanOut(ctx, &core.FanOut{
+		ID:          retentionUUID(lowerFanOut),
+		ParentJobID: retentionUUID(midID),
+		TotalCount:  2,
+		Status:      core.FanOutFailed,
+	}))
+	// A sibling that was never cancelled and is still executing.
+	seedRetentionWorkflowJob(t, s, "pcg-live-child", core.StatusRunning, old, &midID, &rootID, &lowerFanOut)
+
+	// Premise 1: no row carries root_job_id = the mid parent, so rootChildGuard is inert.
+	var byRoot int64
+	require.NoError(t, s.db.Model(&core.Job{}).
+		Where("root_job_id = ?", retentionUUID(midID)).Count(&byRoot).Error)
+	require.Equal(t, int64(0), byRoot,
+		"premise broken: a descendant now points root_job_id at the mid parent, so rootChildGuard would cover this and the test can no longer isolate parentChildGuard")
+
+	// Premise 2: the mid parent's fan-out is not pending, so that guard is inert.
+	var pendingFanOuts int64
+	require.NoError(t, s.db.Model(&core.FanOut{}).
+		Where("parent_job_id = ? AND status = ?", retentionUUID(midID), core.FanOutPending).
+		Count(&pendingFanOuts).Error)
+	require.Equal(t, int64(0), pendingFanOuts,
+		"premise broken: the mid parent's fan-out is pending again, so the pending-fan-out guard would cover this")
+
+	// Premise 3: the mid parent's own fan-out has a terminal parent, so fanOutParentGuard is inert.
+	var liveOwningParents int64
+	require.NoError(t, s.db.Model(&core.Job{}).
+		Joins("JOIN fan_outs f ON f.parent_job_id = jobs.id").
+		Where("f.id = ? AND jobs.status NOT IN ?", retentionUUID(upperFanOut),
+			[]core.JobStatus{core.StatusCompleted, core.StatusFailed, core.StatusCancelled}).
+		Count(&liveOwningParents).Error)
+	require.Equal(t, int64(0), liveOwningParents,
+		"premise broken: the mid parent's owning fan-out now has a non-terminal parent, so fanOutParentGuard would cover this")
+
+	deleted, err := s.DeleteTerminalJobsOlderThan(ctx, core.StatusFailed, time.Hour, 100)
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), deleted, "a mid-tree parent with a live child must not be deleted")
+	assertRetentionExists(t, s, midID)
+	assertRetentionExists(t, s, "pcg-live-child")
+}
+
 func TestDeleteTerminalJobsOlderThan_S04RegressionNoFanOutLeakOrStrandedLiveDescendants(t *testing.T) {
 	s := newTestStorage(t)
 	ctx := context.Background()
@@ -353,12 +431,21 @@ func TestCleanAbandonedFanOuts_Guards(t *testing.T) {
 	assertRetentionFanOutExists(t, s, "guard-completed-fanout")
 }
 
+// TestDeleteTerminalJobsOlderThan_DeletesDanglingUniqueLock pins that a job's
+// unique_locks row is collected WITH the job, so the table cannot grow unbounded.
+//
+// The fixture deliberately expires the window first. A LIVE window now pins its
+// job row instead (IdempotencyKey/UniqueFor are documented to keep deduplicating
+// until their own TTL, which is routinely far longer than the retention horizon),
+// and that case is pinned by TestRetention_KeepsJobWhileIdempotencyWindowLive.
+// This test previously left the window live and asserted retention deleted it,
+// which is the behaviour that let a replayed request charge a card twice.
 func TestDeleteTerminalJobsOlderThan_DeletesDanglingUniqueLock(t *testing.T) {
 	s := newTestStorage(t)
 	ctx := context.Background()
 	scope := "4444444444444444444444444444444444444444444444444444444444444444"
 
-	// Enqueue a job under a live unique lock, then drive it terminal and age it
+	// Enqueue a job under a unique lock, then drive it terminal and age it
 	// past the retention cutoff so it gets collected.
 	job := &core.Job{ID: core.NewID(), Type: "work", Queue: "default", Args: []byte(`{"n":1}`)}
 	jobID, err := s.EnqueueWithUniqueLock(ctx, job, scope, time.Hour)
@@ -369,6 +456,10 @@ func TestDeleteTerminalJobsOlderThan_DeletesDanglingUniqueLock(t *testing.T) {
 	require.NoError(t, s.db.WithContext(ctx).Model(&core.Job{}).
 		Where("id = ?", job.ID).
 		Updates(map[string]any{"status": core.StatusCompleted, "completed_at": old}).Error)
+	// The dedup window has lapsed, so it no longer pins the job row.
+	require.NoError(t, s.db.WithContext(ctx).Model(&core.UniqueLock{}).
+		Where("job_id = ?", job.ID).
+		Update("expires_at", time.Now().Add(-time.Minute).UTC()).Error)
 
 	var lockBefore int64
 	require.NoError(t, s.db.WithContext(ctx).Model(&core.UniqueLock{}).

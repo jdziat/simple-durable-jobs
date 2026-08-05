@@ -30,3 +30,16 @@ type UniqueLockEnqueuer interface {
 type UniqueLockSweeper interface {
 	DeleteExpiredUniqueLocks(ctx context.Context, limit int) (int64, error)
 }
+
+// SignalWaitMarker is an optional storage capability for recording the signal
+// name a job suspended on. Implementations set it atomically with the
+// running->waiting transition so the signal-resume poll can wake the job only for
+// the signal it is actually parked on.
+//
+// It is a separate capability rather than a Storage method so adding it is not a
+// breaking change for third-party implementations. A Storage that does not
+// implement it keeps the previous behaviour: nothing is recorded, and the poll
+// wakes the job on any pending signal.
+type SignalWaitMarker interface {
+	MarkWaitingForSignal(ctx context.Context, jobID UUID, workerID, signalName string) error
+}

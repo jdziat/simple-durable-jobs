@@ -435,15 +435,66 @@ Usage:
 	return exitOK
 }
 
+// runDLQRequeueBulk requeues every dead-lettered job matching the filter that
+// CAN be requeued, and reports the ones that cannot.
+//
+// Two rules make it finish the run instead of wedging on one row:
+//
+//   - A fan-out sub-job is rejected by Requeue (ErrCannotRequeueSubJob) BY
+//     DESIGN — replay goes through the parent. That is a property of one row, not
+//     a failure of the command, so it is counted and skipped. Aborting on it made
+//     the whole subcommand permanently useless: ListDeadLettered orders by
+//     (dead_lettered_at DESC, id DESC), so the same sub-job was hit at the same
+//     position on every re-run and no job sorting after it could EVER be bulk
+//     requeued.
+//   - Rows that stay dead-lettered advance the page offset. Requeued rows leave
+//     the result set, so paging can only make progress on the ones that do not —
+//     without this a full page of unrequeueable rows re-reads the same page
+//     forever.
+//
+// The summary line is printed on EVERY exit, including the error exit: a run that
+// requeued 900 of 1000 jobs and then hit a storage error used to print nothing at
+// all, so the operator could not tell what had already happened.
+// countStillDeadLettered reports how many of the given jobs are still in the
+// dead-letter result set, which is what the paging cursor must step over.
+func countStillDeadLettered(ctx context.Context, store *jobs.GormStorage, page []*jobs.Job) (int, error) {
+	if len(page) == 0 {
+		return 0, nil
+	}
+	ids := make([]jobs.UUID, 0, len(page))
+	for _, job := range page {
+		ids = append(ids, job.ID)
+	}
+	var n int64
+	if err := store.DB().WithContext(ctx).Model(&jobs.Job{}).
+		Where("id IN ?", ids).
+		Where("dead_lettered_at IS NOT NULL").
+		Count(&n).Error; err != nil {
+		return 0, err
+	}
+	return int(n), nil
+}
+
 func (a app) runDLQRequeueBulk(ctx context.Context, store *jobs.GormStorage, filter jobs.DeadLetterFilter) int {
 	const batchLimit = 1000
 	filter.Limit = batchLimit
 	filter.Offset = 0
 
-	var requeued int
+	var requeued, skippedSubJobs, skippedOther int
+	report := func() {
+		_, _ = fmt.Fprintf(a.stdout, "requeued %d jobs\n", requeued)
+		if skippedSubJobs > 0 {
+			_, _ = fmt.Fprintf(a.stdout, "skipped %d fan-out sub-jobs (requeue their parent instead)\n", skippedSubJobs)
+		}
+		if skippedOther > 0 {
+			_, _ = fmt.Fprintf(a.stdout, "skipped %d jobs that could not be requeued (no longer failed or cancelled, or already gone)\n", skippedOther)
+		}
+	}
+
 	for {
 		dead, err := store.ListDeadLettered(ctx, filter)
 		if err != nil {
+			report()
 			return a.fail("could not list dead-lettered jobs for bulk requeue; verify migrations have run and filters are valid: %s", userError(err))
 		}
 		if len(dead) == 0 {
@@ -451,19 +502,42 @@ func (a app) runDLQRequeueBulk(ctx context.Context, store *jobs.GormStorage, fil
 		}
 		for _, job := range dead {
 			ok, err := store.Requeue(ctx, job.ID)
-			if err != nil {
-				return a.fail("could not requeue job %q; verify the job is not a fan-out sub-job and storage is healthy: %s", job.ID, userError(err))
-			}
-			if ok {
+			switch {
+			case errors.Is(err, jobs.ErrCannotRequeueSubJob):
+				skippedSubJobs++
+			case err != nil:
+				report()
+				return a.fail("could not requeue job %q; verify storage is healthy: %s", job.ID, userError(err))
+			case ok:
 				requeued++
+			default:
+				skippedOther++
 			}
+		}
+		// Advance the cursor by exactly the rows from this page that are STILL in
+		// the dead-letter set, because those are the rows the next page will hand
+		// back. Deriving that from the Requeue outcome is not possible: it returns
+		// (false, nil) BOTH for a row that is gone and for a row that is present but
+		// not in a requeuable state, and those need opposite treatment.
+		//
+		// Counting every non-requeued row (the original) over-advances past rows
+		// that no longer exist, silently skipping exactly that many genuine
+		// dead-lettered jobs on the next page — with exit 0 and a success message.
+		// Counting none of them under-advances and re-reads the same page forever
+		// whenever a still-present row cannot be requeued. Both are wrong, so ask
+		// the database instead of inferring.
+		remaining, err := countStillDeadLettered(ctx, store, dead)
+		if err != nil {
+			report()
+			return a.fail("could not confirm dead-letter progress: %s", userError(err))
 		}
 		if len(dead) < batchLimit {
 			break
 		}
+		filter.Offset += remaining
 	}
 
-	_, _ = fmt.Fprintf(a.stdout, "requeued %d jobs\n", requeued)
+	report()
 	return exitOK
 }
 

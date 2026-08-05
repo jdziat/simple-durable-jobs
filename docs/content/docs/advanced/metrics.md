@@ -75,7 +75,7 @@ Without `WithMeterProvider`, instrumentation uses `otel.GetMeterProvider()`.
 | `jobs.dead_letter.depth` | `Int64ObservableGauge` | `{job}` | `queue` | Current dead-lettered job depth by queue. |
 | `jobs.queue.saturation` | `Float64ObservableGauge` | `1` | `queue`, `worker.id` | Worker-local running jobs divided by configured capacity by queue. |
 | `jobs.leases.reclaimed` | `Int64Counter` | `{job}` | `reason=stale_lock\|ownership_audit` | Job leases reclaimed from a presumed-dead owner or observed reclaimed by a peer. |
-| `jobs.dequeue.released` | `Int64ObservableCounter` | `{job}` | `worker.id`, `reason=queue_cap\|queue_rate\|concurrency\|fleet_rate\|fleet_rate_cached\|shutdown` | Dequeued jobs released back to pending without running, by reason. |
+| `jobs.dequeue.released` | `Int64ObservableCounter` | `{job}` | `worker.id`, `reason=queue_cap\|queue_rate\|concurrency\|fleet_rate\|fleet_rate_cached\|shutdown\|paused` | Dequeued jobs released back to pending without running, by reason. `reason=paused` is the pause-race series: a pause landed during the dequeue round-trip and the claimed batch was released. Every scrape of an instrumented worker carries all seven reasons, including the ones sitting at zero, so a recording rule that enumerates reasons must list all of them. |
 | `jobs.dequeue.suppressed_ticks` | `Int64ObservableCounter` | `{tick}` | `worker.id`, `reason=fleet_rate_saturated` | Poll ticks the rate-saturation throttle skipped claiming jobs. |
 | `jobs.dequeue.rate_saturation_cache_size` | `Int64ObservableGauge` | `{bucket}` | `worker.id` | Saturated rate-limit buckets cached by the per-key cooldown; at the cap, new buckets fall back to the DB rate transaction. |
 

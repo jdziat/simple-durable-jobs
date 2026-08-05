@@ -108,7 +108,7 @@ func TestWorkerRateLimitPerKeyAdmissionReleasesDeniedJob(t *testing.T) {
 	)
 	w.config.WorkerID = "worker-1"
 
-	jobsChan := make(chan *core.Job, 1)
+	jobsChan := make(chan dispatchedJob, 1)
 	w.dispatchDequeuedJobs(context.Background(), jobsChan, []*core.Job{job})
 
 	assert.Empty(t, jobsChan)
@@ -133,11 +133,11 @@ func TestWorkerQueueRateLimitDenialDoesNotConsumeFleetRateLimit(t *testing.T) {
 	)
 	w.config.WorkerID = "worker-1"
 
-	jobsChan := make(chan *core.Job, 2)
+	jobsChan := make(chan dispatchedJob, 2)
 	w.dispatchDequeuedJobs(context.Background(), jobsChan, []*core.Job{job1, job2})
 
 	require.Len(t, jobsChan, 1)
-	assert.Equal(t, core.UUID("job-1"), (<-jobsChan).ID)
+	assert.Equal(t, core.UUID("job-1"), (<-jobsChan).job.ID)
 	assert.Equal(t, []core.UUID{core.UUID("job-2")}, store.getReleasedJobIDs())
 	assert.LessOrEqual(t, len(store.seenNames), 1)
 	assert.Equal(t, []string{"fleet"}, store.seenNames)
@@ -158,14 +158,14 @@ func TestWorkerQueueRateLimitRefundsTokenAfterFleetDeny(t *testing.T) {
 	)
 	w.config.WorkerID = "worker-1"
 
-	jobsChan := make(chan *core.Job, 1)
+	jobsChan := make(chan dispatchedJob, 1)
 	w.dispatchDequeuedJobs(context.Background(), jobsChan, []*core.Job{job1})
 	require.Empty(t, jobsChan)
 	assert.Equal(t, []core.UUID{core.UUID("job-1")}, store.getReleasedJobIDs())
 
 	w.dispatchDequeuedJobs(context.Background(), jobsChan, []*core.Job{job2})
 	require.Len(t, jobsChan, 1, "refunded queue token should admit the next job immediately")
-	assert.Equal(t, core.UUID("job-2"), (<-jobsChan).ID)
+	assert.Equal(t, core.UUID("job-2"), (<-jobsChan).job.ID)
 	// The first fleet check is denied and does not increment the fixed-window
 	// counter; only the successfully dispatched second job consumes a fleet unit.
 	assert.Equal(t, []string{"fleet"}, store.consumedNames)
@@ -186,11 +186,11 @@ func TestWorkerConcurrencySlotDenialDoesNotConsumeFleetRateLimit(t *testing.T) {
 	)
 	w.config.WorkerID = "worker-1"
 
-	jobsChan := make(chan *core.Job, 2)
+	jobsChan := make(chan dispatchedJob, 2)
 	w.dispatchDequeuedJobs(context.Background(), jobsChan, []*core.Job{job1, job2})
 
 	require.Len(t, jobsChan, 1)
-	assert.Equal(t, core.UUID("job-1"), (<-jobsChan).ID)
+	assert.Equal(t, core.UUID("job-1"), (<-jobsChan).job.ID)
 	assert.Equal(t, []core.UUID{core.UUID("job-2")}, store.getReleasedJobIDs())
 	assert.Equal(t, []string{"fleet"}, store.seenNames, "fleet rate is the last gate, so slot-denied jobs are never checked")
 	assert.Equal(t, []string{"fleet"}, store.consumedNames, "only the dispatched job consumes a fleet unit")
@@ -224,11 +224,11 @@ func TestWorkerRateLimitUnsupportedStorageIsNoop(t *testing.T) {
 	)
 	w.config.WorkerID = "worker-1"
 
-	jobsChan := make(chan *core.Job, 1)
+	jobsChan := make(chan dispatchedJob, 1)
 	w.dispatchDequeuedJobs(context.Background(), jobsChan, []*core.Job{job})
 
 	require.Len(t, jobsChan, 1)
-	assert.Equal(t, core.UUID("job-1"), (<-jobsChan).ID)
+	assert.Equal(t, core.UUID("job-1"), (<-jobsChan).job.ID)
 	assert.Empty(t, store.getReleasedJobIDs())
 }
 
@@ -249,7 +249,7 @@ func TestWorkerRateLimitThrottleDoesNotBurnAttemptsOrFailHooks(t *testing.T) {
 	)
 	w.config.WorkerID = "worker-1"
 
-	jobsChan := make(chan *core.Job, 1)
+	jobsChan := make(chan dispatchedJob, 1)
 	for i := 0; i < 3; i++ {
 		job.Status = core.StatusRunning
 		job.LockedBy = "worker-1"
@@ -265,9 +265,9 @@ func TestWorkerRateLimitThrottleDoesNotBurnAttemptsOrFailHooks(t *testing.T) {
 	w.dispatchDequeuedJobs(context.Background(), jobsChan, []*core.Job{job})
 	require.Len(t, jobsChan, 1)
 	admitted := <-jobsChan
-	assert.Equal(t, 1, admitted.Attempt)
+	assert.Equal(t, 1, admitted.job.Attempt)
 
-	w.processJob(context.Background(), admitted)
+	w.processJob(context.Background(), admitted.job)
 	assert.Equal(t, 0, failures)
 	assert.Len(t, store.getReleasedJobIDs(), 3)
 }

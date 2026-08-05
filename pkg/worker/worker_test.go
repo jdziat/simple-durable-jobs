@@ -59,6 +59,7 @@ type mockStorage struct {
 	incrementFailedFunc    func(ctx context.Context, fanOutID core.UUID) (*core.FanOut, error)
 	updateFanOutStatusFunc func(ctx context.Context, fanOutID core.UUID, status core.FanOutStatus) (bool, error)
 	resumeJobFunc          func(ctx context.Context, jobID core.UUID) (bool, error)
+	getJobFunc             func(ctx context.Context, jobID core.UUID) (*core.Job, error)
 	cancelSubJobsFunc      func(ctx context.Context, fanOutID core.UUID) ([]core.UUID, error)
 	findOrphanedFunc       func(jobIDs []core.UUID) ([]core.UUID, error)
 	completablePendingFunc func(ctx context.Context, olderThan time.Time) ([]*core.FanOut, error)
@@ -208,7 +209,12 @@ func (m *mockStorage) FindOrphanedJobs(_ context.Context, jobIDs []core.UUID, _ 
 	return nil, nil
 }
 
-func (m *mockStorage) GetJob(_ context.Context, _ core.UUID) (*core.Job, error) { return nil, nil }
+func (m *mockStorage) GetJob(ctx context.Context, jobID core.UUID) (*core.Job, error) {
+	if m.getJobFunc != nil {
+		return m.getJobFunc(ctx, jobID)
+	}
+	return nil, nil
+}
 
 func (m *mockStorage) GetJobsByStatus(_ context.Context, _ core.JobStatus, _ int) ([]*core.Job, error) {
 	return nil, nil
@@ -1163,7 +1169,7 @@ func TestWorker_OwnershipAudit_EmitsJobReclaimed(t *testing.T) {
 	// Seed a running job so the audit snapshot is non-empty. Safe: no jobs are
 	// dequeued in this test, so processJob never touches the map.
 	w.runningJobsMu.Lock()
-	w.runningJobs["job-9"] = func() {}
+	w.runningJobs["job-9"] = runningJobEntry{cancel: func() {}}
 	w.runningJobsMu.Unlock()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1248,10 +1254,10 @@ func TestWorker_AggressivePauseCancelsRegisteredJob(t *testing.T) {
 
 	// Simulate a running job by injecting a cancel func directly.
 	w.runningJobsMu.Lock()
-	w.runningJobs["job-1"] = func() {
+	w.runningJobs["job-1"] = runningJobEntry{cancel: func() {
 		cancelFn()
 		close(cancelled)
-	}
+	}}
 	w.runningJobsMu.Unlock()
 
 	w.Pause(core.PauseModeAggressive)
@@ -1285,10 +1291,10 @@ func TestWorker_CancelJob_KnownIDReturnsTrueAndCancels(t *testing.T) {
 	ctx, cancelFn := context.WithCancel(context.Background())
 
 	w.runningJobsMu.Lock()
-	w.runningJobs["job-abc"] = func() {
+	w.runningJobs["job-abc"] = runningJobEntry{cancel: func() {
 		cancelFn()
 		close(cancelled)
-	}
+	}}
 	w.runningJobsMu.Unlock()
 
 	found := w.CancelJob("job-abc")
@@ -1317,8 +1323,8 @@ func TestWorker_RunningJobCount_ReflectsRegisteredJobs(t *testing.T) {
 	w := newTestWorker(t)
 
 	w.runningJobsMu.Lock()
-	w.runningJobs["j1"] = func() {}
-	w.runningJobs["j2"] = func() {}
+	w.runningJobs["j1"] = runningJobEntry{cancel: func() {}}
+	w.runningJobs["j2"] = runningJobEntry{cancel: func() {}}
 	w.runningJobsMu.Unlock()
 
 	assert.Equal(t, 2, w.RunningJobCount())
@@ -1351,7 +1357,7 @@ func TestWorker_WaitForPause_TimeoutWithRunningJobs(t *testing.T) {
 
 	// Inject a job that never finishes.
 	w.runningJobsMu.Lock()
-	w.runningJobs["stuck-job"] = func() {}
+	w.runningJobs["stuck-job"] = runningJobEntry{cancel: func() {}}
 	w.runningJobsMu.Unlock()
 
 	w.Pause(core.PauseModeGraceful)
@@ -1372,7 +1378,7 @@ func TestWorker_WaitForPause_CompletesWhenJobFinishes(t *testing.T) {
 
 	// Register a "running" job then remove it after a short delay.
 	w.runningJobsMu.Lock()
-	w.runningJobs["finishing-job"] = func() {}
+	w.runningJobs["finishing-job"] = runningJobEntry{cancel: func() {}}
 	w.runningJobsMu.Unlock()
 
 	go func() {
@@ -1396,14 +1402,14 @@ func TestWorker_TrackQueueJob_IncrementsCounter(t *testing.T) {
 	q := queue.New(mock)
 	w := NewWorker(q, WorkerQueue("emails", Concurrency(5)))
 
-	w.trackQueueJob("job-1", "emails")
+	w.trackQueueJob(1, "emails")
 
 	counter, ok := w.queueRunning["emails"]
 	require.True(t, ok)
 	assert.Equal(t, int32(1), counter.Load())
 
 	w.queueJobIDMu.Lock()
-	qname, recorded := w.queueJobID["job-1"]
+	qname, recorded := w.queueJobID[1]
 	w.queueJobIDMu.Unlock()
 
 	assert.True(t, recorded)
@@ -1415,15 +1421,15 @@ func TestWorker_UntrackQueueJob_DecrementsCounter(t *testing.T) {
 	q := queue.New(mock)
 	w := NewWorker(q, WorkerQueue("emails", Concurrency(5)))
 
-	w.trackQueueJob("job-1", "emails")
-	w.untrackQueueJob("job-1")
+	w.trackQueueJob(1, "emails")
+	w.untrackQueueJob(1)
 
 	counter, ok := w.queueRunning["emails"]
 	require.True(t, ok)
 	assert.Equal(t, int32(0), counter.Load())
 
 	w.queueJobIDMu.Lock()
-	_, still := w.queueJobID["job-1"]
+	_, still := w.queueJobID[1]
 	w.queueJobIDMu.Unlock()
 
 	assert.False(t, still, "job should be removed from queueJobID map")
@@ -1435,7 +1441,7 @@ func TestWorker_UntrackQueueJob_UnknownJobIsNoop(t *testing.T) {
 	w := NewWorker(q, WorkerQueue("emails", Concurrency(5)))
 
 	// Should not panic or decrement below zero.
-	w.untrackQueueJob("nonexistent-job")
+	w.untrackQueueJob(99999)
 
 	counter := w.queueRunning["emails"]
 	assert.Equal(t, int32(0), counter.Load())
@@ -1448,14 +1454,14 @@ func TestWorker_TrackUntrackMultipleJobs(t *testing.T) {
 
 	const n = 5
 	for i := range n {
-		w.trackQueueJob(core.UUID(string(rune('a'+i))), "default")
+		w.trackQueueJob(uint64(i)+1, "default")
 	}
 
 	counter := w.queueRunning["default"]
 	assert.Equal(t, int32(n), counter.Load())
 
 	for i := range n {
-		w.untrackQueueJob(core.UUID(string(rune('a' + i))))
+		w.untrackQueueJob(uint64(i) + 1)
 	}
 	assert.Equal(t, int32(0), counter.Load())
 }
@@ -1487,8 +1493,11 @@ func TestWorker_QueuesWithCapacity_FullQueueExcluded(t *testing.T) {
 	)
 
 	// Fill the "full" queue to its limit.
-	w.trackQueueJob("j1", "full")
-	w.trackQueueJob("j2", "full")
+	// DISTINCT tokens: two runs under one token is an ordering dispatch cannot
+	// produce, and it survives here only because the assertion reads the atomic
+	// counter rather than the token-keyed map.
+	w.trackQueueJob(1, "full")
+	w.trackQueueJob(2, "full")
 
 	available := w.queuesWithCapacity()
 
@@ -1500,7 +1509,7 @@ func TestWorker_QueuesWithCapacity_AllFullReturnsEmpty(t *testing.T) {
 	q := queue.New(mock)
 	w := NewWorker(q, WorkerQueue("only", Concurrency(1)))
 
-	w.trackQueueJob("j1", "only")
+	w.trackQueueJob(1, "only")
 
 	available := w.queuesWithCapacity()
 
@@ -1512,7 +1521,7 @@ func TestWorker_QueuesWithCapacity_PartiallyFilled(t *testing.T) {
 	q := queue.New(mock)
 	w := NewWorker(q, WorkerQueue("q1", Concurrency(3)))
 
-	w.trackQueueJob("j1", "q1")
+	w.trackQueueJob(1, "q1")
 	// 1 of 3 slots used — queue still has capacity.
 
 	available := w.queuesWithCapacity()
@@ -2226,7 +2235,7 @@ func TestWorker_ShutdownReleasesDequeuedJobInsteadOfDropping(t *testing.T) {
 	assert.Equal(t, []core.UUID{job.ID}, mock.getReleasedJobIDs())
 	assert.Equal(t, int32(0), w.queueRunning["default"].Load())
 	w.queueJobIDMu.Lock()
-	_, tracked := w.queueJobID[job.ID]
+	_, tracked := w.queueJobID[1]
 	w.queueJobIDMu.Unlock()
 	assert.False(t, tracked, "shutdown release must untrack the per-queue job slot")
 }
@@ -3147,7 +3156,7 @@ func TestWorker_RunHeartbeat_ExitsOnContextCancel(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		w.runHeartbeat(ctx, job)
+		w.runHeartbeat(ctx, job, 0)
 	}()
 
 	cancel()
@@ -3177,7 +3186,7 @@ func TestWorker_RunHeartbeat_StopsOnAggressivePause(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		w.runHeartbeat(ctx, job)
+		w.runHeartbeat(ctx, job, 0)
 	}()
 
 	w.Pause(core.PauseModeAggressive)
@@ -4314,7 +4323,7 @@ func TestRunHeartbeat_AbandonsOrphanedJob(t *testing.T) {
 	jobCtx, jobCancel := context.WithCancel(context.Background())
 	defer jobCancel()
 	w.runningJobsMu.Lock()
-	w.runningJobs["test-job-id"] = jobCancel
+	w.runningJobs["test-job-id"] = runningJobEntry{cancel: jobCancel}
 	w.runningJobsMu.Unlock()
 
 	// Drive the heartbeat loop until orphan threshold trips.
@@ -4322,7 +4331,7 @@ func TestRunHeartbeat_AbandonsOrphanedJob(t *testing.T) {
 	defer hbCancel()
 	done := make(chan struct{})
 	go func() {
-		w.runHeartbeat(hbCtx, &core.Job{ID: "test-job-id"})
+		w.runHeartbeat(hbCtx, &core.Job{ID: "test-job-id"}, 0)
 		close(done)
 	}()
 
@@ -4370,12 +4379,12 @@ func TestRunHeartbeat_TransientErrorDoesNotAbandon(t *testing.T) {
 	jobCtx, jobCancel := context.WithCancel(context.Background())
 	defer jobCancel()
 	w.runningJobsMu.Lock()
-	w.runningJobs["transient-job"] = jobCancel
+	w.runningJobs["transient-job"] = runningJobEntry{cancel: jobCancel}
 	w.runningJobsMu.Unlock()
 
 	hbCtx, hbCancel := context.WithCancel(context.Background())
 	defer hbCancel()
-	go w.runHeartbeat(hbCtx, &core.Job{ID: "transient-job"})
+	go w.runHeartbeat(hbCtx, &core.Job{ID: "transient-job"}, 0)
 
 	// Let the heartbeat tick several times.
 	time.Sleep(150 * time.Millisecond)
@@ -4422,14 +4431,14 @@ func TestRunHeartbeat_SuccessResetsCounter(t *testing.T) {
 	jobCtx, jobCancel := context.WithCancel(context.Background())
 	defer jobCancel()
 	w.runningJobsMu.Lock()
-	w.runningJobs["blip-job"] = jobCancel
+	w.runningJobs["blip-job"] = runningJobEntry{cancel: jobCancel}
 	w.runningJobsMu.Unlock()
 
 	hbCtx, hbCancel := context.WithCancel(context.Background())
 	defer hbCancel()
 	done := make(chan struct{})
 	go func() {
-		w.runHeartbeat(hbCtx, &core.Job{ID: "blip-job"})
+		w.runHeartbeat(hbCtx, &core.Job{ID: "blip-job"}, 0)
 		close(done)
 	}()
 
@@ -4475,7 +4484,7 @@ func TestCompleteFanOut_CancelsLocalSubJobHandlers(t *testing.T) {
 	for _, id := range []string{"sub-a", "sub-b"} {
 		id := id
 		w.runningJobsMu.Lock()
-		w.runningJobs[core.UUID(id)] = func() { cancelCalls[string(id)]++ }
+		w.runningJobs[core.UUID(id)] = runningJobEntry{cancel: func() { cancelCalls[string(id)]++ }}
 		w.runningJobsMu.Unlock()
 	}
 	// sub-c is intentionally NOT in this worker's runningJobs — it's
@@ -4516,8 +4525,8 @@ func TestReapStaleLocks_CancelsLocalHandlersOfReleasedJobs(t *testing.T) {
 	// stored func) and read from the test goroutine, so they must be atomic.
 	var orphan1, orphan2 atomic.Int32
 	w.runningJobsMu.Lock()
-	w.runningJobs["orphan-1"] = func() { orphan1.Add(1) }
-	w.runningJobs["orphan-2"] = func() { orphan2.Add(1) }
+	w.runningJobs["orphan-1"] = runningJobEntry{cancel: func() { orphan1.Add(1) }}
+	w.runningJobs["orphan-2"] = runningJobEntry{cancel: func() { orphan2.Add(1) }}
 	w.runningJobsMu.Unlock()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -4566,8 +4575,8 @@ func TestOwnershipAudit_CancelsOrphanedLocalHandlers(t *testing.T) {
 	// stored func) and read from the test goroutine, so they must be atomic.
 	var mineCancelled, stolenCancelled atomic.Int32
 	w.runningJobsMu.Lock()
-	w.runningJobs["job-mine"] = func() { mineCancelled.Add(1) }
-	w.runningJobs["job-stolen"] = func() { stolenCancelled.Add(1) }
+	w.runningJobs["job-mine"] = runningJobEntry{cancel: func() { mineCancelled.Add(1) }}
+	w.runningJobs["job-stolen"] = runningJobEntry{cancel: func() { stolenCancelled.Add(1) }}
 	w.runningJobsMu.Unlock()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -4616,7 +4625,7 @@ func TestOwnershipAudit_DoesNotCancelSelfSuspendedJob(t *testing.T) {
 	// its own parent to wait on a fan-out (the real production transition).
 	var cancelled atomic.Int32
 	w.runningJobsMu.Lock()
-	w.runningJobs[job.ID] = func() { cancelled.Add(1) }
+	w.runningJobs[job.ID] = runningJobEntry{cancel: func() { cancelled.Add(1) }}
 	w.runningJobsMu.Unlock()
 	require.NoError(t, store.MarkWaiting(ctx, job.ID, workerID))
 
@@ -4652,8 +4661,8 @@ func TestOwnershipAudit_NoOpWhenNoOrphans(t *testing.T) {
 
 	cancelled := 0
 	w.runningJobsMu.Lock()
-	w.runningJobs["healthy-1"] = func() { cancelled++ }
-	w.runningJobs["healthy-2"] = func() { cancelled++ }
+	w.runningJobs["healthy-1"] = runningJobEntry{cancel: func() { cancelled++ }}
+	w.runningJobs["healthy-2"] = runningJobEntry{cancel: func() { cancelled++ }}
 	w.runningJobsMu.Unlock()
 
 	ctx, cancel := context.WithCancel(context.Background())

@@ -114,12 +114,12 @@ func TestWorkerConcurrencyCapPerKeyAdmission(t *testing.T) {
 	)
 	w.config.WorkerID = "worker-1"
 
-	jobsChan := make(chan *core.Job, len(jobs))
+	jobsChan := make(chan dispatchedJob, len(jobs))
 	w.dispatchDequeuedJobs(context.Background(), jobsChan, jobs)
 
 	delivered := make([]string, 0, len(jobsChan))
 	for len(jobsChan) > 0 {
-		delivered = append(delivered, string((<-jobsChan).ID))
+		delivered = append(delivered, string((<-jobsChan).job.ID))
 	}
 	assert.ElementsMatch(t, []string{"job-a1", "job-a2", "job-b1"}, delivered)
 	assert.ElementsMatch(t, []core.UUID{core.UUID("job-a3")}, store.getReleasedJobIDs())
@@ -148,7 +148,7 @@ func TestWorkerConcurrencyCapReleasesOnCompletion(t *testing.T) {
 	)
 	w.config.WorkerID = "worker-1"
 
-	require.True(t, w.tryAcquireConcurrencySlots(context.Background(), job))
+	require.True(t, w.tryAcquireConcurrencySlots(context.Background(), job, 1))
 	assert.Equal(t, 1, store.slotCount("customer:a"))
 
 	job.Args = []byte(`{}`)
@@ -183,7 +183,7 @@ func TestWorkerConcurrencyCapPanickingKeyBouncesAndReleasesSlots(t *testing.T) {
 	)
 	w.config.WorkerID = "worker-1"
 
-	jobsChan := make(chan *core.Job, 1)
+	jobsChan := make(chan dispatchedJob, 1)
 	assert.NotPanics(t, func() {
 		dispatched, released := w.dispatchDequeuedJobs(context.Background(), jobsChan, []*core.Job{job})
 		assert.Equal(t, 0, dispatched)
@@ -216,14 +216,24 @@ func TestRenewConcurrencySlots(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, ok)
 	w.slotJobIDMu.Lock()
-	w.slotJobID["job-1"] = []string{"customer:a"}
+	w.slotJobID[1] = slotHold{jobID: "job-1", names: []string{"customer:a"}}
 	w.slotJobIDMu.Unlock()
 
-	w.renewConcurrencySlots(context.Background(), "job-1")
+	w.renewConcurrencySlots(context.Background(), "job-1", 1)
 	assert.Equal(t, []string{"customer:a:job-1"}, store.renewals(), "the held slot must be renewed exactly once")
 	assert.Equal(t, 1, store.slotCount("customer:a"), "renewal must not drop or duplicate the slot")
 
-	// A job holding no slots is a no-op (no renewal attempted).
-	w.renewConcurrencySlots(context.Background(), "job-unknown")
+	// A RUN holding no slots is a no-op (no renewal attempted). The map is keyed
+	// by run token, so "holds nothing" means an unknown token — reusing token 1
+	// with a different job id would renew the slots token 1 legitimately holds.
+	w.renewConcurrencySlots(context.Background(), "job-unknown", 99999)
 	assert.Equal(t, []string{"customer:a:job-1"}, store.renewals())
+}
+
+// TryAcquireConcurrencySlotOK is a test-only seeding helper: it inserts a held
+// slot row directly, without going through the admission path, so a test can set
+// up "a previous run already holds this".
+func (s *capMockStorage) TryAcquireConcurrencySlotOK(slotName string, jobID core.UUID, workerID string) bool {
+	ok, err := s.TryAcquireConcurrencySlot(context.Background(), slotName, jobID, workerID, 1, time.Minute)
+	return ok && err == nil
 }

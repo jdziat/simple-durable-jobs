@@ -85,6 +85,63 @@ func TestErrorTextCodecRoundTrip(t *testing.T) {
 	}
 }
 
+// TestErrorTextCodecEncryptsFailTerminalWithResult covers FailTerminalWithResult's
+// own pair of error-text writes (last_error and the dead_letter_reason suffix).
+// It builds its updates map independently of Fail, so it can lose the codec on its
+// own; nothing else in the module reads those two columns RAW on this path, so a
+// regression storing cleartext would ship green. Round-tripping through GetJob
+// cannot catch it either — markerXORCodec.Decode passes untagged bytes through —
+// hence the assertions are on the at-rest bytes.
+func TestErrorTextCodecEncryptsFailTerminalWithResult(t *testing.T) {
+	const errMsg = "terminal password=secret detonated"
+	// "detonated" survives sanitization (password=secret is redacted), so its
+	// absence from a raw column is evidence of encryption, not of redaction.
+	sanitized := security.SanitizeErrorMessage(errMsg)
+	require.Contains(t, sanitized, "detonated")
+
+	for name, db := range openCodecTestDBs(t) {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			s := NewGormStorage(db, WithCodec(markerXORCodec{}))
+			require.NoError(t, s.Migrate(ctx))
+			t.Cleanup(func() { cleanupCodecExternalDB(t, db) })
+
+			// MaxRetries 5 with attempt 1 after dequeue: retries are NOT exhausted,
+			// so this exercises the non-retryable dead-letter label.
+			job := &core.Job{Type: "codec.terminal", Queue: "default", MaxRetries: 5}
+			require.NoError(t, s.Enqueue(ctx, job))
+			got, err := s.Dequeue(ctx, []string{"default"}, "worker-terminal")
+			require.NoError(t, err)
+			require.NotNil(t, got)
+
+			fanOut, err := s.FailTerminalWithResult(ctx, got.ID, "worker-terminal", errMsg)
+			require.NoError(t, err)
+			require.Nil(t, fanOut, "leaf job has no fan-out to account for")
+
+			rawLast := rawJobErrorText(t, db, got.ID, "last_error")
+			// A skipped write would leave the column empty and satisfy NotContains
+			// for the wrong reason.
+			require.NotEmpty(t, rawLast)
+			assert.True(t, strings.HasPrefix(rawLast, errTextTag),
+				"raw last_error should begin with the %q tag, got %q", errTextTag, rawLast)
+			assert.NotContains(t, rawLast, "detonated")
+
+			rawReason := rawJobErrorText(t, db, got.ID, "dead_letter_reason")
+			assert.Contains(t, rawReason, "non-retryable failure:")
+			assert.Contains(t, rawReason, errTextTag)
+			assert.NotContains(t, rawReason, "detonated")
+
+			// Positive leg: the ciphertext is really this error, not a placeholder.
+			readback, err := s.GetJob(ctx, got.ID)
+			require.NoError(t, err)
+			require.NotNil(t, readback)
+			assert.Equal(t, core.StatusFailed, readback.Status)
+			assert.Equal(t, sanitized, readback.LastError)
+			assert.Equal(t, "non-retryable failure: "+sanitized, readback.DeadLetterReason)
+		})
+	}
+}
+
 func TestErrorTextLegacyPlaintextReadback(t *testing.T) {
 	const errMsg = "legacy plaintext boom"
 	sanitized := security.SanitizeErrorMessage(errMsg)

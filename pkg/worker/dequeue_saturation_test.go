@@ -235,7 +235,7 @@ type soakResult struct {
 // post-fix collapse assertion (Packet 2) drive.
 func runSaturationSoak(t testing.TB, w *Worker, store *soakStorage, totalConcurrency, ticks int) soakResult {
 	t.Helper()
-	jobsChan := make(chan *core.Job, totalConcurrency)
+	jobsChan := make(chan dispatchedJob, totalConcurrency)
 	ctx := context.Background()
 	dispatched := 0
 	for i := 0; i < ticks; i++ {
@@ -244,10 +244,11 @@ func runSaturationSoak(t testing.TB, w *Worker, store *soakStorage, totalConcurr
 		// tick, mirroring a processLoop that finishes work between polls.
 		for {
 			select {
-			case job := <-jobsChan:
+			case dj := <-jobsChan:
 				dispatched++
-				w.releaseConcurrencySlots(ctx, job.ID)
-				w.untrackQueueJob(job.ID)
+				// Release exactly what dispatch registered for THIS run.
+				w.releaseConcurrencySlots(ctx, dj.job.ID, dj.token)
+				w.untrackQueueJob(dj.token)
 				continue
 			default:
 			}

@@ -3,8 +3,10 @@ package storage
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"slices"
 	"sort"
+	"sync"
 	"time"
 
 	"gorm.io/gorm"
@@ -128,11 +130,38 @@ func (s *GormStorage) dequeueBatchOnce(ctx context.Context, queues []string, wor
 //     single writer). DB-clock leases (Postgres) / wall clock (SQLite) unchanged.
 //   - decodeClaimedBatch still releases+excludes poison rows.
 //
-// A single-unit claim (the common global-limit path) runs as one autocommit
-// statement with no BEGIN/COMMIT. A multi-unit per-queue claim instead wraps its
-// statements in ONE transaction so a mid-batch error rolls back the earlier
-// queues' claims rather than stranding them (running/locked, undispatched) until
-// the stale-lock reaper — matching MySQL's single-transaction dequeueBatchLocked.
+// EVERY claim — single-unit or per-queue — is wrapped in ONE explicit
+// transaction, matching MySQL's single-transaction dequeueBatchLocked.
+//
+// The single-unit path used to run as a bare autocommit statement to save a
+// BEGIN/COMMIT round-trip, and that was a durability bug, not an optimization.
+// `UPDATE ... RETURNING *` in autocommit COMMITS on the server and only then
+// streams its rows to the client; a context cancellation (an ordinary SIGTERM /
+// worker shutdown) landing in that gap makes database/sql fail the scan with
+// context.Canceled while the claim is already durable. claimOne then returns an
+// error carrying NO ids, so nothing — not releaseClaimedOnAbort, not the caller
+// — knows which rows to release. The result was N rows stuck at status='running',
+// locked_by=<a process that has exited>, attempt already incremented and the
+// handler never run, invisible to a healthy replacement worker (which only claims
+// 'pending') until ReleaseStaleLocks at a DEFAULT StaleLockAge of 45 MINUTES. On
+// a rolling deploy every replaced pod could strand a batch. It also directly
+// contradicted docs/content/docs/advanced/batch-dequeue.md, which promises such
+// jobs are "released back to `pending` immediately".
+//
+// Inside an explicit transaction the same cancellation cannot strand anything:
+// database/sql rolls the transaction back (Tx.awaitDone on ctx.Done, plus GORM's
+// own deferred Rollback), so the claim never becomes durable and the rows stay
+// 'pending' — the healthy path is restored BY CONSTRUCTION rather than by a
+// compensating write that has to guess the ids.
+//
+// releaseClaimedOnAbort remains as the backstop for the one window a transaction
+// cannot close: an in-doubt COMMIT (the server commits, the client never sees the
+// ack). There the RETURNING rows WERE scanned, so the ids are known, and the
+// detached-context release is guarded by `locked_by = us AND status = running` —
+// a no-op if the commit actually rolled back, and never able to touch a row
+// another worker holds. If the process dies before even that runs, the stale-lock
+// reaper is still the final backstop; this shortens a 45-minute stall to an
+// immediate release, it does not replace recovery.
 func (s *GormStorage) dequeueBatchReturning(ctx context.Context, queues []string, workerID string, limit int, perQueueBudgets map[string]int) ([]*core.Job, error) {
 	dur := time.Duration(s.lockDuration.Load())
 	var nowVal, lockUntilVal any
@@ -165,11 +194,25 @@ func (s *GormStorage) dequeueBatchReturning(ctx context.Context, queues []string
 	}
 
 	claimed := make([]*core.Job, 0, limit)
+	// abortIDs accumulates every id this call has seen come back from RETURNING,
+	// across serialization retries, so an error exit can release them on a
+	// detached context.
+	//
+	// It is deliberately NOT reset per retry. withSerializationRetry only retries
+	// serialization/deadlock failures, and those ABORT the transaction, so a
+	// retried attempt always follows a ROLLBACK and the previous attempt's ids are
+	// not durable. Carrying them anyway is the conservative choice: against the
+	// `locked_by = us AND status = running` guard a stale id is a no-op, while
+	// dropping one would re-open the strand this function exists to prevent. Note
+	// this is the ONLY dequeue path with this worker's id in flight — the worker
+	// polls from a single goroutine — so a released row cannot be one this process
+	// has concurrently re-claimed and started running.
+	var abortIDs []core.UUID
 
-	// claimOne runs a single unit's claim against exec (either the autocommit
-	// session or a wrapping transaction) and appends the returned rows. The
-	// claimable-candidate SELECT carries the LIMIT and, on Postgres, FOR UPDATE
-	// SKIP LOCKED, and MUST be fenced in a MATERIALIZED CTE so the planner
+	// claimOne runs a single unit's claim against the wrapping transaction and
+	// appends the returned rows. The claimable-candidate SELECT carries the LIMIT
+	// and, on Postgres, FOR UPDATE SKIP LOCKED, and MUST be fenced in a
+	// MATERIALIZED CTE so the planner
 	// evaluates it EXACTLY ONCE. A bare `UPDATE ... WHERE id IN (SELECT ... FOR
 	// UPDATE SKIP LOCKED LIMIT n)` lets Postgres place the locking subquery on the
 	// INNER side of a nested loop and re-evaluate it per candidate row, applying
@@ -204,30 +247,22 @@ func (s *GormStorage) dequeueBatchReturning(ctx context.Context, queues []string
 		).Scan(&rows).Error; err != nil {
 			return err
 		}
+		for _, row := range rows {
+			abortIDs = append(abortIDs, row.ID)
+		}
 		claimed = append(claimed, rows...)
 		return nil
 	}
 
-	switch {
-	case len(units) == 0:
-		// Nothing eligible to claim (per-queue budgets with no positive budget).
-	case len(units) == 1:
-		// A single claim is one atomic autocommit statement, so no wrapping
-		// transaction is needed — the common global-limit hot path stays free of an
-		// extra BEGIN/COMMIT round-trip.
-		if err := s.withSerializationRetry(ctx, func() error {
-			claimed = claimed[:0]
-			return claimOne(silentDB.WithContext(ctx), units[0])
-		}); err != nil {
-			return nil, err
-		}
-	default:
-		// Multiple per-queue claim statements: wrap them in ONE transaction so a
-		// mid-loop DB error rolls back the earlier queues' already-claimed rows
-		// instead of stranding them (status=running, locked_by=self, undispatched)
-		// until the stale-lock reaper. Mirrors dequeueBatchLocked (MySQL), which is
-		// already single-transaction. The MATERIALIZED fence still prevents
-		// over-dispatch; the SKIP LOCKED row locks are simply held until commit.
+	// len(units) == 0 means per-queue budgets with no positive budget: nothing
+	// eligible to claim, and no transaction to open.
+	if len(units) > 0 {
+		// ONE transaction around every claim statement, single-unit included. A
+		// mid-loop DB error, or a ctx cancellation landing between the server-side
+		// commit and the client-side scan of RETURNING, rolls the whole thing back
+		// instead of stranding running/locked/undispatched rows until the stale-lock
+		// reaper. The MATERIALIZED fence still prevents over-dispatch; the SKIP
+		// LOCKED row locks are simply held until commit.
 		if err := s.withSerializationRetry(ctx, func() error {
 			claimed = claimed[:0]
 			return silentDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
@@ -242,7 +277,9 @@ func (s *GormStorage) dequeueBatchReturning(ctx context.Context, queues []string
 				return nil
 			})
 		}); err != nil {
-			return nil, err
+			// Backstop for an in-doubt COMMIT only: the rows were scanned, so the ids
+			// are known, and the release is guarded by locked_by/status.
+			return nil, s.releaseClaimedOnAbort(abortIDs, workerID, err)
 		}
 	}
 
@@ -455,11 +492,25 @@ func (s *GormStorage) dequeueBatchLocked(ctx context.Context, queues []string, w
 // stale-lock reaper, ~45m by default) on a single bad payload (teardown g3). The
 // successfully-decoded jobs are returned so good work is never blocked by a poison
 // sibling. The released poison row is re-claimable (and will re-fail decode) — a
-// visible, self-contained symptom of a misconfigured codec, not a fleet-wide stall.
+// self-contained symptom of a misconfigured codec, not a fleet-wide stall.
+//
+// It has to be a VISIBLE symptom, and it was not. This comment claimed visibility
+// while the drop emitted no log, no metric and no hook: the row was claimed,
+// silently excluded, released, re-claimed and re-failed forever, and the only
+// outward sign was a job that never progressed. A whole queue could be poisoned by
+// a key rotation with nothing to point at it.
+//
+// So each drop now increments a counter (PoisonPayloadDrops) and logs once per job
+// id per process. Once-per-job rather than once-per-attempt because the row
+// re-fails on every claim — at the default poll interval that is tens of lines per
+// second per row. The logged set is capped; past the cap one summary line is
+// emitted and further ids are counted but not named, so a mass decode failure
+// cannot itself become the outage.
 func (s *GormStorage) decodeClaimedBatch(ctx context.Context, jobs []*core.Job, workerID string) ([]*core.Job, error) {
 	out := jobs[:0]
 	for _, job := range jobs {
 		if err := s.decodeJobPayloads(job); err != nil {
+			s.reportPoisonPayload(job.ID, err)
 			if rerr := s.Release(ctx, job.ID, workerID); rerr != nil && !errors.Is(rerr, core.ErrJobNotOwned) {
 				return nil, rerr
 			}
@@ -469,6 +520,77 @@ func (s *GormStorage) decodeClaimedBatch(ctx context.Context, jobs []*core.Job, 
 	}
 	return out, nil
 }
+
+// maxPoisonPayloadIDsLogged bounds the set of job ids named in the log. A mass
+// decode failure (a rotated key, a codec misconfiguration) would otherwise emit a
+// line per row per claim.
+const maxPoisonPayloadIDsLogged = 64
+
+// poisonPayloadLog is the once-per-job-id dedup state behind the poison-payload
+// warning. It hangs off GormStorage by POINTER on purpose: it holds a mutex and a
+// map, neither of which is comparable, and GormStorage is an exported concrete
+// type whose comparability is part of the v4 API surface — gorelease reports a
+// struct that stops being comparable as an INCOMPATIBLE change and the api-compat
+// job fails the release. Keep every non-comparable field of GormStorage indirect.
+type poisonPayloadLog struct {
+	mu     sync.Mutex
+	logged map[core.UUID]struct{}
+	capped bool
+}
+
+// reportPoisonPayload records an undecodable row: always a counter increment, and
+// a log line the first time each id is seen by this process.
+func (s *GormStorage) reportPoisonPayload(jobID core.UUID, cause error) {
+	s.poisonPayloadDrops.Add(1)
+
+	logger := s.logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	dropped := func() {
+		logger.Warn("job payload could not be decoded; the job was released and will be re-claimed and re-fail until its codec can read it",
+			"job_id", jobID, "error", cause, "total_drops", s.poisonPayloadDrops.Load())
+	}
+
+	p := s.poisonPayload
+	if p == nil {
+		// Zero-value storage (no constructor): there is no dedup state to consult.
+		// Log anyway — silence is the exact defect this reporting exists to remove,
+		// and over-logging on a storage nobody built through NewGormStorage is the
+		// strictly safer failure.
+		dropped()
+		return
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if _, seen := p.logged[jobID]; seen {
+		return
+	}
+	if len(p.logged) >= maxPoisonPayloadIDsLogged {
+		if !p.capped {
+			p.capped = true
+			logger.Warn("too many jobs have undecodable payloads to name individually; further job ids are counted but not logged. Check PoisonPayloadDrops() and your codec configuration",
+				"limit", maxPoisonPayloadIDsLogged, "total_drops", s.poisonPayloadDrops.Load())
+		}
+		return
+	}
+	if p.logged == nil {
+		p.logged = make(map[core.UUID]struct{}, 8)
+	}
+	p.logged[jobID] = struct{}{}
+	dropped()
+}
+
+// PoisonPayloadDrops reports how many times this storage has claimed a job whose
+// payload it could not decode and released it again. A non-zero and RISING value
+// means a codec cannot read rows this deployment wrote — typically a rotated or
+// missing key — and those jobs are not progressing.
+func (s *GormStorage) PoisonPayloadDrops() int64 { return s.poisonPayloadDrops.Load() }
+
+// SetLogger supplies the logger used for storage-level warnings. Optional:
+// slog.Default() is used when unset, so a poison payload is never silent.
+func (s *GormStorage) SetLogger(l *slog.Logger) { s.logger = l }
 
 // releaseClaimedOnAbort returns rows already claimed by this call to pending,
 // then returns cause joined with any release failure.
