@@ -362,7 +362,7 @@ queue.Enqueue(ctx, "task", args,
     jobs.Retries(5),                      // Max retry attempts
     jobs.Delay(10 * time.Second),         // Delay execution
     jobs.At(scheduledAt),                 // Run at a specific time
-    jobs.Timeout(30 * time.Minute),       // Recorded on the job; enforce via ctx
+    jobs.Timeout(30 * time.Minute),       // Enforced: handler ctx is cancelled at the deadline
     jobs.QueueOpt("critical"),            // Assign to named queue
     jobs.WithTenant("tenant-a"),          // Persist tenant owner label
     jobs.WithMeta("region", "us"),        // Add queryable metadata

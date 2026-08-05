@@ -89,7 +89,25 @@ func New(s core.Storage) *Queue {
 }
 
 // Register registers a job handler function.
-// The function must have signature: func(ctx context.Context, args T) error
+//
+// fn takes ONE or TWO parameters — an OPTIONAL leading context.Context, then an
+// OPTIONAL args value — and returns either error or (R, error). T is the
+// argument struct and R the result; both are encoded with the queue's payload
+// codec. Every combination is accepted, so all six of these work:
+//
+//	func(ctx context.Context, args T) error
+//	func(ctx context.Context, args T) (R, error)
+//	func(args T) error
+//	func(args T) (R, error)
+//	func(ctx context.Context) error
+//	func(ctx context.Context) (R, error)
+//
+// A zero-parameter func() error is rejected.
+//
+// This godoc used to name only the first form, which was wrong in a way that
+// contradicted the library's own typed API: Define[A, R] / DefineE register
+// through RegisterE and REQUIRE the (R, error) form.
+//
 // Job type names must be alphanumeric (starting with a letter), max 255 chars.
 // Register panics on invalid input; use RegisterE for configuration-driven
 // registration that should return validation errors instead.
@@ -102,7 +120,17 @@ func (q *Queue) Register(name string, fn any, opts ...Option) {
 // RegisterE registers a job handler function and returns validation errors
 // instead of panicking.
 //
-// The function must have signature: func(ctx context.Context, args T) error.
+// fn takes ONE or TWO parameters — an OPTIONAL leading context.Context, then an
+// OPTIONAL args value — and returns either error or (R, error), exactly as
+// listed on Register. All six combinations are accepted:
+//
+//	func(ctx context.Context, args T) error
+//	func(ctx context.Context, args T) (R, error)
+//	func(args T) error
+//	func(args T) (R, error)
+//	func(ctx context.Context) error
+//	func(ctx context.Context) (R, error)
+//
 // Job type names must be alphanumeric (starting with a letter), max 255 chars.
 func (q *Queue) RegisterE(name string, fn any, opts ...Option) error {
 	// Validate job type name

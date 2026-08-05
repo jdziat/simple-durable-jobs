@@ -44,7 +44,24 @@ type JobRetrying struct {
 
 func (*JobRetrying) eventMarker() {}
 
-// CheckpointSaved is emitted when a checkpoint is saved.
+// CheckpointSaved describes a checkpoint write.
+//
+// DECLARED BUT NOT CURRENTLY EMITTED. Nothing in this module constructs a
+// CheckpointSaved, so `case *jobs.CheckpointSaved:` in a Queue.Events()
+// subscriber is dead code: it never fires, with no error and no warning. This
+// godoc used to say "emitted when a checkpoint is saved", and a user who built a
+// workflow-progress feed on that sentence got a permanently empty feed while
+// checkpoints landed in the checkpoints table exactly as expected.
+//
+// Checkpoints are written by jobs.Call, SaveCheckpoint and SavePhaseCheckpoint
+// without publishing an event. To follow progress, poll
+// q.Storage().GetCheckpoints(ctx, jobID) instead — GetCheckpoints is a Storage
+// method, not a Queue one.
+//
+// The type stays exported because removing it would break the v4 API, and it may
+// start being emitted in a future minor — at which point this notice comes off.
+// TestEveryDocumentedEventIsEmitted holds this notice, the facade alias godoc
+// and docs/content/docs/api-reference/events.md to the truth in both directions.
 type CheckpointSaved struct {
 	JobID     UUID
 	CallIndex int

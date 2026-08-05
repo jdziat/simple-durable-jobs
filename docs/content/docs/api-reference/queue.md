@@ -23,14 +23,20 @@ queue := jobs.New(storage)
 
 ### `(*Queue) Register(name string, fn any, opts ...Option)`
 
-Registers a job handler function. The function must have one of these signatures:
+Registers a job handler function. The function takes **one or two** parameters —
+an optional leading `context.Context`, then an optional args value — and returns
+either `error` or `(R, error)`. Every combination is accepted:
 
 ```go
 func(ctx context.Context, args T) error
 func(ctx context.Context, args T) (R, error)
 func(args T) error
 func(args T) (R, error)
+func(ctx context.Context) error          // no args
+func(ctx context.Context) (R, error)     // no args
 ```
+
+A zero-parameter `func() error` is rejected (`handler must have 1-2 arguments`).
 
 Example:
 ```go

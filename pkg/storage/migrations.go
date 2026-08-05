@@ -393,6 +393,73 @@ var schemaMigrations = []schemaMigration{
 		Name:    "checkpoints_result_shape_column",
 		Up:      migrateCheckpointsResultShape,
 	},
+	{
+		Version: 41,
+		Name:    "unique_key_lookup_index",
+		Up:      migrateUniqueKeyLookupIndex,
+	},
+}
+
+// migrateUniqueKeyLookupIndex restores the plain jobs(unique_key) index on
+// Postgres and SQLite. MySQL has carried it since migration 12; this brings the
+// other two dialects back to parity.
+//
+// WHY IT IS NOT REDUNDANT. Migration 12 dropped it on Postgres/SQLite on the
+// theory that the partial UNIQUE idx_jobs_active_unique
+//
+//	ON jobs (unique_key) WHERE unique_key <> '' AND status IN ('pending','running')
+//
+// already covered every unique_key lookup. It does not, and after fc8c227 it
+// provably cannot. The dedup pre-check behind queue.Unique / EnqueueUnique /
+// EnqueueUniqueTx / EnqueueBatch runs
+//
+//	SELECT * FROM jobs WHERE unique_key = ? AND status IN ?   -- core.ActiveDedupStatuses
+//
+// and ActiveDedupStatuses is FIVE statuses (pending, running, retrying, waiting,
+// paused). The partial index's predicate covers two of them. That is a strict
+// SUBSET, so no planner on any engine is permitted to use the index: a duplicate
+// sitting in `waiting` is simply not in it, and answering from it would return a
+// wrong answer (a missed duplicate). The lookup therefore degraded to a scan of
+// the whole active set, growing linearly with the backlog. Measured on SQLite
+// with 400k pending jobs: the dedup SELECT alone went 44.9ms -> 52us and a full
+// EnqueueUnique 58.0ms -> 172us once this index existed (EXPLAIN QUERY PLAN goes
+// from `SEARCH jobs USING INDEX idx_jobs_status_created (status=?)` — every
+// pending row — to `SEARCH jobs USING INDEX idx_jobs_unique_key (unique_key=?)`).
+//
+// WHY A PLAIN INDEX RATHER THAN A WIDER PARTIAL ONE. Widening
+// idx_jobs_active_unique's predicate to all five statuses would serve the lookup
+// too, but that index is also the CONSTRAINT that makes a second active job with
+// the same key impossible, and widening a UNIQUE predicate is not a safe
+// migration: any existing database that legitimately holds, say, one `waiting`
+// and one `pending` job with the same key (allowed under the shipped
+// constraint) would fail to create the wider index and the upgrade would abort
+// mid-migration. It would also fork the constraint away from MySQL's
+// active_unique_key generated column, which spells the same two statuses. So the
+// constraint is left exactly as it is and the LOOKUP gets its own additive,
+// non-unique index — the shape MySQL has been running in production all along.
+//
+// Idempotent and re-runnable: Postgres and SQLite take CREATE INDEX IF NOT
+// EXISTS; MySQL has no such clause, so it is gated on Migrator().HasIndex, the
+// same way migration 12 creates it.
+func migrateUniqueKeyLookupIndex(ctx context.Context, db *gorm.DB, dialect string) error {
+	if dialect == dialectMySQL {
+		m := db.Migrator()
+		if m.HasIndex(&core.Job{}, "idx_jobs_unique_key") {
+			return nil
+		}
+		if err := db.WithContext(ctx).Exec(
+			"CREATE INDEX idx_jobs_unique_key ON jobs (unique_key)",
+		).Error; err != nil && !isBenignDDLError(err) {
+			return fmt.Errorf("create idx_jobs_unique_key: %w", err)
+		}
+		return nil
+	}
+	if err := db.WithContext(ctx).Exec(
+		"CREATE INDEX IF NOT EXISTS idx_jobs_unique_key ON jobs (unique_key)",
+	).Error; err != nil {
+		return fmt.Errorf("create idx_jobs_unique_key: %w", err)
+	}
+	return nil
 }
 
 // jobStatsTimestampIndex is the index name shared by this migration and the UI's

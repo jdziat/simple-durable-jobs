@@ -130,7 +130,35 @@ the original job ID rather than `ErrDuplicateJob`.
 
 ### `Timeout(d time.Duration) Option`
 
-Records a per-job timeout on the job record. The value is surfaced on the job metadata and in events — applications should enforce it via the handler's `context.Context` or external monitoring; the queue does not cancel handlers automatically.
+Sets the maximum wall time for this job's handler execution. **The queue enforces
+it.** When the deadline expires the worker cancels the handler's
+`context.Context` (`pkg/worker`: the per-job timeout overrides the handler's
+registration-time `Timeout`, and the handler runs under
+`context.WithTimeout`). `0` means no limit, which is the default.
+
+Cancelling a context does not kill a goroutine, so what the deadline actually
+does depends on the handler:
+
+- **A handler that propagates the cancellation** — the usual case, because any
+  ctx-aware work inside it (database queries, HTTP requests, `Call()` steps)
+  starts returning `context deadline exceeded` — fails the attempt with that
+  error, burns a retry, and eventually dead-letters the job.
+- **A handler that never checks `ctx` and returns `nil` anyway** runs to
+  completion past the deadline and is recorded **completed**. The worker waits
+  for it; the timeout does not abandon it or mark it failed on its own.
+
+Either way the deadline is live, and it is not a label you can attach for
+documentation purposes.
+
+{{< callout type="warning" >}}
+**Corrected.** Every release through v4.7.0 shipped this page — and the options
+snippet in `README.md` — describing `Timeout` as an advisory label that
+applications had to police themselves. That was never true — the worker has
+always wrapped the handler in `context.WithTimeout`, and the godoc on
+`jobs.Timeout` and `Queue.Enqueue` described the real behaviour all along. If you
+built on the old wording, check any handler that ignores `ctx` during a long
+phase: its deadline is live.
+{{< /callout >}}
 
 Even when a handler's own deadline or cancellation fires the moment a `Call()` step (or `SavePhaseCheckpoint()` phase) completes, that step's checkpoint is still persisted: the engine writes it on a detached context (cancellation/deadline stripped, with an independent ~5s budget), so a completed step is never lost and re-run on replay because the deadline expired microseconds after the handler returned.
 

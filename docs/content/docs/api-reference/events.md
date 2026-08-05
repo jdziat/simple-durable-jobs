@@ -52,6 +52,7 @@ type JobRetrying struct {
     Timestamp time.Time
 }
 
+// DECLARED BUT NOT CURRENTLY EMITTED — see the note under this block.
 type CheckpointSaved struct {
     JobID     UUID
     CallIndex int
@@ -145,6 +146,24 @@ type CustomEvent struct {
     Timestamp time.Time
 }
 ```
+
+{{< callout type="warning" >}}
+**`CheckpointSaved` is DECLARED BUT NOT CURRENTLY EMITTED.** Every other type
+above is published to `Queue.Events()` subscribers; `CheckpointSaved` is not.
+Nothing in the module constructs one, so a `case *jobs.CheckpointSaved:` arm
+never fires — no error, no warning, just an arm that is dead code. The
+`CallType` annotation above can therefore never be observed.
+
+Checkpoints themselves are written normally by `jobs.Call`, `SaveCheckpoint` and
+`SavePhaseCheckpoint`. To follow workflow progress, poll
+`q.Storage().GetCheckpoints(ctx, jobID)` rather than subscribing — note it is a
+`Storage` method, not a `Queue` one.
+
+The type stays exported because removing it would be a breaking change, and it
+may start being emitted in a future minor. `TestEveryDocumentedEventIsEmitted`
+fails if that happens without this notice coming off — and fails today if any
+other event type loses its emitter.
+{{< /callout >}}
 
 ---
 

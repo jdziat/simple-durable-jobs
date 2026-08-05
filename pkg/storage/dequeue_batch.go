@@ -130,11 +130,38 @@ func (s *GormStorage) dequeueBatchOnce(ctx context.Context, queues []string, wor
 //     single writer). DB-clock leases (Postgres) / wall clock (SQLite) unchanged.
 //   - decodeClaimedBatch still releases+excludes poison rows.
 //
-// A single-unit claim (the common global-limit path) runs as one autocommit
-// statement with no BEGIN/COMMIT. A multi-unit per-queue claim instead wraps its
-// statements in ONE transaction so a mid-batch error rolls back the earlier
-// queues' claims rather than stranding them (running/locked, undispatched) until
-// the stale-lock reaper — matching MySQL's single-transaction dequeueBatchLocked.
+// EVERY claim — single-unit or per-queue — is wrapped in ONE explicit
+// transaction, matching MySQL's single-transaction dequeueBatchLocked.
+//
+// The single-unit path used to run as a bare autocommit statement to save a
+// BEGIN/COMMIT round-trip, and that was a durability bug, not an optimization.
+// `UPDATE ... RETURNING *` in autocommit COMMITS on the server and only then
+// streams its rows to the client; a context cancellation (an ordinary SIGTERM /
+// worker shutdown) landing in that gap makes database/sql fail the scan with
+// context.Canceled while the claim is already durable. claimOne then returns an
+// error carrying NO ids, so nothing — not releaseClaimedOnAbort, not the caller
+// — knows which rows to release. The result was N rows stuck at status='running',
+// locked_by=<a process that has exited>, attempt already incremented and the
+// handler never run, invisible to a healthy replacement worker (which only claims
+// 'pending') until ReleaseStaleLocks at a DEFAULT StaleLockAge of 45 MINUTES. On
+// a rolling deploy every replaced pod could strand a batch. It also directly
+// contradicted docs/content/docs/advanced/batch-dequeue.md, which promises such
+// jobs are "released back to `pending` immediately".
+//
+// Inside an explicit transaction the same cancellation cannot strand anything:
+// database/sql rolls the transaction back (Tx.awaitDone on ctx.Done, plus GORM's
+// own deferred Rollback), so the claim never becomes durable and the rows stay
+// 'pending' — the healthy path is restored BY CONSTRUCTION rather than by a
+// compensating write that has to guess the ids.
+//
+// releaseClaimedOnAbort remains as the backstop for the one window a transaction
+// cannot close: an in-doubt COMMIT (the server commits, the client never sees the
+// ack). There the RETURNING rows WERE scanned, so the ids are known, and the
+// detached-context release is guarded by `locked_by = us AND status = running` —
+// a no-op if the commit actually rolled back, and never able to touch a row
+// another worker holds. If the process dies before even that runs, the stale-lock
+// reaper is still the final backstop; this shortens a 45-minute stall to an
+// immediate release, it does not replace recovery.
 func (s *GormStorage) dequeueBatchReturning(ctx context.Context, queues []string, workerID string, limit int, perQueueBudgets map[string]int) ([]*core.Job, error) {
 	dur := time.Duration(s.lockDuration.Load())
 	var nowVal, lockUntilVal any
@@ -167,11 +194,25 @@ func (s *GormStorage) dequeueBatchReturning(ctx context.Context, queues []string
 	}
 
 	claimed := make([]*core.Job, 0, limit)
+	// abortIDs accumulates every id this call has seen come back from RETURNING,
+	// across serialization retries, so an error exit can release them on a
+	// detached context.
+	//
+	// It is deliberately NOT reset per retry. withSerializationRetry only retries
+	// serialization/deadlock failures, and those ABORT the transaction, so a
+	// retried attempt always follows a ROLLBACK and the previous attempt's ids are
+	// not durable. Carrying them anyway is the conservative choice: against the
+	// `locked_by = us AND status = running` guard a stale id is a no-op, while
+	// dropping one would re-open the strand this function exists to prevent. Note
+	// this is the ONLY dequeue path with this worker's id in flight — the worker
+	// polls from a single goroutine — so a released row cannot be one this process
+	// has concurrently re-claimed and started running.
+	var abortIDs []core.UUID
 
-	// claimOne runs a single unit's claim against exec (either the autocommit
-	// session or a wrapping transaction) and appends the returned rows. The
-	// claimable-candidate SELECT carries the LIMIT and, on Postgres, FOR UPDATE
-	// SKIP LOCKED, and MUST be fenced in a MATERIALIZED CTE so the planner
+	// claimOne runs a single unit's claim against the wrapping transaction and
+	// appends the returned rows. The claimable-candidate SELECT carries the LIMIT
+	// and, on Postgres, FOR UPDATE SKIP LOCKED, and MUST be fenced in a
+	// MATERIALIZED CTE so the planner
 	// evaluates it EXACTLY ONCE. A bare `UPDATE ... WHERE id IN (SELECT ... FOR
 	// UPDATE SKIP LOCKED LIMIT n)` lets Postgres place the locking subquery on the
 	// INNER side of a nested loop and re-evaluate it per candidate row, applying
@@ -206,30 +247,22 @@ func (s *GormStorage) dequeueBatchReturning(ctx context.Context, queues []string
 		).Scan(&rows).Error; err != nil {
 			return err
 		}
+		for _, row := range rows {
+			abortIDs = append(abortIDs, row.ID)
+		}
 		claimed = append(claimed, rows...)
 		return nil
 	}
 
-	switch {
-	case len(units) == 0:
-		// Nothing eligible to claim (per-queue budgets with no positive budget).
-	case len(units) == 1:
-		// A single claim is one atomic autocommit statement, so no wrapping
-		// transaction is needed — the common global-limit hot path stays free of an
-		// extra BEGIN/COMMIT round-trip.
-		if err := s.withSerializationRetry(ctx, func() error {
-			claimed = claimed[:0]
-			return claimOne(silentDB.WithContext(ctx), units[0])
-		}); err != nil {
-			return nil, err
-		}
-	default:
-		// Multiple per-queue claim statements: wrap them in ONE transaction so a
-		// mid-loop DB error rolls back the earlier queues' already-claimed rows
-		// instead of stranding them (status=running, locked_by=self, undispatched)
-		// until the stale-lock reaper. Mirrors dequeueBatchLocked (MySQL), which is
-		// already single-transaction. The MATERIALIZED fence still prevents
-		// over-dispatch; the SKIP LOCKED row locks are simply held until commit.
+	// len(units) == 0 means per-queue budgets with no positive budget: nothing
+	// eligible to claim, and no transaction to open.
+	if len(units) > 0 {
+		// ONE transaction around every claim statement, single-unit included. A
+		// mid-loop DB error, or a ctx cancellation landing between the server-side
+		// commit and the client-side scan of RETURNING, rolls the whole thing back
+		// instead of stranding running/locked/undispatched rows until the stale-lock
+		// reaper. The MATERIALIZED fence still prevents over-dispatch; the SKIP
+		// LOCKED row locks are simply held until commit.
 		if err := s.withSerializationRetry(ctx, func() error {
 			claimed = claimed[:0]
 			return silentDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
@@ -244,7 +277,9 @@ func (s *GormStorage) dequeueBatchReturning(ctx context.Context, queues []string
 				return nil
 			})
 		}); err != nil {
-			return nil, err
+			// Backstop for an in-doubt COMMIT only: the rows were scanned, so the ids
+			// are known, and the release is guarded by locked_by/status.
+			return nil, s.releaseClaimedOnAbort(abortIDs, workerID, err)
 		}
 	}
 

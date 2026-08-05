@@ -22,8 +22,27 @@ type Handler struct {
 }
 
 // NewHandler creates a Handler from a function.
-// The function must have signature: func(ctx context.Context, args T) error
-// or func(ctx context.Context, args T) (T, error)
+//
+// The rule, rather than a list to memorize: fn takes ONE or TWO parameters — an
+// OPTIONAL leading context.Context, then an OPTIONAL args value — and returns
+// either error or (R, error). Every combination of those choices is accepted, so
+// all six of these work:
+//
+//	func(ctx context.Context, args T) error
+//	func(ctx context.Context, args T) (R, error)
+//	func(args T) error
+//	func(args T) (R, error)
+//	func(ctx context.Context) error
+//	func(ctx context.Context) (R, error)
+//
+// A zero-parameter func() error is NOT accepted ("handler must have 1-2
+// arguments"), and neither is any other return shape.
+//
+// This comment used to name only the two context-carrying forms with args, and
+// queue.Register/RegisterE named only the first of those — a narrower contract
+// than the code has ever enforced, and one that contradicted the library's own
+// typed API, since Define[A, R] registers through RegisterE and REQUIRES the
+// (R, error) shape.
 func NewHandler(fn any) (*Handler, error) {
 	if fn == nil {
 		return nil, fmt.Errorf("handler cannot be nil")

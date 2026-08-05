@@ -117,12 +117,31 @@ func TestPostgresSchemaAssertions(t *testing.T) {
 	require.Contains(t, signalsPendingDef, "where", "idx_signals_pending must be partial on postgres:\n%s", signalsPendingDef)
 	require.Contains(t, signalsPendingDef, "consumed_at is null", "idx_signals_pending must be partial on consumed_at IS NULL:\n%s", signalsPendingDef)
 
+	// idx_jobs_unique_key USED to be pinned "must not exist" here. That assertion
+	// was wrong and migration 41 reverses it. It was added when the dedup
+	// pre-check filtered on status IN ('pending','running') — exactly the
+	// predicate of the partial UNIQUE idx_jobs_active_unique, which could
+	// therefore serve the lookup. fc8c227 widened core.ActiveDedupStatuses to
+	// five statuses (adding retrying, waiting, paused); the partial index's
+	// predicate became a strict SUBSET of what the query asks for, so no planner
+	// may use it, and every idempotent enqueue degraded to a scan of the whole
+	// active set (measured on SQLite at 400k pending jobs: 58.0ms per
+	// EnqueueUnique, 172us with the index). MySQL kept the plain index all along
+	// and was never affected; this restores parity, it does not invent a shape.
+	require.True(t, postgresIndexExists(t, db, "idx_jobs_unique_key"),
+		"idx_jobs_unique_key must exist on postgres: the five-status dedup lookup cannot use the two-status partial unique index")
+	uniqueKeyDef := strings.ToLower(postgresIndexDef(t, db, "idx_jobs_unique_key"))
+	require.Contains(t, uniqueKeyDef, "unique_key", "idx_jobs_unique_key definition:\n%s", uniqueKeyDef)
+	require.NotContains(t, uniqueKeyDef, " where ",
+		"idx_jobs_unique_key must NOT be partial — a predicate the dedup query does not restate is exactly what made the old index unusable:\n%s", uniqueKeyDef)
+	require.False(t, strings.HasPrefix(uniqueKeyDef, "create unique index"),
+		"idx_jobs_unique_key must stay NON-unique; idx_jobs_active_unique is the constraint:\n%s", uniqueKeyDef)
+
 	for _, indexName := range []string{
 		"idx_jobs_priority",
 		"idx_jobs_queue",
 		"idx_jobs_locked_until",
 		"idx_jobs_dequeue",
-		"idx_jobs_unique_key",
 		"idx_jobs_dequeue_order",
 		"idx_jobs_status",
 		"idx_jobs_run_at",

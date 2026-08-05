@@ -135,7 +135,13 @@ type (
 	// JobReclaimed is emitted when a worker reclaims a job from a presumed-dead owner.
 	JobReclaimed = core.JobReclaimed
 
-	// CheckpointSaved is emitted when a checkpoint is saved.
+	// CheckpointSaved describes a checkpoint write.
+	//
+	// DECLARED BUT NOT CURRENTLY EMITTED: nothing in this module constructs one,
+	// so a `case *jobs.CheckpointSaved:` arm in a Queue.Events() subscriber never
+	// fires. Poll q.Storage().GetCheckpoints(ctx, jobID) for workflow progress
+	// instead — it is a Storage method, not a Queue one. See
+	// core.CheckpointSaved for the full note.
 	CheckpointSaved = core.CheckpointSaved
 
 	// SignalDelivered is emitted when a signal is persisted for a job.
@@ -677,35 +683,45 @@ func RetryAfter(d time.Duration, err error) error {
 
 // ValidateJobTypeName validates a job type name.
 //
-// Deprecated: internal helper; will be unexported in v3.
+// Deprecated: internal helper. Slated for unexporting in a future major (it was
+// NOT unexported in v3 or v4, despite what this notice used to say — the module
+// is at /v4 and this function is still exported). Prefer not to depend on it.
 func ValidateJobTypeName(name string) error {
 	return security.ValidateJobTypeName(name)
 }
 
 // ValidateQueueName validates a queue name.
 //
-// Deprecated: internal helper; will be unexported in v3.
+// Deprecated: internal helper. Slated for unexporting in a future major (it was
+// NOT unexported in v3 or v4, despite what this notice used to say — the module
+// is at /v4 and this function is still exported). Prefer not to depend on it.
 func ValidateQueueName(name string) error {
 	return security.ValidateQueueName(name)
 }
 
 // SanitizeErrorMessage truncates and sanitizes error messages for storage.
 //
-// Deprecated: internal helper; will be unexported in v3.
+// Deprecated: internal helper. Slated for unexporting in a future major (it was
+// NOT unexported in v3 or v4, despite what this notice used to say — the module
+// is at /v4 and this function is still exported). Prefer not to depend on it.
 func SanitizeErrorMessage(msg string) string {
 	return security.SanitizeErrorMessage(msg)
 }
 
 // ClampRetries ensures retry count is within limits.
 //
-// Deprecated: internal helper; will be unexported in v3.
+// Deprecated: internal helper. Slated for unexporting in a future major (it was
+// NOT unexported in v3 or v4, despite what this notice used to say — the module
+// is at /v4 and this function is still exported). Prefer not to depend on it.
 func ClampRetries(n int) int {
 	return security.ClampRetries(n)
 }
 
 // ClampConcurrency ensures concurrency is within limits.
 //
-// Deprecated: internal helper; will be unexported in v3.
+// Deprecated: internal helper. Slated for unexporting in a future major (it was
+// NOT unexported in v3 or v4, despite what this notice used to say — the module
+// is at /v4 and this function is still exported). Prefer not to depend on it.
 func ClampConcurrency(n int) int {
 	return security.ClampConcurrency(n)
 }
