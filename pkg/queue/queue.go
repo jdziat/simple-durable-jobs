@@ -1280,12 +1280,24 @@ func (q *Queue) CallRetryHooks(ctx context.Context, job *core.Job, attempt int, 
 	}
 }
 
-// CallWaitingHooks calls all registered waiting hooks.
 // OnAttemptEnd registers a callback for an attempt that ended without reporting a
-// disposition. It is deliberately NOT exported through the facade: it exists for
-// pkg/otel's span lifecycle, and its population (cancelled jobs, shutdown-released
-// jobs, lost-ownership jobs) is not the "parked workflow" population OnJobWaiting
-// documents.
+// disposition — no complete, fail, retry or waiting write landed, because the row
+// stopped being this worker's before one could. Its population is cancelled jobs,
+// shutdown-released jobs and lost-ownership jobs.
+//
+// This is PUBLIC API on pkg/queue and carries the v4 compatibility promise. It is
+// not surfaced through the root facade, which is a convenience decision and not a
+// visibility one: any caller holding a *Queue may register here.
+//
+// It exists because that population is NOT the "parked workflow" population
+// OnJobWaiting documents, and routing abandoned attempts through OnJobWaiting to
+// close their spans would silently add cancelled jobs — and every in-flight job on
+// every graceful shutdown — to any user counter built on it.
+//
+// The population has one non-obvious boundary: a job whose type this worker has no
+// handler for does not reach this hook, because the handler lookup precedes span
+// creation, so no span was opened and no attempt-end is reported. Both halves are
+// pinned by TestOnAttemptEnd_* in pkg/worker.
 func (q *Queue) OnAttemptEnd(fn func(context.Context, *core.Job)) {
 	q.mu.Lock()
 	q.onAttemptEnd = append(q.onAttemptEnd, fn)
@@ -1303,6 +1315,7 @@ func (q *Queue) CallAttemptEndHooks(ctx context.Context, job *core.Job) {
 	}
 }
 
+// CallWaitingHooks calls all registered waiting hooks.
 func (q *Queue) CallWaitingHooks(ctx context.Context, job *core.Job) {
 	q.mu.RLock()
 	hooks := make([]func(context.Context, *core.Job), len(q.onWaiting))

@@ -1,8 +1,8 @@
 # Upgrading
 
-## Upgrading through the v4.6 / v4.7 / v4.8 line
+## Upgrading through the v4.6 / v4.7 / v4.8 / v4.9 line
 
-Three releases matter here.
+Four releases matter here.
 
 - **v4.6.0** closed a silent data-corruption bug in nested `Call()` replay and an
   authentication bypass in the embedded dashboard, and cleared two reachable
@@ -11,9 +11,12 @@ Three releases matter here.
   dispositions reported but never written, backlog age counting not-yet-due jobs,
   a MySQL charset crashloop, and an unfenced concurrency-slot release. None of it
   changed behaviour you could have been relying on.
-- **v4.8.0** (this document's subject) changes runtime behaviour in several
+- **v4.8.0** changes runtime behaviour in several
   places, all of them cases where the old behaviour was wrong — but wrong in ways
   a deployment may have been tuned around. Those are listed below.
+- **v4.9.0** adds one hook and one CLI exit code, and fixes four defects. It needs
+  no migration and no code change on your side; the two additive surfaces are
+  described in its own section below.
 
 No API break: `gorelease` reports every change compatible against a v4.7.0 base.
 The additions are wider than "options and storage methods", so here are the ones
@@ -242,6 +245,71 @@ not about authentication, and it is not required to get the fix.
 
 v4.6.0 also cleared two reachable advisories: **GO-2026-5970** (`golang.org/x/text`,
 reachable in every default configuration) and **GO-2026-5506** (`go.opentelemetry.io/otel`).
+
+---
+
+## Behaviour changes in v4.9.0
+
+v4.9.0 is a **minor**, not a patch, for two reasons — both additive, neither
+requiring any change on your side:
+
+- it adds one exported hook to `pkg/queue` (`OnAttemptEnd` / `CallAttemptEndHooks`), and
+- `sdj dlq requeue` gains a non-zero exit code for a case that previously exited 0.
+
+Everything else in the release is a defect fix or a repair to the project's own
+release-gating test harness, which is not shipped to you.
+
+### `sdj dlq requeue` exits 4 when it skipped rows it matched
+
+**Before:** a bulk requeue exited **0** whether it drained the queue or requeued
+some rows and left others behind. Sub-jobs of a live fan-out, and rows that are no
+longer dead-lettered by the time the write runs, are skipped by design — but the
+exit code did not say so, so
+
+```sh
+sdj dlq requeue --queue payments && clear-alert
+```
+
+cleared the alert over a queue that was still stuck.
+
+**Now:** if any matched row was skipped, the command exits **4** and prints the
+skipped counts. A clean drain still exits 0.
+
+**What to check:** an automation that treats any non-zero exit from `dlq requeue`
+as a hard failure will now surface partial drains. That is the point, but if you
+run it from a `set -e` script and would rather keep going, handle 4 explicitly:
+
+```sh
+sdj dlq requeue --queue payments || [ $? -eq 4 ]
+```
+
+**Deliberately unchanged:** "matched nothing at all" still exits **0**. It
+includes the ordinary already-drained queue, so giving it a code of its own would
+break the same `&& clear-alert` invocation this change exists to serve. It prints
+a note on stderr instead. There is no exit 3.
+
+### `OnAttemptEnd`: a hook for attempts that ended without a disposition
+
+Purely additive; nothing fires differently unless you register it.
+
+An attempt can end without persisting any disposition — no complete, fail, retry or
+waiting write landed, because the row stopped being that worker's before one could.
+Cancelled jobs, jobs released by graceful shutdown, and jobs whose lease was lost
+all take this path. `OnAttemptEnd` reports exactly that population.
+
+It exists because those attempts were previously invisible, and the obvious place
+to put them — `OnJobWaiting` — is the wrong one: that hook documents parked
+workflows, and adding cancelled and shutting-down jobs to it would silently change
+what an already-registered callback counts. **`OnJobWaiting`'s population is
+unchanged in this release.**
+
+One boundary worth knowing if you build metrics on it: a job whose type the worker
+has no handler for does **not** reach this hook. The handler lookup happens before
+the observability span is created, so there is no attempt-end to report. Those jobs
+terminally fail and fire `OnJobFail` (which is itself a fix in v4.8.0).
+
+If you use `pkg/otel`, you need do nothing — it registers on this hook itself, which
+is what stops a cancelled job leaking its `job.process` span.
 
 ---
 
@@ -1661,8 +1729,10 @@ Two consequences worth knowing:
 
 ## Rollback
 
-Across the whole v4.6 → v4.8 line there are six forward-only migrations. The last
-four are new in **v4.8.0**; the other two are already in the releases named:
+Across the whole v4.6 → v4.9 line there are six forward-only migrations. The last
+four are new in **v4.8.0**; the other two are already in the releases named.
+**v4.9.0 adds none**, so upgrading from v4.8.0 to v4.9.0 does not touch the schema
+at all:
 
 | Migration | Adds | First shipped in |
 | --- | --- | --- |

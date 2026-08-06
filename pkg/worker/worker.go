@@ -2439,10 +2439,12 @@ func (w *Worker) processJobRun(ctx context.Context, job *core.Job, runToken uint
 		}
 		w.logger.Debug("job attempt ended without reporting a disposition; closing its observability span",
 			"job_id", job.ID, "job_type", job.Type)
-		// The INTERNAL hook, not CallWaitingHooks. Routing abandoned attempts
-		// through the public OnJobWaiting would add cancelled jobs and every
+		// OnAttemptEnd, not CallWaitingHooks. Both are public API on pkg/queue;
+		// the distinction is the POPULATION, not visibility. Routing abandoned
+		// attempts through OnJobWaiting would add cancelled jobs and every
 		// in-flight job on every graceful shutdown to any user counter built on
-		// it — a silent population change in a patch release.
+		// it, silently changing what an already-registered callback observes.
+		// OnAttemptEnd is new, so it has no existing population to change.
 		w.queue.CallAttemptEndHooks(jobCtx, job)
 	}()
 
