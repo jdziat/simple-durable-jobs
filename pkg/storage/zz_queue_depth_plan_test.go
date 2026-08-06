@@ -17,7 +17,8 @@ import (
 // queueDepthQueueOnlyQuery, which is the only thing standing between the queue
 // depth sampler and a full walk of every retained job row.
 //
-// The two orders return byte-identical rows (the caller folds them into a map),
+// The two orders return the same MULTISET of rows in a different order (the caller
+// folds them into a map, so order is not observable),
 // so no behavioural test in this suite can tell them apart — this is the guard
 // that can. Grouping queue-major asks the planner for queue-major order, which it
 // supplies by scanning idx_jobs_queue_created end to end: EVERY row, including
@@ -26,6 +27,16 @@ import (
 //
 // Measured on this exact shape at 300k jobs (3k live, 8 queues), ANALYZEd,
 // best of 5: 121.2ms queue-major vs 1.3ms status-major.
+//
+// ANALYZEd is load-bearing in that sentence, and the honest version of the claim
+// is narrower than "92x faster". Without statistics SQLite falls back to
+// heuristics that happen to pick the right index for BOTH orders, so on a fresh
+// un-ANALYZEd SQLite file the two are indistinguishable. The gap opens once
+// statistics exist — which is the steady state on Postgres and MySQL, where
+// autovacuum/autoanalyze maintain them without anyone asking, and on any SQLite
+// deployment whose operator has ever run ANALYZE. So this is not a win that shows
+// up in a quick local benchmark; it is a win on the databases that have been
+// running long enough to matter.
 func TestQueueDepthGroupByKeepsTheStatusIndex(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStorage(t)

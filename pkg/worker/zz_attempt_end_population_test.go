@@ -353,3 +353,41 @@ func TestOnAttemptEnd_SeparatesAbandonedFromCompletedInTheSameWorker(t *testing.
 	assert.Equal(t, []core.UUID{core.UUID("abandoned")}, probe.firedFor(),
 		"only the attempt that reported no disposition may reach OnAttemptEnd")
 }
+
+// A panicking user hook must be contained, exactly as every other Call*Hooks
+// dispatcher in pkg/queue contains one.
+//
+// This one is special because of WHERE it is called from: processJob's deferred
+// fallback, inside a function that has its own panic recovery whose job is to
+// conclude "the worker panicked, release the row". An unguarded panic in a user
+// callback would therefore not merely skip that callback — it would unwind into
+// that recovery and be logged as a library-side processJob panic, sending an
+// operator to read a stack trace that blames the wrong code.
+//
+// Observability without depending on release semantics: safeUserCallback wraps
+// each hook INDIVIDUALLY, so a later hook still runs after an earlier one panics.
+// Unwrapped, the first panic unwinds out of the loop and the second hook never
+// fires. That difference is what this asserts.
+func TestOnAttemptEnd_ContainsAPanickingUserHook(t *testing.T) {
+	store := &mockStorage{
+		completeFunc: func(context.Context, core.UUID, string) error { return core.ErrJobNotOwned },
+	}
+
+	q := queue.New(store)
+	q.Register("ok", func(context.Context, struct{}) error { return nil })
+
+	var second atomic.Int32
+	q.OnAttemptEnd(func(context.Context, *core.Job) { panic("user OnAttemptEnd hook panicked") })
+	q.OnAttemptEnd(func(context.Context, *core.Job) { second.Add(1) })
+
+	w := NewWorker(q, DisableRetry())
+	require.NotPanics(t, func() {
+		w.processJob(context.Background(), &core.Job{
+			ID: "panicking-hook", Type: "ok", Queue: "default",
+			Args: []byte(`{}`), Attempt: 1, MaxRetries: 3,
+		})
+	}, "a panicking user hook must not escape into processJob's own panic recovery")
+
+	assert.Equal(t, int32(1), second.Load(),
+		"each hook is wrapped individually, so a panic in one must not prevent the next from running")
+}

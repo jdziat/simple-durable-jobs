@@ -75,8 +75,7 @@ Commands:
   requeue           Requeue one dead-lettered job by id or a filtered batch
 
 Bulk requeue exit codes (--queue/--tenant):
-  0                 every matching job was requeued
-  3                 no dead-lettered job matched the filter
+  0                 every matching job was requeued, or none matched
   4                 some matching jobs were skipped and are still dead-lettered
 `
 
@@ -411,8 +410,9 @@ Usage:
   sdj --driver postgres --dsn postgres://user:pass@localhost/db dlq requeue --queue emails --tenant acme
 
 Bulk exit codes (--queue/--tenant):
-  0   every matching job was requeued
-  3   no dead-lettered job matched the filter (typo'd filter, or already drained)
+  0   every matching job was requeued -- or none matched, which includes the
+      ordinary already-drained queue, so 'requeue && clear-alert' still works.
+      A no-match prints a note on stderr.
   4   some matching jobs were skipped and are still dead-lettered
   1   a storage error stopped the run (the partial counts are still printed)
 `)

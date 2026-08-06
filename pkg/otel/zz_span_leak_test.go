@@ -135,11 +135,23 @@ func TestInstrumentedWorkerEndsProcessSpanOnCancel(t *testing.T) {
 	assert.Positive(t, started)
 }
 
-// TestInstrumentedWorkerFiresNoSpuriousWaitingHookOnComplete is the other half of
-// the fix: the fallback that closes an abandoned attempt's span must NOT fire on
-// an attempt that reported its own disposition. Ending an already-ended span is a
-// no-op in OTel, so a blanket fallback would look correct here while calling every
-// user's OnJobWaiting callback for a job that plainly completed.
+// TestInstrumentedWorkerFiresNoSpuriousWaitingHookOnComplete pins that a completed
+// attempt does not reach OnJobWaiting.
+//
+// READ THE SCOPE BEFORE TRUSTING IT. This catches the original incident shape —
+// the fallback routed through CallWaitingHooks *and* made unconditional — because
+// then a plainly-completed job would call every user's OnJobWaiting. It does NOT
+// catch the fallback merely becoming unconditional, because the fallback no longer
+// calls CallWaitingHooks at all: it calls CallAttemptEndHooks, which this test does
+// not observe. Deleting `if dispositionReported.reported { return }` leaves this
+// test green.
+//
+// An earlier version of this comment claimed the broader property, which is how a
+// reviewer would conclude the whole attemptDisposition mechanism was covered when
+// it was not. The mutation that this test cannot see is caught by
+// TestOnAttemptEnd_DoesNotFireWhenADispositionWasPersisted in pkg/worker, which
+// counts the hook the fallback actually calls and was verified to redden under
+// exactly that edit.
 func TestInstrumentedWorkerFiresNoSpuriousWaitingHookOnComplete(t *testing.T) {
 	counter := newStartedSpanCounter()
 	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(counter))

@@ -54,7 +54,7 @@ func (s *GormStorage) GetQueueStats(ctx context.Context) ([]*jobsv1.QueueStats, 
 // # WHY THE GROUP BY LEADS WITH status
 //
 // See queueDepthQueueOnlyQuery: the grouping ORDER decides which index the
-// planner walks, and the two orders return identical rows, so nothing else in
+// planner walks, and the two orders return the same rows, so nothing else in
 // this suite can tell them apart.
 func (s *GormStorage) GetQueueDepthQueueOnly(ctx context.Context) (map[string][2]int64, error) {
 	type row struct {
@@ -85,7 +85,8 @@ func (s *GormStorage) GetQueueDepthQueueOnly(ctx context.Context) (map[string][2
 // queueDepthQueueOnlyQuery builds the per-queue depth aggregate.
 //
 // The GROUP BY leads with status, and that ORDER is load-bearing. The two orders
-// return byte-identical rows — the caller folds them into a map — so no
+// return the same multiset of rows in a different order — the caller folds them
+// into a map, so the order is not observable — so no
 // behavioural test can distinguish them, but they select different plans:
 //
 //	GROUP BY queue, status → SCAN jobs USING INDEX idx_jobs_queue_created

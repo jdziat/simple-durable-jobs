@@ -170,10 +170,27 @@ queue actually drained:
 
 | Exit | Meaning |
 | ---- | ------- |
-| `0` | every matching dead-lettered job was requeued |
-| `3` | no dead-lettered job matched the filter — a typo'd `--queue`/`--tenant`, or the queue was already drained |
+| `0` | every matching dead-lettered job was requeued — **or** none matched |
 | `4` | some matching jobs were skipped and are still dead-lettered (see the `skipped N ...` lines) |
 | `1` | a storage error stopped the run; the counts reached so far are still printed |
+
+"Nothing matched" deliberately shares exit `0` with a clean drain rather than
+taking a code of its own. It includes the ordinary already-drained queue, so a
+non-zero exit there would break the very `&& clear-alert` invocation above and
+abort a `set -e` cron. The command prints a note on **stderr** instead, which a
+script can capture when it needs to tell the two apart:
+
+```sh
+sdj dlq requeue --queue "$Q" 2>err.log && clear-alert
+grep -q 'no dead-lettered jobs matched' err.log && echo "filter matched nothing"
+```
+
+If you run the command under `set -e` and would rather continue past a partial
+drain, handle `4` explicitly:
+
+```sh
+sdj dlq requeue --queue "$Q" || [ $? -eq 4 ]
+```
 
 Requeueing a single job by id is unchanged: exit `0` on success, exit `1` when the
 id does not exist or the job is not failed or cancelled.

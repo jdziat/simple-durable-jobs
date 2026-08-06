@@ -76,6 +76,36 @@ func TestNoHandlerJobCountsAsFailed(t *testing.T) {
 		return failHookCalls, failHookErr
 	}
 
+	// The EVENT is a separate assertion from the hook, because they have separate
+	// consumers and separate call sites. pkg/metrics drives jobs.failed from the
+	// hook; the dashboard's failed counter and the SSE stream are driven from the
+	// JobFailed EVENT. Review found that deleting the Emit(&core.JobFailed{...})
+	// line from the no-handler branch left the whole suite green — so the half of
+	// the fix that feeds the UI was pinned by nothing while the half that feeds
+	// this counter was pinned twice.
+	events := consumer.Events()
+	defer consumer.Unsubscribe(events)
+	var eventMu sync.Mutex
+	var failedEvents []*core.JobFailed
+	eventsDone := make(chan struct{})
+	go func() {
+		defer close(eventsDone)
+		for ev := range events {
+			if failed, ok := ev.(*core.JobFailed); ok {
+				eventMu.Lock()
+				failedEvents = append(failedEvents, failed)
+				eventMu.Unlock()
+			}
+		}
+	}()
+	readEvents := func() []*core.JobFailed {
+		eventMu.Lock()
+		defer eventMu.Unlock()
+		out := make([]*core.JobFailed, len(failedEvents))
+		copy(out, failedEvents)
+		return out
+	}
+
 	w := worker.NewWorker(consumer, worker.WithPollInterval(50*time.Millisecond))
 	runCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
@@ -110,6 +140,20 @@ func TestNoHandlerJobCountsAsFailed(t *testing.T) {
 	assert.Contains(t, hookErr.Error(), "no handler for orphaned-type",
 		"the hook's error must say what actually happened; alert text and the DLQ "+
 			"row's reason are built from the same error")
+
+	require.Eventually(t, func() bool { return len(readEvents()) > 0 }, 5*time.Second, 25*time.Millisecond,
+		"a terminal no-handler failure must also EMIT JobFailed; the dashboard's failed "+
+			"counter and the SSE stream read the event, not the hook, so emitting neither "+
+			"leaves an operator watching a flat graph while jobs dead-letter")
+
+	emitted := readEvents()
+	require.Len(t, emitted, 1, "exactly one JobFailed event for one terminal failure")
+	require.NotNil(t, emitted[0].Job)
+	assert.Equal(t, jobID, emitted[0].Job.ID, "the event must carry the job that failed")
+	require.Error(t, emitted[0].Error)
+	assert.Contains(t, emitted[0].Error.Error(), "no handler for orphaned-type",
+		"the event and the hook are built from the same error value, so the UI and an "+
+			"alert cannot disagree about why the job died")
 
 	rm := collectMetrics(t, reader)
 	assertCounterPoint(t, rm, metricJobsFailed, 1, map[string]string{

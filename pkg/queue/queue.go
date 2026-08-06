@@ -1311,7 +1311,12 @@ func (q *Queue) CallAttemptEndHooks(ctx context.Context, job *core.Job) {
 	copy(hooks, q.onAttemptEnd)
 	q.mu.RUnlock()
 	for _, fn := range hooks {
-		fn(ctx, job)
+		// safeUserCallback, exactly like every other Call*Hooks dispatcher here.
+		// This one is called from processJob's deferred fallback, so an unguarded
+		// panic would not merely skip the hook: it would unwind into the
+		// "processJob panicked → release the job" recovery and be reported as a
+		// worker-side panic, blaming the library for a user callback.
+		safeUserCallback("OnAttemptEnd hook", job.ID, func() { fn(ctx, job) })
 	}
 }
 
