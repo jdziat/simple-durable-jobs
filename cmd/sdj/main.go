@@ -29,6 +29,17 @@ const (
 	exitOK      = 0
 	exitError   = 1
 	exitHandled = 2
+	// exitPartial exists so `dlq requeue --queue "$Q" && clear-alert` means what an
+	// operator thinks it means. A bulk requeue used to exit 0 whether it drained the
+	// queue or requeued some rows and skipped others — two outcomes an automation
+	// must act on differently, collapsed into one code. Now a skipped row is a
+	// non-zero exit, so the alert is not cleared over a queue that is still stuck.
+	//
+	// "Matched nothing" deliberately does NOT get its own code: it includes the
+	// ordinary already-drained queue, so returning non-zero there would break the
+	// same `&& clear-alert` invocation this constant exists to serve, and abort any
+	// `set -e` cron. It reports on stderr instead. There is no exit 3.
+	exitPartial = 4
 )
 
 const usageText = `sdj is the Simple Durable Jobs operations CLI.
@@ -62,6 +73,10 @@ Usage:
 Commands:
   list              List dead-lettered jobs as a table, JSON, or IDs only
   requeue           Requeue one dead-lettered job by id or a filtered batch
+
+Bulk requeue exit codes (--queue/--tenant):
+  0                 every matching job was requeued, or none matched
+  4                 some matching jobs were skipped and are still dead-lettered
 `
 
 type globalOptions struct {
@@ -393,6 +408,13 @@ Usage:
   sdj --driver sqlite --dsn ./jobs.db dlq requeue <jobID>
   sdj --driver postgres --dsn postgres://user:pass@localhost/db dlq requeue <jobID>
   sdj --driver postgres --dsn postgres://user:pass@localhost/db dlq requeue --queue emails --tenant acme
+
+Bulk exit codes (--queue/--tenant):
+  0   every matching job was requeued -- or none matched, which includes the
+      ordinary already-drained queue, so 'requeue && clear-alert' still works.
+      A no-match prints a note on stderr.
+  4   some matching jobs were skipped and are still dead-lettered
+  1   a storage error stopped the run (the partial counts are still printed)
 `)
 	fs.StringVar(&filter.Queue, "queue", "", "Bulk requeue dead-lettered jobs in this queue")
 	fs.StringVar(&filter.Tenant, "tenant", "", "Bulk requeue dead-lettered jobs for this tenant")
@@ -480,7 +502,9 @@ func (a app) runDLQRequeueBulk(ctx context.Context, store *jobs.GormStorage, fil
 	filter.Limit = batchLimit
 	filter.Offset = 0
 
-	var requeued, skippedSubJobs, skippedOther int
+	// matched counts the rows the LISTING handed back across all pages. Only its
+	// zero-ness is used, so the paging cursor's step-over semantics cannot skew it.
+	var requeued, skippedSubJobs, skippedOther, matched int
 	report := func() {
 		_, _ = fmt.Fprintf(a.stdout, "requeued %d jobs\n", requeued)
 		if skippedSubJobs > 0 {
@@ -500,6 +524,7 @@ func (a app) runDLQRequeueBulk(ctx context.Context, store *jobs.GormStorage, fil
 		if len(dead) == 0 {
 			break
 		}
+		matched += len(dead)
 		for _, job := range dead {
 			ok, err := store.Requeue(ctx, job.ID)
 			switch {
@@ -538,6 +563,28 @@ func (a app) runDLQRequeueBulk(ctx context.Context, store *jobs.GormStorage, fil
 	}
 
 	report()
+	// Three outcomes, TWO exit codes — see exitPartial. The distinction is made
+	// from what the LISTING returned, not from what Requeue reported: a filter that
+	// matched nothing at all and a filter whose every match was unrequeueable need
+	// opposite operator responses (check the filter vs. investigate the rows), and
+	// both used to exit 0 alongside a clean drain. Only the second gets a code; the
+	// first is reported on stderr, for the reason below.
+	switch {
+	case matched == 0:
+		// EXIT 0, not a distinct code. "Nothing matched" includes the ordinary
+		// already-drained queue, and the runbook's own example is
+		// `sdj dlq requeue --queue "$Q" && clear-alert` — returning non-zero there
+		// would stop clearing the alert on a healthy queue and would abort a
+		// `set -e` cron. Distinguishability comes from a line on STDERR, which
+		// scripts can capture and humans can read, without changing what every
+		// existing invocation returns.
+		// report() has already printed "requeued 0 jobs"; do not repeat it.
+		_, _ = fmt.Fprintln(a.stderr, "note: no dead-lettered jobs matched the filter — check --queue/--tenant, or the queue is already drained")
+		return exitOK
+	case skippedSubJobs > 0 || skippedOther > 0:
+		_, _ = fmt.Fprintln(a.stdout, "some matching jobs were not requeued; see the skipped counts above")
+		return exitPartial
+	}
 	return exitOK
 }
 

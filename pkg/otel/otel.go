@@ -107,6 +107,13 @@ func Instrument(q *queue.Queue, opts ...InstrumentOption) {
 	// StatusWaiting (fan-out / signal wait). The resumed attempt later starts a
 	// brand-new span via startCtxHook.
 	q.OnJobWaiting(waitingHook())
+	// Also close the span for an attempt that ended WITHOUT a disposition —
+	// cancelled mid-run, released on shutdown, ownership lost. Those attempts fire
+	// no complete/fail/waiting hook, so without this their span is never ended: the
+	// SDK retains it and never exports it, one per cancelled job. Registered on the
+	// internal hook rather than OnJobWaiting so the public hook's documented
+	// population (parked on a signal, sleep or fan-out) does not change.
+	q.OnAttemptEnd(waitingHook())
 }
 
 // enqueueMiddleware returns middleware that serializes the current span context

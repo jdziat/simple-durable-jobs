@@ -16,6 +16,19 @@ import (
 // (SQLite ~32k, Postgres 65535). It matches PurgeJobs' purgeBatchSize.
 const retentionDeleteChunkSize = 1000
 
+// retentionTerminalIndexPredicate is the WHERE clause of the partial
+// idx_jobs_retention_terminal, and the term DeleteTerminalJobsOlderThan repeats
+// so the planner can see the index applies. Both read this one constant because
+// a partial index and the query it was built for are the same decision written
+// twice, and this repo has already shipped an index whose predicate no query
+// matched.
+//
+// It is a hardcoded literal, NOT derived from core.TerminalJobStatuses, on
+// purpose: it is the text of a shipped, versioned migration. Adding a fourth
+// terminal status must not silently change what an already-applied migration
+// says the index covers.
+const retentionTerminalIndexPredicate = "status IN ('completed','failed','cancelled')"
+
 // chunkIDs splits ids into consecutive slices of at most size elements, so a
 // literal SQL IN-list built from one chunk stays within the driver's
 // bind-parameter ceiling. The returned slices alias ids; callers must not retain
@@ -141,13 +154,37 @@ func (s *GormStorage) DeleteTerminalJobsOlderThan(ctx context.Context, status co
 		lockBinds = []any{lockNow, lockNow, lockNow}
 	}
 
+	// The partial-index term, on the dialects that HAVE a partial index. See
+	// retentionTerminalIndexPredicate: MySQL's idx_jobs_retention_terminal is a
+	// plain (status, completed_at) index with no predicate to satisfy, so the extra
+	// clause buys nothing there and is omitted rather than handed to an optimizer
+	// it cannot help — the change is confined to the dialects it was measured on.
+	partialIndexTerms := []string{retentionTerminalIndexPredicate}
+	if s.dialect() == dialectMySQL {
+		partialIndexTerms = nil
+	}
+
 	var deleted int64
 	err := s.withSerializationRetry(ctx, func() error {
 		deleted = 0
 		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 			var ids []core.UUID
 			query := tx.Model(&core.Job{}).
-				Where("status = ?", status).
+				Where("status = ?", status)
+			// Logically implied by `status = ?` above — status is validated to be one
+			// of exactly these three at the top of this function — but a PARTIAL index
+			// is only usable when the planner can see that its own WHERE clause is
+			// satisfied, and SQLite matches partial-index predicates against the terms
+			// actually present in the query rather than deriving them.
+			// idx_jobs_retention_terminal is defined `WHERE status IN
+			// ('completed','failed','cancelled') AND completed_at IS NOT NULL`, so
+			// without this term the index built FOR this sweep can never serve it —
+			// `INDEXED BY idx_jobs_retention_terminal` answers "no query solution" —
+			// and the index is pure write carrying-cost.
+			for _, term := range partialIndexTerms {
+				query = query.Where(term)
+			}
+			query = query.
 				Where("completed_at IS NOT NULL").
 				Where("completed_at < ?", cutoff).
 				Where(parentChildGuard).

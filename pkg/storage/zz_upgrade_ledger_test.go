@@ -47,6 +47,36 @@ func TestUpgradeLedgerNamesEveryMigration(t *testing.T) {
 	}
 	require.NotEmpty(t, rows, "%s has no **vNN** ledger rows at all", upgradeLedgerPath)
 
+	// Each row must also carry a plausible DESCRIPTION and a shipped-in version.
+	// A CTO review pointed out that pinning row PRESENCE is the same shape that
+	// failed in round 45 — a guard that certifies prose exists rather than that it
+	// is true. Verified: before this block, rewriting v41's row to
+	// "totally_wrong_thing | v4.2.0" passed.
+	rowRe := regexp.MustCompile(`\|\s*\*\*v(\d+)\*\*\s*\|([^|]*)\|([^|]*)\|`)
+	for _, m := range rowRe.FindAllStringSubmatch(page, -1) {
+		n, desc, shipped := m[1], strings.TrimSpace(m[2]), strings.TrimSpace(m[3])
+		require.NotEmptyf(t, desc, "%s: ledger row **v%s** has an empty description", upgradeLedgerPath, n)
+		require.Regexpf(t, `^v\d+\.\d+\.\d+$`, shipped,
+			"%s: ledger row **v%s** has %q in the 'First shipped in' column, which is not a version",
+			upgradeLedgerPath, n, shipped)
+		// The description must name a REAL identifier. Entries reference an `Up:`
+		// function rather than inline SQL, so resolving row -> exact migration body
+		// would mean following that indirection; instead require the identifier to
+		// exist somewhere in the migration source. That is weaker — it would not
+		// catch a row naming a real identifier belonging to a DIFFERENT migration —
+		// but it does catch an invented one, which is the failure a CTO review
+		// demonstrated by rewriting v41's row to `totally_wrong_thing`.
+		if token := regexp.MustCompile("`([a-z_0-9.]+)`").FindStringSubmatch(desc); token != nil {
+			ident := token[1]
+			if i := strings.LastIndex(ident, "."); i >= 0 {
+				ident = ident[i+1:]
+			}
+			require.Containsf(t, migrationsSource(t), ident,
+				"%s: ledger row **v%s** claims it adds %q, but no migration mentions %q",
+				upgradeLedgerPath, n, token[1], ident)
+		}
+	}
+
 	for n := lowest; n <= head; n++ {
 		require.Truef(t, documented[fmt.Sprint(n)],
 			"%s documents migrations v%d..v%d but omits **v%d**; the registry head is %d. "+
@@ -63,4 +93,13 @@ func TestUpgradeLedgerNamesEveryMigration(t *testing.T) {
 		require.Containsf(t, strings.ToLower(page), w+" forward-only migrations",
 			"%s should say %q forward-only migrations for v%d..v%d", upgradeLedgerPath, w, lowest, head)
 	}
+}
+
+// migrationsSource returns migrations.go, so a ledger row's claimed identifier can
+// be checked for existence rather than taken on trust.
+func migrationsSource(t *testing.T) string {
+	t.Helper()
+	b, err := os.ReadFile("migrations.go")
+	require.NoError(t, err)
+	return string(b)
 }

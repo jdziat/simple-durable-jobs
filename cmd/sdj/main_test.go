@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"path/filepath"
+	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -171,6 +173,12 @@ func TestRunDLQRequeueBulkSQLite(t *testing.T) {
 	seedCLIDeadLetterJob(t, store, "00000000-0000-7000-8000-000000000211", "emails", "tenant-a", nil)
 	seedCLIDeadLetterJob(t, store, "00000000-0000-7000-8000-000000000212", "emails", "tenant-a", nil)
 	seedCLIDeadLetterJob(t, store, "00000000-0000-7000-8000-000000000213", "emails", "tenant-b", nil)
+	// The queue-scope bystander: SAME tenant, DIFFERENT queue. Without it the only
+	// non-matching row also differed by tenant, so the tenant clause alone
+	// distinguished it and deleting the --queue predicate entirely
+	// (storage.deadLetterQuery) left this test green while `dlq requeue --queue
+	// emails` silently drained every other queue.
+	seedCLIDeadLetterJob(t, store, "00000000-0000-7000-8000-000000000214", "billing", "tenant-a", nil)
 
 	stdout.Reset()
 	stderr.Reset()
@@ -186,8 +194,82 @@ func TestRunDLQRequeueBulkSQLite(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list dead-lettered: %v", err)
 	}
-	if len(dead) != 1 || dead[0].ID != "00000000-0000-7000-8000-000000000213" {
-		t.Fatalf("remaining dead-lettered = %v, want only dlq-globex-1", dead)
+	remaining := make([]string, 0, len(dead))
+	for _, job := range dead {
+		remaining = append(remaining, string(job.ID))
+	}
+	sort.Strings(remaining)
+	want := []string{
+		"00000000-0000-7000-8000-000000000213", // other tenant, same queue
+		"00000000-0000-7000-8000-000000000214", // same tenant, other queue
+	}
+	if !reflect.DeepEqual(remaining, want) {
+		t.Fatalf("remaining dead-lettered = %v, want %v (both scope predicates must apply)", remaining, want)
+	}
+}
+
+// TestRunDLQRequeueBulkExitCodesSQLite pins that the three bulk outcomes are
+// distinguishable from a shell. `sdj dlq requeue --queue "$Q" && clear-alert`
+// used to clear the alert when the filter matched nothing at all and when rows
+// were skipped and left dead-lettered.
+func TestRunDLQRequeueBulkExitCodesSQLite(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "jobs.db")
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"--driver", "sqlite", "--dsn", dbPath, "migrate"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("migrate exit code = %d, stderr = %q", code, stderr.String())
+	}
+	store := openSQLiteStoreForTest(t, dbPath)
+
+	requeue := func(queue string) (int, string) {
+		t.Helper()
+		stdout.Reset()
+		stderr.Reset()
+		code := run([]string{"--driver", "sqlite", "--dsn", dbPath, "dlq", "requeue", "--queue", queue}, &stdout, &stderr)
+		return code, stdout.String()
+	}
+
+	// (1) Nothing matches. This must still exit 0: "nothing matched" includes the
+	// ordinary already-drained queue, and the runbook's own example is
+	// `sdj dlq requeue --queue "$Q" && clear-alert`. Changing that to non-zero
+	// would stop clearing the alert on a healthy queue and abort a `set -e` cron —
+	// a user-visible CLI break in a patch release. Distinguishability lives on
+	// STDERR instead, where a script can capture it and a human can read it.
+	code, out := requeue("no-such-queue")
+	if code != exitOK {
+		t.Fatalf("empty filter exit code = %d, want %d (already-drained is not a failure); stdout = %q", code, exitOK, out)
+	}
+	if !strings.Contains(out, "requeued 0 jobs") {
+		t.Fatalf("stdout = %q, want the zero count", out)
+	}
+
+	// (2) A clean drain.
+	seedCLIDeadLetterJob(t, store, "00000000-0000-7000-8000-000000000221", "clean", "", nil)
+	code, out = requeue("clean")
+	if code != exitOK {
+		t.Fatalf("clean drain exit code = %d, want %d; stdout = %q", code, exitOK, out)
+	}
+	if !strings.Contains(out, "requeued 1 jobs") {
+		t.Fatalf("stdout = %q, want the requeued count", out)
+	}
+
+	// (3) A partial run: a dead-lettered fan-out sub-job is rejected by Requeue by
+	// design, so it stays dead-lettered and the operator must not be told the
+	// queue is clear.
+	seedCLIDeadLetterJob(t, store, "00000000-0000-7000-8000-000000000231", "mixed", "", nil)
+	seedCLIDeadLetterSubJob(t, store, "00000000-0000-7000-8000-000000000232", "mixed")
+	code, out = requeue("mixed")
+	if code != exitPartial {
+		t.Fatalf("partial run exit code = %d, want %d; stdout = %q", code, exitPartial, out)
+	}
+	if !strings.Contains(out, "skipped 1 fan-out sub-jobs") {
+		t.Fatalf("stdout = %q, want the skipped sub-job count", out)
+	}
+	dead, err := store.ListDeadLettered(context.Background(), jobs.DeadLetterFilter{Queue: "mixed", Limit: 10})
+	if err != nil {
+		t.Fatalf("list dead-lettered: %v", err)
+	}
+	if len(dead) != 1 || string(dead[0].ID) != "00000000-0000-7000-8000-000000000232" {
+		t.Fatalf("remaining dead-lettered = %v, want the sub-job still queued", dead)
 	}
 }
 
@@ -309,6 +391,31 @@ func openSQLiteStoreForTest(t *testing.T, path string) *jobs.GormStorage {
 	}
 	t.Cleanup(func() { closeStore(opened) })
 	return opened.store
+}
+
+// seedCLIDeadLetterSubJob seeds a dead-lettered FAN-OUT SUB-JOB: Requeue rejects
+// it with ErrCannotRequeueSubJob by design (replay goes through the parent), so
+// it is what a bulk run skips and leaves in the DLQ.
+func seedCLIDeadLetterSubJob(t *testing.T, store *jobs.GormStorage, id, queue string) {
+	t.Helper()
+	now := time.Now()
+	fanOutID := jobs.UUID("00000000-0000-7000-8000-0000000009f0")
+	err := store.DB().Create(&jobs.Job{
+		ID:               jobs.UUID(id),
+		Type:             "send-email",
+		Queue:            queue,
+		Status:           jobs.StatusFailed,
+		Attempt:          1,
+		MaxRetries:       1,
+		LastError:        "boom",
+		FanOutID:         &fanOutID,
+		DeadLetteredAt:   &now,
+		DeadLetterReason: "max retries exhausted: boom",
+		CompletedAt:      &now,
+	}).Error
+	if err != nil {
+		t.Fatalf("seed dlq sub-job %s: %v", id, err)
+	}
 }
 
 func seedCLIDeadLetterJob(t *testing.T, store *jobs.GormStorage, id, queue, tenant string, metadata jobs.MetadataMap) {

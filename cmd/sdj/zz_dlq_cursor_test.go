@@ -84,10 +84,14 @@ func TestRunDLQRequeueBulkCursorDoesNotSkipRows(t *testing.T) {
 		var out, errb bytes.Buffer
 		done <- run([]string{"--driver", "sqlite", "--dsn", dbPath, "dlq", "requeue", "--queue", "emails"}, &out, &errb)
 	}()
+	// exitPartial, not exitOK: this fixture is a full page of rows that stay
+	// dead-lettered by construction, which is exactly the outcome that code now
+	// reports. What this test is about is that the run TERMINATES and visits the
+	// rows behind them.
 	select {
 	case code := <-done:
-		if code != 0 {
-			t.Fatalf("dlq requeue exit code = %d", code)
+		if code != exitPartial {
+			t.Fatalf("dlq requeue exit code = %d, want %d (the stuck page is skipped, not drained)", code, exitPartial)
 		}
 	case <-time.After(30 * time.Second):
 		t.Fatal("dlq requeue never terminated: the cursor failed to advance past a row " +
@@ -96,8 +100,8 @@ func TestRunDLQRequeueBulkCursorDoesNotSkipRows(t *testing.T) {
 
 	stdout.Reset()
 	stderr.Reset()
-	if code := run([]string{"--driver", "sqlite", "--dsn", dbPath, "dlq", "requeue", "--queue", "emails"}, &stdout, &stderr); code != 0 {
-		t.Fatalf("dlq requeue exit code = %d, stderr = %q", code, stderr.String())
+	if code := run([]string{"--driver", "sqlite", "--dsn", dbPath, "dlq", "requeue", "--queue", "emails"}, &stdout, &stderr); code != exitPartial {
+		t.Fatalf("dlq requeue exit code = %d, want %d, stderr = %q", code, exitPartial, stderr.String())
 	}
 
 	// Every ordinary row behind the stuck page must have been requeued; only the

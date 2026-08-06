@@ -944,7 +944,8 @@ func migrateRetentionTerminalIndex(ctx context.Context, db *gorm.DB, dialect str
 		return nil
 	default:
 		return db.Exec(
-			"CREATE INDEX IF NOT EXISTS idx_jobs_retention_terminal ON jobs (status, completed_at) WHERE status IN ('completed','failed','cancelled') AND completed_at IS NOT NULL",
+			"CREATE INDEX IF NOT EXISTS idx_jobs_retention_terminal ON jobs (status, completed_at) WHERE " +
+				retentionTerminalIndexPredicate + " AND completed_at IS NOT NULL",
 		).Error
 	}
 }
@@ -1456,7 +1457,8 @@ func migrateScaleFinishIndexes(ctx context.Context, db *gorm.DB, dialect string)
 			return fmt.Errorf("drop idx_jobs_retention_terminal: %w", err)
 		}
 		if err := db.WithContext(ctx).Exec(
-			"CREATE INDEX IF NOT EXISTS idx_jobs_retention_terminal ON jobs (status, completed_at, id) WHERE status IN ('completed','failed','cancelled') AND completed_at IS NOT NULL",
+			"CREATE INDEX IF NOT EXISTS idx_jobs_retention_terminal ON jobs (status, completed_at, id) WHERE " +
+				retentionTerminalIndexPredicate + " AND completed_at IS NOT NULL",
 		).Error; err != nil {
 			return fmt.Errorf("create idx_jobs_retention_terminal: %w", err)
 		}
