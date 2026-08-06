@@ -131,3 +131,32 @@ and routed. Otherwise "not silent" is true on paper and false in practice.
 - Backlog-gauge blanking under positive DB clock skew.
 - The chaos mutation matrix on MySQL (dialect-specific branches of
   `checkExactlyOnce`, `checkRateWellFormed`, `checkSlotNoLeak`).
+
+## A HARD invariant sub-check that has never seen a non-empty input
+
+`checkExactlyOnce`'s third term, `windowCheckpointedRows` (`cmd/chaostest/main.go:993`),
+is one of the three conditions gating a HARD invariant — and therefore gates every
+future release. It has passed on every run so far with an **empty input set**: both
+chaos runs on this branch reported `window_reexec_markers=0`, so the query returned
+zero rows because there were no rows to return, not because the property held.
+
+That is not a defect and it did not block v4.9.0. It is recorded here because of
+how it will fail if it is wrong. A false-fire will not surface now, while the
+change is fresh and attributable; it will surface on some future run, and will look
+like a regression in whatever landed that day. The cost of finding that out later
+is paid by whoever is least equipped to explain it.
+
+Two ways to close it, in preference order:
+
+1. A torture run with `CHAOS_SCALE` raised until re-execution markers appear inside
+   the window, so the check is observed evaluating a populated set.
+2. Failing that, a unit-level probe that seeds the shape the query looks for and
+   asserts it both fires and does not false-fire — the same two-sided treatment
+   `TestExactlyOnceRedensOnASeededDuplicate` and
+   `TestExactlyOnceIgnoresTheDocumentedAtLeastOnceWindow` give the sibling terms.
+
+Worth stating plainly, since this whole round exists because of it: an invariant
+that has only ever been evaluated against an empty set is in exactly the position
+`duplicate_effect_groups` was in before this round — passing, trusted, and proving
+nothing. `TestEveryHardInvariantCanFail` guards the invariant as a whole, not each
+term within it.
