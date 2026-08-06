@@ -71,11 +71,18 @@ fan-out and signal paths; `DequeueReleasedByReason` returns all 7 documented rea
 ## SQL plans (`ui`)
 
 - **`GetQueueDepthQueueOnly` flips to a 300k-row scan after `ANALYZE`** — 1043ms vs
-  8.0ms for the same query written `GROUP BY status, queue` (130x). 3/4: the
-  library never runs `ANALYZE`, so the shipped state plans correctly at 7.4ms.
-  One-word fix (swap the GROUP BY column order) removes the trap for free.
-  **Postgres autovacuum ANALYZEs automatically, so that escape hatch may not exist
-  there — unverified.**
+  8.0ms for the same query written `GROUP BY status, queue` (130x).
+  3/4 **on the SILENCE prong**: 1043ms crosses GORM's 200ms Warn threshold, so the
+  default logger names the statement.
+
+  **DO NOT refute a plan finding with "the library never runs ANALYZE".** That was
+  this entry's original reasoning and it is wrong. It holds only on SQLite. Postgres
+  autovacuum issues `ANALYZE` automatically once roughly `50 + 0.1 x reltuples` rows
+  change, and `jobs` is the highest-churn table in the system — every enqueue an
+  insert, every transition an update. The analyzed state is the STEADY state there,
+  not an edge case. A future plan finding that lands at ~150ms after autoanalyze
+  would be silent, ordinary, >=10x and unbounded — 4/4 — and that phrase would
+  wrongly kill it.
 - `SearchJobs` with no filter (the dashboard default) scans + temp-B-tree sorts,
   549ms at 300k. Already measured and published in `jobSortOrder`'s godoc; closing
   it needs a new index, i.e. a schema change.
@@ -100,6 +107,18 @@ statement-level and the 4880x is an idle pass that deletes nothing.
 
 Worth doing — it is one redundant clause — but it does not warrant a remediation
 cycle ahead of anything above.
+
+## A caution on the "not silent, GORM warns" refutation
+
+Two findings above are now refuted on the grounds that GORM's default slow-query
+logger (Warn, 200ms) names the statement. That is literally true and operationally
+weak: production users routinely install `logger.Silent`, and this repo's own
+dequeue path uses a silenced handle. It holds for these two only because they run
+on the un-silenced `s.db`.
+
+If that signal is going to carry refutations, it has to be watchable — expose a
+slow-query counter, or document that operators must keep GORM's slow log enabled
+and routed. Otherwise "not silent" is true on paper and false in practice.
 
 ## Needs live Postgres/MySQL (agents are SQLite-only)
 

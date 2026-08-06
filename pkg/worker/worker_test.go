@@ -4852,7 +4852,7 @@ func TestHandleError_NotOwnedSkipsFanOutAccounting(t *testing.T) {
 	job := &core.Job{ID: "sub-1", FanOutID: &fanOutID, Attempt: 5, MaxRetries: 3}
 
 	ctx := context.Background()
-	w.handleError(ctx, ctx, job, errors.New("boom"))
+	w.handleError(ctx, ctx, job, errors.New("boom"), &attemptDisposition{})
 
 	assert.Equal(t, int32(0), incrementCalled.Load(),
 		"a job we no longer own must not write to the fan-out counters")
@@ -4881,7 +4881,7 @@ func TestHandleError_OwnedStillAccountsFanOut(t *testing.T) {
 	job := &core.Job{ID: "sub-1", FanOutID: &fanOutID, Attempt: 5, MaxRetries: 3}
 
 	ctx := context.Background()
-	w.handleError(ctx, ctx, job, errors.New("boom"))
+	w.handleError(ctx, ctx, job, errors.New("boom"), &attemptDisposition{})
 
 	assert.Equal(t, int32(1), incrementCalled.Load(),
 		"a job we still own must record its failure against the fan-out")

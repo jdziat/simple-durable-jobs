@@ -164,6 +164,20 @@ longer failed or cancelled (or has since been deleted) under `skipped N jobs
 that could not be requeued`. The `requeued N jobs` summary is printed even when the run
 stops early on a storage error, so a partial run is never silent.
 
+A bulk requeue reports its outcome in the exit code, so
+`sdj dlq requeue --queue "$Q" && clear-alert` only clears the alert when the
+queue actually drained:
+
+| Exit | Meaning |
+| ---- | ------- |
+| `0` | every matching dead-lettered job was requeued |
+| `3` | no dead-lettered job matched the filter — a typo'd `--queue`/`--tenant`, or the queue was already drained |
+| `4` | some matching jobs were skipped and are still dead-lettered (see the `skipped N ...` lines) |
+| `1` | a storage error stopped the run; the counts reached so far are still printed |
+
+Requeueing a single job by id is unchanged: exit `0` on success, exit `1` when the
+id does not exist or the job is not failed or cancelled.
+
 ## Health Probes
 
 Headless workers can expose probes with `Worker.HealthHandler()`:
@@ -284,8 +298,13 @@ that makes a delayed/scheduled job dequeue-visible, so it always runs and cannot
 be disabled; it is idempotent and bounded (PostgreSQL/SQLite use the partial
 index `idx_jobs_dq_unready`; MySQL uses the `(status, dq_ready)` prefix of
 `idx_jobs_dq_ready`), so it scans only the not-yet-eligible set, never the whole
-ready backlog. The chaos suite's `INV-READY-NO-STUCK` invariant asserts no
-eligible job is ever left unready.
+ready backlog. The chaos suite's `INV-READY-NO-STUCK` invariant samples this
+during its drain and fails if any single job stays eligible-but-unready across 30
+consecutive one-second samples — far longer than a promoter running at the poll
+interval can take, so only a row nothing is healing reaches it.
+It deliberately does not assert that no job is *ever momentarily* unready: a job
+is unready for the instant between its `run_at` passing and the next promoter
+pass, by design.
 
 ### MySQL must default to utf8mb4
 

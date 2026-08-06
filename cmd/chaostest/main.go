@@ -115,25 +115,69 @@ func openApp(ctx context.Context) (*app, error) {
 // selects Postgres.
 func openDialector() (gorm.Dialector, string) {
 	if dsn := os.Getenv("TEST_MYSQL_URL"); dsn != "" {
-		return mysql.Open(dsn), "mysql"
+		return mysql.Open(dsn), dialectMySQL
 	}
 	dsn := os.Getenv("TEST_DATABASE_URL")
 	if dsn == "" {
 		dsn = defaultDatabaseURL
 	}
-	return postgres.Open(dsn), "postgres"
+	return postgres.Open(dsn), dialectPostgres
 }
 
+const (
+	dialectPostgres = "postgres"
+	dialectMySQL    = "mysql"
+	// dialectSQLite is not reachable from openDialector — the chaos harness needs
+	// multiple worker PROCESSES against one database, which SQLite cannot serve.
+	// It exists so the invariant checks themselves are testable in-process: every
+	// one of them is a SQL assertion, and a release gate whose assertions are never
+	// executed by a test is how a check comes to be silently vacuous.
+	dialectSQLite = "sqlite"
+)
+
+// fixedAttemptNonce is the attempt_nonce every effect that is NOT written inside
+// a checkpoint transaction carries. Those effects are at-least-once BY DESIGN —
+// a SIGKILL between the effect commit and the job's completion write replays the
+// handler — so a second row for the same (job_id, marker) must keep colliding
+// with the unique index exactly as it did before attempt_nonce existed.
+//
+// See insertEffectAttempt for the other half.
+const fixedAttemptNonce = ""
+
 func ensureLedger(ctx context.Context, db *gorm.DB, dialect string) error {
+	// WHY chaos_effects IS NOT UNIQUE ON (job_id, marker)
+	//
+	// It used to be, and that made INV-EXACTLY-ONCE's duplicate_effect_groups
+	// sub-check worse than dead: the fixture MASKED the defect the check exists to
+	// find. If a job really ran twice, the second effect INSERT failed with 23505
+	// instead of being recorded, so a genuine duplicate-execution bug surfaced as a
+	// handler error — retried, eventually a failed job nothing asserts on — and
+	// `duplicate_effect_groups` reported 0. A population guard on a check whose data
+	// CANNOT EXIST is still vacuous.
+	//
+	// The key is now (job_id, marker, attempt_nonce), which lets a duplicate be
+	// RECORDED while keeping the collision behaviour every existing handler relies
+	// on: only the four effects written inside a checkpoint transaction pass a
+	// per-execution nonce (see insertEffectAttempt); everything else passes
+	// fixedAttemptNonce and behaves exactly as before.
+	//
+	// That split is what keeps duplicate_effect_groups from FALSE-FIRING. The
+	// library's guarantee is at-least-once, and the harness deliberately SIGKILLs
+	// workers: chaos.unit, chaos.sub, chaos.pipeline_window and friends can legally
+	// re-execute, and their duplicates must stay unrecordable. Only a tx-paired
+	// effect — where the checkpoint that suppresses replay commits WITH the effect —
+	// is exactly-once, so only there is a duplicate row unambiguously a defect.
 	var stmts []string
-	if dialect == "mysql" {
+	switch dialect {
+	case dialectMySQL:
 		stmts = []string{
 			`CREATE TABLE IF NOT EXISTS chaos_effects (
 				id BIGINT AUTO_INCREMENT PRIMARY KEY,
 				job_id VARCHAR(191) NOT NULL,
 				marker VARCHAR(191) NOT NULL,
+				attempt_nonce VARCHAR(64) NOT NULL DEFAULT '',
 				created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-				UNIQUE KEY uq_job_marker (job_id, marker)
+				UNIQUE KEY uq_job_marker_nonce (job_id, marker, attempt_nonce)
 			)`,
 			`CREATE TABLE IF NOT EXISTS chaos_ticks (
 				id BIGINT AUTO_INCREMENT PRIMARY KEY,
@@ -144,14 +188,34 @@ func ensureLedger(ctx context.Context, db *gorm.DB, dialect string) error {
 				sig_count INT NOT NULL
 			)`,
 		}
-	} else {
+	case dialectSQLite:
+		stmts = []string{
+			`CREATE TABLE IF NOT EXISTS chaos_effects (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				job_id text NOT NULL,
+				marker text NOT NULL,
+				attempt_nonce text NOT NULL DEFAULT '',
+				created_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
+				UNIQUE(job_id, marker, attempt_nonce)
+			)`,
+			`CREATE TABLE IF NOT EXISTS chaos_ticks (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				fired_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP
+			)`,
+			`CREATE TABLE IF NOT EXISTS chaos_signal_targets (
+				job_id text PRIMARY KEY,
+				sig_count int NOT NULL
+			)`,
+		}
+	default:
 		stmts = []string{
 			`CREATE TABLE IF NOT EXISTS chaos_effects (
 				id bigserial PRIMARY KEY,
 				job_id text NOT NULL,
 				marker text NOT NULL,
+				attempt_nonce text NOT NULL DEFAULT '',
 				created_at timestamptz NOT NULL DEFAULT now(),
-				UNIQUE(job_id, marker)
+				UNIQUE(job_id, marker, attempt_nonce)
 			)`,
 			`CREATE TABLE IF NOT EXISTS chaos_ticks (
 				id bigserial PRIMARY KEY,
@@ -190,6 +254,12 @@ func registerHandlers(q *jobs.Queue, db *gorm.DB, dialect string) {
 
 	q.Register("chaos.pipeline", func(ctx context.Context, _ struct{}) error {
 		jobID := jobs.JobIDFromContext(ctx)
+		// One nonce per handler INVOCATION: a replay is a new invocation, so a phase
+		// that runs twice writes two rows instead of failing on the unique index —
+		// which is what makes the re-execution visible to duplicate_effect_groups.
+		// This replaces the old phase-reexec marker, which only ever existed because
+		// the duplicate could not be recorded.
+		nonce := newAttemptNonce()
 		for _, phase := range []string{"extract", "transform", "load"} {
 			if _, ok := jobs.LoadPhaseCheckpoint[string](ctx, phase); ok {
 				continue
@@ -197,15 +267,12 @@ func registerHandlers(q *jobs.Queue, db *gorm.DB, dialect string) {
 			time.Sleep(150 * time.Millisecond)
 			marker := "phase:" + phase
 			err := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-				if err := insertEffect(ctx, tx, jobID, marker); err != nil {
+				if err := insertEffectAttempt(ctx, tx, jobID, marker, nonce); err != nil {
 					return err
 				}
 				return jobs.SavePhaseCheckpointTx(ctx, tx, phase, "ok")
 			})
 			if err != nil {
-				if isDuplicate(err) {
-					_ = insertEffectIgnoreDuplicate(ctx, db, dialect, jobID, "phase-reexec:"+phase)
-				}
 				return err
 			}
 		}
@@ -297,6 +364,8 @@ func registerHandlers(q *jobs.Queue, db *gorm.DB, dialect string) {
 	// happy resume path end to end.
 	q.Register("chaos.megaflow", func(ctx context.Context, _ struct{}) error {
 		jobID := jobs.JobIDFromContext(ctx)
+		// Per-invocation nonce; see chaos.pipeline.
+		nonce := newAttemptNonce()
 
 		// 1. Idempotent phase Call-chain (atomic effect + checkpoint per phase).
 		for _, phase := range []string{"mega-extract", "mega-transform", "mega-load"} {
@@ -304,15 +373,12 @@ func registerHandlers(q *jobs.Queue, db *gorm.DB, dialect string) {
 				continue
 			}
 			err := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-				if err := insertEffect(ctx, tx, jobID, "phase:"+phase); err != nil {
+				if err := insertEffectAttempt(ctx, tx, jobID, "phase:"+phase, nonce); err != nil {
 					return err
 				}
 				return jobs.SavePhaseCheckpointTx(ctx, tx, phase, "ok")
 			})
 			if err != nil {
-				if isDuplicate(err) {
-					_ = insertEffectIgnoreDuplicate(ctx, db, dialect, jobID, "phase-reexec:"+phase)
-				}
 				return err
 			}
 		}
@@ -342,15 +408,12 @@ func registerHandlers(q *jobs.Queue, db *gorm.DB, dialect string) {
 			return nil
 		}
 		err := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-			if e := insertEffect(ctx, tx, jobID, "megaflow-done"); e != nil {
+			if e := insertEffectAttempt(ctx, tx, jobID, "megaflow-done", nonce); e != nil {
 				return e
 			}
 			return jobs.SavePhaseCheckpointTx(ctx, tx, "mega-done", "ok")
 		})
 		if err != nil {
-			if isDuplicate(err) {
-				_ = insertEffectIgnoreDuplicate(ctx, db, dialect, jobID, "mega-done-reexec")
-			}
 			return err
 		}
 		return nil
@@ -424,13 +487,16 @@ func registerHandlers(q *jobs.Queue, db *gorm.DB, dialect string) {
 	// chaos.timer defends the durable-timer path and P3 (crash-resistant checkpoint
 	// write). It Sleeps 2s (suspending via &WaitingError, resumed on the ORIGINAL
 	// checkpointed deadline) then performs ONE effect using the atomic transaction
-	// pattern proven by chaos.pipeline: insertEffect + SavePhaseCheckpointTx commit
+	// pattern proven by chaos.pipeline: the effect + SavePhaseCheckpointTx commit
 	// together, so a SIGKILL either commits both (replay short-circuits via
 	// LoadPhaseCheckpoint) or neither (replay redoes cleanly). A lost timer effect
-	// shows as fired<expected; a doubled one as a duplicate timer-fired or a
-	// timer-reexec marker; a wedge as an unfinished chaos.timer row.
+	// shows as fired<expected; a doubled one as fired>expected (the per-execution
+	// nonce lets the second row be RECORDED rather than rejected, which is the whole
+	// reason the old timer-reexec marker existed); a wedge as an unfinished
+	// chaos.timer row.
 	q.Register("chaos.timer", func(ctx context.Context, _ struct{}) error {
 		jobID := jobs.JobIDFromContext(ctx)
+		nonce := newAttemptNonce()
 		if err := jobs.Sleep(ctx, 2*time.Second); err != nil {
 			return err
 		}
@@ -438,15 +504,12 @@ func registerHandlers(q *jobs.Queue, db *gorm.DB, dialect string) {
 			return nil
 		}
 		err := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-			if e := insertEffect(ctx, tx, jobID, "timer-fired"); e != nil {
+			if e := insertEffectAttempt(ctx, tx, jobID, "timer-fired", nonce); e != nil {
 				return e
 			}
 			return jobs.SavePhaseCheckpointTx(ctx, tx, "timer-effect", "ok")
 		})
 		if err != nil {
-			if isDuplicate(err) {
-				_ = insertEffectIgnoreDuplicate(ctx, db, dialect, jobID, "timer-reexec")
-			}
 			return err
 		}
 		return nil
@@ -454,7 +517,7 @@ func registerHandlers(q *jobs.Queue, db *gorm.DB, dialect string) {
 
 	q.Register("chaos.tick", func(ctx context.Context, _ struct{}) error {
 		stmt := `INSERT INTO chaos_ticks DEFAULT VALUES`
-		if dialect == "mysql" {
+		if dialect == dialectMySQL {
 			stmt = `INSERT INTO chaos_ticks () VALUES ()`
 		}
 		return db.WithContext(ctx).Exec(stmt).Error
@@ -602,17 +665,33 @@ func runSeed(ctx context.Context, a *app) error {
 	return nil
 }
 
+// harnessTables is every table the seed clears, in one place so the MySQL,
+// Postgres and SQLite reset paths cannot list different sets.
+var harnessTables = []string{
+	"chaos_effects", "chaos_ticks", "chaos_signal_targets", "signals", "checkpoints",
+	"fan_outs", "jobs", "unique_locks", "queue_states", "scheduled_fires", "leases",
+}
+
 func resetHarnessData(ctx context.Context, db *gorm.DB, dialect string) error {
-	if dialect == "mysql" {
+	if dialect == dialectSQLite {
+		// SQLite has no TRUNCATE; DELETE FROM is the documented equivalent and the
+		// optimizer turns an unqualified one into the same bulk operation.
+		for _, t := range harnessTables {
+			if err := db.WithContext(ctx).Exec(`DELETE FROM ` + t).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if dialect == dialectMySQL {
 		// MySQL TRUNCATE can't target multiple tables or CASCADE; truncate each
 		// with FK checks off (the schema has no inter-table FKs, but this keeps
 		// the order-independent regardless).
-		tables := []string{"chaos_effects", "chaos_ticks", "chaos_signal_targets", "signals", "checkpoints", "fan_outs", "jobs", "unique_locks", "queue_states", "scheduled_fires", "leases"}
 		return db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 			if err := tx.Exec(`SET FOREIGN_KEY_CHECKS=0`).Error; err != nil {
 				return err
 			}
-			for _, t := range tables {
+			for _, t := range harnessTables {
 				if err := tx.Exec(`TRUNCATE TABLE ` + t).Error; err != nil {
 					return err
 				}
@@ -620,40 +699,29 @@ func resetHarnessData(ctx context.Context, db *gorm.DB, dialect string) error {
 			return tx.Exec(`SET FOREIGN_KEY_CHECKS=1`).Error
 		})
 	}
-	return db.WithContext(ctx).Exec(`TRUNCATE TABLE chaos_effects, chaos_ticks, chaos_signal_targets, signals, checkpoints, fan_outs, jobs, unique_locks, queue_states, scheduled_fires, leases RESTART IDENTITY CASCADE`).Error
+	return db.WithContext(ctx).Exec(
+		`TRUNCATE TABLE ` + strings.Join(harnessTables, ", ") + ` RESTART IDENTITY CASCADE`).Error
 }
 
 func runCheck(ctx context.Context, a *app) error {
 	// Drain timeout scales with the workload; CHAOS_DRAIN_TIMEOUT (e.g. "25m")
 	// overrides the 120s baseline so large torture runs are not cut short.
 	drainTimeout := envDuration("CHAOS_DRAIN_TIMEOUT", 120*time.Second)
-	if err := waitForDrain(ctx, a.db, drainTimeout, 10*time.Second); err != nil {
+	obs, err := waitForDrain(ctx, a.db, drainTimeout, 10*time.Second)
+	if err != nil {
+		// A query error inside the drain loop is not "did not drain" — it is a
+		// broken harness, and it must not be reported as a workload verdict.
 		fmt.Printf("drain wait: %v\n", err)
-		inv := checkNoWedge(ctx, a.db)
-		status := "PASS"
-		if !inv.pass {
-			status = "FAIL"
-		}
-		fmt.Println("chaostest invariant report:")
-		fmt.Printf("%-26s %-4s %-4s %s\n", inv.name, inv.level, status, inv.detail)
-		fmt.Println("chaostest result: DID NOT DRAIN (wedged or still draining)")
-		return fmt.Errorf("chaostest did not drain: %w", err)
+		fmt.Println("chaostest result: DRAIN OBSERVATION FAILED")
+		return fmt.Errorf("chaostest drain observation failed: %w", err)
 	}
 
-	results := []invariant{
-		checkExactlyOnce(ctx, a.db, a.dialect),
-		checkAtLeastOnceWindow(ctx, a.db),
-		checkNoWedge(ctx, a.db),
-		checkReadyNoStuck(ctx, a.db),
-		checkFanOutCounts(ctx, a.db),
-		checkUnique(ctx, a.db),
-		checkUniqueWindowed(ctx, a.db),
-		checkSchedule(ctx, a.db),
-		checkSignalExactlyOnce(ctx, a.db),
-		checkTimerExactlyOnce(ctx, a.db),
-		checkSlotNoLeak(ctx, a.db),
-		checkRateWellFormed(ctx, a.db, a.dialect),
-	}
+	// The full report runs whether or not the workload drained. It used to
+	// short-circuit into a one-line checkNoWedge report on the not-drained path,
+	// which meant the run that most needed the other eleven invariants printed none
+	// of them. INV-NO-WEDGE and INV-READY-NO-STUCK now read the drain OBSERVATION
+	// rather than re-querying afterwards — see the comment on drainObservation.
+	results := runAllChecks(ctx, a.db, a.dialect, obs, schedWindow, schedPeriod)
 
 	hardFailed := 0
 	fmt.Println("chaostest invariant report:")
@@ -665,7 +733,7 @@ func runCheck(ctx context.Context, a *app) error {
 				hardFailed++
 			}
 		}
-		fmt.Printf("%-26s %-4s %-4s %s\n", inv.name, inv.level, status, inv.detail)
+		fmt.Printf("%-28s %-4s %-4s %s\n", inv.name, inv.level, status, inv.detail)
 	}
 	if hardFailed > 0 {
 		fmt.Printf("chaostest result: RED baseline reproduced with %d HARD failure(s)\n", hardFailed)
@@ -675,27 +743,165 @@ func runCheck(ctx context.Context, a *app) error {
 	return nil
 }
 
-func waitForDrain(ctx context.Context, db *gorm.DB, timeout, quietFor time.Duration) error {
+// schedWindow / schedPeriod are the production INV-SCHED measurement window and
+// the scheduled tick's period.
+const (
+	schedWindow = 12 * time.Second
+	schedPeriod = 5 * time.Second
+)
+
+// runAllChecks is THE list of checks the release gate runs. It is a function so a
+// test can enumerate the same list production does: the meta-guard
+// (TestEveryHardInvariantCanFail) requires every HARD check here to FAIL on an
+// empty database, and a check added to a list the test cannot see would slip past
+// it — which is precisely how four checks came to be missing their population
+// guards.
+//
+// The schedule window is a parameter only so the test does not have to sleep for
+// the production 12 seconds; runCheck always passes the production values.
+func runAllChecks(ctx context.Context, db *gorm.DB, dialect string, obs drainObservation, window, period time.Duration) []invariant {
+	return []invariant{
+		checkExactlyOnce(ctx, db, dialect),
+		checkAtLeastOnceWindow(ctx, db),
+		checkNoWedge(obs),
+		checkReadyNoStuck(obs),
+		checkFanOutCounts(ctx, db),
+		checkUnique(ctx, db),
+		checkUniqueWindowed(ctx, db),
+		checkScheduleWindow(ctx, db, window, period),
+		checkSignalExactlyOnce(ctx, db),
+		checkTimerExactlyOnce(ctx, db),
+		checkSlotNoLeak(ctx, db, dialect),
+		checkRateWellFormed(ctx, db, dialect),
+	}
+}
+
+// drainObservation is what the drain loop SAW, retained so the wedge invariants
+// can be evaluated against it.
+//
+// INV-NO-WEDGE and INV-READY-NO-STUCK used to run AFTER waitForDrain returned
+// successfully, over sets waitForDrain had just proven empty — waiting=0,
+// running=0 and, since no pending row survives a drain, eligible_but_unready=0
+// too. They could not fail at the point they ran. Evaluating them BEFORE the drain
+// is not the fix either: mid-run there are of course running jobs, and the dq_ready
+// promoter heals an unready row within a poll, so a pre-drain snapshot false-fires
+// on a perfectly healthy system.
+//
+// What is real is what PERSISTS across the whole drain window: a workload that
+// never quiesced, and a row that stayed eligible-but-unready poll after poll. Both
+// are recorded here as the loop runs.
+type drainObservation struct {
+	drained bool
+	// waiting/running are the last sample, which on the not-drained path is the
+	// state at the deadline — the wedge itself.
+	waiting int64
+	running int64
+	// stuckStreak is the longest run of consecutive polls that ONE PARTICULAR row
+	// spent pending, eligible and dq_ready=false. It is per ROW, not per poll,
+	// and the difference is the whole reason this can be trusted: under retry
+	// churn a stream of DIFFERENT rows passes through the promoter's ~50ms healing
+	// window, so "some row was unready at this instant" is nonzero on nearly every
+	// poll of a perfectly healthy busy run. A count-based streak would therefore
+	// fail the release gate on exactly the workload the gate exists to run. What
+	// cannot happen on a healthy system is the SAME row surviving poll after poll.
+	stuckStreak int
+	// maxStuck is the largest single-poll count, reported for context only.
+	maxStuck int64
+	polls    int
+	quietFor time.Duration
+}
+
+// stuckStreakLimit is how many consecutive 1s polls ONE row must stay
+// eligible-but-unready before INV-READY-NO-STUCK calls it a wedge.
+//
+// Deliberately far out. runReadyPromoter is a dedicated per-worker loop at
+// ReadyPromoteInterval (defaults to PollInterval = 50ms here), promoting up to
+// maxResumeBatch=100 rows a pass, so four chaos workers heal on the order of 8,000
+// rows/second. The only benign way a row waits 30 seconds is a promotion backlog
+// of ~240,000 simultaneously-eligible rows, which no chaos or torture seed
+// produces. A genuinely unhealed row, by contrast, waits forever.
+const stuckStreakLimit = 30
+
+// maxStuckIDsSampled bounds the per-poll id fetch. The streak only needs to know
+// whether SOME row persists; a backlog larger than this is already reported by
+// maxStuck, and sampling its first rows is enough to notice one that never leaves.
+const maxStuckIDsSampled = 200
+
+// foldStuckStreaks advances the per-row consecutive-poll counters by one poll and
+// returns the new counters plus the longest streak now standing.
+//
+// Rows present in this poll carry their previous count forward; every row ABSENT
+// from it drops out of the map, which is what resets a transient row to zero. It
+// is a separate pure function because the property that matters — a churning
+// stream of different rows never accumulates a streak, only a persistent one does
+// — is the entire reason INV-READY-NO-STUCK can be trusted on a busy run, and it
+// is not something a timing-dependent integration test can pin reliably.
+func foldStuckStreaks(prev map[string]int, ids []jobs.UUID) (map[string]int, int) {
+	next := make(map[string]int, len(ids))
+	longest := 0
+	for _, id := range ids {
+		n := prev[string(id)] + 1
+		next[string(id)] = n
+		if n > longest {
+			longest = n
+		}
+	}
+	return next, longest
+}
+
+func waitForDrain(ctx context.Context, db *gorm.DB, timeout, quietFor time.Duration) (drainObservation, error) {
+	obs := drainObservation{quietFor: quietFor}
 	deadline := time.Now().Add(timeout)
 	quietSince := time.Time{}
+	streaks := map[string]int{}
 	for time.Now().Before(deadline) {
-		var active int64
-		if err := db.WithContext(ctx).Raw(`SELECT count(*) FROM jobs WHERE status IN ('pending','running','waiting')`).Scan(&active).Error; err != nil {
-			return err
+		obs.polls++
+		waiting, err := scanCount(ctx, db, `SELECT count(*) FROM jobs WHERE status = 'waiting'`)
+		if err != nil {
+			return obs, err
 		}
-		if active == 0 {
+		running, err := scanCount(ctx, db, `SELECT count(*) FROM jobs WHERE status = 'running'`)
+		if err != nil {
+			return obs, err
+		}
+		pending, err := scanCount(ctx, db, `SELECT count(*) FROM jobs WHERE status = 'pending'`)
+		if err != nil {
+			return obs, err
+		}
+		var stuckIDs []jobs.UUID
+		if err := db.WithContext(ctx).Model(&jobs.Job{}).
+			Where("status = ?", "pending").
+			Where("dq_ready = ?", false).
+			Where("(run_at IS NULL OR run_at <= ?)", time.Now()).
+			Order("id").
+			Limit(maxStuckIDsSampled).
+			Pluck("id", &stuckIDs).Error; err != nil {
+			return obs, err
+		}
+		obs.waiting, obs.running = waiting, running
+		if int64(len(stuckIDs)) > obs.maxStuck {
+			obs.maxStuck = int64(len(stuckIDs))
+		}
+		var longest int
+		streaks, longest = foldStuckStreaks(streaks, stuckIDs)
+		if longest > obs.stuckStreak {
+			obs.stuckStreak = longest
+		}
+
+		if waiting+running+pending == 0 {
 			if quietSince.IsZero() {
 				quietSince = time.Now()
 			}
 			if time.Since(quietSince) >= quietFor {
-				return nil
+				obs.drained = true
+				return obs, nil
 			}
 		} else {
 			quietSince = time.Time{}
 		}
 		time.Sleep(1 * time.Second)
 	}
-	return fmt.Errorf("timeout waiting for 10s quiescence")
+	return obs, nil
 }
 
 // scanCount runs a single scalar count query and SURFACES the error. A bare
@@ -723,6 +929,22 @@ func checkErr(name, level string, err error) invariant {
 	}
 }
 
+// checkExactlyOnce defends the exactly-once contract of effects that commit
+// together with their replay-suppressing checkpoint.
+//
+// duplicate_effect_groups is the primary signal and it is LIVE again: chaos_effects
+// is keyed on (job_id, marker, attempt_nonce), so a tx-paired effect that runs a
+// second time is RECORDED as a second row instead of being rejected by the unique
+// index. Under the old (job_id, marker) key the second INSERT failed with 23505,
+// the handler returned an error, and this count could only ever read 0 — the
+// fixture masked the exact defect the check exists to find.
+//
+// It cannot false-fire on the documented at-least-once window: every effect that
+// is NOT tx-paired is written with fixedAttemptNonce and therefore still collides,
+// so it can never form a duplicate group no matter how many times a SIGKILL
+// replays it. atomic_effects is the population guard — the count of rows that
+// COULD have duplicated. Zero of them means the exactly-once handlers never ran,
+// which must read as a broken gate, not a pass.
 func checkExactlyOnce(ctx context.Context, db *gorm.DB, dialect string) invariant {
 	const name = "INV-EXACTLY-ONCE"
 	duplicateRows, err := scanCount(ctx, db, `
@@ -732,7 +954,7 @@ func checkExactlyOnce(ctx context.Context, db *gorm.DB, dialect string) invarian
 	if err != nil {
 		return checkErr(name, "HARD", err)
 	}
-	reexecRows, err := scanCount(ctx, db, `SELECT count(*) FROM chaos_effects WHERE marker LIKE 'phase-reexec:%'`)
+	atomicEffects, err := scanCount(ctx, db, `SELECT count(*) FROM chaos_effects WHERE attempt_nonce <> ''`)
 	if err != nil {
 		return checkErr(name, "HARD", err)
 	}
@@ -755,9 +977,18 @@ func checkExactlyOnce(ctx context.Context, db *gorm.DB, dialect string) invarian
 	// only the ::text cast is needed there.
 	cpJobID := "cp.job_id::text"
 	markerExpr := "SUBSTRING(ce.marker FROM 15)"
-	if dialect == "mysql" {
+	switch dialect {
+	case dialectMySQL:
 		cpJobID = "BIN_TO_UUID(cp.job_id)"
 		markerExpr = "SUBSTRING(ce.marker FROM 15) COLLATE utf8mb4_0900_as_cs"
+	case dialectSQLite:
+		// SQLite stores the UUID as a 16-byte blob and has neither a UUID type nor
+		// a formatting function, so the canonical text form is assembled by hand.
+		// Same principle as the other two: convert the NATIVE column, never parse
+		// the marker side.
+		cpJobID = "lower(substr(hex(cp.job_id),1,8)||'-'||substr(hex(cp.job_id),9,4)||'-'||" +
+			"substr(hex(cp.job_id),13,4)||'-'||substr(hex(cp.job_id),17,4)||'-'||substr(hex(cp.job_id),21,12))"
+		markerExpr = "substr(ce.marker, 15)"
 	}
 	windowCheckpointedRows, err := scanCount(ctx, db, `
 		SELECT count(*)
@@ -773,17 +1004,25 @@ func checkExactlyOnce(ctx context.Context, db *gorm.DB, dialect string) invarian
 	if err != nil {
 		return checkErr(name, "HARD", err)
 	}
-	pass := duplicateRows == 0 && reexecRows == 0 && windowCheckpointedRows == 0
+	pass := atomicEffects > 0 && duplicateRows == 0 && windowCheckpointedRows == 0
 	return invariant{
 		name:   name,
 		level:  "HARD",
 		pass:   pass,
-		detail: fmt.Sprintf("tx pipeline: duplicate_effect_groups=%d phase_reexec_markers=%d; window checkpointed_reexec_markers=%d", duplicateRows, reexecRows, windowCheckpointedRows),
+		detail: fmt.Sprintf("tx pipeline: atomic_effects=%d duplicate_effect_groups=%d; window checkpointed_reexec_markers=%d", atomicEffects, duplicateRows, windowCheckpointedRows),
 	}
 }
 
+// checkAtLeastOnceWindow is REPORTING ONLY and is named accordingly.
+//
+// It hardcodes pass:true — the at-least-once re-execution it counts is the
+// documented behaviour of chaos.pipeline_window, not a defect — so calling it
+// INV-anything put a line in the release gate's report that says PASS no matter
+// what the system did. That is precisely how a vacuous check regrows: the name
+// claims an invariant, the reader counts the PASS, and nothing is being asserted.
+// The REPORT- prefix says what it is.
 func checkAtLeastOnceWindow(ctx context.Context, db *gorm.DB) invariant {
-	const name = "INV-AT-LEAST-ONCE-WINDOW"
+	const name = "REPORT-AT-LEAST-ONCE-WINDOW"
 	windowRows, err := scanCount(ctx, db, `SELECT count(*) FROM chaos_effects WHERE marker LIKE 'window-reexec:%'`)
 	if err != nil {
 		return checkErr(name, "INFO", err)
@@ -792,48 +1031,52 @@ func checkAtLeastOnceWindow(ctx context.Context, db *gorm.DB) invariant {
 		name:   name,
 		level:  "INFO",
 		pass:   true,
-		detail: fmt.Sprintf("window_reexec_markers=%d expected at-least-once re-execution under SIGKILL; bounded by design", windowRows),
+		detail: fmt.Sprintf("reporting only, asserts nothing: window_reexec_markers=%d expected at-least-once re-execution under SIGKILL; bounded by design", windowRows),
 	}
 }
 
-func checkNoWedge(ctx context.Context, db *gorm.DB) invariant {
-	const name = "INV-NO-WEDGE"
-	waiting, err := scanCount(ctx, db, `SELECT count(*) FROM jobs WHERE status = 'waiting'`)
-	if err != nil {
-		return checkErr(name, "HARD", err)
-	}
-	running, err := scanCount(ctx, db, `SELECT count(*) FROM jobs WHERE status = 'running'`)
-	if err != nil {
-		return checkErr(name, "HARD", err)
-	}
+// checkNoWedge asserts the workload actually reached quiescence inside the drain
+// window, evaluated on the drain OBSERVATION rather than on a post-drain query.
+// Queried afterwards it could only ever see the zeros waitForDrain had just
+// waited for; read from the observation it fails exactly when the drain timed out
+// with work still in flight, and reports the state at the deadline.
+func checkNoWedge(obs drainObservation) invariant {
 	return invariant{
-		name:   name,
-		level:  "HARD",
-		pass:   waiting == 0 && running == 0,
-		detail: fmt.Sprintf("waiting=%d running=%d", waiting, running),
+		name:  "INV-NO-WEDGE",
+		level: "HARD",
+		pass:  obs.drained,
+		detail: fmt.Sprintf("drained=%t last_waiting=%d last_running=%d polls=%d quiet_for=%s",
+			obs.drained, obs.waiting, obs.running, obs.polls, obs.quietFor),
 	}
 }
 
 // checkReadyNoStuck asserts the dq_ready promoter backstop left no pending job
 // eligible-to-run-now but still flagged dq_ready=false. Such a row is invisible
 // to Dequeue (which requires dq_ready=true) — a latent wedge the per-worker
-// promoter must heal. run_at IS NULL OR run_at <= now is the eligibility test.
-func checkReadyNoStuck(ctx context.Context, db *gorm.DB) invariant {
-	const name = "INV-READY-NO-STUCK"
-	stuck, err := scanCount(ctx, db,
-		`SELECT count(*) FROM jobs WHERE status = 'pending' AND dq_ready = ? AND (run_at IS NULL OR run_at <= ?)`,
-		false, time.Now())
-	if err != nil {
-		return checkErr(name, "HARD", err)
-	}
+// promoter must heal.
+//
+// It is evaluated on the PERSISTENCE of that state for one ROW across the drain,
+// not on a single sample and not on a per-poll count. A single post-drain sample
+// is empty by construction (a drained system has no pending rows at all); a single
+// mid-drain sample flags a row the promoter is about to heal on the next poll; and
+// a per-poll COUNT is nonzero on nearly every poll of a healthy busy run, because
+// retry churn keeps feeding different rows through the promoter's ~50ms window.
+// One row surviving poll after poll is the only shape of this question that both
+// can fail and is true only when something is actually broken.
+func checkReadyNoStuck(obs drainObservation) invariant {
 	return invariant{
-		name:   name,
-		level:  "HARD",
-		pass:   stuck == 0,
-		detail: fmt.Sprintf("eligible_but_unready=%d", stuck),
+		name:  "INV-READY-NO-STUCK",
+		level: "HARD",
+		pass:  obs.stuckStreak < stuckStreakLimit,
+		detail: fmt.Sprintf("longest_consecutive_polls_one_row_stayed_eligible_but_unready=%d limit=%d max_rows_in_a_poll=%d polls=%d",
+			obs.stuckStreak, stuckStreakLimit, obs.maxStuck, obs.polls),
 	}
 }
 
+// checkFanOutCounts asserts every fan-out's per-child counters sum to its total.
+// fan_out_rows is the population guard: a regression that stops fan-outs being
+// created at all leaves nothing to mismatch, and a check with no population must
+// read as broken rather than clean.
 func checkFanOutCounts(ctx context.Context, db *gorm.DB) invariant {
 	const name = "INV-FANOUT-COUNTS"
 	total, err := scanCount(ctx, db, `SELECT count(*) FROM fan_outs`)
@@ -849,7 +1092,7 @@ func checkFanOutCounts(ctx context.Context, db *gorm.DB) invariant {
 	return invariant{
 		name:   name,
 		level:  "HARD",
-		pass:   bad == 0,
+		pass:   total > 0 && bad == 0,
 		detail: fmt.Sprintf("fan_out_rows=%d mismatched_counts=%d", total, bad),
 	}
 }
@@ -882,15 +1125,16 @@ func checkUniqueWindowed(ctx context.Context, db *gorm.DB) invariant {
 	}
 }
 
-func checkSchedule(ctx context.Context, db *gorm.DB) invariant {
-	// Measure the steady-state fire rate over a fresh window while the worker
-	// replicas are still running. A correctly fleet-deduplicated scheduler
-	// fires the 5s tick ~once per period regardless of replica count; without
-	// dedup, N replicas each fire (and a scheduler that boot-storms re-fires on
-	// every chaos respawn). Counting over a window — rather than total ticks
-	// since seed — avoids the earlier drain-time accounting error.
-	const window = 12 * time.Second
-	const period = 5 * time.Second
+// checkScheduleWindow measures the steady-state fire rate over a fresh window
+// while the worker replicas are still running. The window is a parameter (rather
+// than the production 12-second constant inline) so a test can exercise the logic
+// without a 12-second sleep — this check used to be one no test ever ran.
+func checkScheduleWindow(ctx context.Context, db *gorm.DB, window, period time.Duration) invariant {
+	// A correctly fleet-deduplicated scheduler fires the tick ~once per period
+	// regardless of replica count; without dedup, N replicas each fire (and a
+	// scheduler that boot-storms re-fires on every chaos respawn). Counting over a
+	// window — rather than total ticks since seed — avoids the earlier drain-time
+	// accounting error.
 	before, err := scanCount(ctx, db, `SELECT count(*) FROM chaos_ticks`)
 	if err != nil {
 		return checkErr("INV-SCHED", "HARD", err)
@@ -907,14 +1151,25 @@ func checkSchedule(ctx context.Context, db *gorm.DB) invariant {
 	// One logical scheduler: floor(window/period) boundaries, +2 slack for
 	// boundary alignment and a tick landing at each edge of the window.
 	maxExpected := int64(window/period) + 2
+	// And a floor. The bound used to be one-sided, so a scheduler that fired ZERO
+	// times in the window PASSED — verified: ticks_in_12s_window=0 was reported as
+	// PASS. A dead scheduler is at least as bad as a double-firing one, and this
+	// check is the only thing watching for it.
+	//
+	// 1, not floor(window/period): the window is 12s at a 5s period, so a correct
+	// scheduler fires 2-3 times, and the floor is deliberately set well below that
+	// so boundary alignment, a chaos kill landing mid-window, or a slow dequeue can
+	// never manufacture a failure. It catches "the scheduler stopped", which is the
+	// defect, not "the scheduler is a beat late".
+	const minExpected = 1
 	return invariant{
 		name: "INV-SCHED",
 		// HARD as of the shared-anchor scheduler fix: a fresh schedule now seeds
 		// a fleet-wide base (SeedScheduledFire), so skewed worker clocks can no
 		// longer make replicas target different first boundaries and double-fire.
 		level:  "HARD",
-		pass:   got <= maxExpected,
-		detail: fmt.Sprintf("ticks_in_%s_window=%d max_expected_single_scheduler=%d", window, got, maxExpected),
+		pass:   got >= minExpected && got <= maxExpected,
+		detail: fmt.Sprintf("ticks_in_%s_window=%d min_expected=%d max_expected_single_scheduler=%d", window, got, minExpected, maxExpected),
 	}
 }
 
@@ -953,8 +1208,14 @@ func checkSignalExactlyOnce(ctx context.Context, db *gorm.DB) invariant {
 
 // checkTimerExactlyOnce defends the durable-timer path and P3: each timer fires
 // its effect exactly once with no re-execution and no wedge. A lost effect shows
-// as fired<expected, a doubled effect as reexec>0 (or a duplicate timer-fired),
-// and a re-sleep/wedge as unfinished>0. expected>0 guards against a vacuous PASS.
+// as fired<expected, a doubled effect as fired>expected, and a re-sleep/wedge as
+// unfinished>0. expected>0 guards against a vacuous PASS.
+//
+// The separate timer-reexec sub-check is gone with the marker that fed it. It
+// existed only because the old (job_id, marker) unique index made a second
+// timer-fired row impossible to write; now the duplicate row IS the signal, and it
+// lands in fired — a strictly more direct assertion than a marker the handler had
+// to notice a constraint violation to produce.
 func checkTimerExactlyOnce(ctx context.Context, db *gorm.DB) invariant {
 	const name = "INV-TIMER-EXACTLY-ONCE"
 	expected, err := scanCount(ctx, db, `SELECT count(*) FROM jobs WHERE type = 'chaos.timer'`)
@@ -965,52 +1226,72 @@ func checkTimerExactlyOnce(ctx context.Context, db *gorm.DB) invariant {
 	if err != nil {
 		return checkErr(name, "HARD", err)
 	}
-	reexec, err := scanCount(ctx, db, `SELECT count(*) FROM chaos_effects WHERE marker = 'timer-reexec'`)
-	if err != nil {
-		return checkErr(name, "HARD", err)
-	}
 	unfinished, err := scanCount(ctx, db, `SELECT count(*) FROM jobs WHERE type = 'chaos.timer' AND status <> 'completed'`)
 	if err != nil {
 		return checkErr(name, "HARD", err)
 	}
-	pass := expected > 0 && fired == expected && reexec == 0 && unfinished == 0
+	pass := expected > 0 && fired == expected && unfinished == 0
 	return invariant{
 		name:   name,
 		level:  "HARD",
 		pass:   pass,
-		detail: fmt.Sprintf("expected=%d fired=%d reexec=%d unfinished=%d", expected, fired, reexec, unfinished),
+		detail: fmt.Sprintf("expected=%d fired=%d unfinished=%d", expected, fired, unfinished),
 	}
 }
 
-func checkSlotNoLeak(ctx context.Context, db *gorm.DB) invariant {
+// checkSlotNoLeak asserts no concurrency slot outlived the job that held it.
+//
+// slot_rows is the population guard. Every slot a job holds is DELETED on release,
+// so after a clean drain the only rows left are the per-key sentinels — which is
+// exactly why the leak count alone is vacuous: a run in which ConcurrencyCap was
+// never exercised at all (a dropped option, a seed that produced no capped jobs)
+// leaves an empty table and reports live_nonsentinel_slots=0, indistinguishable
+// from a clean run. The sentinel is never deleted, so its presence is the proof
+// the machinery ran.
+func checkSlotNoLeak(ctx context.Context, db *gorm.DB, dialect string) invariant {
+	const name = "INV-SLOT-NO-LEAK"
+	nowExpr := "NOW()"
+	var args []any
+	if dialect == dialectSQLite {
+		nowExpr = "?"
+		args = append(args, time.Now().UTC())
+	}
 	var n int64
 	// The sentinel slot is stored as the nil UUID (16 zero bytes); job_id is now a
 	// binary uuid column, so compare against the bound nil-UUID value (its Value()
 	// encodes to 16 zero bytes per dialect) rather than the literal ''. Checking the
 	// error matters: a comparison that fails to typecheck must fail the invariant,
 	// not silently leave n=0 and report a false pass.
+	args = append(args, jobs.NilUUID)
 	if err := db.WithContext(ctx).
-		Raw(`SELECT count(*) FROM concurrency_slots WHERE job_id <> ? AND expires_at > NOW()`, jobs.NilUUID).
+		Raw(`SELECT count(*) FROM concurrency_slots WHERE expires_at > `+nowExpr+` AND job_id <> ?`, args...).
 		Scan(&n).Error; err != nil {
 		return invariant{
-			name:   "INV-SLOT-NO-LEAK",
+			name:   name,
 			level:  "HARD",
 			pass:   false,
 			detail: fmt.Sprintf("slot-leak query failed: %v", err),
 		}
 	}
+	slotRows, err := scanCount(ctx, db, `SELECT count(*) FROM concurrency_slots`)
+	if err != nil {
+		return checkErr(name, "HARD", err)
+	}
 	return invariant{
-		name:   "INV-SLOT-NO-LEAK",
+		name:   name,
 		level:  "HARD",
-		pass:   n == 0,
-		detail: fmt.Sprintf("live_nonsentinel_slots=%d", n),
+		pass:   slotRows > 0 && n == 0,
+		detail: fmt.Sprintf("slot_rows=%d live_nonsentinel_slots=%d", slotRows, n),
 	}
 }
 
+// checkRateWellFormed asserts no rate-limit window ever went negative. total_windows
+// is the population guard: RateLimit("chaos", ...) is configured on every worker, so
+// an empty table means the limiter never ran and there was nothing to be well-formed.
 func checkRateWellFormed(ctx context.Context, db *gorm.DB, dialect string) invariant {
 	const name = "INV-RATE-WELLFORMED"
 	countColumn := `"count"`
-	if dialect == "mysql" {
+	if dialect == dialectMySQL {
 		countColumn = "`count`"
 	}
 	negs, err := scanCount(ctx, db, `SELECT count(*) FROM rate_limit_windows WHERE `+countColumn+` < 0`)
@@ -1024,7 +1305,7 @@ func checkRateWellFormed(ctx context.Context, db *gorm.DB, dialect string) invar
 	return invariant{
 		name:   name,
 		level:  "HARD",
-		pass:   negs == 0,
+		pass:   total > 0 && negs == 0,
 		detail: fmt.Sprintf("negative_counts=%d total_windows=%d", negs, total),
 	}
 }
@@ -1033,12 +1314,43 @@ func insertSignalTarget(ctx context.Context, db *gorm.DB, jobID jobs.UUID, n int
 	return db.WithContext(ctx).Exec(`INSERT INTO chaos_signal_targets (job_id, sig_count) VALUES (?, ?)`, string(jobID), n).Error
 }
 
+// insertEffect records an at-least-once effect: it carries fixedAttemptNonce, so
+// a replay of the SAME (job_id, marker) still collides with the unique index and
+// still surfaces as a duplicate-key error, exactly as it did before attempt_nonce
+// existed. Every handler whose effect is not committed together with a checkpoint
+// uses this.
 func insertEffect(ctx context.Context, db *gorm.DB, jobID jobs.UUID, marker string) error {
+	return insertEffectAttempt(ctx, db, jobID, marker, fixedAttemptNonce)
+}
+
+// insertEffectAttempt records an effect under a PER-EXECUTION nonce, so a second
+// execution of the same (job_id, marker) is RECORDED as a second row rather than
+// rejected.
+//
+// It is used only for effects written inside a checkpoint transaction. There the
+// checkpoint that suppresses replay commits with the effect, so the effect is
+// exactly-once by construction and a duplicate row can only mean the replay
+// suppression failed — which is precisely what INV-EXACTLY-ONCE's
+// duplicate_effect_groups is for, and what the old (job_id, marker) unique index
+// made unobservable.
+//
+// The nonce also IDENTIFIES the exactly-once population: an effect row with a
+// non-empty attempt_nonce is one that could have produced a duplicate group, which
+// is what INV-EXACTLY-ONCE's population guard counts.
+func insertEffectAttempt(ctx context.Context, db *gorm.DB, jobID jobs.UUID, marker, nonce string) error {
 	id := string(jobID)
 	if id == "" {
 		id = "unknown"
 	}
-	return db.WithContext(ctx).Exec(`INSERT INTO chaos_effects (job_id, marker) VALUES (?, ?)`, id, marker).Error
+	return db.WithContext(ctx).Exec(
+		`INSERT INTO chaos_effects (job_id, marker, attempt_nonce) VALUES (?, ?, ?)`, id, marker, nonce).Error
+}
+
+// newAttemptNonce returns a value unique to ONE handler invocation. A replay is a
+// new invocation and therefore a new nonce, which is what makes a re-executed
+// tx-paired effect recordable instead of a constraint violation.
+func newAttemptNonce() string {
+	return string(jobs.NewID())
 }
 
 func insertEffectIgnoreDuplicate(ctx context.Context, db *gorm.DB, dialect string, jobID jobs.UUID, marker string) error {
@@ -1046,11 +1358,15 @@ func insertEffectIgnoreDuplicate(ctx context.Context, db *gorm.DB, dialect strin
 	if id == "" {
 		id = "unknown"
 	}
-	stmt := `INSERT INTO chaos_effects (job_id, marker) VALUES (?, ?) ON CONFLICT (job_id, marker) DO NOTHING`
-	if dialect == "mysql" {
-		stmt = `INSERT IGNORE INTO chaos_effects (job_id, marker) VALUES (?, ?)`
+	// The conflict target must name the full unique key. These markers are written
+	// with fixedAttemptNonce so they still collide (that is the point: one re-exec
+	// marker per job, not one per retry).
+	stmt := `INSERT INTO chaos_effects (job_id, marker, attempt_nonce) VALUES (?, ?, ?) ` +
+		`ON CONFLICT (job_id, marker, attempt_nonce) DO NOTHING`
+	if dialect == dialectMySQL {
+		stmt = `INSERT IGNORE INTO chaos_effects (job_id, marker, attempt_nonce) VALUES (?, ?, ?)`
 	}
-	return db.WithContext(ctx).Exec(stmt, id, marker).Error
+	return db.WithContext(ctx).Exec(stmt, id, marker, fixedAttemptNonce).Error
 }
 
 func isDuplicate(err error) bool {

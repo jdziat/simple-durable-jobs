@@ -2273,8 +2273,29 @@ func (w *Worker) processJobRun(ctx context.Context, job *core.Job, runToken uint
 	h, ok := w.queue.GetHandler(job.Type)
 	if !ok {
 		w.logger.Error("no handler for job", "type", job.Type)
+		// This is a TERMINAL failure — the row ends up status='failed' with
+		// dead_lettered_at set, exactly like an attempts-exhausted failure — so it
+		// must be reported like one. It previously fired no hook and emitted no
+		// event, which made `jobs.failed` (pkg/metrics increments it from the
+		// JobFailed event) silently miss an entire failure class: every job whose
+		// type this worker does not know. A worker fleet mid-rollout, or one whose
+		// registry is a subset of the enqueuer's, dead-letters those jobs while the
+		// counter alerts are built on stays flat.
+		//
+		// noHandlerErr is built ONCE and used for both the stored message and the
+		// hook/event payload, so an operator's alert text and the DLQ row cannot
+		// disagree.
+		noHandlerErr := fmt.Errorf("no handler for %s", job.Type)
+		// No jobCtx and no span exist on this path (the handler lookup precedes
+		// CallStartCtxHooks), so ctx is the right context to hand the hooks: OTel's
+		// failHook finds a non-recording span and returns, and user callbacks still
+		// get the failure.
+		reportNoHandlerFailure := func() {
+			w.queue.CallFailHooks(ctx, job, noHandlerErr)
+			w.queue.Emit(&core.JobFailed{Job: job, Error: noHandlerErr, Timestamp: time.Now()})
+		}
 		if failer, ok := w.queue.Storage().(failTerminalWithResultStorage); ok {
-			fo, err := w.failTerminalWithResult(ctx, failer, job.ID, fmt.Sprintf("no handler for %s", job.Type))
+			fo, err := w.failTerminalWithResult(ctx, failer, job.ID, noHandlerErr.Error())
 			if errors.Is(err, core.ErrJobNotOwned) {
 				w.logger.Warn("job no longer owned after no-handler failure; skipping sub-job completion",
 					"job_id", job.ID)
@@ -2285,6 +2306,10 @@ func (w *Worker) processJobRun(ctx context.Context, job *core.Job, runToken uint
 				w.releaseAfterTerminalWriteError(ctx, job.ID, "no-handler failure")
 				return
 			}
+			// Reported only once the terminal write actually LANDED — the same rule
+			// handleError follows. A hook describing a state the database never
+			// entered is worse than a missing one.
+			reportNoHandlerFailure()
 			if err := w.checkFanOutCompletion(ctx, fo); err != nil {
 				w.logger.Error("failed to handle no-handler sub-job failure", "job_id", job.ID, "error", err)
 			}
@@ -2294,11 +2319,12 @@ func (w *Worker) processJobRun(ctx context.Context, job *core.Job, runToken uint
 		// accounting runs for it. A worker that reclaims the job may even have
 		// the handler registered.
 		if !w.dispositionWriteLanded(ctx, job.ID,
-			w.failWithRetry(ctx, job.ID, fmt.Sprintf("no handler for %s", job.Type), nil),
+			w.failWithRetry(ctx, job.ID, noHandlerErr.Error(), nil),
 			"no-handler failure",
 			"job no longer owned after no-handler failure; skipping sub-job completion") {
 			return
 		}
+		reportNoHandlerFailure()
 		if err := w.handleSubJobCompletion(ctx, job, false); err != nil {
 			w.logger.Error("failed to handle no-handler sub-job failure", "job_id", job.ID, "error", err)
 		}
@@ -2383,6 +2409,43 @@ func (w *Worker) processJobRun(ctx context.Context, job *core.Job, runToken uint
 	// Call context-modifying start hooks (e.g. OTel span injection)
 	jobCtx = w.queue.CallStartCtxHooks(jobCtx, job)
 
+	// From here on the attempt owns an observability span (pkg/otel's startCtxHook
+	// opened one on jobCtx), and the ONLY thing that closes a span is a disposition
+	// hook — complete, fail, retry or waiting. Several exits below report no
+	// disposition at all, because the row stopped being ours before the write
+	// landed: CancelJob writes the terminal status FIRST and then cancels the
+	// handler, so the handler's error travels into handleError, every disposition
+	// write comes back ErrJobNotOwned, and it returns having fired nothing. Same
+	// shape on a shutdown release, on a lost-ownership completion, and on a
+	// disposition write that never landed.
+	//
+	// An unended span is not merely un-exported — the SDK RETAINS it, so this is a
+	// slow leak of one span per cancelled job for every OTel user.
+	//
+	// The fallback is CONDITIONAL on purpose. Ending an already-ended span is a
+	// no-op in OTel, so firing the waiting hooks unconditionally would look correct
+	// in a span recorder while calling every user's OnJobWaiting callback for jobs
+	// that plainly completed. dispositionReported is set by the branches that DO
+	// report one, and nowhere else.
+	//
+	// Waiting is the right shape for an abandoned attempt and is already used this
+	// way by the aggressive-pause branch below: the attempt neither succeeded nor
+	// failed, and whatever re-dispatches the job starts a fresh attempt with a
+	// fresh span.
+	dispositionReported := &attemptDisposition{}
+	defer func() {
+		if dispositionReported.reported {
+			return
+		}
+		w.logger.Debug("job attempt ended without reporting a disposition; closing its observability span",
+			"job_id", job.ID, "job_type", job.Type)
+		// The INTERNAL hook, not CallWaitingHooks. Routing abandoned attempts
+		// through the public OnJobWaiting would add cancelled jobs and every
+		// in-flight job on every graceful shutdown to any user counter built on
+		// it — a silent population change in a patch release.
+		w.queue.CallAttemptEndHooks(jobCtx, job)
+	}()
+
 	// Emit start event
 	w.queue.Emit(&core.JobStarted{Job: job, Timestamp: startTime})
 
@@ -2435,6 +2498,7 @@ func (w *Worker) processJobRun(ctx context.Context, job *core.Job, runToken uint
 			// attempt with a fresh span. Use jobCtx — it carries the span injected
 			// by CallStartCtxHooks, same as the complete/fail hooks below.
 			w.queue.CallWaitingHooks(jobCtx, job)
+			dispositionReported.mark()
 			cancelHeartbeat()
 			// Job is already in StatusWaiting; just return
 			return
@@ -2523,6 +2587,7 @@ func (w *Worker) processJobRun(ctx context.Context, job *core.Job, runToken uint
 		// is emitted only by Queue.PauseJob, which sets no pause mark and so never
 		// reaches this branch — Worker.Pause emits WorkerPaused.)
 		w.queue.CallWaitingHooks(jobCtx, job)
+		dispositionReported.mark()
 
 		// EXACTLY ONE of these fires. An earlier version added this switch but left
 		// the original unconditional Info below it, so the failure branch logged an
@@ -2548,7 +2613,7 @@ func (w *Worker) processJobRun(ctx context.Context, job *core.Job, runToken uint
 		}
 	} else if err != nil {
 		w.queue.CallErrorHandler(jobCtx, job, err)
-		w.handleError(ctx, jobCtx, job, err)
+		w.handleError(ctx, jobCtx, job, err, dispositionReported)
 		cancelHeartbeat()
 	} else {
 		if w.config.BatchCompletion.Enabled && job.FanOutID == nil && w.batchCompleter != nil {
@@ -2572,6 +2637,7 @@ func (w *Worker) processJobRun(ctx context.Context, job *core.Job, runToken uint
 
 				cancelHeartbeat()
 				w.queue.CallCompleteHooks(jobCtx, job)
+				dispositionReported.mark()
 				w.queue.Emit(&core.JobCompleted{Job: job, Duration: time.Since(startTime), Timestamp: time.Now()})
 				return
 			}
@@ -2605,6 +2671,7 @@ func (w *Worker) processJobRun(ctx context.Context, job *core.Job, runToken uint
 		}
 
 		w.queue.CallCompleteHooks(jobCtx, job)
+		dispositionReported.mark()
 		w.queue.Emit(&core.JobCompleted{Job: job, Duration: time.Since(startTime), Timestamp: time.Now()})
 		// The atomic path already accounted the sub-job inside its terminal
 		// transaction and handed back the resulting fan-out; the legacy path has
@@ -2914,7 +2981,20 @@ func (w *Worker) executeHandler(ctx context.Context, job *core.Job, h *handler.H
 	return resultBytes, err
 }
 
-func (w *Worker) handleError(ctx context.Context, jobCtx context.Context, job *core.Job, err error) {
+// attemptDisposition records whether an attempt reported an outcome through one
+// of the disposition hooks (complete / fail / retry / waiting).
+//
+// It exists so processJob's fallback span-closer can tell an attempt that
+// reported nothing — every disposition write came back ErrJobNotOwned, or never
+// landed — from one that did. It is a struct rather than a bare *bool so it can
+// only be threaded deliberately: handleError takes it as a parameter, which is
+// what makes "did this path fire a hook?" a compile-time question at the one call
+// site instead of a thing to remember.
+type attemptDisposition struct{ reported bool }
+
+func (d *attemptDisposition) mark() { d.reported = true }
+
+func (w *Worker) handleError(ctx context.Context, jobCtx context.Context, job *core.Job, err error, disposition *attemptDisposition) {
 	// Decide the disposition: a scheduled retry (retryAt != nil) or a terminal
 	// failure (retryAt == nil). NoRetry always wins; otherwise we retry while
 	// attempts remain. This mirrors the original branch-by-branch logic.
@@ -2951,6 +3031,7 @@ func (w *Worker) handleError(ctx context.Context, jobCtx context.Context, job *c
 			return
 		}
 		w.queue.CallRetryHooks(jobCtx, job, job.Attempt, err)
+		disposition.mark()
 		w.queue.Emit(&core.JobRetrying{Job: job, Attempt: job.Attempt, Error: err, NextRunAt: *retryAt, Timestamp: time.Now()})
 		return
 	}
@@ -2968,6 +3049,7 @@ func (w *Worker) handleError(ctx context.Context, jobCtx context.Context, job *c
 			return
 		}
 		w.queue.CallFailHooks(jobCtx, job, err)
+		disposition.mark()
 		w.queue.Emit(&core.JobFailed{Job: job, Error: err, Timestamp: time.Now()})
 		if handleErr := w.checkFanOutCompletion(ctx, fo); handleErr != nil {
 			w.logger.Error("failed to handle sub-job failure", "job_id", job.ID, "error", handleErr)
@@ -2989,6 +3071,7 @@ func (w *Worker) handleError(ctx context.Context, jobCtx context.Context, job *c
 
 	// Terminal failure.
 	w.queue.CallFailHooks(jobCtx, job, err)
+	disposition.mark()
 	w.queue.Emit(&core.JobFailed{Job: job, Error: err, Timestamp: time.Now()})
 	// Handle sub-job failure (resume parent if needed).
 	if handleErr := w.handleSubJobCompletion(ctx, job, false); handleErr != nil {

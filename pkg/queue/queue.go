@@ -48,7 +48,16 @@ type Queue struct {
 	onFail     []func(context.Context, *core.Job, error)
 	onRetry    []func(context.Context, *core.Job, int, error)
 	onWaiting  []func(context.Context, *core.Job)
-	onReclaim  []func(context.Context, core.UUID, string)
+	// onAttemptEnd fires when an attempt ends WITHOUT reporting a disposition
+	// (cancelled mid-run, released on shutdown, ownership lost). It exists so an
+	// observability integration can close that attempt's span without widening the
+	// PUBLIC OnJobWaiting contract, which documents parking on a signal, a durable
+	// sleep or a fan-out. A skeptic caught the first version of this fix routing
+	// abandoned attempts through OnJobWaiting: that silently adds cancelled jobs and
+	// every in-flight job on every graceful shutdown to any user counter built on
+	// that hook — a behaviour change shipping in a PATCH.
+	onAttemptEnd []func(context.Context, *core.Job)
+	onReclaim    []func(context.Context, core.UUID, string)
 
 	// Enqueue middleware chain
 	enqueueMiddleware []EnqueueMiddleware
@@ -1272,6 +1281,28 @@ func (q *Queue) CallRetryHooks(ctx context.Context, job *core.Job, attempt int, 
 }
 
 // CallWaitingHooks calls all registered waiting hooks.
+// OnAttemptEnd registers a callback for an attempt that ended without reporting a
+// disposition. It is deliberately NOT exported through the facade: it exists for
+// pkg/otel's span lifecycle, and its population (cancelled jobs, shutdown-released
+// jobs, lost-ownership jobs) is not the "parked workflow" population OnJobWaiting
+// documents.
+func (q *Queue) OnAttemptEnd(fn func(context.Context, *core.Job)) {
+	q.mu.Lock()
+	q.onAttemptEnd = append(q.onAttemptEnd, fn)
+	q.mu.Unlock()
+}
+
+// CallAttemptEndHooks fires the OnAttemptEnd callbacks.
+func (q *Queue) CallAttemptEndHooks(ctx context.Context, job *core.Job) {
+	q.mu.RLock()
+	hooks := make([]func(context.Context, *core.Job), len(q.onAttemptEnd))
+	copy(hooks, q.onAttemptEnd)
+	q.mu.RUnlock()
+	for _, fn := range hooks {
+		fn(ctx, job)
+	}
+}
+
 func (q *Queue) CallWaitingHooks(ctx context.Context, job *core.Job) {
 	q.mu.RLock()
 	hooks := make([]func(context.Context, *core.Job), len(q.onWaiting))
