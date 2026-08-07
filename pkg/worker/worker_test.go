@@ -1846,9 +1846,28 @@ func TestWorker_PerJobTimeoutCancelsHandlerContext(t *testing.T) {
 
 	select {
 	case elapsed := <-cancelled:
-		assert.GreaterOrEqual(t, elapsed, jobTimeout-10*time.Millisecond)
-		assert.Less(t, elapsed, 500*time.Millisecond)
-	case <-time.After(time.Second):
+		// The LOWER bound is the real invariant: the handler must not be cancelled
+		// BEFORE its own timeout. 10ms of slack absorbs timer granularity.
+		assert.GreaterOrEqual(t, elapsed, jobTimeout-10*time.Millisecond,
+			"the handler was cancelled before its per-job timeout elapsed")
+
+		// The UPPER bound exists only to establish that the cancellation came from
+		// the PER-JOB timeout and not from some other source. The only other
+		// cancellers here are the worker's own 6s context and shutdown, so any bound
+		// comfortably below 6s discriminates just as well as a tight one — and the
+		// enclosing select already fails the test outright if nothing cancels.
+		//
+		// It was 500ms, which is 8x the timeout and looks generous until the runner
+		// is loaded: this is a SCHEDULING measurement, not a duration measurement,
+		// and a busy CI box can delay the goroutine that records `elapsed` well past
+		// the cancellation that triggered it. It failed exactly that way on main
+		// once the second SQLite CI leg doubled how often this package runs.
+		//
+		// 2s keeps every discriminating property (33x the timeout, 3x below the
+		// worker context) while no longer measuring the scheduler.
+		assert.Less(t, elapsed, 2*time.Second,
+			"cancellation took long enough that it may not have come from the per-job timeout")
+	case <-time.After(3 * time.Second):
 		t.Fatal("job context was not cancelled by per-job timeout")
 	}
 }
