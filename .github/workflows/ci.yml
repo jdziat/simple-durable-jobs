@@ -91,12 +91,18 @@ jobs:
       # combined result to Codecov (a single-backend profile understates the
       # storage layer's real coverage).
       - name: Upload coverage artifact
-        # Only the UTC legs upload. The non-UTC leg is the SAME backend running the
-        # SAME tests, so it adds no covered lines — and upload-artifact@v4 FAILS on a
-        # duplicate name, which "coverage-sqlite" would be.
-        if: matrix.tz == ''
+        # TWO conditions, one key. always() is the original: upload the profile even
+        # when the tests failed, so a red run still reports coverage. matrix.tz == ''
+        # is the new half: the non-UTC leg is the SAME backend running the SAME
+        # tests, so it adds no covered lines — and upload-artifact@v4 FAILS on a
+        # duplicate artifact name, which "coverage-sqlite" would be.
+        #
+        # They must be ANDed into a single `if:`. Written as two `if:` keys this is a
+        # duplicate mapping key: a strict YAML loader rejects the whole workflow, and
+        # a lenient one silently keeps only the last — which drops the guard and
+        # reintroduces the very collision the comment claims to prevent.
+        if: always() && matrix.tz == ''
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        if: always()
         with:
           name: coverage-${{ matrix.backend }}
           path: ./coverage/coverage-${{ matrix.backend }}.out
