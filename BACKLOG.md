@@ -172,3 +172,55 @@ against data produced by a real crash rather than a seeded row. Close it with a
 torture run (raise `CHAOS_DURATION` until `window_reexec_markers > 0`); the SIGKILL
 has to land inside a ~150ms window in `chaos.pipeline_window`, which is why 25s CI
 runs never populate it.
+
+## OPEN: three more unfenced checkpoint writers (round 47b hole #7)
+
+`GormStorage.SaveCheckpoint` is an unfenced upsert — `OnConflict(job_id, call_index,
+call_type) DoUpdates(...)` — so any writer can overwrite an existing checkpoint's
+`result`, with no ownership predicate. Four call sites reach it through
+`jc.SaveCheckpoint`:
+
+| site | audited |
+| --- | --- |
+| `pkg/signal/signal.go:135` (the timeout verdict) | **yes — was the round-47b HIGH, fixed** |
+| `pkg/call/call.go:321` (error checkpoint) | **no** |
+| `pkg/call/call.go:335` (result checkpoint) | **no** |
+| `pkg/fanout/fanout.go:161` (fan-out checkpoint) | **no** |
+
+The signal one was confirmed harmful because the value written is a **terminal
+verdict**: a run that had lost its lease could decide "timed out" for a signal that
+was pending and in time, and replay treats that as authoritative.
+
+Whether the other three are harmful is **genuinely open, and should not be assumed
+either way**. The argument for benign is that under a double-run both executions
+compute the same value, so an overwrite is a no-op. The argument for harmful is that
+`Call` exists precisely to make a NONDETERMINISTIC operation replay-safe — that is
+its whole contract — so two runs need not agree, and a later replay reading the
+loser's result is the v4.6.0 nested-`Call` corruption class, which completed jobs
+carrying another call's result.
+
+Note the fix for the signal site does NOT cover these: it fenced the ownership gate
+in `consumeSignalTx`/`drainSignalsTx`, not `SaveCheckpoint` itself. A fence on
+`SaveCheckpoint` would cover all four, but it is a wider change — the fan-out site
+in particular writes before the parent is marked waiting, so the ownership predicate
+has to be checked against the right state.
+
+This is the largest unexamined surface in the codebase right now. It wants its own
+round with an executed reproduction attempt per site, not a reasoned verdict.
+
+## Deferred from round 47b, with the reasoning already done
+
+- **Rate-limit window GC across a DST fall-back.** `deleteExpiredRateLimitWindows`
+  uses a `windowStart - 2*window` cutoff; across a fall-back the current window's own
+  row can sort below it when `window < 30min`, deleting the live counter and
+  resetting the cap. Blast radius is a `2*window` sliver twice a year. Hypothesis
+  only — **not reproduced**, and explicitly not filed as a finding.
+- **`batchCompleteChunkSize = 400` sits at 80% of a measured SQLite compound-SELECT
+  ceiling of 500**, and no comment says so. Fails loudly rather than silently if
+  raised, so this is a comment, not a fix.
+- **Does the `signals.created_at` face bug exist on MySQL?** `DATETIME(3)` is
+  zone-less and go-sql-driver converts via the DSN `loc` param (default UTC).
+  Reasoned unaffected; not verified.
+- **PG/MySQL execution of `batch_complete.go`'s dialect branches.** Rounds 47 and 47b
+  were SQLite-only by rule, so `batchCompleteFlipPostgres` and `batchCompleteFlipMySQL`
+  were read but never run.

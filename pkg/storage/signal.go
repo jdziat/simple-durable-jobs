@@ -30,6 +30,25 @@ func (s *GormStorage) SendSignal(ctx context.Context, jobID core.UUID, name stri
 		JobID:   jobID,
 		Name:    name,
 		Payload: encoded,
+		// Set EXPLICITLY on one clock face rather than left to GORM's
+		// autoCreateTime, which stamps a bare time.Now() wearing the SENDING
+		// process's local offset.
+		//
+		// created_at is not decoration here: it is the ORDER BY that implements the
+		// documented FIFO delivery contract (core.Signal's godoc), and on SQLite it
+		// is TEXT compared LEXICALLY. Two senders on different offsets — a UTC
+		// container and a local-TZ host, the ordinary shape in a mixed deployment —
+		// therefore invert permanently, and a single host inverts across a DST
+		// fall-back. Measured: signals sent 30ms apart delivered newest-first.
+		//
+		// The sibling column is the tell: consumed_at already goes through
+		// nowWriteValue(). This one was left on the GORM default.
+		//
+		// UTC() rather than nowWriteValue(): the value must be comparable with rows
+		// written by OTHER processes, and on DB-clock backends Create cannot take a
+		// SQL expression here without a raw insert. UTC is the one face every
+		// sender agrees on without a round trip.
+		CreatedAt: time.Now().UTC(),
 	}
 	if !s.isSQLite {
 		return s.db.WithContext(ctx).Create(sig).Error
@@ -218,7 +237,20 @@ func (s *GormStorage) consumeSignalTx(ctx context.Context, jobID core.UUID, work
 					return err
 				}
 				if owned == 0 {
-					return nil // not the current owner — do not consume; caller suspends
+					// ErrJobNotOwned, NOT nil. A bare nil here is byte-identical to
+					// the "nothing pending" return below, and the caller acts on the
+					// difference: WaitForSignalTimeout reads nil as "no signal
+					// arrived" and, once its deadline has passed, commits a DURABLE
+					// 'timed out' verdict through an unfenced SaveCheckpoint upsert.
+					// A run that had already lost its lease could therefore decide
+					// the timeout for a signal sitting in the table, in time and
+					// undelivered — and replay treats that checkpoint as
+					// authoritative, so the job completes down the wrong branch.
+					//
+					// This method's own godoc says a non-owner "suspends"; it could
+					// not, because it was never told. The suspend path in this file
+					// already fences this way.
+					return core.ErrJobNotOwned
 				}
 			}
 			q := s.pendingSignalsLocked(tx, jobID, name)
@@ -297,7 +329,10 @@ func (s *GormStorage) drainSignalsTx(ctx context.Context, jobID core.UUID, worke
 					return err
 				}
 				if owned == 0 {
-					return nil // not the current owner — do not drain; caller suspends
+					// Same fence, same reason as consumeSignalTx above: a non-owner
+					// must be told it is a non-owner, not handed the value that means
+					// "there was nothing here".
+					return core.ErrJobNotOwned
 				}
 			}
 			q := s.pendingSignalsLocked(tx, jobID, name)
