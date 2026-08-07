@@ -59,6 +59,24 @@ jobs:
             db: ""
             label: "sqlite, TZ=America/Los_Angeles"
             tz: America/Los_Angeles
+          # And a POSITIVE offset, with a half-hour component.
+          #
+          # One negative leg is not enough, and the reason is specific: a negative
+          # offset catches a stored-local value sorting BELOW a UTC cutoff (a live
+          # row swept, a cap that stops capping). A positive offset catches the
+          # opposite — a value sorting ABOVE it, so an EXPIRED row is never
+          # collected and blocks its slot forever. Those are different defects, and
+          # normalizing a write to UTC can FIX the first while INTRODUCING the
+          # second on any database that already has rows.
+          #
+          # Two shipped tests were red at +05:30 while green at UTC and -07:00, so
+          # this is not hypothetical. :30 rather than a whole hour because the
+          # trailing "+HH:MM" is compared with its minutes, and a whole-hour zone
+          # cannot catch a predicate that slices the offset wrong.
+          - backend: sqlite
+            db: ""
+            label: "sqlite, TZ=Asia/Kolkata"
+            tz: Asia/Kolkata
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1

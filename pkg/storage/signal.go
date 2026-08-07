@@ -20,6 +20,32 @@ import (
 // between a caller's existence check and this write). On SQLite the job's
 // existence is therefore re-checked inside the write transaction — where the
 // serialized writer makes check-then-insert atomic — returning core.ErrJobNotFound.
+// signalFIFOOrder is the ORDER BY implementing the documented FIFO delivery
+// contract, written so it is correct against rows stored on EITHER clock face.
+//
+// created_at is now written in UTC, but an upgraded database still holds rows
+// written by older releases wearing the sender's local offset — and during a
+// rolling deploy both faces are being written concurrently. A bare
+// `created_at ASC` is a LEXICAL compare on SQLite, so those rows sort by their
+// digits rather than their instants: measured at TZ=Asia/Kolkata, a signal sent
+// 30ms EARLIER by an older binary was delivered SECOND.
+//
+// julianday() is computed from the parsed instant and is face-independent.
+//
+// WHY THIS IS AFFORDABLE HERE, WHERE THE UI LIST REJECTED THE SAME FIX.
+// gorm_ui.go documents a measured 554x regression from julianday-ordering the
+// dead-letter list, because that query walks an index over the whole table in
+// order. This one does not: the WHERE narrows to the PENDING signals of a single
+// (job_id, name) before anything is sorted. EXPLAIN QUERY PLAN confirms
+// idx_signals_pending still serves the lookup on both forms; julianday adds only
+// "USE TEMP B-TREE FOR ORDER BY" over that handful of rows.
+func (s *GormStorage) signalFIFOOrder() string {
+	if !s.isSQLite {
+		return "created_at ASC"
+	}
+	return "julianday(created_at) ASC"
+}
+
 func (s *GormStorage) SendSignal(ctx context.Context, jobID core.UUID, name string, payload []byte) error {
 	encoded, err := s.encodePayload("signal payload", string(jobID)+"/"+name, payload)
 	if err != nil {
@@ -71,7 +97,7 @@ func (s *GormStorage) PeekSignal(ctx context.Context, jobID core.UUID, name stri
 	var sig core.Signal
 	err := s.db.WithContext(ctx).
 		Where("job_id = ? AND name = ? AND consumed_at IS NULL", jobID, name).
-		Order("created_at ASC").
+		Order(s.signalFIFOOrder()).
 		First(&sig).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil, nil
@@ -86,7 +112,7 @@ func (s *GormStorage) PeekSignal(ctx context.Context, jobID core.UUID, name stri
 }
 
 func (s *GormStorage) pendingSignalsLocked(tx *gorm.DB, jobID core.UUID, name string) *gorm.DB {
-	return s.lockForUpdate(tx.Where("job_id = ? AND name = ? AND consumed_at IS NULL", jobID, name).Order("created_at ASC"), true)
+	return s.lockForUpdate(tx.Where("job_id = ? AND name = ? AND consumed_at IS NULL", jobID, name).Order(s.signalFIFOOrder()), true)
 }
 
 // ConsumeSignal atomically takes the oldest pending signal of name for the job
@@ -390,7 +416,7 @@ func (s *GormStorage) GetPendingSignalName(ctx context.Context, jobID core.UUID)
 	err := s.db.WithContext(ctx).
 		Select("name").
 		Where("job_id = ? AND consumed_at IS NULL", jobID).
-		Order("created_at ASC").
+		Order(s.signalFIFOOrder()).
 		First(&sig).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return "", false, nil

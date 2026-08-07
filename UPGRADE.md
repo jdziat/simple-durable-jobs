@@ -280,10 +280,21 @@ running, and it compounded on every hourly tick.
 **Entirely silent:** the sweep returned success, and the running job's slot renewal
 reported "not renewed" to a caller that discarded the result.
 
-**Affects:** SQLite only, in a negative-offset timezone, using `ConcurrencyCap`.
-Postgres and MySQL route both ends through the database server clock and were never
-affected. **No action needed on upgrade** — slot rows are ephemeral (45m default
-TTL), so any rows written on the old face age out within one TTL.
+**Affects:** SQLite only, using `ConcurrencyCap`. Postgres and MySQL route both
+ends through the database server clock and were never affected.
+
+**No action needed on upgrade, and the reason is worth stating** because an earlier
+draft of this note got it wrong. Normalizing the *write* to UTC fixes nothing on a
+database that already has rows: those still wear the old face, a rolling deploy
+writes both faces at once, and the comparison is what has to cope. So the
+comparison itself is now face-aware — it compares raw text when the two faces match
+and parsed instants when they do not.
+
+Without that, a write-side-only change would have *fixed* the over-admission west of
+UTC while *introducing* a stall east of it: an expired legacy row sorting above the
+cutoff can never be collected, and a limit-1 cap then admits **zero** jobs until real
+time overtakes the offset — up to 14 hours at +14:00. Both directions are now
+covered, and both are pinned by a test that seeds a row the old way.
 
 A running job that has lost its slot now logs a warning naming the slot and what it
 means for the cap.
@@ -322,11 +333,21 @@ local-timezone host — an ordinary mixed deployment) delivered signals **perman
 out of order**, and a single host inverted across a DST fall-back. Measured: two
 signals sent 30ms apart delivered newest-first.
 
-`created_at` is now written in UTC. **Rows written before this upgrade keep the face
-they were stored with**, so if you have long-buffered pending signals sent from a
-non-UTC host, their relative order against newly sent ones can still be wrong until
-they drain. There is no migration because the correct value for an existing row is
-not recoverable — the offset is in the string, but which host wrote it is not.
+`created_at` is now written in UTC, **and the FIFO `ORDER BY` compares instants
+rather than rendered text**, so pending signals sent before this upgrade are ordered
+correctly against ones sent after it. The second half matters as much as the first:
+with only the write normalized, a signal sent 30ms earlier by an older binary was
+measured being delivered *second* at +05:30.
+
+There is no migration — the correct value for an existing row is not recoverable,
+since the offset is in the string but which host wrote it is not — and none is
+needed, because the ordering no longer depends on the stored face.
+
+On SQLite this orders by `julianday(created_at)`. The lookup index is unaffected:
+the `WHERE` narrows to the pending signals of one `(job_id, name)` before any sort
+happens. (This is deliberately *not* done for the dashboard's dead-letter list,
+where the same change was measured at 554x because that query walks an index over
+the whole table in order.)
 
 ---
 

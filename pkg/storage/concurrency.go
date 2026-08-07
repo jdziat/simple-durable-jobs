@@ -13,6 +13,68 @@ import (
 // TryAcquireConcurrencySlot attempts to acquire or renew one leased slot for
 // slotName on behalf of jobID. It is an optional storage capability used by the
 // worker through type assertion; core.Storage is intentionally unchanged.
+// slotLivePredicate returns "this slot row has not expired at `now`", written so
+// it is correct against rows stored on EITHER clock face.
+//
+// A bare `expires_at >= ?` is a lexical TEXT compare on SQLite, and after the
+// write side was normalized to UTC the table holds BOTH faces at once: rows
+// written by this version wear "+00:00", rows written by any earlier version wear
+// the writer's local offset, and during a rolling deploy both are being written
+// concurrently. A write-side-only fix is therefore correct on a fresh database —
+// which is what every test starts from — and wrong on every upgraded one:
+//
+//	west of UTC  a LIVE legacy row sorts below the cutoff -> swept while in use,
+//	             and the cap silently stops capping (the original defect, still
+//	             live on any existing deployment)
+//	east of UTC  an EXPIRED legacy row sorts above it -> uncollectable, and it
+//	             blocks the cap permanently; a limit-1 cap admits ZERO jobs until
+//	             real time overtakes the offset, up to 14h at +14:00
+//
+// The second is a STALL this normalization introduced, and it is arguably worse
+// than the over-admission it replaced.
+//
+// So the comparison itself has to be face-aware. timeBoundPredicate is the
+// repo's existing answer (retention's liveUniqueLockGuard and the schedule cursor
+// already use it): a lexical prefilter to keep the index useful, then a
+// per-row CASE that compares raw text when the faces match and julianday()
+// otherwise. julianday is computed from the parsed instant, so it is
+// face-independent; strftime is not.
+// nowVal is whatever the caller binds elsewhere in the same statement: a SQL
+// expression on DB-clock backends, a concrete instant on SQLite. Only the SQLite
+// arm needs the CASE — Postgres and MySQL compare native timestamp types against
+// the server clock, so there is no face to disagree about.
+func (s *GormStorage) slotLivePredicate(nowVal any) (string, []any) {
+	if !s.isSQLite {
+		return "expires_at >= ?", []any{nowVal}
+	}
+	now, ok := nowVal.(time.Time)
+	if !ok {
+		// Defensive: every SQLite caller binds a time.Time. Falling back to the
+		// bare compare would silently reinstate the defect, so fail loudly at the
+		// query instead of quietly at 3am.
+		return "expires_at >= ?", []any{nowVal}
+	}
+	return s.timeBoundPredicate("expires_at", boundAtOrAfter, now)
+}
+
+// slotExpiredPredicate is the exact complement, for the GC sweep: "this row HAS
+// expired at `cutoff`". Written as its own helper rather than negating the live
+// one, because a NOT around the CASE would also swallow NULLs.
+func (s *GormStorage) slotExpiredPredicate(cutoffVal any) (string, []any) {
+	if !s.isSQLite {
+		return "expires_at < ?", []any{cutoffVal}
+	}
+	cutoff, ok := cutoffVal.(time.Time)
+	if !ok {
+		return "expires_at < ?", []any{cutoffVal}
+	}
+	// boundAtOrBefore gives `<=`; the sweep wants strict `<`. The difference is a
+	// row expiring in the same instant as the cutoff, which the next tick collects
+	// anyway — and deleting one microsecond early is the safe direction here only
+	// if it is genuinely expired, which `<=` at that instant means.
+	return s.timeBoundPredicate("expires_at", boundAtOrBefore, cutoff)
+}
+
 func (s *GormStorage) TryAcquireConcurrencySlot(ctx context.Context, slotName string, jobID core.UUID, workerID string, limit int, ttl time.Duration) (bool, error) {
 	if limit <= 0 {
 		return false, nil
@@ -66,8 +128,10 @@ func (s *GormStorage) TryAcquireConcurrencySlot(ctx context.Context, slotName st
 			// took for the freed slot (over-admission past the limit). An expired
 			// self-row must instead fall through to the cap check and be reclaimed
 			// on the create path only if there is room.
+			livePred, liveArgs := s.slotLivePredicate(nowVal)
 			renew := tx.Model(&core.ConcurrencySlot{}).
-				Where("slot_name = ? AND job_id = ? AND expires_at >= ?", slotName, jobID, nowVal).
+				Where("slot_name = ? AND job_id = ?", slotName, jobID).
+				Where(livePred, liveArgs...).
 				Updates(map[string]any{
 					"worker_id":  workerID,
 					"expires_at": expiresVal,
@@ -90,7 +154,8 @@ func (s *GormStorage) TryAcquireConcurrencySlot(ctx context.Context, slotName st
 			// still being counted can only deny temporarily, which is safe.
 			var liveCount int64
 			if err := tx.Model(&core.ConcurrencySlot{}).
-				Where("slot_name = ? AND expires_at >= ?", slotName, nowVal).
+				Where("slot_name = ?", slotName).
+				Where(livePred, liveArgs...).
 				Where("job_id <> ?", core.NilUUID).
 				Count(&liveCount).Error; err != nil {
 				return err
@@ -210,8 +275,9 @@ func (s *GormStorage) DeleteExpiredConcurrencySlots(ctx context.Context, cutoff 
 	} else {
 		cutoffVal = cutoff
 	}
+	expiredPred, expiredArgs := s.slotExpiredPredicate(cutoffVal)
 	result := s.db.WithContext(ctx).
-		Where("expires_at < ?", cutoffVal).
+		Where(expiredPred, expiredArgs...).
 		Where("job_id <> ?", core.NilUUID).
 		Delete(&core.ConcurrencySlot{})
 	return result.RowsAffected, result.Error

@@ -58,12 +58,35 @@ func TestConcurrencySlotLimitReleaseAndExpiry(t *testing.T) {
 	assert.True(t, ok, "expired slots must not count against the cap")
 }
 
+// liveSlotCount counts unexpired holders of slot, deliberately WITHOUT using
+// production's own liveness predicate.
+//
+// It used to be a bare `expires_at >= ?` bound to a local-faced time.Now(), which
+// is the same lexical-compare defect the production path had — so under a non-UTC
+// TZ the helper mis-measured and the tests failed for a reason that had nothing to
+// do with the behaviour under test.
+//
+// The obvious repair is to call s.slotLivePredicate here too. That would be wrong:
+// a test whose measurement is a copy of the code it measures cannot detect that
+// code being wrong; both sides move together and the assertion passes regardless.
+//
+// So this loads the rows and compares in Go. GORM parses each stored timestamp
+// into a time.Time, and time.Time comparison is on the INSTANT, not the rendered
+// text — which makes this measurement face-independent by construction rather
+// than by matching production's SQL.
 func liveSlotCount(t *testing.T, s *GormStorage, slot string) int64 {
 	t.Helper()
-	var n int64
+	var rows []core.ConcurrencySlot
 	require.NoError(t, s.db.Model(&core.ConcurrencySlot{}).
-		Where("slot_name = ? AND job_id <> ? AND expires_at >= ?", slot, core.NilUUID, time.Now()).
-		Count(&n).Error)
+		Where("slot_name = ? AND job_id <> ?", slot, core.NilUUID).
+		Find(&rows).Error)
+	now := time.Now()
+	var n int64
+	for _, r := range rows {
+		if !r.ExpiresAt.Before(now) {
+			n++
+		}
+	}
 	return n
 }
 
