@@ -132,31 +132,43 @@ and routed. Otherwise "not silent" is true on paper and false in practice.
 - The chaos mutation matrix on MySQL (dialect-specific branches of
   `checkExactlyOnce`, `checkRateWellFormed`, `checkSlotNoLeak`).
 
-## A HARD invariant sub-check that has never seen a non-empty input
+## A HARD invariant sub-check that has never seen LIVE data
 
-`checkExactlyOnce`'s third term, `windowCheckpointedRows` (`cmd/chaostest/main.go:993`),
-is one of the three conditions gating a HARD invariant — and therefore gates every
-future release. It has passed on every run so far with an **empty input set**: both
-chaos runs on this branch reported `window_reexec_markers=0`, so the query returned
-zero rows because there were no rows to return, not because the property held.
+**Status: narrowed, not closed. No defect found.**
 
-That is not a defect and it did not block v4.9.0. It is recorded here because of
-how it will fail if it is wrong. A false-fire will not surface now, while the
-change is fresh and attributable; it will surface on some future run, and will look
-like a regression in whatever landed that day. The cost of finding that out later
-is paid by whoever is least equipped to explain it.
+`checkExactlyOnce`'s third term, `windowCheckpointedRows` (`cmd/chaostest/main.go`),
+gates a HARD invariant and therefore gates every release. Both chaos runs on the
+v4.9.0 branch reported `window_reexec_markers=0`, so in a *live* run it has only
+ever evaluated an empty set.
 
-Two ways to close it, in preference order:
+An earlier version of this entry said the two-sided unit probe was a thing still to
+write. That was wrong — `TestWindowCheckpointJoinActuallyMatches` already seeds a
+re-exec marker with no checkpoint (asserts PASS), then commits the checkpoint
+(asserts FAIL). The entry has been corrected rather than deleted, because writing
+down a gap that does not exist is its own defect: it sends the next round to build
+something twice.
 
-1. A torture run with `CHAOS_SCALE` raised until re-execution markers appear inside
-   the window, so the check is observed evaluating a populated set.
-2. Failing that, a unit-level probe that seeds the shape the query looks for and
-   asserts it both fires and does not false-fire — the same two-sided treatment
-   `TestExactlyOnceRedensOnASeededDuplicate` and
-   `TestExactlyOnceIgnoresTheDocumentedAtLeastOnceWindow` give the sibling terms.
+What WAS missing, and is now fixed: **every one of the harness's 20 invariant tests
+ran `dialectSQLite`.** The window-checkpoint join is written three different ways —
+`cp.job_id::text` (PG uuid), `BIN_TO_UUID(cp.job_id)` (MySQL binary(16)),
+hand-assembled hex (SQLite blob) — and only the SQLite branch was proven. That is
+the same defect one layer out: the repair for a join that had been dead on PG and
+MySQL since the v3 binary-UUID migration was itself verified only on SQLite, while
+`ci.yml`'s release-gating chaos smoke runs on **Postgres**.
 
-Worth stating plainly, since this whole round exists because of it: an invariant
-that has only ever been evaluated against an empty set is in exactly the position
-`duplicate_effect_groups` was in before this round — passing, trusted, and proving
-nothing. `TestEveryHardInvariantCanFail` guards the invariant as a whole, not each
-term within it.
+`TestWindowCheckpointJoinMatchesOnEveryDialect` now runs the two-sided proof against
+live PG and MySQL. **Both pass, and both mutations kill** — replacing the join with a
+silently-never-matching variant (`... || 'x'` / `CONCAT(...,'x')`, the historical
+defect shape) reddens each dialect. So the code was right; only the evidence was
+missing.
+
+Incidental finding from writing it: `checkpoints.job_id` carries a real FK to `jobs`
+on PG and MySQL, so the SQLite-only probe's fixture — a checkpoint for a job that was
+never enqueued — is impossible on either real backend. A fixture that works on SQLite
+can be unbuildable on the backend that gates releases.
+
+**Residual, and it is now small:** the term has still never matched or not-matched
+against data produced by a real crash rather than a seeded row. Close it with a
+torture run (raise `CHAOS_DURATION` until `window_reexec_markers > 0`); the SIGKILL
+has to land inside a ~150ms window in `chaos.pipeline_window`, which is why 25s CI
+runs never populate it.
