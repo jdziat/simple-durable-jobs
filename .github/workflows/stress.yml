@@ -4,6 +4,15 @@ on:
   schedule:
     - cron: '17 7 * * *'
   workflow_dispatch:
+    inputs:
+      chaos_duration:
+        description: >-
+          Seconds to run the chaos loop. The nightly default is 60. Raise it for a
+          TORTURE RUN: some invariant terms need a SIGKILL to land inside a window
+          only a few hundred milliseconds wide, so they never populate at 60s and
+          pass against an empty set. 1800 is a reasonable torture value.
+        required: false
+        default: '60'
 
 jobs:
   codec-fuzz:
@@ -70,7 +79,10 @@ jobs:
   chaos:
     name: Chaos (${{ matrix.backend }})
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # Sized for the largest torture run the input invites (1800s loop) plus image
+    # build, seed and drain. The nightly 60s run is unaffected — a timeout is a
+    # ceiling, not a wait.
+    timeout-minutes: 50
     strategy:
       fail-fast: false
       matrix:
@@ -78,4 +90,9 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Run chaos harness
+        # Overridable so a torture run is a button press rather than a code edit.
+        # Defaults to the script's own 60s on the nightly schedule, where
+        # github.event.inputs is empty.
+        env:
+          CHAOS_DURATION: ${{ github.event.inputs.chaos_duration || '60' }}
         run: bash scripts/chaos-test.sh ${{ matrix.backend }}

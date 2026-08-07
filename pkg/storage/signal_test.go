@@ -685,7 +685,19 @@ func TestConsumeSignalTx_NonOwnerDoesNotConsume(t *testing.T) {
 		t.Fatal("a non-owner must not consume the signal / build a checkpoint")
 		return nil, nil
 	})
-	require.NoError(t, err)
+	// ErrJobNotOwned, not nil. This assertion used to be require.NoError, and that
+	// is how a defect one layer up looked intentional: not-the-owner and
+	// nothing-pending returned the same (nil, nil), so WaitForSignalTimeout read
+	// the refusal as "no signal arrived" and — once its deadline had passed —
+	// committed a durable 'timed out' verdict through an unfenced upsert, for a
+	// signal that was still pending and still in time.
+	//
+	// The property this test was written for is unchanged and still asserted below:
+	// a non-owner consumes nothing and writes nothing. What changed is that it is
+	// now TOLD, so its caller can abandon the attempt instead of deciding an
+	// outcome it has no right to decide.
+	require.ErrorIs(t, err, core.ErrJobNotOwned,
+		"a non-owner must be told it is a non-owner, not handed the value that means 'nothing was here'")
 	assert.Nil(t, sig, "non-owner consumes nothing")
 
 	peek, err := s.PeekSignal(ctx, signalUUID("j1"), "ctx")
@@ -745,7 +757,9 @@ func TestDrainSignalsTxOwned_NonOwnerDoesNotDrain(t *testing.T) {
 		t.Fatal("a non-owner must not drain / build a checkpoint (even an empty-batch one)")
 		return nil, nil
 	})
-	require.NoError(t, err)
+	// Same fence, same reason as TestConsumeSignalTx_NonOwnerDoesNotConsume above.
+	require.ErrorIs(t, err, core.ErrJobNotOwned,
+		"a non-owner must be told, not handed the 'nothing pending' value")
 	assert.Empty(t, sigs, "non-owner drains nothing")
 
 	cps, err := s.GetCheckpoints(ctx, signalUUID("j1"))

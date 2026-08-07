@@ -2161,8 +2161,28 @@ func (w *Worker) renewConcurrencySlots(ctx context.Context, jobID core.UUID, run
 	}
 	ttl := w.concurrencySlotTTL()
 	for _, slot := range slots {
-		if _, err := storage.RenewConcurrencySlot(ctx, slot, jobID, ttl); err != nil {
+		// The BOOL matters as much as the error, and discarding it is what made a
+		// vanished slot silent. RenewConcurrencySlot is renew-only: it updates a row
+		// that exists and reports renewed=false rather than re-creating one. So a
+		// false here means this job is STILL RUNNING while holding no slot — the cap
+		// it was admitted under is no longer counting it, and another job can be
+		// admitted in its place. Nothing else in the system notices: the sweep that
+		// removed the row returned err=nil, and the eventual release deletes 0 rows
+		// and also returns nil.
+		//
+		// This is not recoverable here — re-acquiring would either block on a cap
+		// that is already over-subscribed or double-count this job — so it is
+		// reported rather than repaired. It is a real operational signal: it means
+		// either the slot expired under a slow handler (raise the TTL) or something
+		// deleted a live row.
+		renewed, err := storage.RenewConcurrencySlot(ctx, slot, jobID, ttl)
+		switch {
+		case err != nil:
 			w.logger.Warn("failed to renew concurrency slot", "job_id", jobID, "slot", slot, "error", err)
+		case !renewed:
+			w.logger.Warn("concurrency slot vanished while its job was still running; "+
+				"the cap is no longer counting this job and may admit another in its place",
+				"job_id", jobID, "slot", slot, "slot_ttl", ttl)
 		}
 	}
 }

@@ -1,8 +1,8 @@
 # Upgrading
 
-## Upgrading through the v4.6 / v4.7 / v4.8 / v4.9 line
+## Upgrading through the v4.6 / v4.7 / v4.8 / v4.9 / v4.10 line
 
-Four releases matter here.
+Five releases matter here.
 
 - **v4.6.0** closed a silent data-corruption bug in nested `Call()` replay and an
   authentication bypass in the embedded dashboard, and cleared two reachable
@@ -17,6 +17,11 @@ Four releases matter here.
 - **v4.9.0** adds one hook and one CLI exit code, and fixes four defects. It needs
   no migration and no code change on your side; the two additive surfaces are
   described in its own section below.
+- **v4.10.0** fixes three defects, two of them changing observable behaviour: a
+  SQLite concurrency-cap collapse in negative-UTC-offset timezones, a lost-lease run
+  committing a signal timeout verdict, and signal FIFO ordering across timezones. No
+  migration. Read its section if you use `ConcurrencyCap` on SQLite, or call
+  `ConsumeSignalTxOwned`/`DrainSignalsTxOwned` directly.
 
 No API break: `gorelease` reports every change compatible against a v4.7.0 base.
 The additions are wider than "options and storage methods", so here are the ones
@@ -245,6 +250,104 @@ not about authentication, and it is not required to get the fix.
 
 v4.6.0 also cleared two reachable advisories: **GO-2026-5970** (`golang.org/x/text`,
 reachable in every default configuration) and **GO-2026-5506** (`go.opentelemetry.io/otel`).
+
+---
+
+## Behaviour changes in v4.10.0
+
+No migration, no API additions. Three defect fixes, two of which change observable
+behaviour — one on an exported storage method, one on a stored timestamp — which is
+why this is a minor rather than a patch.
+
+### `ConcurrencyCap` silently stopped capping west of UTC (SQLite)
+
+**This one is worth checking your dashboards for.**
+
+`TryAcquireConcurrencySlot` wrote `expires_at` on the process-local clock face while
+the worker's hourly expiry sweep compares against a UTC cutoff. On SQLite timestamps
+are TEXT and the comparison is lexical, so in any **negative-UTC-offset timezone**
+— roughly all of the Americas — the sweep deleted slot rows that were still live:
+
+```
+stored under TZ=America/Los_Angeles   "2026-08-06 20:46:04.884-07:00"
+sweep cutoff (UTC)                    "2026-08-07 03:01:04.885+00:00"
+```
+
+Same instant, 45 minutes of TTL left, and `2026-08-06…` sorts first — so it was
+deleted. The cap then admitted another job while the original holder was still
+running, and it compounded on every hourly tick.
+
+**Entirely silent:** the sweep returned success, and the running job's slot renewal
+reported "not renewed" to a caller that discarded the result.
+
+**Affects:** SQLite only, using `ConcurrencyCap`. Postgres and MySQL route both
+ends through the database server clock and were never affected.
+
+**No action needed on upgrade, and the reason is worth stating** because an earlier
+draft of this note got it wrong. Normalizing the *write* to UTC fixes nothing on a
+database that already has rows: those still wear the old face, a rolling deploy
+writes both faces at once, and the comparison is what has to cope. So the
+comparison itself is now face-aware — it compares raw text when the two faces match
+and parsed instants when they do not.
+
+Without that, a write-side-only change would have *fixed* the over-admission west of
+UTC while *introducing* a stall east of it: an expired legacy row sorting above the
+cutoff can never be collected, and a limit-1 cap then admits **zero** jobs until real
+time overtakes the offset — up to 14 hours at +14:00. Both directions are now
+covered, and both are pinned by a test that seeds a row the old way.
+
+A running job that has lost its slot now logs a warning naming the slot and what it
+means for the cap.
+
+### A run that lost its lease could commit a `WaitForSignalTimeout` verdict
+
+`ConsumeSignalTxOwned` and `DrainSignalsTxOwned` returned `(nil, nil)` for **two
+different facts**: "you are no longer the owner of this job" and "there is nothing
+pending". `WaitForSignalTimeout` read that as "no signal arrived" and, if its
+deadline had passed, wrote a durable *timed out* checkpoint — even though the signal
+was sitting in the table, sent in time, unconsumed. Replay treats that checkpoint as
+authoritative, so the workflow took the timeout branch and the signal was never
+delivered to anyone.
+
+Reachable under the documented at-least-once double-run edge: a worker's heartbeat
+lapses, the reaper releases the row, another worker claims it, and the original run
+is still executing.
+
+**Behaviour change:** both methods now return `core.ErrJobNotOwned` instead of
+`(nil, nil)` when the caller is not the current owner. The run abandons the attempt
+and writes nothing; whichever worker actually owns the job delivers the signal.
+
+**What to check:** only if you call `ConsumeSignalTxOwned` / `DrainSignalsTxOwned`
+**directly** — they are exported on `*GormStorage`, and code that treated a nil
+signal as "nothing pending" now needs to distinguish the two. If you only use
+`WaitForSignal` / `WaitForSignalTimeout` / `DrainSignals`, nothing changes for you
+except that the bug is gone.
+
+### Signals are delivered in send order across timezones
+
+`signals.created_at` — the `ORDER BY` implementing the documented FIFO contract —
+was written by GORM's `autoCreateTime`, i.e. on the **sending** process's local clock
+face, while its sibling `consumed_at` was already normalized. On SQLite that column
+is compared lexically, so two senders on different UTC offsets (a UTC container and a
+local-timezone host — an ordinary mixed deployment) delivered signals **permanently
+out of order**, and a single host inverted across a DST fall-back. Measured: two
+signals sent 30ms apart delivered newest-first.
+
+`created_at` is now written in UTC, **and the FIFO `ORDER BY` compares instants
+rather than rendered text**, so pending signals sent before this upgrade are ordered
+correctly against ones sent after it. The second half matters as much as the first:
+with only the write normalized, a signal sent 30ms earlier by an older binary was
+measured being delivered *second* at +05:30.
+
+There is no migration — the correct value for an existing row is not recoverable,
+since the offset is in the string but which host wrote it is not — and none is
+needed, because the ordering no longer depends on the stored face.
+
+On SQLite this orders by `julianday(created_at)`. The lookup index is unaffected:
+the `WHERE` narrows to the pending signals of one `(job_id, name)` before any sort
+happens. (This is deliberately *not* done for the dashboard's dead-letter list,
+where the same change was measured at 554x because that query walks an index over
+the whole table in order.)
 
 ---
 
@@ -1729,10 +1832,10 @@ Two consequences worth knowing:
 
 ## Rollback
 
-Across the whole v4.6 → v4.9 line there are six forward-only migrations. The last
+Across the whole v4.6 → v4.10 line there are six forward-only migrations. The last
 four are new in **v4.8.0**; the other two are already in the releases named.
-**v4.9.0 adds none**, so upgrading from v4.8.0 to v4.9.0 does not touch the schema
-at all:
+**Neither v4.9.0 nor v4.10.0 adds any**, so upgrading from v4.8.0 forward does not
+touch the schema at all:
 
 | Migration | Adds | First shipped in |
 | --- | --- | --- |

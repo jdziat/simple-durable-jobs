@@ -15,7 +15,7 @@ permissions:
 
 jobs:
   test-backends:
-    name: Tests (${{ matrix.backend }})
+    name: Tests (${{ matrix.label }})
     runs-on: ubuntu-latest
 
     # One parallel job per backend. Each builds the test image (frontend assets
@@ -28,10 +28,55 @@ jobs:
         include:
           - backend: sqlite
             db: ""
+            label: sqlite
           - backend: postgres
             db: postgres
+            label: postgres
           - backend: mysql
             db: mysql
+            label: mysql
+          # A NON-UTC leg, and specifically a NEGATIVE-offset one.
+          #
+          # Every runner here is UTC, and this repo has at least five test files
+          # whose whole subject is that a stored timestamp must not wear the
+          # writer's local clock face. On SQLite those columns are TEXT and are
+          # compared LEXICALLY, so a "...-07:00" write mis-sorts against a UTC
+          # cutoff — but under TZ=UTC there is no offset to mis-sort, and every one
+          # of those guards is VACUOUSLY GREEN. zz_r29_order_test.go says so in its
+          # own comment.
+          #
+          # That is how a concurrency-slot sweep shipped that deleted live slot rows
+          # in any negative-offset zone, silently collapsing every ConcurrencyCap:
+          # the class had tests, and CI could not run them meaningfully.
+          #
+          # Negative offset is the load-bearing part — a positive one (+02:00) sorts
+          # ABOVE a UTC cutoff and passes even when the bug is present.
+          #
+          # SQLite only: Postgres and MySQL route both ends through the server clock
+          # (useDBClock), so the hazard does not exist there and a second DB leg
+          # would cost CI minutes to prove nothing.
+          - backend: sqlite
+            db: ""
+            label: "sqlite, TZ=America/Los_Angeles"
+            tz: America/Los_Angeles
+          # And a POSITIVE offset, with a half-hour component.
+          #
+          # One negative leg is not enough, and the reason is specific: a negative
+          # offset catches a stored-local value sorting BELOW a UTC cutoff (a live
+          # row swept, a cap that stops capping). A positive offset catches the
+          # opposite — a value sorting ABOVE it, so an EXPIRED row is never
+          # collected and blocks its slot forever. Those are different defects, and
+          # normalizing a write to UTC can FIX the first while INTRODUCING the
+          # second on any database that already has rows.
+          #
+          # Two shipped tests were red at +05:30 while green at UTC and -07:00, so
+          # this is not hypothetical. :30 rather than a whole hour because the
+          # trailing "+HH:MM" is compared with its minutes, and a whole-hour zone
+          # cannot catch a predicate that slices the offset wrong.
+          - backend: sqlite
+            db: ""
+            label: "sqlite, TZ=Asia/Kolkata"
+            tz: Asia/Kolkata
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
@@ -46,7 +91,14 @@ jobs:
         run: docker compose up -d --wait ${{ matrix.db }}
 
       - name: Run tests
-        run: docker compose run --rm --no-deps tests ${{ matrix.backend }}
+        # TZ defaults to UTC so the three original legs are unchanged. tzdata ships
+        # in the Debian-based golang image, so a named zone really takes effect —
+        # without it the setting would silently fall back to UTC and this leg would
+        # be vacuous in exactly the way it exists to prevent.
+        run: >-
+          docker compose run --rm --no-deps
+          -e TZ=${{ matrix.tz || 'UTC' }}
+          tests ${{ matrix.backend }}
 
       - name: Stop database
         if: always() && matrix.db != ''
@@ -57,8 +109,18 @@ jobs:
       # combined result to Codecov (a single-backend profile understates the
       # storage layer's real coverage).
       - name: Upload coverage artifact
+        # TWO conditions, one key. always() is the original: upload the profile even
+        # when the tests failed, so a red run still reports coverage. matrix.tz == ''
+        # is the new half: the non-UTC leg is the SAME backend running the SAME
+        # tests, so it adds no covered lines — and upload-artifact@v4 FAILS on a
+        # duplicate artifact name, which "coverage-sqlite" would be.
+        #
+        # They must be ANDed into a single `if:`. Written as two `if:` keys this is a
+        # duplicate mapping key: a strict YAML loader rejects the whole workflow, and
+        # a lenient one silently keeps only the last — which drops the guard and
+        # reintroduces the very collision the comment claims to prevent.
+        if: always() && matrix.tz == ''
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        if: always()
         with:
           name: coverage-${{ matrix.backend }}
           path: ./coverage/coverage-${{ matrix.backend }}.out

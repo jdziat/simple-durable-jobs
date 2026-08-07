@@ -20,6 +20,32 @@ import (
 // between a caller's existence check and this write). On SQLite the job's
 // existence is therefore re-checked inside the write transaction — where the
 // serialized writer makes check-then-insert atomic — returning core.ErrJobNotFound.
+// signalFIFOOrder is the ORDER BY implementing the documented FIFO delivery
+// contract, written so it is correct against rows stored on EITHER clock face.
+//
+// created_at is now written in UTC, but an upgraded database still holds rows
+// written by older releases wearing the sender's local offset — and during a
+// rolling deploy both faces are being written concurrently. A bare
+// `created_at ASC` is a LEXICAL compare on SQLite, so those rows sort by their
+// digits rather than their instants: measured at TZ=Asia/Kolkata, a signal sent
+// 30ms EARLIER by an older binary was delivered SECOND.
+//
+// julianday() is computed from the parsed instant and is face-independent.
+//
+// WHY THIS IS AFFORDABLE HERE, WHERE THE UI LIST REJECTED THE SAME FIX.
+// gorm_ui.go documents a measured 554x regression from julianday-ordering the
+// dead-letter list, because that query walks an index over the whole table in
+// order. This one does not: the WHERE narrows to the PENDING signals of a single
+// (job_id, name) before anything is sorted. EXPLAIN QUERY PLAN confirms
+// idx_signals_pending still serves the lookup on both forms; julianday adds only
+// "USE TEMP B-TREE FOR ORDER BY" over that handful of rows.
+func (s *GormStorage) signalFIFOOrder() string {
+	if !s.isSQLite {
+		return "created_at ASC"
+	}
+	return "julianday(created_at) ASC"
+}
+
 func (s *GormStorage) SendSignal(ctx context.Context, jobID core.UUID, name string, payload []byte) error {
 	encoded, err := s.encodePayload("signal payload", string(jobID)+"/"+name, payload)
 	if err != nil {
@@ -30,6 +56,25 @@ func (s *GormStorage) SendSignal(ctx context.Context, jobID core.UUID, name stri
 		JobID:   jobID,
 		Name:    name,
 		Payload: encoded,
+		// Set EXPLICITLY on one clock face rather than left to GORM's
+		// autoCreateTime, which stamps a bare time.Now() wearing the SENDING
+		// process's local offset.
+		//
+		// created_at is not decoration here: it is the ORDER BY that implements the
+		// documented FIFO delivery contract (core.Signal's godoc), and on SQLite it
+		// is TEXT compared LEXICALLY. Two senders on different offsets — a UTC
+		// container and a local-TZ host, the ordinary shape in a mixed deployment —
+		// therefore invert permanently, and a single host inverts across a DST
+		// fall-back. Measured: signals sent 30ms apart delivered newest-first.
+		//
+		// The sibling column is the tell: consumed_at already goes through
+		// nowWriteValue(). This one was left on the GORM default.
+		//
+		// UTC() rather than nowWriteValue(): the value must be comparable with rows
+		// written by OTHER processes, and on DB-clock backends Create cannot take a
+		// SQL expression here without a raw insert. UTC is the one face every
+		// sender agrees on without a round trip.
+		CreatedAt: time.Now().UTC(),
 	}
 	if !s.isSQLite {
 		return s.db.WithContext(ctx).Create(sig).Error
@@ -52,7 +97,7 @@ func (s *GormStorage) PeekSignal(ctx context.Context, jobID core.UUID, name stri
 	var sig core.Signal
 	err := s.db.WithContext(ctx).
 		Where("job_id = ? AND name = ? AND consumed_at IS NULL", jobID, name).
-		Order("created_at ASC").
+		Order(s.signalFIFOOrder()).
 		First(&sig).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil, nil
@@ -67,7 +112,7 @@ func (s *GormStorage) PeekSignal(ctx context.Context, jobID core.UUID, name stri
 }
 
 func (s *GormStorage) pendingSignalsLocked(tx *gorm.DB, jobID core.UUID, name string) *gorm.DB {
-	return s.lockForUpdate(tx.Where("job_id = ? AND name = ? AND consumed_at IS NULL", jobID, name).Order("created_at ASC"), true)
+	return s.lockForUpdate(tx.Where("job_id = ? AND name = ? AND consumed_at IS NULL", jobID, name).Order(s.signalFIFOOrder()), true)
 }
 
 // ConsumeSignal atomically takes the oldest pending signal of name for the job
@@ -218,7 +263,20 @@ func (s *GormStorage) consumeSignalTx(ctx context.Context, jobID core.UUID, work
 					return err
 				}
 				if owned == 0 {
-					return nil // not the current owner — do not consume; caller suspends
+					// ErrJobNotOwned, NOT nil. A bare nil here is byte-identical to
+					// the "nothing pending" return below, and the caller acts on the
+					// difference: WaitForSignalTimeout reads nil as "no signal
+					// arrived" and, once its deadline has passed, commits a DURABLE
+					// 'timed out' verdict through an unfenced SaveCheckpoint upsert.
+					// A run that had already lost its lease could therefore decide
+					// the timeout for a signal sitting in the table, in time and
+					// undelivered — and replay treats that checkpoint as
+					// authoritative, so the job completes down the wrong branch.
+					//
+					// This method's own godoc says a non-owner "suspends"; it could
+					// not, because it was never told. The suspend path in this file
+					// already fences this way.
+					return core.ErrJobNotOwned
 				}
 			}
 			q := s.pendingSignalsLocked(tx, jobID, name)
@@ -297,7 +355,10 @@ func (s *GormStorage) drainSignalsTx(ctx context.Context, jobID core.UUID, worke
 					return err
 				}
 				if owned == 0 {
-					return nil // not the current owner — do not drain; caller suspends
+					// Same fence, same reason as consumeSignalTx above: a non-owner
+					// must be told it is a non-owner, not handed the value that means
+					// "there was nothing here".
+					return core.ErrJobNotOwned
 				}
 			}
 			q := s.pendingSignalsLocked(tx, jobID, name)
@@ -355,7 +416,7 @@ func (s *GormStorage) GetPendingSignalName(ctx context.Context, jobID core.UUID)
 	err := s.db.WithContext(ctx).
 		Select("name").
 		Where("job_id = ? AND consumed_at IS NULL", jobID).
-		Order("created_at ASC").
+		Order(s.signalFIFOOrder()).
 		First(&sig).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return "", false, nil
