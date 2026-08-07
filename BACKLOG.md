@@ -224,3 +224,23 @@ round with an executed reproduction attempt per site, not a reasoned verdict.
 - **PG/MySQL execution of `batch_complete.go`'s dialect branches.** Rounds 47 and 47b
   were SQLite-only by rule, so `batchCompleteFlipPostgres` and `batchCompleteFlipMySQL`
   were read but never run.
+
+## Known load-sensitive test (not a defect on this branch)
+
+`TestDefaultBatchSizeDrainsRespectingQueueCap` failed once on live Postgres during a
+run that shared the machine with a CI docker build and a queued second backend suite.
+It did not reproduce: 5+ isolated runs, `-count=3`, and a full-package `-race` run all
+pass, and CI's own `Tests (postgres)` leg is green.
+
+Recorded rather than dismissed, because "a test that is load-sensitive" and "a test
+my change made load-sensitive" produce identical output, and this one names a queue
+cap while the branch touches a concurrency cap.
+
+It is provably not this branch: the ONLY `pkg/worker` change here is inside
+`renewConcurrencySlots`, which returns at `len(slots) == 0` before doing anything —
+and the test has **zero** references to `ConcurrencyCap`/`ConcurrencySlot`. It
+exercises `queueCap`, the in-memory per-queue counter, which the branch does not
+touch.
+
+Worth a hardening pass on its own schedule; see also the pause-integration PG flake
+already tracked.
