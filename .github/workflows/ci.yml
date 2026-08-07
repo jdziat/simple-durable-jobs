@@ -59,6 +59,7 @@ jobs:
             db: ""
             label: "sqlite, TZ=America/Los_Angeles"
             tz: America/Los_Angeles
+            pkgs: ./pkg/storage/... ./pkg/schedule/... ./pkg/core/... ./ui/...
           # And a POSITIVE offset, with a half-hour component.
           #
           # One negative leg is not enough, and the reason is specific: a negative
@@ -77,6 +78,7 @@ jobs:
             db: ""
             label: "sqlite, TZ=Asia/Kolkata"
             tz: Asia/Kolkata
+            pkgs: ./pkg/storage/... ./pkg/schedule/... ./pkg/core/... ./ui/...
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
@@ -95,9 +97,23 @@ jobs:
         # in the Debian-based golang image, so a named zone really takes effect —
         # without it the setting would silently fall back to UTC and this leg would
         # be vacuous in exactly the way it exists to prevent.
+        #
+        # PKGS SCOPES THE TZ LEGS, and the reason is a cost this matrix created.
+        # Adding two non-UTC legs TRIPLED how many times the SQLite suite runs per
+        # CI, which triples the chance that any marginal liveness wait anywhere in
+        # it fails — and pkg/worker in particular is full of timing-sensitive
+        # waits that have nothing to do with clock faces. Both post-merge failures
+        # were exactly that: one in pkg/worker against an in-memory mockStorage,
+        # neither touching a stored timestamp.
+        #
+        # So the TZ legs run only the packages whose guards are face-sensitive.
+        # That is not a coverage compromise: the UTC leg still runs everything,
+        # and re-running a mock-backed timing test under a second timezone proves
+        # nothing it did not already prove.
         run: >-
           docker compose run --rm --no-deps
           -e TZ=${{ matrix.tz || 'UTC' }}
+          -e PKGS=${{ matrix.pkgs && format('"{0}"', matrix.pkgs) || '""' }}
           tests ${{ matrix.backend }}
 
       - name: Stop database
