@@ -26,7 +26,13 @@ func (s *GormStorage) TryAcquireConcurrencySlot(ctx context.Context, slotName st
 				nowVal = s.nowExpr()
 				expiresVal = s.offsetExpr(ttl)
 			} else {
-				now := time.Now()
+				// .UTC() is load-bearing, not tidiness. On SQLite these land in TEXT
+				// and DeleteExpiredConcurrencySlots compares them LEXICALLY against a
+				// UTC cutoff. A local-offset write ("...-07:00") sorts below that
+				// cutoff across the offset, so the routine hourly sweep deletes a slot
+				// that is still live and the cap it enforces silently stops capping.
+				// This is the failure nowWriteValue's godoc describes verbatim.
+				now := time.Now().UTC()
 				nowVal = now
 				expiresVal = now.Add(ttl)
 			}
@@ -138,7 +144,9 @@ func (s *GormStorage) RenewConcurrencySlot(ctx context.Context, slotName string,
 		if s.useDBClock() {
 			expiresVal = s.offsetExpr(ttl)
 		} else {
-			expiresVal = time.Now().Add(ttl)
+			// Same face as the acquire above — a renew that re-introduced the local
+			// face would resurrect the bug on the hour, on a row that had been correct.
+			expiresVal = time.Now().UTC().Add(ttl)
 		}
 		result := s.db.WithContext(ctx).
 			Model(&core.ConcurrencySlot{}).
