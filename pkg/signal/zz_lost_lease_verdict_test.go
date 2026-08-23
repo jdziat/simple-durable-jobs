@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/jdziat/simple-durable-jobs/v4/pkg/core"
+	intctx "github.com/jdziat/simple-durable-jobs/v4/pkg/internal/context"
 	"github.com/jdziat/simple-durable-jobs/v4/pkg/signal"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -87,4 +88,30 @@ func TestWaitForSignalTimeout_ALostLeaseDoesNotCommitATimeoutVerdict(t *testing.
 
 	assert.Len(t, store.pending, 1,
 		"the signal must remain pending for the run that actually owns the job")
+}
+
+// The earlier test reaches the consume fence because its in-time signal is still
+// pending. This one pins the other interleave: the owner consumed that signal and
+// wrote the delivered verdict after this stale run loaded its unresolved snapshot.
+// Peek now sees nothing, so the stale run reaches the EARLY timeout write directly.
+func TestWaitForSignalTimeout_AStaleSnapshotCannotOverwriteTheOwnersDeliveredVerdict(t *testing.T) {
+	const name = "approval"
+	deadline := time.Now().Add(-10 * time.Second)
+	store := &fakeSignalStore{} // the owner already consumed the signal
+	rec := newRecorder()
+	ctx := buildCtx(store, rec, unresolvedTimeoutCheckpoint(t, name, deadline))
+
+	// Model the worker's ownership-fenced SaveCheckpoint closure after its lease
+	// moved. If WaitForSignalTimeout tries to commit the stale timeout verdict, it
+	// must surface ErrJobNotOwned and leave durable state untouched.
+	jc := intctx.GetJobContext(ctx)
+	require.NotNil(t, jc)
+	jc.SaveCheckpoint = func(context.Context, *core.Checkpoint) error {
+		return core.ErrJobNotOwned
+	}
+
+	_, ok, err := signal.WaitForSignalTimeout[string](ctx, name, time.Minute)
+	require.ErrorIs(t, err, core.ErrJobNotOwned)
+	assert.False(t, ok)
+	assert.Empty(t, rec.list(), "the stale timeout verdict must not be recorded")
 }

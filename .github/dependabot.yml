@@ -33,14 +33,6 @@ updates:
       prefix: "fix"
       include: "scope"
     open-pull-requests-limit: 5
-    ignore:
-      # golang.org/x/net v0.54+ deprecates x/net/http2/h2c, which ui/handler.go
-      # imports to serve Connect streaming over cleartext HTTP/2. A previous
-      # bump past this line had to be reverted. Remove this ignore only when
-      # ui/handler.go no longer imports h2c (tracked for v5); the guard test
-      # TestDependabotPinsXNetWhileH2CIsImported enforces the pairing.
-      - dependency-name: "golang.org/x/net"
-        versions: [">=0.54.0"]
     groups:
       gomod-security:
         applies-to: security-updates

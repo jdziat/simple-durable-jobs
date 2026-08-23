@@ -74,6 +74,30 @@ func TestSavePhaseCheckpointTx_PersistsThroughCommittedTx(t *testing.T) {
 	assert.True(t, found, "the committed phase checkpoint is persisted and queryable")
 }
 
+func TestSavePhaseCheckpointTx_RejectsAStaleWorkerAndRollsBack(t *testing.T) {
+	ctx := context.Background()
+	store := newVersionTestStorage(t)
+
+	job := &core.Job{ID: core.NewID(), Type: "wf.run", Queue: "default"}
+	require.NoError(t, store.Enqueue(ctx, job))
+	claimed, err := store.Dequeue(ctx, []string{"default"}, "owner-worker")
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+
+	jobCtx := intctx.WithJobContext(ctx, &intctx.JobContext{
+		Job: job, Storage: store, WorkerID: "stale-worker",
+	})
+	tx := store.DB().Begin()
+	require.NoError(t, tx.Error)
+	err = SavePhaseCheckpointTx(jobCtx, tx, "charge", "receipt")
+	require.ErrorIs(t, err, core.ErrJobNotOwned)
+	require.NoError(t, tx.Rollback().Error)
+
+	cps, err := store.GetCheckpoints(ctx, job.ID)
+	require.NoError(t, err)
+	assert.Empty(t, cps)
+}
+
 func TestSavePhaseCheckpointTx_DuplicateNameInOneRun(t *testing.T) {
 	// The transactional form shares the phase-name identity, so it refuses a
 	// duplicate too — and it is the form where the duplicate actually reaches

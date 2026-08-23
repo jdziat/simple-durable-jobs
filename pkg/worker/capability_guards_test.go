@@ -17,6 +17,7 @@ import (
 var _ scheduledFireReader = (*storage.GormStorage)(nil)
 var _ scheduledFireSeeder = (*storage.GormStorage)(nil)
 var _ completeWithResultStorage = (*storage.GormStorage)(nil)
+var _ checkpointOwnerStorage = (*storage.GormStorage)(nil)
 var _ completablePendingFanOutStorage = (*storage.GormStorage)(nil)
 var _ failTerminalWithResultStorage = (*storage.GormStorage)(nil)
 var _ batchDequeuer = (*storage.GormStorage)(nil)
@@ -44,6 +45,7 @@ func TestGormStorageSatisfiesAllGuardedInterfaces(t *testing.T) {
 		{"scheduledFireReader", implements[scheduledFireReader](s)},
 		{"scheduledFireSeeder", implements[scheduledFireSeeder](s)},
 		{"completeWithResultStorage", implements[completeWithResultStorage](s)},
+		{"checkpointOwnerStorage", implements[checkpointOwnerStorage](s)},
 		{"completablePendingFanOutStorage", implements[completablePendingFanOutStorage](s)},
 		{"failTerminalWithResultStorage", implements[failTerminalWithResultStorage](s)},
 		{"batchDequeuer", implements[batchDequeuer](s)},
@@ -84,6 +86,7 @@ func TestLogStorageCapabilitiesLogsInactiveOnFakeStorage(t *testing.T) {
 	assert.Contains(t, out, "batch-dequeue")
 	assert.Contains(t, out, "recovery-lease")
 	assert.Contains(t, out, "atomic-fanout-suspend")
+	assert.Contains(t, out, "owned-checkpoint-writes")
 }
 
 // TestWarnDegradedStorageDurability_WarnsForNonAtomicStorage (PKT-12) proves the

@@ -10,6 +10,7 @@ import (
 var _ scheduledFireReader = (*storage.GormStorage)(nil)
 var _ scheduledFireSeeder = (*storage.GormStorage)(nil)
 var _ completeWithResultStorage = (*storage.GormStorage)(nil)
+var _ checkpointOwnerStorage = (*storage.GormStorage)(nil)
 var _ completablePendingFanOutStorage = (*storage.GormStorage)(nil)
 var _ failTerminalWithResultStorage = (*storage.GormStorage)(nil)
 var _ batchDequeuer = (*storage.GormStorage)(nil)
@@ -30,7 +31,7 @@ var _ recoveryLeaser = (*storage.GormStorage)(nil)
 
 func (w *Worker) logStorageCapabilities() {
 	s := w.queue.Storage()
-	inactive := make([]string, 0, 18)
+	inactive := make([]string, 0, 20)
 
 	if _, ok := s.(scheduledFireReader); !ok {
 		inactive = append(inactive, "durable-timers/scheduled-fire-read")
@@ -44,6 +45,9 @@ func (w *Worker) logStorageCapabilities() {
 		// What is inactive is doing all of it in ONE transaction, so name that
 		// rather than "result-on-complete" — results are still stored.
 		inactive = append(inactive, "atomic-complete-with-result")
+	}
+	if _, ok := s.(checkpointOwnerStorage); !ok {
+		inactive = append(inactive, "owned-checkpoint-writes")
 	}
 	if _, ok := s.(completablePendingFanOutStorage); !ok {
 		inactive = append(inactive, "fanout-pending-recovery")

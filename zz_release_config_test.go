@@ -68,26 +68,27 @@ func TestDependabotCoversGoModules(t *testing.T) {
 			`bump — a bump that mints no tag never raises the floor for consumers who do not pin`)
 }
 
-// TestDependabotPinsXNetWhileH2CIsImported is CONDITIONAL on the import that
-// creates the constraint, so it retires itself rather than becoming a stale
-// prohibition. golang.org/x/net v0.54+ deprecates x/net/http2/h2c; a previous
-// bump past that line had to be reverted for exactly this reason.
-func TestDependabotPinsXNetWhileH2CIsImported(t *testing.T) {
+// TestDependabotDoesNotBlockTheXNetSecurityFloor pins the correction to a rule
+// that held x/net below v0.54 because h2c became deprecated there. Deprecation
+// is not removal: h2c still builds, while GO-2026-5026 requires x/net v0.55.0.
+// Dependabot must remain free to deliver security updates while the v5 h2c
+// migration is pending.
+func TestDependabotDoesNotBlockTheXNetSecurityFloor(t *testing.T) {
 	handler, err := os.ReadFile("ui/handler.go")
 	require.NoError(t, err)
 
 	if !strings.Contains(string(handler), "golang.org/x/net/http2/h2c") {
-		t.Skip("ui/handler.go no longer imports h2c — the x/net ignore may be removed")
+		t.Skip("ui/handler.go no longer imports h2c")
 	}
 
 	block, ok := dependabotBlock(t, "gomod")
 	require.True(t, ok)
 	joined := strings.Join(block, "\n")
 
-	assert.Contains(t, joined, "golang.org/x/net",
-		"while ui/handler.go imports x/net/http2/h2c, dependabot must not be free to bump x/net")
-	assert.Contains(t, joined, ">=0.54.0",
-		"the x/net ignore must name the version where h2c is deprecated")
+	assert.NotContains(t, joined, "golang.org/x/net",
+		"deprecation must not pin x/net below a required security floor")
+	assert.NotContains(t, joined, ">=0.54.0",
+		"the obsolete h2c deprecation pin blocks GO-2026-5026's fixed versions")
 }
 
 // TestScheduledGovulncheckDiscriminatesExitCodes pins the three-way exit-code

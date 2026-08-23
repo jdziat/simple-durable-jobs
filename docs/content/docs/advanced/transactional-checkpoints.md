@@ -68,6 +68,12 @@ visible and the retry runs the phase again. If `Commit` succeeds and the handler
 crashes later, replay loads the checkpoint with `LoadPhaseCheckpoint`, skips the
 phase, and does not insert a second ledger entry.
 
+`GormStorage` also verifies, inside that same transaction, that the current worker
+still owns the running job. If its lease moved to another worker before the commit,
+`SavePhaseCheckpointTx` returns `jobs.ErrJobNotOwned`; returning that error rolls the
+business effect and checkpoint back together instead of letting a stale execution
+commit over the new owner's workflow state.
+
 ## Constraints
 
 - This makes only **this phase's effect** exactly-once. Other phases, `Call()`
@@ -79,6 +85,10 @@ phase, and does not insert a second ledger entry.
   library cannot detect this.
 - This is implemented by `GormStorage`. Custom storage backends that do not
   implement the optional capability return `jobs.ErrStorageNoTxCheckpoint`.
+- Custom transactional-checkpoint backends can implement the additive
+  `jobs.OwnedTxCheckpointer` capability to get the same stale-worker fence. A
+  v4 backend implementing only `TxCheckpointer` retains the legacy unfenced
+  behavior for compatibility.
 - The checkpoint is invisible to replay until the transaction commits. That is
   the guarantee: rolled-back effects do not leave checkpoints behind.
 - `SavePhaseCheckpointTx` must be called from inside a job handler. Outside a

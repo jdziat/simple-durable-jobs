@@ -1318,23 +1318,31 @@ var checkpointConflictColumns = []string{
 	"result_shape",
 }
 
-// SaveCheckpoint stores a checkpoint for a durable call.
+// SaveCheckpoint stores a checkpoint for a durable call without an ownership
+// predicate. It remains the core.Storage compatibility surface for maintenance
+// callers and older custom integrations. Running workers use
+// SaveCheckpointOwned so a stale attempt cannot overwrite the current owner's
+// durable verdict.
 // If a checkpoint with the same (job_id, call_index, call_type) already exists,
 // the latest result and error fields are updated in place (upsert).
 func (s *GormStorage) SaveCheckpoint(ctx context.Context, cp *core.Checkpoint) error {
-	if cp.ID == "" {
-		cp.ID = core.NewID()
-	}
-	row, err := s.encodedCheckpointForSave(cp)
+	row, err := s.checkpointRowForSave(cp)
 	if err != nil {
 		return err
 	}
-	return s.db.WithContext(ctx).
-		Clauses(clause.OnConflict{
-			Columns:   []clause.Column{{Name: "job_id"}, {Name: "call_index"}, {Name: "call_type"}},
-			DoUpdates: clause.AssignmentColumns(checkpointConflictColumns),
-		}).
-		Create(row).Error
+	return s.saveCheckpointRow(ctx, s.db, row)
+}
+
+// SaveCheckpointOwned stores a running handler's checkpoint only while
+// workerID still owns that job. The ownership row lock and checkpoint upsert
+// commit together, so a stale execution cannot replace a newer owner's result
+// or terminal error after its lease moves.
+func (s *GormStorage) SaveCheckpointOwned(ctx context.Context, cp *core.Checkpoint, workerID string) error {
+	return s.withSerializationRetry(ctx, func() error {
+		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			return s.SaveCheckpointTxOwned(ctx, tx, cp, workerID)
+		})
+	})
 }
 
 // GetCheckpoints retrieves all checkpoints for a job.

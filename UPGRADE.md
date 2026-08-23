@@ -1,5 +1,29 @@
 # Upgrading
 
+## Unreleased after v4.10.0
+
+Running handlers now persist checkpoints through an ownership-fenced
+`GormStorage.SaveCheckpointOwned` path. This closes a double-run corruption where a
+stale execution could overwrite the current owner's nondeterministic `Call` result
+or signal-timeout verdict; replay could then complete with a value no single
+execution produced. `SavePhaseCheckpointTx` uses the corresponding
+`SaveCheckpointTxOwned` capability when its handler context carries a worker ID.
+
+The two methods and `jobs.OwnedTxCheckpointer` are additive. Custom v4 storage
+implementations continue to compile and fall back to `Storage.SaveCheckpoint` /
+`TxCheckpointer`, but workers emit a `DEGRADED DURABILITY` warning until the owned
+capability is implemented.
+
+A panic from a worker- or handler-level `BackoffPolicy.NextRetry` now terminally
+fails the affected job with an explanatory `last_error`. Previously the panic fell
+into the worker's library-internal recovery net, which released and reclaimed the
+job without advancing its attempt count; the handler could execute forever without
+ever reaching the dead letter queue.
+
+SQLite retention now compares legacy local-faced and current UTC-faced
+`completed_at` values by instant. Upgraded databases no longer delete legacy rows
+before their retention window west of UTC or stall collection east of UTC.
+
 ## Upgrading through the v4.6 / v4.7 / v4.8 / v4.9 / v4.10 line
 
 Five releases matter here.

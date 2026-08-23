@@ -60,6 +60,41 @@ func quotedTerminalJobStatuses() string {
 // whose terminal timestamp is older than age. It is an optional storage
 // capability used by the worker through type assertion; core.Storage is
 // intentionally unchanged.
+
+// retentionCutoffPredicate returns "completed_at is at or before the retention
+// cutoff", correct against rows stored on EITHER clock face.
+//
+// completed_at was normalized to UTC (nowWriteValue) with no backfill, so an
+// upgraded database holds both faces at once. On SQLite the column is TEXT compared
+// LEXICALLY, so a bare `completed_at < ?` mis-compares every pre-upgrade row — in
+// both directions, and one of them destroys data:
+//
+//	west of UTC  a legacy row sorts BELOW the cutoff -> a job that completed TEN
+//	             MINUTES ago is deleted under a one-hour window, together with its
+//	             checkpoints, signals and fan-outs. Measured at
+//	             TZ=America/Los_Angeles: deleted=1 for the legacy row while the
+//	             UTC-faced control at the same instant survived.
+//	east of UTC  it sorts ABOVE -> pre-upgrade rows are never collected, so
+//	             retention silently stops draining them and deadletter.go's stated
+//	             mitigation ("legacy rows drain with retention") does not hold.
+//
+// liveUniqueLockGuard in this same function was already written face-aware, with a
+// comment describing this exact failure. This term was left bare 40 lines below it.
+//
+// boundAtOrBefore yields `<=` where the original was `<`. The difference is a row
+// whose completed_at equals the cutoff exactly, which is `age` old and therefore
+// genuinely eligible — so this is correct, not merely close.
+func (s *GormStorage) retentionCutoffPredicate(cutoff any) (string, []any) {
+	if !s.isSQLite {
+		return "completed_at < ?", []any{cutoff}
+	}
+	at, ok := cutoff.(time.Time)
+	if !ok {
+		return "completed_at < ?", []any{cutoff}
+	}
+	return s.timeBoundPredicate("completed_at", boundAtOrBefore, at)
+}
+
 func (s *GormStorage) DeleteTerminalJobsOlderThan(ctx context.Context, status core.JobStatus, age time.Duration, limit int) (int64, error) {
 	if age <= 0 || limit <= 0 {
 		return 0, nil
@@ -184,9 +219,23 @@ func (s *GormStorage) DeleteTerminalJobsOlderThan(ctx context.Context, status co
 			for _, term := range partialIndexTerms {
 				query = query.Where(term)
 			}
+			// FACE-AWARE, for the same reason liveUniqueLockGuard above is — and this
+			// term was left bare while that one was fixed, 40 lines apart in the same
+			// builder.
+			//
+			// completed_at was normalized to UTC (nowWriteValue) without a backfill,
+			// so an upgraded database holds both faces. A bare lexical `completed_at
+			// < ?` then mis-compares legacy rows in BOTH directions, and one of them
+			// destroys data: west of UTC a job that completed TEN MINUTES ago sorts
+			// below a one-hour cutoff and is deleted, along with its checkpoints,
+			// signals and fan-outs. Measured at TZ=America/Los_Angeles: deleted=1 for
+			// the legacy row while the UTC-faced control at the same instant survived.
+			// East of UTC the mirror case means pre-upgrade rows are never collected,
+			// so retention silently stops draining them.
+			completedBefore, completedBinds := s.retentionCutoffPredicate(cutoff)
 			query = query.
 				Where("completed_at IS NOT NULL").
-				Where("completed_at < ?", cutoff).
+				Where(completedBefore, completedBinds...).
 				Where(parentChildGuard).
 				Where(rootChildGuard).
 				Where("NOT EXISTS (SELECT 1 FROM fan_outs f WHERE f.parent_job_id = jobs.id AND f.status = 'pending')").
@@ -222,10 +271,15 @@ func (s *GormStorage) DeleteTerminalJobsOlderThan(ctx context.Context, status co
 				if err := tx.Where("job_id IN ?", chunk).Delete(&core.UniqueLock{}).Error; err != nil {
 					return err
 				}
+				// The SAME face-aware predicate as the id-SELECT above. This is the
+				// clause that actually deletes, so a bare compare here would keep the
+				// data loss even with the SELECT fixed — and would additionally make
+				// the two disagree, so a row could be selected and then not deleted.
+				delBefore, delBinds := s.retentionCutoffPredicate(cutoff)
 				result := tx.Where("id IN ?", chunk).
 					Where("status = ?", status).
 					Where("completed_at IS NOT NULL").
-					Where("completed_at < ?", cutoff).
+					Where(delBefore, delBinds...).
 					Delete(&core.Job{})
 				if result.Error != nil {
 					return result.Error
