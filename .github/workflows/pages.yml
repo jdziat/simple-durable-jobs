@@ -15,7 +15,7 @@ permissions:
   pages: write
   id-token: write
 
-# CI pins Go to 1.25.11 (matches go.mod's `toolchain` directive) so setup-go
+# CI pins Go to 1.25.13 (matches go.mod's `toolchain` directive) so setup-go
 # installs it directly: no on-the-fly sum.golang.org toolchain download
 # (which flaked Lint) and CI runs the patched stdlib. Bump with go.mod.
 
@@ -55,7 +55,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
-          go-version: '1.25.11'
+          go-version: '1.25.13'
 
       - name: Setup Pages
         uses: actions/configure-pages@1f0c5cde4bc74cd7e1254d0cb4de8d49e9068c7d # v4.0.0

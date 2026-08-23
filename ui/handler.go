@@ -12,7 +12,7 @@ import (
 
 	"connectrpc.com/connect"
 	"golang.org/x/net/http2"
-	"golang.org/x/net/http2/h2c"
+	"golang.org/x/net/http2/h2c" //nolint:staticcheck // v4 Handler cannot configure the caller-owned http.Server.Protocols; migrate in v5.
 	"gorm.io/gorm"
 
 	"github.com/jdziat/simple-durable-jobs/v4/pkg/core"
@@ -188,7 +188,7 @@ func Handler(storage core.Storage, opts ...Option) http.Handler {
 		return inner
 	}
 
-	h2cHandler := h2c.NewHandler(inner, &http2.Server{})
+	h2cHandler := h2c.NewHandler(inner, &http2.Server{}) //nolint:staticcheck // Preserves v4's handler-only h2c contract until the v5 server API.
 
 	// Cap the body of an UPGRADE request specifically. x/net's h2c handler reads
 	// the whole request body into memory to replay it as the first stream, and
