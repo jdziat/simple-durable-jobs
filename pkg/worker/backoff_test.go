@@ -1,9 +1,13 @@
 package worker
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -115,4 +119,71 @@ func TestRetryBackoffClampsPolicyDelay(t *testing.T) {
 	delay := w.retryBackoff(&core.Job{Type: "missing"}, errors.New("boom"))
 
 	assert.Equal(t, 5*time.Second, delay)
+}
+
+func TestPanickingBackoffPolicyBecomesATerminalFailure(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		workerOpts []WorkerOption
+		handlerOpt queue.Option
+	}{
+		{
+			name: "worker policy",
+			workerOpts: []WorkerOption{WithBackoff(BackoffFunc(func(int, error) time.Duration {
+				panic("worker backoff boom")
+			}))},
+		},
+		{
+			name: "handler policy",
+			handlerOpt: queue.WithHandlerBackoff(BackoffFunc(func(int, error) time.Duration {
+				panic("handler backoff boom")
+			})),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var failCalls atomic.Int32
+			var retryAt *time.Time
+			var storedError string
+			store := &mockStorage{
+				failFunc: func(_ context.Context, _ core.UUID, _ string, errMsg string, at *time.Time) error {
+					failCalls.Add(1)
+					storedError = errMsg
+					retryAt = at
+					return nil
+				},
+			}
+			q := queue.New(store)
+			registerOpts := []queue.Option{}
+			if tc.handlerOpt != nil {
+				registerOpts = append(registerOpts, tc.handlerOpt)
+			}
+			require.NoError(t, q.RegisterE("backoff-panic", func(context.Context, struct{}) error {
+				return errors.New("handler failed")
+			}, registerOpts...))
+
+			var retries, failures atomic.Int32
+			q.OnRetry(func(context.Context, *core.Job, int, error) { retries.Add(1) })
+			q.OnJobFail(func(context.Context, *core.Job, error) { failures.Add(1) })
+
+			w := NewWorker(q, append(tc.workerOpts, DisableRetry())...)
+			var logs bytes.Buffer
+			w.logger = slog.New(slog.NewTextHandler(&logs, nil))
+
+			require.NotPanics(t, func() {
+				w.processJob(context.Background(), &core.Job{
+					ID: "backoff-panic-job", Type: "backoff-panic", Queue: "default",
+					Args: []byte(`{}`), Attempt: 1, MaxRetries: 3,
+				})
+			})
+
+			assert.Equal(t, int32(1), failCalls.Load(), "the panic must produce one durable disposition")
+			assert.Nil(t, retryAt, "a broken retry policy cannot safely schedule a retry")
+			assert.Contains(t, storedError, "backoff policy panicked")
+			assert.Equal(t, int32(0), retries.Load())
+			assert.Equal(t, int32(1), failures.Load())
+			assert.True(t, strings.Contains(logs.String(), "backoff policy panicked"))
+			assert.NotContains(t, logs.String(), "recovered panic in processJob",
+				"a user callback panic must not be misreported as a library-internal panic")
+		})
+	}
 }

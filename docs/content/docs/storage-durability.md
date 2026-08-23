@@ -100,10 +100,11 @@ The capability line logged at startup names this one as
 
 | Capability | Interface | Missing → |
 |---|---|---|
+| Ownership-fenced checkpoints | `SaveCheckpointOwned` | a stale double-run execution can overwrite the current owner's durable `Call` or signal verdict (**silent replay corruption**) |
 | Atomic scheduled fire | `ScheduledFireTxClaimer` + `TxEnqueuer` | a fire can be **lost** on a crash (data loss) |
 | Atomic fan-out suspend | `SuspendForFanOut` | wider, **recoverable** crash window |
 | Atomic completion | `CompleteWithResult` | split completion writes. **Recoverable** on `GormStorage` (a replayed job, or a parent resumed by `GetCompletablePendingFanOuts`). On a backend with a stored `completed_count` and no `GetCompletablePendingFanOuts`, a lost fan-out increment is **not** recoverable and the parent wedges — see above. |
 
-`GormStorage` implements all three. If you write a custom backend and see a
+`GormStorage` implements all four. If you write a custom backend and see a
 `DEGRADED DURABILITY` warning, implement the named capability to restore the full
 guarantee.

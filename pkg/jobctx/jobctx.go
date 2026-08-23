@@ -237,22 +237,11 @@ func SavePhaseCheckpoint(ctx context.Context, phaseName string, result any) erro
 // LoadPhaseCheckpoint therefore will not observe it; the value is read back on
 // the next replay after the caller commits.
 //
-// NOT OWNERSHIP-FENCED. The checkpoint write carries no locked_by/status
-// predicate, so it succeeds even when this worker no longer owns the job — its
-// lease lapsed and the stale-lock reaper handed the job to a peer, or an operator
-// cancelled it. Every checkpoint write in the library behaves this way
-// (SaveCheckpoint too); it is not specific to the transactional form.
-//
-// What that means in practice: the atomic pairing is still honoured — your effect
-// and the checkpoint recording it commit or roll back together — so a peer
-// replaying the job skips a phase whose effect genuinely happened. What it does
-// NOT do is stop a handler that has lost its lease from committing at all. The
-// worker's ownership audit interrupts such a handler within a few seconds
-// (FindOrphanedJobs), but a transaction already in flight can still land.
-//
-// If your phase must not commit after cancellation, check ctx.Err() immediately
-// before committing, and prefer effects that are safe to observe once even if the
-// job is later cancelled.
+// GormStorage additionally ownership-fences this write inside the supplied
+// transaction when the JobContext carries a WorkerID. A stale handler therefore
+// receives core.ErrJobNotOwned and its business effect rolls back with the
+// checkpoint. Custom TxCheckpointer implementations without the additive
+// OwnedTxCheckpointer capability retain the v4 compatibility behaviour.
 func SavePhaseCheckpointTx(ctx context.Context, tx *gorm.DB, phaseName string, result any) error {
 	jc := intctx.GetJobContext(ctx)
 	if jc == nil {
@@ -285,11 +274,17 @@ func SavePhaseCheckpointTx(ctx context.Context, tx *gorm.DB, phaseName string, r
 		return duplicatePhaseNameError(phaseName)
 	}
 
-	if err := txCheckpointer.SaveCheckpointTx(ctx, tx, cp); err != nil {
+	var saveErr error
+	if owned, ok := jc.Storage.(storage.OwnedTxCheckpointer); ok && jc.WorkerID != "" {
+		saveErr = owned.SaveCheckpointTxOwned(ctx, tx, cp, jc.WorkerID)
+	} else {
+		saveErr = txCheckpointer.SaveCheckpointTx(ctx, tx, cp)
+	}
+	if saveErr != nil {
 		if cs != nil {
 			cs.ReleasePhaseName(phaseName)
 		}
-		return err
+		return saveErr
 	}
 	return nil
 }

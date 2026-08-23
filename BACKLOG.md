@@ -173,40 +173,24 @@ torture run (raise `CHAOS_DURATION` until `window_reexec_markers > 0`); the SIGK
 has to land inside a ~150ms window in `chaos.pipeline_window`, which is why 25s CI
 runs never populate it.
 
-## OPEN: three more unfenced checkpoint writers (round 47b hole #7)
+## CLOSED: handler-path checkpoint ownership (round 48 H1/H2/H3)
 
-`GormStorage.SaveCheckpoint` is an unfenced upsert — `OnConflict(job_id, call_index,
-call_type) DoUpdates(...)` — so any writer can overwrite an existing checkpoint's
-`result`, with no ownership predicate. Four call sites reach it through
-`jc.SaveCheckpoint`:
+The v4 `Storage.SaveCheckpoint` signature has no worker ID and remains the
+compatibility surface for direct/maintenance callers. Running handlers now route
+through the additive `GormStorage.SaveCheckpointOwned` capability, which locks and
+checks `id + locked_by + status=running` in the same transaction as the upsert.
 
 | site | audited |
 | --- | --- |
-| `pkg/signal/signal.go:135` (the timeout verdict) | **yes — was the round-47b HIGH, fixed** |
-| `pkg/call/call.go:321` (error checkpoint) | **no** |
-| `pkg/call/call.go:335` (result checkpoint) | **no** |
-| `pkg/fanout/fanout.go:161` (fan-out checkpoint) | **no** |
+| `pkg/signal/signal.go` (timeout verdicts) | **yes — both the post-consume and early-timeout branches reject a stale owner** |
+| `pkg/call/call.go` (error checkpoint) | **yes — reproduced stale error overwriting owner success; fenced** |
+| `pkg/call/call.go` (result checkpoint) | **yes — reproduced a successfully completed mixed-run result; fenced** |
+| `pkg/fanout/fanout.go` (legacy fan-out fallback) | **yes — routes through the same owned capability when available; GormStorage uses the already-fenced atomic suspend path** |
 
-The signal one was confirmed harmful because the value written is a **terminal
-verdict**: a run that had lost its lease could decide "timed out" for a signal that
-was pending and in time, and replay treats that as authoritative.
-
-Whether the other three are harmful is **genuinely open, and should not be assumed
-either way**. The argument for benign is that under a double-run both executions
-compute the same value, so an overwrite is a no-op. The argument for harmful is that
-`Call` exists precisely to make a NONDETERMINISTIC operation replay-safe — that is
-its whole contract — so two runs need not agree, and a later replay reading the
-loser's result is the v4.6.0 nested-`Call` corruption class, which completed jobs
-carrying another call's result.
-
-Note the fix for the signal site does NOT cover these: it fenced the ownership gate
-in `consumeSignalTx`/`drainSignalsTx`, not `SaveCheckpoint` itself. A fence on
-`SaveCheckpoint` would cover all four, but it is a wider change — the fan-out site
-in particular writes before the parent is marked waiting, so the ownership predicate
-has to be checked against the right state.
-
-This is the largest unexamined surface in the codebase right now. It wants its own
-round with an executed reproduction attempt per site, not a reasoned verdict.
+`SavePhaseCheckpointTx` also selects `SaveCheckpointTxOwned` when its handler context
+carries a worker ID, so the ownership check and the caller's business effect share
+one transaction. Custom v4 storage implementations keep compiling; workers warn
+`DEGRADED DURABILITY` until they implement the additive owned capability.
 
 ## Deferred from round 47b, with the reasoning already done
 

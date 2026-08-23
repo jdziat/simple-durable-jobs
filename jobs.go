@@ -270,6 +270,10 @@ type (
 	// TxCheckpointer is the optional storage capability for caller-supplied transaction checkpoints.
 	TxCheckpointer = storage.TxCheckpointer
 
+	// OwnedTxCheckpointer adds a stale-worker ownership fence to caller-supplied
+	// transaction checkpoints.
+	OwnedTxCheckpointer = storage.OwnedTxCheckpointer
+
 	// Secretbox is the built-in NaCl Secretbox payload codec.
 	Secretbox = payloadcodec.Secretbox
 

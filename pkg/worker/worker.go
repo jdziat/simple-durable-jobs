@@ -172,6 +172,14 @@ type completeWithResultStorage interface {
 	CompleteWithResult(ctx context.Context, jobID core.UUID, workerID string, result []byte) (*core.FanOut, error)
 }
 
+// checkpointOwnerStorage is the additive, ownership-fenced checkpoint
+// capability. core.Storage cannot grow a workerID parameter inside v4, so
+// custom backends without this method keep the legacy SaveCheckpoint fallback
+// and receive a startup durability warning.
+type checkpointOwnerStorage interface {
+	SaveCheckpointOwned(ctx context.Context, cp *core.Checkpoint, workerID string) error
+}
+
 type batchCompleteStorage interface {
 	BatchComplete(ctx context.Context, workerID string, items []storage.BatchCompleteItem) ([]core.UUID, error)
 }
@@ -693,6 +701,17 @@ type fanOutSuspendStorage interface {
 // than fail. GormStorage implements both atomic paths, so neither warning fires
 // for the default storage. See docs/content/docs/storage-durability.md.
 func (w *Worker) warnDegradedStorageDurability(storage core.Storage) {
+	// Checkpoints are durable control-flow verdicts. Without an ownership-fenced
+	// save, a stale at-least-once execution can overwrite the current owner's
+	// nondeterministic Call result and make replay complete with a value no owner
+	// produced. The fallback preserves v4 compatibility for custom backends, but
+	// its weaker guarantee must be operator-visible.
+	if _, ok := storage.(checkpointOwnerStorage); !ok {
+		w.logger.Warn("DEGRADED DURABILITY: storage lacks ownership-fenced checkpoint writes (SaveCheckpointOwned); "+
+			"a stale double-run execution can overwrite the current owner's durable Call or signal verdict. "+
+			"Use GormStorage or implement SaveCheckpointOwned for replay-safe multi-worker execution.",
+			"storage", fmt.Sprintf("%T", storage))
+	}
 	// Scheduled fires: the non-atomic fallback can LOSE a fire on a crash between
 	// claiming the boundary and enqueuing the job. Only relevant when schedules
 	// are actually configured.
@@ -2979,6 +2998,9 @@ func (w *Worker) executeHandler(ctx context.Context, job *core.Job, h *handler.H
 			// (OTel span, hooks), so tracing/propagation is unaffected.
 			writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), checkpointWriteTimeout)
 			defer cancel()
+			if owned, ok := w.queue.Storage().(checkpointOwnerStorage); ok {
+				return owned.SaveCheckpointOwned(writeCtx, cp, w.config.WorkerID)
+			}
 			return w.queue.Storage().SaveCheckpoint(writeCtx, cp)
 		},
 	}
@@ -3030,8 +3052,17 @@ func (w *Worker) handleError(ctx context.Context, jobCtx context.Context, job *c
 		t := time.Now().Add(retryAfter.Delay)
 		retryAt = &t
 	case job.Attempt < job.MaxRetries:
-		t := time.Now().Add(w.retryBackoff(job, err))
-		retryAt = &t
+		delay, policyErr := w.safeRetryBackoff(job, err)
+		if policyErr != nil {
+			// A broken user retry policy cannot safely choose a retry time. Make the
+			// callback failure terminal and durable instead of letting it unwind to
+			// processJob's library-panic net, whose Release decrements attempt and
+			// creates an infinite pending/running loop with no last_error.
+			err = core.NoRetry(policyErr)
+		} else {
+			t := time.Now().Add(delay)
+			retryAt = &t
+		}
 	default:
 		// terminal — attempts exhausted.
 	}
@@ -3344,6 +3375,23 @@ func (w *Worker) retryBackoff(job *core.Job, err error) time.Duration {
 		return time.Nanosecond
 	}
 	return delay
+}
+
+// safeRetryBackoff contains a user-supplied BackoffPolicy panic at the callback
+// boundary. The returned error is persisted as a terminal job failure by
+// handleError, so the job cannot re-execute forever with an empty last_error.
+func (w *Worker) safeRetryBackoff(job *core.Job, jobErr error) (delay time.Duration, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			w.logger.Error("backoff policy panicked; terminally failing job",
+				"job_id", job.ID,
+				"job_type", job.Type,
+				"panic", r,
+				"stack", string(debug.Stack()))
+			err = fmt.Errorf("jobs: backoff policy panicked: %v", r)
+		}
+	}()
+	return w.retryBackoff(job, jobErr), nil
 }
 
 // maxCatchUpIterations bounds the seed scan so a pathologically dense schedule

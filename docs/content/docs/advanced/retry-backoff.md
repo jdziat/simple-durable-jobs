@@ -23,6 +23,10 @@ The worker calls `NextRetry` when a handler error should be retried. The
 computed delay is stored through the normal `Fail(retryAt)` path; no additional
 database state is required.
 
+`NextRetry` is user code. If it panics, the worker contains the panic at the
+policy boundary, records a terminal failure naming the broken backoff policy, and
+moves on to other jobs. It does not repeatedly release and re-run the same job.
+
 ## ExponentialBackoff
 
 `ExponentialBackoff` is the built-in policy:
