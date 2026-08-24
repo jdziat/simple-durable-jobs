@@ -130,6 +130,14 @@ func TestExactlyOnceFailsOnAnEmptyPopulation(t *testing.T) {
 	assert.Contains(t, inv.detail, "atomic_effects=0")
 }
 
+func TestPipelineWindowGap(t *testing.T) {
+	t.Setenv("CHAOS_WINDOW_GAP", "37ms")
+	assert.Equal(t, 37*time.Millisecond, pipelineWindowGap())
+
+	t.Setenv("CHAOS_WINDOW_GAP", "")
+	assert.Zero(t, pipelineWindowGap(), "normal chaos runs must not widen the crash window")
+}
+
 // TestPopulationGuards covers A2 for the other three checks that lacked one: an
 // EMPTIED population currently reads as PASS, which is how a regression that
 // stops producing the data disappears from the gate.

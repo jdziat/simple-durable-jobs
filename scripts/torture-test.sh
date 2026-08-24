@@ -20,8 +20,9 @@
 #   TORTURE_WORKERS       number of worker containers                 (default 8)
 #   TORTURE_DURATION      --chaos kill-loop seconds                   (default 1200)
 #   CHAOS_DRAIN_TIMEOUT   max drain wait in the check phase           (default 1800s)
-#   CHAOS_SEED_*          per-type seed overrides (UNIT, PIPELINE, FANOUT,
-#                         MEGAFLOW, SLOW, TIMER, SIGNAL_WAITERS, …); win over CHAOS_SCALE
+#   CHAOS_WINDOW_GAP      widen effect->checkpoint crash window       (default 0s)
+#   CHAOS_SEED_*          per-type seed overrides (UNIT, PIPELINE, PIPELINE_WINDOW,
+#                         FANOUT, MEGAFLOW, SLOW, TIMER, SIGNAL_WAITERS, …); win over CHAOS_SCALE
 #   KEEP_CONTAINERS=1     leave containers running after the run
 #
 # Fast smoke (correctness, ~1 min):

@@ -243,6 +243,7 @@ func registerHandlers(q *jobs.Queue, db *gorm.DB, dialect string) {
 	if megaFanoutWidth < 1 {
 		megaFanoutWidth = 1
 	}
+	windowGap := pipelineWindowGap()
 
 	q.Register("chaos.unit", func(ctx context.Context, _ struct{}) error {
 		return insertEffect(ctx, db, jobs.JobIDFromContext(ctx), "done")
@@ -311,6 +312,13 @@ func registerHandlers(q *jobs.Queue, db *gorm.DB, dialect string) {
 					_ = insertEffectIgnoreDuplicate(ctx, db, dialect, jobID, "window-reexec:"+phase)
 				}
 				return err
+			}
+			// Normal runs leave this at zero. Torture runs can widen the exact
+			// effect-committed/checkpoint-not-yet-written interval so SIGKILL can
+			// exercise the documented at-least-once replay path repeatably instead
+			// of depending on a sub-millisecond database timing coincidence.
+			if windowGap > 0 {
+				time.Sleep(windowGap)
 			}
 			// This handler intentionally keeps the old two-commit pattern to
 			// demonstrate the documented at-least-once crash window.
@@ -525,6 +533,10 @@ func registerHandlers(q *jobs.Queue, db *gorm.DB, dialect string) {
 	if err := q.Schedule("chaos.tick", nil, jobs.Every(5*time.Second), jobs.Retries(0)); err != nil {
 		panic(err)
 	}
+}
+
+func pipelineWindowGap() time.Duration {
+	return envDuration("CHAOS_WINDOW_GAP", 0)
 }
 
 func runWorker(parent context.Context, a *app) error {

@@ -159,3 +159,29 @@ func TestSecurityAndVersioningDocsMatchModuleMajor(t *testing.T) {
 		assert.NotContains(t, body, "(currently `v3`)", "%s still says the major is v3", f)
 	}
 }
+
+// TestChaosComposeSupportsIsolatedTortureOverrides pins two harness contracts
+// that failed together in Campaign 49: a project-scoped torture run collided
+// with the shared test containers, then silently dropped its documented
+// per-type seed override at the Compose boundary.
+func TestChaosComposeSupportsIsolatedTortureOverrides(t *testing.T) {
+	base, err := os.ReadFile("docker-compose.yml")
+	require.NoError(t, err)
+	assert.NotContains(t, string(base), "container_name:",
+		"fixed container names make every non-default chaos project collide with the shared test stack")
+
+	seedVars := []string{
+		"CHAOS_SEED_UNIT", "CHAOS_SEED_PIPELINE", "CHAOS_SEED_PIPELINE_WINDOW",
+		"CHAOS_SEED_FANOUT", "CHAOS_SEED_SLOW", "CHAOS_SEED_MEGAFLOW",
+		"CHAOS_SEED_UNIQUE_ATTEMPTS", "CHAOS_SEED_WINDOWED_ATTEMPTS",
+		"CHAOS_SEED_SIGNAL_WAITERS", "CHAOS_SEED_TIMER",
+	}
+	for _, path := range []string{"docker-compose.chaos.yml", "docker-compose.chaos-mysql.yml"} {
+		raw, err := os.ReadFile(path)
+		require.NoError(t, err)
+		for _, key := range seedVars {
+			assert.Contains(t, string(raw), key+": ${"+key+":-}",
+				"%s must forward the documented %s override", path, key)
+		}
+	}
+}
