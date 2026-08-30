@@ -7,45 +7,19 @@ each was deferred is on file.
 
 Gate scores are the verifying skeptic's, not the finder's.
 
-## Chaos harness (`cmd/chaostest`) — checks that cannot fail
+## CLOSED: chaos harness checks that could not fail
 
-The release-gating harness has 1,125 LOC, 55 invariant sites and no test files. A
-mutation audit seeded each invariant's violation and checked whether the predicate
-fired. None was individually 4/4, but several cannot fail:
-
-- **`INV-EXACTLY-ONCE` / `duplicate_effect_groups` is structurally dead.**
-  `chaos_effects` carries `UNIQUE(job_id, marker)` (main.go:126-155), so the
-  duplicate row the check looks for cannot exist. Seeding it is rejected with
-  SQLSTATE 23505 and the check still returns PASS. Its two sibling sub-checks
-  (`phase_reexec_markers`, `checkpointed_reexec_markers`) DO fire, so the
-  invariant as a whole still gates — which is why this is not 4/4.
-- **`INV-AT-LEAST-ONCE-WINDOW` hardcodes `pass: true`** (main.go:786-798). INFO
-  level, never increments `hardFailed`, and the comment says reporting-only by
-  design. Harmless, but it reads as an invariant in the output.
-- **`INV-NO-WEDGE` and `INV-READY-NO-STUCK` evaluate over sets `waitForDrain`
-  has already guaranteed are empty.** A real wedge takes the DID-NOT-DRAIN branch
-  and exits 1 first — loud, so not silent, but the invariants themselves add
-  nothing at the point they run.
-- **`INV-SCHED` is one-sided** (`got <= maxExpected`): a scheduler that fires ZERO
-  times passes. Verified — PASS with `ticks_in_12s_window=0`. Covered elsewhere by
-  84 scheduler test funcs, hence not silent.
-- **Four invariants lack the population guard two others carry.**
-  `INV-FANOUT-COUNTS`, `INV-EXACTLY-ONCE`, `INV-SLOT-NO-LEAK` and
-  `INV-RATE-WELLFORMED` have no `expected > 0` check, so a regression that EMPTIES
-  their population reads as PASS. `INV-SIGNAL-EXACTLY-ONCE` and
-  `INV-TIMER-EXACTLY-ONCE` show the right shape.
-
-Cheapest high-value work on this list: add the `expected > 0` guard to the four,
-and either delete `duplicate_effect_groups` or drop the UNIQUE constraint it needs.
+Commit `6da3de7` made `duplicate_effect_groups` observable, added population guards,
+renamed the reporting-only window check, moved wedge checks onto drain observations,
+added a scheduler lower bound, and added mutation tests for every HARD invariant.
+Campaign 49 re-verified the focused guards under `-race` and added a repeatable live
+crash-window control; the PostgreSQL and MySQL evidence is recorded below.
 
 ## CLI (`cmd/sdj`)
 
-- **The `--queue` scope predicate is correct but untested.** Mutating
-  `if filter.Queue != ""` to `if false` in `deadletter.go:119-121` — so
-  `dlq requeue --queue emails` would drain EVERY queue — leaves
-  `go test ./cmd/sdj/` GREEN. The identical mutation on `Tenant` fails two tests.
-  Cause: the fixture's only cross-queue row is also cross-tenant. Fix: add a
-  bystander row in a DIFFERENT queue, SAME tenant.
+- **CLOSED: the `--queue` scope predicate now has an independent fixture.** Commit
+  `6da3de7` added a same-tenant, different-queue bystander; Campaign 49 re-ran the
+  regression under `-race`.
 - `dlq list` prints no total and no "more rows" indicator; the default `--limit 50`
   truncates silently while the runbook's next step touches every matching row.
   `CountDeadLettered` exists and is never called. 3/4 — the rows shown are real.
@@ -132,9 +106,9 @@ and routed. Otherwise "not silent" is true on paper and false in practice.
 - The chaos mutation matrix on MySQL (dialect-specific branches of
   `checkExactlyOnce`, `checkRateWellFormed`, `checkSlotNoLeak`).
 
-## A HARD invariant sub-check that has never seen LIVE data
+## CLOSED: HARD window-checkpoint invariant exercised by live crashes
 
-**Status: narrowed, not closed. No defect found.**
+**Status: closed. No defect found.**
 
 `checkExactlyOnce`'s third term, `windowCheckpointedRows` (`cmd/chaostest/main.go`),
 gates a HARD invariant and therefore gates every release. Both chaos runs on the
@@ -167,11 +141,13 @@ on PG and MySQL, so the SQLite-only probe's fixture — a checkpoint for a job t
 never enqueued — is impossible on either real backend. A fixture that works on SQLite
 can be unbuildable on the backend that gates releases.
 
-**Residual, and it is now small:** the term has still never matched or not-matched
-against data produced by a real crash rather than a seeded row. Close it with a
-torture run (raise `CHAOS_DURATION` until `window_reexec_markers > 0`); the SIGKILL
-has to land inside a ~150ms window in `chaos.pipeline_window`, which is why 25s CI
-runs never populate it.
+Campaign 49 added the opt-in `CHAOS_WINDOW_GAP` torture control at the exact
+effect-committed/checkpoint-not-yet-written boundary, while leaving normal runs at
+zero delay. Sixty-second four-worker SIGKILL runs with 200 window jobs produced 29
+real PostgreSQL replay markers and 21 real MySQL replay markers. Both reported
+`window checkpointed_reexec_markers=0`, every HARD invariant passed, and both
+workloads drained. The sub-check has now seen non-empty data produced by real worker
+crashes on both release backends.
 
 ## CLOSED: handler-path checkpoint ownership (round 48 H1/H2/H3)
 
