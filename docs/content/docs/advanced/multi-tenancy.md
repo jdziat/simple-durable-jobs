@@ -37,9 +37,13 @@ label:
 
 - Separate database, schema, or deployment per tenant. This is the clearest
   boundary for regulated or contractual isolation.
-- Dashboard authorization that pins the principal's tenant. Store the tenant in
-  your authenticated principal, permit only matching `Job.Tenant` views, and do
-  not expose broad search or mutation rights to tenant-scoped users.
+- Per-tenant dashboard access. Note the built-in `ui.WithAuthorizer` is
+  **class-level only**: it is consulted with the action (a read or a mutation) but
+  never with the request, so it cannot by itself restrict a principal to matching
+  `Job.Tenant` rows. To pin a principal to one tenant, run a separate dashboard
+  (or storage handle) per tenant against a tenant-scoped database view/RLS, and
+  use the authorizer to deny mutations for read-only users. Do not rely on the
+  label alone to keep one tenant from seeing another's rows.
 - Database row-level security or equivalent views/policies managed by your
   application. If you add RLS, ensure every queue, dashboard, retention, and
   operational connection sets the correct database principal or tenant setting.
