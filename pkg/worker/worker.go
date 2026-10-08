@@ -1016,7 +1016,7 @@ func (w *Worker) releaseClaimedJobs(ctx context.Context, jobs []*core.Job) {
 			continue
 		}
 		w.recordBounce(bouncePaused)
-		releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		releaseCtx, cancel := context.WithTimeout(core.WithDispatchToken(context.WithoutCancel(ctx), job.DispatchToken), 5*time.Second)
 		if err := w.queue.Storage().Release(releaseCtx, job.ID, w.config.WorkerID); err != nil && !errors.Is(err, core.ErrJobNotOwned) {
 			w.logger.Warn("failed to release job claimed while pausing",
 				"job_id", job.ID, "error", err)
@@ -1043,7 +1043,7 @@ func (w *Worker) releaseDequeuedJobOnShutdown(ctx context.Context, job *core.Job
 	// job at once — so the connection pool is at its most contended exactly when
 	// Release is asked to finish inside 5s, and database/sql charges pool wait to
 	// the same context.
-	jobCtx, cancelJob := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	jobCtx, cancelJob := context.WithTimeout(core.WithDispatchToken(context.WithoutCancel(ctx), job.DispatchToken), 5*time.Second)
 	defer cancelJob()
 
 	if err := w.queue.Storage().Release(jobCtx, job.ID, w.config.WorkerID); err != nil && !errors.Is(err, core.ErrJobNotOwned) {
@@ -1847,7 +1847,7 @@ func (w *Worker) tryAcquireConcurrencySlots(ctx context.Context, job *core.Job, 
 	// no longer depends on its caller cleaning up after a bail-out it already
 	// reported. Worth keeping; not worth claiming as a fix.
 	rollback := func() {
-		releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		releaseCtx, cancel := context.WithTimeout(core.WithDispatchToken(context.WithoutCancel(ctx), job.DispatchToken), 5*time.Second)
 		defer cancel()
 		w.releaseConcurrencySlots(releaseCtx, job.ID, runToken)
 	}
@@ -2275,6 +2275,7 @@ func (w *Worker) processJob(ctx context.Context, job *core.Job) {
 }
 
 func (w *Worker) processJobRun(ctx context.Context, job *core.Job, runToken uint64) {
+	ctx = core.WithDispatchToken(ctx, job.DispatchToken)
 	// Defense-in-depth: no panic may escape processJob and crash the processLoop
 	// goroutine (an unrecovered goroutine panic terminates the whole process).
 	// User callbacks are individually recovered (queue.safeUserCallback,
@@ -2658,7 +2659,7 @@ func (w *Worker) processJobRun(ctx context.Context, job *core.Job, runToken uint
 		cancelHeartbeat()
 	} else {
 		if w.config.BatchCompletion.Enabled && job.FanOutID == nil && w.batchCompleter != nil {
-			committed, completeErr := w.batchCompleter.Submit(job.ID, resultBytes)
+			committed, completeErr := w.batchCompleter.Submit(job.ID, job.DispatchToken, resultBytes)
 			if errors.Is(completeErr, errBatchCompletionClosed) {
 				w.logger.Debug("batch completion accumulator closed; falling back to per-job completion",
 					"job_id", job.ID)

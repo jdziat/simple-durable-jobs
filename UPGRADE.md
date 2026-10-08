@@ -2,6 +2,16 @@
 
 ## Unreleased after v4.10.0
 
+### Drain workers before enabling dispatch fencing
+
+Each dequeue now records a durable dispatch token, and ownership-guarded writes
+match that token as well as the configured worker ID. Before deploying this
+release, drain or stop every worker running an older binary, run `Migrate`, then
+start the new workers. Do not run old and new workers against the same database:
+old workers do not send the token and can therefore mutate a same-ID claim made
+by a new worker. The additive nullable column makes the schema migration safe;
+the drained deployment is the required safety gate.
+
 Running handlers now persist checkpoints through an ownership-fenced
 `GormStorage.SaveCheckpointOwned` path. This closes a double-run corruption where a
 stale execution could overwrite the current owner's nondeterministic `Call` result

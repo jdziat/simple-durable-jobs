@@ -111,9 +111,13 @@ type Job struct {
 	CreatedAt        time.Time `gorm:"autoCreateTime"`
 	UpdatedAt        time.Time `gorm:"autoUpdateTime"`
 	LockedBy         string    `gorm:"size:255"`
-	LockedUntil      *time.Time
-	LastHeartbeatAt  *time.Time // Tracks when the last heartbeat was received
-	UniqueKey        string     `gorm:"size:255"` // For job deduplication
+	// DispatchToken is replaced atomically on every dequeue. Ownership-fenced
+	// writes match it as well as LockedBy, preventing a stale run from mutating a
+	// later claim by the same configured worker.
+	DispatchToken   string `gorm:"size:36;index"`
+	LockedUntil     *time.Time
+	LastHeartbeatAt *time.Time // Tracks when the last heartbeat was received
+	UniqueKey       string     `gorm:"size:255"` // For job deduplication
 	// DQReady is a performance hint for MySQL dequeue: true iff this is a pending
 	// job eligible to run now (run_at is nil or in the past). It lets MySQL use an
 	// index that serves the priority-ordered dequeue without a filesort. It is NOT a

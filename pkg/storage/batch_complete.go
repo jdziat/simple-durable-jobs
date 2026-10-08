@@ -16,8 +16,9 @@ const batchCompleteChunkSize = 400
 
 // BatchCompleteItem is one leaf job to complete in a batch.
 type BatchCompleteItem struct {
-	JobID  core.UUID
-	Result []byte // raw handler result; encoded by BatchComplete via the codec
+	JobID         core.UUID
+	Result        []byte // raw handler result; encoded by BatchComplete via the codec
+	DispatchToken string // durable dequeue incarnation
 }
 
 // BatchComplete completes a batch of OWNED running LEAF jobs in a single
@@ -130,17 +131,17 @@ func (s *GormStorage) batchCompleteFlipPostgres(tx *gorm.DB, workerID string, it
 	args := make([]any, 0, len(items)*2+1)
 	for i, it := range items {
 		if i == 0 {
-			rows[i] = "(?::uuid,?::bytea)"
+			rows[i] = "(?::uuid,?::bytea,?::text)"
 		} else {
-			rows[i] = "(?,?)"
+			rows[i] = "(?,?,?)"
 		}
-		args = append(args, string(it.JobID), encoded[i])
+		args = append(args, string(it.JobID), encoded[i], it.DispatchToken)
 	}
 	args = append(args, workerID)
 	sql := `UPDATE jobs AS j SET status = 'completed', locked_by = '', locked_until = NULL, ` +
 		`result = v.result, completed_at = NOW(), updated_at = NOW() ` +
-		`FROM (VALUES ` + strings.Join(rows, ",") + `) AS v(id, result) ` +
-		`WHERE j.id = v.id AND j.locked_by = ? AND j.status = 'running' AND j.fan_out_id IS NULL RETURNING j.id`
+		`FROM (VALUES ` + strings.Join(rows, ",") + `) AS v(id, result, dispatch_token) ` +
+		`WHERE j.id = v.id AND COALESCE(j.dispatch_token, '') = v.dispatch_token AND j.locked_by = ? AND j.status = 'running' AND j.fan_out_id IS NULL RETURNING j.id`
 	var committed []core.UUID
 	if err := tx.Raw(sql, args...).Scan(&committed).Error; err != nil {
 		return nil, err
@@ -148,7 +149,7 @@ func (s *GormStorage) batchCompleteFlipPostgres(tx *gorm.DB, workerID string, it
 	return committed, nil
 }
 
-// SQLite: UPDATE ... FROM (SELECT ? AS id, ? AS result UNION ALL ...) ... RETURNING.
+// SQLite: UPDATE ... FROM (SELECT ? AS id, ? AS result, ? AS dispatch_token UNION ALL ...) ... RETURNING.
 // The `AS v(id,result)` column-alias form is rejected by SQLite, so a UNION-ALL
 // derived table is used. completed_at is a bound wall-clock value (single-clock
 // backend). Raw 16-byte blob ids match jobs.id directly (no cast).
@@ -159,17 +160,17 @@ func (s *GormStorage) batchCompleteFlipSQLite(tx *gorm.DB, workerID string, item
 	args = append(args, now, now) // leading completed_at and updated_at binds
 	for i, it := range items {
 		if i == 0 {
-			selects[i] = "SELECT ? AS id, ? AS result"
+			selects[i] = "SELECT ? AS id, ? AS result, ? AS dispatch_token"
 		} else {
-			selects[i] = "SELECT ?, ?"
+			selects[i] = "SELECT ?, ?, ?"
 		}
-		args = append(args, it.JobID, encoded[i])
+		args = append(args, it.JobID, encoded[i], it.DispatchToken)
 	}
 	args = append(args, workerID)
 	sql := `UPDATE jobs SET status = 'completed', locked_by = '', locked_until = NULL, ` +
 		`result = v.result, completed_at = ?, updated_at = ? ` +
 		`FROM (` + strings.Join(selects, " UNION ALL ") + `) AS v ` +
-		`WHERE jobs.id = v.id AND jobs.locked_by = ? AND jobs.status = 'running' AND jobs.fan_out_id IS NULL RETURNING jobs.id`
+		`WHERE jobs.id = v.id AND COALESCE(jobs.dispatch_token, '') = v.dispatch_token AND jobs.locked_by = ? AND jobs.status = 'running' AND jobs.fan_out_id IS NULL RETURNING jobs.id`
 	var committed []core.UUID
 	if err := tx.Raw(sql, args...).Scan(&committed).Error; err != nil {
 		return nil, err
@@ -190,15 +191,15 @@ func (s *GormStorage) batchCompleteFlipMySQL(tx *gorm.DB, workerID string, items
 	args := make([]any, 0, len(items)*2+2)
 	for i, it := range items {
 		if i == 0 {
-			selects[i] = "SELECT CAST(? AS BINARY) AS id, UNHEX(?) AS result"
+			selects[i] = "SELECT CAST(? AS BINARY) AS id, UNHEX(?) AS result, ? AS dispatch_token"
 		} else {
-			selects[i] = "SELECT CAST(? AS BINARY), UNHEX(?)"
+			selects[i] = "SELECT CAST(? AS BINARY), UNHEX(?), ?"
 		}
-		args = append(args, it.JobID, hex.EncodeToString(encoded[i]))
+		args = append(args, it.JobID, hex.EncodeToString(encoded[i]), it.DispatchToken)
 		ids[i] = it.JobID
 	}
 	args = append(args, token, workerID)
-	sql := `UPDATE jobs j JOIN (` + strings.Join(selects, " UNION ALL ") + `) v ON j.id = v.id ` +
+	sql := `UPDATE jobs j JOIN (` + strings.Join(selects, " UNION ALL ") + `) v ON j.id = v.id AND COALESCE(j.dispatch_token, '') = v.dispatch_token ` +
 		`SET j.status = 'completed', j.locked_by = ?, j.locked_until = NULL, ` +
 		`j.result = v.result, j.completed_at = NOW(6), j.updated_at = NOW(6) ` +
 		`WHERE j.locked_by = ? AND j.status = 'running' AND j.fan_out_id IS NULL`

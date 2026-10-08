@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/jdziat/simple-durable-jobs/v4/pkg/core"
 	"github.com/stretchr/testify/assert"
@@ -40,6 +41,49 @@ func TestSaveCheckpointOwnedRejectsAStaleWorkerWithoutOverwriting(t *testing.T) 
 	assert.JSONEq(t, `"payment-owner"`, string(checkpoints[0].Result))
 	assert.Empty(t, checkpoints[0].Error,
 		"a stale run's terminal error must not replace the owner's successful result")
+}
+
+func TestSaveCheckpointOwnedRejectsStaleDispatchFromSameWorker(t *testing.T) {
+	base := context.Background()
+	s := newTestStorage(t)
+	const worker = "worker-a"
+	jobID := seedRunningJobOwnedBy(t, base, s, worker)
+
+	// This models a lease reclaim followed by redispatch to the same configured
+	// worker. Worker identity is unchanged; the durable dispatch incarnation is
+	// what must keep the old handler from overwriting the new handler's result.
+	require.NoError(t, s.DB().Model(&core.Job{}).Where("id = ?", jobID).Update("dispatch_token", "run-2").Error)
+	current := core.WithDispatchToken(base, "run-2")
+	stale := core.WithDispatchToken(base, "run-1")
+	require.NoError(t, s.SaveCheckpointOwned(current, &core.Checkpoint{JobID: jobID, CallIndex: 0, CallType: "call", Result: []byte(`"new"`)}, worker))
+	require.ErrorIs(t, s.SaveCheckpointOwned(stale, &core.Checkpoint{JobID: jobID, CallIndex: 0, CallType: "call", Result: []byte(`"stale"`)}, worker), core.ErrJobNotOwned)
+
+	checkpoints, err := s.GetCheckpoints(base, jobID)
+	require.NoError(t, err)
+	require.Len(t, checkpoints, 1)
+	assert.JSONEq(t, `"new"`, string(checkpoints[0].Result))
+}
+
+func TestLifecycleWritesRejectStaleSameWorkerDispatch(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+	stale := core.WithDispatchToken(ctx, "stale")
+	for name, write := range map[string]func(core.UUID) error{
+		"complete":  func(id core.UUID) error { return s.Complete(stale, id, "worker-a") },
+		"fail":      func(id core.UUID) error { return s.Fail(stale, id, "worker-a", "failed", nil) },
+		"heartbeat": func(id core.UUID) error { return s.Heartbeat(stale, id, "worker-a") },
+		"release":   func(id core.UUID) error { return s.Release(stale, id, "worker-a") },
+		"waiting":   func(id core.UUID) error { return s.MarkWaitingWithDeadline(stale, id, "worker-a", time.Minute) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			id := seedRunningJobOwnedBy(t, ctx, s, "worker-a")
+			require.NoError(t, s.DB().Model(&core.Job{}).Where("id = ?", id).Update("dispatch_token", "current").Error)
+			require.ErrorIs(t, write(id), core.ErrJobNotOwned)
+			got, err := s.GetJob(ctx, id)
+			require.NoError(t, err)
+			assert.Equal(t, core.StatusRunning, got.Status)
+		})
+	}
 }
 
 // Re-saving is ordinary replay behaviour. The ownership fence must reject only

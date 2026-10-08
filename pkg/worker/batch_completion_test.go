@@ -383,7 +383,7 @@ func TestBatchCompleter_CloseFlushesBufferedAndLateSubmitFallsBack(t *testing.T)
 
 	result := make(chan error, 1)
 	go func() {
-		committed, err := b.Submit("buffered", []byte(`1`))
+		committed, err := b.Submit("buffered", "", []byte(`1`))
 		if err == nil && !committed {
 			err = fmt.Errorf("buffered submission was not committed")
 		}
@@ -406,7 +406,7 @@ func TestBatchCompleter_CloseFlushesBufferedAndLateSubmitFallsBack(t *testing.T)
 	}
 	assert.Equal(t, int32(1), calls.Load())
 
-	committed, err := b.Submit("late", nil)
+	committed, err := b.Submit("late", "", nil)
 	assert.False(t, committed)
 	assert.ErrorIs(t, err, errBatchCompletionClosed)
 }
