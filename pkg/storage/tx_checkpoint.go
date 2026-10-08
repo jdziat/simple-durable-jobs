@@ -45,7 +45,7 @@ func (s *GormStorage) SaveCheckpointTxOwned(ctx context.Context, tx *gorm.DB, cp
 	if err != nil {
 		return err
 	}
-	if err := s.requireCheckpointOwner(tx.WithContext(ctx), cp.JobID, workerID); err != nil {
+	if err := s.requireCheckpointOwner(ctx, tx.WithContext(ctx), cp.JobID, workerID); err != nil {
 		return err
 	}
 	return s.saveCheckpointRow(ctx, tx, row)
@@ -67,10 +67,9 @@ func (s *GormStorage) saveCheckpointRow(ctx context.Context, db *gorm.DB, row *c
 		Create(row).Error
 }
 
-func (s *GormStorage) requireCheckpointOwner(tx *gorm.DB, jobID core.UUID, workerID string) error {
+func (s *GormStorage) requireCheckpointOwner(ctx context.Context, tx *gorm.DB, jobID core.UUID, workerID string) error {
 	var job core.Job
-	err := s.lockForUpdate(tx.Model(&core.Job{}).Select("id"), false).
-		Where("id = ? AND locked_by = ? AND status = ?", jobID, workerID, core.StatusRunning).
+	err := s.lockForUpdate(s.ownedRunning(tx.Model(&core.Job{}).Select("id"), ctx, jobID, workerID), false).
 		Take(&job).Error
 	if err == nil {
 		return nil

@@ -206,7 +206,7 @@ func TestGormStorageCodecEncryptsBatchCompleteResult(t *testing.T) {
 
 			result := []byte(`{"secret":"batch-plaintext"}`)
 			committed, err := s.BatchComplete(ctx, "worker-batch", []BatchCompleteItem{
-				{JobID: running.ID, Result: result},
+				{JobID: running.ID, DispatchToken: running.DispatchToken, Result: result},
 			})
 			require.NoError(t, err)
 			require.Equal(t, []core.UUID{running.ID}, committed)

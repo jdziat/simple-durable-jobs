@@ -77,14 +77,14 @@ func newBatchCompleter(
 	}
 }
 
-func (b *batchCompleter) Submit(jobID core.UUID, result []byte) (bool, error) {
+func (b *batchCompleter) Submit(jobID core.UUID, dispatchToken string, result []byte) (bool, error) {
 	if b == nil || b.closed.Load() {
 		return false, errBatchCompletionClosed
 	}
 
 	sub := &batchCompletionSubmission{
 		item: storage.BatchCompleteItem{
-			JobID:  jobID,
+			JobID: jobID, DispatchToken: dispatchToken,
 			Result: result,
 		},
 		result: make(chan batchCompletionResult, 1),

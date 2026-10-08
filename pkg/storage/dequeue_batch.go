@@ -74,13 +74,14 @@ func (s *GormStorage) dequeueBatch(ctx context.Context, queues []string, workerI
 }
 
 func (s *GormStorage) dequeueBatchOnce(ctx context.Context, queues []string, workerID string, limit int, perQueueBudgets map[string]int) ([]*core.Job, error) {
+	dispatchToken := string(core.NewID())
 	// MySQL has no RETURNING and cannot reference the UPDATE's target table in a
 	// subquery, so it keeps the candidate-SELECT -> UPDATE path. Postgres and
 	// SQLite (>= 3.35) claim with one UPDATE ... RETURNING per queue.
 	if s.dialect() == dialectMySQL {
-		return s.dequeueBatchLocked(ctx, queues, workerID, limit, perQueueBudgets)
+		return s.dequeueBatchLocked(ctx, queues, workerID, dispatchToken, limit, perQueueBudgets)
 	}
-	return s.dequeueBatchReturning(ctx, queues, workerID, limit, perQueueBudgets)
+	return s.dequeueBatchReturning(ctx, queues, workerID, dispatchToken, limit, perQueueBudgets)
 }
 
 // dequeueBatchReturning claims due jobs with a SINGLE atomic UPDATE ... RETURNING
@@ -162,7 +163,7 @@ func (s *GormStorage) dequeueBatchOnce(ctx context.Context, queues []string, wor
 // another worker holds. If the process dies before even that runs, the stale-lock
 // reaper is still the final backstop; this shortens a 45-minute stall to an
 // immediate release, it does not replace recovery.
-func (s *GormStorage) dequeueBatchReturning(ctx context.Context, queues []string, workerID string, limit int, perQueueBudgets map[string]int) ([]*core.Job, error) {
+func (s *GormStorage) dequeueBatchReturning(ctx context.Context, queues []string, workerID, dispatchToken string, limit int, perQueueBudgets map[string]int) ([]*core.Job, error) {
 	dur := time.Duration(s.lockDuration.Load())
 	var nowVal, lockUntilVal any
 	if s.useDBClock() {
@@ -239,11 +240,11 @@ func (s *GormStorage) dequeueBatchReturning(ctx context.Context, queues []string
 		).Limit(n)
 		if err := exec.Raw(
 			"WITH claimed AS MATERIALIZED (?) "+
-				"UPDATE jobs SET status = ?, locked_by = ?, locked_until = ?, "+
+				"UPDATE jobs SET status = ?, locked_by = ?, dispatch_token = ?, locked_until = ?, "+
 				"started_at = ?, updated_at = ?, attempt = attempt + 1, "+
 				"last_heartbeat_at = NULL "+
 				"WHERE id IN (SELECT id FROM claimed) RETURNING *",
-			sub, core.StatusRunning, workerID, lockUntilVal, nowVal, nowVal,
+			sub, core.StatusRunning, workerID, dispatchToken, lockUntilVal, nowVal, nowVal,
 		).Scan(&rows).Error; err != nil {
 			return err
 		}
@@ -279,7 +280,7 @@ func (s *GormStorage) dequeueBatchReturning(ctx context.Context, queues []string
 		}); err != nil {
 			// Backstop for an in-doubt COMMIT only: the rows were scanned, so the ids
 			// are known, and the release is guarded by locked_by/status.
-			return nil, s.releaseClaimedOnAbort(abortIDs, workerID, err)
+			return nil, s.releaseClaimedOnAbort(abortIDs, workerID, dispatchToken, err)
 		}
 	}
 
@@ -312,7 +313,7 @@ func claimOrderKey(j *core.Job) time.Time {
 	return j.CreatedAt
 }
 
-func (s *GormStorage) dequeueBatchLocked(ctx context.Context, queues []string, workerID string, limit int, perQueueBudgets map[string]int) ([]*core.Job, error) {
+func (s *GormStorage) dequeueBatchLocked(ctx context.Context, queues []string, workerID, dispatchToken string, limit int, perQueueBudgets map[string]int) ([]*core.Job, error) {
 	nowExpr := s.nowExpr()
 	lockUntilExpr := s.offsetExpr(time.Duration(s.lockDuration.Load()))
 	silentDB := s.db.Session(&gorm.Session{Logger: s.db.Logger.LogMode(logger.Silent)})
@@ -411,11 +412,12 @@ func (s *GormStorage) dequeueBatchLocked(ctx context.Context, queues []string, w
 					if err := tx.Model(&core.Job{}).
 						Where("id IN ?", claimIDs).
 						Updates(map[string]any{
-							"status":       core.StatusRunning,
-							"locked_by":    workerID,
-							"locked_until": lockUntilExpr,
-							"started_at":   nowExpr,
-							"attempt":      gorm.Expr("attempt + 1"),
+							"status":         core.StatusRunning,
+							"locked_by":      workerID,
+							"dispatch_token": dispatchToken,
+							"locked_until":   lockUntilExpr,
+							"started_at":     nowExpr,
+							"attempt":        gorm.Expr("attempt + 1"),
 							// Clear the prior run's heartbeat on claim so the stale-lock
 							// reaper anchors on this claim's started_at, not a stale
 							// heartbeat (CD-01 double-execution). See Dequeue.
@@ -435,7 +437,7 @@ func (s *GormStorage) dequeueBatchLocked(ctx context.Context, queues []string, w
 			})
 		})
 		if err != nil {
-			return nil, s.releaseClaimedOnAbort(claimedIDs, workerID, err)
+			return nil, s.releaseClaimedOnAbort(claimedIDs, workerID, dispatchToken, err)
 		}
 
 		if len(batchIDs) > 0 {
@@ -452,7 +454,7 @@ func (s *GormStorage) dequeueBatchLocked(ctx context.Context, queues []string, w
 
 		hasMore, err := s.hasClaimableBatchJob(ctx, queues)
 		if err != nil {
-			return nil, s.releaseClaimedOnAbort(claimedIDs, workerID, err)
+			return nil, s.releaseClaimedOnAbort(claimedIDs, workerID, dispatchToken, err)
 		}
 		if !hasMore {
 			break
@@ -462,7 +464,7 @@ func (s *GormStorage) dequeueBatchLocked(ctx context.Context, queues []string, w
 			break
 		}
 		if err := sleepDequeueBatchRetry(ctx, time.Duration(emptyRetries)*2*time.Millisecond); err != nil {
-			return nil, s.releaseClaimedOnAbort(claimedIDs, workerID, err)
+			return nil, s.releaseClaimedOnAbort(claimedIDs, workerID, dispatchToken, err)
 		}
 	}
 
@@ -476,7 +478,7 @@ func (s *GormStorage) dequeueBatchLocked(ctx context.Context, queues []string, w
 		// COALESCE(run_at, created_at) for a deterministic priority,time ordering.
 		Order("priority DESC, COALESCE(run_at, created_at) ASC").
 		Find(&jobs).Error; err != nil {
-		return nil, s.releaseClaimedOnAbort(claimedIDs, workerID, err)
+		return nil, s.releaseClaimedOnAbort(claimedIDs, workerID, dispatchToken, err)
 	}
 	decoded, err := s.decodeClaimedBatch(ctx, jobs, workerID)
 	if err != nil {
@@ -511,7 +513,7 @@ func (s *GormStorage) decodeClaimedBatch(ctx context.Context, jobs []*core.Job, 
 	for _, job := range jobs {
 		if err := s.decodeJobPayloads(job); err != nil {
 			s.reportPoisonPayload(job.ID, err)
-			if rerr := s.Release(ctx, job.ID, workerID); rerr != nil && !errors.Is(rerr, core.ErrJobNotOwned) {
+			if rerr := s.Release(core.WithDispatchToken(ctx, job.DispatchToken), job.ID, workerID); rerr != nil && !errors.Is(rerr, core.ErrJobNotOwned) {
 				return nil, rerr
 			}
 			continue
@@ -613,7 +615,7 @@ func (s *GormStorage) SetLogger(l *slog.Logger) { s.logger = l }
 //     pkg/worker/worker.go's dequeue loop uses that test to stay quiet during a
 //     normal shutdown; wrapping the cause in anything opaque would turn every
 //     clean stop into a logged error.
-func (s *GormStorage) releaseClaimedOnAbort(claimedIDs []core.UUID, workerID string, cause error) error {
+func (s *GormStorage) releaseClaimedOnAbort(claimedIDs []core.UUID, workerID, dispatchToken string, cause error) error {
 	if len(claimedIDs) == 0 {
 		return cause
 	}
@@ -625,7 +627,7 @@ func (s *GormStorage) releaseClaimedOnAbort(claimedIDs []core.UUID, workerID str
 	for chunk := range slices.Chunk(claimedIDs, releaseOnAbortChunk) {
 		if err := s.db.WithContext(ctx).
 			Model(&core.Job{}).
-			Where("id IN ? AND locked_by = ? AND status = ?", chunk, workerID, core.StatusRunning).
+			Where("id IN ? AND locked_by = ? AND dispatch_token = ? AND status = ?", chunk, workerID, dispatchToken, core.StatusRunning).
 			Updates(map[string]any{
 				"status":       core.StatusPending,
 				"locked_by":    "",
