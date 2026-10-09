@@ -108,10 +108,10 @@ func (h *Handler) ValidateArgs(name string, args any) error {
 
 	at := reflect.TypeOf(args)
 	argsType := h.ArgsType
-	if at.Kind() == reflect.Ptr {
+	if at.Kind() == reflect.Pointer {
 		at = at.Elem()
 	}
-	if argsType.Kind() == reflect.Ptr {
+	if argsType.Kind() == reflect.Pointer {
 		argsType = argsType.Elem()
 	}
 	if at.AssignableTo(argsType) {
@@ -196,7 +196,7 @@ func acceptsEmptyArgs(t reflect.Type) bool {
 	switch t.Kind() {
 	case reflect.Struct:
 		return isEmptyStructType(t)
-	case reflect.Slice, reflect.Map, reflect.Ptr, reflect.Interface:
+	case reflect.Slice, reflect.Map, reflect.Pointer, reflect.Interface:
 		return true
 	default:
 		return false
