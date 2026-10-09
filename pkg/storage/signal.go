@@ -256,13 +256,7 @@ func (s *GormStorage) consumeSignalTx(ctx context.Context, jobID core.UUID, work
 		out = nil
 		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 			if gate {
-				var owned int64
-				if err := tx.Model(&core.Job{}).
-					Where("id = ? AND locked_by = ? AND status = ?", jobID, workerID, core.StatusRunning).
-					Count(&owned).Error; err != nil {
-					return err
-				}
-				if owned == 0 {
+				if err := s.requireCheckpointOwner(ctx, tx, jobID, workerID); err != nil {
 					// ErrJobNotOwned, NOT nil. A bare nil here is byte-identical to
 					// the "nothing pending" return below, and the caller acts on the
 					// difference: WaitForSignalTimeout reads nil as "no signal
@@ -276,7 +270,7 @@ func (s *GormStorage) consumeSignalTx(ctx context.Context, jobID core.UUID, work
 					// This method's own godoc says a non-owner "suspends"; it could
 					// not, because it was never told. The suspend path in this file
 					// already fences this way.
-					return core.ErrJobNotOwned
+					return err
 				}
 			}
 			q := s.pendingSignalsLocked(tx, jobID, name)
@@ -309,7 +303,12 @@ func (s *GormStorage) consumeSignalTx(ctx context.Context, jobID core.UUID, work
 				return err
 			}
 			if cp != nil {
-				if err := s.SaveCheckpointTx(ctx, tx, cp); err != nil {
+				if gate {
+					err = s.SaveCheckpointTxOwned(ctx, tx, cp, workerID)
+				} else {
+					err = s.SaveCheckpointTx(ctx, tx, cp)
+				}
+				if err != nil {
 					return err
 				}
 			}
@@ -348,17 +347,11 @@ func (s *GormStorage) drainSignalsTx(ctx context.Context, jobID core.UUID, worke
 		out = nil
 		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 			if gate {
-				var owned int64
-				if err := tx.Model(&core.Job{}).
-					Where("id = ? AND locked_by = ? AND status = ?", jobID, workerID, core.StatusRunning).
-					Count(&owned).Error; err != nil {
-					return err
-				}
-				if owned == 0 {
+				if err := s.requireCheckpointOwner(ctx, tx, jobID, workerID); err != nil {
 					// Same fence, same reason as consumeSignalTx above: a non-owner
 					// must be told it is a non-owner, not handed the value that means
 					// "there was nothing here".
-					return core.ErrJobNotOwned
+					return err
 				}
 			}
 			q := s.pendingSignalsLocked(tx, jobID, name)
@@ -394,7 +387,12 @@ func (s *GormStorage) drainSignalsTx(ctx context.Context, jobID core.UUID, worke
 				return err
 			}
 			if cp != nil {
-				if err := s.SaveCheckpointTx(ctx, tx, cp); err != nil {
+				if gate {
+					err = s.SaveCheckpointTxOwned(ctx, tx, cp, workerID)
+				} else {
+					err = s.SaveCheckpointTx(ctx, tx, cp)
+				}
+				if err != nil {
 					return err
 				}
 			}
@@ -491,7 +489,7 @@ func (s *GormStorage) DeleteConsumedSignalsOlderThan(ctx context.Context, age ti
 // skew that would otherwise make the timeout fire early or late. SQLite is
 // single-clock, so it uses the caller's time.
 func (s *GormStorage) MarkWaitingWithDeadline(ctx context.Context, jobID core.UUID, workerID string, d time.Duration) error {
-	rowsAffected, err := s.markWaitingWithDeadlineTx(s.db.WithContext(ctx), jobID, workerID, d)
+	rowsAffected, err := s.markWaitingWithDeadlineTx(ctx, s.db.WithContext(ctx), jobID, workerID, d)
 	if err != nil {
 		return err
 	}
@@ -508,23 +506,21 @@ func (s *GormStorage) MarkWaitingWithDeadline(ctx context.Context, jobID core.UU
 // (e.g. a just-written checkpoint) when ownership was lost. run_at is computed on
 // the DB clock (offsetExpr) on multi-worker backends and the caller's clock on
 // SQLite, exactly as MarkWaitingWithDeadline documents.
-func (s *GormStorage) markWaitingWithDeadlineTx(tx *gorm.DB, jobID core.UUID, workerID string, d time.Duration) (int64, error) {
-	return s.markWaitingWithDeadlineForSignalTx(tx, jobID, workerID, d, "")
+func (s *GormStorage) markWaitingWithDeadlineTx(ctx context.Context, tx *gorm.DB, jobID core.UUID, workerID string, d time.Duration) (int64, error) {
+	return s.markWaitingWithDeadlineForSignalTx(ctx, tx, jobID, workerID, d, "")
 }
 
 // markWaitingWithDeadlineForSignalTx is markWaitingWithDeadlineTx that also
 // records which signal name may wake the job. An empty name means "not recorded"
 // and leaves the resume poll permissive for this job.
-func (s *GormStorage) markWaitingWithDeadlineForSignalTx(tx *gorm.DB, jobID core.UUID, workerID string, d time.Duration, signalName string) (int64, error) {
+func (s *GormStorage) markWaitingWithDeadlineForSignalTx(ctx context.Context, tx *gorm.DB, jobID core.UUID, workerID string, d time.Duration, signalName string) (int64, error) {
 	var runAt any
 	if s.useDBClock() {
 		runAt = s.offsetExpr(d)
 	} else {
 		runAt = time.Now().Add(d)
 	}
-	result := tx.
-		Model(&core.Job{}).
-		Where("id = ? AND locked_by = ? AND status = ?", jobID, workerID, core.StatusRunning).
+	result := s.ownedRunning(tx, ctx, jobID, workerID).
 		Updates(map[string]any{
 			"status":              core.StatusWaiting,
 			"locked_by":           "",
@@ -577,7 +573,7 @@ func (s *GormStorage) SaveCheckpointAndMarkWaitingForSignal(ctx context.Context,
 					return err
 				}
 			}
-			rowsAffected, err := s.markWaitingWithDeadlineForSignalTx(tx, jobID, workerID, d, signalName)
+			rowsAffected, err := s.markWaitingWithDeadlineForSignalTx(ctx, tx, jobID, workerID, d, signalName)
 			if err != nil {
 				return err
 			}

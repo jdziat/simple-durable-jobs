@@ -560,6 +560,20 @@ func TestWorker_Pause(t *testing.T) {
 	assert.False(t, w.IsPaused())
 }
 
+func TestReleaseClaimedJobsBindsDispatchToken(t *testing.T) {
+	store := &mockStorage{}
+	store.releaseJobFunc = func(ctx context.Context, _ core.UUID, _ string) error {
+		token, ok := core.DispatchTokenFromContext(ctx)
+		if !ok || token != "current" {
+			return errors.New("missing dispatch token")
+		}
+		return nil
+	}
+	w := NewWorker(queue.New(store))
+	w.releaseClaimedJobs(context.Background(), []*core.Job{{ID: core.NewID(), LockedBy: w.config.WorkerID, DispatchToken: "current"}})
+	require.Len(t, store.releasedJobIDs, 1)
+}
+
 func TestWorker_PauseMode(t *testing.T) {
 	db := newInMemoryDB(t)
 	store := storage.NewGormStorage(db)

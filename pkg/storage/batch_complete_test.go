@@ -34,10 +34,10 @@ func TestBatchComplete_PerRowResults_OwnershipAndGC(t *testing.T) {
 	require.NoError(t, s.SaveCheckpoint(ctx, &core.Checkpoint{JobID: a.ID, CallIndex: 0, CallType: "x", Result: []byte(`"r"`)}))
 
 	items := []BatchCompleteItem{
-		{JobID: a.ID, Result: []byte(`{"job":"a"}`)},
-		{JobID: b.ID, Result: []byte(`{"job":"b"}`)},
-		{JobID: c.ID, Result: []byte(`{"job":"c"}`)},
-		{JobID: other.ID, Result: []byte(`{"job":"other"}`)}, // not owned by w
+		{JobID: a.ID, DispatchToken: a.DispatchToken, Result: []byte(`{"job":"a"}`)},
+		{JobID: b.ID, DispatchToken: b.DispatchToken, Result: []byte(`{"job":"b"}`)},
+		{JobID: c.ID, DispatchToken: c.DispatchToken, Result: []byte(`{"job":"c"}`)},
+		{JobID: other.ID, DispatchToken: other.DispatchToken, Result: []byte(`{"job":"other"}`)}, // not owned by w
 	}
 	committed, err := s.BatchComplete(ctx, "w", items)
 	require.NoError(t, err)
@@ -67,13 +67,29 @@ func TestBatchComplete_PerRowResults_OwnershipAndGC(t *testing.T) {
 	assert.Empty(t, cps, "checkpoints GC'd in the batch tx")
 }
 
+func TestBatchCompleteRejectsStaleSameWorkerDispatch(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+	job := runningJob(t, ctx, s, "worker-a")
+	require.NoError(t, s.DB().Model(&core.Job{}).Where("id = ?", job.ID).Update("dispatch_token", "current").Error)
+
+	committed, err := s.BatchComplete(ctx, "worker-a", []BatchCompleteItem{{JobID: job.ID, DispatchToken: "stale", Result: []byte(`"stale"`)}})
+	require.NoError(t, err)
+	assert.Empty(t, committed)
+
+	got, err := s.GetJob(ctx, job.ID)
+	require.NoError(t, err)
+	assert.Equal(t, core.StatusRunning, got.Status)
+	assert.Empty(t, got.Result)
+}
+
 func TestBatchComplete_BinaryResultRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStorage(t)
 	j := runningJob(t, ctx, s, "w")
 
 	committed, err := s.BatchComplete(ctx, "w", []BatchCompleteItem{
-		{JobID: j.ID, Result: binaryResult},
+		{JobID: j.ID, DispatchToken: j.DispatchToken, Result: binaryResult},
 	})
 	require.NoError(t, err)
 	require.ElementsMatch(t, []core.UUID{j.ID}, committed)
@@ -129,7 +145,7 @@ func TestBatchComplete_ExcludesFanOutSubJobs(t *testing.T) {
 	require.NotNil(t, got)
 
 	committed, err := s.BatchComplete(ctx, "w", []BatchCompleteItem{
-		{JobID: got.ID, Result: []byte(`{"sub":true}`)},
+		{JobID: got.ID, DispatchToken: got.DispatchToken, Result: []byte(`{"sub":true}`)},
 	})
 	require.NoError(t, err)
 	assert.Empty(t, committed)
@@ -149,7 +165,7 @@ func TestBatchComplete_AdvancesUpdatedAt(t *testing.T) {
 	before := time.Now().UTC().Add(-time.Hour)
 	require.NoError(t, s.db.WithContext(ctx).Model(&core.Job{}).Where("id = ?", j.ID).Update("updated_at", before).Error)
 	committed, err := s.BatchComplete(ctx, "w", []BatchCompleteItem{
-		{JobID: j.ID, Result: []byte(`{"ok":true}`)},
+		{JobID: j.ID, DispatchToken: j.DispatchToken, Result: []byte(`{"ok":true}`)},
 	})
 	require.NoError(t, err)
 	require.ElementsMatch(t, []core.UUID{j.ID}, committed)

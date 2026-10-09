@@ -69,7 +69,7 @@ func TestReleaseClaimedOnAbort_OwnershipFenced(t *testing.T) {
 	s := newTestStorage(t)
 	ctx := context.Background()
 
-	mine := &core.Job{ID: core.NewID(), Type: "t", Queue: "default", Status: core.StatusRunning, LockedBy: "worker-A"}
+	mine := &core.Job{ID: core.NewID(), Type: "t", Queue: "default", Status: core.StatusRunning, LockedBy: "worker-A", DispatchToken: "mine"}
 	theirs := &core.Job{ID: core.NewID(), Type: "t", Queue: "default", Status: core.StatusRunning, LockedBy: "worker-B"}
 	pendingAlready := &core.Job{ID: core.NewID(), Type: "t", Queue: "default", Status: core.StatusPending}
 	for _, j := range []*core.Job{mine, theirs, pendingAlready} {
@@ -77,7 +77,7 @@ func TestReleaseClaimedOnAbort_OwnershipFenced(t *testing.T) {
 	}
 
 	cause := errors.New("boom")
-	err := s.releaseClaimedOnAbort([]core.UUID{mine.ID, theirs.ID, pendingAlready.ID}, "worker-A", cause)
+	err := s.releaseClaimedOnAbort([]core.UUID{mine.ID, theirs.ID, pendingAlready.ID}, "worker-A", "mine", cause)
 	require.ErrorIs(t, err, cause, "the original cause must survive so callers can classify it")
 
 	// A fresh destination per lookup: GORM folds a primary key already set on the
@@ -86,11 +86,25 @@ func TestReleaseClaimedOnAbort_OwnershipFenced(t *testing.T) {
 	var gotMine core.Job
 	require.NoError(t, s.db.First(&gotMine, "id = ?", mine.ID).Error)
 	assert.Equal(t, core.StatusPending, gotMine.Status, "our own claim must be released")
+	assert.Empty(t, gotMine.DispatchToken, "an aborted claim must not leave a usable fencing token")
 
 	var gotTheirs core.Job
 	require.NoError(t, s.db.First(&gotTheirs, "id = ?", theirs.ID).Error)
 	assert.Equal(t, core.StatusRunning, gotTheirs.Status, "another worker's running job must be untouched")
 	assert.Equal(t, "worker-B", gotTheirs.LockedBy)
+}
+
+func TestReleaseClaimedOnAbortRejectsStaleSameWorkerDispatch(t *testing.T) {
+	s := newTestStorage(t)
+	ctx := context.Background()
+	job := &core.Job{ID: core.NewID(), Type: "t", Queue: "default", Status: core.StatusRunning, LockedBy: "worker-A", DispatchToken: "current"}
+	require.NoError(t, s.db.WithContext(ctx).Create(job).Error)
+
+	require.Error(t, s.releaseClaimedOnAbort([]core.UUID{job.ID}, "worker-A", "stale", errors.New("decode failed")))
+	var got core.Job
+	require.NoError(t, s.db.First(&got, "id = ?", job.ID).Error)
+	assert.Equal(t, core.StatusRunning, got.Status)
+	assert.Equal(t, "current", got.DispatchToken)
 }
 
 // TestReleaseClaimedOnAbort_PreservesContextCanceled pins the property
@@ -103,7 +117,7 @@ func TestReleaseClaimedOnAbort_PreservesContextCanceled(t *testing.T) {
 	job := &core.Job{ID: core.NewID(), Type: "t", Queue: "default", Status: core.StatusRunning, LockedBy: "worker-A"}
 	require.NoError(t, s.db.Create(job).Error)
 
-	err := s.releaseClaimedOnAbort([]core.UUID{job.ID}, "worker-A", context.Canceled)
+	err := s.releaseClaimedOnAbort([]core.UUID{job.ID}, "worker-A", "", context.Canceled)
 	assert.ErrorIs(t, err, context.Canceled,
 		"worker.go's dequeue loop tests errors.Is(err, context.Canceled) to stay quiet during shutdown")
 
@@ -119,7 +133,7 @@ func TestReleaseClaimedOnAbort_PreservesContextCanceled(t *testing.T) {
 func TestReleaseClaimedOnAbort_NoClaimsIsPassthrough(t *testing.T) {
 	s := newTestStorage(t)
 	cause := errors.New("boom")
-	assert.Equal(t, cause, s.releaseClaimedOnAbort(nil, "worker-A", cause))
+	assert.Equal(t, cause, s.releaseClaimedOnAbort(nil, "worker-A", "", cause))
 }
 
 // TestReleaseClaimedOnAbort_ChunksLargeBatches exercises the >200-id path so the
@@ -137,7 +151,7 @@ func TestReleaseClaimedOnAbort_ChunksLargeBatches(t *testing.T) {
 		ids = append(ids, j.ID)
 	}
 
-	require.Error(t, s.releaseClaimedOnAbort(ids, "worker-A", errors.New("boom")))
+	require.Error(t, s.releaseClaimedOnAbort(ids, "worker-A", "", errors.New("boom")))
 
 	var stillRunning int64
 	require.NoError(t, s.db.Model(&core.Job{}).

@@ -406,7 +406,7 @@ func TestJobAttributes(t *testing.T) {
 	attrs := jobAttributes(job)
 	m := make(map[string]string)
 	for _, a := range attrs {
-		m[string(a.Key)] = a.Value.Emit()
+		m[string(a.Key)] = a.Value.String()
 	}
 
 	assert.Equal(t, "abc-123", m["job.id"])
@@ -593,7 +593,7 @@ func TestInstrumentedWorkerEndsProcessSpanOnWaiting(t *testing.T) {
 func spanAttrMap(attrs []attribute.KeyValue) map[string]string {
 	m := make(map[string]string, len(attrs))
 	for _, a := range attrs {
-		m[string(a.Key)] = a.Value.Emit()
+		m[string(a.Key)] = a.Value.String()
 	}
 	return m
 }

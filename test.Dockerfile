@@ -17,7 +17,7 @@ RUN npm run build
 
 # Stage 2: the test runner. The Debian-based golang image ships gcc, which both
 # the race detector and the CGO sqlite driver (mattn/go-sqlite3) require.
-FROM golang:1.25-bookworm AS test
+FROM golang:1.26-bookworm AS test
 ENV CGO_ENABLED=1
 WORKDIR /src
 

@@ -117,7 +117,7 @@ func BenchmarkBatchComplete(b *testing.B) {
 			if err != nil || got == nil {
 				b.Fatalf("seed dequeue: %v (nil=%v)", err, got == nil)
 			}
-			items[k] = BatchCompleteItem{JobID: got.ID, Result: []byte(`{"ok":true}`)}
+			items[k] = BatchCompleteItem{JobID: got.ID, DispatchToken: got.DispatchToken, Result: []byte(`{"ok":true}`)}
 		}
 		return items
 	}

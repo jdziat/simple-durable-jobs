@@ -806,7 +806,7 @@ func (s *GormStorage) dequeueDecoded(ctx context.Context, queues []string, worke
 		// invisible to any queue-depth alert (it reads as healthy work in
 		// progress) and reclaimable only by ReleaseStaleLocks, by default 45
 		// minutes later.
-		if relErr := s.releaseClaimedOnAbort([]core.UUID{job.ID}, workerID, nil); relErr != nil {
+		if relErr := s.releaseClaimedOnAbort([]core.UUID{job.ID}, workerID, job.DispatchToken, nil); relErr != nil {
 			// The row could not be released, so it IS parked as 'running'. Do not
 			// pretend this dequeue was clean — surface both causes.
 			return nil, errors.Join(decodeErr, relErr)
@@ -821,6 +821,7 @@ func (s *GormStorage) dequeueOnce(ctx context.Context, queues []string, workerID
 	now := time.Now()
 	lockDuration := time.Duration(s.lockDuration.Load())
 	lockUntil := now.Add(lockDuration)
+	dispatchToken := string(core.NewID())
 
 	// SQLite uses optimistic locking - no row-level locks available
 	if s.isSQLite {
@@ -874,11 +875,12 @@ func (s *GormStorage) dequeueOnce(ctx context.Context, queues []string, workerID
 		if err := tx.Model(&core.Job{}).
 			Where("id = ?", job.ID).
 			Updates(map[string]any{
-				"status":       core.StatusRunning,
-				"locked_by":    workerID,
-				"locked_until": lockUntilExpr,
-				"started_at":   nowExpr,
-				"attempt":      job.Attempt + 1,
+				"status":         core.StatusRunning,
+				"locked_by":      workerID,
+				"dispatch_token": dispatchToken,
+				"locked_until":   lockUntilExpr,
+				"started_at":     nowExpr,
+				"attempt":        job.Attempt + 1,
 				// Clear any prior run's heartbeat on claim. The stale-lock reaper
 				// anchors freshness on COALESCE(last_heartbeat_at, started_at,
 				// locked_until); without this reset a re-dequeued job (durable
@@ -914,6 +916,7 @@ func (s *GormStorage) dequeueOnce(ctx context.Context, queues []string, workerID
 // This is NOT safe for multiple concurrent workers - use PostgreSQL for production.
 func (s *GormStorage) dequeueSQLite(ctx context.Context, queues []string, workerID string, now time.Time, lockUntil time.Time, skipIDs []core.UUID) (*core.Job, error) {
 	var job core.Job
+	dispatchToken := string(core.NewID())
 
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		// Find a candidate job
@@ -942,11 +945,12 @@ func (s *GormStorage) dequeueSQLite(ctx context.Context, queues []string, worker
 			Where("id = ?", job.ID).
 			Where("status = ?", core.StatusPending). // Must still be pending
 			Updates(map[string]any{
-				"status":       core.StatusRunning,
-				"locked_by":    workerID,
-				"locked_until": lockUntil,
-				"started_at":   now,
-				"attempt":      job.Attempt + 1,
+				"status":         core.StatusRunning,
+				"locked_by":      workerID,
+				"dispatch_token": dispatchToken,
+				"locked_until":   lockUntil,
+				"started_at":     now,
+				"attempt":        job.Attempt + 1,
 				// Clear the prior run's heartbeat on claim so the stale-lock reaper
 				// anchors on this claim's started_at, not a stale heartbeat (CD-01
 				// double-execution). See Dequeue.
@@ -969,6 +973,7 @@ func (s *GormStorage) dequeueSQLite(ctx context.Context, queues []string, worker
 		job.LockedUntil = &lockUntil
 		job.StartedAt = &now
 		job.Attempt++
+		job.DispatchToken = dispatchToken
 
 		return nil
 	})
@@ -994,8 +999,7 @@ func (s *GormStorage) dequeueSQLite(ctx context.Context, queues []string, worker
 // keeps them for the dashboard. A not-owned Complete deletes nothing.
 func (s *GormStorage) Complete(ctx context.Context, jobID core.UUID, workerID string) error {
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		result := tx.Model(&core.Job{}).
-			Where("id = ? AND locked_by = ? AND status = ?", jobID, workerID, core.StatusRunning).
+		result := s.ownedRunning(tx, ctx, jobID, workerID).
 			Updates(map[string]any{
 				"status":       core.StatusCompleted,
 				"completed_at": s.nowWriteValue(),
@@ -1036,6 +1040,17 @@ func (s *GormStorage) CompleteWithResult(ctx context.Context, jobID core.UUID, w
 	// Success path: GC this job's checkpoints in the same tx ONLY when the
 	// opt-in is enabled (default off keeps them for the dashboard).
 	return s.accountTerminalWithFanOut(ctx, jobID, workerID, updates, "completed_count", s.deleteCheckpointsOnComplete.Load())
+}
+
+// ownedRunning adds the durable dequeue incarnation when a worker supplied one.
+// The worker ID remains part of the predicate for compatibility and diagnostics;
+// the token is the fencing value that distinguishes two runs of that worker.
+func (s *GormStorage) ownedRunning(db *gorm.DB, ctx context.Context, jobID core.UUID, workerID string) *gorm.DB {
+	db = db.Model(&core.Job{}).Where("id = ? AND locked_by = ? AND status = ?", jobID, workerID, core.StatusRunning)
+	if token, ok := core.DispatchTokenFromContext(ctx); ok {
+		db = db.Where("dispatch_token = ?", token)
+	}
+	return db
 }
 
 // Fail marks a job as failed, optionally scheduling a retry.
@@ -1085,9 +1100,7 @@ func (s *GormStorage) Fail(ctx context.Context, jobID core.UUID, workerID string
 		updates["dead_letter_reason"] = deadLetterReasonExpr(encErr)
 	}
 
-	result := s.db.WithContext(ctx).
-		Model(&core.Job{}).
-		Where("id = ? AND locked_by = ? AND status = ?", jobID, workerID, core.StatusRunning).
+	result := s.ownedRunning(s.db.WithContext(ctx), ctx, jobID, workerID).
 		Updates(updates)
 
 	if result.Error != nil {
@@ -1185,9 +1198,7 @@ func (s *GormStorage) accountTerminalWithFanOut(ctx context.Context, jobID core.
 				updates["dead_letter_reason"] = deadLetterReasonExpr(lastError)
 			}
 
-			update := tx.Model(&core.Job{}).
-				Where("id = ? AND locked_by = ? AND status = ?", jobID, workerID, core.StatusRunning).
-				Updates(updates)
+			update := s.ownedRunning(tx, ctx, jobID, workerID).Updates(updates)
 			if update.Error != nil {
 				return update.Error
 			}
@@ -1596,9 +1607,7 @@ func (s *GormStorage) Heartbeat(ctx context.Context, jobID core.UUID, workerID s
 		updates["locked_until"] = now.Add(lockDuration)
 		updates["last_heartbeat_at"] = now
 	}
-	result := s.db.WithContext(ctx).
-		Model(&core.Job{}).
-		Where("id = ? AND locked_by = ? AND status = ?", jobID, workerID, core.StatusRunning).
+	result := s.ownedRunning(s.db.WithContext(ctx), ctx, jobID, workerID).
 		Updates(updates)
 	if result.Error != nil {
 		return result.Error
@@ -1613,9 +1622,7 @@ func (s *GormStorage) Heartbeat(ctx context.Context, jobID core.UUID, workerID s
 // immediately dequeued by another worker after a local dispatch is abandoned.
 func (s *GormStorage) Release(ctx context.Context, jobID core.UUID, workerID string) error {
 	now := time.Now()
-	result := s.db.WithContext(ctx).
-		Model(&core.Job{}).
-		Where("id = ? AND locked_by = ? AND status = ?", jobID, workerID, core.StatusRunning).
+	result := s.ownedRunning(s.db.WithContext(ctx), ctx, jobID, workerID).
 		Updates(map[string]any{
 			"status":       core.StatusPending,
 			"locked_by":    "",
@@ -2148,7 +2155,31 @@ func (s *GormStorage) CancelSubJobs(ctx context.Context, fanOutID core.UUID) ([]
 			// them left a cancelled fan-out with children that later woke up and
 			// ran, and left completed+failed+cancelled < total forever.
 			cancelled, err = s.cancelFanOutChildrenAndReconcile(tx, fanOutID, cancellableChildStatuses, true, nil, "")
-			return err
+			if err != nil || len(cancelled) == 0 {
+				return err
+			}
+			// A child waiting on a nested fan-out owns descendants of its own.
+			// Cancel them in the same transaction; otherwise they can wake and run
+			// after their ancestor's fail-fast cancellation.
+			for _, root := range append([]core.UUID(nil), cancelled...) {
+				fanOutIDs, subJobIDs, truncated, walkErr := s.collectFanOutSubtree(tx, root)
+				if walkErr != nil {
+					return walkErr
+				}
+				if truncated {
+					return fmt.Errorf("fan-out cancellation subtree exceeded traversal limit")
+				}
+				for _, nestedFanOutID := range fanOutIDs {
+					status := core.FanOutCancelled
+					nested, cancelErr := s.cancelFanOutChildrenAndReconcile(tx, nestedFanOutID, cancellableChildStatuses, true, &status, "")
+					if cancelErr != nil {
+						return cancelErr
+					}
+					cancelled = append(cancelled, nested...)
+				}
+				_ = subJobIDs // the fan-out-level cancellation above is authoritative.
+			}
+			return nil
 		})
 	})
 	if err != nil {
@@ -2340,9 +2371,7 @@ func (s *GormStorage) CancelSubJob(ctx context.Context, jobID core.UUID) (*core.
 // MarkWaiting suspends a job to waiting status.
 // Returns ErrJobNotOwned if the job is no longer owned by this worker.
 func (s *GormStorage) MarkWaiting(ctx context.Context, jobID core.UUID, workerID string) error {
-	result := s.db.WithContext(ctx).
-		Model(&core.Job{}).
-		Where("id = ? AND locked_by = ? AND status = ?", jobID, workerID, core.StatusRunning).
+	result := s.ownedRunning(s.db.WithContext(ctx), ctx, jobID, workerID).
 		Updates(map[string]any{
 			"status":       core.StatusWaiting,
 			"locked_by":    "",
@@ -2379,9 +2408,7 @@ func (s *GormStorage) MarkWaiting(ctx context.Context, jobID core.UUID, workerID
 // suspended on, so the signal-resume poll can correlate against it instead of
 // waking on any pending signal. It implements core.SignalWaitMarker.
 func (s *GormStorage) MarkWaitingForSignal(ctx context.Context, jobID core.UUID, workerID, signalName string) error {
-	result := s.db.WithContext(ctx).
-		Model(&core.Job{}).
-		Where("id = ? AND locked_by = ? AND status = ?", jobID, workerID, core.StatusRunning).
+	result := s.ownedRunning(s.db.WithContext(ctx), ctx, jobID, workerID).
 		Updates(map[string]any{
 			"status":              core.StatusWaiting,
 			"locked_by":           "",
@@ -2436,8 +2463,7 @@ func (s *GormStorage) SuspendForFanOut(ctx context.Context, parentID core.UUID, 
 			if err := s.SaveCheckpointTx(ctx, tx, checkpoint); err != nil {
 				return err
 			}
-			res := tx.Model(&core.Job{}).
-				Where("id = ? AND locked_by = ? AND status = ?", parentID, workerID, core.StatusRunning).
+			res := s.ownedRunning(tx, ctx, parentID, workerID).
 				Updates(map[string]any{
 					"status":       core.StatusWaiting,
 					"locked_by":    "",
@@ -2901,9 +2927,7 @@ func (s *GormStorage) SaveJobResult(ctx context.Context, jobID core.UUID, worker
 	if err != nil {
 		return err
 	}
-	update := s.db.WithContext(ctx).
-		Model(&core.Job{}).
-		Where("id = ? AND locked_by = ? AND status = ?", jobID, workerID, core.StatusRunning).
+	update := s.ownedRunning(s.db.WithContext(ctx), ctx, jobID, workerID).
 		Update("result", encoded)
 	if update.Error != nil {
 		return update.Error
@@ -3301,9 +3325,16 @@ func (s *GormStorage) UnpauseJob(ctx context.Context, jobID core.UUID) error {
 				updates["dq_ready"] = s.dqReadyExpr(now)
 			}
 
-			return tx.Model(&core.Job{}).
-				Where("id = ?", jobID).
-				Updates(updates).Error
+			result := tx.Model(&core.Job{}).
+				Where("id = ? AND status = ? AND previous_status = ?", jobID, core.StatusPaused, job.PreviousStatus).
+				Updates(updates)
+			if result.Error != nil {
+				return result.Error
+			}
+			if result.RowsAffected == 0 {
+				return core.ErrJobNotPaused
+			}
+			return nil
 		})
 	})
 }
