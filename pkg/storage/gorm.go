@@ -2170,7 +2170,8 @@ func (s *GormStorage) CancelSubJobs(ctx context.Context, fanOutID core.UUID) ([]
 					return fmt.Errorf("fan-out cancellation subtree exceeded traversal limit")
 				}
 				for _, nestedFanOutID := range fanOutIDs {
-					nested, cancelErr := s.cancelFanOutChildrenAndReconcile(tx, nestedFanOutID, cancellableChildStatuses, true, nil, "")
+					status := core.FanOutCancelled
+					nested, cancelErr := s.cancelFanOutChildrenAndReconcile(tx, nestedFanOutID, cancellableChildStatuses, true, &status, "")
 					if cancelErr != nil {
 						return cancelErr
 					}
