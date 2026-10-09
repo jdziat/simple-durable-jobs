@@ -1016,7 +1016,7 @@ func (w *Worker) releaseClaimedJobs(ctx context.Context, jobs []*core.Job) {
 			continue
 		}
 		w.recordBounce(bouncePaused)
-		releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		releaseCtx, cancel := context.WithTimeout(core.WithDispatchToken(context.WithoutCancel(ctx), job.DispatchToken), 5*time.Second)
 		if err := w.queue.Storage().Release(releaseCtx, job.ID, w.config.WorkerID); err != nil && !errors.Is(err, core.ErrJobNotOwned) {
 			w.logger.Warn("failed to release job claimed while pausing",
 				"job_id", job.ID, "error", err)
@@ -1847,7 +1847,7 @@ func (w *Worker) tryAcquireConcurrencySlots(ctx context.Context, job *core.Job, 
 	// no longer depends on its caller cleaning up after a bail-out it already
 	// reported. Worth keeping; not worth claiming as a fix.
 	rollback := func() {
-		releaseCtx, cancel := context.WithTimeout(core.WithDispatchToken(context.WithoutCancel(ctx), job.DispatchToken), 5*time.Second)
+		releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer cancel()
 		w.releaseConcurrencySlots(releaseCtx, job.ID, runToken)
 	}
