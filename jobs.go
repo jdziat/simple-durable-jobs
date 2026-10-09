@@ -737,7 +737,10 @@ func QueueOpt(name string) Option {
 	return queue.QueueOpt(name)
 }
 
-// WithTenant sets the tenant that owns the job.
+// WithTenant sets the tenant that owns the job. The tenant is an advisory label
+// for grouping and dashboard filtering; it does NOT scope worker dequeue or
+// enforce isolation. See queue.WithTenant and docs/advanced/multi-tenancy for
+// how to build hard isolation.
 func WithTenant(t string) Option {
 	return queue.WithTenant(t)
 }

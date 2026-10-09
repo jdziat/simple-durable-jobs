@@ -30,11 +30,20 @@ are your responsibility, not vulnerabilities in the library:
 
 - **Handler input.** Job arguments are application data; validate them in your
   handlers as you would any input.
-- **The embedded UI** mounts a dashboard and a Connect-RPC API. It does not add
-  authentication — wrap it with your own auth middleware (`ui.WithMiddleware`)
-  and never expose it unauthenticated, especially with write endpoints enabled.
-  Middleware supplied this way runs inside the H2C handler, so it is applied to
-  every HTTP/2 stream on an upgraded connection and not only to the request that
-  performed the upgrade.
+- **The embedded UI** mounts a dashboard and a Connect-RPC API. Every RPC is
+  denied by default: unless you configure authentication the handler returns
+  `permission_denied` on every call. The primary mechanism is `ui.WithAuthorizer`,
+  which is consulted per RPC (classified as a read or a mutation) — use it to gate
+  access and, if you run multi-tenant, to pin the principal. State-changing
+  (mutating) RPCs additionally enforce an origin check: a cross-origin browser
+  caller must be allow-listed with `ui.WithAllowedOrigins` (same-origin is
+  permitted automatically), which blocks CSRF against write endpoints. Reads are
+  gated by the authorizer, not by origin. `ui.WithMiddleware` wraps the whole handler (and runs
+  inside the H2C handler, so it applies to every HTTP/2 stream, not only the
+  upgrade request) but does NOT satisfy the default-deny gate on its own — pairing
+  middleware-only auth with the dashboard requires
+  `ui.WithInsecureAllowUnauthenticated()`, which makes your middleware the sole
+  gate; only do that when the middleware genuinely fails closed. Never expose the
+  dashboard unauthenticated, especially with write endpoints enabled.
 - **Database access.** The library is only as isolated as the database
   credentials and network you give it.

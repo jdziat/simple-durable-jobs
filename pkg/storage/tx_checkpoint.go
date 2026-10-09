@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"errors"
 
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -74,7 +75,7 @@ func (s *GormStorage) requireCheckpointOwner(tx *gorm.DB, jobID core.UUID, worke
 	if err == nil {
 		return nil
 	}
-	if err == gorm.ErrRecordNotFound {
+	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return core.ErrJobNotOwned
 	}
 	return err

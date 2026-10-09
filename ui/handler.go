@@ -98,6 +98,17 @@ func Handler(storage core.Storage, opts ...Option) http.Handler {
 	// Register Connect-RPC handler
 	path, handler := jobsv1connect.NewJobsServiceHandler(
 		svc,
+		// Cap the request body BEFORE it is buffered and decoded. connect reads and
+		// unmarshals the whole message (and, with gzip on by default, decompresses
+		// it) in receiveUnaryRequest, which runs strictly BEFORE the interceptor
+		// chain — so without this an unauthenticated caller can drive unbounded
+		// host-process memory (a ~1 MiB gzip bomb decompresses to gigabytes) and be
+		// OOM-killed before the authorizer is ever consulted. Zero (the connect
+		// default) disables both the raw and decompressed-body limiters. The largest
+		// legitimate request is BulkDelete/BulkRetry with maxBulkJobIDs (1000) UUIDs
+		// (~45 KiB), so this leaves ~90x headroom. The h2c upgrade path has its own
+		// narrower cap; this covers every ordinary RPC.
+		connect.WithReadMaxBytes(maxRPCRequestBytes),
 		connect.WithInterceptors(authInterceptor(
 			cfg.insecureAllowUnauthenticated,
 			cfg.authorizer,
@@ -230,6 +241,12 @@ func relativeMountRoot(p string) string {
 // bodies do not arrive as upgrade requests.
 const maxH2CUpgradeBody = 64 << 10
 
+// maxRPCRequestBytes bounds the raw and decompressed size of an ordinary Connect
+// RPC request body. connect decodes the body before the auth interceptor runs, so
+// this is the pre-authorization memory guard for the main RPC surface. 4 MiB is ~90x
+// the largest legitimate request (BulkDelete/BulkRetry with maxBulkJobIDs UUIDs).
+const maxRPCRequestBytes = 4 << 20
+
 // isH2CUpgrade reports whether r is an HTTP/1.1 cleartext-HTTP/2 upgrade — the
 // only request shape whose body x/net reads into memory before dispatch.
 //
@@ -351,6 +368,14 @@ func (i dashboardAuthInterceptor) WrapStreamingClient(next connect.StreamingClie
 
 func (i dashboardAuthInterceptor) WrapStreamingHandler(next connect.StreamingHandlerFunc) connect.StreamingHandlerFunc {
 	return connect.StreamingHandlerFunc(func(ctx context.Context, conn connect.StreamingHandlerConn) error {
+		// Keep the origin check symmetric with WrapUnary: a mutating streaming RPC
+		// added later must not silently skip it. No stream mutates today, so this is
+		// inert now and defense-in-depth for the future.
+		if _, mutates := mutatingProcedures[conn.Spec().Procedure]; mutates {
+			if err := i.authorizeOriginHeader(conn.RequestHeader()); err != nil {
+				return err
+			}
+		}
 		if err := i.authorize(ctx, conn.Spec().Procedure); err != nil {
 			return err
 		}
@@ -383,7 +408,11 @@ func (i dashboardAuthInterceptor) authorize(ctx context.Context, procedure strin
 }
 
 func (i dashboardAuthInterceptor) authorizeOrigin(req connect.AnyRequest) error {
-	origin := req.Header().Get("Origin")
+	return i.authorizeOriginHeader(req.Header())
+}
+
+func (i dashboardAuthInterceptor) authorizeOriginHeader(h http.Header) error {
+	origin := h.Get("Origin")
 	if origin == "" {
 		return nil
 	}
@@ -397,7 +426,7 @@ func (i dashboardAuthInterceptor) authorizeOrigin(req connect.AnyRequest) error 
 	// WithAllowedOrigins.
 	originURL, err := url.Parse(origin)
 	if err == nil && originURL.Host != "" {
-		if host := req.Header().Get("Host"); host != "" && strings.EqualFold(originURL.Host, host) {
+		if host := h.Get("Host"); host != "" && strings.EqualFold(originURL.Host, host) {
 			return nil
 		}
 	}

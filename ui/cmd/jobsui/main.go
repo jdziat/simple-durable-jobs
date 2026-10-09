@@ -91,7 +91,17 @@ func main() {
 	}
 
 	log.Printf("Jobs UI running at %s", *addr)
-	log.Fatal(http.ListenAndServe(*addr, ui.Handler(store, handlerOpts...)))
+	// Explicit timeouts: this binary can bind a non-loopback address (--insecure),
+	// so a bare ListenAndServe would be open to Slowloris. ReadHeaderTimeout is the
+	// Slowloris guard; WriteTimeout is generous because WatchEvents is a long-lived
+	// stream, so it is left unset and IdleTimeout bounds keep-alives instead.
+	srv := &http.Server{
+		Addr:              *addr,
+		Handler:           ui.Handler(store, handlerOpts...),
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+	log.Fatal(srv.ListenAndServe())
 }
 
 // isLoopbackAddr reports whether addr binds ONLY the loopback interface. An

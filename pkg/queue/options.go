@@ -84,8 +84,10 @@ func QueueOpt(name string) Option {
 	})
 }
 
-// WithTenant sets the tenant that owns the job. The tenant is a label and a
-// query/dequeue filter; it is validated for length only (unlike Queue, it is not
+// WithTenant sets the tenant that owns the job. The tenant is an advisory label
+// used for grouping and dashboard filtering; it does NOT scope worker dequeue
+// (workers dequeue across all tenants) and does NOT enforce isolation on its own.
+// It is validated for length only (unlike Queue, it is not
 // charset-validated or case-normalized, so callers requiring canonical forms must
 // normalize the value themselves). It does NOT scope deduplication: Unique and
 // IdempotencyKey keys are matched fleet-wide, so namespace them per tenant (e.g.
