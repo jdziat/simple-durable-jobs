@@ -69,7 +69,7 @@ func TestReleaseClaimedOnAbort_OwnershipFenced(t *testing.T) {
 	s := newTestStorage(t)
 	ctx := context.Background()
 
-	mine := &core.Job{ID: core.NewID(), Type: "t", Queue: "default", Status: core.StatusRunning, LockedBy: "worker-A"}
+	mine := &core.Job{ID: core.NewID(), Type: "t", Queue: "default", Status: core.StatusRunning, LockedBy: "worker-A", DispatchToken: "mine"}
 	theirs := &core.Job{ID: core.NewID(), Type: "t", Queue: "default", Status: core.StatusRunning, LockedBy: "worker-B"}
 	pendingAlready := &core.Job{ID: core.NewID(), Type: "t", Queue: "default", Status: core.StatusPending}
 	for _, j := range []*core.Job{mine, theirs, pendingAlready} {
@@ -77,7 +77,7 @@ func TestReleaseClaimedOnAbort_OwnershipFenced(t *testing.T) {
 	}
 
 	cause := errors.New("boom")
-	err := s.releaseClaimedOnAbort([]core.UUID{mine.ID, theirs.ID, pendingAlready.ID}, "worker-A", "", cause)
+	err := s.releaseClaimedOnAbort([]core.UUID{mine.ID, theirs.ID, pendingAlready.ID}, "worker-A", "mine", cause)
 	require.ErrorIs(t, err, cause, "the original cause must survive so callers can classify it")
 
 	// A fresh destination per lookup: GORM folds a primary key already set on the
@@ -86,6 +86,7 @@ func TestReleaseClaimedOnAbort_OwnershipFenced(t *testing.T) {
 	var gotMine core.Job
 	require.NoError(t, s.db.First(&gotMine, "id = ?", mine.ID).Error)
 	assert.Equal(t, core.StatusPending, gotMine.Status, "our own claim must be released")
+	assert.Empty(t, gotMine.DispatchToken, "an aborted claim must not leave a usable fencing token")
 
 	var gotTheirs core.Job
 	require.NoError(t, s.db.First(&gotTheirs, "id = ?", theirs.ID).Error)

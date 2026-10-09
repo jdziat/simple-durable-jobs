@@ -629,13 +629,14 @@ func (s *GormStorage) releaseClaimedOnAbort(claimedIDs []core.UUID, workerID, di
 			Model(&core.Job{}).
 			Where("id IN ? AND locked_by = ? AND dispatch_token = ? AND status = ?", chunk, workerID, dispatchToken, core.StatusRunning).
 			Updates(map[string]any{
-				"status":       core.StatusPending,
-				"locked_by":    "",
-				"locked_until": nil,
-				"started_at":   nil,
-				"attempt":      gorm.Expr("CASE WHEN attempt > 0 THEN attempt - 1 ELSE 0 END"),
-				"dq_ready":     s.dqReadyExpr(now),
-				"updated_at":   now,
+				"status":         core.StatusPending,
+				"locked_by":      "",
+				"dispatch_token": "",
+				"locked_until":   nil,
+				"started_at":     nil,
+				"attempt":        gorm.Expr("CASE WHEN attempt > 0 THEN attempt - 1 ELSE 0 END"),
+				"dq_ready":       s.dqReadyExpr(now),
+				"updated_at":     now,
 			}).Error; err != nil {
 			relErr = errors.Join(relErr, err)
 		}
