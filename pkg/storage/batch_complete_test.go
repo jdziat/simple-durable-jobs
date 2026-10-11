@@ -94,6 +94,7 @@ func TestBatchComplete_EmptyTokenOnlyCompletesEmptyTokenRow(t *testing.T) {
 
 	legacy := runningJob(t, ctx, s, "worker-a")
 	// Simulate a row created before dispatch tokens existed: empty stored token.
+	// (NULL cannot survive: the column is NOT NULL and Migrate backfills it.)
 	require.NoError(t, s.DB().Model(&core.Job{}).Where("id = ?", legacy.ID).Update("dispatch_token", "").Error)
 	committed, err := s.BatchComplete(ctx, "worker-a", []BatchCompleteItem{{JobID: legacy.ID, Result: []byte(`"ok"`)}})
 	require.NoError(t, err)

@@ -32,11 +32,14 @@ type BatchCompleteItem struct {
 // additionally fenced on the item's DispatchToken whenever the row has one, so a
 // stale same-worker run cannot complete a later claim. A row whose stored token is
 // NULL or empty is the only case that skips the fence, which is what a legacy row
-// (and a caller that predates dispatch tokens) already relies on. The returned
-// slice is the ids that actually committed (in no particular order) — the caller
-// fires completion hooks for those and treats the rest as not-owned. Concurrency
-// slots, and optionally checkpoints, for the committed ids are deleted in the SAME
-// transaction so a crash cannot orphan a slot.
+// (and a caller that predates dispatch tokens) already relies on. That escape is
+// bounded in practice: Dequeue always mints a fresh non-empty token on every
+// claim, so a row reaches the running state with an empty token only if it was
+// never claimed by token-aware code. The returned slice is the ids that actually
+// committed (in no particular order) — the caller fires completion hooks for
+// those and treats the rest as not-owned. Concurrency slots, and optionally
+// checkpoints, for the committed ids are deleted in the SAME transaction so a
+// crash cannot orphan a slot.
 //
 // Fan-out sub-jobs MUST NOT be passed here: their parent-counter accounting is
 // per-job and order-sensitive. The caller routes them to CompleteWithResult.

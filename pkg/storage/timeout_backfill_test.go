@@ -161,7 +161,9 @@ func TestMigrateSQLiteBackfillsLegacyNullDispatchToken(t *testing.T) {
 	require.NoError(t, db.Exec("ALTER TABLE jobs DROP COLUMN dispatch_token_old").Error)
 	job := newTestJob("default", "task")
 	require.NoError(t, s.Enqueue(ctx, job))
-	require.NoError(t, db.Exec("UPDATE jobs SET dispatch_token = NULL WHERE id = ?", job.ID).Error)
+	res := db.Exec("UPDATE jobs SET dispatch_token = NULL WHERE id = ?", job.ID)
+	require.NoError(t, res.Error)
+	require.EqualValues(t, 1, res.RowsAffected, "the seeded row must actually hold NULL, or the test proves nothing")
 
 	require.NoError(t, s.Migrate(ctx), "re-migrate over a NULL dispatch_token must succeed")
 
