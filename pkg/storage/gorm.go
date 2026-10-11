@@ -378,13 +378,12 @@ func (s *GormStorage) applyIndexedMetadataKeyIndexes(ctx context.Context, db *go
 //     cannot apply `SET NOT NULL` until those NULLs are healed.
 //
 // A baseline holding any of these NULLs would otherwise crash Migrate at boot (PG
-// 23502 / MySQL 1265). type was `not null` from introduction (no baseline can hold a
-// NULL); fan_outs.total_count is `not null` with no default and intrinsic to every
-// fan-out row, so it is never NULL in a real baseline.
+// 23502 / MySQL 1265), and on SQLite the column rebuild AutoMigrate uses to add a
+// NOT NULL constraint fails on the surviving NULLs. type was `not null` from
+// introduction (no baseline can hold a NULL); fan_outs.total_count is `not null`
+// with no default and intrinsic to every fan-out row, so it is never NULL in a real
+// baseline.
 func backfillDispatcherNulls(ctx context.Context, db *gorm.DB, dialect string) error {
-	if dialect != dialectPostgres && dialect != dialectMySQL {
-		return nil
-	}
 	m := db.Migrator()
 	if !m.HasTable(&core.Job{}) {
 		return nil
@@ -3341,7 +3340,10 @@ func (s *GormStorage) UnpauseJob(ctx context.Context, jobID core.UUID) error {
 			}
 
 			result := tx.Model(&core.Job{}).
-				Where("id = ? AND status = ? AND previous_status = ?", jobID, core.StatusPaused, job.PreviousStatus).
+				// COALESCE: previous_status is nullable, and a legacy or
+				// never-paused row holds NULL, which a bare `= ''` predicate
+				// can never match — the job would stay paused forever.
+				Where("id = ? AND status = ? AND COALESCE(previous_status, '') = ?", jobID, core.StatusPaused, job.PreviousStatus).
 				Updates(updates)
 			if result.Error != nil {
 				return result.Error

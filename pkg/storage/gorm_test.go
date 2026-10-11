@@ -3981,6 +3981,27 @@ func TestUnpauseJob_DefaultsToPendingWhenNoPreviousStatus(t *testing.T) {
 	assert.Equal(t, core.StatusPending, after.Status)
 }
 
+// A legacy row can hold NULL previous_status (the column is nullable and predates
+// the column itself). A bare `previous_status = ”` CAS can never match NULL, so
+// the job would stay paused forever. UnpauseJob must coalesce it.
+func TestUnpauseJob_HandlesNullPreviousStatus(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	job := newTestJob("default", "task")
+	require.NoError(t, s.Enqueue(ctx, job))
+	require.NoError(t, s.db.Exec(
+		"UPDATE jobs SET status = ?, previous_status = NULL WHERE id = ?",
+		core.StatusPaused, job.ID,
+	).Error)
+
+	require.NoError(t, s.UnpauseJob(ctx, job.ID))
+
+	after, err := s.GetJob(ctx, job.ID)
+	require.NoError(t, err)
+	assert.Equal(t, core.StatusPending, after.Status)
+}
+
 func TestUnpauseJob_NotFound(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStorage(t)

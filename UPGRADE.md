@@ -15,7 +15,8 @@ match that token as well as the configured worker ID. Before deploying this
 release, drain or stop every worker running an older binary, run `Migrate`, then
 start the new workers. Do not run old and new workers against the same database:
 old workers do not send the token and can therefore mutate a same-ID claim made
-by a new worker. The additive nullable column makes the schema migration safe;
+by a new worker. The additive column is `NOT NULL DEFAULT ''`, so `Migrate` adds
+it without touching existing rows and pre-existing rows read as an empty token;
 the drained deployment is the required safety gate.
 
 Running handlers now persist checkpoints through an ownership-fenced

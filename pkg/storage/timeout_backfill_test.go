@@ -144,6 +144,35 @@ func TestMigrateMySQLBackfillsLegacyNullTimeoutAndDeterminism(t *testing.T) {
 	}
 }
 
+// TestMigrateSQLiteBackfillsLegacyNullDispatchToken reproduces an upgrade from
+// the first dispatch-fencing release, which shipped jobs.dispatch_token nullable.
+// AutoMigrate adds the NOT NULL constraint by rebuilding the column on SQLite, and
+// the rebuild aborts if any surviving row holds NULL. backfillDispatcherNulls must
+// coalesce those rows to ” before AutoMigrate runs.
+func TestMigrateSQLiteBackfillsLegacyNullDispatchToken(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+	s := NewGormStorage(db)
+	require.NoError(t, s.Migrate(ctx))
+
+	// Recreate the prior release's shape: dispatch_token exists but is nullable.
+	require.NoError(t, db.Exec("ALTER TABLE jobs RENAME COLUMN dispatch_token TO dispatch_token_old").Error)
+	require.NoError(t, db.Exec("ALTER TABLE jobs ADD COLUMN dispatch_token text").Error)
+	require.NoError(t, db.Exec("ALTER TABLE jobs DROP COLUMN dispatch_token_old").Error)
+	job := newTestJob("default", "task")
+	require.NoError(t, s.Enqueue(ctx, job))
+	require.NoError(t, db.Exec("UPDATE jobs SET dispatch_token = NULL WHERE id = ?", job.ID).Error)
+
+	require.NoError(t, s.Migrate(ctx), "re-migrate over a NULL dispatch_token must succeed")
+
+	var notnull int
+	require.NoError(t, db.Raw("SELECT [notnull] FROM pragma_table_info('jobs') WHERE name='dispatch_token'").Row().Scan(&notnull))
+	require.Equal(t, 1, notnull, "dispatch_token is NOT NULL after the upgrade")
+	var nulls int
+	require.NoError(t, db.Raw("SELECT count(*) FROM jobs WHERE dispatch_token IS NULL").Scan(&nulls).Error)
+	require.Zero(t, nulls, "legacy NULLs are backfilled to ''")
+}
+
 // TestMigratePostgresBootsWhenTimeoutDeterminismColumnsMissing is the D1
 // regression: a v1.0.0–v1.2.1 baseline has NO jobs.timeout / jobs.determinism
 // column (both added in #16). backfillDispatcherNulls must build its probe/UPDATE

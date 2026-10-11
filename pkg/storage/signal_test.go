@@ -717,6 +717,72 @@ func TestConsumeSignalTx_NonOwnerDoesNotConsume(t *testing.T) {
 }
 
 // TestMarkWaiting_ClearsRunAt is the E6-run_at regression: an indefinite wait
+// TestConsumeSignalTxOwned_RejectsStaleDispatchToken covers the durable
+// dispatch-token fence on the signal consume path, not just locked_by. A stale
+// same-worker execution (same worker ID, earlier incarnation) must not consume a
+// delivered signal: doing so sets consumed_at, and the real owner then finds
+// nothing pending and commits the timeout verdict.
+func TestConsumeSignalTxOwned_RejectsStaleDispatchToken(t *testing.T) {
+	s := newTestStorage(t)
+	ctx := context.Background()
+	sendTestSignal(t, ctx, s, "j1", "ctx", []byte(`"hi"`))
+	jobID := signalUUID("j1")
+	ownJob(t, ctx, s, jobID, "w")
+	// The row is now on its second incarnation; the handler that runs holds the
+	// matching token, and a stale run of the same worker holds the first.
+	require.NoError(t, s.db.WithContext(ctx).Model(&core.Job{}).
+		Where("id = ?", jobID).Update("dispatch_token", "run-2").Error)
+
+	stale := core.WithDispatchToken(ctx, "run-1")
+	sig, err := s.ConsumeSignalTxOwned(stale, jobID, "w", "ctx", func(*core.Signal) (*core.Checkpoint, error) {
+		t.Fatal("a stale dispatch must not consume the signal")
+		return nil, nil
+	})
+	require.ErrorIs(t, err, core.ErrJobNotOwned)
+	assert.Nil(t, sig)
+	peek, err := s.PeekSignal(ctx, jobID, "ctx")
+	require.NoError(t, err)
+	require.NotNil(t, peek, "signal stays pending for the live dispatch")
+
+	live := core.WithDispatchToken(ctx, "run-2")
+	sig, err = s.ConsumeSignalTxOwned(live, jobID, "w", "ctx", func(sg *core.Signal) (*core.Checkpoint, error) {
+		return validCheckpoint(jobID, sg), nil
+	})
+	require.NoError(t, err)
+	require.NotNil(t, sig, "the live dispatch consumes it")
+}
+
+// TestDrainSignalsTxOwned_RejectsStaleDispatchToken is the drain-path twin: a
+// stale same-worker execution must not drain buffered signals (or write the
+// empty-batch checkpoint that would make the owner's replay return []).
+func TestDrainSignalsTxOwned_RejectsStaleDispatchToken(t *testing.T) {
+	s := newTestStorage(t)
+	ctx := context.Background()
+	for _, p := range [][]byte{[]byte(`"a"`), []byte(`"b"`)} {
+		sendTestSignal(t, ctx, s, "j1", "ctx", p)
+	}
+	jobID := signalUUID("j1")
+	ownJob(t, ctx, s, jobID, "w")
+	require.NoError(t, s.db.WithContext(ctx).Model(&core.Job{}).
+		Where("id = ?", jobID).Update("dispatch_token", "run-2").Error)
+
+	stale := core.WithDispatchToken(ctx, "run-1")
+	sigs, err := s.DrainSignalsTxOwned(stale, jobID, "w", "ctx", func([]*core.Signal) (*core.Checkpoint, error) {
+		t.Fatal("a stale dispatch must not drain signals")
+		return nil, nil
+	})
+	require.ErrorIs(t, err, core.ErrJobNotOwned)
+	assert.Empty(t, sigs)
+
+	live := core.WithDispatchToken(ctx, "run-2")
+	sigs, err = s.DrainSignalsTxOwned(live, jobID, "w", "ctx", func(all []*core.Signal) (*core.Checkpoint, error) {
+		return validCheckpoint(jobID, all[0]), nil
+	})
+	require.NoError(t, err)
+	assert.Len(t, sigs, 2, "the live dispatch drains both buffered signals")
+}
+
+// TestMarkWaiting_ClearsRunAt is the E6-run_at regression: an indefinite wait
 // must NULL run_at so a stale past run_at (from a delayed enqueue or a retry
 // backoff) does not spuriously match the signal-resume poll and burn a wasted
 // re-dispatch.
