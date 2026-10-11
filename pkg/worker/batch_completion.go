@@ -195,6 +195,19 @@ func (b *batchCompleter) run() {
 }
 
 func (b *batchCompleter) flush(ctx context.Context, batch []*batchCompletionSubmission) {
+	// BatchComplete reports the committed set as job IDs, so two submissions for
+	// the same job in one flush would BOTH be told "committed" off a single row
+	// flip — and the stale run would emit a second JobCompleted for a completion
+	// the live incarnation made. That can only happen when a job was reaped and
+	// re-dispatched inside one batch window, so the cheap resolution is to fall
+	// back to one call per submission for the whole flush, letting the dispatch
+	// fence decide each independently. The common, duplicate-free batch keeps the
+	// single grouped call.
+	if hasDuplicateJobIDs(batch) {
+		b.flushIndividually(ctx, batch)
+		return
+	}
+
 	items := make([]storage.BatchCompleteItem, len(batch))
 	for i, sub := range batch {
 		items[i] = sub.item
@@ -220,5 +233,35 @@ func (b *batchCompleter) flush(ctx context.Context, batch []*batchCompletionSubm
 	for _, sub := range batch {
 		_, ok := committedSet[sub.item.JobID]
 		sub.result <- batchCompletionResult{committed: ok}
+	}
+}
+
+func hasDuplicateJobIDs(batch []*batchCompletionSubmission) bool {
+	seen := make(map[core.UUID]struct{}, len(batch))
+	for _, sub := range batch {
+		id := sub.item.JobID
+		if _, ok := seen[id]; ok {
+			return true
+		}
+		seen[id] = struct{}{}
+	}
+	return false
+}
+
+// flushIndividually completes each submission with its own BatchComplete call so
+// the per-row dispatch-token fence resolves duplicates independently.
+func (b *batchCompleter) flushIndividually(ctx context.Context, batch []*batchCompletionSubmission) {
+	for _, sub := range batch {
+		var committed []core.UUID
+		err := retryWithBackoff(ctx, b.retry, func() error {
+			var batchErr error
+			committed, batchErr = b.storage.BatchComplete(ctx, b.workerID, []storage.BatchCompleteItem{sub.item})
+			return batchErr
+		})
+		if err != nil {
+			sub.result <- batchCompletionResult{err: err}
+			continue
+		}
+		sub.result <- batchCompletionResult{committed: len(committed) > 0}
 	}
 }

@@ -28,14 +28,14 @@ type BatchCompleteItem struct {
 // when a backend does not implement it.
 //
 // Each job is completed only if still owned (locked_by = workerID AND status =
-// 'running'); a row reclaimed by the stale-lock reaper is excluded. When the
-// item carries a non-empty DispatchToken the write is additionally fenced on it,
-// so a stale same-worker run cannot complete a later claim; an empty token skips
-// that fence and keeps the pre-fencing ownership check, which is what a caller
-// that predates dispatch tokens already relies on. The returned slice is the ids
-// that actually committed (in no particular order) — the caller fires completion
-// hooks for those and treats the rest as not-owned. Concurrency slots, and
-// optionally checkpoints, for the committed ids are deleted in the SAME
+// 'running'); a row reclaimed by the stale-lock reaper is excluded. The write is
+// additionally fenced on the item's DispatchToken whenever the row has one, so a
+// stale same-worker run cannot complete a later claim. A row whose stored token is
+// NULL or empty is the only case that skips the fence, which is what a legacy row
+// (and a caller that predates dispatch tokens) already relies on. The returned
+// slice is the ids that actually committed (in no particular order) — the caller
+// fires completion hooks for those and treats the rest as not-owned. Concurrency
+// slots, and optionally checkpoints, for the committed ids are deleted in the SAME
 // transaction so a crash cannot orphan a slot.
 //
 // Fan-out sub-jobs MUST NOT be passed here: their parent-counter accounting is
@@ -145,7 +145,7 @@ func (s *GormStorage) batchCompleteFlipPostgres(tx *gorm.DB, workerID string, it
 	sql := `UPDATE jobs AS j SET status = 'completed', locked_by = '', locked_until = NULL, ` +
 		`result = v.result, completed_at = NOW(), updated_at = NOW() ` +
 		`FROM (VALUES ` + strings.Join(rows, ",") + `) AS v(id, result, dispatch_token) ` +
-		`WHERE j.id = v.id AND (v.dispatch_token = '' OR COALESCE(j.dispatch_token, '') = v.dispatch_token) AND j.locked_by = ? AND j.status = 'running' AND j.fan_out_id IS NULL RETURNING j.id`
+		`WHERE j.id = v.id AND (COALESCE(j.dispatch_token, '') = '' OR j.dispatch_token = v.dispatch_token) AND j.locked_by = ? AND j.status = 'running' AND j.fan_out_id IS NULL RETURNING j.id`
 	var committed []core.UUID
 	if err := tx.Raw(sql, args...).Scan(&committed).Error; err != nil {
 		return nil, err
@@ -174,7 +174,7 @@ func (s *GormStorage) batchCompleteFlipSQLite(tx *gorm.DB, workerID string, item
 	sql := `UPDATE jobs SET status = 'completed', locked_by = '', locked_until = NULL, ` +
 		`result = v.result, completed_at = ?, updated_at = ? ` +
 		`FROM (` + strings.Join(selects, " UNION ALL ") + `) AS v ` +
-		`WHERE jobs.id = v.id AND (v.dispatch_token = '' OR COALESCE(jobs.dispatch_token, '') = v.dispatch_token) AND jobs.locked_by = ? AND jobs.status = 'running' AND jobs.fan_out_id IS NULL RETURNING jobs.id`
+		`WHERE jobs.id = v.id AND (COALESCE(jobs.dispatch_token, '') = '' OR jobs.dispatch_token = v.dispatch_token) AND jobs.locked_by = ? AND jobs.status = 'running' AND jobs.fan_out_id IS NULL RETURNING jobs.id`
 	var committed []core.UUID
 	if err := tx.Raw(sql, args...).Scan(&committed).Error; err != nil {
 		return nil, err
@@ -203,7 +203,7 @@ func (s *GormStorage) batchCompleteFlipMySQL(tx *gorm.DB, workerID string, items
 		ids[i] = it.JobID
 	}
 	args = append(args, token, workerID)
-	sql := `UPDATE jobs j JOIN (` + strings.Join(selects, " UNION ALL ") + `) v ON j.id = v.id AND (v.dispatch_token = '' OR COALESCE(j.dispatch_token, '') = v.dispatch_token) ` +
+	sql := `UPDATE jobs j JOIN (` + strings.Join(selects, " UNION ALL ") + `) v ON j.id = v.id AND (COALESCE(j.dispatch_token, '') = '' OR j.dispatch_token = v.dispatch_token) ` +
 		`SET j.status = 'completed', j.locked_by = ?, j.locked_until = NULL, ` +
 		`j.result = v.result, j.completed_at = NOW(6), j.updated_at = NOW(6) ` +
 		`WHERE j.locked_by = ? AND j.status = 'running' AND j.fan_out_id IS NULL`

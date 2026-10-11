@@ -15,9 +15,11 @@ match that token as well as the configured worker ID. Before deploying this
 release, drain or stop every worker running an older binary, run `Migrate`, then
 start the new workers. Do not run old and new workers against the same database:
 old workers do not send the token and can therefore mutate a same-ID claim made
-by a new worker. The additive column is `NOT NULL DEFAULT ''`, so `Migrate` adds
-it without touching existing rows and pre-existing rows read as an empty token;
-the drained deployment is the required safety gate.
+by a new worker. The column is `NOT NULL DEFAULT ''`, so a fresh database adds it
+without touching existing rows and pre-existing rows read as an empty token. A
+database that ran the first dispatch-fencing release (which shipped the column
+nullable) gets a one-time backfill of any NULL tokens in the same `Migrate`; the
+drained deployment is the required safety gate.
 
 Running handlers now persist checkpoints through an ownership-fenced
 `GormStorage.SaveCheckpointOwned` path. This closes a double-run corruption where a

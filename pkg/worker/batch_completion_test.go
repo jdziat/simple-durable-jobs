@@ -362,6 +362,39 @@ func TestWorker_BatchCompletion_FanOutSubJobsBypassBatchComplete(t *testing.T) {
 	assert.Len(t, perJobIDs, 2, "exactly the two sub-jobs use the per-job path, never the batched path")
 }
 
+// Two submissions for the same job in one flush must be resolved independently.
+// The grouped BatchComplete call reports only job IDs, so both would be told
+// "committed" off one row flip and a stale run would emit a duplicate completion
+// hook. The completer splits duplicates into per-item calls, letting the dispatch
+// fence decide each; here the mock commits only the item carrying the live token.
+func TestBatchCompleter_DuplicateJobIDResolvedPerItem(t *testing.T) {
+	store := &batchOnlyMockStorage{mockStorage: &mockStorage{}}
+	var calls atomic.Int32
+	store.batchFunc = func(_ context.Context, _ string, items []storage.BatchCompleteItem) ([]core.UUID, error) {
+		calls.Add(1)
+		var committed []core.UUID
+		for _, item := range items {
+			if item.DispatchToken == "live" {
+				committed = append(committed, item.JobID)
+			}
+		}
+		return committed, nil
+	}
+
+	b := newBatchCompleter(context.Background(), store, "w", 10, time.Hour, RetryConfig{MaxAttempts: 1}, nil)
+	staleSub := &batchCompletionSubmission{item: storage.BatchCompleteItem{JobID: "dup", DispatchToken: "stale", Result: []byte(`1`)}, result: make(chan batchCompletionResult, 1)}
+	liveSub := &batchCompletionSubmission{item: storage.BatchCompleteItem{JobID: "dup", DispatchToken: "live", Result: []byte(`2`)}, result: make(chan batchCompletionResult, 1)}
+	b.flush(context.Background(), []*batchCompletionSubmission{staleSub, liveSub})
+
+	stale := <-staleSub.result
+	live := <-liveSub.result
+	require.NoError(t, stale.err)
+	require.NoError(t, live.err)
+	assert.False(t, stale.committed, "stale incarnation must not be reported committed")
+	assert.True(t, live.committed, "live incarnation must be committed")
+	assert.Equal(t, int32(2), calls.Load(), "duplicates must be split into per-item calls")
+}
+
 func TestBatchCompleter_CloseFlushesBufferedAndLateSubmitFallsBack(t *testing.T) {
 	var calls atomic.Int32
 	store := &batchOnlyMockStorage{mockStorage: &mockStorage{}}
