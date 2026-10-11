@@ -579,47 +579,28 @@ func migrateCheckpointsResultShape(ctx context.Context, db *gorm.DB, dialect str
 // nullable: a `not null` tag would make AutoMigrate ALTER the existing column, and
 // on SQLite that table rebuild drops every index the versioned migrations created
 // (measured: 11). The fence already reads NULL as "no token", so the only thing a
-// backfill buys is a single canonical representation, and it is gated on the
-// column actually being nullable so a clean database does not pay a full-table
-// UPDATE (dispatch_token is unindexed, so the write locks every row it scans on
-// MySQL). Idempotent on every dialect.
+// backfill buys is a single canonical representation, and it is gated on an actual
+// NULL row so a clean database does not pay a full-table UPDATE (dispatch_token is
+// unindexed, so the write locks every row it scans on MySQL). Idempotent on every
+// dialect.
 func migrateJobsDispatchTokenBackfill(ctx context.Context, db *gorm.DB, dialect string) error {
 	m := db.Migrator()
 	if !m.HasTable(&core.Job{}) || !m.HasColumn(&core.Job{}, "dispatch_token") {
 		return nil
 	}
-	if dialect == dialectSQLite {
-		// pragma_table_info reports notnull; a NOT NULL column can hold no NULLs,
-		// so skip the scan. A nullable column can, so fall through.
-		var notnull int
-		if err := db.WithContext(ctx).Raw(
-			"SELECT [notnull] FROM pragma_table_info('jobs') WHERE name = 'dispatch_token'",
-		).Row().Scan(&notnull); err != nil {
-			return fmt.Errorf("read jobs.dispatch_token nullability: %w", err)
-		}
-		if notnull == 1 {
-			return nil
-		}
-	} else {
-		var nullable string
-		// MySQL scopes information_schema by DATABASE(); Postgres by the current
-		// schema. Mirrors the existing per-dialect nullability reads in this file.
-		schemaExpr := "current_schema()"
-		if dialect == dialectMySQL {
-			schemaExpr = "DATABASE()"
-		}
-		if err := db.WithContext(ctx).Raw(`
-			SELECT IS_NULLABLE
-			FROM information_schema.COLUMNS
-			WHERE TABLE_SCHEMA = ` + schemaExpr + `
-			  AND TABLE_NAME = 'jobs'
-			  AND COLUMN_NAME = 'dispatch_token'
-		`).Scan(&nullable).Error; err != nil {
-			return fmt.Errorf("read jobs.dispatch_token nullability: %w", err)
-		}
-		if nullable == "NO" {
-			return nil
-		}
+	// Probe for an actual NULL row rather than the column's declared nullability:
+	// the column is nullable by design, so a nullability gate never skips, and the
+	// UPDATE below takes a scanned-range write lock (dispatch_token is unindexed).
+	// A cheap EXISTS short-circuits the common clean-table case, exactly as
+	// backfillDispatcherNulls does.
+	var hasNulls bool
+	if err := db.WithContext(ctx).Raw(
+		"SELECT EXISTS(SELECT 1 FROM jobs WHERE dispatch_token IS NULL)",
+	).Scan(&hasNulls).Error; err != nil {
+		return fmt.Errorf("probe jobs.dispatch_token nulls: %w", err)
+	}
+	if !hasNulls {
+		return nil
 	}
 	if err := db.WithContext(ctx).Exec(
 		"UPDATE jobs SET dispatch_token = '' WHERE dispatch_token IS NULL",

@@ -35,7 +35,10 @@ type BatchCompleteItem struct {
 // (and a caller that predates dispatch tokens) already relies on. That escape is
 // bounded in practice: Dequeue always mints a fresh non-empty token on every
 // claim, so a row reaches the running state with an empty token only if it was
-// never claimed by token-aware code. The returned slice is the ids that actually
+// never claimed by token-aware code. A caller that omits the token for a
+// token-carrying row gets that row excluded from the committed set (no error),
+// so a caller must populate DispatchToken from the claim it is completing. The
+// returned slice is the ids that actually
 // committed (in no particular order) — the caller fires completion hooks for
 // those and treats the rest as not-owned. Concurrency slots, and optionally
 // checkpoints, for the committed ids are deleted in the SAME transaction so a

@@ -2151,6 +2151,15 @@ func (s *GormStorage) GetSubJobResults(ctx context.Context, fanOutID core.UUID) 
 // core.Storage.CancelSubJobs for the rationale.
 func (s *GormStorage) CancelSubJobs(ctx context.Context, fanOutID core.UUID) ([]core.UUID, error) {
 	var cancelled []core.UUID
+	// SERIALIZABLE on PG/MySQL for the same reason as CancelJobTerminal: the
+	// subtree walk is a sequence of lock-free reads, so a descendant that suspends
+	// (inserting a fresh fan-out + grandchildren) after the walk read its
+	// then-empty children level would leave those grandchildren running under a
+	// cancelled ancestor. SQLite serializes writers already.
+	var txOpts []*sql.TxOptions
+	if s.dialect() != dialectSQLite {
+		txOpts = append(txOpts, &sql.TxOptions{Isolation: sql.LevelSerializable})
+	}
 	err := s.withSerializationRetry(ctx, func() error {
 		cancelled = nil
 		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
@@ -2200,7 +2209,7 @@ func (s *GormStorage) CancelSubJobs(ctx context.Context, fanOutID core.UUID) ([]
 			}
 			_ = subJobIDs // the fan-out-level cancellation above is authoritative.
 			return nil
-		})
+		}, txOpts...)
 	})
 	if err != nil {
 		return nil, err

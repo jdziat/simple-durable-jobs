@@ -196,31 +196,53 @@ func (b *batchCompleter) run() {
 
 func (b *batchCompleter) flush(ctx context.Context, batch []*batchCompletionSubmission) {
 	// BatchComplete reports the committed set as job IDs, so two submissions for
-	// the same job in one flush would BOTH be told "committed" off a single row
+	// the same job in one call would BOTH be told "committed" off a single row
 	// flip — and the stale run would emit a second JobCompleted for a completion
-	// the live incarnation made. Only jobs that actually appear more than once are
-	// split out into their own calls, so a single re-dispatch costs two calls and a
-	// clean flush keeps its one grouped call.
-	dupIDs := duplicateJobIDs(batch)
+	// the live incarnation made. Group by job so duplicates are split from the
+	// single-occurrence rows, then flush each job's occurrences one at a time. A
+	// flush with any duplicate costs at most (distinct jobs + duplicates) calls;
+	// the common clean flush stays one grouped call.
+	groups := groupSubmissionsByJob(batch)
 
-	items := make([]storage.BatchCompleteItem, 0, len(batch))
+	var items []storage.BatchCompleteItem
 	var grouped []*batchCompletionSubmission
-	var duplicated []*batchCompletionSubmission
-	for _, sub := range batch {
-		if _, dup := dupIDs[sub.item.JobID]; dup {
-			duplicated = append(duplicated, sub)
+	var singles []*batchCompletionSubmission
+	for _, g := range groups {
+		if len(g) == 1 {
+			items = append(items, g[0].item)
+			grouped = append(grouped, g[0])
 			continue
 		}
-		items = append(items, sub.item)
-		grouped = append(grouped, sub)
+		singles = append(singles, g...)
 	}
 
 	if len(items) > 0 {
 		b.flushGroup(ctx, grouped, items)
 	}
-	for _, sub := range duplicated {
+	// Duplicated jobs are resolved one occurrence per call so the dispatch-token
+	// fence decides each incarnation independently.
+	for _, sub := range singles {
 		b.flushGroup(ctx, []*batchCompletionSubmission{sub}, []storage.BatchCompleteItem{sub.item})
 	}
+}
+
+// groupSubmissionsByJob returns the submissions grouped by job ID, preserving
+// first-seen order so a flush is deterministic.
+func groupSubmissionsByJob(batch []*batchCompletionSubmission) [][]*batchCompletionSubmission {
+	order := make([]core.UUID, 0, len(batch))
+	byJob := make(map[core.UUID][]*batchCompletionSubmission, len(batch))
+	for _, sub := range batch {
+		id := sub.item.JobID
+		if _, ok := byJob[id]; !ok {
+			order = append(order, id)
+		}
+		byJob[id] = append(byJob[id], sub)
+	}
+	groups := make([][]*batchCompletionSubmission, 0, len(order))
+	for _, id := range order {
+		groups = append(groups, byJob[id])
+	}
+	return groups
 }
 
 // flushGroup runs one BatchComplete call for the given submissions/items and
@@ -248,18 +270,4 @@ func (b *batchCompleter) flushGroup(ctx context.Context, batch []*batchCompletio
 		_, ok := committedSet[sub.item.JobID]
 		sub.result <- batchCompletionResult{committed: ok}
 	}
-}
-
-func duplicateJobIDs(batch []*batchCompletionSubmission) map[core.UUID]struct{} {
-	seen := make(map[core.UUID]int, len(batch))
-	for _, sub := range batch {
-		seen[sub.item.JobID]++
-	}
-	dups := make(map[core.UUID]struct{})
-	for id, n := range seen {
-		if n > 1 {
-			dups[id] = struct{}{}
-		}
-	}
-	return dups
 }

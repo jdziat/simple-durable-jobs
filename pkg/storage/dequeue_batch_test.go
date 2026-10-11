@@ -43,12 +43,20 @@ func TestDequeueBatch_AssignsDispatchToken(t *testing.T) {
 		require.NoError(t, s.db.WithContext(ctx).Raw("SELECT dispatch_token FROM jobs WHERE id = ?", job.ID).Scan(&stored).Error)
 		require.Equal(t, job.DispatchToken, stored)
 	}
-	// A second batch mints a new incarnation, so a stale first-batch run is fenced.
-	require.NoError(t, s.Enqueue(ctx, newTestJob("default", "work")))
+	// Release the SAME job and re-claim it: the second claim must rotate the token,
+	// and a stale first-batch run must then be refused by the fence.
+	victim := got[0]
+	require.NoError(t, s.Release(core.WithDispatchToken(ctx, victim.DispatchToken), victim.ID, "w1"))
 	again, err := s.DequeueBatch(ctx, []string{"default"}, "w1", 1)
 	require.NoError(t, err)
 	require.Len(t, again, 1)
+	require.Equal(t, victim.ID, again[0].ID)
 	require.NotEqual(t, token, again[0].DispatchToken, "a later claim must rotate the token")
+
+	staleCtx := core.WithDispatchToken(ctx, victim.DispatchToken)
+	err = s.Complete(staleCtx, victim.ID, "w1")
+	require.ErrorIs(t, err, core.ErrJobNotOwned, "a stale token must not complete the re-claimed job")
+	require.NoError(t, s.Complete(core.WithDispatchToken(ctx, again[0].DispatchToken), victim.ID, "w1"))
 }
 
 func TestDequeueBatch_CorrectnessAndPausedQueues(t *testing.T) {
