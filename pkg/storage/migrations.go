@@ -601,6 +601,24 @@ func migrateJobsDispatchTokenNotNull(ctx context.Context, db *gorm.DB, dialect s
 			return fmt.Errorf("set jobs.dispatch_token not null: %w", err)
 		}
 	case dialectMySQL:
+		// AutoMigrate normally applies the NOT NULL constraint itself, so this is
+		// usually a no-op. Read the live nullability first: on MySQL an unconditional
+		// MODIFY rebuilds the whole jobs table under a lock, and a hardcoded type
+		// could reject a deployed column whose definition differs. Sibling column
+		// migrations read information_schema and skip for the same reason.
+		var nullable string
+		if err := db.WithContext(ctx).Raw(`
+			SELECT IS_NULLABLE
+			FROM information_schema.COLUMNS
+			WHERE TABLE_SCHEMA = DATABASE()
+			  AND TABLE_NAME = 'jobs'
+			  AND COLUMN_NAME = 'dispatch_token'
+		`).Scan(&nullable).Error; err != nil {
+			return fmt.Errorf("read jobs.dispatch_token nullability: %w", err)
+		}
+		if nullable == "NO" {
+			return nil
+		}
 		if err := db.WithContext(ctx).Exec(
 			"ALTER TABLE jobs MODIFY dispatch_token varchar(36) NOT NULL DEFAULT ''",
 		).Error; err != nil && !isBenignDDLError(err) {

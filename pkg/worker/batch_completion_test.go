@@ -392,7 +392,36 @@ func TestBatchCompleter_DuplicateJobIDResolvedPerItem(t *testing.T) {
 	require.NoError(t, live.err)
 	assert.False(t, stale.committed, "stale incarnation must not be reported committed")
 	assert.True(t, live.committed, "live incarnation must be committed")
-	assert.Equal(t, int32(2), calls.Load(), "duplicates must be split into per-item calls")
+	assert.Equal(t, int32(2), calls.Load(), "only the duplicated job is split into per-item calls")
+}
+
+// A duplicate-free flush keeps a single grouped call even when other jobs in the
+// same batch share a different id.
+func TestBatchCompleter_NoDuplicatesUsesSingleGroupedCall(t *testing.T) {
+	store := &batchOnlyMockStorage{mockStorage: &mockStorage{}}
+	var calls atomic.Int32
+	store.batchFunc = func(_ context.Context, _ string, items []storage.BatchCompleteItem) ([]core.UUID, error) {
+		calls.Add(1)
+		ids := make([]core.UUID, len(items))
+		for i, item := range items {
+			ids[i] = item.JobID
+		}
+		return ids, nil
+	}
+
+	b := newBatchCompleter(context.Background(), store, "w", 10, time.Hour, RetryConfig{MaxAttempts: 1}, nil)
+	subs := []*batchCompletionSubmission{
+		{item: storage.BatchCompleteItem{JobID: "a"}, result: make(chan batchCompletionResult, 1)},
+		{item: storage.BatchCompleteItem{JobID: "b"}, result: make(chan batchCompletionResult, 1)},
+	}
+	b.flush(context.Background(), subs)
+
+	for _, sub := range subs {
+		res := <-sub.result
+		require.NoError(t, res.err)
+		assert.True(t, res.committed)
+	}
+	assert.Equal(t, int32(1), calls.Load(), "a duplicate-free flush is one grouped call")
 }
 
 func TestBatchCompleter_CloseFlushesBufferedAndLateSubmitFallsBack(t *testing.T) {

@@ -2169,24 +2169,26 @@ func (s *GormStorage) CancelSubJobs(ctx context.Context, fanOutID core.UUID) ([]
 			// A child waiting on a nested fan-out owns descendants of its own.
 			// Cancel them in the same transaction; otherwise they can wake and run
 			// after their ancestor's fail-fast cancellation.
-			for _, root := range append([]core.UUID(nil), cancelled...) {
-				fanOutIDs, subJobIDs, truncated, walkErr := s.collectFanOutSubtree(tx, root)
-				if walkErr != nil {
-					return walkErr
-				}
-				if truncated {
-					return fmt.Errorf("fan-out cancellation subtree exceeded traversal limit")
-				}
-				for _, nestedFanOutID := range fanOutIDs {
-					status := core.FanOutCancelled
-					nested, cancelErr := s.cancelFanOutChildrenAndReconcile(tx, nestedFanOutID, cancellableChildStatuses, true, &status, "")
-					if cancelErr != nil {
-						return cancelErr
-					}
-					cancelled = append(cancelled, nested...)
-				}
-				_ = subJobIDs // the fan-out-level cancellation above is authoritative.
+			// One walk seeded with every cancelled child, not one walk per child: the
+			// surrounding transaction already holds a FOR UPDATE lock on each sibling,
+			// so per-child round trips multiply the lock-hold time linearly.
+			roots := append([]core.UUID(nil), cancelled...)
+			fanOutIDs, subJobIDs, truncated, walkErr := s.collectFanOutSubtreeRoots(tx, roots)
+			if walkErr != nil {
+				return walkErr
 			}
+			if truncated {
+				return fmt.Errorf("fan-out cancellation subtree exceeded traversal limit")
+			}
+			for _, nestedFanOutID := range fanOutIDs {
+				status := core.FanOutCancelled
+				nested, cancelErr := s.cancelFanOutChildrenAndReconcile(tx, nestedFanOutID, cancellableChildStatuses, true, &status, "")
+				if cancelErr != nil {
+					return cancelErr
+				}
+				cancelled = append(cancelled, nested...)
+			}
+			_ = subJobIDs // the fan-out-level cancellation above is authoritative.
 			return nil
 		})
 	})
@@ -3159,9 +3161,27 @@ func (s *GormStorage) CancelJobTerminal(ctx context.Context, jobID core.UUID) er
 // work still pending, so the caller can fail loudly rather than silently cancel
 // only part of the tree.
 func (s *GormStorage) collectFanOutSubtree(tx *gorm.DB, rootJobID core.UUID) (allFanOutIDs, allSubJobIDs []core.UUID, truncated bool, err error) {
+	return s.collectFanOutSubtreeRoots(tx, []core.UUID{rootJobID})
+}
+
+// collectFanOutSubtreeRoots is collectFanOutSubtree seeded with several roots at
+// once. Cancelling a wide fan-out has one root per cancelled child, and a
+// per-root walk issues at least one query per level per root inside the same
+// transaction that holds every sibling's row lock. Seeding the frontier with all
+// roots collapses those into one chunked query per level, which is the difference
+// between a handful of round trips and one per cancelled child at the scale this
+// path is documented for.
+func (s *GormStorage) collectFanOutSubtreeRoots(tx *gorm.DB, rootJobIDs []core.UUID) (allFanOutIDs, allSubJobIDs []core.UUID, truncated bool, err error) {
 	seenFanOuts := make(map[core.UUID]struct{})
 	seenJobs := make(map[core.UUID]struct{})
-	frontier := []core.UUID{rootJobID}
+	frontier := make([]core.UUID, 0, len(rootJobIDs))
+	for _, id := range rootJobIDs {
+		if _, ok := seenJobs[id]; ok {
+			continue
+		}
+		seenJobs[id] = struct{}{}
+		frontier = append(frontier, id)
+	}
 
 	for depth := 0; len(frontier) > 0; depth++ {
 		if depth >= maxFanOutTreeDepth {

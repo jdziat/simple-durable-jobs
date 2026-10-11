@@ -198,20 +198,34 @@ func (b *batchCompleter) flush(ctx context.Context, batch []*batchCompletionSubm
 	// BatchComplete reports the committed set as job IDs, so two submissions for
 	// the same job in one flush would BOTH be told "committed" off a single row
 	// flip — and the stale run would emit a second JobCompleted for a completion
-	// the live incarnation made. That can only happen when a job was reaped and
-	// re-dispatched inside one batch window, so the cheap resolution is to fall
-	// back to one call per submission for the whole flush, letting the dispatch
-	// fence decide each independently. The common, duplicate-free batch keeps the
-	// single grouped call.
-	if hasDuplicateJobIDs(batch) {
-		b.flushIndividually(ctx, batch)
-		return
+	// the live incarnation made. Only jobs that actually appear more than once are
+	// split out into their own calls, so a single re-dispatch costs two calls and a
+	// clean flush keeps its one grouped call.
+	dupIDs := duplicateJobIDs(batch)
+
+	items := make([]storage.BatchCompleteItem, 0, len(batch))
+	var grouped []*batchCompletionSubmission
+	var duplicated []*batchCompletionSubmission
+	for _, sub := range batch {
+		if _, dup := dupIDs[sub.item.JobID]; dup {
+			duplicated = append(duplicated, sub)
+			continue
+		}
+		items = append(items, sub.item)
+		grouped = append(grouped, sub)
 	}
 
-	items := make([]storage.BatchCompleteItem, len(batch))
-	for i, sub := range batch {
-		items[i] = sub.item
+	if len(items) > 0 {
+		b.flushGroup(ctx, grouped, items)
 	}
+	for _, sub := range duplicated {
+		b.flushGroup(ctx, []*batchCompletionSubmission{sub}, []storage.BatchCompleteItem{sub.item})
+	}
+}
+
+// flushGroup runs one BatchComplete call for the given submissions/items and
+// resolves each submission from the committed id set.
+func (b *batchCompleter) flushGroup(ctx context.Context, batch []*batchCompletionSubmission, items []storage.BatchCompleteItem) {
 
 	var committed []core.UUID
 	err := retryWithBackoff(ctx, b.retry, func() error {
@@ -236,32 +250,16 @@ func (b *batchCompleter) flush(ctx context.Context, batch []*batchCompletionSubm
 	}
 }
 
-func hasDuplicateJobIDs(batch []*batchCompletionSubmission) bool {
-	seen := make(map[core.UUID]struct{}, len(batch))
+func duplicateJobIDs(batch []*batchCompletionSubmission) map[core.UUID]struct{} {
+	seen := make(map[core.UUID]int, len(batch))
 	for _, sub := range batch {
-		id := sub.item.JobID
-		if _, ok := seen[id]; ok {
-			return true
-		}
-		seen[id] = struct{}{}
+		seen[sub.item.JobID]++
 	}
-	return false
-}
-
-// flushIndividually completes each submission with its own BatchComplete call so
-// the per-row dispatch-token fence resolves duplicates independently.
-func (b *batchCompleter) flushIndividually(ctx context.Context, batch []*batchCompletionSubmission) {
-	for _, sub := range batch {
-		var committed []core.UUID
-		err := retryWithBackoff(ctx, b.retry, func() error {
-			var batchErr error
-			committed, batchErr = b.storage.BatchComplete(ctx, b.workerID, []storage.BatchCompleteItem{sub.item})
-			return batchErr
-		})
-		if err != nil {
-			sub.result <- batchCompletionResult{err: err}
-			continue
+	dups := make(map[core.UUID]struct{})
+	for id, n := range seen {
+		if n > 1 {
+			dups[id] = struct{}{}
 		}
-		sub.result <- batchCompletionResult{committed: len(committed) > 0}
 	}
+	return dups
 }

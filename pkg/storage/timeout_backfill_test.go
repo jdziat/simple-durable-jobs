@@ -173,6 +173,9 @@ func TestMigrateSQLiteBackfillsLegacyNullDispatchToken(t *testing.T) {
 	var nulls int
 	require.NoError(t, db.Raw("SELECT count(*) FROM jobs WHERE dispatch_token IS NULL").Scan(&nulls).Error)
 	require.Zero(t, nulls, "legacy NULLs are backfilled to ''")
+	var token string
+	require.NoError(t, db.Raw("SELECT dispatch_token FROM jobs WHERE id = ?", job.ID).Scan(&token).Error)
+	require.Empty(t, token, "the backfill writes '', not an arbitrary non-NULL value")
 }
 
 // TestMigratePostgresBootsWhenTimeoutDeterminismColumnsMissing is the D1
