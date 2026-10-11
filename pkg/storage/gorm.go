@@ -372,6 +372,10 @@ func (s *GormStorage) applyIndexedMetadataKeyIndexes(ctx context.Context, db *go
 //     and migrateIntWidthRightsizing's `MODIFY determinism int NOT NULL DEFAULT 0`
 //     aborts at boot on a NULL determinism (MySQL Error 1265; PG would 23502 on
 //     SET NOT NULL).
+//   - dispatch_token — shipped nullable in the first dispatch-fencing release and
+//     tightened to `not null;default:”`. A database that ran that release can hold
+//     NULL for any row that existed before the column was added, and migration v42
+//     cannot apply `SET NOT NULL` until those NULLs are healed.
 //
 // A baseline holding any of these NULLs would otherwise crash Migrate at boot (PG
 // 23502 / MySQL 1265). type was `not null` from introduction (no baseline can hold a
@@ -402,6 +406,7 @@ func backfillDispatcherNulls(ctx context.Context, db *gorm.DB, dialect string) e
 		{"max_retries", "3"},
 		{"timeout", "0"},
 		{"determinism", "0"},
+		{"dispatch_token", "''"},
 	}
 	whereParts := make([]string, 0, len(candidates))
 	setParts := make([]string, 0, len(candidates))
@@ -1624,13 +1629,17 @@ func (s *GormStorage) Release(ctx context.Context, jobID core.UUID, workerID str
 	now := time.Now()
 	result := s.ownedRunning(s.db.WithContext(ctx), ctx, jobID, workerID).
 		Updates(map[string]any{
-			"status":       core.StatusPending,
-			"locked_by":    "",
-			"locked_until": nil,
-			"started_at":   nil,
-			"attempt":      gorm.Expr("CASE WHEN attempt > 0 THEN attempt - 1 ELSE 0 END"),
-			"dq_ready":     s.dqReadyExpr(now),
-			"updated_at":   now,
+			"status": core.StatusPending,
+			// Clear the fencing token alongside the lock: once the row is pending
+			// the next Dequeue mints a fresh incarnation, and a token left on an
+			// unlocked row is a credential no current owner can match.
+			"locked_by":      "",
+			"dispatch_token": "",
+			"locked_until":   nil,
+			"started_at":     nil,
+			"attempt":        gorm.Expr("CASE WHEN attempt > 0 THEN attempt - 1 ELSE 0 END"),
+			"dq_ready":       s.dqReadyExpr(now),
+			"updated_at":     now,
 		})
 	if result.Error != nil {
 		return result.Error
@@ -2373,9 +2382,13 @@ func (s *GormStorage) CancelSubJob(ctx context.Context, jobID core.UUID) (*core.
 func (s *GormStorage) MarkWaiting(ctx context.Context, jobID core.UUID, workerID string) error {
 	result := s.ownedRunning(s.db.WithContext(ctx), ctx, jobID, workerID).
 		Updates(map[string]any{
-			"status":       core.StatusWaiting,
-			"locked_by":    "",
-			"locked_until": nil,
+			"status": core.StatusWaiting,
+			// The lock is released, so the fencing token goes with it. The row is
+			// not running and no live handler owns it; a token left here would only
+			// sit as a stale credential until the next Dequeue replaces it.
+			"locked_by":      "",
+			"dispatch_token": "",
+			"locked_until":   nil,
 			// Clear run_at: this is an INDEFINITE wait (no wake deadline). A job
 			// reaching MarkWaiting was dequeued while running, so any residual
 			// run_at (from a delayed enqueue or a retry backoff) is necessarily
@@ -2412,6 +2425,7 @@ func (s *GormStorage) MarkWaitingForSignal(ctx context.Context, jobID core.UUID,
 		Updates(map[string]any{
 			"status":              core.StatusWaiting,
 			"locked_by":           "",
+			"dispatch_token":      "",
 			"locked_until":        nil,
 			"run_at":              nil,
 			"waiting_signal_name": signalName,
@@ -2465,10 +2479,11 @@ func (s *GormStorage) SuspendForFanOut(ctx context.Context, parentID core.UUID, 
 			}
 			res := s.ownedRunning(tx, ctx, parentID, workerID).
 				Updates(map[string]any{
-					"status":       core.StatusWaiting,
-					"locked_by":    "",
-					"locked_until": nil,
-					"updated_at":   time.Now(),
+					"status":         core.StatusWaiting,
+					"locked_by":      "",
+					"dispatch_token": "",
+					"locked_until":   nil,
+					"updated_at":     time.Now(),
 				})
 			if res.Error != nil {
 				return res.Error

@@ -114,7 +114,7 @@ type Job struct {
 	// DispatchToken is replaced atomically on every dequeue. Ownership-fenced
 	// writes match it as well as LockedBy, preventing a stale run from mutating a
 	// later claim by the same configured worker.
-	DispatchToken   string `gorm:"size:36"`
+	DispatchToken   string `gorm:"size:36;not null;default:''"`
 	LockedUntil     *time.Time
 	LastHeartbeatAt *time.Time // Tracks when the last heartbeat was received
 	UniqueKey       string     `gorm:"size:255"` // For job deduplication

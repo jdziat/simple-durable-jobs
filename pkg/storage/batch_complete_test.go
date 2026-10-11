@@ -83,6 +83,25 @@ func TestBatchCompleteRejectsStaleSameWorkerDispatch(t *testing.T) {
 	assert.Empty(t, got.Result)
 }
 
+// An item with no DispatchToken keeps the pre-fencing ownership check: it must
+// still complete an owned running job even though the row has a live token. This
+// is the backward-compatibility contract for callers written before dispatch
+// tokens existed.
+func TestBatchComplete_EmptyTokenCompletesOwnedJob(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+	job := runningJob(t, ctx, s, "worker-a")
+	require.NoError(t, s.DB().Model(&core.Job{}).Where("id = ?", job.ID).Update("dispatch_token", "live").Error)
+
+	committed, err := s.BatchComplete(ctx, "worker-a", []BatchCompleteItem{{JobID: job.ID, Result: []byte(`"ok"`)}})
+	require.NoError(t, err)
+	require.ElementsMatch(t, []core.UUID{job.ID}, committed)
+
+	got, err := s.GetJob(ctx, job.ID)
+	require.NoError(t, err)
+	assert.Equal(t, core.StatusCompleted, got.Status)
+}
+
 func TestBatchComplete_BinaryResultRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStorage(t)

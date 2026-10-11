@@ -398,6 +398,11 @@ var schemaMigrations = []schemaMigration{
 		Name:    "unique_key_lookup_index",
 		Up:      migrateUniqueKeyLookupIndex,
 	},
+	{
+		Version: 42,
+		Name:    "jobs_dispatch_token_not_null",
+		Up:      migrateJobsDispatchTokenNotNull,
+	},
 }
 
 // migrateUniqueKeyLookupIndex restores the plain jobs(unique_key) index on
@@ -563,6 +568,44 @@ func migrateCheckpointsResultShape(ctx context.Context, db *gorm.DB, dialect str
 		"ALTER TABLE checkpoints ADD COLUMN result_shape varchar(32) NOT NULL DEFAULT ''",
 	).Error; err != nil && !isBenignDDLError(err) {
 		return fmt.Errorf("add checkpoints.result_shape (%s): %w", dialect, err)
+	}
+	return nil
+}
+
+// migrateJobsDispatchTokenNotNull backfills any NULL jobs.dispatch_token rows and
+// reasserts the column's NOT NULL DEFAULT ” constraint.
+//
+// The first dispatch-fencing release shipped the column nullable. That is safe to
+// read — a NULL scans into the string zero value — but it is inconsistent with the
+// other added columns, and it lets a caller insert a NULL token that the
+// `dispatch_token = ?` fence can never match. The pre-AutoMigrate heal
+// (backfillDispatcherNulls) already coalesces the NULLs on Postgres and MySQL, so
+// AutoMigrate normally applies the constraint on its own; this migration exists so
+// the ledger records the tightening and so a database that predates the heal still
+// converges. Idempotent on every dialect.
+func migrateJobsDispatchTokenNotNull(ctx context.Context, db *gorm.DB, dialect string) error {
+	m := db.Migrator()
+	if !m.HasTable(&core.Job{}) || !m.HasColumn(&core.Job{}, "dispatch_token") {
+		return nil
+	}
+	if err := db.WithContext(ctx).Exec(
+		"UPDATE jobs SET dispatch_token = '' WHERE dispatch_token IS NULL",
+	).Error; err != nil {
+		return fmt.Errorf("backfill jobs.dispatch_token nulls: %w", err)
+	}
+	switch dialect {
+	case dialectPostgres:
+		if err := db.WithContext(ctx).Exec(
+			"ALTER TABLE jobs ALTER COLUMN dispatch_token SET DEFAULT '', ALTER COLUMN dispatch_token SET NOT NULL",
+		).Error; err != nil && !isBenignDDLError(err) {
+			return fmt.Errorf("set jobs.dispatch_token not null: %w", err)
+		}
+	case dialectMySQL:
+		if err := db.WithContext(ctx).Exec(
+			"ALTER TABLE jobs MODIFY dispatch_token varchar(36) NOT NULL DEFAULT ''",
+		).Error; err != nil && !isBenignDDLError(err) {
+			return fmt.Errorf("modify jobs.dispatch_token not null: %w", err)
+		}
 	}
 	return nil
 }

@@ -524,6 +524,7 @@ func (s *GormStorage) markWaitingWithDeadlineForSignalTx(ctx context.Context, tx
 		Updates(map[string]any{
 			"status":              core.StatusWaiting,
 			"locked_by":           "",
+			"dispatch_token":      "",
 			"locked_until":        nil,
 			"run_at":              runAt,
 			"waiting_signal_name": signalName,
