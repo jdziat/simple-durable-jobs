@@ -717,6 +717,34 @@ func TestConsumeSignalTx_NonOwnerDoesNotConsume(t *testing.T) {
 }
 
 // TestMarkWaiting_ClearsRunAt is the E6-run_at regression: an indefinite wait
+// TestMarkWaiting_RejectsStaleDispatchToken proves the suspend path is fenced on
+// the dispatch token, not just locked_by. A stale same-worker run (same worker
+// ID, earlier incarnation) must not park the job; if it could, the live run's
+// completion would race a job already flipped to waiting.
+func TestMarkWaiting_RejectsStaleDispatchToken(t *testing.T) {
+	s := newTestStorage(t)
+	ctx := context.Background()
+	id := signalUUID("mw-stale")
+	seedTestJob(t, ctx, s, id, core.StatusPending)
+	ownJob(t, ctx, s, id, "w")
+	require.NoError(t, s.db.WithContext(ctx).Model(&core.Job{}).
+		Where("id = ?", id).Update("dispatch_token", "run-2").Error)
+
+	stale := core.WithDispatchToken(ctx, "run-1")
+	err := s.MarkWaiting(stale, id, "w")
+	require.ErrorIs(t, err, core.ErrJobNotOwned, "a stale incarnation must not park the job")
+	got, err := s.GetJob(ctx, id)
+	require.NoError(t, err)
+	require.Equal(t, core.StatusRunning, got.Status)
+
+	live := core.WithDispatchToken(ctx, "run-2")
+	require.NoError(t, s.MarkWaiting(live, id, "w"))
+	got, err = s.GetJob(ctx, id)
+	require.NoError(t, err)
+	require.Equal(t, core.StatusWaiting, got.Status)
+}
+
+// TestMarkWaiting_ClearsRunAt is the E6-run_at regression: an indefinite wait
 // TestConsumeSignalTxOwned_RejectsStaleDispatchToken covers the durable
 // dispatch-token fence on the signal consume path, not just locked_by. A stale
 // same-worker execution (same worker ID, earlier incarnation) must not consume a
