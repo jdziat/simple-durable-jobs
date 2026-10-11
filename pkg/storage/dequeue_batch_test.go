@@ -13,6 +13,44 @@ import (
 	"github.com/jdziat/simple-durable-jobs/v4/pkg/core"
 )
 
+// DequeueBatch must mint a non-empty dispatch token on every claimed row, the
+// same as single Dequeue. If it stopped, every Complete/BatchComplete for a
+// batch-claimed job would be rejected as not-owned and the job would strand until
+// the stale-lock reaper — with no other test failing.
+func TestDequeueBatch_AssignsDispatchToken(t *testing.T) {
+	s := newTestStorage(t)
+	ctx := context.Background()
+	for i := 0; i < 3; i++ {
+		require.NoError(t, s.Enqueue(ctx, newTestJob("default", "work")))
+	}
+
+	got, err := s.DequeueBatch(ctx, []string{"default"}, "w1", 3)
+	require.NoError(t, err)
+	require.Len(t, got, 3)
+
+	var token string
+	for _, job := range got {
+		require.NotEmpty(t, job.DispatchToken, "batch dequeue must assign a dispatch token")
+		// One DequeueBatch call mints a single incarnation shared by the whole
+		// batch; a later call mints a new one. What matters is that the stored row
+		// carries the same token the caller holds, so the fence can match it.
+		if token == "" {
+			token = job.DispatchToken
+		}
+		require.Equal(t, token, job.DispatchToken, "one batch claim shares an incarnation")
+		// The stored row carries the same token, so the fence can match it.
+		var stored string
+		require.NoError(t, s.db.WithContext(ctx).Raw("SELECT dispatch_token FROM jobs WHERE id = ?", job.ID).Scan(&stored).Error)
+		require.Equal(t, job.DispatchToken, stored)
+	}
+	// A second batch mints a new incarnation, so a stale first-batch run is fenced.
+	require.NoError(t, s.Enqueue(ctx, newTestJob("default", "work")))
+	again, err := s.DequeueBatch(ctx, []string{"default"}, "w1", 1)
+	require.NoError(t, err)
+	require.Len(t, again, 1)
+	require.NotEqual(t, token, again[0].DispatchToken, "a later claim must rotate the token")
+}
+
 func TestDequeueBatch_CorrectnessAndPausedQueues(t *testing.T) {
 	s := newTestStorage(t)
 	ctx := context.Background()

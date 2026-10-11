@@ -401,7 +401,7 @@ var schemaMigrations = []schemaMigration{
 	{
 		Version: 42,
 		Name:    "jobs_dispatch_token_not_null",
-		Up:      migrateJobsDispatchTokenNotNull,
+		Up:      migrateJobsDispatchTokenBackfill,
 	},
 }
 
@@ -572,45 +572,46 @@ func migrateCheckpointsResultShape(ctx context.Context, db *gorm.DB, dialect str
 	return nil
 }
 
-// migrateJobsDispatchTokenNotNull backfills any NULL jobs.dispatch_token rows and
-// reasserts the column's NOT NULL DEFAULT ” constraint.
+// migrateJobsDispatchTokenBackfill coalesces any NULL jobs.dispatch_token rows to
+// the empty string.
 //
-// The first dispatch-fencing release shipped the column nullable. That is safe to
-// read — a NULL scans into the string zero value — but it is inconsistent with the
-// other added columns, and it lets a caller insert a NULL token that the
-// `dispatch_token = ?` fence can never match. The pre-AutoMigrate heal
-// (backfillDispatcherNulls) already coalesces the NULLs on Postgres and MySQL, so
-// AutoMigrate normally applies the constraint on its own; this migration exists so
-// the ledger records the tightening and so a database that predates the heal still
-// converges. Idempotent on every dialect.
-func migrateJobsDispatchTokenNotNull(ctx context.Context, db *gorm.DB, dialect string) error {
+// The first dispatch-fencing release shipped the column nullable, and it STAYS
+// nullable: a `not null` tag would make AutoMigrate ALTER the existing column, and
+// on SQLite that table rebuild drops every index the versioned migrations created
+// (measured: 11). The fence already reads NULL as "no token", so the only thing a
+// backfill buys is a single canonical representation, and it is gated on the
+// column actually being nullable so a clean database does not pay a full-table
+// UPDATE (dispatch_token is unindexed, so the write locks every row it scans on
+// MySQL). Idempotent on every dialect.
+func migrateJobsDispatchTokenBackfill(ctx context.Context, db *gorm.DB, dialect string) error {
 	m := db.Migrator()
 	if !m.HasTable(&core.Job{}) || !m.HasColumn(&core.Job{}, "dispatch_token") {
 		return nil
 	}
-	if err := db.WithContext(ctx).Exec(
-		"UPDATE jobs SET dispatch_token = '' WHERE dispatch_token IS NULL",
-	).Error; err != nil {
-		return fmt.Errorf("backfill jobs.dispatch_token nulls: %w", err)
-	}
-	switch dialect {
-	case dialectPostgres:
-		if err := db.WithContext(ctx).Exec(
-			"ALTER TABLE jobs ALTER COLUMN dispatch_token SET DEFAULT '', ALTER COLUMN dispatch_token SET NOT NULL",
-		).Error; err != nil && !isBenignDDLError(err) {
-			return fmt.Errorf("set jobs.dispatch_token not null: %w", err)
+	if dialect == dialectSQLite {
+		// pragma_table_info reports notnull; a NOT NULL column can hold no NULLs,
+		// so skip the scan. A nullable column can, so fall through.
+		var notnull int
+		if err := db.WithContext(ctx).Raw(
+			"SELECT [notnull] FROM pragma_table_info('jobs') WHERE name = 'dispatch_token'",
+		).Row().Scan(&notnull); err != nil {
+			return fmt.Errorf("read jobs.dispatch_token nullability: %w", err)
 		}
-	case dialectMySQL:
-		// AutoMigrate normally applies the NOT NULL constraint itself, so this is
-		// usually a no-op. Read the live nullability first: on MySQL an unconditional
-		// MODIFY rebuilds the whole jobs table under a lock, and a hardcoded type
-		// could reject a deployed column whose definition differs. Sibling column
-		// migrations read information_schema and skip for the same reason.
+		if notnull == 1 {
+			return nil
+		}
+	} else {
 		var nullable string
+		// MySQL scopes information_schema by DATABASE(); Postgres by the current
+		// schema. Mirrors the existing per-dialect nullability reads in this file.
+		schemaExpr := "current_schema()"
+		if dialect == dialectMySQL {
+			schemaExpr = "DATABASE()"
+		}
 		if err := db.WithContext(ctx).Raw(`
 			SELECT IS_NULLABLE
 			FROM information_schema.COLUMNS
-			WHERE TABLE_SCHEMA = DATABASE()
+			WHERE TABLE_SCHEMA = ` + schemaExpr + `
 			  AND TABLE_NAME = 'jobs'
 			  AND COLUMN_NAME = 'dispatch_token'
 		`).Scan(&nullable).Error; err != nil {
@@ -619,11 +620,11 @@ func migrateJobsDispatchTokenNotNull(ctx context.Context, db *gorm.DB, dialect s
 		if nullable == "NO" {
 			return nil
 		}
-		if err := db.WithContext(ctx).Exec(
-			"ALTER TABLE jobs MODIFY dispatch_token varchar(36) NOT NULL DEFAULT ''",
-		).Error; err != nil && !isBenignDDLError(err) {
-			return fmt.Errorf("modify jobs.dispatch_token not null: %w", err)
-		}
+	}
+	if err := db.WithContext(ctx).Exec(
+		"UPDATE jobs SET dispatch_token = '' WHERE dispatch_token IS NULL",
+	).Error; err != nil {
+		return fmt.Errorf("backfill jobs.dispatch_token nulls: %w", err)
 	}
 	return nil
 }

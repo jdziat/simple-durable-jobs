@@ -570,7 +570,7 @@ func TestReleaseClaimedJobsBindsDispatchToken(t *testing.T) {
 	}
 	w := NewWorker(queue.New(store))
 	w.releaseClaimedJobs(context.Background(), []*core.Job{{ID: core.NewID(), LockedBy: w.config.WorkerID, DispatchToken: "current"}})
-	require.Len(t, store.releasedJobIDs, 1)
+	require.Len(t, store.getReleasedJobIDs(), 1)
 	require.True(t, sawToken, "release must bind the job's dispatch token into the context")
 }
 

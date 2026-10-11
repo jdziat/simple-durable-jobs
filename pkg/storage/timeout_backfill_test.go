@@ -146,9 +146,9 @@ func TestMigrateMySQLBackfillsLegacyNullTimeoutAndDeterminism(t *testing.T) {
 
 // TestMigrateSQLiteBackfillsLegacyNullDispatchToken reproduces an upgrade from
 // the first dispatch-fencing release, which shipped jobs.dispatch_token nullable.
-// AutoMigrate adds the NOT NULL constraint by rebuilding the column on SQLite, and
-// the rebuild aborts if any surviving row holds NULL. backfillDispatcherNulls must
-// coalesce those rows to ” before AutoMigrate runs.
+// A later release backfills those NULLs to ” so the dispatch fence reads a
+// canonical empty token. The column stays nullable on purpose: a NOT NULL tag
+// would make AutoMigrate rebuild the SQLite table and drop its indexes.
 func TestMigrateSQLiteBackfillsLegacyNullDispatchToken(t *testing.T) {
 	ctx := context.Background()
 	db := openTestDB(t)
@@ -167,15 +167,21 @@ func TestMigrateSQLiteBackfillsLegacyNullDispatchToken(t *testing.T) {
 
 	require.NoError(t, s.Migrate(ctx), "re-migrate over a NULL dispatch_token must succeed")
 
-	var notnull int
-	require.NoError(t, db.Raw("SELECT [notnull] FROM pragma_table_info('jobs') WHERE name='dispatch_token'").Row().Scan(&notnull))
-	require.Equal(t, 1, notnull, "dispatch_token is NOT NULL after the upgrade")
 	var nulls int
 	require.NoError(t, db.Raw("SELECT count(*) FROM jobs WHERE dispatch_token IS NULL").Scan(&nulls).Error)
 	require.Zero(t, nulls, "legacy NULLs are backfilled to ''")
 	var token string
 	require.NoError(t, db.Raw("SELECT dispatch_token FROM jobs WHERE id = ?", job.ID).Scan(&token).Error)
 	require.Empty(t, token, "the backfill writes '', not an arbitrary non-NULL value")
+
+	// The upgrade must not rebuild the jobs table: the dispatch_token column stays
+	// nullable, so AutoMigrate has nothing to ALTER. A rebuild would silently drop
+	// every index the versioned migrations created (measured: 11 indexes).
+	var indexes []string
+	require.NoError(t, db.Raw("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='jobs'").Scan(&indexes).Error)
+	for _, want := range []string{"idx_jobs_dequeue_eligible", "idx_jobs_status_created", "idx_jobs_tenant", "idx_jobs_dq_unready"} {
+		require.Contains(t, indexes, want, "index %s must survive the upgrade", want)
+	}
 }
 
 // TestMigratePostgresBootsWhenTimeoutDeterminismColumnsMissing is the D1

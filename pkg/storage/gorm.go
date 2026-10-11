@@ -373,9 +373,9 @@ func (s *GormStorage) applyIndexedMetadataKeyIndexes(ctx context.Context, db *go
 //     aborts at boot on a NULL determinism (MySQL Error 1265; PG would 23502 on
 //     SET NOT NULL).
 //   - dispatch_token — shipped nullable in the first dispatch-fencing release and
-//     tightened to `not null;default:”`. A database that ran that release can hold
-//     NULL for any row that existed before the column was added, and migration v42
-//     cannot apply `SET NOT NULL` until those NULLs are healed.
+//     kept nullable (a `not null` tag would make AutoMigrate rebuild the SQLite
+//     table and drop its indexes). Any NULL is healed here so the dispatch fence
+//     reads a canonical empty token; migration v42 backfills the same rows.
 //
 // A baseline holding any of these NULLs would otherwise crash Migrate at boot (PG
 // 23502 / MySQL 1265), and on SQLite the column rebuild AutoMigrate uses to add a
@@ -2163,16 +2163,26 @@ func (s *GormStorage) CancelSubJobs(ctx context.Context, fanOutID core.UUID) ([]
 			// them left a cancelled fan-out with children that later woke up and
 			// ran, and left completed+failed+cancelled < total forever.
 			cancelled, err = s.cancelFanOutChildrenAndReconcile(tx, fanOutID, cancellableChildStatuses, true, nil, "")
-			if err != nil || len(cancelled) == 0 {
+			if err != nil {
 				return err
 			}
 			// A child waiting on a nested fan-out owns descendants of its own.
 			// Cancel them in the same transaction; otherwise they can wake and run
 			// after their ancestor's fail-fast cancellation.
-			// One walk seeded with every cancelled child, not one walk per child: the
+			//
+			// Seed with EVERY child of the fan-out, not just the ones cancelled in
+			// this call. A sibling cancelled earlier (via CancelSubJob or PauseJob)
+			// is already terminal, so it is absent from `cancelled` and its own
+			// nested subtree would otherwise be skipped — leaving grandchildren to
+			// be dequeued and run under a terminal ancestor. The walk dedups, and a
+			// fully-terminal nested fan-out simply yields no cancellable rows.
+			var roots []core.UUID
+			if err := tx.Model(&core.Job{}).Where("fan_out_id = ?", fanOutID).Pluck("id", &roots).Error; err != nil {
+				return err
+			}
+			// One walk seeded with every child, not one walk per child: the
 			// surrounding transaction already holds a FOR UPDATE lock on each sibling,
 			// so per-child round trips multiply the lock-hold time linearly.
-			roots := append([]core.UUID(nil), cancelled...)
 			fanOutIDs, subJobIDs, truncated, walkErr := s.collectFanOutSubtreeRoots(tx, roots)
 			if walkErr != nil {
 				return walkErr
@@ -2971,19 +2981,11 @@ func (s *GormStorage) SaveJobResult(ctx context.Context, jobID core.UUID, worker
 // apart (CancelSubJobs was missing Waiting as well as Paused), which is how the
 // gap survived. A set cannot disagree with itself.
 //
-// KNOWN INCOMPLETE, and stated here rather than implied away. This aligns which
-// STATUSES are cancellable; it does not give every call site the same REACH.
-// CancelJobTerminal walks the fan-out subtree (collectFanOutSubtree);
-// CancelSubJobs does not. So a `waiting` sibling cancelled by the fail-fast path
-// has its own descendants left running — and a `waiting` sibling is, by
-// construction, one suspended on a nested fan-out or Call, i.e. exactly the
-// population that HAS descendants. Reproduced on live Postgres: cancelling the
-// parent fan-out cancelled the waiting child but left its grandchild pending, and
-// a worker will dequeue and run it under a terminal ancestor.
-//
-// Still strictly better than leaving the sibling resumable (it used to wake up and
-// run itself), which is why it ships. Giving CancelSubJobs the same subtree walk
-// is the completion, and it belongs in its own change with its own test.
+// Both call sites walk the fan-out subtree (collectFanOutSubtreeRoots).
+// CancelJobTerminal and CancelSubJobs each seed the walk with the children of the
+// fan-out — CancelSubJobs with every child, so a sibling cancelled by an EARLIER
+// call still has its own nested descendants cancelled rather than left pending to
+// run under a terminal ancestor.
 var cancellableChildStatuses = []core.JobStatus{
 	core.StatusPending,
 	core.StatusWaiting,
