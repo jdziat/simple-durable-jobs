@@ -152,6 +152,9 @@ func TestMigrateMySQLBackfillsLegacyNullTimeoutAndDeterminism(t *testing.T) {
 func TestMigrateSQLiteBackfillsLegacyNullDispatchToken(t *testing.T) {
 	ctx := context.Background()
 	db := openTestDB(t)
+	if db.Name() != "sqlite" {
+		t.Skip("sqlite-specific: only SQLite exposes sqlite_master and its RENAME COLUMN syntax")
+	}
 	s := NewGormStorage(db)
 	require.NoError(t, s.Migrate(ctx))
 
