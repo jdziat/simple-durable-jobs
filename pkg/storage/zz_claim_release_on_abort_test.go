@@ -70,7 +70,10 @@ func TestReleaseClaimedOnAbort_OwnershipFenced(t *testing.T) {
 	ctx := context.Background()
 
 	mine := &core.Job{ID: core.NewID(), Type: "t", Queue: "default", Status: core.StatusRunning, LockedBy: "worker-A", DispatchToken: "mine"}
-	theirs := &core.Job{ID: core.NewID(), Type: "t", Queue: "default", Status: core.StatusRunning, LockedBy: "worker-B"}
+	// Same DispatchToken as the release carries, so the ONLY predicate that can
+	// exclude this row is `locked_by = ?`. With an empty token the dispatch-token
+	// fence alone would exclude it and the owner predicate would go untested.
+	theirs := &core.Job{ID: core.NewID(), Type: "t", Queue: "default", Status: core.StatusRunning, LockedBy: "worker-B", DispatchToken: "mine"}
 	pendingAlready := &core.Job{ID: core.NewID(), Type: "t", Queue: "default", Status: core.StatusPending}
 	for _, j := range []*core.Job{mine, theirs, pendingAlready} {
 		require.NoError(t, s.db.WithContext(ctx).Create(j).Error)

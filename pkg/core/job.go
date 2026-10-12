@@ -114,6 +114,12 @@ type Job struct {
 	// DispatchToken is replaced atomically on every dequeue. Ownership-fenced
 	// writes match it as well as LockedBy, preventing a stale run from mutating a
 	// later claim by the same configured worker.
+	//
+	// Deliberately NULLABLE, unlike the sibling added columns. A `not null` tag here
+	// would make AutoMigrate ALTER the existing nullable column, and on SQLite that
+	// table rebuild DROPS every index the versioned migrations created (measured:
+	// 11 indexes). The read path already treats NULL as the empty string, and
+	// migration v42 backfills NULLs to '' so the fence has a well-defined value.
 	DispatchToken   string `gorm:"size:36"`
 	LockedUntil     *time.Time
 	LastHeartbeatAt *time.Time // Tracks when the last heartbeat was received

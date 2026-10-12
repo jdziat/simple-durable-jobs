@@ -141,6 +141,41 @@ func TestCancelJobTerminal_SubtreeCancelsChildrenAndGrandchildren(t *testing.T) 
 	}
 }
 
+// Two cancelled siblings each owning a nested fan-out: the subtree walk is seeded
+// with both roots at once, and it must still reach both grandchildren.
+func TestCancelJobTerminal_MultipleNestedSubtreesCancelled(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	parentID := testUUID("multi-tree-parent")
+	childA := testUUID("multi-tree-child-a")
+	childB := testUUID("multi-tree-child-b")
+	gcA := testUUID("multi-tree-gc-a")
+	gcB := testUUID("multi-tree-gc-b")
+	foRoot := testUUID("multi-tree-fo-root")
+	foA := testUUID("multi-tree-fo-a")
+	foB := testUUID("multi-tree-fo-b")
+
+	seedCancelJob(t, ctx, s, parentID, core.StatusWaiting)
+	seedCancelFanOut(t, ctx, s, foRoot, parentID, 2, core.FanOutPending)
+	seedCancelSubJob(t, ctx, s, childA, foRoot, 0, core.StatusWaiting)
+	seedCancelSubJob(t, ctx, s, childB, foRoot, 1, core.StatusPending)
+	seedCancelFanOut(t, ctx, s, foA, childA, 1, core.FanOutPending)
+	seedCancelFanOut(t, ctx, s, foB, childB, 1, core.FanOutPending)
+	seedCancelSubJob(t, ctx, s, gcA, foA, 0, core.StatusPending)
+	seedCancelSubJob(t, ctx, s, gcB, foB, 0, core.StatusWaiting)
+
+	require.NoError(t, s.CancelJobTerminal(ctx, parentID))
+
+	for _, id := range []core.UUID{parentID, childA, childB, gcA, gcB} {
+		requireJobStatus(t, ctx, s, id, core.StatusCancelled)
+	}
+	for _, id := range []core.UUID{foRoot, foA, foB} {
+		fo := requirePersistedFanOutAccounted(t, ctx, s, id)
+		assert.Equal(t, core.FanOutCancelled, fo.Status)
+	}
+}
+
 func TestCancelJobTerminal_PreFrozenFailFastFanOutReconcilesCounts(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStorage(t)
@@ -273,6 +308,37 @@ func TestCancelJobTerminal_PreservesLockedByForOwnershipAudit(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, orphaned, rootID, "directly-cancelled running root must still be flagged for its owner")
 	assert.Contains(t, orphaned, childID, "subtree-cancelled running child must still be flagged for its owner")
+}
+
+// CancelSubJobs must reach the descendants of a child that was cancelled by an
+// EARLIER call, not just the children it cancels now. A waiting sibling cancelled
+// through CancelSubJob owns a nested fan-out whose grandchildren would otherwise
+// stay pending and run under a terminal ancestor.
+func TestCancelSubJobs_ReachesPreviouslyCancelledChildSubtree(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	parentID := testUUID("cancelsub-reach-parent")
+	foRoot := testUUID("cancelsub-reach-fo-root")
+	alreadyCancelled := testUUID("cancelsub-reach-child-old")
+	liveChild := testUUID("cancelsub-reach-child-live")
+	foNested := testUUID("cancelsub-reach-fo-nested")
+	grandchild := testUUID("cancelsub-reach-gc")
+
+	seedCancelJob(t, ctx, s, parentID, core.StatusWaiting)
+	seedCancelFanOut(t, ctx, s, foRoot, parentID, 2, core.FanOutPending)
+	// The first child was cancelled earlier and its nested fan-out left behind.
+	seedCancelSubJob(t, ctx, s, alreadyCancelled, foRoot, 0, core.StatusCancelled)
+	seedCancelFanOut(t, ctx, s, foNested, alreadyCancelled, 1, core.FanOutPending)
+	seedCancelSubJob(t, ctx, s, grandchild, foNested, 0, core.StatusPending)
+	// The second child is still live and is the one this call cancels.
+	seedCancelSubJob(t, ctx, s, liveChild, foRoot, 1, core.StatusPending)
+
+	_, err := s.CancelSubJobs(ctx, foRoot)
+	require.NoError(t, err)
+
+	requireJobStatus(t, ctx, s, liveChild, core.StatusCancelled)
+	requireJobStatus(t, ctx, s, grandchild, core.StatusCancelled)
 }
 
 // TestCancelSubJobs_PreservesLockedBy guards the pre-existing CancelOnFail path

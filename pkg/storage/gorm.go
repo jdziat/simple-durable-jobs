@@ -372,15 +372,18 @@ func (s *GormStorage) applyIndexedMetadataKeyIndexes(ctx context.Context, db *go
 //     and migrateIntWidthRightsizing's `MODIFY determinism int NOT NULL DEFAULT 0`
 //     aborts at boot on a NULL determinism (MySQL Error 1265; PG would 23502 on
 //     SET NOT NULL).
+//   - dispatch_token — shipped nullable in the first dispatch-fencing release and
+//     kept nullable (a `not null` tag would make AutoMigrate rebuild the SQLite
+//     table and drop its indexes). Any NULL is healed here so the dispatch fence
+//     reads a canonical empty token; migration v42 backfills the same rows.
 //
 // A baseline holding any of these NULLs would otherwise crash Migrate at boot (PG
-// 23502 / MySQL 1265). type was `not null` from introduction (no baseline can hold a
-// NULL); fan_outs.total_count is `not null` with no default and intrinsic to every
-// fan-out row, so it is never NULL in a real baseline.
+// 23502 / MySQL 1265), and on SQLite the column rebuild AutoMigrate uses to add a
+// NOT NULL constraint fails on the surviving NULLs. type was `not null` from
+// introduction (no baseline can hold a NULL); fan_outs.total_count is `not null`
+// with no default and intrinsic to every fan-out row, so it is never NULL in a real
+// baseline.
 func backfillDispatcherNulls(ctx context.Context, db *gorm.DB, dialect string) error {
-	if dialect != dialectPostgres && dialect != dialectMySQL {
-		return nil
-	}
 	m := db.Migrator()
 	if !m.HasTable(&core.Job{}) {
 		return nil
@@ -402,6 +405,7 @@ func backfillDispatcherNulls(ctx context.Context, db *gorm.DB, dialect string) e
 		{"max_retries", "3"},
 		{"timeout", "0"},
 		{"determinism", "0"},
+		{"dispatch_token", "''"},
 	}
 	whereParts := make([]string, 0, len(candidates))
 	setParts := make([]string, 0, len(candidates))
@@ -1624,13 +1628,17 @@ func (s *GormStorage) Release(ctx context.Context, jobID core.UUID, workerID str
 	now := time.Now()
 	result := s.ownedRunning(s.db.WithContext(ctx), ctx, jobID, workerID).
 		Updates(map[string]any{
-			"status":       core.StatusPending,
-			"locked_by":    "",
-			"locked_until": nil,
-			"started_at":   nil,
-			"attempt":      gorm.Expr("CASE WHEN attempt > 0 THEN attempt - 1 ELSE 0 END"),
-			"dq_ready":     s.dqReadyExpr(now),
-			"updated_at":   now,
+			"status": core.StatusPending,
+			// Clear the fencing token alongside the lock: once the row is pending
+			// the next Dequeue mints a fresh incarnation, and a token left on an
+			// unlocked row is a credential no current owner can match.
+			"locked_by":      "",
+			"dispatch_token": "",
+			"locked_until":   nil,
+			"started_at":     nil,
+			"attempt":        gorm.Expr("CASE WHEN attempt > 0 THEN attempt - 1 ELSE 0 END"),
+			"dq_ready":       s.dqReadyExpr(now),
+			"updated_at":     now,
 		})
 	if result.Error != nil {
 		return result.Error
@@ -2143,6 +2151,15 @@ func (s *GormStorage) GetSubJobResults(ctx context.Context, fanOutID core.UUID) 
 // core.Storage.CancelSubJobs for the rationale.
 func (s *GormStorage) CancelSubJobs(ctx context.Context, fanOutID core.UUID) ([]core.UUID, error) {
 	var cancelled []core.UUID
+	// SERIALIZABLE on PG/MySQL for the same reason as CancelJobTerminal: the
+	// subtree walk is a sequence of lock-free reads, so a descendant that suspends
+	// (inserting a fresh fan-out + grandchildren) after the walk read its
+	// then-empty children level would leave those grandchildren running under a
+	// cancelled ancestor. SQLite serializes writers already.
+	var txOpts []*sql.TxOptions
+	if s.dialect() != dialectSQLite {
+		txOpts = append(txOpts, &sql.TxOptions{Isolation: sql.LevelSerializable})
+	}
 	err := s.withSerializationRetry(ctx, func() error {
 		cancelled = nil
 		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
@@ -2155,32 +2172,44 @@ func (s *GormStorage) CancelSubJobs(ctx context.Context, fanOutID core.UUID) ([]
 			// them left a cancelled fan-out with children that later woke up and
 			// ran, and left completed+failed+cancelled < total forever.
 			cancelled, err = s.cancelFanOutChildrenAndReconcile(tx, fanOutID, cancellableChildStatuses, true, nil, "")
-			if err != nil || len(cancelled) == 0 {
+			if err != nil {
 				return err
 			}
 			// A child waiting on a nested fan-out owns descendants of its own.
 			// Cancel them in the same transaction; otherwise they can wake and run
 			// after their ancestor's fail-fast cancellation.
-			for _, root := range append([]core.UUID(nil), cancelled...) {
-				fanOutIDs, subJobIDs, truncated, walkErr := s.collectFanOutSubtree(tx, root)
-				if walkErr != nil {
-					return walkErr
-				}
-				if truncated {
-					return fmt.Errorf("fan-out cancellation subtree exceeded traversal limit")
-				}
-				for _, nestedFanOutID := range fanOutIDs {
-					status := core.FanOutCancelled
-					nested, cancelErr := s.cancelFanOutChildrenAndReconcile(tx, nestedFanOutID, cancellableChildStatuses, true, &status, "")
-					if cancelErr != nil {
-						return cancelErr
-					}
-					cancelled = append(cancelled, nested...)
-				}
-				_ = subJobIDs // the fan-out-level cancellation above is authoritative.
+			//
+			// Seed with EVERY child of the fan-out, not just the ones cancelled in
+			// this call. A sibling cancelled earlier (via CancelSubJob or PauseJob)
+			// is already terminal, so it is absent from `cancelled` and its own
+			// nested subtree would otherwise be skipped — leaving grandchildren to
+			// be dequeued and run under a terminal ancestor. The walk dedups, and a
+			// fully-terminal nested fan-out simply yields no cancellable rows.
+			var roots []core.UUID
+			if err := tx.Model(&core.Job{}).Where("fan_out_id = ?", fanOutID).Pluck("id", &roots).Error; err != nil {
+				return err
 			}
+			// One walk seeded with every child, not one walk per child: the
+			// surrounding transaction already holds a FOR UPDATE lock on each sibling,
+			// so per-child round trips multiply the lock-hold time linearly.
+			fanOutIDs, subJobIDs, truncated, walkErr := s.collectFanOutSubtreeRoots(tx, roots)
+			if walkErr != nil {
+				return walkErr
+			}
+			if truncated {
+				return fmt.Errorf("fan-out cancellation subtree exceeded traversal limit")
+			}
+			for _, nestedFanOutID := range fanOutIDs {
+				status := core.FanOutCancelled
+				nested, cancelErr := s.cancelFanOutChildrenAndReconcile(tx, nestedFanOutID, cancellableChildStatuses, true, &status, "")
+				if cancelErr != nil {
+					return cancelErr
+				}
+				cancelled = append(cancelled, nested...)
+			}
+			_ = subJobIDs // the fan-out-level cancellation above is authoritative.
 			return nil
-		})
+		}, txOpts...)
 	})
 	if err != nil {
 		return nil, err
@@ -2373,9 +2402,13 @@ func (s *GormStorage) CancelSubJob(ctx context.Context, jobID core.UUID) (*core.
 func (s *GormStorage) MarkWaiting(ctx context.Context, jobID core.UUID, workerID string) error {
 	result := s.ownedRunning(s.db.WithContext(ctx), ctx, jobID, workerID).
 		Updates(map[string]any{
-			"status":       core.StatusWaiting,
-			"locked_by":    "",
-			"locked_until": nil,
+			"status": core.StatusWaiting,
+			// The lock is released, so the fencing token goes with it. The row is
+			// not running and no live handler owns it; a token left here would only
+			// sit as a stale credential until the next Dequeue replaces it.
+			"locked_by":      "",
+			"dispatch_token": "",
+			"locked_until":   nil,
 			// Clear run_at: this is an INDEFINITE wait (no wake deadline). A job
 			// reaching MarkWaiting was dequeued while running, so any residual
 			// run_at (from a delayed enqueue or a retry backoff) is necessarily
@@ -2412,6 +2445,7 @@ func (s *GormStorage) MarkWaitingForSignal(ctx context.Context, jobID core.UUID,
 		Updates(map[string]any{
 			"status":              core.StatusWaiting,
 			"locked_by":           "",
+			"dispatch_token":      "",
 			"locked_until":        nil,
 			"run_at":              nil,
 			"waiting_signal_name": signalName,
@@ -2465,10 +2499,11 @@ func (s *GormStorage) SuspendForFanOut(ctx context.Context, parentID core.UUID, 
 			}
 			res := s.ownedRunning(tx, ctx, parentID, workerID).
 				Updates(map[string]any{
-					"status":       core.StatusWaiting,
-					"locked_by":    "",
-					"locked_until": nil,
-					"updated_at":   time.Now(),
+					"status":         core.StatusWaiting,
+					"locked_by":      "",
+					"dispatch_token": "",
+					"locked_until":   nil,
+					"updated_at":     time.Now(),
 				})
 			if res.Error != nil {
 				return res.Error
@@ -2955,19 +2990,11 @@ func (s *GormStorage) SaveJobResult(ctx context.Context, jobID core.UUID, worker
 // apart (CancelSubJobs was missing Waiting as well as Paused), which is how the
 // gap survived. A set cannot disagree with itself.
 //
-// KNOWN INCOMPLETE, and stated here rather than implied away. This aligns which
-// STATUSES are cancellable; it does not give every call site the same REACH.
-// CancelJobTerminal walks the fan-out subtree (collectFanOutSubtree);
-// CancelSubJobs does not. So a `waiting` sibling cancelled by the fail-fast path
-// has its own descendants left running — and a `waiting` sibling is, by
-// construction, one suspended on a nested fan-out or Call, i.e. exactly the
-// population that HAS descendants. Reproduced on live Postgres: cancelling the
-// parent fan-out cancelled the waiting child but left its grandchild pending, and
-// a worker will dequeue and run it under a terminal ancestor.
-//
-// Still strictly better than leaving the sibling resumable (it used to wake up and
-// run itself), which is why it ships. Giving CancelSubJobs the same subtree walk
-// is the completion, and it belongs in its own change with its own test.
+// Both call sites walk the fan-out subtree (collectFanOutSubtreeRoots).
+// CancelJobTerminal and CancelSubJobs each seed the walk with the children of the
+// fan-out — CancelSubJobs with every child, so a sibling cancelled by an EARLIER
+// call still has its own nested descendants cancelled rather than left pending to
+// run under a terminal ancestor.
 var cancellableChildStatuses = []core.JobStatus{
 	core.StatusPending,
 	core.StatusWaiting,
@@ -3145,9 +3172,27 @@ func (s *GormStorage) CancelJobTerminal(ctx context.Context, jobID core.UUID) er
 // work still pending, so the caller can fail loudly rather than silently cancel
 // only part of the tree.
 func (s *GormStorage) collectFanOutSubtree(tx *gorm.DB, rootJobID core.UUID) (allFanOutIDs, allSubJobIDs []core.UUID, truncated bool, err error) {
+	return s.collectFanOutSubtreeRoots(tx, []core.UUID{rootJobID})
+}
+
+// collectFanOutSubtreeRoots is collectFanOutSubtree seeded with several roots at
+// once. Cancelling a wide fan-out has one root per cancelled child, and a
+// per-root walk issues at least one query per level per root inside the same
+// transaction that holds every sibling's row lock. Seeding the frontier with all
+// roots collapses those into one chunked query per level, which is the difference
+// between a handful of round trips and one per cancelled child at the scale this
+// path is documented for.
+func (s *GormStorage) collectFanOutSubtreeRoots(tx *gorm.DB, rootJobIDs []core.UUID) (allFanOutIDs, allSubJobIDs []core.UUID, truncated bool, err error) {
 	seenFanOuts := make(map[core.UUID]struct{})
 	seenJobs := make(map[core.UUID]struct{})
-	frontier := []core.UUID{rootJobID}
+	frontier := make([]core.UUID, 0, len(rootJobIDs))
+	for _, id := range rootJobIDs {
+		if _, ok := seenJobs[id]; ok {
+			continue
+		}
+		seenJobs[id] = struct{}{}
+		frontier = append(frontier, id)
+	}
 
 	for depth := 0; len(frontier) > 0; depth++ {
 		if depth >= maxFanOutTreeDepth {
@@ -3326,7 +3371,10 @@ func (s *GormStorage) UnpauseJob(ctx context.Context, jobID core.UUID) error {
 			}
 
 			result := tx.Model(&core.Job{}).
-				Where("id = ? AND status = ? AND previous_status = ?", jobID, core.StatusPaused, job.PreviousStatus).
+				// COALESCE: previous_status is nullable, and a legacy or
+				// never-paused row holds NULL, which a bare `= ''` predicate
+				// can never match — the job would stay paused forever.
+				Where("id = ? AND status = ? AND COALESCE(previous_status, '') = ?", jobID, core.StatusPaused, job.PreviousStatus).
 				Updates(updates)
 			if result.Error != nil {
 				return result.Error

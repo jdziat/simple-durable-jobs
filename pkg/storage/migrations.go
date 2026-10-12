@@ -398,6 +398,11 @@ var schemaMigrations = []schemaMigration{
 		Name:    "unique_key_lookup_index",
 		Up:      migrateUniqueKeyLookupIndex,
 	},
+	{
+		Version: 42,
+		Name:    "jobs_dispatch_token_not_null",
+		Up:      migrateJobsDispatchTokenBackfill,
+	},
 }
 
 // migrateUniqueKeyLookupIndex restores the plain jobs(unique_key) index on
@@ -563,6 +568,44 @@ func migrateCheckpointsResultShape(ctx context.Context, db *gorm.DB, dialect str
 		"ALTER TABLE checkpoints ADD COLUMN result_shape varchar(32) NOT NULL DEFAULT ''",
 	).Error; err != nil && !isBenignDDLError(err) {
 		return fmt.Errorf("add checkpoints.result_shape (%s): %w", dialect, err)
+	}
+	return nil
+}
+
+// migrateJobsDispatchTokenBackfill coalesces any NULL jobs.dispatch_token rows to
+// the empty string.
+//
+// The first dispatch-fencing release shipped the column nullable, and it STAYS
+// nullable: a `not null` tag would make AutoMigrate ALTER the existing column, and
+// on SQLite that table rebuild drops every index the versioned migrations created
+// (measured: 11). The fence already reads NULL as "no token", so the only thing a
+// backfill buys is a single canonical representation, and it is gated on an actual
+// NULL row so a clean database does not pay a full-table UPDATE (dispatch_token is
+// unindexed, so the write locks every row it scans on MySQL). Idempotent on every
+// dialect.
+func migrateJobsDispatchTokenBackfill(ctx context.Context, db *gorm.DB, dialect string) error {
+	m := db.Migrator()
+	if !m.HasTable(&core.Job{}) || !m.HasColumn(&core.Job{}, "dispatch_token") {
+		return nil
+	}
+	// Probe for an actual NULL row rather than the column's declared nullability:
+	// the column is nullable by design, so a nullability gate never skips, and the
+	// UPDATE below takes a scanned-range write lock (dispatch_token is unindexed).
+	// A cheap EXISTS short-circuits the common clean-table case, exactly as
+	// backfillDispatcherNulls does.
+	var hasNulls bool
+	if err := db.WithContext(ctx).Raw(
+		"SELECT EXISTS(SELECT 1 FROM jobs WHERE dispatch_token IS NULL)",
+	).Scan(&hasNulls).Error; err != nil {
+		return fmt.Errorf("probe jobs.dispatch_token nulls: %w", err)
+	}
+	if !hasNulls {
+		return nil
+	}
+	if err := db.WithContext(ctx).Exec(
+		"UPDATE jobs SET dispatch_token = '' WHERE dispatch_token IS NULL",
+	).Error; err != nil {
+		return fmt.Errorf("backfill jobs.dispatch_token nulls: %w", err)
 	}
 	return nil
 }

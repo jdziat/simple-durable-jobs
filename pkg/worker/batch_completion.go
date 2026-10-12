@@ -195,10 +195,59 @@ func (b *batchCompleter) run() {
 }
 
 func (b *batchCompleter) flush(ctx context.Context, batch []*batchCompletionSubmission) {
-	items := make([]storage.BatchCompleteItem, len(batch))
-	for i, sub := range batch {
-		items[i] = sub.item
+	// BatchComplete reports the committed set as job IDs, so two submissions for
+	// the same job in one call would BOTH be told "committed" off a single row
+	// flip — and the stale run would emit a second JobCompleted for a completion
+	// the live incarnation made. Group by job so duplicates are split from the
+	// single-occurrence rows, then flush each job's occurrences one at a time. A
+	// flush with any duplicate costs at most (distinct jobs + duplicates) calls;
+	// the common clean flush stays one grouped call.
+	groups := groupSubmissionsByJob(batch)
+
+	var items []storage.BatchCompleteItem
+	var grouped []*batchCompletionSubmission
+	var singles []*batchCompletionSubmission
+	for _, g := range groups {
+		if len(g) == 1 {
+			items = append(items, g[0].item)
+			grouped = append(grouped, g[0])
+			continue
+		}
+		singles = append(singles, g...)
 	}
+
+	if len(items) > 0 {
+		b.flushGroup(ctx, grouped, items)
+	}
+	// Duplicated jobs are resolved one occurrence per call so the dispatch-token
+	// fence decides each incarnation independently.
+	for _, sub := range singles {
+		b.flushGroup(ctx, []*batchCompletionSubmission{sub}, []storage.BatchCompleteItem{sub.item})
+	}
+}
+
+// groupSubmissionsByJob returns the submissions grouped by job ID, preserving
+// first-seen order so a flush is deterministic.
+func groupSubmissionsByJob(batch []*batchCompletionSubmission) [][]*batchCompletionSubmission {
+	order := make([]core.UUID, 0, len(batch))
+	byJob := make(map[core.UUID][]*batchCompletionSubmission, len(batch))
+	for _, sub := range batch {
+		id := sub.item.JobID
+		if _, ok := byJob[id]; !ok {
+			order = append(order, id)
+		}
+		byJob[id] = append(byJob[id], sub)
+	}
+	groups := make([][]*batchCompletionSubmission, 0, len(order))
+	for _, id := range order {
+		groups = append(groups, byJob[id])
+	}
+	return groups
+}
+
+// flushGroup runs one BatchComplete call for the given submissions/items and
+// resolves each submission from the committed id set.
+func (b *batchCompleter) flushGroup(ctx context.Context, batch []*batchCompletionSubmission, items []storage.BatchCompleteItem) {
 
 	var committed []core.UUID
 	err := retryWithBackoff(ctx, b.retry, func() error {

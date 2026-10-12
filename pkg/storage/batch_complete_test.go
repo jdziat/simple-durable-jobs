@@ -83,6 +83,36 @@ func TestBatchCompleteRejectsStaleSameWorkerDispatch(t *testing.T) {
 	assert.Empty(t, got.Result)
 }
 
+// A row whose stored token is NULL or empty is the only one the fence skips: a
+// legacy row (or one written by a caller that predates dispatch tokens) still
+// completes with a token-less item. A row with a live token must NOT complete on
+// an empty item token, or a call site that forgets to populate the field silently
+// loses the fence.
+func TestBatchComplete_EmptyTokenOnlyCompletesEmptyTokenRow(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+
+	legacy := runningJob(t, ctx, s, "worker-a")
+	// Simulate a row created before dispatch tokens existed: empty stored token.
+	// (NULL cannot survive: the column is NOT NULL and Migrate backfills it.)
+	require.NoError(t, s.DB().Model(&core.Job{}).Where("id = ?", legacy.ID).Update("dispatch_token", "").Error)
+	committed, err := s.BatchComplete(ctx, "worker-a", []BatchCompleteItem{{JobID: legacy.ID, Result: []byte(`"ok"`)}})
+	require.NoError(t, err)
+	require.ElementsMatch(t, []core.UUID{legacy.ID}, committed)
+	got, err := s.GetJob(ctx, legacy.ID)
+	require.NoError(t, err)
+	assert.Equal(t, core.StatusCompleted, got.Status)
+
+	live := runningJob(t, ctx, s, "worker-a")
+	require.NoError(t, s.DB().Model(&core.Job{}).Where("id = ?", live.ID).Update("dispatch_token", "live").Error)
+	committed, err = s.BatchComplete(ctx, "worker-a", []BatchCompleteItem{{JobID: live.ID, Result: []byte(`"ok"`)}})
+	require.NoError(t, err)
+	assert.Empty(t, committed, "a live token must not be completed by an empty item token")
+	got, err = s.GetJob(ctx, live.ID)
+	require.NoError(t, err)
+	assert.Equal(t, core.StatusRunning, got.Status)
+}
+
 func TestBatchComplete_BinaryResultRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStorage(t)

@@ -562,16 +562,16 @@ func TestWorker_Pause(t *testing.T) {
 
 func TestReleaseClaimedJobsBindsDispatchToken(t *testing.T) {
 	store := &mockStorage{}
+	var sawToken bool
 	store.releaseJobFunc = func(ctx context.Context, _ core.UUID, _ string) error {
 		token, ok := core.DispatchTokenFromContext(ctx)
-		if !ok || token != "current" {
-			return errors.New("missing dispatch token")
-		}
+		sawToken = ok && token == "current"
 		return nil
 	}
 	w := NewWorker(queue.New(store))
 	w.releaseClaimedJobs(context.Background(), []*core.Job{{ID: core.NewID(), LockedBy: w.config.WorkerID, DispatchToken: "current"}})
-	require.Len(t, store.releasedJobIDs, 1)
+	require.Len(t, store.getReleasedJobIDs(), 1)
+	require.True(t, sawToken, "release must bind the job's dispatch token into the context")
 }
 
 func TestWorker_PauseMode(t *testing.T) {

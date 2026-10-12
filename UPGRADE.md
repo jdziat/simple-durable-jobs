@@ -2,6 +2,12 @@
 
 ## Unreleased after v4.10.0
 
+### Go 1.26 toolchain
+
+The module's `go` directive is now `1.26.0` and the pinned toolchain is
+`go1.26.9`. A build with `GOTOOLCHAIN=local` on a 1.25 toolchain fails until you
+upgrade; the default `GOTOOLCHAIN=auto` fetches the pinned toolchain for you.
+
 ### Drain workers before enabling dispatch fencing
 
 Each dequeue now records a durable dispatch token, and ownership-guarded writes
@@ -9,8 +15,12 @@ match that token as well as the configured worker ID. Before deploying this
 release, drain or stop every worker running an older binary, run `Migrate`, then
 start the new workers. Do not run old and new workers against the same database:
 old workers do not send the token and can therefore mutate a same-ID claim made
-by a new worker. The additive nullable column makes the schema migration safe;
-the drained deployment is the required safety gate.
+by a new worker. The column is added nullable, so a fresh database adds it without
+rewriting the table and pre-existing rows read as an empty token. A database that
+ran the first dispatch-fencing release gets a one-time backfill of any NULL tokens
+in the same `Migrate` — a single indexed-free UPDATE gated on the presence of NULL
+rows, so a clean table pays only an EXISTS probe. The drained deployment is the
+required safety gate.
 
 Running handlers now persist checkpoints through an ownership-fenced
 `GormStorage.SaveCheckpointOwned` path. This closes a double-run corruption where a
@@ -1869,7 +1879,7 @@ Two consequences worth knowing:
 Across the whole v4.6 → v4.10 line there are six forward-only migrations. The last
 four are new in **v4.8.0**; the other two are already in the releases named.
 **Neither v4.9.0 nor v4.10.0 adds any**, so upgrading from v4.8.0 forward does not
-touch the schema at all:
+touch the schema at all. The unreleased dispatch-fencing release adds a seventh:
 
 | Migration | Adds | First shipped in |
 | --- | --- | --- |
@@ -1879,10 +1889,14 @@ touch the schema at all:
 | **v39** | `jobs.waiting_signal_name` | v4.8.0 |
 | **v40** | `checkpoints.result_shape` | v4.8.0 |
 | **v41** | `idx_jobs_unique_key` (Postgres/SQLite; MySQL already had it) | v4.8.0 |
+| **v42** | `jobs.dispatch_token` NULL backfilled to `''` | v4.11.0 |
 
-All six are additive — three columns, each `NOT NULL` with a default, and three
-indexes — so an older binary runs correctly against the newer schema. No migration
-in this line rewrites data.
+That is seven forward-only migrations in total. v36–v41 are additive — three
+columns, each `NOT NULL` with a default, and three indexes — so an older binary
+runs correctly against the newer schema. v42 only backfills NULL `dispatch_token`
+values to `''`; it changes no constraint and rewrites no other data, and no older
+binary depends on the difference, since a NULL token already reads as the empty
+string.
 
 **Plan v41 on a large `jobs` table.** It builds a plain index on `jobs(unique_key)`
 to make `Unique`/`IdempotencyKey` dedup lookups index-served instead of scanning

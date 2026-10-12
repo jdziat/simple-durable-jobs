@@ -144,6 +144,49 @@ func TestMigrateMySQLBackfillsLegacyNullTimeoutAndDeterminism(t *testing.T) {
 	}
 }
 
+// TestMigrateSQLiteBackfillsLegacyNullDispatchToken reproduces an upgrade from
+// the first dispatch-fencing release, which shipped jobs.dispatch_token nullable.
+// A later release backfills those NULLs to ” so the dispatch fence reads a
+// canonical empty token. The column stays nullable on purpose: a NOT NULL tag
+// would make AutoMigrate rebuild the SQLite table and drop its indexes.
+func TestMigrateSQLiteBackfillsLegacyNullDispatchToken(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+	if db.Name() != "sqlite" {
+		t.Skip("sqlite-specific: only SQLite exposes sqlite_master and its RENAME COLUMN syntax")
+	}
+	s := NewGormStorage(db)
+	require.NoError(t, s.Migrate(ctx))
+
+	// Recreate the prior release's shape: dispatch_token exists but is nullable.
+	require.NoError(t, db.Exec("ALTER TABLE jobs RENAME COLUMN dispatch_token TO dispatch_token_old").Error)
+	require.NoError(t, db.Exec("ALTER TABLE jobs ADD COLUMN dispatch_token text").Error)
+	require.NoError(t, db.Exec("ALTER TABLE jobs DROP COLUMN dispatch_token_old").Error)
+	job := newTestJob("default", "task")
+	require.NoError(t, s.Enqueue(ctx, job))
+	res := db.Exec("UPDATE jobs SET dispatch_token = NULL WHERE id = ?", job.ID)
+	require.NoError(t, res.Error)
+	require.EqualValues(t, 1, res.RowsAffected, "the seeded row must actually hold NULL, or the test proves nothing")
+
+	require.NoError(t, s.Migrate(ctx), "re-migrate over a NULL dispatch_token must succeed")
+
+	var nulls int
+	require.NoError(t, db.Raw("SELECT count(*) FROM jobs WHERE dispatch_token IS NULL").Scan(&nulls).Error)
+	require.Zero(t, nulls, "legacy NULLs are backfilled to ''")
+	var token string
+	require.NoError(t, db.Raw("SELECT dispatch_token FROM jobs WHERE id = ?", job.ID).Scan(&token).Error)
+	require.Empty(t, token, "the backfill writes '', not an arbitrary non-NULL value")
+
+	// The upgrade must not rebuild the jobs table: the dispatch_token column stays
+	// nullable, so AutoMigrate has nothing to ALTER. A rebuild would silently drop
+	// every index the versioned migrations created (measured: 11 indexes).
+	var indexes []string
+	require.NoError(t, db.Raw("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='jobs'").Scan(&indexes).Error)
+	for _, want := range []string{"idx_jobs_dequeue_eligible", "idx_jobs_status_created", "idx_jobs_tenant", "idx_jobs_dq_unready"} {
+		require.Contains(t, indexes, want, "index %s must survive the upgrade", want)
+	}
+}
+
 // TestMigratePostgresBootsWhenTimeoutDeterminismColumnsMissing is the D1
 // regression: a v1.0.0–v1.2.1 baseline has NO jobs.timeout / jobs.determinism
 // column (both added in #16). backfillDispatcherNulls must build its probe/UPDATE
