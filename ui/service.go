@@ -288,7 +288,11 @@ func (s *jobsService) BulkRetryJobs(ctx context.Context, req *connect.Request[jo
 	count := 0
 	var skipped []*jobsv1.BulkSkip
 	for _, id := range req.Msg.Ids {
-		if _, err := s.retryJob(ctx, id); err != nil {
+		job, err := s.retryJob(ctx, id)
+		if err == nil && job == nil {
+			err = core.ErrJobNotFound
+		}
+		if err != nil {
 			skipped = append(skipped, &jobsv1.BulkSkip{Id: id, Reason: bulkSkipReason(err)})
 			continue
 		}
@@ -339,7 +343,10 @@ func (s *jobsService) PauseJob(ctx context.Context, req *connect.Request[jobsv1.
 		return nil, errToConnect(err)
 	}
 	if job == nil {
-		return nil, connect.NewError(connect.CodeNotFound, nil)
+		// The pause already committed; the row just can't be read back (e.g. a
+		// retention GC raced the re-read). Return a minimal paused job rather
+		// than a misleading NotFound for an operation that did complete.
+		job = &core.Job{ID: id, Status: core.StatusPaused}
 	}
 	return connect.NewResponse(&jobsv1.PauseJobResponse{Job: s.jobToProto(job)}), nil
 }
@@ -386,7 +393,10 @@ func (s *jobsService) ResumeJob(ctx context.Context, req *connect.Request[jobsv1
 		return nil, errToConnect(err)
 	}
 	if job == nil {
-		return nil, connect.NewError(connect.CodeNotFound, nil)
+		// The resume already committed; the row just can't be read back. Return a
+		// minimal resumed job rather than a misleading NotFound for an operation
+		// that did complete.
+		job = &core.Job{ID: id, Status: core.StatusPending}
 	}
 	return connect.NewResponse(&jobsv1.ResumeJobResponse{Job: s.jobToProto(job)}), nil
 }
@@ -895,12 +905,17 @@ func (s *jobsService) collectWorkflowTree(ctx context.Context, root *core.Job) (
 func (s *jobsService) collectWorkflowTreeBatched(ctx context.Context, root *core.Job, batch workflowBatchStorage) ([]*jobsv1.FanOut, []*jobsv1.Job, bool, error) {
 	var allFanOuts []*jobsv1.FanOut
 	var allChildren []*jobsv1.Job
+	truncated := false
 
 	queue := []core.UUID{root.ID}
 	visited := make(map[core.UUID]struct{}, maxWorkflowJobs)
 	visited[root.ID] = struct{}{}
 
-	for len(queue) > 0 && len(allChildren) < maxWorkflowJobs {
+	// Truncation is reported only when a further unseen child is actually found,
+	// so a tree of exactly maxWorkflowJobs nodes is reported complete. Nodes past
+	// the cap are never queued, so this costs at most one extra level of batch
+	// queries beyond the level where the cap was reached.
+	for len(queue) > 0 && !truncated {
 		currentParents := queue
 		queue = nil
 
@@ -930,36 +945,42 @@ func (s *jobsService) collectWorkflowTreeBatched(ctx context.Context, root *core
 					if _, seen := visited[sj.ID]; seen {
 						continue
 					}
+					if len(allChildren) >= maxWorkflowJobs {
+						truncated = true
+						break
+					}
 					visited[sj.ID] = struct{}{}
 					allChildren = append(allChildren, s.jobToProto(sj))
 					queue = append(queue, sj.ID)
-					if len(allChildren) >= maxWorkflowJobs {
-						break
-					}
 				}
-				if len(allChildren) >= maxWorkflowJobs {
+				if truncated {
 					break
 				}
 			}
-			if len(allChildren) >= maxWorkflowJobs {
+			if truncated {
 				break
 			}
 		}
 	}
 
-	// queue non-empty here means the BFS stopped at maxWorkflowJobs with tree left.
-	return allFanOuts, allChildren, len(queue) > 0, nil
+	return allFanOuts, allChildren, truncated, nil
 }
 
 func (s *jobsService) collectWorkflowTreeFallback(ctx context.Context, root *core.Job) ([]*jobsv1.FanOut, []*jobsv1.Job, bool, error) {
 	var allFanOuts []*jobsv1.FanOut
 	var allChildren []*jobsv1.Job
+	truncated := false
 
 	queue := []core.UUID{root.ID}
 	visited := make(map[core.UUID]struct{}, maxWorkflowJobs)
 	visited[root.ID] = struct{}{}
 
-	for len(queue) > 0 && len(allChildren) < maxWorkflowJobs {
+	// The walk continues past the cap so that a tree of exactly maxWorkflowJobs
+	// nodes is reported complete. On this unbatched path that costs up to one
+	// GetFanOutsByParent per queued node to confirm nothing is left; storages
+	// that implement workflowBatchStorage (every shipped backend) take the batched
+	// walker and pay one extra level instead.
+	for len(queue) > 0 && !truncated {
 		current := queue[0]
 		queue = queue[1:]
 
@@ -978,18 +999,21 @@ func (s *jobsService) collectWorkflowTreeFallback(ctx context.Context, root *cor
 				if _, seen := visited[sj.ID]; seen {
 					continue
 				}
+				if len(allChildren) >= maxWorkflowJobs {
+					truncated = true
+					break
+				}
 				visited[sj.ID] = struct{}{}
 				allChildren = append(allChildren, s.jobToProto(sj))
 				queue = append(queue, sj.ID)
-				if len(allChildren) >= maxWorkflowJobs {
-					break
-				}
+			}
+			if truncated {
+				break
 			}
 		}
 	}
 
-	// queue non-empty here means the BFS stopped at maxWorkflowJobs with tree left.
-	return allFanOuts, allChildren, len(queue) > 0, nil
+	return allFanOuts, allChildren, truncated, nil
 }
 
 func (s *jobsService) getFanOutsForParents(ctx context.Context, roots []*core.Job) (map[core.UUID][]*core.FanOut, error) {

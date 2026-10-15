@@ -3202,36 +3202,6 @@ func TestWorker_RunHeartbeat_ExitsOnContextCancel(t *testing.T) {
 	}
 }
 
-func TestWorker_RunHeartbeat_StopsOnAggressivePause(t *testing.T) {
-	// We need the heartbeat to actually tick. Use a custom implementation
-	// that exercises the pause-check branch by calling the method with a
-	// replaced ticker.  Since runHeartbeat uses a hardcoded 2-minute ticker
-	// we cannot easily trigger the tick in a test.  Instead we verify that
-	// calling Pause(Aggressive) + context cancel exits cleanly.
-	mock := &mockStorage{}
-	q := queue.New(mock)
-	w := NewWorker(q)
-
-	ctx, cancel := context.WithCancel(context.Background())
-
-	job := &core.Job{ID: "hb-job-agg", Type: "noop", Queue: "default"}
-
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		w.runHeartbeat(ctx, job, 0)
-	}()
-
-	w.Pause(core.PauseModeAggressive)
-	cancel() // context cancel causes select to fire
-
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("runHeartbeat did not exit after aggressive pause + cancel")
-	}
-}
-
 // ---------------------------------------------------------------------------
 // handleError — RetryAfter with exhausted retries goes to fail-permanently
 // ---------------------------------------------------------------------------

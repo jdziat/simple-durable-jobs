@@ -176,8 +176,9 @@ func FanOut[T any](ctx context.Context, subJobs []SubJob, opts ...Option) ([]Res
 		// If enqueue fails after marking waiting, resume the parent so
 		// it does not get stuck in waiting with no sub-jobs behind it.
 		if _, resumeErr := jc.Storage.ResumeJob(ctx, jc.Job.ID); resumeErr != nil {
-			// Log but don't mask the original error
-			_ = resumeErr
+			// Surface both: the enqueue error stays the cause, and the failed
+			// resume tells the operator the parent may be stuck in waiting.
+			return nil, fmt.Errorf("failed to enqueue sub-jobs: %w (resuming parent also failed: %v)", err, resumeErr)
 		}
 		return nil, fmt.Errorf("failed to enqueue sub-jobs: %w", err)
 	}

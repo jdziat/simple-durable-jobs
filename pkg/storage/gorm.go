@@ -161,6 +161,9 @@ type GormStorage struct {
 	// disables it. atomic (comparable) so WithHotStatsCacheTTL and tests can set
 	// it without breaking GormStorage comparability.
 	hotStatsTTL atomic.Int64
+	// lastPromoteWarnNano is the unix-nano time of the last promote-failure
+	// warning, used to rate-limit that log line.
+	lastPromoteWarnNano atomic.Int64
 	// hotStats holds the coalescing caches for the dashboard/metrics aggregates.
 	// Behind a pointer so GormStorage stays comparable (see hot_stats_cache.go).
 	hotStats *hotStatCaches
@@ -750,7 +753,24 @@ func (s *GormStorage) Dequeue(ctx context.Context, queues []string, workerID str
 		return job, err
 	}
 	promoted, perr := s.PromoteReadyJobs(ctx)
-	if perr != nil || promoted == 0 {
+	if perr != nil {
+		// The first claim already found nothing, so an empty result is still the
+		// right return; but a persistently failing promote would otherwise leave
+		// eligible jobs invisible with no signal to the operator.
+		// Dequeue runs every poll tick on every worker, so the warning is limited
+		// to one per minute per storage instead of one per tick.
+		nowNano := time.Now().UnixNano()
+		last := s.lastPromoteWarnNano.Load()
+		if nowNano-last >= int64(time.Minute) && s.lastPromoteWarnNano.CompareAndSwap(last, nowNano) {
+			logger := s.logger
+			if logger == nil {
+				logger = slog.Default()
+			}
+			logger.Warn("dequeue could not promote ready jobs", "error", perr)
+		}
+		return nil, nil
+	}
+	if promoted == 0 {
 		return nil, nil
 	}
 	return s.dequeueDecoded(ctx, queues, workerID, &skipped)
@@ -2503,7 +2523,13 @@ func (s *GormStorage) SuspendForFanOut(ctx context.Context, parentID core.UUID, 
 					"locked_by":      "",
 					"dispatch_token": "",
 					"locked_until":   nil,
-					"updated_at":     time.Now(),
+					// Same suspend-state clears as MarkWaiting: a residual run_at (from
+					// a delayed enqueue or retry backoff, necessarily <= now here) and
+					// a stale waiting_signal_name from an earlier signal wait must not
+					// carry into the fan-out wait.
+					"run_at":              nil,
+					"waiting_signal_name": "",
+					"updated_at":          time.Now(),
 				})
 			if res.Error != nil {
 				return res.Error

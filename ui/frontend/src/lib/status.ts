@@ -36,6 +36,6 @@ const STATUS_TOKENS = {
 } satisfies Record<JobStatus, StatusToken>
 
 export function statusToken(status: string): StatusToken {
-  if (status in STATUS_TOKENS) return STATUS_TOKENS[status as JobStatus]
+  if (Object.hasOwn(STATUS_TOKENS, status)) return STATUS_TOKENS[status as JobStatus]
   return { role: 'neutral', ...tokenByRole('neutral'), label: status || 'unknown' }
 }

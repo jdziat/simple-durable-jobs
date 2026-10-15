@@ -275,15 +275,6 @@ func (q *Queue) enqueue(ctx context.Context, name string, args any, opts ...Opti
 	return q.enqueueWithOptions(ctx, name, args, options)
 }
 
-// EnqueueScheduledFire atomically claims a schedule's fire boundary and enqueues
-// the fired job in a single transaction: if the enqueue fails, the boundary claim
-// is rolled back so it can be re-claimed, instead of advancing the durable cursor
-// and silently dropping a due run (at-least-once-per-boundary; teardown g8). The
-// returned claimed reports whether THIS call won the boundary (false = a peer
-// already claimed it). Falls back to the prior non-atomic claim-then-enqueue only
-// when the storage backend is not transactional (no GORM tx / TxEnqueuer). It is
-// the scheduler's enqueue path and runs the same options, dedup, and middleware as
-// EnqueueTx.
 // SupportsAtomicScheduledFire reports whether the storage backend can claim a
 // schedule's fire boundary AND enqueue its job in a single transaction. When it
 // returns false, EnqueueScheduledFire uses a non-atomic claim-then-enqueue
@@ -297,6 +288,15 @@ func (q *Queue) SupportsAtomicScheduledFire() bool {
 	return claimerOK && enqOK && dbOK
 }
 
+// EnqueueScheduledFire atomically claims a schedule's fire boundary and enqueues
+// the fired job in a single transaction: if the enqueue fails, the boundary claim
+// is rolled back so it can be re-claimed, instead of advancing the durable cursor
+// and silently dropping a due run (at-least-once-per-boundary; teardown g8). The
+// returned claimed reports whether THIS call won the boundary (false = a peer
+// already claimed it). Falls back to the prior non-atomic claim-then-enqueue only
+// when the storage backend is not transactional (no GORM tx / TxEnqueuer). It is
+// the scheduler's enqueue path and runs the same options, dedup, and middleware as
+// EnqueueTx.
 func (q *Queue) EnqueueScheduledFire(ctx context.Context, scheduleName string, fireTime time.Time, jobName string, args any, opts ...Option) (claimed bool, id core.UUID, err error) {
 	txClaimer, claimerOK := q.storage.(storage.ScheduledFireTxClaimer)
 	_, enqOK := q.storage.(storage.TxEnqueuer)

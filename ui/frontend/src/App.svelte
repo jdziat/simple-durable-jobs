@@ -104,7 +104,15 @@
   }
 </script>
 
-<a class="skip-link" href="#content">Skip to content</a>
+<a
+  class="skip-link"
+  href="#content"
+  onclick={(e) => {
+    // The app routes on location.hash, so the default jump to #content would be
+    // parsed as a route and replace the current page with the dashboard.
+    e.preventDefault()
+    document.getElementById('content')?.focus()
+  }}>Skip to content</a>
 <div class="app">
   <Ticker />
   <NavRail {currentPath} {isActive} />

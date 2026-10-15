@@ -269,7 +269,7 @@ func TestTryAcquireConcurrencySlots_RollbackReleasesOnADetachedContext(t *testin
 	w := NewWorker(q,
 		WorkerQueue("default", Concurrency(3)),
 		ConcurrencyCap("customer", 1, CapKey(func(j *core.Job) string { return j.UniqueKey })),
-		ConcurrencyCap("region", 2, CapKey(func(*core.Job) string { return "" })), // refused: empty key
+		ConcurrencyCap("region", 2, CapKey(func(*core.Job) string { return "" })), // inert here: empty key still yields slot "region:"
 		DisableRetry(),
 	)
 	w.config.WorkerID = "worker-1"
@@ -279,7 +279,7 @@ func TestTryAcquireConcurrencySlots_RollbackReleasesOnADetachedContext(t *testin
 	cancel()
 
 	// Seed the row on a LIVE context, then drive the acquire on the cancelled one.
-	// The first cap is refused (empty key -> capSlotName fails), which is rollback
+	// The first cap's acquire fails on the cancelled context, which is rollback
 	// exit #1, and it must still remove what a previous run left behind.
 	// No manual slotJobID seed: record-before-acquire means the acquire publishes
 	// the entry itself. An earlier version hand-seeded it, which was dead weight

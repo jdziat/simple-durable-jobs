@@ -70,6 +70,16 @@ func (s *gormStatsStorage) createTimestampIndex(ctx context.Context) error {
 func (s *gormStatsStorage) UpsertStatCounters(ctx context.Context, queue string, ts time.Time, completed, failed, retried int64) error {
 	ts = ts.Truncate(time.Minute)
 
+	if completed == 0 && failed == 0 && retried == 0 {
+		// A zero delta changes no row, and on MySQL an unchanged row reports
+		// RowsAffected == 0, which the loop below would mistake for "row missing".
+		// Just make sure the bucket exists.
+		return s.db.WithContext(ctx).Clauses(clause.OnConflict{DoNothing: true}).Create(&JobStat{
+			Queue:     queue,
+			Timestamp: ts,
+		}).Error
+	}
+
 	for attempt := 0; attempt < 3; attempt++ {
 		result := s.db.WithContext(ctx).Model(&JobStat{}).
 			Where("queue = ? AND timestamp = ?", queue, ts).
@@ -106,26 +116,17 @@ func (s *gormStatsStorage) UpsertStatCounters(ctx context.Context, queue string,
 func (s *gormStatsStorage) SnapshotQueueDepth(ctx context.Context, queue string, ts time.Time, pending, running int64) error {
 	ts = ts.Truncate(time.Minute)
 
-	var existing JobStat
-	result := s.db.WithContext(ctx).
-		Where("queue = ? AND timestamp = ?", queue, ts).
-		First(&existing)
-
-	if result.Error == gorm.ErrRecordNotFound {
-		return s.db.WithContext(ctx).Create(&JobStat{
-			Queue:     queue,
-			Timestamp: ts,
-			Pending:   pending,
-			Running:   running,
-		}).Error
-	}
-	if result.Error != nil {
-		return result.Error
-	}
-
-	return s.db.WithContext(ctx).Model(&existing).Updates(map[string]any{
-		"pending": pending,
-		"running": running,
+	// One atomic upsert on the (queue, timestamp) unique index: concurrent
+	// snapshots for the same minute cannot race a read-then-create into a
+	// unique-constraint error.
+	return s.db.WithContext(ctx).Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "queue"}, {Name: "timestamp"}},
+		DoUpdates: clause.AssignmentColumns([]string{"pending", "running"}),
+	}).Create(&JobStat{
+		Queue:     queue,
+		Timestamp: ts,
+		Pending:   pending,
+		Running:   running,
 	}).Error
 }
 

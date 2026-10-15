@@ -35,6 +35,7 @@
 
   let workflows = $state<WorkflowItem[]>([])
   let loading = $state(true)
+  let latestLoadId = 0
   let error = $state<string | null>(null)
   let total = $state(0)
   let page = $state(1)
@@ -111,11 +112,14 @@
     void loadWorkflows()
   }
 
-  async function loadWorkflows() {
+  async function loadWorkflows(background = false) {
+    const requestId = ++latestLoadId
     try {
-      loading = true
+      // Page and filter changes show skeletons; the 5s poll refreshes in place.
+      if (!background) loading = true
       error = null
       const response = await jobsClient.listWorkflows({ page, limit, status: statusFilter })
+      if (requestId !== latestLoadId) return
       workflows = response.workflows.map(wf => {
         const totalJobs = Math.max(0, wf.totalJobs)
         // Clamp every segment against a remaining-track budget so the four
@@ -145,9 +149,10 @@
       })
       total = Number(response.total)
     } catch (e) {
+      if (requestId !== latestLoadId) return
       error = e instanceof Error ? e.message : 'Failed to load workflows'
     } finally {
-      loading = false
+      if (requestId === latestLoadId) loading = false
     }
   }
 
@@ -183,7 +188,7 @@
   onMount(() => {
     seedFromHash()
     void loadWorkflows()
-    const interval = setInterval(() => void loadWorkflows(), 5000)
+    const interval = setInterval(() => void loadWorkflows(true), 5000)
     return () => {
       clearInterval(interval)
       if (filterTimer) clearTimeout(filterTimer)
