@@ -178,7 +178,7 @@ func FanOut[T any](ctx context.Context, subJobs []SubJob, opts ...Option) ([]Res
 		if _, resumeErr := jc.Storage.ResumeJob(ctx, jc.Job.ID); resumeErr != nil {
 			// Surface both: the enqueue error stays the cause, and the failed
 			// resume tells the operator the parent may be stuck in waiting.
-			return nil, fmt.Errorf("failed to enqueue sub-jobs: %w (resuming parent also failed: %v)", err, resumeErr)
+			return nil, fmt.Errorf("failed to enqueue sub-jobs: %w (resuming parent also failed: %w)", err, resumeErr)
 		}
 		return nil, fmt.Errorf("failed to enqueue sub-jobs: %w", err)
 	}
@@ -237,8 +237,7 @@ func buildSubJobs(subJobs []SubJob, cfg *config, jc *intctx.JobContext, fanOutID
 			return nil, fmt.Errorf("failed to marshal sub-job args: %w", err)
 		}
 		if len(args) > security.MaxJobArgsSize {
-			// Deterministic for the same input, so retrying the parent cannot succeed.
-			return nil, core.NoRetry(fmt.Errorf("%w: sub-job type %q arguments are %d bytes, limit is %d", core.ErrJobArgsTooLarge, sj.Type, len(args), security.MaxJobArgsSize))
+			return nil, fmt.Errorf("%w: sub-job type %q arguments are %d bytes, limit is %d", core.ErrJobArgsTooLarge, sj.Type, len(args), security.MaxJobArgsSize)
 		}
 
 		// Determine queue name with fallback chain

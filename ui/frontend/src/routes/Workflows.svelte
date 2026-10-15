@@ -149,12 +149,14 @@
         }
       })
       total = Number(response.total)
-      hasLoaded = true
     } catch (e) {
       if (requestId !== latestLoadId) return
       error = e instanceof Error ? e.message : 'Failed to load workflows'
     } finally {
-      if (requestId === latestLoadId) loading = false
+      if (requestId === latestLoadId) {
+        loading = false
+        hasLoaded = true
+      }
     }
   }
 

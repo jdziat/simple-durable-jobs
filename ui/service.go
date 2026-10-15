@@ -905,9 +905,10 @@ func (s *jobsService) collectWorkflowTreeBatched(ctx context.Context, root *core
 	visited := make(map[core.UUID]struct{}, maxWorkflowJobs)
 	visited[root.ID] = struct{}{}
 
-	// Keep walking after the cap is reached: truncation is reported only when a
-	// further unseen child is actually found, so a tree of exactly
-	// maxWorkflowJobs nodes is reported complete.
+	// Truncation is reported only when a further unseen child is actually found,
+	// so a tree of exactly maxWorkflowJobs nodes is reported complete. Nodes past
+	// the cap are never queued, so this costs at most one extra level of batch
+	// queries beyond the level where the cap was reached.
 	for len(queue) > 0 && !truncated {
 		currentParents := queue
 		queue = nil
@@ -946,12 +947,6 @@ func (s *jobsService) collectWorkflowTreeBatched(ctx context.Context, root *core
 					allChildren = append(allChildren, s.jobToProto(sj))
 					queue = append(queue, sj.ID)
 				}
-				if truncated {
-					break
-				}
-			}
-			if truncated {
-				break
 			}
 		}
 	}

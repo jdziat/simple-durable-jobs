@@ -71,9 +71,13 @@ func (s *gormStatsStorage) UpsertStatCounters(ctx context.Context, queue string,
 	ts = ts.Truncate(time.Minute)
 
 	if completed == 0 && failed == 0 && retried == 0 {
-		// A zero delta changes no row; on MySQL that reports RowsAffected == 0 and
-		// would be mistaken for "row missing" below.
-		return nil
+		// A zero delta changes no row, and on MySQL an unchanged row reports
+		// RowsAffected == 0, which the loop below would mistake for "row missing".
+		// Just make sure the bucket exists.
+		return s.db.WithContext(ctx).Clauses(clause.OnConflict{DoNothing: true}).Create(&JobStat{
+			Queue:     queue,
+			Timestamp: ts,
+		}).Error
 	}
 
 	for attempt := 0; attempt < 3; attempt++ {
