@@ -947,6 +947,12 @@ func (s *jobsService) collectWorkflowTreeBatched(ctx context.Context, root *core
 					allChildren = append(allChildren, s.jobToProto(sj))
 					queue = append(queue, sj.ID)
 				}
+				if truncated {
+					break
+				}
+			}
+			if truncated {
+				break
 			}
 		}
 	}
@@ -963,6 +969,11 @@ func (s *jobsService) collectWorkflowTreeFallback(ctx context.Context, root *cor
 	visited := make(map[core.UUID]struct{}, maxWorkflowJobs)
 	visited[root.ID] = struct{}{}
 
+	// The walk continues past the cap so that a tree of exactly maxWorkflowJobs
+	// nodes is reported complete. On this unbatched path that costs up to one
+	// GetFanOutsByParent per queued node to confirm nothing is left; storages
+	// that implement workflowBatchStorage (every shipped backend) take the batched
+	// walker and pay one extra level instead.
 	for len(queue) > 0 && !truncated {
 		current := queue[0]
 		queue = queue[1:]

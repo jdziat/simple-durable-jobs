@@ -3204,8 +3204,9 @@ func TestWorker_RunHeartbeat_ExitsOnContextCancel(t *testing.T) {
 
 // An aggressively paused worker keeps renewing the lease of a job that is still
 // running; dropping it would let the stale-lock reaper reclaim the row while the
-// handler is still executing. The context stays live for the whole assertion
-// window so the heartbeat tick, not ctx.Done(), is what is observed.
+// handler is still executing. The job is registered the way processJobRun does,
+// so Pause genuinely cancels its context; the heartbeat context is detached from
+// the job context (context.WithoutCancel), which is what keeps it ticking.
 func TestWorker_RunHeartbeat_ContinuesUnderAggressivePause(t *testing.T) {
 	var beats atomic.Int32
 	mock := &mockStorage{
@@ -3217,11 +3218,20 @@ func TestWorker_RunHeartbeat_ContinuesUnderAggressivePause(t *testing.T) {
 	q := queue.New(mock)
 	w := NewWorker(q)
 	w.heartbeatInterval = 5 * time.Millisecond
-	w.Pause(core.PauseModeAggressive)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	job := &core.Job{ID: "hb-job-agg", Type: "noop", Queue: "default"}
+	jobCtx, cancelJob := context.WithCancel(context.Background())
+	defer cancelJob()
+	w.runningJobsMu.Lock()
+	w.runningJobs[job.ID] = runningJobEntry{cancel: cancelJob, token: 1}
+	w.runningJobsMu.Unlock()
+
+	// Detached exactly as processJobRun builds it.
+	ctx, cancel := context.WithCancel(context.WithoutCancel(jobCtx))
+	defer cancel()
+
+	w.Pause(core.PauseModeAggressive)
+	require.Error(t, jobCtx.Err(), "aggressive pause must have cancelled the registered job context")
 
 	done := make(chan struct{})
 	go func() {
