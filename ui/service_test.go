@@ -3016,7 +3016,10 @@ func TestPauseJob_StorageError(t *testing.T) {
 	assert.Equal(t, connect.CodeInternal, connect.CodeOf(err))
 }
 
-func TestPauseJob_JobNotFoundAfterPause(t *testing.T) {
+// The pause already committed, so a row that vanished before the re-read (a
+// retention GC) must not be reported as NotFound; the response carries a minimal
+// paused job instead. Mirrors TestCancelJob_JobNotFoundAfterCancel.
+func TestPauseJob_JobNotFoundAfterPause_ReturnsMinimalJob(t *testing.T) {
 	store := &mockStorage{
 		pauseJobFn: func(_ context.Context, _ core.UUID) error { return nil },
 		getJobFn:   func(_ context.Context, _ core.UUID) (*core.Job, error) { return nil, nil },
@@ -3024,9 +3027,11 @@ func TestPauseJob_JobNotFoundAfterPause(t *testing.T) {
 	q := queue.New(store)
 	svc := newJobsService(store, q, nil)
 
-	_, err := svc.PauseJob(context.Background(), connect.NewRequest(&jobsv1.PauseJobRequest{Id: uiTestID("j1")}))
-	require.Error(t, err)
-	assert.Equal(t, connect.CodeNotFound, connect.CodeOf(err))
+	resp, err := svc.PauseJob(context.Background(), connect.NewRequest(&jobsv1.PauseJobRequest{Id: uiTestID("j1")}))
+	require.NoError(t, err)
+	require.NotNil(t, resp.Msg.Job)
+	assert.Equal(t, uiTestID("j1"), resp.Msg.Job.Id)
+	assert.Equal(t, string(core.StatusPaused), resp.Msg.Job.Status)
 }
 
 // ---------------------------------------------------------------------------
@@ -3144,7 +3149,7 @@ func TestResumeJob_UnpauseError(t *testing.T) {
 	assert.Equal(t, connect.CodeInternal, connect.CodeOf(err))
 }
 
-func TestResumeJob_JobNotFoundAfterUnpause(t *testing.T) {
+func TestResumeJob_JobNotFoundAfterUnpause_ReturnsMinimalJob(t *testing.T) {
 	store := &mockStorage{
 		unpauseJobFn: func(_ context.Context, _ core.UUID) error { return nil },
 		getJobFn:     func(_ context.Context, _ core.UUID) (*core.Job, error) { return nil, nil },
@@ -3152,9 +3157,11 @@ func TestResumeJob_JobNotFoundAfterUnpause(t *testing.T) {
 	q := queue.New(store)
 	svc := newJobsService(store, q, nil)
 
-	_, err := svc.ResumeJob(context.Background(), connect.NewRequest(&jobsv1.ResumeJobRequest{Id: uiTestID("j1")}))
-	require.Error(t, err)
-	assert.Equal(t, connect.CodeNotFound, connect.CodeOf(err))
+	resp, err := svc.ResumeJob(context.Background(), connect.NewRequest(&jobsv1.ResumeJobRequest{Id: uiTestID("j1")}))
+	require.NoError(t, err)
+	require.NotNil(t, resp.Msg.Job)
+	assert.Equal(t, uiTestID("j1"), resp.Msg.Job.Id)
+	assert.Equal(t, string(core.StatusPending), resp.Msg.Job.Status)
 }
 
 // ---------------------------------------------------------------------------

@@ -343,7 +343,10 @@ func (s *jobsService) PauseJob(ctx context.Context, req *connect.Request[jobsv1.
 		return nil, errToConnect(err)
 	}
 	if job == nil {
-		return nil, connect.NewError(connect.CodeNotFound, nil)
+		// The pause already committed; the row just can't be read back (e.g. a
+		// retention GC raced the re-read). Return a minimal paused job rather
+		// than a misleading NotFound for an operation that did complete.
+		job = &core.Job{ID: id, Status: core.StatusPaused}
 	}
 	return connect.NewResponse(&jobsv1.PauseJobResponse{Job: s.jobToProto(job)}), nil
 }
@@ -390,7 +393,10 @@ func (s *jobsService) ResumeJob(ctx context.Context, req *connect.Request[jobsv1
 		return nil, errToConnect(err)
 	}
 	if job == nil {
-		return nil, connect.NewError(connect.CodeNotFound, nil)
+		// The resume already committed; the row just can't be read back. Return a
+		// minimal resumed job rather than a misleading NotFound for an operation
+		// that did complete.
+		job = &core.Job{ID: id, Status: core.StatusPending}
 	}
 	return connect.NewResponse(&jobsv1.ResumeJobResponse{Job: s.jobToProto(job)}), nil
 }
