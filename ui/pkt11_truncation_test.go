@@ -132,6 +132,69 @@ func TestGetWorkflow_TruncatedOnOversizedTree_Batched(t *testing.T) {
 }
 
 // TestGetWorkflow_NotTruncatedForNormalTree guards the happy path: a plain root
+// TestGetWorkflow_ExactlyAtCapIsNotTruncated pins the boundary: a tree holding
+// exactly maxWorkflowJobs descendants lost nothing, so it must not be reported
+// truncated (both collectors).
+func TestGetWorkflow_ExactlyAtCapIsNotTruncated(t *testing.T) {
+	root := core.NewID()
+	fanOut := core.NewID()
+	exact := func() []*core.Job { return oversizedSubJobs(fanOut)[:maxWorkflowJobs] }
+
+	t.Run("fallback", func(t *testing.T) {
+		mock := &mockStorage{
+			getJobFn: func(_ context.Context, id core.UUID) (*core.Job, error) {
+				return &core.Job{ID: id, Queue: "q", Type: "work"}, nil
+			},
+			getFanOutsByParentFn: func(_ context.Context, parentID core.UUID) ([]*core.FanOut, error) {
+				if parentID == root {
+					return []*core.FanOut{{ID: fanOut, ParentJobID: root}}, nil
+				}
+				return nil, nil
+			},
+			getSubJobsFn: func(_ context.Context, foID core.UUID) ([]*core.Job, error) {
+				if foID == fanOut {
+					return exact(), nil
+				}
+				return nil, nil
+			},
+		}
+		resp, err := newServiceWithBaseStorage(mock).GetWorkflow(context.Background(),
+			connect.NewRequest(&jobsv1.GetWorkflowRequest{JobId: root.String()}))
+		require.NoError(t, err)
+		require.False(t, resp.Msg.Truncated)
+		require.Len(t, resp.Msg.Children, maxWorkflowJobs)
+	})
+
+	t.Run("batched", func(t *testing.T) {
+		mock := &mockUIWorkflowBatchStorage{}
+		mock.getJobFn = func(_ context.Context, id core.UUID) (*core.Job, error) {
+			return &core.Job{ID: id, Queue: "q", Type: "work"}, nil
+		}
+		mock.getFanOutsByParentsFn = func(_ context.Context, parentIDs []core.UUID) ([]*core.FanOut, error) {
+			for _, p := range parentIDs {
+				if p == root {
+					return []*core.FanOut{{ID: fanOut, ParentJobID: root}}, nil
+				}
+			}
+			return nil, nil
+		}
+		mock.getSubJobsByFanOutsFn = func(_ context.Context, fanOutIDs []core.UUID) ([]*core.Job, error) {
+			for _, f := range fanOutIDs {
+				if f == fanOut {
+					return exact(), nil
+				}
+			}
+			return nil, nil
+		}
+		resp, err := newJobsService(mock, nil, nil).GetWorkflow(context.Background(),
+			connect.NewRequest(&jobsv1.GetWorkflowRequest{JobId: root.String()}))
+		require.NoError(t, err)
+		require.False(t, resp.Msg.Truncated)
+		require.Len(t, resp.Msg.Children, maxWorkflowJobs)
+	})
+}
+
+// TestGetWorkflow_NotTruncatedForNormalTree guards the happy path: a plain root
 // (no parent, no oversized tree) reports truncated=false.
 func TestGetWorkflow_NotTruncatedForNormalTree(t *testing.T) {
 	root := core.NewID()

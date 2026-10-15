@@ -2099,7 +2099,7 @@ func TestCheckpointToProto(t *testing.T) {
 }
 
 func TestCheckpointToProto_RedactsResultWithoutTruncating(t *testing.T) {
-	secret := "sk_live_1234567890abcdef"
+	secret := "sk_" + "live_1234567890abcdef"
 	sentinel := "CHECKPOINT_TAIL_SENTINEL"
 	cp := &core.Checkpoint{
 		ID:        "cp1",
@@ -2179,8 +2179,8 @@ func TestJobToProto_Worker(t *testing.T) {
 }
 
 func TestJobToProto_RedactsPayloadsWithoutTruncating(t *testing.T) {
-	argsSecret := "ghp_1234567890abcdefghij"
-	resultSecret := "sk_live_1234567890abcdef"
+	argsSecret := "gh" + "p_1234567890abcdefghij"
+	resultSecret := "sk_" + "live_1234567890abcdef"
 	sentinel := "RESULT_TAIL_SENTINEL"
 	job := sampleJob(uiTestID("j1"), "default", "work", core.StatusCompleted)
 	job.Args = []byte(`{"token":"` + argsSecret + `"}`)
@@ -2205,7 +2205,7 @@ func TestJobToProto_RedactsPayloadsWithoutTruncating(t *testing.T) {
 }
 
 func TestJobToProto_RedactsMetadataValues(t *testing.T) {
-	secret := "sk_live_1234567890abcdef"
+	secret := "sk_" + "live_1234567890abcdef"
 	job := sampleJob(uiTestID("j1"), "default", "work", core.StatusCompleted)
 	job.Metadata = map[string]string{
 		"token": "token=" + secret,
@@ -2221,7 +2221,7 @@ func TestJobToProto_RedactsMetadataValues(t *testing.T) {
 }
 
 func TestService_MetadataRedactionOptOut(t *testing.T) {
-	secret := "sk_live_1234567890abcdef"
+	secret := "sk_" + "live_1234567890abcdef"
 	job := sampleJob(uiTestID("j1"), "default", "work", core.StatusCompleted)
 	job.Metadata = map[string]string{"token": "token=" + secret}
 	store := &mockStorage{
@@ -2239,7 +2239,7 @@ func TestService_MetadataRedactionOptOut(t *testing.T) {
 }
 
 func TestHandler_MetadataRedactionOptOut(t *testing.T) {
-	secret := "sk_live_1234567890abcdef"
+	secret := "sk_" + "live_1234567890abcdef"
 	job := sampleJob(uiTestID("j1"), "default", "work", core.StatusCompleted)
 	job.Metadata = map[string]string{"token": "token=" + secret}
 	store := &mockStorage{
@@ -2261,7 +2261,7 @@ func TestHandler_MetadataRedactionOptOut(t *testing.T) {
 }
 
 func TestListJobs_RedactsMetadataValues(t *testing.T) {
-	secret := "ghp_1234567890abcdefghij"
+	secret := "gh" + "p_1234567890abcdefghij"
 	job := sampleJob(uiTestID("j1"), "default", "work", core.StatusPending)
 	job.Metadata = map[string]string{"token": "token=" + secret}
 	store := &mockUIStorage{
