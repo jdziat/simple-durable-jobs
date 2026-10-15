@@ -79,6 +79,29 @@ func TestSuspendForFanOut_CommitsAtomically(t *testing.T) {
 	assert.True(t, hasFanoutCP, "fan-out resume checkpoint must be persisted")
 }
 
+// A delayed or retried parent reaches the suspend with a residual run_at (<= now)
+// and possibly a stale waiting_signal_name. Left set, the signal-resume poll's
+// run_at clause would wake the parent before its children finish. The fan-out
+// suspend must clear both, as MarkWaiting does.
+func TestSuspendForFanOut_ClearsRunAtAndSignalName(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+	const worker = "w1"
+	parentID := seedRunningLockedParent(t, ctx, s, worker)
+	past := time.Now().Add(-time.Minute)
+	require.NoError(t, s.db.WithContext(ctx).Model(&core.Job{}).Where("id = ?", parentID).
+		Updates(map[string]any{"run_at": past, "waiting_signal_name": "stale"}).Error)
+	fanOut, cp, subs := buildFanOutFixtures(parentID, 2)
+
+	require.NoError(t, s.SuspendForFanOut(ctx, parentID, worker, fanOut, cp, subs))
+
+	parent, err := s.GetJob(ctx, parentID)
+	require.NoError(t, err)
+	assert.Equal(t, core.StatusWaiting, parent.Status)
+	assert.Nil(t, parent.RunAt, "suspended fan-out parent must not keep a residual run_at")
+	assert.Empty(t, parent.WaitingSignalName)
+}
+
 func TestSuspendForFanOut_AbortsAtomicallyWhenParentNotOwned(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStorage(t)

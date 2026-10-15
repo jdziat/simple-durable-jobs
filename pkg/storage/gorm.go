@@ -750,7 +750,18 @@ func (s *GormStorage) Dequeue(ctx context.Context, queues []string, workerID str
 		return job, err
 	}
 	promoted, perr := s.PromoteReadyJobs(ctx)
-	if perr != nil || promoted == 0 {
+	if perr != nil {
+		// The first claim already found nothing, so an empty result is still the
+		// right return; but a persistently failing promote would otherwise leave
+		// eligible jobs invisible with no signal to the operator.
+		logger := s.logger
+		if logger == nil {
+			logger = slog.Default()
+		}
+		logger.Warn("dequeue could not promote ready jobs", "error", perr)
+		return nil, nil
+	}
+	if promoted == 0 {
 		return nil, nil
 	}
 	return s.dequeueDecoded(ctx, queues, workerID, &skipped)
@@ -2503,7 +2514,13 @@ func (s *GormStorage) SuspendForFanOut(ctx context.Context, parentID core.UUID, 
 					"locked_by":      "",
 					"dispatch_token": "",
 					"locked_until":   nil,
-					"updated_at":     time.Now(),
+					// Same suspend-state clears as MarkWaiting: a residual run_at (from
+					// a delayed enqueue or retry backoff, necessarily <= now here) and
+					// a stale waiting_signal_name from an earlier signal wait must not
+					// carry into the fan-out wait.
+					"run_at":              nil,
+					"waiting_signal_name": "",
+					"updated_at":          time.Now(),
 				})
 			if res.Error != nil {
 				return res.Error
