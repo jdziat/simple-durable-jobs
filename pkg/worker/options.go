@@ -297,9 +297,11 @@ type WorkerConfig struct {
 // Concurrency sets the concurrency for a queue.
 // Values are clamped to [1, MaxConcurrency].
 //
-// Used at the top level (e.g. NewWorker(q, Concurrency(50))) it sets the
-// concurrency of the implicit "default" queue created when no WorkerQueue is
-// configured. Inside WorkerQueue(name, Concurrency(n)) it scopes to that queue.
+// Inside WorkerQueue(name, Concurrency(n)) it scopes to that queue. Used at the
+// top level (e.g. NewWorker(q, Concurrency(50))) it sets the concurrency of the
+// implicit "default" queue when no WorkerQueue is configured, and overwrites
+// every queue already configured by an earlier WorkerQueue option. Put it before
+// the WorkerQueue options, or scope it inside them, to keep per-queue values.
 func Concurrency(n int) WorkerOption {
 	return workerOptionFunc(func(c *WorkerConfig) {
 		clamped := security.ClampConcurrency(n)

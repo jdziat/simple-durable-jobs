@@ -3202,18 +3202,25 @@ func TestWorker_RunHeartbeat_ExitsOnContextCancel(t *testing.T) {
 	}
 }
 
-func TestWorker_RunHeartbeat_StopsOnAggressivePause(t *testing.T) {
-	// We need the heartbeat to actually tick. Use a custom implementation
-	// that exercises the pause-check branch by calling the method with a
-	// replaced ticker.  Since runHeartbeat uses a hardcoded 2-minute ticker
-	// we cannot easily trigger the tick in a test.  Instead we verify that
-	// calling Pause(Aggressive) + context cancel exits cleanly.
-	mock := &mockStorage{}
+// An aggressively paused worker keeps renewing the lease of a job that is still
+// running; dropping it would let the stale-lock reaper reclaim the row while the
+// handler is still executing. The context stays live for the whole assertion
+// window so the heartbeat tick, not ctx.Done(), is what is observed.
+func TestWorker_RunHeartbeat_ContinuesUnderAggressivePause(t *testing.T) {
+	var beats atomic.Int32
+	mock := &mockStorage{
+		heartbeatFunc: func(context.Context, core.UUID, string) error {
+			beats.Add(1)
+			return nil
+		},
+	}
 	q := queue.New(mock)
 	w := NewWorker(q)
+	w.heartbeatInterval = 5 * time.Millisecond
+	w.Pause(core.PauseModeAggressive)
 
 	ctx, cancel := context.WithCancel(context.Background())
-
+	defer cancel()
 	job := &core.Job{ID: "hb-job-agg", Type: "noop", Queue: "default"}
 
 	done := make(chan struct{})
@@ -3222,13 +3229,14 @@ func TestWorker_RunHeartbeat_StopsOnAggressivePause(t *testing.T) {
 		w.runHeartbeat(ctx, job, 0)
 	}()
 
-	w.Pause(core.PauseModeAggressive)
-	cancel() // context cancel causes select to fire
+	require.Eventually(t, func() bool { return beats.Load() >= 3 }, time.Second, 5*time.Millisecond,
+		"heartbeat must keep ticking while aggressively paused")
 
+	cancel()
 	select {
 	case <-done:
 	case <-time.After(time.Second):
-		t.Fatal("runHeartbeat did not exit after aggressive pause + cancel")
+		t.Fatal("runHeartbeat did not exit after context cancel")
 	}
 }
 

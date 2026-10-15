@@ -19,10 +19,10 @@ import (
 )
 
 // TestDefaultBatchSizeDrainsRespectingQueueCap is the guard for the P13 default
-// lift (DequeueBatchSize 1 -> 10). It proves that a freshly constructed worker
+// lift (DequeueBatchSize 1 -> 50). It proves that a freshly constructed worker
 // using the new batched default still:
 //
-//   - actually picks up the new default (config.DequeueBatchSize == 10);
+//   - actually picks up the new default (config.DequeueBatchSize == 50);
 //   - drains a saturated single queue exactly once (200 distinct completions,
 //     zero duplicate job IDs) under the batch path;
 //   - never runs more jobs concurrently than the queue's configured cap, even
@@ -265,7 +265,8 @@ func TestDispatchRespectsPerQueueCapsAcrossMultipleQueues(t *testing.T) {
 	}
 
 	// Build the worker with NO WithDequeueBatchSize: it must use the batched
-	// default of 10, which equals sigma(per-queue caps) and the jobsChan buffer.
+	// default of 50, which exceeds sigma(per-queue caps) (2+3+5 = 10), so the
+	// per-queue caps rather than the batch size bound each claim.
 	w := NewWorker(q,
 		WorkerQueue("a", Concurrency(2)),
 		WorkerQueue("b", Concurrency(3)),

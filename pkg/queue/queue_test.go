@@ -1294,12 +1294,20 @@ func TestQueue_RegisterRunningJob_StoresCancel(t *testing.T) {
 
 	q.RegisterRunningJob("job-abc", cancel)
 
-	// Verify the cancel function was stored by calling it via PauseJob
-	// with a job that's in the running registry.
-	// (Direct field access is not possible from outside the package;
-	// we confirm indirectly via UnregisterRunningJob not panicking.)
+	q.runningJobsMu.Lock()
+	stored, ok := q.runningJobs["job-abc"]
+	q.runningJobsMu.Unlock()
+	require.True(t, ok, "RegisterRunningJob must store the job")
+	stored()
+	assert.True(t, cancelled, "the stored function must be the one registered")
+
+	cancelled = false
 	q.UnregisterRunningJob("job-abc")
-	assert.False(t, cancelled, "cancel should not be called by UnregisterRunningJob")
+	q.runningJobsMu.Lock()
+	_, ok = q.runningJobs["job-abc"]
+	q.runningJobsMu.Unlock()
+	assert.False(t, ok, "UnregisterRunningJob must remove the job")
+	assert.False(t, cancelled, "UnregisterRunningJob must not invoke the cancel function")
 }
 
 func TestQueue_RegisterRunningJob_OverwritesPrevious(t *testing.T) {
@@ -1309,17 +1317,22 @@ func TestQueue_RegisterRunningJob_OverwritesPrevious(t *testing.T) {
 	var first, second bool
 	q.RegisterRunningJob("job-x", func() { first = true })
 	q.RegisterRunningJob("job-x", func() { second = true })
-	q.UnregisterRunningJob("job-x")
 
-	assert.False(t, first)
-	assert.False(t, second)
+	q.runningJobsMu.Lock()
+	stored := q.runningJobs["job-x"]
+	q.runningJobsMu.Unlock()
+	require.NotNil(t, stored)
+	stored()
+
+	assert.True(t, second, "the latest registration wins")
+	assert.False(t, first, "the replaced cancel function is dropped")
 }
 
 func TestQueue_UnregisterRunningJob_NonExistentIsNoop(t *testing.T) {
 	store := newMockStorage()
 	q := New(store)
 
-	// Must not panic when job was never registered.
+	// Unregistering a job that was never registered must be a no-op.
 	assert.NotPanics(t, func() {
 		q.UnregisterRunningJob("never-existed")
 	})
