@@ -131,7 +131,6 @@ func TestGetWorkflow_TruncatedOnOversizedTree_Batched(t *testing.T) {
 	require.True(t, resp.Msg.Truncated, "a tree exceeding maxWorkflowJobs must be reported truncated (batched path)")
 }
 
-// TestGetWorkflow_NotTruncatedForNormalTree guards the happy path: a plain root
 // TestGetWorkflow_ExactlyAtCapIsNotTruncated pins the boundary: a tree holding
 // exactly maxWorkflowJobs descendants lost nothing, so it must not be reported
 // truncated (both collectors).
