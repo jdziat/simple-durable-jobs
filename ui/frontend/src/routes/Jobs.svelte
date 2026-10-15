@@ -66,6 +66,7 @@
 
   let jobs = $state<JobItem[]>([])
   let loading = $state(true)
+  let latestLoadId = 0
   let error = $state<string | null>(null)
   let total = $state(0)
   let page = $state(1)
@@ -229,6 +230,9 @@
   }
 
   async function loadJobs() {
+    // A slow earlier response must not overwrite a later one (debounced filter
+    // edits and page changes overlap), so only the latest request may apply.
+    const requestId = ++latestLoadId
     loading = true
     error = null
     try {
@@ -258,14 +262,16 @@
         deadLetteredAt: toDate(j.deadLetteredAt),
         lastError: j.lastError || '',
       }))
+      if (requestId !== latestLoadId) return
       noteTransitions(nextJobs)
       jobs = nextJobs
       total = Number(response.total)
     } catch (e) {
+      if (requestId !== latestLoadId) return
       error = e instanceof Error ? e.message : 'Failed to load jobs'
       toast.push({ kind: 'err', msg: error })
     } finally {
-      loading = false
+      if (requestId === latestLoadId) loading = false
     }
   }
 

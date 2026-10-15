@@ -237,7 +237,8 @@ func buildSubJobs(subJobs []SubJob, cfg *config, jc *intctx.JobContext, fanOutID
 			return nil, fmt.Errorf("failed to marshal sub-job args: %w", err)
 		}
 		if len(args) > security.MaxJobArgsSize {
-			return nil, fmt.Errorf("%w: sub-job type %q arguments are %d bytes, limit is %d", core.ErrJobArgsTooLarge, sj.Type, len(args), security.MaxJobArgsSize)
+			// Deterministic for the same input, so retrying the parent cannot succeed.
+			return nil, core.NoRetry(fmt.Errorf("%w: sub-job type %q arguments are %d bytes, limit is %d", core.ErrJobArgsTooLarge, sj.Type, len(args), security.MaxJobArgsSize))
 		}
 
 		// Determine queue name with fallback chain

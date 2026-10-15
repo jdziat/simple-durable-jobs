@@ -269,7 +269,9 @@ func CallWithCheckpointCtx[T any](execCtx, checkpointCtx context.Context, name s
 		return zero, fmt.Errorf("failed to marshal args: %w", err)
 	}
 	if len(argsBytes) > security.MaxJobArgsSize {
-		return zero, fmt.Errorf("%w: call %q arguments are %d bytes, limit is %d", core.ErrJobArgsTooLarge, name, len(argsBytes), security.MaxJobArgsSize)
+		// Deterministic: the same call re-marshals to the same oversized args on
+		// every outer-job attempt, so retrying only burns the retry budget.
+		return zero, core.NoRetry(fmt.Errorf("%w: call %q arguments are %d bytes, limit is %d", core.ErrJobArgsTooLarge, name, len(argsBytes), security.MaxJobArgsSize))
 	}
 
 	result, err := handler.ExecuteCall[T](execCtx, hnd, args)

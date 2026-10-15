@@ -288,7 +288,11 @@ func (s *jobsService) BulkRetryJobs(ctx context.Context, req *connect.Request[jo
 	count := 0
 	var skipped []*jobsv1.BulkSkip
 	for _, id := range req.Msg.Ids {
-		if _, err := s.retryJob(ctx, id); err != nil {
+		job, err := s.retryJob(ctx, id)
+		if err == nil && job == nil {
+			err = core.ErrJobNotFound
+		}
+		if err != nil {
 			skipped = append(skipped, &jobsv1.BulkSkip{Id: id, Reason: bulkSkipReason(err)})
 			continue
 		}

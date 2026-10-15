@@ -35,6 +35,8 @@
 
   let workflows = $state<WorkflowItem[]>([])
   let loading = $state(true)
+  let latestLoadId = 0
+  let hasLoaded = false
   let error = $state<string | null>(null)
   let total = $state(0)
   let page = $state(1)
@@ -112,10 +114,13 @@
   }
 
   async function loadWorkflows() {
+    const requestId = ++latestLoadId
     try {
-      loading = true
+      // Only the first load shows skeletons; the 5s poll refreshes in place.
+      if (!hasLoaded) loading = true
       error = null
       const response = await jobsClient.listWorkflows({ page, limit, status: statusFilter })
+      if (requestId !== latestLoadId) return
       workflows = response.workflows.map(wf => {
         const totalJobs = Math.max(0, wf.totalJobs)
         // Clamp every segment against a remaining-track budget so the four
@@ -144,10 +149,12 @@
         }
       })
       total = Number(response.total)
+      hasLoaded = true
     } catch (e) {
+      if (requestId !== latestLoadId) return
       error = e instanceof Error ? e.message : 'Failed to load workflows'
     } finally {
-      loading = false
+      if (requestId === latestLoadId) loading = false
     }
   }
 

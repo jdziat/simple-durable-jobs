@@ -161,6 +161,9 @@ type GormStorage struct {
 	// disables it. atomic (comparable) so WithHotStatsCacheTTL and tests can set
 	// it without breaking GormStorage comparability.
 	hotStatsTTL atomic.Int64
+	// lastPromoteWarnNano is the unix-nano time of the last promote-failure
+	// warning, used to rate-limit that log line.
+	lastPromoteWarnNano atomic.Int64
 	// hotStats holds the coalescing caches for the dashboard/metrics aggregates.
 	// Behind a pointer so GormStorage stays comparable (see hot_stats_cache.go).
 	hotStats *hotStatCaches
@@ -754,11 +757,17 @@ func (s *GormStorage) Dequeue(ctx context.Context, queues []string, workerID str
 		// The first claim already found nothing, so an empty result is still the
 		// right return; but a persistently failing promote would otherwise leave
 		// eligible jobs invisible with no signal to the operator.
-		logger := s.logger
-		if logger == nil {
-			logger = slog.Default()
+		// Dequeue runs every poll tick on every worker, so the warning is limited
+		// to one per minute per storage instead of one per tick.
+		nowNano := time.Now().UnixNano()
+		last := s.lastPromoteWarnNano.Load()
+		if nowNano-last >= int64(time.Minute) && s.lastPromoteWarnNano.CompareAndSwap(last, nowNano) {
+			logger := s.logger
+			if logger == nil {
+				logger = slog.Default()
+			}
+			logger.Warn("dequeue could not promote ready jobs", "error", perr)
 		}
-		logger.Warn("dequeue could not promote ready jobs", "error", perr)
 		return nil, nil
 	}
 	if promoted == 0 {
