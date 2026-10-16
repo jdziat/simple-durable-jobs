@@ -452,6 +452,12 @@ worker := jobs.NewWorker(queue,
 
 ## Error Handling
 
+When a top-level handler returns both an error and nonzero, JSON-serializable
+output, the output is included in the failure message (subject to error-message
+redaction and length limits). Return recovery details such as a retained checkout
+path this way so they remain visible on failed jobs. The job still fails or
+retries normally; this output is not stored as a successful result.
+
 ```go
 // Don't retry this job
 return jobs.NoRetry(errors.New("invalid input"))

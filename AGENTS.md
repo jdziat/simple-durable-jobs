@@ -29,6 +29,7 @@ The project uses a layered architecture with a root facade pattern:
 - **Facade pattern**: All public types are re-exported through the root `jobs` package. Users should never import `pkg/` sub-packages directly.
 - **Constructor pattern**: Use `NewXxx()` factory functions, not direct struct initialization.
 - **Error handling**: Return sentinel errors from storage layer (e.g., `ErrJobAlreadyPaused`). Convert to user-facing errors at the API boundary.
+- **Failed handler output**: Top-level handlers returning both an error and nonzero JSON-serializable output include that output in the failure message, subject to redaction and length limits. The original error remains wrapped for retry classification.
 - **Concurrency**: Queue's event system uses `sync.RWMutex` for subscriber management. Worker tracks running jobs with per-job cancel functions. Use `sync.Once` for one-time initialization (e.g., `StatsCollector.ready`).
 - **Event system**: Channels are buffered (100 elements). `Unsubscribe()` removes the channel but does NOT close it. Callers must stop reading before calling `Unsubscribe`. `Emit` copies the subscriber slice under RLock to avoid holding the lock during sends.
 - **Context lifecycle**: Background goroutines (like stats collector) should accept a `context.Context` for shutdown. Use bounded timeout contexts for flush operations during shutdown (e.g., 5s timeout).
