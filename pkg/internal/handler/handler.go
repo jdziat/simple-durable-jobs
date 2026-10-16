@@ -133,7 +133,8 @@ func (h *Handler) ValidateArgs(name string, args any) error {
 
 // Execute runs the handler with the given context and arguments.
 // Returns the JSON-marshaled return value (or nil for error-only handlers
-// or when the handler returned an error) and any handler error.
+// or when the handler returned an error) and any handler error. On failure,
+// nonzero, serializable output is included in the error message for recovery.
 func (h *Handler) Execute(ctx context.Context, argsJSON []byte) ([]byte, error) {
 	// Defensive check: ensure handler function is valid
 	if !h.Fn.IsValid() || h.Fn.IsNil() {
@@ -173,7 +174,15 @@ func (h *Handler) Execute(ctx context.Context, argsJSON []byte) ([]byte, error) 
 		return nil, nil
 	case 2:
 		if !results[1].IsNil() {
-			return nil, results[1].Interface().(error)
+			handlerErr := results[1].Interface().(error)
+			if !results[0].IsZero() {
+				// Output is diagnostic here, not a successful result. A marshal
+				// failure must never replace the handler's original error.
+				if output, err := json.Marshal(results[0].Interface()); err == nil && string(output) != "null" {
+					return nil, fmt.Errorf("%w; output: %s", handlerErr, security.SanitizeErrorMessage(string(output)))
+				}
+			}
+			return nil, handlerErr
 		}
 		// Marshal the return value to JSON bytes.
 		resultBytes, marshalErr := json.Marshal(results[0].Interface())
