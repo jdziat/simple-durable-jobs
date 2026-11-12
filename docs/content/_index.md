@@ -140,7 +140,7 @@ func main() {
   {{< hextra/feature-card
     icon="lock-closed"
     title="Payload Encryption"
-    subtitle="Plug in a codec to transparently encrypt job arguments, results, checkpoints, and error text (last_error / dead-letter reason) at rest, with key rotation, at the storage boundary. (opt-in; encrypts the listed fields at the application/storage boundary; it is not whole-database encryption and is not a compliance attestation.)"
+    subtitle="Plug in a codec to transparently encrypt job arguments, results, checkpoints, and error text (last_error / dead-letter reason) at rest, with key rotation, at the storage boundary. (opt-in; encrypts the listed fields at the application/storage boundary, and is not whole-database encryption or a compliance attestation.)"
   >}}
 {{< /hextra/feature-grid >}}
 

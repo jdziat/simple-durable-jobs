@@ -181,7 +181,7 @@ twice.
 
 So a job row guarded by a window is retained for `max(retention window, window
 TTL)`. Once the window lapses, the next pass collects the job row and the lock
-row together, so growth stays bounded by the TTL you chose; but a long TTL is a
+row together, so growth stays bounded by the TTL you chose, but a long TTL is a
 deliberate decision to keep those rows that long. To remove such a job sooner,
 delete it explicitly: `DeleteJob`, `DeleteWorkflowSubtree` and the dashboard's
 purge all release the job's window along with the row.
@@ -261,7 +261,7 @@ nothing. The trade-off is that completed jobs then show an empty checkpoints
 panel in the dashboard.
 
 The option needs no background sweep and is independent of the per-status
-windows; but it is a `Retention*` option, so it has to be passed inside
+windows, but it is a `Retention*` option, so it has to be passed inside
 `WithRetention`, and by the replace-not-merge rule that call drops the stock
 windows. Passing it *alone* therefore turns the terminal-row sweep off entirely
 and the worker logs the "retention is disabled" warning. Restate the windows you

@@ -62,8 +62,8 @@ a warranty of fitness for any particular use.
   most one worker holds a job's lock. Lock timing is anchored to the **database
   clock** on Postgres/MySQL, so a worker whose own clock is skewed cannot reclaim
   a live lock early. That anchoring is not covered by a dedicated chaos
-  invariant; the suite's clock-skew handling concerns scheduled fires, not lock
-  reclaim; so treat it as a design property, not an asserted one.
+  invariant: the suite's clock-skew handling concerns scheduled fires, not lock
+  reclaim, so treat it as a design property, not an asserted one.
 - **Checkpointed workflows**: completed `Call()` steps are not re-executed on
   replay (subject to the at-least-once window above). The fan-out's *status*
   advance is a SECOND write that commits **after** the sub-job's terminal
@@ -113,7 +113,7 @@ is almost certainly wrong for short jobs. The relevant knobs:
   contact** before the reaper reclaims the job (default 45m). The anchor is
   `COALESCE(last_heartbeat_at, started_at, locked_until)`; the worker's last
   contact (a live heartbeat, else when it started, else the lease as a last
-  resort), measured as *time since last contact*, not lease expiry; so reclaim
+  resort), measured as *time since last contact*, not lease expiry, so reclaim
   latency is roughly `StaleLockAge`, regardless of how far an in-flight lease has
   been pushed out.
   `StaleLockAge` also governs the heartbeat interval: it is clamped to
@@ -215,7 +215,7 @@ mid-replay. Two consequences:
 
    **`Requeue` on a listed job does nothing.** It is the only operation that
    clears checkpoints, but it accepts only `failed` or `cancelled` jobs, and this
-   listing excludes those statuses; so the two sets are disjoint and it returns
+   listing excludes those statuses, so the two sets are disjoint and it returns
    `false`. To clear a listed job you must cancel it first
    (`CancelJobTerminal`, then `Requeue`), which **restarts** the workflow rather
    than resuming it, and does not un-consume signals a previous run consumed. See

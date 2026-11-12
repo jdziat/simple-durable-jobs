@@ -69,7 +69,7 @@ the lease-expiry sweep intentionally preserves, so concurrent contenders for the
 same slot always have a row to lock before they count and insert.
 
 That permanent sentinel is what makes the cap correct, but it means the key must
-come from a **bounded, enumerable set**; a fixed list of tenants, regions, or
+come from a **bounded, enumerable set**: a fixed list of tenants, regions, or
 resource classes. Partitioning on a high-cardinality value (a job ID, a UUID, or
 arbitrary user input) creates a new permanent row per distinct value and grows
 `concurrency_slots` without bound. For "only N of these at a time" use a bounded
