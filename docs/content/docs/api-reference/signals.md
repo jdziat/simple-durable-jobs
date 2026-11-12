@@ -4,8 +4,8 @@ weight: 4
 ---
 
 Signals let an **external producer** influence a **running or waiting** workflow
-mid-flight, update an AI agent's context, inject new instructions, or unblock a
-human-in-the-loop step, without restarting the job. They are durable, buffered,
+mid-flight (update an AI agent's context, inject new instructions, or unblock a
+human-in-the-loop step) without restarting the job. They are durable, buffered,
 and delivered **FIFO per `(job, name)`**.
 
 Signals are built on the same **suspend, resume, and checkpoint-replay** machinery

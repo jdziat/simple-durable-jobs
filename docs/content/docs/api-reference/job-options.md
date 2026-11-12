@@ -151,8 +151,8 @@ Either way the deadline is live, and it is not a label you can attach for
 documentation purposes.
 
 {{< callout type="warning" >}}
-**Corrected.** Every release through v4.7.0 shipped this page, and the options
-snippet in `README.md`, describing `Timeout` as an advisory label that
+**Corrected.** Every release through v4.7.0 shipped this page (and the options
+snippet in `README.md`) describing `Timeout` as an advisory label that
 applications had to police themselves. That was never true; the worker has
 always wrapped the handler in `context.WithTimeout`, and the godoc on
 `jobs.Timeout` and `Queue.Enqueue` described the real behaviour all along. If you
@@ -186,8 +186,8 @@ checkpoint. What the modes differ on is how a replayed `Call` that
 | `Strict` | Same as the default. | Fails the job **terminally** (non-retryable) after the handler returns: `jobs: strict determinism violation: N recorded Call checkpoint(s) were not replayed`. This is the case where the handler issued **fewer or reordered** `Call`s than the original run. |
 | `BestEffort` | Logs a warning and **re-executes** the call instead of erroring. | Tolerated. |
 
-Note what `Strict` does *not* do. It never panics; every outcome above is a
-returned error, and it does not fire when a replay adds a call that was not
+Note what `Strict` does *not* do. It never panics (every outcome above is a
+returned error) and it does not fire when a replay adds a call that was not
 there before. Its extra guard is the opposite trigger: a replay that drops or
 reorders calls it previously made. If you are trying to catch a handler whose
 `Call` sequence *grows* nondeterministically, no mode reports it; assert on the

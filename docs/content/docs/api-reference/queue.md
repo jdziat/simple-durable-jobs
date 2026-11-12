@@ -23,8 +23,7 @@ queue := jobs.New(storage)
 
 ### `(*Queue) Register(name string, fn any, opts ...Option)`
 
-Registers a job handler function. The function takes **one or two** parameters:
-an optional leading `context.Context`, then an optional args value, and returns
+Registers a job handler function. The function takes **one or two** parameters (an optional leading `context.Context`, then an optional args value) and returns
 either `error` or `(R, error)`. Every combination is accepted:
 
 ```go

@@ -33,8 +33,8 @@ instant on that calendar day whose clock in `loc` has reached `hour:minute`**:
 - the reading exists twice (fall back), and the **first** occurrence fires.
 
 `Next` always returns an instant strictly after its argument, so a schedule can
-never stall. A calendar day that cannot hold the fire at all; a location can skip
-the tail of a day, or a whole day when it crosses the date line, is skipped
+never stall. A calendar day that cannot hold the fire at all (a location can skip
+the tail of a day, or a whole day when it crosses the date line) is skipped
 rather than pushed onto the next day.
 
 `Daily(h, m)` is `DailyIn(time.UTC, h, m)`, and UTC has no DST, so none of the

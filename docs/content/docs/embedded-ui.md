@@ -138,8 +138,8 @@ RPC access.
 ui.WithInsecureAllowUnauthenticated()
 ```
 
-Permits every dashboard RPC, reads *and* mutations, including `CancelJob` and
-`PauseQueue`, with no authorization at all. Local development and trusted
+Permits every dashboard RPC (reads *and* mutations, including `CancelJob` and
+`PauseQueue`) with no authorization at all. Local development and trusted
 networks only.
 
 ### WithAllowedOrigins

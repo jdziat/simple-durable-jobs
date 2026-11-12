@@ -115,8 +115,8 @@ the old branch:
 version, err := jobs.GetVersion(ctx, "shipping-v2", 1, 1)
 ```
 
-If an old run still has `DefaultVersion` recorded, or is pinned to it by the
-checkpoints it carries; this returns `jobs.ErrUnsupportedWorkflowVersion`
+If an old run still has `DefaultVersion` recorded (or is pinned to it by the
+checkpoints it carries), this returns `jobs.ErrUnsupportedWorkflowVersion`
 instead of silently taking the wrong branch. Removing the old arm while such runs
 exist therefore fails them loudly on the sentinel; wrap it in `jobs.NoRetry` (as
 the pattern above does) if you would rather they dead-letter for triage than

@@ -84,7 +84,7 @@ because what recovers it depends on the backend:
   with a still-`pending` fan-out, which this one is. The parent waits forever, or,
   on a backend whose scan is more permissive, is resumed every recovery tick,
   replays the whole handler, finds the fan-out still non-terminal and marks itself
-  `waiting` again; a workflow that never finishes even though every sub-job
+  `waiting` again: a workflow that never finishes even though every sub-job
   completed.
 
 So if you write a custom backend, implement **either** `CompleteWithResult`

@@ -276,8 +276,8 @@ under unexpected dequeue pressure.
 
 ## Dequeue Index
 
-The dequeue hot path claims the highest-priority *eligible* job, pending, with
-its scheduled time reached, using `FOR UPDATE SKIP LOCKED`, ordered by
+The dequeue hot path claims the highest-priority *eligible* job (pending, with
+its scheduled time reached) using `FOR UPDATE SKIP LOCKED`, ordered by
 `priority DESC` then eligibility time. A single index, `idx_jobs_dequeue_eligible`,
 serves both ready and delayed/scheduled jobs by folding `run_at` into the
 eligibility key (`COALESCE(run_at, created_at)`):
@@ -326,8 +326,8 @@ pass.
 ### MySQL must default to utf8mb4
 
 The schema pins `utf8mb4_0900_*` collations, which exist only in **MySQL 8.0+**.
-A database still defaulting to `utf8mb3`; the MySQL 5.x-era default, and what an
-older `CREATE DATABASE` leaves behind, cannot carry them: the column would
+A database still defaulting to `utf8mb3` (the MySQL 5.x-era default, and what an
+older `CREATE DATABASE` leaves behind) cannot carry them: the column would
 inherit `utf8mb3` while being handed a `utf8mb4` collation, and the server
 rejects it with `ER_COLLATION_CHARSET_MISMATCH`.
 
@@ -363,8 +363,8 @@ lock) before rolling out the upgrade:
 - **New index builds.** Versioned index migrations use plain `CREATE INDEX`, which
   on PostgreSQL takes a `SHARE` lock that blocks writes for the build duration. If
   you add an index migration against a large `jobs` table, build it first with
-  `CREATE INDEX CONCURRENTLY` out-of-band; it cannot run inside the transactional
-  migration runner, then deploy.
+  `CREATE INDEX CONCURRENTLY` out-of-band (it cannot run inside the transactional
+  migration runner), then deploy.
 - **MySQL collation migration (v15).** v15 pins `unique_key` /
   `active_unique_key` to `utf8mb4_0900_as_cs` (case- and accent-sensitive dedup,
   for cross-engine parity). On MySQL this is a table-copy `ALTER`: instant on a
