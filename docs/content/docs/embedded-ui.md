@@ -20,9 +20,9 @@ Import the `ui` package and mount the handler on any `http.ServeMux` or router.
 {{< callout type="warning" >}}
 **`ui.Handler` fails closed.** Without either [`ui.WithAuthorizer`](#withauthorizer)
 or [`ui.WithInsecureAllowUnauthenticated`](#withinsecureallowunauthenticated),
-*every* RPC returns `PermissionDenied`, the SPA shell loads and then shows
+*every* RPC returns `PermissionDenied`; the SPA shell loads and then shows
 nothing, with no error on the server side to explain it. The quickstart below
-uses the insecure opt-in and therefore binds explicitly to `127.0.0.1`, note
+uses the insecure opt-in and therefore binds explicitly to `127.0.0.1`; note
 that a bare `:8080` would bind every interface and publish the whole dashboard,
 mutating RPCs included. Anything reachable by other people needs a real
 authorizer, not a loopback bind. See
@@ -138,8 +138,8 @@ RPC access.
 ui.WithInsecureAllowUnauthenticated()
 ```
 
-Permits every dashboard RPC, reads *and* mutations, including `CancelJob` and
-`PauseQueue`, with no authorization at all. Local development and trusted
+Permits every dashboard RPC (reads *and* mutations, including `CancelJob` and
+`PauseQueue`) with no authorization at all. Local development and trusted
 networks only.
 
 ### WithAllowedOrigins
@@ -261,7 +261,7 @@ A paginated, filterable view of all jobs. You can filter by:
   light="images/dashboard/jobs-light.png"
   dark="images/dashboard/jobs-dark.png"
   alt="The Jobs view: a filterable table of jobs with ID, type, queue, status, attempts, and per-row Retry/Delete actions."
-  caption="The **Jobs** browser, filter by status, queue, or type, and retry or delete jobs inline." >}}
+  caption="The **Jobs** browser: filter by status, queue, or type, and retry or delete jobs inline." >}}
 
 ### Job Detail
 
@@ -289,13 +289,13 @@ Fan-out/fan-in jobs get a dedicated view showing each parent workflow, its strat
   light="images/dashboard/workflows-light.png"
   dark="images/dashboard/workflows-dark.png"
   alt="The Workflows view: fan-out/fan-in parents with strategy badges, completed/failed progress bars, and status."
-  caption="The **Workflows** view, track fan-out/fan-in progress and strategy at a glance." >}}
+  caption="The **Workflows** view: track fan-out/fan-in progress and strategy at a glance." >}}
 
 ### Historical Charts
 
 When the stats collector is active (requires `WithQueue` and a GORM-backed storage), the dashboard shows time-series charts of completed and failed jobs. The history can be viewed over four periods: `1h` (1 hour), `24h` (24 hours), `7d` (7 days), and `30d` (30 days). Each period spans its full window on a period-appropriate bucket width (1 minute, 30 minutes, 3 hours, 12 hours respectively), so the series stays bounded at roughly 48-60 points whichever period is selected. An unrecognised period string falls back to the `1h` window and its 1-minute buckets.
 
-`30d` is the longest window, which is why the default `WithStatsRetention` is 31 days, set it lower and the 30d chart renders short.
+`30d` is the longest window, which is why the default `WithStatsRetention` is 31 days; set it lower and the 30d chart renders short.
 
 ### Real-Time Events
 
@@ -336,7 +336,7 @@ The two series on the dashboard come from different places, and only one of them
 
 It can also under-report *within* that one process. Each subscriber gets a 100-event buffer and `Emit` **drops** rather than blocks when it is full, so a burst that outruns the collector is lost rather than queued. That is the right trade for an event bus -- a slow dashboard must never stall job execution -- but it means the chart is a sample, not a ledger.
 
-This is a property of the event bus, not a bug in the collector. The *drop* half is at least observable: `Queue.DroppedEventCount()` returns a running total, so a process that wants to can tell whether its own feed lost events (the dashboard does not surface it today). The *multi-process* half is not observable from inside one process at all, a queue simply has no way to know what its peers ran. If you need fleet-wide throughput, read it from the OpenTelemetry metrics in `pkg/metrics` (see [Metrics]({{< relref "/docs/advanced/metrics" >}})), which every process exports to your collector. Treat the dashboard's throughput chart as a view of one process.
+This is a property of the event bus, not a bug in the collector. The *drop* half is at least observable: `Queue.DroppedEventCount()` returns a running total, so a process that wants to can tell whether its own feed lost events (the dashboard does not surface it today). The *multi-process* half is not observable from inside one process at all; a queue simply has no way to know what its peers ran. If you need fleet-wide throughput, read it from the OpenTelemetry metrics in `pkg/metrics` (see [Metrics]({{< relref "/docs/advanced/metrics" >}})), which every process exports to your collector. Treat the dashboard's throughput chart as a view of one process.
 
 ### Stats Model
 
@@ -416,7 +416,7 @@ type UIStorage interface {
 ```
 
 `jobsv1` is `github.com/jdziat/simple-durable-jobs/v4/ui/gen/jobs/v1`. Job IDs
-are `core.UUID`, a defined string type, a method that takes `string` does not
+are `core.UUID`, a defined string type; a method that takes `string` does not
 satisfy this interface.
 
 `UIStorage` is discovered by a **type assertion**, not by a compile-time

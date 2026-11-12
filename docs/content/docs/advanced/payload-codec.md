@@ -45,7 +45,7 @@ bytes unchanged. Nil or empty payloads are not encoded or decoded.
 ## What the codec does not cover
 
 The codec transforms payload and error bytes only. Columns you populate through
-the API, notably `unique_key`, `tenant`, `queue`, and the `metadata` JSON, are
+the API (notably `unique_key`, `tenant`, `queue`, and the `metadata` JSON) are
 stored **as you supply them**, in cleartext, under every codec including Secretbox.
 
 For `unique_key` this is structural rather than an oversight: deduplication works
@@ -53,7 +53,7 @@ by an equality lookup against a unique index, so the value has to be stored in a
 form the database can compare. Encrypting it with a nonce would make two identical
 keys store as different ciphertexts and dedup would stop working entirely.
 
-Choose these values accordingly, derive `unique_key` from a hash or an opaque ID
+Choose these values accordingly; derive `unique_key` from a hash or an opaque ID
 rather than embedding an email address, account number, or other PII directly.
 
 ## Secretbox encryption

@@ -193,7 +193,7 @@ worker.Start(ctx) // Blocks until ctx is cancelled AND in-flight handlers drain
 ```
 
 For graceful shutdown, cancel the context on a signal and then **wait for
-`Start` to return**, that return is the only indication the drain has finished:
+`Start` to return**; that return is the only indication the drain has finished:
 
 ```go
 ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -370,7 +370,7 @@ mux.Handle("/jobs/", http.StripPrefix("/jobs", ui.Handler(storage,
 )))
 ```
 
-The dashboard fails closed by default: without `ui.WithAuthorizer(...)` or `ui.WithInsecureAllowUnauthenticated()`, all dashboard RPCs (reads and mutations) return `PermissionDenied`. This is an authorization gate only, it does not provide transport encryption, CSRF protection, or audit logging; operate the dashboard behind your own TLS and network controls.
+The dashboard fails closed by default: without `ui.WithAuthorizer(...)` or `ui.WithInsecureAllowUnauthenticated()`, all dashboard RPCs (reads and mutations) return `PermissionDenied`. This is an authorization gate only; it does not provide transport encryption, CSRF protection, or audit logging, so operate the dashboard behind your own TLS and network controls.
 
 The dashboard shows real-time queue stats, historical charts, live event streaming, and job management controls.
 
@@ -414,7 +414,7 @@ Each worker will process jobs from the queue without duplicates.
 
 ### Hardening for production
 
-Two knobs matter most once you're running multiple workers against a shared database. Both have sensible defaults, so reach for them when you're tuning, the dedicated pages cover the trade-offs in depth:
+Two knobs matter most once you're running multiple workers against a shared database. Both have sensible defaults, so reach for them when you're tuning; the dedicated pages cover the trade-offs in depth:
 
 {{< cards >}}
   {{< card link="../advanced/stale-lock-reaper/" title="Stale Lock Reaper" icon="refresh" subtitle="Workers automatically reclaim jobs stuck in 'running' after a crash. Tune with WithStaleLockInterval and WithStaleLockAge." >}}

@@ -96,7 +96,7 @@ row left to triage.
 Widen `RetentionFailedAfter` to however long operators need to inspect,
 diagnose, export, or requeue dead-lettered jobs. `WithRetention` **replaces** the
 stock windows rather than merging with them, so restate the windows you still
-want, a window omitted from the call is `0`, which keeps that status forever:
+want; a window omitted from the call is `0`, which keeps that status forever:
 
 ```go
 w := jobs.NewWorker(q,

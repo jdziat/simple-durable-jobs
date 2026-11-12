@@ -7,7 +7,7 @@ weight: 10
 
 Workers delete terminal job rows and consumed signal rows on their own. A worker
 built with no retention options starts a background retention loop using the
-stock windows below, there is nothing to switch on, and rows older than a window
+stock windows below; there is nothing to switch on, and rows older than a window
 are deleted permanently.
 
 ```go
@@ -36,7 +36,7 @@ history.
 Pending (unconsumed) signal rows are workflow state and are never pruned. If an
 audit, compliance, or archival policy needs terminal job history for longer than
 these windows, widen them with `WithRetention` or turn retention off and manage
-deletion yourself, the sweep does not ask, and the deletes are not recoverable.
+deletion yourself; the sweep does not ask, and the deletes are not recoverable.
 
 ### Startup log
 
@@ -101,7 +101,7 @@ w := jobs.NewWorker(q,
 ## The DefaultRetention preset
 
 `jobs.DefaultRetention()` is **not** what a default worker uses. It is an
-explicit preset whose windows are *tighter* than the stock ones, it deletes
+explicit preset whose windows are *tighter* than the stock ones; it deletes
 completed jobs after a week rather than a month:
 
 <!--
@@ -174,7 +174,7 @@ write locks.
 Retention never deletes a terminal job that a still-live `unique_locks` row
 references. `jobs.IdempotencyKey` and `jobs.UniqueFor` promise to keep
 deduplicating until their own TTL expires, and an operator who writes
-`jobs.IdempotencyKey("invoice-42", 90*24*time.Hour)` means it, if the sweep
+`jobs.IdempotencyKey("invoice-42", 90*24*time.Hour)` means it: if the sweep
 removed the job at the 30 day (or `jobs.DefaultRetention()`'s 7 day) horizon, the
 replayed request on day 31 would enqueue a second job and do the guarded work
 twice.

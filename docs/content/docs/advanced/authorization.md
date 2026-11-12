@@ -148,7 +148,7 @@ The dashboard passes one of these actions for mutating RPCs:
 
 `ui.Handler` fails closed by default: without `ui.WithAuthorizer(...)` or
 `ui.WithInsecureAllowUnauthenticated()`, all dashboard RPCs (reads and mutations) return
-`PermissionDenied`. This is an authorization gate only, it does not provide
+`PermissionDenied`. This is an authorization gate only; it does not provide
 transport encryption, CSRF protection, or audit logging; operate the dashboard
 behind your own TLS and network controls. Static frontend assets remain public
 because they do not carry job payloads or metadata.

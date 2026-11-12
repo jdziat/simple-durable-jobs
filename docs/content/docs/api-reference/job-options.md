@@ -71,7 +71,7 @@ serialized fragment can over-match.
 
 ### `Unique(key string) Option`
 
-Ensures only one *unfinished* job with this `key` exists. If a matching job already exists, `Queue.Enqueue` returns `ErrDuplicateJob`. The uniqueness check runs inside a transaction with row-level locking on Postgres/MySQL and relies on SQLite's writer serialization. The key has no TTL, the guard releases as soon as the existing job reaches `completed`, `failed`, or `cancelled`, and is held in every other status: `pending`, `running`, `retrying`, and also `waiting` (parked on a signal or fan-out) and `paused`.
+Ensures only one *unfinished* job with this `key` exists. If a matching job already exists, `Queue.Enqueue` returns `ErrDuplicateJob`. The uniqueness check runs inside a transaction with row-level locking on Postgres/MySQL and relies on SQLite's writer serialization. The key has no TTL; the guard releases as soon as the existing job reaches `completed`, `failed`, or `cancelled`, and is held in every other status: `pending`, `running`, `retrying`, and also `waiting` (parked on a signal or fan-out) and `paused`.
 
 This page previously said "pending-or-running" in the first sentence and "releases on completed/failed/cancelled" in the last, which are not the same rule. The implementation followed the first and a `waiting` holder stopped deduplicating; it now follows the second, matching `IdempotencyKey`/`UniqueFor`, which have always treated a parked job as still in progress.
 
@@ -111,7 +111,7 @@ jobID, err := queue.Enqueue(ctx, "sync-account", args,
 
 `Unique` and the windowed options solve different problems. `Unique` is an
 active-job guard: it blocks another job with the same key while the holder is in
-ANY non-terminal status, pending, running, retrying, waiting or paused, and
+ANY non-terminal status (pending, running, retrying, waiting or paused) and
 releases only when the holder becomes terminal. `IdempotencyKey` and `UniqueFor`
 are time-window guards: they keep deduplicating until the TTL expires, even if
 the original job completed quickly.
@@ -151,9 +151,9 @@ Either way the deadline is live, and it is not a label you can attach for
 documentation purposes.
 
 {{< callout type="warning" >}}
-**Corrected.** Every release through v4.7.0 shipped this page, and the options
-snippet in `README.md`, describing `Timeout` as an advisory label that
-applications had to police themselves. That was never true, the worker has
+**Corrected.** Every release through v4.7.0 shipped this page (and the options
+snippet in `README.md`) describing `Timeout` as an advisory label that
+applications had to police themselves. That was never true; the worker has
 always wrapped the handler in `context.WithTimeout`, and the godoc on
 `jobs.Timeout` and `Queue.Enqueue` described the real behaviour all along. If you
 built on the old wording, check any handler that ignores `ctx` during a long
@@ -186,8 +186,8 @@ checkpoint. What the modes differ on is how a replayed `Call` that
 | `Strict` | Same as the default. | Fails the job **terminally** (non-retryable) after the handler returns: `jobs: strict determinism violation: N recorded Call checkpoint(s) were not replayed`. This is the case where the handler issued **fewer or reordered** `Call`s than the original run. |
 | `BestEffort` | Logs a warning and **re-executes** the call instead of erroring. | Tolerated. |
 
-Note what `Strict` does *not* do. It never panics, every outcome above is a
-returned error, and it does not fire when a replay adds a call that was not
+Note what `Strict` does *not* do. It never panics (every outcome above is a
+returned error) and it does not fire when a replay adds a call that was not
 there before. Its extra guard is the opposite trigger: a replay that drops or
 reorders calls it previously made. If you are trying to catch a handler whose
 `Call` sequence *grows* nondeterministically, no mode reports it; assert on the

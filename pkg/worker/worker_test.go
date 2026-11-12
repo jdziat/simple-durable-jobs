@@ -1786,13 +1786,21 @@ func newSQLiteQueue(t *testing.T) (*queue.Queue, func()) {
 		Logger: logger.Default.LogMode(logger.Silent),
 	})
 	require.NoError(t, err)
+	// A shared-cache in-memory database is destroyed when its last connection
+	// closes. database/sql closes a connection whose query was interrupted by a
+	// cancelled context, so a shutdown-time query could drop the only connection
+	// and the next one would open an empty database ("no such table: jobs").
+	// Hold one connection for the life of the test so the database outlives them.
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	pin, err := sqlDB.Conn(context.Background())
+	require.NoError(t, err)
 	store := storage.NewGormStorage(db)
 	require.NoError(t, store.Migrate(context.Background()))
 	q := queue.New(store)
 	return q, func() {
-		if sqlDB, dbErr := db.DB(); dbErr == nil {
-			_ = sqlDB.Close()
-		}
+		_ = pin.Close()
+		_ = sqlDB.Close()
 	}
 }
 

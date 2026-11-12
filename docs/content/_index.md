@@ -140,7 +140,7 @@ func main() {
   {{< hextra/feature-card
     icon="lock-closed"
     title="Payload Encryption"
-    subtitle="Plug in a codec to transparently encrypt job arguments, results, checkpoints, and error text (last_error / dead-letter reason) at rest, with key rotation, at the storage boundary. (opt-in; encrypts the listed fields at the application/storage boundary, it is not whole-database encryption and is not a compliance attestation.)"
+    subtitle="Plug in a codec to transparently encrypt job arguments, results, checkpoints, and error text (last_error / dead-letter reason) at rest, with key rotation, at the storage boundary. (opt-in; encrypts the listed fields at the application/storage boundary, and is not whole-database encryption or a compliance attestation.)"
   >}}
 {{< /hextra/feature-grid >}}
 
@@ -149,8 +149,8 @@ func main() {
 <div class="sdj-shot-wrap">
   <div class="sdj-window">
     <div class="sdj-window__bar"><span></span><span></span><span></span><span class="sdj-window__title">localhost:8080/jobs/</span></div>
-    <img class="hx:block hx:dark:hidden" src="/simple-durable-jobs/images/dashboard/dashboard-light.png" alt="Simple Durable Jobs embedded dashboard, queue stats, throughput chart, and per-queue table" loading="lazy">
-    <img class="hx:hidden hx:dark:block" src="/simple-durable-jobs/images/dashboard/dashboard-dark.png" alt="Simple Durable Jobs embedded dashboard (dark), queue stats, throughput chart, and per-queue table" loading="lazy">
+    <img class="hx:block hx:dark:hidden" src="/simple-durable-jobs/images/dashboard/dashboard-light.png" alt="Simple Durable Jobs embedded dashboard: queue stats, throughput chart, and per-queue table" loading="lazy">
+    <img class="hx:hidden hx:dark:block" src="/simple-durable-jobs/images/dashboard/dashboard-dark.png" alt="Simple Durable Jobs embedded dashboard (dark): queue stats, throughput chart, and per-queue table" loading="lazy">
   </div>
   <a class="sdj-quietlink" href="/simple-durable-jobs/docs/live-demo/">Try the interactive demo, running on simulated data</a>
 </div>

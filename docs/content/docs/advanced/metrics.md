@@ -141,7 +141,7 @@ DB transaction (a high-cardinality-`RateLimitKey` signal).
 
 Note the per-key cooldown removes the DB rate transaction but **not** the
 claim/release itself, so for keyed configs `released{reason="fleet_rate_cached"}`
-(and the underlying claim/release write volume) can stay high even when healthy,
+(and the underlying claim/release write volume) can stay high even when healthy;
 it is the DB-transaction count, not the release count, that the cooldown reduces.
 Trade-offs: a just-recovered limit can wait up to one rate window before this
 worker probes it again, and the keyed saving is per-worker and locality-dependent

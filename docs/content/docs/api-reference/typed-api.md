@@ -36,7 +36,7 @@ match the handler's return type.
 `fn` is declared as `any` so `Define` accepts every handler shape
 `Queue.Register` accepts (`func(ctx, A) (R, error)`, `func(A) (R, error)`, …)
 and validates it reflectively. The consequence is that **`A` and `R` cannot be
-inferred from the arguments, you must always write the type parameters out**:
+inferred from the arguments; you must always write the type parameters out**:
 
 ```go
 sendEmail := typed.Define[SendEmailArgs, SendEmailResult](queue, "send-email",

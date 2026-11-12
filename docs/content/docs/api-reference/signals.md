@@ -4,8 +4,8 @@ weight: 4
 ---
 
 Signals let an **external producer** influence a **running or waiting** workflow
-mid-flight, update an AI agent's context, inject new instructions, or unblock a
-human-in-the-loop step, without restarting the job. They are durable, buffered,
+mid-flight (update an AI agent's context, inject new instructions, or unblock a
+human-in-the-loop step) without restarting the job. They are durable, buffered,
 and delivered **FIFO per `(job, name)`**.
 
 Signals are built on the same **suspend, resume, and checkpoint-replay** machinery
@@ -134,7 +134,7 @@ short-circuiting the already-done work. The same rule as fan-out applies:
   checkpoint before the wait is recomputed on resume.
 - **Every signal observation is itself a checkpoint** keyed by call index, so a
   wait that consumed payload `X`, a peek that found nothing, or a timeout that
-  fired all replay to the same outcome, a signal arriving *after* a recorded
+  fired all replay to the same outcome; a signal arriving *after* a recorded
   peek cannot retroactively change it.
 - Under **strict determinism**, signal calls count as Call-index checkpoints, so
   a *conditional* signal call must keep a deterministic call sequence (or use

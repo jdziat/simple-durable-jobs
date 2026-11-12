@@ -114,10 +114,10 @@ worker := jobs.NewWorker(queue,
 | Parameter | Default | Guidance |
 |-----------|---------|----------|
 | `WithStaleLockInterval` | 5 min | Lower values detect stale jobs faster but add more database queries. Non-positive values keep the default; positive values below 1s are clamped to 1s. For high-throughput clusters, 2-3 minutes is reasonable. |
-| `WithStaleLockAge` | 45 min | How long the owning worker may be silent (send no heartbeat) before its job is reclaimed. This directly sets your post-crash recovery latency, a smaller value reclaims abandoned jobs faster. A live worker refreshes `last_heartbeat_at` several times per window, so an active job is never falsely reclaimed (see below); lower it freely if you want faster crash recovery. |
+| `WithStaleLockAge` | 45 min | How long the owning worker may be silent (send no heartbeat) before its job is reclaimed. This directly sets your post-crash recovery latency; a smaller value reclaims abandoned jobs faster. A live worker refreshes `last_heartbeat_at` several times per window, so an active job is never falsely reclaimed (see below); lower it freely if you want faster crash recovery. |
 
 A live worker refreshes `last_heartbeat_at` several times within every
-`StaleLockAge` window, the heartbeat interval is auto-clamped to
+`StaleLockAge` window; the heartbeat interval is auto-clamped to
 `StaleLockAge/3` (with a 200ms floor), so roughly three heartbeats land before
 the stale window could elapse. An active job's last-contact timestamp therefore
 stays well inside the window and is never reclaimed. Because reclaim now anchors

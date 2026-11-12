@@ -18,7 +18,7 @@ Documentation for **Simple Durable Jobs**, a Go library for durable job queues w
   {{< card link="embedded-ui/" title="Embedded Web UI" icon="chart-bar" subtitle="Mount the real-time monitoring dashboard into your own HTTP server." >}}
   {{< card link="production-ops/" title="Production Operations" icon="shield-check" subtitle="Run workers in production: migrations, graceful drain, probes, CLI, throughput tuning, metrics, DLQ, and retention." >}}
   {{< card link="migration-v1-to-v2/" title="Migrating from v1 to v2" icon="switch-horizontal" subtitle="Mechanical /v2 import-path migration, storage method rename notes, and rolling-deploy safety." >}}
-  {{< card link="live-demo/" title="Live Demo" icon="play" subtitle="Try the dashboard in your browser on simulated data, no backend required." >}}
+  {{< card link="live-demo/" title="Live Demo" icon="play" subtitle="Try the dashboard in your browser on simulated data: no backend required." >}}
   {{< card link="benchmarks/" title="Benchmarks" icon="chart-bar" subtitle="Measured enqueue, end-to-end, workflow, and dispatch-latency results with reproduction commands." >}}
   {{< card link="comparison/" title="Choosing a Job System" icon="scale" subtitle="Comparison with River, Temporal, and Asynq, including where each is stronger." >}}
   {{< card link="migrating-from-river/" title="Migrating from River" icon="database" subtitle="Map River clients, workers, transactional inserts, unique jobs, and schedules to this library." >}}

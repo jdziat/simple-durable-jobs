@@ -54,14 +54,14 @@ On cancellation the worker runs three phases:
 |---|---|---|
 | 1. Drain | Stop dispatching, close the dispatch channel, wait for in-flight handlers to finish **on their own**. Handler contexts are *not* cancelled here. | `DrainTimeout`, default 30s, set with `WithDrainTimeout(d)` |
 | 2. Force-cancel | Cancel every remaining handler context, wait again. | A fixed 5-second forced-drain grace, then the worker logs `in-flight handlers did not exit within the forced-drain grace; abandoning them` and moves on **while they are still executing** |
-| 3. Background wait | Wait for the reaper, scheduler, retention and other internal goroutines. | Unbounded, none is abandoned mid-write |
+| 3. Background wait | Wait for the reaper, scheduler, retention and other internal goroutines. | Unbounded: none is abandoned mid-write |
 
 Two consequences that are easy to get wrong:
 
 {{< callout type="warning" >}}
 **Handlers do not see `ctx.Done()` during phase 1.** Worker-context cancellation
 is deliberately *not* propagated to running handlers while the drain window is
-open, that is what gives a handler its full `DrainTimeout` to finish the work it
+open; that is what gives a handler its full `DrainTimeout` to finish the work it
 already started. `ctx.Done()` fires only in phase 2, i.e. after the whole
 `DrainTimeout` has elapsed. So a lengthening `DrainTimeout` does not give a
 cancellation-aware handler more warning; it delays the warning, and delays
@@ -85,7 +85,7 @@ force-cancels handlers immediately.
 
 `Start` returns after phase 3, but **phase 2 is bounded**: a handler that ignores
 its context is abandoned, not waited for, so it may still be executing after
-`Start` returns. Do not treat `Start`'s return as proof that no handler is live,
+`Start` returns. Do not treat `Start`'s return as proof that no handler is live:
 closing the `*sql.DB`, flushing tracing, or calling `os.Exit` immediately can
 yank the pool out from under an abandoned handler mid-transaction. Make handlers
 context-aware and keep them shorter than `DrainTimeout`; that, not the return of
@@ -276,8 +276,8 @@ under unexpected dequeue pressure.
 
 ## Dequeue Index
 
-The dequeue hot path claims the highest-priority *eligible* job, pending, with
-its scheduled time reached, using `FOR UPDATE SKIP LOCKED`, ordered by
+The dequeue hot path claims the highest-priority *eligible* job (pending, with
+its scheduled time reached) using `FOR UPDATE SKIP LOCKED`, ordered by
 `priority DESC` then eligibility time. A single index, `idx_jobs_dequeue_eligible`,
 serves both ready and delayed/scheduled jobs by folding `run_at` into the
 eligibility key (`COALESCE(run_at, created_at)`):
@@ -292,7 +292,7 @@ eligibility key (`COALESCE(run_at, created_at)`):
   order, so a large steady-state **ready** backlog used to filesort. The
   dequeue now also filters a stored `dq_ready` boolean (see below) and is served
   by `idx_jobs_dq_ready (status, dq_ready, priority DESC, dq_eligible_at, queue)`:
-  equality on `(status, dq_ready)` then the index's own priority order, **no
+  equality on `(status, dq_ready)` then the index's own priority order: **no
   filesort**, the claim reads one row and stops.
 
 This replaces the earlier `idx_jobs_dequeue` / `idx_jobs_dequeue_order` indexes,
@@ -326,8 +326,8 @@ pass.
 ### MySQL must default to utf8mb4
 
 The schema pins `utf8mb4_0900_*` collations, which exist only in **MySQL 8.0+**.
-A database still defaulting to `utf8mb3`, the MySQL 5.x-era default, and what an
-older `CREATE DATABASE` leaves behind, cannot carry them: the column would
+A database still defaulting to `utf8mb3` (the MySQL 5.x-era default, and what an
+older `CREATE DATABASE` leaves behind) cannot carry them: the column would
 inherit `utf8mb3` while being handed a `utf8mb4` collation, and the server
 rejects it with `ER_COLLATION_CHARSET_MISMATCH`.
 
@@ -363,8 +363,8 @@ lock) before rolling out the upgrade:
 - **New index builds.** Versioned index migrations use plain `CREATE INDEX`, which
   on PostgreSQL takes a `SHARE` lock that blocks writes for the build duration. If
   you add an index migration against a large `jobs` table, build it first with
-  `CREATE INDEX CONCURRENTLY` out-of-band, it cannot run inside the transactional
-  migration runner, then deploy.
+  `CREATE INDEX CONCURRENTLY` out-of-band (it cannot run inside the transactional
+  migration runner), then deploy.
 - **MySQL collation migration (v15).** v15 pins `unique_key` /
   `active_unique_key` to `utf8mb4_0900_as_cs` (case- and accent-sensitive dedup,
   for cross-engine parity). On MySQL this is a table-copy `ALTER`: instant on a
@@ -475,7 +475,7 @@ separate archive table.
 
 Requeue clears DLQ metadata, resets execution state, and deletes checkpoints so
 the workflow starts from the beginning. The dashboard's Retry button does the
-same thing, it routes through the identical replay-from-scratch reset, so it
+same thing; it routes through the identical replay-from-scratch reset, so it
 is **not** a way to resume from existing checkpoints. Neither path preserves
 them, and there is no operation that does. Handlers still must be idempotent:
 every step of a requeued workflow runs again, including steps that already

@@ -69,7 +69,7 @@ the lease-expiry sweep intentionally preserves, so concurrent contenders for the
 same slot always have a row to lock before they count and insert.
 
 That permanent sentinel is what makes the cap correct, but it means the key must
-come from a **bounded, enumerable set**, a fixed list of tenants, regions, or
+come from a **bounded, enumerable set**: a fixed list of tenants, regions, or
 resource classes. Partitioning on a high-cardinality value (a job ID, a UUID, or
 arbitrary user input) creates a new permanent row per distinct value and grows
 `concurrency_slots` without bound. For "only N of these at a time" use a bounded
@@ -77,7 +77,7 @@ key; do not derive it from `job.ID` or free-form data.
 
 ## Prefer a cap key that is stable per job
 
-Bounded is not quite the whole story, the key should also be **stable for a given
+Bounded is not quite the whole story; the key should also be **stable for a given
 job across re-dispatches**. A job can be dequeued twice by the same worker: the
 stale-lock reaper can release a lock this worker then reclaims, and the two runs
 briefly overlap.

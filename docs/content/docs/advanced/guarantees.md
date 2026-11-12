@@ -7,11 +7,11 @@ This page is the contract: what Simple Durable Jobs guarantees, what it
 asks of you in return, and how to configure it for production. Read it before
 you put revenue-critical work on the queue.
 
-> **No warranty, use at your own risk.** Simple Durable Jobs is free,
+> **No warranty; use at your own risk.** Simple Durable Jobs is free,
 > open-source software provided "AS IS", without warranty of any kind, as set
 > out in the [LICENSE](https://github.com/jdziat/simple-durable-jobs/blob/main/LICENSE).
 > The properties described on this page are the library's *design contract*,
-> exercised by the automated test suite described below, they are not a
+> exercised by the automated test suite described below; they are not a
 > guarantee of fitness for any particular purpose and create no warranty. You
 > are responsible for validating the library against your own requirements.
 >
@@ -62,7 +62,7 @@ a warranty of fitness for any particular use.
   most one worker holds a job's lock. Lock timing is anchored to the **database
   clock** on Postgres/MySQL, so a worker whose own clock is skewed cannot reclaim
   a live lock early. That anchoring is not covered by a dedicated chaos
-  invariant, the suite's clock-skew handling concerns scheduled fires, not lock
+  invariant: the suite's clock-skew handling concerns scheduled fires, not lock
   reclaim, so treat it as a design property, not an asserted one.
 - **Checkpointed workflows**: completed `Call()` steps are not re-executed on
   replay (subject to the at-least-once window above). The fan-out's *status*
@@ -106,12 +106,12 @@ By default a crashed worker's in-flight job is **not reclaimed for ~45 minutes**
 That conservative default avoids reclaiming long-running jobs prematurely, but it
 is almost certainly wrong for short jobs. The relevant knobs:
 
-- `WithLockDuration(d)`, how long a lease is held before it is considered
+- `WithLockDuration(d)`: how long a lease is held before it is considered
   expired (default 45m). Set this to comfortably exceed your longest job plus a
   couple of heartbeat intervals.
-- `WithStaleLockAge(d)`, how long the owning worker must have made **no
+- `WithStaleLockAge(d)`: how long the owning worker must have made **no
   contact** before the reaper reclaims the job (default 45m). The anchor is
-  `COALESCE(last_heartbeat_at, started_at, locked_until)`, the worker's last
+  `COALESCE(last_heartbeat_at, started_at, locked_until)`: the worker's last
   contact (a live heartbeat, else when it started, else the lease as a last
   resort), measured as *time since last contact*, not lease expiry, so reclaim
   latency is roughly `StaleLockAge`, regardless of how far an in-flight lease has
@@ -121,7 +121,7 @@ is almost certainly wrong for short jobs. The relevant knobs:
   last-contact timestamp several times within the stale window. The reaper is
   designed so that an active job is not falsely reclaimed, and the chaos suite
   asserts that behavior.
-- `WithStaleLockInterval(d)`, how often the reaper runs (default 5m).
+- `WithStaleLockInterval(d)`: how often the reaper runs (default 5m).
 
 For sub-minute jobs, something like `WithLockDuration(2*time.Minute)`,
 `WithStaleLockAge(2*time.Minute)`, `WithStaleLockInterval(10*time.Second)` gives
@@ -141,8 +141,8 @@ failed, _ := q.Storage().GetJobsByStatus(ctx, jobs.StatusFailed, 100)
 
 Replay one with `q.Requeue`. **This is a replay from scratch:** requeueing
 deletes the job's checkpoints, so a workflow re-executes every step, including
-ones that already succeeded. If a completed step had an external side effect,
-a charge, an email, a provisioning call, it happens again unless the handler
+ones that already succeeded. If a completed step had an external side effect
+(a charge, an email, a provisioning call), it happens again unless the handler
 is idempotent. There is no "resume from the last successful step" operation;
 the dashboard's Retry button performs this same full reset:
 
@@ -157,7 +157,7 @@ flapping dependency is not hammered.
 
 `Determinism(mode)` controls how strictly `Call()` replay is validated:
 
-- **`ExplicitCheckpoints`** (default), errors when a replayed `Call`'s type does
+- **`ExplicitCheckpoints`** (default): errors when a replayed `Call`'s type does
   not match the checkpoint at that index.
 - **`Strict`**: also fails the job terminally if the replay does not reach every
   recorded `Call` checkpoint (the handler's `Call` sequence changed). Use it to
