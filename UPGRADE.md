@@ -5,7 +5,7 @@
 ### Go 1.26 toolchain
 
 The module's `go` directive is now `1.26.0` and the pinned toolchain is
-`go1.26.9`. A build with `GOTOOLCHAIN=local` on a 1.25 toolchain fails until you
+`go1.26.11`. A build with `GOTOOLCHAIN=local` on a 1.25 toolchain fails until you
 upgrade; the default `GOTOOLCHAIN=auto` fetches the pinned toolchain for you.
 
 ### Drain workers before enabling dispatch fencing
