@@ -4,11 +4,11 @@ weight: 4
 ---
 
 Signals let an **external producer** influence a **running or waiting** workflow
-mid-flight — update an AI agent's context, inject new instructions, or unblock a
-human-in-the-loop step — without restarting the job. They are durable, buffered,
+mid-flight, update an AI agent's context, inject new instructions, or unblock a
+human-in-the-loop step, without restarting the job. They are durable, buffered,
 and delivered **FIFO per `(job, name)`**.
 
-Signals are built on the same **suspend → resume → checkpoint-replay** machinery
+Signals are built on the same **suspend, resume, and checkpoint-replay** machinery
 as [fan-out]({{< relref "/docs/api-reference/workflows#fan-outfan-in" >}}), so they inherit the same correctness
 properties: a wait survives a process crash, and every signal *observation* is
 checkpointed so handler replay is deterministic.
@@ -130,16 +130,16 @@ handler is *replayed from the start*, with prior `Call`/phase checkpoints
 short-circuiting the already-done work. The same rule as fan-out applies:
 
 - **In-flight in-memory state must be checkpointed** (via `Call` or
-  `SavePhaseCheckpoint`) to survive a wait — anything you computed but did not
+  `SavePhaseCheckpoint`) to survive a wait, anything you computed but did not
   checkpoint before the wait is recomputed on resume.
 - **Every signal observation is itself a checkpoint** keyed by call index, so a
   wait that consumed payload `X`, a peek that found nothing, or a timeout that
-  fired all replay to the same outcome — a signal arriving *after* a recorded
+  fired all replay to the same outcome, a signal arriving *after* a recorded
   peek cannot retroactively change it.
 - Under **strict determinism**, signal calls count as Call-index checkpoints, so
   a *conditional* signal call must keep a deterministic call sequence (or use
   explicit/best-effort checkpoint strategies). See
-  [Job Options → Determinism]({{< relref "/docs/api-reference/job-options#determinismmode-determinismmode-option" >}}).
+  [Job Options: Determinism]({{< relref "/docs/api-reference/job-options#determinismmode-determinismmode-option" >}}).
 
 `CheckSignal` and `DrainSignals` never suspend, so they don't unwind the handler.
 

@@ -25,8 +25,8 @@ Spans emitted:
 
 | Span | When |
 |---|---|
-| `job.enqueue` | `Queue.Enqueue` — producer span; trace context is persisted on the job so the consumer picks it up. |
-| `job.process {type}` | Worker handler execution — child of `job.enqueue`. |
+| `job.enqueue` | `Queue.Enqueue`, producer span; trace context is persisted on the job so the consumer picks it up. |
+| `job.process {type}` | Worker handler execution, child of `job.enqueue`. |
 | `job.retry` | Span event added to `job.process` when a job is retried. |
 
 Every span carries `job.id`, `job.type`, `job.queue`, `job.attempt`, and `job.priority` attributes.

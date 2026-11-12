@@ -39,7 +39,7 @@ record in the database:
 If a worker crashes before it can clear the lock, its heartbeats stop. Its last
 contact (`last_heartbeat_at`, or `started_at` if it crashed before the first
 heartbeat) stops advancing, and once that timestamp falls more than
-`StaleLockAge` behind the current time the job becomes reclaimable — even if the
+`StaleLockAge` behind the current time the job becomes reclaimable, even if the
 stacked `LockedUntil` lease is still in the future.
 
 ## The Stale Lock Reaper
@@ -71,7 +71,7 @@ one worker remains online.
 ### Observability
 
 Stale-lock reclaims are a crash leading-indicator, so they are surfaced through
-the event/hook/metric pipeline — not just `slog` — and are fully alertable:
+the event/hook/metric pipeline as well as `slog`, and are fully alertable:
 
 - **Event** -- each reclaimed job ID produces a `JobReclaimed` event carrying
   `JobID`, `WorkerID`, `Reason` (`stale_lock` for the reaper) and `Timestamp`.
@@ -114,10 +114,10 @@ worker := jobs.NewWorker(queue,
 | Parameter | Default | Guidance |
 |-----------|---------|----------|
 | `WithStaleLockInterval` | 5 min | Lower values detect stale jobs faster but add more database queries. Non-positive values keep the default; positive values below 1s are clamped to 1s. For high-throughput clusters, 2-3 minutes is reasonable. |
-| `WithStaleLockAge` | 45 min | How long the owning worker may be silent (send no heartbeat) before its job is reclaimed. This directly sets your post-crash recovery latency — a smaller value reclaims abandoned jobs faster. A live worker refreshes `last_heartbeat_at` several times per window, so an active job is never falsely reclaimed (see below); lower it freely if you want faster crash recovery. |
+| `WithStaleLockAge` | 45 min | How long the owning worker may be silent (send no heartbeat) before its job is reclaimed. This directly sets your post-crash recovery latency, a smaller value reclaims abandoned jobs faster. A live worker refreshes `last_heartbeat_at` several times per window, so an active job is never falsely reclaimed (see below); lower it freely if you want faster crash recovery. |
 
 A live worker refreshes `last_heartbeat_at` several times within every
-`StaleLockAge` window — the heartbeat interval is auto-clamped to
+`StaleLockAge` window, the heartbeat interval is auto-clamped to
 `StaleLockAge/3` (with a 200ms floor), so roughly three heartbeats land before
 the stale window could elapse. An active job's last-contact timestamp therefore
 stays well inside the window and is never reclaimed. Because reclaim now anchors
@@ -167,7 +167,7 @@ recently.
 A job can only be reclaimed if **both** of the following are true:
 
 1. Its status is `running`.
-2. Its last contact — `COALESCE(last_heartbeat_at, started_at, locked_until)` —
+2. Its last contact, `COALESCE(last_heartbeat_at, started_at, locked_until)`,
    is at least `StaleLockAge` in the past, regardless of how far the stacked
    `LockedUntil` lease has been pushed into the future.
 

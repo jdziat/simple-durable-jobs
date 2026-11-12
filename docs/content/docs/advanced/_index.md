@@ -7,7 +7,7 @@ toc: false
 Production tuning for Simple Durable Jobs. These pages cover the knobs you reach for once jobs are flowing and you're hardening for scale and failure.
 
 {{< cards >}}
-  {{< card link="guarantees/" title="Guarantees & Production Readiness" icon="shield-check" subtitle="The honest contract: at-least-once execution, the idempotency requirement, backend support tiers, crash-recovery tuning, and how the guarantees are verified." >}}
+  {{< card link="guarantees/" title="Guarantees & Production Readiness" icon="shield-check" subtitle="The contract: at-least-once execution, the idempotency requirement, backend support tiers, crash-recovery tuning, and how the guarantees are verified." >}}
   {{< card link="../production-ops/" title="Production Operations" icon="terminal" subtitle="Deployment topology, fleet-safe migrations, graceful drain, health probes, sdj CLI, throughput tuning, metrics, DLQ, and retention runbooks." >}}
   {{< card link="stale-lock-reaper/" title="Stale Lock Reaper" icon="refresh" subtitle="How the worker reclaims jobs whose owners crashed or disappeared, and the two options (WithStaleLockInterval, WithStaleLockAge) that tune it." >}}
   {{< card link="pool-configuration/" title="Pool Configuration" icon="adjustments" subtitle="The four connection-pool presets, what each optimizes for, and how to hand-roll a custom PoolConfig with the option functions." >}}
@@ -24,9 +24,9 @@ Production tuning for Simple Durable Jobs. These pages cover the knobs you reach
   {{< card link="authorization/" title="Dashboard Authorization" icon="shield-check" subtitle="Add optional per-action authorization for mutating dashboard RPCs while keeping identity extraction in your own middleware." >}}
   {{< card link="execution-middleware/" title="Execution Middleware" icon="adjustments" subtitle="Wrap handler execution with interceptors for logging, auth context, panic classification, and error mapping." >}}
   {{< card link="concurrency-caps/" title="Concurrency Caps" icon="adjustments" subtitle="Cap parallelism fleet-wide and per-key (e.g. at most N jobs per customer) with DB-coordinated concurrency slots." >}}
-  {{< card link="rate-limiting/" title="Rate Limiting" icon="clock" subtitle="Throttle execution to a requests-per-window ceiling with per-queue token buckets and an optional fleet-wide limiter — without burning retry attempts." >}}
+  {{< card link="rate-limiting/" title="Rate Limiting" icon="clock" subtitle="Throttle execution to a requests-per-window ceiling with per-queue token buckets and an optional fleet-wide limiter, without burning retry attempts." >}}
   {{< card link="retention-gc/" title="Retention & GC" icon="trash" subtitle="Automatically prune terminal jobs by per-status age window with a background retention worker, so the jobs table stays bounded." >}}
-  {{< card link="metrics/" title="Metrics" icon="chart-bar" subtitle="Export Prometheus / OpenTelemetry metrics — queue depth, throughput, wait/run latency, attempts, failures, retries — via an opt-in instrument." >}}
+  {{< card link="metrics/" title="Metrics" icon="chart-bar" subtitle="Export Prometheus / OpenTelemetry metrics, queue depth, throughput, wait/run latency, attempts, failures, retries, via an opt-in instrument." >}}
   {{< card link="cancel-job/" title="Cancel & Terminate" icon="x-circle" subtitle="Cancel a running job fleet-wide via a first-class verb across the facade, Connect-RPC, and the dashboard (cooperative cancellation)." >}}
   {{< card link="testing/" title="Testing Utilities" icon="beaker" subtitle="The jobstest package: isolated SQLite fixtures and rivertest-style enqueue assertions for testing job producers and consumers." >}}
 {{< /cards >}}

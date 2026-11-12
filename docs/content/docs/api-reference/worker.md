@@ -115,7 +115,7 @@ Sets how often the worker polls for new jobs. The default is 100ms and the floor
 Sets the per-poll cap for optional batch dequeue. The default is `50`; values
 are clamped to `[1, 1000]`. The claim is additionally capped at the worker's
 free concurrency slots, so a worker left at the default concurrency (10) never
-claims more than 10 at once — only deployments that raise concurrency see the
+claims more than 10 at once, only deployments that raise concurrency see the
 larger batch. Set `WithDequeueBatchSize(1)` to force single-row claims.
 
 ### `WithDrainTimeout(d time.Duration) WorkerOption`
@@ -149,7 +149,7 @@ Reaper]({{< relref "/docs/advanced/stale-lock-reaper" >}}) for the full story.
 
 ### `WithStaleLockAge(d time.Duration) WorkerOption`
 
-Sets how long the owning worker must have made no contact before its job is reclaimed (reset to pending). The reaper anchors on last contact — it reclaims `status=running` jobs where `COALESCE(last_heartbeat_at, started_at, locked_until)` is older than `StaleLockAge` — not on lease (`LockedUntil`) expiry. It is designed so that a still-running worker that keeps heartbeating is not reclaimed even if its stacked lease has lapsed. Default is 45 minutes. See [Stale Lock Reaper]({{< relref "/docs/advanced/stale-lock-reaper" >}}).
+Sets how long the owning worker must have made no contact before its job is reclaimed (reset to pending). The reaper anchors on last contact, it reclaims `status=running` jobs where `COALESCE(last_heartbeat_at, started_at, locked_until)` is older than `StaleLockAge`, not on lease (`LockedUntil`) expiry. It is designed so that a still-running worker that keeps heartbeating is not reclaimed even if its stacked lease has lapsed. Default is 45 minutes. See [Stale Lock Reaper]({{< relref "/docs/advanced/stale-lock-reaper" >}}).
 
 ### `worker.WithLockDuration(d time.Duration) WorkerOption`
 

@@ -3,22 +3,22 @@ title: "Guarantees & Production Readiness"
 weight: 0
 ---
 
-This page is the honest contract: what Simple Durable Jobs guarantees, what it
+This page is the contract: what Simple Durable Jobs guarantees, what it
 asks of you in return, and how to configure it for production. Read it before
 you put revenue-critical work on the queue.
 
-> **No warranty — use at your own risk.** Simple Durable Jobs is free,
+> **No warranty, use at your own risk.** Simple Durable Jobs is free,
 > open-source software provided "AS IS", without warranty of any kind, as set
 > out in the [LICENSE](https://github.com/jdziat/simple-durable-jobs/blob/main/LICENSE).
 > The properties described on this page are the library's *design contract*,
-> exercised by the automated test suite described below — they are not a
+> exercised by the automated test suite described below, they are not a
 > guarantee of fitness for any particular purpose and create no warranty. You
 > are responsible for validating the library against your own requirements.
 >
 > **Not for high-risk use.** This software is general-purpose infrastructure and
-> is **not designed or tested for safety-critical or high-risk uses** — including
+> is **not designed or tested for safety-critical or high-risk uses**, including
 > medical, life-support, aviation, automotive, nuclear, emergency-response, or
-> financial-settlement systems — where failure could lead to death, injury, or
+> financial-settlement systems, where failure could lead to death, injury, or
 > severe financial or environmental harm. Do not use it for such purposes.
 
 ## Execution semantics: at-least-once
@@ -34,9 +34,9 @@ A completed `Call()` or `SavePhaseCheckpoint` writes its checkpoint on a
 cancellation- and deadline-immune detached context (a fixed ~5s budget), so a
 per-job `Timeout` that fires *as the activity returns* will not lose the
 checkpoint and re-run the step. That detached window narrows the crash gap to a
-genuine process/machine death — the case the statement above describes.
+genuine process/machine death, the case the statement above describes.
 
-**Your handlers — and every `Call()` step — must be idempotent.** Use a unique
+**Your handlers, and every `Call()` step, must be idempotent.** Use a unique
 key, an upsert, or an external dedup guard for any side effect that must not
 happen twice (charging a card, sending an email, calling a non-idempotent API).
 For phase effects in the same database as the jobs storage, see
@@ -52,24 +52,24 @@ These properties are the library's design contract, verified by the test suite
 described below; they are provided on the AS-IS basis in the LICENSE and are not
 a warranty of fitness for any particular use.
 
-- **Durability** — an enqueued job is committed to the database before
+- **Durability**: an enqueued job is committed to the database before
   `Enqueue` returns; it survives process and machine restarts.
-- **No lost jobs** — the library is designed so that a leased job is either
+- **No lost jobs**: the library is designed so that a leased job is either
   completed, failed (terminally), retried, or returned to the queue by the
   stale-lock reaper, and the chaos suite asserts that jobs do not silently
   disappear.
-- **Single active owner** — the library is designed so that at any instant at
+- **Single active owner**: the library is designed so that at any instant at
   most one worker holds a job's lock. Lock timing is anchored to the **database
   clock** on Postgres/MySQL, so a worker whose own clock is skewed cannot reclaim
   a live lock early. That anchoring is not covered by a dedicated chaos
-  invariant — the suite's clock-skew handling concerns scheduled fires, not lock
-  reclaim — so treat it as a design property, not an asserted one.
-- **Checkpointed workflows** — completed `Call()` steps are not re-executed on
+  invariant, the suite's clock-skew handling concerns scheduled fires, not lock
+  reclaim, so treat it as a design property, not an asserted one.
+- **Checkpointed workflows**: completed `Call()` steps are not re-executed on
   replay (subject to the at-least-once window above). The fan-out's *status*
   advance is a SECOND write that commits **after** the sub-job's terminal
   transaction, deliberately: counting afterwards is what lets the snapshot see
   siblings that committed concurrently. So a terminal fan-out **is** briefly
-  observable as `status=pending` while its counts already read terminal — and
+  observable as `status=pending` while its counts already read terminal, and
   across a process death in that gap, durably so. Do not alert on that
   combination as corruption; it is the normal shape of a fan-out completing, and
   on GormStorage the counts are derived from child rows rather than accumulated,
@@ -78,7 +78,7 @@ a warranty of fitness for any particular use.
   any parent left in `waiting`. Note the sweep runs only on the worker holding
   the recovery lease, so the heal is bounded by that interval rather than
   immediate.
-- **Atomic signal consumption** — consuming a signal
+- **Atomic signal consumption**: consuming a signal
   (`WaitForSignal`/`WaitForSignalTimeout`/`DrainSignals`) persists the consume
   and its replay checkpoint in a single transaction; the library is designed so
   that a crash mid-wait does not wedge a waiting job or drop a drained signal,
@@ -106,14 +106,14 @@ By default a crashed worker's in-flight job is **not reclaimed for ~45 minutes**
 That conservative default avoids reclaiming long-running jobs prematurely, but it
 is almost certainly wrong for short jobs. The relevant knobs:
 
-- `WithLockDuration(d)` — how long a lease is held before it is considered
+- `WithLockDuration(d)`, how long a lease is held before it is considered
   expired (default 45m). Set this to comfortably exceed your longest job plus a
   couple of heartbeat intervals.
-- `WithStaleLockAge(d)` — how long the owning worker must have made **no
+- `WithStaleLockAge(d)`, how long the owning worker must have made **no
   contact** before the reaper reclaims the job (default 45m). The anchor is
-  `COALESCE(last_heartbeat_at, started_at, locked_until)` — the worker's last
+  `COALESCE(last_heartbeat_at, started_at, locked_until)`, the worker's last
   contact (a live heartbeat, else when it started, else the lease as a last
-  resort), measured as *time since last contact*, not lease expiry — so reclaim
+  resort), measured as *time since last contact*, not lease expiry, so reclaim
   latency is roughly `StaleLockAge`, regardless of how far an in-flight lease has
   been pushed out.
   `StaleLockAge` also governs the heartbeat interval: it is clamped to
@@ -121,7 +121,7 @@ is almost certainly wrong for short jobs. The relevant knobs:
   last-contact timestamp several times within the stale window. The reaper is
   designed so that an active job is not falsely reclaimed, and the chaos suite
   asserts that behavior.
-- `WithStaleLockInterval(d)` — how often the reaper runs (default 5m).
+- `WithStaleLockInterval(d)`, how often the reaper runs (default 5m).
 
 For sub-minute jobs, something like `WithLockDuration(2*time.Minute)`,
 `WithStaleLockAge(2*time.Minute)`, `WithStaleLockInterval(10*time.Second)` gives
@@ -141,8 +141,8 @@ failed, _ := q.Storage().GetJobsByStatus(ctx, jobs.StatusFailed, 100)
 
 Replay one with `q.Requeue`. **This is a replay from scratch:** requeueing
 deletes the job's checkpoints, so a workflow re-executes every step, including
-ones that already succeeded. If a completed step had an external side effect —
-a charge, an email, a provisioning call — it happens again unless the handler
+ones that already succeeded. If a completed step had an external side effect,
+a charge, an email, a provisioning call, it happens again unless the handler
 is idempotent. There is no "resume from the last successful step" operation;
 the dashboard's Retry button performs this same full reset:
 
@@ -157,19 +157,19 @@ flapping dependency is not hammered.
 
 `Determinism(mode)` controls how strictly `Call()` replay is validated:
 
-- **`ExplicitCheckpoints`** (default) — errors when a replayed `Call`'s type does
+- **`ExplicitCheckpoints`** (default), errors when a replayed `Call`'s type does
   not match the checkpoint at that index.
-- **`Strict`** — also fails the job terminally if the replay does not reach every
+- **`Strict`**: also fails the job terminally if the replay does not reach every
   recorded `Call` checkpoint (the handler's `Call` sequence changed). Use it to
   catch nondeterministic handlers early.
-- **`BestEffort`** — logs mismatches and re-executes instead of erroring.
+- **`BestEffort`**: logs mismatches and re-executes instead of erroring.
 
 ### Nested durable operations and replay (upgrading to v4.6)
 
 `Call()` indices come from one counter shared with everything nested beneath a
 call. Before v4.6 an outer `Call` served from its checkpoint on replay did not
 account for the indices its nested operations had consumed, so a later `Call`
-could read the wrong checkpoint — returning another call's cached result, or
+could read the wrong checkpoint, returning another call's cached result, or
 raising a determinism violation against a handler that was in fact deterministic.
 
 From v4.6 each checkpoint records the index span its call consumed and replay
@@ -210,12 +210,12 @@ mid-replay. Two consequences:
    ```
 
    The listing is a deliberate over-approximation: nothing recorded tells us
-   whether a legacy call actually nested, so flat workflows with two or more
+   whether a legacy call nested, so flat workflows with two or more
    calls appear too.
 
    **`Requeue` on a listed job does nothing.** It is the only operation that
    clears checkpoints, but it accepts only `failed` or `cancelled` jobs, and this
-   listing excludes those statuses — so the two sets are disjoint and it returns
+   listing excludes those statuses, so the two sets are disjoint and it returns
    `false`. To clear a listed job you must cancel it first
    (`CancelJobTerminal`, then `Requeue`), which **restarts** the workflow rather
    than resuming it, and does not un-consume signals a previous run consumed. See
@@ -242,7 +242,7 @@ Always run `Migrate()` on deploy; it is idempotent.
 
 Every change runs the full suite under the race detector on SQLite, Postgres,
 and MySQL. A nightly **Stress & Chaos** workflow additionally runs long stress
-tests on all three backends and a multi-worker crash/recovery chaos harness on
+tests on all three backends and a multi-worker crash/recovery chaos test on
 Postgres and MySQL that kills workers at random and then asserts the durability
 invariants (exactly-once effects, no wedged jobs, fan-in count integrity,
 unique-key dedup, single-scheduler firing). A short chaos smoke runs on every

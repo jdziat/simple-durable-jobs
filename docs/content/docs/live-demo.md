@@ -3,7 +3,7 @@ title: "Live Demo"
 weight: 5
 ---
 
-Try the embedded web UI dashboard below. This is an interactive demo running entirely in your browser with simulated job data — no backend required. Jobs move through their lifecycle automatically (pending → running → completed/failed), and every panel is interactive: filter, retry failed jobs, browse queues, inspect events.
+Try the embedded web UI dashboard below. This is an interactive demo running entirely in your browser with simulated job data, no backend required. Jobs move through their lifecycle automatically (pending, running, then completed or failed), and every panel is interactive: filter, retry failed jobs, browse queues, inspect events.
 
 <style>
   /* On phones the demo stays inside the content column (a full-bleed
@@ -107,7 +107,7 @@ Try the embedded web UI dashboard below. This is an interactive demo running ent
       <div class="sdj-demo-chrome">
         <span class="sdj-demo-status">
           <span class="sdj-demo-dot"></span>
-          Interactive Demo — Simulated Data
+          Interactive Demo, Simulated Data
         </span>
         <a href="/simple-durable-jobs/demo/" target="_blank" rel="noopener">Open full-screen ↗</a>
       </div>

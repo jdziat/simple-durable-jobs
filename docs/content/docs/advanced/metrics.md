@@ -83,7 +83,7 @@ The throughput, latency, depth, backlog-age, dead-letter-depth, and reclaimed
 metrics are wired automatically by `Instrument`; `jobs.leases.reclaimed`
 is registered through the same call (it hooks `OnJobReclaimed`) and needs no extra
 setup. Unlike the throughput, latency, and depth series, it carries no `queue` or
-`job.type` attribute — `reason` is its only label. `reason=stale_lock` is the
+`job.type` attribute, `reason` is its only label. `reason=stale_lock` is the
 actor side (this worker's reaper recovered a job from a presumed-dead peer, the
 crash leading-indicator), while `reason=ownership_audit` is the victim side (this
 worker observed a peer reclaim a job it was still running). In a multi-process
@@ -114,7 +114,7 @@ counters that surface dispatch churn. They are registered per worker with
 and both carry `worker.id`.
 
 A worker dequeues (claims) a job before the final admission gates run; if a gate
-denies, the job is released back to pending — a "bounce" counted under
+denies, the job is released back to pending, a "bounce" counted under
 `jobs.dequeue.released` by `reason`. When **every** configured fleet `RateLimit`
 is unkeyed, a saturated limit engages a claim-rate throttle: the worker stops
 claiming until the limit's rate window rolls over, rather than bouncing the full
@@ -123,7 +123,7 @@ concurrency budget every poll tick. Each suppressed tick increments
 
 The healthy steady state under a saturated **unkeyed** fleet limit is
 `suppressed_ticks` rising while `released{reason="fleet_rate"}` stays low (one
-probe batch per rate window) — the throttle collapsing the claim/release write
+probe batch per rate window), the throttle collapsing the claim/release write
 amplification, not a stuck worker.
 
 For a **keyed** `RateLimit` the worker can't pre-check a bucket before claiming
@@ -131,8 +131,8 @@ For a **keyed** `RateLimit` the worker can't pre-check a bucket before claiming
 per-key cooldown skips the expensive DB rate transaction for a bucket already
 denied this window. Those skipped bounces are attributed to
 `released{reason="fleet_rate_cached"}`, distinct from `reason="fleet_rate"` (the
-bounces that actually paid the DB transaction). The healthy keyed signal is
-`fleet_rate_cached` dominating `fleet_rate` — the cooldown eliding the contended
+bounces that paid the DB transaction). The healthy keyed signal is
+`fleet_rate_cached` dominating `fleet_rate`, the cooldown eliding the contended
 locked transaction. Register the cooldown's cache-size gauge with
 `InstrumentWorkerRateSaturation(workerID, worker.DequeueRateSaturationCacheSize, ...)`;
 when `jobs_dequeue_rate_saturation_cache_size` sits at the configured
@@ -141,7 +141,7 @@ DB transaction (a high-cardinality-`RateLimitKey` signal).
 
 Note the per-key cooldown removes the DB rate transaction but **not** the
 claim/release itself, so for keyed configs `released{reason="fleet_rate_cached"}`
-(and the underlying claim/release write volume) can stay high even when healthy —
+(and the underlying claim/release write volume) can stay high even when healthy,
 it is the DB-transaction count, not the release count, that the cooldown reduces.
 Trade-offs: a just-recovered limit can wait up to one rate window before this
 worker probes it again, and the keyed saving is per-worker and locality-dependent

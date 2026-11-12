@@ -6,7 +6,7 @@
 [![codecov](https://codecov.io/gh/jdziat/simple-durable-jobs/branch/main/graph/badge.svg)](https://codecov.io/gh/jdziat/simple-durable-jobs)
 
 A Go library for durable, checkpointed background jobs and workflows that runs
-on the database you already have — PostgreSQL or MySQL in production, SQLite for
+on the database you already have, PostgreSQL or MySQL in production, SQLite for
 local development. Conceptually inspired by [River](https://riverqueue.com/) and
 [Temporal](https://temporal.io/).
 
@@ -16,7 +16,7 @@ An **in-process, embeddable** job system: import a package, point it at a GORM
 database, register handlers, run workers. No separate server, broker, or control
 plane to operate. You get durable background jobs, checkpointed multi-step
 workflows, fan-out/fan-in, durable signals, scheduling, and an optional embedded
-dashboard — in one dependency.
+dashboard, in one dependency.
 
 ### When to choose it
 
@@ -36,7 +36,7 @@ existing database."
 Execution is **at-least-once**: handlers and `Call()` steps re-run from their
 last checkpoint after a crash, so **handlers must be idempotent**. Jobs are
 durable and designed not to be silently lost, and a job has a single active
-owner — lock timing is anchored to the database clock, so worker clock skew
+owner, lock timing is anchored to the database clock, so worker clock skew
 can't reclaim a live lock. See **[Guarantees & Production Readiness](https://jdziat.github.io/simple-durable-jobs/docs/advanced/guarantees/)**
 for the AS-IS warranty disclaimer, high-risk-use exclusion, full contract,
 backend support tiers, and crash-recovery tuning.
@@ -48,7 +48,7 @@ backend support tiers, and crash-recovery tuning.
 - [Typed API](https://jdziat.github.io/simple-durable-jobs/docs/api-reference/typed-api/) - Compile-time checked job definitions over the same durable queue
 - [Examples](https://jdziat.github.io/simple-durable-jobs/docs/examples/)
 - [Benchmarks](https://jdziat.github.io/simple-durable-jobs/docs/benchmarks/) - Measured numbers, methodology, and throughput tuning
-- [Choosing a Job System](https://jdziat.github.io/simple-durable-jobs/docs/comparison/) - An honest comparison vs River, Temporal, and Asynq
+- [Choosing a Job System](https://jdziat.github.io/simple-durable-jobs/docs/comparison/) - A comparison of River, Temporal, and Asynq
 - [Migrating from River](https://jdziat.github.io/simple-durable-jobs/docs/migrating-from-river/) / [Migrating from Asynq](https://jdziat.github.io/simple-durable-jobs/docs/migrating-from-asynq/)
 - [Migrating from v2 to v4](https://jdziat.github.io/simple-durable-jobs/docs/migration-v2-to-v3/) - `/v4` import-path, API, and schema conversion notes
 - [Migrating from v1 to v2](https://jdziat.github.io/simple-durable-jobs/docs/migration-v1-to-v2/) - Mechanical `/v2` import-path migration and storage rename notes
@@ -73,13 +73,13 @@ backend support tiers, and crash-recovery tuning.
 - **Transactional Checkpoints** - Save phase checkpoints in the same DB transaction as the business effect they protect
 - **Job Metadata & Multi-tenancy** - Persist tenant labels and metadata tags for programmatic search, fairness controls, and operations
 - **Batch Enqueue & Dequeue** - Bulk insert plus buffered worker-side batch dequeue for throughput
-- **Concurrency Caps** - Fleet-wide and per-key concurrency limits, not just per-process
+- **Concurrency Caps** - Fleet-wide and per-key concurrency limits
 - **Rate Limiting** - Per-queue token buckets and an optional fleet-wide limiter (throttle waits don't burn retry attempts)
 - **Retries with Backoff** - Configurable retry logic with exponential backoff and jitter
 - **Dead-Letter Queue** - Explicit dead-letter metadata with list/count/requeue triage
-- **Retention / GC** - **On by default.** A worker built with no retention options prunes completed jobs after 30 days, failed/cancelled after 90, and consumed signals after 7 — none of that is opt-in, so plan external archival inside those windows. A one-time WARN is logged only when retention is explicitly DISABLED. Opt-in transactional checkpoint GC (`RetentionDeleteCheckpointsOnComplete`) additionally bounds checkpoint growth
+- **Retention / GC** - **On by default.** A worker built with no retention options prunes completed jobs after 30 days, failed/cancelled after 90, and consumed signals after 7, none of that is opt-in, so plan external archival inside those windows. A one-time WARN is logged only when retention is explicitly DISABLED. Opt-in transactional checkpoint GC (`RetentionDeleteCheckpointsOnComplete`) additionally bounds checkpoint growth
 - **Execution Middleware** - Interceptors that wrap handler execution
-- **Payload Codec** - Pluggable encryption-at-rest for job arguments, results, checkpoints, and error text (`last_error` and the dead-letter reason suffix) (opt-in; encrypts the listed fields at the application/storage boundary — it is not whole-database encryption and is not a compliance attestation.)
+- **Payload Codec** - Pluggable encryption-at-rest for job arguments, results, checkpoints, and error text (`last_error` and the dead-letter reason suffix) (opt-in; encrypts the listed fields at the application/storage boundary, it is not whole-database encryption and is not a compliance attestation.)
 - **Workflow Versioning** - GetVersion markers to evolve in-flight workflows safely across deploys
 - **Metrics** - Optional Prometheus / OpenTelemetry metrics exporter (queue depth, latency, throughput, failures)
 - **Observability** - Hooks, event streams, OpenTelemetry tracing, and an embedded web dashboard
@@ -87,7 +87,7 @@ backend support tiers, and crash-recovery tuning.
 - **Dashboard Authorization** - Optional per-action authorization for mutating dashboard RPCs
 - **Operations CLI (`sdj`)** - Inspect, requeue, purge, and operate jobs from the [`sdj` binary](./docs/content/docs/production-ops.md)
 - **Stale Lock Reaper** - Automatically reclaims stuck running jobs after worker crashes
-- **Connection Pool Presets** - `NewGormStorage` installs a safe bounded default pool out of the box (unbounded is no longer the default), so presets are an optional optimization, not a requirement, for different workloads
+- **Connection Pool Presets** - `NewGormStorage` installs a safe bounded default pool (unbounded is no longer the default), so presets are an optional optimization, not a requirement, for different workloads
 - **Testing Utilities** - The jobstest package: SQLite fixtures and enqueue assertions
 - **Simple API** - Minimal boilerplate, type-safe handlers
 
@@ -433,9 +433,9 @@ jobsotel.Instrument(queue, jobsotel.WithTracerProvider(tp))
 ```
 
 This creates spans for:
-- `job.enqueue` — when a job is enqueued (producer span)
-- `job.process {type}` — when a job is executed by a worker (consumer span, child of enqueue)
-- `job.retry` — span event when a job is retried
+- `job.enqueue`, when a job is enqueued (producer span)
+- `job.process {type}`, when a job is executed by a worker (consumer span, child of enqueue)
+- `job.retry`, span event when a job is retried
 
 Span attributes include `job.id`, `job.type`, `job.queue`, `job.attempt`, and `job.priority`.
 
@@ -511,7 +511,7 @@ if err != nil {
 ```
 
 `NewGormStorage(db)` applies a safe bounded default pool unless the pool is
-already sized — `DefaultPoolConfig` (25 max open / 10 idle / 5m lifetime / 1m
+already sized, `DefaultPoolConfig` (25 max open / 10 idle / 5m lifetime / 1m
 idle) for PostgreSQL and MySQL, and a small SQLite-safe pool (4 open / 2 idle,
 no connection expiry) for SQLite. The default is skipped if you size the pool
 before constructing storage or use `NewGormStorageWithPool` (including an

@@ -26,7 +26,7 @@ is matchable with `errors.Is`, so a poller never has to inspect error strings.
 | `ErrNoResult` | completed (no result) | The job finished but persisted no return value. |
 | `ErrJobFailed` | failed | The job exhausted retries. The wrapped message embeds `job.LastError`, so `errors.Is(err, ErrJobFailed)` is true and `err.Error()` carries the cause. |
 | `ErrJobCancelled` | cancelled | The job was cancelled before completing. |
-| `ErrJobNotCompleted` | pending, running, retrying, waiting, or paused | The job is in a genuinely non-terminal state — keep polling. |
+| `ErrJobNotCompleted` | pending, running, retrying, waiting, or paused | The job is in a non-terminal state, keep polling. |
 
 `ErrJobFailed` and `ErrJobCancelled` are returned wrapped (via `fmt.Errorf("%w: …")`),
 so always compare with `errors.Is`, never `==`. `ErrJobNotCompleted` is the only

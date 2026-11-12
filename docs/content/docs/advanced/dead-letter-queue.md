@@ -48,8 +48,8 @@ Results are ordered by `dead_lettered_at DESC`. Use `DeadLetterOffset` with
 On SQLite that column is stored as text carrying a UTC offset, so the sort is a
 newest-first ordering of instants only when every row shares one clock face. Rows
 dead-lettered by this version do; rows written by releases before this one carry
-the offset of whichever process wrote them, so a mixed-zone fleet — or one worker
-across a daylight-saving fall-back — can leave those legacy rows out of order
+the offset of whichever process wrote them, so a mixed-zone fleet, or one worker
+across a daylight-saving fall-back, can leave those legacy rows out of order
 relative to each other. They are still returned, and the `DeadLetteredSince` /
 `DeadLetteredUntil` window selects them by instant regardless. They age out with
 retention. Postgres and MySQL store a real instant and are unaffected.
@@ -93,10 +93,10 @@ failed row from it: terminal failed and cancelled rows are pruned by
 started with no retention options. Triage that has not happened by then has no
 row left to triage.
 
-Widen `RetentionFailedAfter` to however long operators actually need to inspect,
+Widen `RetentionFailedAfter` to however long operators need to inspect,
 diagnose, export, or requeue dead-lettered jobs. `WithRetention` **replaces** the
 stock windows rather than merging with them, so restate the windows you still
-want — a window omitted from the call is `0`, which keeps that status forever:
+want, a window omitted from the call is `0`, which keeps that status forever:
 
 ```go
 w := jobs.NewWorker(q,
