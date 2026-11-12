@@ -19,7 +19,7 @@ description: "A Go library for durable job queues with checkpointed workflows, f
 
 <div class="hx:mb-6">
 {{< hextra/hero-subtitle >}}
-  Background jobs, checkpointed multi-step workflows, fan-out/fan-in,&nbsp;<br class="hx:hidden sm:hx:block" />crash recovery, and an embedded real-time dashboard — in a single import.
+  Background jobs, checkpointed multi-step workflows, fan-out/fan-in,&nbsp;<br class="hx:hidden sm:hx:block" />crash recovery, and an embedded real-time dashboard, in a single import.
 {{< /hextra/hero-subtitle >}}
 </div>
 
@@ -28,7 +28,7 @@ description: "A Go library for durable job queues with checkpointed workflows, f
 <div class="sdj-hero-buttons">
 {{< hextra/hero-button text="Get Started" link="docs/getting-started/" >}}
 {{< hextra/hero-button text="Migrate to v2" link="docs/migration-v1-to-v2/" style="background:transparent;border:1px solid var(--sdj-accent);color:var(--sdj-accent)" >}}
-{{< hextra/hero-button text="Live Demo  →" link="docs/live-demo/" style="background:transparent;border:1px solid var(--sdj-accent);color:var(--sdj-accent)" >}}
+{{< hextra/hero-button text="Live Demo" link="docs/live-demo/" style="background:transparent;border:1px solid var(--sdj-accent);color:var(--sdj-accent)" >}}
 </div>
 
 <div class="sdj-badges">
@@ -79,7 +79,7 @@ func main() {
 }
 ```
 
-<p class="sdj-section-label">Everything you need to run jobs reliably</p>
+<p class="sdj-section-label">Run jobs reliably</p>
 
 {{< hextra/feature-grid >}}
   {{< hextra/feature-card
@@ -100,7 +100,7 @@ func main() {
   {{< hextra/feature-card
     icon="chart-bar"
     title="Embedded Web UI"
-    subtitle="A real-time monitoring dashboard with stats, historical charts, live event streaming, and job management — mounted into your own HTTP server."
+    subtitle="A real-time monitoring dashboard with stats, historical charts, live event streaming, and job management, mounted into your own HTTP server."
   >}}
   {{< hextra/feature-card
     icon="clock"
@@ -115,12 +115,12 @@ func main() {
   {{< hextra/feature-card
     icon="database"
     title="Transactional Enqueue"
-    subtitle="Enqueue inside your own database transaction so business rows and the jobs that act on them commit — or roll back — together. No dual-write race."
+    subtitle="Enqueue inside your own database transaction so business rows and the jobs that act on them commit, or roll back, together. No dual-write race."
   >}}
   {{< hextra/feature-card
     icon="bell"
     title="Durable Signals"
-    subtitle="Send, wait, check, and drain durable signals to coordinate jobs with each other and with the outside world — buffered, FIFO, and consumed exactly-once. (Handlers themselves are at-least-once; keep side effects idempotent.)"
+    subtitle="Send, wait, check, and drain durable signals to coordinate jobs with each other and with the outside world, buffered, FIFO, and consumed exactly-once. (Handlers themselves are at-least-once; keep side effects idempotent.)"
   >}}
   {{< hextra/feature-card
     icon="exclamation-circle"
@@ -130,17 +130,17 @@ func main() {
   {{< hextra/feature-card
     icon="adjustments"
     title="Rate Limiting"
-    subtitle="Throttle execution with per-queue token buckets and an optional fleet-wide limiter, and cap concurrency fleet-wide or per key — without burning retry attempts."
+    subtitle="Throttle execution with per-queue token buckets and an optional fleet-wide limiter, and cap concurrency fleet-wide or per key, without burning retry attempts."
   >}}
   {{< hextra/feature-card
     icon="chart-bar"
     title="Prometheus / OTel Metrics"
-    subtitle="Opt into an exporter for queue depth, throughput, wait and run latency, attempts, failures, and retries — scrapeable for alerting and capacity planning."
+    subtitle="Opt into an exporter for queue depth, throughput, wait and run latency, attempts, failures, and retries, scrapeable for alerting and capacity planning."
   >}}
   {{< hextra/feature-card
     icon="lock-closed"
     title="Payload Encryption"
-    subtitle="Plug in a codec to transparently encrypt job arguments, results, checkpoints, and error text (last_error / dead-letter reason) at rest, with key rotation, at the storage boundary. (opt-in; encrypts the listed fields at the application/storage boundary — it is not whole-database encryption and is not a compliance attestation.)"
+    subtitle="Plug in a codec to transparently encrypt job arguments, results, checkpoints, and error text (last_error / dead-letter reason) at rest, with key rotation, at the storage boundary. (opt-in; encrypts the listed fields at the application/storage boundary, it is not whole-database encryption and is not a compliance attestation.)"
   >}}
 {{< /hextra/feature-grid >}}
 
@@ -149,10 +149,10 @@ func main() {
 <div class="sdj-shot-wrap">
   <div class="sdj-window">
     <div class="sdj-window__bar"><span></span><span></span><span></span><span class="sdj-window__title">localhost:8080/jobs/</span></div>
-    <img class="hx:block hx:dark:hidden" src="/simple-durable-jobs/images/dashboard/dashboard-light.png" alt="Simple Durable Jobs embedded dashboard — queue stats, throughput chart, and per-queue table" loading="lazy">
-    <img class="hx:hidden hx:dark:block" src="/simple-durable-jobs/images/dashboard/dashboard-dark.png" alt="Simple Durable Jobs embedded dashboard (dark) — queue stats, throughput chart, and per-queue table" loading="lazy">
+    <img class="hx:block hx:dark:hidden" src="/simple-durable-jobs/images/dashboard/dashboard-light.png" alt="Simple Durable Jobs embedded dashboard, queue stats, throughput chart, and per-queue table" loading="lazy">
+    <img class="hx:hidden hx:dark:block" src="/simple-durable-jobs/images/dashboard/dashboard-dark.png" alt="Simple Durable Jobs embedded dashboard (dark), queue stats, throughput chart, and per-queue table" loading="lazy">
   </div>
-  <a class="sdj-quietlink" href="/simple-durable-jobs/docs/live-demo/">Try the interactive demo, running on simulated data →</a>
+  <a class="sdj-quietlink" href="/simple-durable-jobs/docs/live-demo/">Try the interactive demo, running on simulated data</a>
 </div>
 
 <div class="sdj-hero-buttons" style="margin-top:3.5rem">

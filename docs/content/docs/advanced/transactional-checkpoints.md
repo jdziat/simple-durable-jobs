@@ -81,7 +81,7 @@ commit over the new owner's workflow state.
   idempotent.
 - The transaction must be for the same GORM database used by the job storage.
   If it belongs to a different database, the checkpoint is committed somewhere
-  replay never reads — the phase will silently re-run on every retry, and the
+  replay never reads, the phase will silently re-run on every retry, and the
   library cannot detect this.
 - This is implemented by `GormStorage`. Custom storage backends that do not
   implement the optional capability return `jobs.ErrStorageNoTxCheckpoint`.

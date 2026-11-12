@@ -11,11 +11,11 @@ weight: 12
 err := jobs.CancelJob(ctx, q, jobID)
 ```
 
-A job in any live status — pending, running, waiting or **paused** — moves to a
+A job in any live status, pending, running, waiting or **paused**, moves to a
 terminal `cancelled` state. Paused is deliberately in that set: leaving it out
 meant a paused child survived its parent's cancellation and stayed resumable, so
 the dashboard's Resume button would run work an operator had explicitly
-cancelled. A cancelled job is **not resumable** — `ResumeJob` will not bring it
+cancelled. A cancelled job is **not resumable**, `ResumeJob` will not bring it
 back, and `UnpauseJob` returns `ErrJobNotPaused`. To replay a cancelled job from
 scratch, use `Requeue`.
 
@@ -28,7 +28,7 @@ It deliberately does **not** clear `locked_by`/`locked_until`. A running job
 keeps its owning worker's lock so that worker's ownership audit short-circuits
 the live handler in about 5 seconds instead of waiting for the multi-minute
 heartbeat fallback. A cancelled row therefore still carries a `locked_by` and a
-future `locked_until`, and nothing clears them later — the stale-lock reaper only
+future `locked_until`, and nothing clears them later, the stale-lock reaper only
 reclaims `running` rows, so the values persist until retention deletes the job.
 If you monitor `locked_by <> ''` to mean "a worker is actively holding this job",
 exclude terminal statuses or you will misclassify every cancelled row.
@@ -51,7 +51,7 @@ half-cancelled tree where a parent is cancelled but children keep running in the
 database.
 
 > **Operational note:** cancelling a fan-out parent is an `O(subtree)`
-> single-transaction operation — every descendant sub-job is locked and updated
+> single-transaction operation, every descendant sub-job is locked and updated
 > in one transaction to guarantee atomicity. Cancelling a *very wide* fan-out
 > parent therefore holds that many row locks for the transaction's duration and
 > can briefly stall workers completing those children. The cost is bounded by

@@ -52,16 +52,16 @@ On cancellation the worker runs three phases:
 
 | Phase | What happens | Bounded by |
 |---|---|---|
-| 1. Drain | Stop dispatching, close the dispatch channel, wait for in-flight handlers to finish **on their own**. Handler contexts are *not* cancelled here. | `DrainTimeout` — default 30s, set with `WithDrainTimeout(d)` |
+| 1. Drain | Stop dispatching, close the dispatch channel, wait for in-flight handlers to finish **on their own**. Handler contexts are *not* cancelled here. | `DrainTimeout`, default 30s, set with `WithDrainTimeout(d)` |
 | 2. Force-cancel | Cancel every remaining handler context, wait again. | A fixed 5-second forced-drain grace, then the worker logs `in-flight handlers did not exit within the forced-drain grace; abandoning them` and moves on **while they are still executing** |
-| 3. Background wait | Wait for the reaper, scheduler, retention and other internal goroutines. | Unbounded — none is abandoned mid-write |
+| 3. Background wait | Wait for the reaper, scheduler, retention and other internal goroutines. | Unbounded, none is abandoned mid-write |
 
 Two consequences that are easy to get wrong:
 
 {{< callout type="warning" >}}
 **Handlers do not see `ctx.Done()` during phase 1.** Worker-context cancellation
 is deliberately *not* propagated to running handlers while the drain window is
-open — that is what gives a handler its full `DrainTimeout` to finish the work it
+open, that is what gives a handler its full `DrainTimeout` to finish the work it
 already started. `ctx.Done()` fires only in phase 2, i.e. after the whole
 `DrainTimeout` has elapsed. So a lengthening `DrainTimeout` does not give a
 cancellation-aware handler more warning; it delays the warning, and delays
@@ -85,7 +85,7 @@ force-cancels handlers immediately.
 
 `Start` returns after phase 3, but **phase 2 is bounded**: a handler that ignores
 its context is abandoned, not waited for, so it may still be executing after
-`Start` returns. Do not treat `Start`'s return as proof that no handler is live —
+`Start` returns. Do not treat `Start`'s return as proof that no handler is live,
 closing the `*sql.DB`, flushing tracing, or calling `os.Exit` immediately can
 yank the pool out from under an abandoned handler mid-transaction. Make handlers
 context-aware and keep them shorter than `DrainTimeout`; that, not the return of
@@ -166,11 +166,11 @@ stops early on a storage error, so a partial run is never silent.
 
 A bulk requeue reports its outcome in the exit code, so
 `sdj dlq requeue --queue "$Q" && clear-alert` only clears the alert when the
-queue actually drained:
+queue drained:
 
 | Exit | Meaning |
 | ---- | ------- |
-| `0` | every matching dead-lettered job was requeued — **or** none matched |
+| `0` | every matching dead-lettered job was requeued, **or** none matched |
 | `4` | some matching jobs were skipped and are still dead-lettered (see the `skipped N ...` lines) |
 | `1` | a storage error stopped the run; the counts reached so far are still printed |
 
@@ -276,23 +276,23 @@ under unexpected dequeue pressure.
 
 ## Dequeue Index
 
-The dequeue hot path claims the highest-priority *eligible* job — pending, with
-its scheduled time reached — using `FOR UPDATE SKIP LOCKED`, ordered by
+The dequeue hot path claims the highest-priority *eligible* job, pending, with
+its scheduled time reached, using `FOR UPDATE SKIP LOCKED`, ordered by
 `priority DESC` then eligibility time. A single index, `idx_jobs_dequeue_eligible`,
 serves both ready and delayed/scheduled jobs by folding `run_at` into the
 eligibility key (`COALESCE(run_at, created_at)`):
 
-- **PostgreSQL / SQLite** — partial index on
+- **PostgreSQL / SQLite**: partial index on
   `(priority DESC, COALESCE(run_at, created_at), queue) WHERE status = 'pending'`.
   Terminal rows are excluded from the index entirely.
-- **MySQL** — `dq_eligible_at` is a `STORED` generated column
+- **MySQL**: `dq_eligible_at` is a `STORED` generated column
   `IF(status = 'pending', COALESCE(run_at, created_at), NULL)`. MySQL has no
   partial indexes, so `status` leads the index as an equality. A single
   index cannot both range-prune eligibility *and* provide the `priority DESC`
   order, so a large steady-state **ready** backlog used to filesort. The
   dequeue now also filters a stored `dq_ready` boolean (see below) and is served
   by `idx_jobs_dq_ready (status, dq_ready, priority DESC, dq_eligible_at, queue)`:
-  equality on `(status, dq_ready)` then the index's own priority order — **no
+  equality on `(status, dq_ready)` then the index's own priority order, **no
   filesort**, the claim reads one row and stops.
 
 This replaces the earlier `idx_jobs_dequeue` / `idx_jobs_dequeue_order` indexes,
@@ -305,7 +305,7 @@ regression cannot ship.
 
 `dq_ready` is a stored boolean meaning "pending and eligible to run *now*"
 (`run_at` is null or in the past). It is a **pure performance hint** that lets
-MySQL separate ready from not-yet-due jobs in the index — Dequeue still filters
+MySQL separate ready from not-yet-due jobs in the index, Dequeue still filters
 `dq_eligible_at <= now`, so a stale flag can never cause an incorrect or early
 dequeue; it can only cost latency. Readiness depends on wall-clock time, which a
 generated column cannot express, so each worker runs a small **ready-promoter**
@@ -317,17 +317,17 @@ index `idx_jobs_dq_unready`; MySQL uses the `(status, dq_ready)` prefix of
 `idx_jobs_dq_ready`), so it scans only the not-yet-eligible set, never the whole
 ready backlog. The chaos suite's `INV-READY-NO-STUCK` invariant samples this
 during its drain and fails if any single job stays eligible-but-unready across 30
-consecutive one-second samples — far longer than a promoter running at the poll
+consecutive one-second samples, far longer than a promoter running at the poll
 interval can take, so only a row nothing is healing reaches it.
 It deliberately does not assert that no job is *ever momentarily* unready: a job
 is unready for the instant between its `run_at` passing and the next promoter
-pass, by design.
+pass.
 
 ### MySQL must default to utf8mb4
 
 The schema pins `utf8mb4_0900_*` collations, which exist only in **MySQL 8.0+**.
-A database still defaulting to `utf8mb3` — the MySQL 5.x-era default, and what an
-older `CREATE DATABASE` leaves behind — cannot carry them: the column would
+A database still defaulting to `utf8mb3`, the MySQL 5.x-era default, and what an
+older `CREATE DATABASE` leaves behind, cannot carry them: the column would
 inherit `utf8mb3` while being handed a `utf8mb4` collation, and the server
 rejects it with `ER_COLLATION_CHARSET_MISMATCH`.
 
@@ -343,7 +343,7 @@ ALTER TABLE `your_table` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_a
 ```
 
 Then re-run `Migrate`. A `CREATE DATABASE` with no explicit charset inherits the
-server's `character_set_server`, which is `utf8mb4` by default on MySQL 8.0 — so
+server's `character_set_server`, which is `utf8mb4` by default on MySQL 8.0, so
 a new database on a stock 8.0 server needs none of this, but one created against
 a server whose `character_set_server` was set to `utf8mb3` still does.
 
@@ -353,7 +353,7 @@ that is already correct.
 
 ## Schema Migrations At Scale
 
-`sdj migrate` — and the automatic `Migrate` on worker startup — is idempotent and
+`sdj migrate`, and the automatic `Migrate` on worker startup, is idempotent and
 applies every versioned migration under a fleet-wide advisory lock. On a fresh or
 small database every migration is effectively instant. A few migrations applied to
 an **already-large** `jobs` table take locks proportional to table size; on large
@@ -363,8 +363,8 @@ lock) before rolling out the upgrade:
 - **New index builds.** Versioned index migrations use plain `CREATE INDEX`, which
   on PostgreSQL takes a `SHARE` lock that blocks writes for the build duration. If
   you add an index migration against a large `jobs` table, build it first with
-  `CREATE INDEX CONCURRENTLY` out-of-band — it cannot run inside the transactional
-  migration runner — then deploy.
+  `CREATE INDEX CONCURRENTLY` out-of-band, it cannot run inside the transactional
+  migration runner, then deploy.
 - **MySQL collation migration (v15).** v15 pins `unique_key` /
   `active_unique_key` to `utf8mb4_0900_as_cs` (case- and accent-sensitive dedup,
   for cross-engine parity). On MySQL this is a table-copy `ALTER`: instant on a
@@ -373,11 +373,11 @@ lock) before rolling out the upgrade:
   (`pt-online-schema-change` / `gh-ost`) before upgrading.
 - **MySQL queue/tenant collation + signal index rebuild (v25).** v25 pins
   `queue` and `tenant` to `utf8mb4_0900_as_cs`, so on MySQL these become
-  **case-sensitive** — `"Default"` and `"default"` are now *distinct* queues
+  **case-sensitive**, `"Default"` and `"default"` are now *distinct* queues
   (matching PostgreSQL, which was already case-sensitive). If a MySQL-only
   deployment relied on case-insensitive queue/tenant matching, normalize your
   queue/tenant names before upgrading. v25 also right-sizes `dq_eligible_at` to
-  `datetime(3)` and rebuilds `idx_signals_pending` to include `created_at` — all
+  `datetime(3)` and rebuilds `idx_signals_pending` to include `created_at`, all
   table-copy/index `ALTER`s on MySQL, so the same maintenance-window guidance as
   v15 applies on large installs.
 - **MySQL foreign keys (v14).** v14 adds `ON DELETE CASCADE` foreign keys from
@@ -385,7 +385,7 @@ lock) before rolling out the upgrade:
   consequences: (1) a child-row `INSERT` takes a shared lock on its parent `jobs`
   row, so a checkpoint or signal write can briefly contend with a concurrent
   status transition of the same job under heavy load; (2) `TRUNCATE jobs` now
-  fails (`Cannot truncate a table referenced in a foreign key constraint`) —
+  fails (`Cannot truncate a table referenced in a foreign key constraint`),
   truncate the child tables first, or `SET FOREIGN_KEY_CHECKS = 0` for a full
   reset. PostgreSQL's FK locks are `FOR KEY SHARE` and do not block the status
   update; SQLite uses application-level cascade (its DSN runs with
@@ -475,7 +475,7 @@ separate archive table.
 
 Requeue clears DLQ metadata, resets execution state, and deletes checkpoints so
 the workflow starts from the beginning. The dashboard's Retry button does the
-same thing — it routes through the identical replay-from-scratch reset, so it
+same thing, it routes through the identical replay-from-scratch reset, so it
 is **not** a way to resume from existing checkpoints. Neither path preserves
 them, and there is no operation that does. Handlers still must be idempotent:
 every step of a requeued workflow runs again, including steps that already
@@ -525,12 +525,12 @@ Delete-based retention removes old rows from `jobs`, `checkpoints`, and
 VACUUM reclaims them. On high-write queues, tune autovacuum per table instead
 of relying only on the database-wide defaults:
 
-> **Why `jobs` bloats fastest.** A job's `status` transitions (pending → running
-> → completed/failed) are **non-HOT by construction**: PostgreSQL treats a
+> **Why `jobs` bloats fastest.** A job's `status` transitions (pending, running,
+> then completed or failed) are **non-HOT by construction**: PostgreSQL treats a
 > partial index's predicate columns as HOT-blocking, and `status` is a
 > predicate/key column of the dequeue, stale-lock, retention, and active-unique
 > indexes. Every status change therefore writes fresh index tuples (and dead old
-> ones), independent of how few indexes name `status` directly — which is exactly
+> ones), independent of how few indexes name `status` directly, which is exactly
 > why aggressive autovacuum on `jobs` matters. (The redundant full `idx_jobs_status`
 > was dropped in v20 to cut per-write index maintenance; the inherent non-HOT
 > cost on the remaining partial indexes is unavoidable for an indexed queue.)

@@ -34,7 +34,7 @@ Insert into the `jobs` table with these columns:
 | `created_at` | Current timestamp |
 | `updated_at` | Current timestamp |
 
-Leave library-owned execution columns empty or `NULL`: `locked_by`, `locked_until`, `last_heartbeat_at`, `started_at`, `completed_at`, `last_error`, `dead_lettered_at`, `dead_letter_reason`, `previous_status`, `parent_job_id`, `root_job_id`, `fan_out_id`, `fan_out_index`, `result`, and `trace_context`. Also leave `unique_key` `NULL` — uniqueness/dedup is not part of this contract (use the Go API's `Unique` option instead).
+Leave library-owned execution columns empty or `NULL`: `locked_by`, `locked_until`, `last_heartbeat_at`, `started_at`, `completed_at`, `last_error`, `dead_lettered_at`, `dead_letter_reason`, `previous_status`, `parent_job_id`, `root_job_id`, `fan_out_id`, `fan_out_index`, `result`, and `trace_context`. Also leave `unique_key` `NULL`, uniqueness/dedup is not part of this contract (use the Go API's `Unique` option instead).
 
 Do not insert `active_unique_key` on MySQL. It is a generated column added by migration for active-job uniqueness.
 

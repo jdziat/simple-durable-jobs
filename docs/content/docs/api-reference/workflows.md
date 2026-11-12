@@ -27,7 +27,7 @@ queue.Register("workflow", func(ctx context.Context, input Input) error {
 
 Manually saves a checkpoint for a named phase within a job handler.
 
-The name identifies the checkpoint, so each phase in a handler needs its own. Saving a second phase under a name the same run already used is refused with `jobctx.ErrDuplicatePhaseName` and fails the job terminally: the two phases would share one record, and every later replay would skip both — including one whose body never ran. Saving the same name again in a *later* run is replay and stays allowed.
+The name identifies the checkpoint, so each phase in a handler needs its own. Saving a second phase under a name the same run already used is refused with `jobctx.ErrDuplicatePhaseName` and fails the job terminally: the two phases would share one record, and every later replay would skip both, including one whose body never ran. Saving the same name again in a *later* run is replay and stays allowed.
 
 Use `SavePhaseCheckpointTx(ctx, tx, phaseName, result)` when the phase's business write and checkpoint must commit atomically in the same GORM transaction; see [Transactional Checkpoints]({{< relref "/docs/advanced/transactional-checkpoints" >}}).
 
@@ -41,7 +41,7 @@ Retrieves a previously saved phase checkpoint. Returns the result and true if fo
 
 ### `LoadResult[T any](ctx context.Context, q *Queue, jobID core.UUID) (T, error)`
 
-Decodes the persisted return value of a completed job into `T`. This is the primary way to read a job's result from outside its handler — for example, a caller polling for the outcome of a job it enqueued.
+Decodes the persisted return value of a completed job into `T`. This is the primary way to read a job's result from outside its handler, for example, a caller polling for the outcome of a job it enqueued.
 
 The returned error discriminates terminal from non-terminal states, and every sentinel is `errors.Is`-matchable:
 
@@ -53,7 +53,7 @@ The returned error discriminates terminal from non-terminal states, and every se
 | Job cancelled | error wrapping `ErrJobCancelled` | stop |
 | Job still `pending`, `running`, `retrying`, `waiting`, or `paused` | `ErrJobNotCompleted` | keep polling |
 
-`ErrJobNotCompleted` is returned **only** for genuinely non-terminal states; cancelled and failed jobs return their own sentinels so a poller stops instead of spinning. The result-fetch error is also wrapped if `T` cannot be JSON-decoded from the stored value.
+`ErrJobNotCompleted` is returned **only** for non-terminal states; cancelled and failed jobs return their own sentinels so a poller stops instead of spinning. The result-fetch error is also wrapped if `T` cannot be JSON-decoded from the stored value.
 
 ```go
 result, err := jobs.LoadResult[Output](ctx, queue, jobID)
@@ -104,7 +104,7 @@ subJobs := []jobs.SubJob{
 
 ### `FanOut[T any](ctx context.Context, subJobs []SubJob, opts ...FanOutOption) ([]Result[T], error)`
 
-Spawns sub-jobs in parallel and waits for all results. Must be called from within a job handler. On first execution FanOut marks the parent job `waiting`, enqueues the sub-jobs, and returns `(nil, *WaitingError)` — the worker treats that signal as "suspend, not fail". When the sub-jobs complete the worker resumes the parent, FanOut replays, detects the completed fan-out via a checkpoint, and returns the collected results.
+Spawns sub-jobs in parallel and waits for all results. Must be called from within a job handler. On first execution FanOut marks the parent job `waiting`, enqueues the sub-jobs, and returns `(nil, *WaitingError)`, the worker treats that signal as "suspend, not fail". When the sub-jobs complete the worker resumes the parent, FanOut replays, detects the completed fan-out via a checkpoint, and returns the collected results.
 
 Sub-jobs receive a deterministic `UniqueKey` of the form `fanout-<fanOutID>-<index>` so a crashed parent can replay without inserting duplicate children.
 
@@ -145,7 +145,7 @@ Returns the number of successful results.
 
 ### `IsWaitingError(err error) bool`
 
-Reports whether `err` is the signal `FanOut` returns to the worker when a parent job has moved into `StatusWaiting` for its sub-jobs. Handlers generally do not need to inspect this — the worker treats it as "suspend, do not fail" automatically.
+Reports whether `err` is the signal `FanOut` returns to the worker when a parent job has moved into `StatusWaiting` for its sub-jobs. Handlers generally do not need to inspect this, the worker treats it as "suspend, do not fail" automatically.
 
 ```go
 if jobs.IsWaitingError(err) {
@@ -185,7 +185,7 @@ Sets the retry count for sub-jobs.
 
 ### `WithFanOutTimeout(d time.Duration) FanOutOption`
 
-Records a deadline on the fan-out record (`TimeoutAt` field on the `FanOut` row) for bookkeeping and observability. **Not automatically enforced** — applications should react to the timeout via their own monitoring or by checking `FanOut.TimeoutAt` before acting on partial results.
+Records a deadline on the fan-out record (`TimeoutAt` field on the `FanOut` row) for bookkeeping and observability. **Not automatically enforced**, applications should react to the timeout via their own monitoring or by checking `FanOut.TimeoutAt` before acting on partial results.
 
 ### `CancelOnParentFailure() FanOutOption`
 

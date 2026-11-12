@@ -15,7 +15,7 @@ workers, storage, checkpoints, middleware, and payload codec as `Queue.Register`
 and `Queue.Enqueue`.
 
 Job IDs are `core.UUID` (`github.com/jdziat/simple-durable-jobs/v4/pkg/core`),
-a defined string type — not `string`. The root facade re-exports it as
+a defined string type, not `string`. The root facade re-exports it as
 `jobs.UUID`.
 
 Keep using `Queue.Register`, `Queue.Enqueue`, and `Queue.EnqueueRemote` directly
@@ -36,7 +36,7 @@ match the handler's return type.
 `fn` is declared as `any` so `Define` accepts every handler shape
 `Queue.Register` accepts (`func(ctx, A) (R, error)`, `func(A) (R, error)`, …)
 and validates it reflectively. The consequence is that **`A` and `R` cannot be
-inferred from the arguments — you must always write the type parameters out**:
+inferred from the arguments, you must always write the type parameters out**:
 
 ```go
 sendEmail := typed.Define[SendEmailArgs, SendEmailResult](queue, "send-email",

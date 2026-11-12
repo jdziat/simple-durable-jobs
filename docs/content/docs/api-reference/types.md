@@ -21,7 +21,7 @@ Returns the default retry configuration.
 
 ### `Job`
 
-Abridged — the fields an application normally reads. Run
+Abridged, the fields an application normally reads. Run
 `go doc github.com/jdziat/simple-durable-jobs/v4/pkg/core.Job` for the complete
 struct, including the persistence-only and replay-control fields.
 
@@ -143,7 +143,7 @@ var (
 ```
 
 When polling for a job's result with `LoadResult`, only `ErrJobNotCompleted`
-signals a non-terminal state — it is returned for `pending`, `running`,
+signals a non-terminal state, it is returned for `pending`, `running`,
 `retrying`, `waiting`, and `paused`, but **not** for `cancelled` (which has its
 own `ErrJobCancelled`). A poller keeps polling on `ErrJobNotCompleted` and stops
 on `ErrJobFailed` or `ErrJobCancelled` (both terminal). All four are
