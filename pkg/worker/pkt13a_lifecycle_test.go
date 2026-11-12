@@ -112,7 +112,10 @@ func TestWorker_Shutdown_BoundedDrainOnStuckHandler(t *testing.T) {
 // hardens the intent (clean release, no wasted completion attempt) and is robust
 // to any completion path that would otherwise succeed despite cancellation.
 func TestWorker_Shutdown_ReleasesUnderNonFailureIsFailure(t *testing.T) {
-	q, cleanup := newSQLiteQueue(t)
+	// WAL file DB, not the shared-cache in-memory queue: the shutdown release
+	// races the test's own read, and shared-cache turns that into SQLITE_LOCKED
+	// ("database table is locked"), which leaves the job running.
+	q, cleanup := newWALFileQueue(t)
 	defer cleanup()
 	q.SetIsFailure(func(_ *core.Job, err error) bool { return !errors.Is(err, context.Canceled) })
 
