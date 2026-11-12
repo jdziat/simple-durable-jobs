@@ -121,7 +121,7 @@ The dashboard passes one of these actions for read RPCs:
 
 There is **no default action**. A procedure that is not in one of the two tables
 on this page is denied outright with `PermissionDenied`, before your
-`Authorizer` is consulted and before the insecure opt-in is honoured, so an
+`Authorizer` is consulted and before the insecure opt-in is honoured; so an
 unmapped RPC never reaches your policy at all, under any configuration. If you
 upgrade and a newly-added RPC starts returning `PermissionDenied`, the fix is in
 the library's procedure classification (`actionForProcedure` in `ui/handler.go`),
@@ -148,7 +148,7 @@ The dashboard passes one of these actions for mutating RPCs:
 
 `ui.Handler` fails closed by default: without `ui.WithAuthorizer(...)` or
 `ui.WithInsecureAllowUnauthenticated()`, all dashboard RPCs (reads and mutations) return
-`PermissionDenied`. This is an authorization gate only, it does not provide
+`PermissionDenied`. This is an authorization gate only; it does not provide
 transport encryption, CSRF protection, or audit logging; operate the dashboard
 behind your own TLS and network controls. Static frontend assets remain public
 because they do not carry job payloads or metadata.

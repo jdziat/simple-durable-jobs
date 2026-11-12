@@ -28,7 +28,7 @@ It deliberately does **not** clear `locked_by`/`locked_until`. A running job
 keeps its owning worker's lock so that worker's ownership audit short-circuits
 the live handler in about 5 seconds instead of waiting for the multi-minute
 heartbeat fallback. A cancelled row therefore still carries a `locked_by` and a
-future `locked_until`, and nothing clears them later, the stale-lock reaper only
+future `locked_until`, and nothing clears them later; the stale-lock reaper only
 reclaims `running` rows, so the values persist until retention deletes the job.
 If you monitor `locked_by <> ''` to mean "a worker is actively holding this job",
 exclude terminal statuses or you will misclassify every cancelled row.
@@ -51,7 +51,7 @@ half-cancelled tree where a parent is cancelled but children keep running in the
 database.
 
 > **Operational note:** cancelling a fan-out parent is an `O(subtree)`
-> single-transaction operation, every descendant sub-job is locked and updated
+> single-transaction operation; every descendant sub-job is locked and updated
 > in one transaction to guarantee atomicity. Cancelling a *very wide* fan-out
 > parent therefore holds that many row locks for the transaction's duration and
 > can briefly stall workers completing those children. The cost is bounded by

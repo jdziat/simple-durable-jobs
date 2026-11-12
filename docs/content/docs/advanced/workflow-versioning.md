@@ -39,14 +39,14 @@ increases `maxSupported`.
 
 ## Runs That Were Already In Flight
 
-A run that was mid-flight when you deployed the marker has no marker to replay,
+A run that was mid-flight when you deployed the marker has no marker to replay;
 the code that produced its checkpoints never called `GetVersion`. Those are
 exactly the runs the branch exists to protect, so they are **pinned to
 `DefaultVersion`** rather than handed `maxSupported`.
 
 The pin is decided on durable evidence, not a guess. When `GetVersion` finds no
-marker it looks for an indexed checkpoint, a `Call`, fan-out, signal wait, or
-timer, that an **earlier** execution recorded **at or beyond the call position
+marker it looks for an indexed checkpoint (a `Call`, fan-out, signal wait, or
+timer) that an **earlier** execution recorded **at or beyond the call position
 the handler is standing on**. Only a run that already executed past this point
 can carry one. `DefaultVersion` is then recorded like any other version, so every
 later replay of that run reads it straight back from the marker.
@@ -116,7 +116,7 @@ version, err := jobs.GetVersion(ctx, "shipping-v2", 1, 1)
 ```
 
 If an old run still has `DefaultVersion` recorded, or is pinned to it by the
-checkpoints it carries, this returns `jobs.ErrUnsupportedWorkflowVersion`
+checkpoints it carries; this returns `jobs.ErrUnsupportedWorkflowVersion`
 instead of silently taking the wrong branch. Removing the old arm while such runs
 exist therefore fails them loudly on the sentinel; wrap it in `jobs.NoRetry` (as
 the pattern above does) if you would rather they dead-letter for triage than

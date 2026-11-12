@@ -41,7 +41,7 @@ Retrieves a previously saved phase checkpoint. Returns the result and true if fo
 
 ### `LoadResult[T any](ctx context.Context, q *Queue, jobID core.UUID) (T, error)`
 
-Decodes the persisted return value of a completed job into `T`. This is the primary way to read a job's result from outside its handler, for example, a caller polling for the outcome of a job it enqueued.
+Decodes the persisted return value of a completed job into `T`. This is the primary way to read a job's result from outside its handler (for example, a caller polling for the outcome of a job it enqueued).
 
 The returned error discriminates terminal from non-terminal states, and every sentinel is `errors.Is`-matchable:
 
@@ -104,7 +104,7 @@ subJobs := []jobs.SubJob{
 
 ### `FanOut[T any](ctx context.Context, subJobs []SubJob, opts ...FanOutOption) ([]Result[T], error)`
 
-Spawns sub-jobs in parallel and waits for all results. Must be called from within a job handler. On first execution FanOut marks the parent job `waiting`, enqueues the sub-jobs, and returns `(nil, *WaitingError)`, the worker treats that signal as "suspend, not fail". When the sub-jobs complete the worker resumes the parent, FanOut replays, detects the completed fan-out via a checkpoint, and returns the collected results.
+Spawns sub-jobs in parallel and waits for all results. Must be called from within a job handler. On first execution FanOut marks the parent job `waiting`, enqueues the sub-jobs, and returns `(nil, *WaitingError)`; the worker treats that signal as "suspend, not fail". When the sub-jobs complete the worker resumes the parent, FanOut replays, detects the completed fan-out via a checkpoint, and returns the collected results.
 
 Sub-jobs receive a deterministic `UniqueKey` of the form `fanout-<fanOutID>-<index>` so a crashed parent can replay without inserting duplicate children.
 
@@ -145,7 +145,7 @@ Returns the number of successful results.
 
 ### `IsWaitingError(err error) bool`
 
-Reports whether `err` is the signal `FanOut` returns to the worker when a parent job has moved into `StatusWaiting` for its sub-jobs. Handlers generally do not need to inspect this, the worker treats it as "suspend, do not fail" automatically.
+Reports whether `err` is the signal `FanOut` returns to the worker when a parent job has moved into `StatusWaiting` for its sub-jobs. Handlers generally do not need to inspect this; the worker treats it as "suspend, do not fail" automatically.
 
 ```go
 if jobs.IsWaitingError(err) {

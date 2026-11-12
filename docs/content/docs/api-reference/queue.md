@@ -23,7 +23,7 @@ queue := jobs.New(storage)
 
 ### `(*Queue) Register(name string, fn any, opts ...Option)`
 
-Registers a job handler function. The function takes **one or two** parameters,
+Registers a job handler function. The function takes **one or two** parameters:
 an optional leading `context.Context`, then an optional args value, and returns
 either `error` or `(R, error)`. Every combination is accepted:
 
@@ -89,7 +89,7 @@ if err := queue.Schedule("cleanup", nil, jobs.Every(5*time.Minute)); err != nil 
 
 Creates a worker for this queue. Note the return type: it is `core.Starter`,
 whose only method is `Start`. **Use `jobs.NewWorker(q, ...)` instead** unless
-`Start` is all you need, the facade returns `*Worker`, which is the
+`Start` is all you need; the facade returns `*Worker`, which is the
 type that carries `Pause`, `Resume`, `WaitForPause`, `CancelJob`, `Health`,
 `IsPaused`, `RunningJobCount` and `HealthHandler`. The `...any` parameter also
 means a mistyped option is not caught by the compiler; the facade takes typed

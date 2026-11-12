@@ -3,9 +3,9 @@ title: "Migrating from v2 to v4"
 weight: 9
 ---
 
-v4 is the current major. The breaking changes below, the Go module path, a
+v4 is the current major. The breaking changes below (the Go module path, a
 small set of Go APIs, and the SQL schema representation used by PostgreSQL and
-MySQL, span the v3.0.0 and v4.0.0 releases: v3.0.0 carried the schema break and
+MySQL) span the v3.0.0 and v4.0.0 releases: v3.0.0 carried the schema break and
 most of the API moves, and v4.0.0 carried the `/v3` to `/v4` module-path change
 and made `CancelJob` terminal (see Go API Changes). A v2 to v4 upgrade applies all
 of them at once. Plan the schema step deliberately before rolling v4 workers onto
@@ -73,8 +73,8 @@ remote producers.
 
 `q.CancelJob` is now **terminal** (changed in v4.0.0). In v2 it aliased an
 aggressive pause, so a running job could be resumed afterward. In v4 a cancelled
-job is not resumable via `ResumeJob`, use `Requeue` to replay it from scratch,
-and cancelling a fan-out parent terminally cancels all of its direct and nested
+job is not resumable via `ResumeJob`; use `Requeue` to replay it from scratch.
+Cancelling a fan-out parent terminally cancels all of its direct and nested
 children in the same storage transaction. Audit any v2 code that relied on
 `CancelJob` being recoverable.
 

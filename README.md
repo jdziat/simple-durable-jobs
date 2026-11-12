@@ -77,9 +77,9 @@ backend support tiers, and crash-recovery tuning.
 - **Rate Limiting** - Per-queue token buckets and an optional fleet-wide limiter (throttle waits don't burn retry attempts)
 - **Retries with Backoff** - Configurable retry logic with exponential backoff and jitter
 - **Dead-Letter Queue** - Explicit dead-letter metadata with list/count/requeue triage
-- **Retention / GC** - **On by default.** A worker built with no retention options prunes completed jobs after 30 days, failed/cancelled after 90, and consumed signals after 7, none of that is opt-in, so plan external archival inside those windows. A one-time WARN is logged only when retention is explicitly DISABLED. Opt-in transactional checkpoint GC (`RetentionDeleteCheckpointsOnComplete`) additionally bounds checkpoint growth
+- **Retention / GC** - **On by default.** A worker built with no retention options prunes completed jobs after 30 days, failed/cancelled after 90, and consumed signals after 7; none of that is opt-in, so plan external archival inside those windows. A one-time WARN is logged only when retention is explicitly DISABLED. Opt-in transactional checkpoint GC (`RetentionDeleteCheckpointsOnComplete`) additionally bounds checkpoint growth
 - **Execution Middleware** - Interceptors that wrap handler execution
-- **Payload Codec** - Pluggable encryption-at-rest for job arguments, results, checkpoints, and error text (`last_error` and the dead-letter reason suffix) (opt-in; encrypts the listed fields at the application/storage boundary, it is not whole-database encryption and is not a compliance attestation.)
+- **Payload Codec** - Pluggable encryption-at-rest for job arguments, results, checkpoints, and error text (`last_error` and the dead-letter reason suffix) (opt-in; encrypts the listed fields at the application/storage boundary; it is not whole-database encryption and is not a compliance attestation.)
 - **Workflow Versioning** - GetVersion markers to evolve in-flight workflows safely across deploys
 - **Metrics** - Optional Prometheus / OpenTelemetry metrics exporter (queue depth, latency, throughput, failures)
 - **Observability** - Hooks, event streams, OpenTelemetry tracing, and an embedded web dashboard

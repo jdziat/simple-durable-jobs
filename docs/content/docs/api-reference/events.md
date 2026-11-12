@@ -151,12 +151,12 @@ type CustomEvent struct {
 **`CheckpointSaved` is DECLARED BUT NOT CURRENTLY EMITTED.** Every other type
 above is published to `Queue.Events()` subscribers; `CheckpointSaved` is not.
 Nothing in the module constructs one, so a `case *jobs.CheckpointSaved:` arm
-never fires, no error, no warning, just an arm that is dead code. The
+never fires; no error, no warning, just an arm that is dead code. The
 `CallType` annotation above can therefore never be observed.
 
 Checkpoints themselves are written normally by `jobs.Call`, `SaveCheckpoint` and
 `SavePhaseCheckpoint`. To follow workflow progress, poll
-`q.Storage().GetCheckpoints(ctx, jobID)` rather than subscribing, note it is a
+`q.Storage().GetCheckpoints(ctx, jobID)` rather than subscribing; note it is a
 `Storage` method, not a `Queue` one.
 
 The type stays exported because removing it would be a breaking change, and it
@@ -198,4 +198,4 @@ once-per-job hook.
 
 ### `(*Queue) OnJobReclaimed(fn func(ctx context.Context, jobID core.UUID, reason string))`
 
-Registers a callback for when a job lease is reclaimed. It fires both when this worker's stale-lock reaper recovers a job from a presumed-dead owner and when the ownership audit observes a peer reclaim a job this worker was running. `reason` is `ReclaimReasonStaleLock` (`"stale_lock"`, the actor/crash-leading-indicator side) or `ReclaimReasonOwnershipAudit` (`"ownership_audit"`, the victim side). See the `JobReclaimed` event above, the same caveat applies: do not sum across reasons, since one logical reclaim can fire on both sides on different workers.
+Registers a callback for when a job lease is reclaimed. It fires both when this worker's stale-lock reaper recovers a job from a presumed-dead owner and when the ownership audit observes a peer reclaim a job this worker was running. `reason` is `ReclaimReasonStaleLock` (`"stale_lock"`, the actor/crash-leading-indicator side) or `ReclaimReasonOwnershipAudit` (`"ownership_audit"`, the victim side). See the `JobReclaimed` event above; the same caveat applies: do not sum across reasons, since one logical reclaim can fire on both sides on different workers.
