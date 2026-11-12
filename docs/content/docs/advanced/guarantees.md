@@ -34,7 +34,7 @@ A completed `Call()` or `SavePhaseCheckpoint` writes its checkpoint on a
 cancellation- and deadline-immune detached context (a fixed ~5s budget), so a
 per-job `Timeout` that fires *as the activity returns* will not lose the
 checkpoint and re-run the step. That detached window narrows the crash gap to a
-genuine process/machine death; the case the statement above describes.
+genuine process/machine death, the case the statement above describes.
 
 **Your handlers, and every `Call()` step, must be idempotent.** Use a unique
 key, an upsert, or an external dedup guard for any side effect that must not
@@ -111,7 +111,7 @@ is almost certainly wrong for short jobs. The relevant knobs:
   couple of heartbeat intervals.
 - `WithStaleLockAge(d)`: how long the owning worker must have made **no
   contact** before the reaper reclaims the job (default 45m). The anchor is
-  `COALESCE(last_heartbeat_at, started_at, locked_until)`; the worker's last
+  `COALESCE(last_heartbeat_at, started_at, locked_until)`: the worker's last
   contact (a live heartbeat, else when it started, else the lease as a last
   resort), measured as *time since last contact*, not lease expiry, so reclaim
   latency is roughly `StaleLockAge`, regardless of how far an in-flight lease has

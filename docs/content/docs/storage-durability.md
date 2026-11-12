@@ -78,8 +78,8 @@ because what recovers it depends on the backend:
 - **A custom backend that stores `completed_count` as a real column and loses the
   increment**: the completion **is** lost. Nothing in the required `core.Storage`
   interface recovers it. `GetStalledFanOutParents` cannot: its contract is
-  "a pending fan-out with FEWER CHILD ROWS than `total_count`"; a fan-out whose
-  creation never finished, so a fan-out with all its children present and a
+  "a pending fan-out with FEWER CHILD ROWS than `total_count`", which describes a fan-out whose
+  creation never finished; a fan-out with all its children present and a
   counter one short matches nothing. `GetWaitingJobsToResume` excludes any parent
   with a still-`pending` fan-out, which this one is. The parent waits forever, or,
   on a backend whose scan is more permissive, is resumed every recovery tick,

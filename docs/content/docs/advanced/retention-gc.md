@@ -174,7 +174,7 @@ write locks.
 Retention never deletes a terminal job that a still-live `unique_locks` row
 references. `jobs.IdempotencyKey` and `jobs.UniqueFor` promise to keep
 deduplicating until their own TTL expires, and an operator who writes
-`jobs.IdempotencyKey("invoice-42", 90*24*time.Hour)` means it; if the sweep
+`jobs.IdempotencyKey("invoice-42", 90*24*time.Hour)` means it: if the sweep
 removed the job at the 30 day (or `jobs.DefaultRetention()`'s 7 day) horizon, the
 replayed request on day 31 would enqueue a second job and do the guarded work
 twice.

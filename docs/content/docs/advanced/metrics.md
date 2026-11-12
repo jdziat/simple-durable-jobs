@@ -114,7 +114,7 @@ counters that surface dispatch churn. They are registered per worker with
 and both carry `worker.id`.
 
 A worker dequeues (claims) a job before the final admission gates run; if a gate
-denies, the job is released back to pending; a "bounce" counted under
+denies, the job is released back to pending, a "bounce" counted under
 `jobs.dequeue.released` by `reason`. When **every** configured fleet `RateLimit`
 is unkeyed, a saturated limit engages a claim-rate throttle: the worker stops
 claiming until the limit's rate window rolls over, rather than bouncing the full
@@ -123,7 +123,7 @@ concurrency budget every poll tick. Each suppressed tick increments
 
 The healthy steady state under a saturated **unkeyed** fleet limit is
 `suppressed_ticks` rising while `released{reason="fleet_rate"}` stays low (one
-probe batch per rate window); the throttle collapsing the claim/release write
+probe batch per rate window), the throttle collapsing the claim/release write
 amplification, not a stuck worker.
 
 For a **keyed** `RateLimit` the worker can't pre-check a bucket before claiming
@@ -132,7 +132,7 @@ per-key cooldown skips the expensive DB rate transaction for a bucket already
 denied this window. Those skipped bounces are attributed to
 `released{reason="fleet_rate_cached"}`, distinct from `reason="fleet_rate"` (the
 bounces that paid the DB transaction). The healthy keyed signal is
-`fleet_rate_cached` dominating `fleet_rate`; the cooldown eliding the contended
+`fleet_rate_cached` dominating `fleet_rate`, the cooldown eliding the contended
 locked transaction. Register the cooldown's cache-size gauge with
 `InstrumentWorkerRateSaturation(workerID, worker.DequeueRateSaturationCacheSize, ...)`;
 when `jobs_dequeue_rate_saturation_cache_size` sits at the configured

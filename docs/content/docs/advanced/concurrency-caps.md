@@ -64,7 +64,7 @@ continues to apply.
 
 When you partition a cap with `CapKey`, the effective slot name is
 `Name + ":" + key`. Each distinct slot name leaves a permanent
-admission-serialization row in the `concurrency_slots` table; a sentinel that
+admission-serialization row in the `concurrency_slots` table, a sentinel that
 the lease-expiry sweep intentionally preserves, so concurrent contenders for the
 same slot always have a row to lock before they count and insert.
 

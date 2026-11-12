@@ -343,7 +343,7 @@ ALTER TABLE `your_table` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_a
 ```
 
 Then re-run `Migrate`. A `CREATE DATABASE` with no explicit charset inherits the
-server's `character_set_server`, which is `utf8mb4` by default on MySQL 8.0; so
+server's `character_set_server`, which is `utf8mb4` by default on MySQL 8.0, so
 a new database on a stock 8.0 server needs none of this, but one created against
 a server whose `character_set_server` was set to `utf8mb3` still does.
 
