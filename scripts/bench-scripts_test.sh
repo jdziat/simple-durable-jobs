@@ -190,6 +190,14 @@ expect "regress: a gated benchmark missing from the current run fails" 1 "Workfl
 expect "regress: no baseline is a loud skip" 0 "no baseline" -- "$REGRESS" "$tmp/nope.txt" "$clean"
 expect "regress: a different cpu is a loud skip" 0 "different cpu" -- "$REGRESS" "$tmp/other-cpu.txt" "$clean"
 
+# A benchmark that changed which metric it reports cannot be compared.
+awk '/^BenchmarkEnqueue-/ { for (i = 3; i < NF; i++) if ($(i+1) == "jobs/sec") $(i+1) = "ops/sec" } { print }' "$clean" >"$tmp/metric-changed.txt"
+expect "regress: a changed metric fails instead of producing a wrong ratio" 1 "Enqueue reports tp in the baseline but ns now" -- "$REGRESS" "$clean" "$tmp/metric-changed.txt"
+
+# A zero current throughput is the worst slowdown there is: it must fail, not divide.
+awk '/^BenchmarkEnqueue-/ { for (i = 3; i < NF; i++) if ($(i+1) == "jobs/sec") $i = 0 } { print }' "$clean" >"$tmp/zero-tp.txt"
+expect "regress: zero current throughput fails" 1 "REGRESSION Enqueue" -- "$REGRESS" "$clean" "$tmp/zero-tp.txt"
+
 # Sub-benchmarks of a gated benchmark are gated too.
 cp "$clean" "$tmp/sub-base.txt"
 cp "$clean" "$tmp/sub-cur.txt"

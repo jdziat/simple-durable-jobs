@@ -78,6 +78,11 @@ for name in $gated; do
       fail=1
       continue
     fi
+    if [ "$bm" != "$cm" ]; then
+      echo "bench-regress: $full reports $bm in the baseline but $cm now; the ratio would be meaningless, so record a new baseline" >&2
+      fail=1
+      continue
+    fi
     bv="$(awk -v n="$full" '$1 == n { print $3 }' "$tmp/base" | median)"
     cv="$(awk -v n="$full" '$1 == n { print $3 }' "$tmp/cur" | median)"
     if [ "$bm" = tp ]; then

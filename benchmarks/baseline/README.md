@@ -45,6 +45,10 @@ skips.
 
 4. Record each CPU model you see. A new model on a later run only skips (with a NOTICE
    naming the file to record) until its baseline is added.
+5. Build each baseline from **three or more** runs on that CPU model, not one: validate
+   each artifact on its own, then concatenate the result lines of all of them under one
+   header. The checks take the median across every sample, so one unlucky run cannot
+   shift the threshold. Dispatch until each (backend, CPU model) has three.
 
 ## What the checks mean
 
@@ -71,4 +75,10 @@ six samples:
 
 The worst same-CPU ratio is 1.07, so 2.0 leaves a wide margin against false alarms and
 still catches a real slowdown (a 3x one fails; see `scripts/bench-scripts_test.sh`).
-This is two runs; lower the factor only after a longer series shows the spread.
+
+Limits of this calibration, stated plainly: it is **SQLite only** and **two runs**. Both
+Postgres runs landed on different CPU models, so the Postgres same-CPU spread has not
+been measured, and Postgres is more sensitive to I/O and noisy neighbours. The factor is
+provisional there. After three or more runs per Postgres CPU model, re-derive it; if the
+spread exceeds 1.3, give Postgres its own factor (for example 2.5) rather than letting a
+noisy backend raise false alarms.
