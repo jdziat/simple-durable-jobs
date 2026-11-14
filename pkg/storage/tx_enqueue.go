@@ -343,7 +343,9 @@ func (s *GormStorage) enqueueBatchWithDB(db *gorm.DB, jobs []*core.Job) error {
 	// one statement per phase keeps today's SQL and pays no savepoint. Today a list
 	// over retentionDeleteChunkSize ids already implies more than one insert chunk
 	// (the insert cap is 500 rows); the conditions stay independent so a later cap
-	// change cannot reopen the window.
+	// change cannot reopen the window. The comparisons are strict on purpose:
+	// chunkIDs splits only ABOVE the chunk size, so a list of exactly
+	// retentionDeleteChunkSize ids is still a single statement and needs no savepoint.
 	if len(insertChunks) > 1 ||
 		len(zeroRetryIDs) > retentionDeleteChunkSize ||
 		len(dqReadyFalseIDs) > retentionDeleteChunkSize {
