@@ -77,10 +77,13 @@ run_backend() {
   esac
 
   info "[$backend] go test -bench=. -benchmem -count=${BENCH_COUNT} -timeout=${BENCH_TIMEOUT} ./benchmarks/"
-  env "${env_args[@]}" go test -run '^$' -bench=. -benchmem -count="$BENCH_COUNT" -timeout="$BENCH_TIMEOUT" ./benchmarks/ | tee "$output"
+  # `|| return 1` matters: run_backend is called from an `if`, where `set -e` is off,
+  # so without it the status of the last command in the function would replace a
+  # failed `go test` (pipefail makes the pipeline carry go test's status).
+  env "${env_args[@]}" go test -run '^$' -bench=. -benchmem -count="$BENCH_COUNT" -timeout="$BENCH_TIMEOUT" ./benchmarks/ | tee "$output" || return 1
   # A run can exit 0 and still be unusable (a partial or corrupted file); check the
   # file itself before it is uploaded or compared.
-  "$ROOT/scripts/validate-bench-output.sh" "$output" "$backend" "$BENCH_COUNT"
+  "$ROOT/scripts/validate-bench-output.sh" "$output" "$backend" "$BENCH_COUNT" || return 1
 }
 
 declare -A results

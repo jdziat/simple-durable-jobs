@@ -43,6 +43,7 @@ esac
 
 awk -v count="$count" -v required="$required" -v file="$file" '
   function bad(msg) { print file ":" NR ": " msg > "/dev/stderr"; problems++ }
+  !/^[ \t]/ { in_log = 0 }
   /^(--- FAIL|FAIL|panic:)/ { bad("failure line: " $0); next }
   /^Benchmark[A-Za-z0-9_]+(-[0-9]+)?[ \t]+[0-9]+[ \t]+[0-9.]+ ns\/op([ \t]+[0-9.eE+-]+ [A-Za-z0-9_\/%-]+)*[ \t]*$/ {
     name = $1
@@ -54,8 +55,11 @@ awk -v count="$count" -v required="$required" -v file="$file" '
   /^(goos|goarch|pkg|cpu): / { next }
   /^(PASS|ok[ \t].*)$/ { next }
   /^[ \t]*$/ { next }
-  /^--- BENCH: Benchmark[A-Za-z0-9_]+(-[0-9]+)?$/ { next }
-  /^    [A-Za-z0-9_]+\.go:[0-9]+: / { next }
+  /^--- BENCH: Benchmark[A-Za-z0-9_]+(-[0-9]+)?$/ { in_log = 1; next }
+  # b.Logf output: indented lines (a space or a tab; multi-line messages indent deeper)
+  # are accepted only inside a --- BENCH: block, so a stray indented line elsewhere
+  # still fails.
+  in_log && /^[ \t]+[^ \t]/ { next }
   { bad("unexpected line: " substr($0, 1, 120)) }
   END {
     n = split(required, names, " ")
