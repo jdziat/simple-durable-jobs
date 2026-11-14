@@ -108,7 +108,7 @@ run_bench_sh_bad_count() { PATH="$tmp/shim:$PATH" FAKE_GO_OUTPUT="$clean" BENCH_
 expect "bench.sh rejects BENCH_COUNT=0 before running anything" 2 "BENCH_COUNT must be a positive integer" -- run_bench_sh_bad_count
 run_bench_sh_with_timeout() { PATH="$tmp/shim:$PATH" FAKE_GO_OUTPUT="$clean" BENCH_COUNT=3 BENCH_TIMEOUT="$1" "$tmp/sandbox/scripts/bench.sh" sqlite; }
 expect "bench.sh rejects BENCH_TIMEOUT without a unit" 2 "BENCH_TIMEOUT must be a Go duration" -- run_bench_sh_with_timeout 25
-expect "bench.sh rejects an empty BENCH_TIMEOUT" 2 "BENCH_TIMEOUT must be a Go duration" -- run_bench_sh_with_timeout ""
+expect "bench.sh treats an empty BENCH_TIMEOUT as unset and uses the default" 0 "timeout=25m" -- run_bench_sh_with_timeout ""
 expect "bench.sh accepts BENCH_TIMEOUT=90s" 0 "sqlite: PASS" -- run_bench_sh_with_timeout 90s
 
 # ---- bench-compare.sh ----
