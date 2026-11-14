@@ -1637,6 +1637,30 @@ func (s *GormStorage) Heartbeat(ctx context.Context, jobID core.UUID, workerID s
 		return result.Error
 	}
 	if result.RowsAffected == 0 {
+		return s.notOwnedUnlessStillOwned(ctx, jobID, workerID)
+	}
+	return nil
+}
+
+// notOwnedUnlessStillOwned resolves an ownership-fenced UPDATE that reported zero
+// affected rows. MySQL reports CHANGED rows, not MATCHED rows, so an UPDATE that
+// matched the owned row but wrote the values it already held also reports zero.
+// The timestamp columns are datetime(3): two statements that evaluate NOW(6) inside
+// the same millisecond write identical values. Zero rows is therefore ambiguous on
+// MySQL, and the row has to be read before an owned job is called lost. PostgreSQL
+// and SQLite count matched rows, so there zero always means not owned and this is
+// one extra read on a path that is already an error.
+//
+// Use it only after an UPDATE that CAN legitimately change nothing (a heartbeat, or
+// re-saving an identical result). An UPDATE that moves status or clears the lock
+// always changes a row when it matches, so zero rows is unambiguous there.
+func (s *GormStorage) notOwnedUnlessStillOwned(ctx context.Context, jobID core.UUID, workerID string) error {
+	var owned int64
+	if err := s.ownedRunning(s.db.WithContext(ctx), ctx, jobID, workerID).
+		Count(&owned).Error; err != nil {
+		return err
+	}
+	if owned == 0 {
 		return core.ErrJobNotOwned
 	}
 	return nil
@@ -2994,7 +3018,9 @@ func (s *GormStorage) SaveJobResult(ctx context.Context, jobID core.UUID, worker
 		return update.Error
 	}
 	if update.RowsAffected == 0 {
-		return core.ErrJobNotOwned
+		// Re-saving a byte-identical result inside one millisecond changes no
+		// column (updated_at is datetime(3)); see notOwnedUnlessStillOwned.
+		return s.notOwnedUnlessStillOwned(ctx, jobID, workerID)
 	}
 	return nil
 }
