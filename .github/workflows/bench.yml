@@ -80,27 +80,37 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-  # A red scheduled run went unnoticed for five weeks. Open one issue (or comment on
-  # the open one) so a failing benchmark job is visible without watching Actions.
-  report-failure:
-    name: Report benchmark failure
+  # A red scheduled run went unnoticed for five weeks. Keep one issue labelled `bench`
+  # in step with the schedule: open (or comment on) it when the run does not succeed,
+  # close it when a later run does. A job killed at timeout-minutes concludes
+  # `cancelled`, not `failure`, so this keys on the result rather than failure().
+  report:
+    name: Report benchmark status
     needs: bench
-    if: ${{ failure() && github.event_name == 'schedule' }}
+    if: ${{ always() && github.event_name == 'schedule' && needs.bench.result != 'skipped' }}
     runs-on: ubuntu-latest
     permissions:
       issues: write
     steps:
-      - name: Open or update the benchmark issue
+      - name: Open, update or close the benchmark issue
         env:
           GH_TOKEN: ${{ github.token }}
+          RESULT: ${{ needs.bench.result }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
-          gh label create bench --repo "$GITHUB_REPOSITORY" \
-            --description "Scheduled benchmark run failed" --color B60205 2>/dev/null || true
           existing="$(gh issue list --repo "$GITHUB_REPOSITORY" --label bench --state open \
             --json number --jq '.[0].number // empty')"
-          body="The scheduled benchmark run failed: $RUN_URL"
+          if [ "$RESULT" = success ]; then
+            if [ -n "$existing" ]; then
+              gh issue close "$existing" --repo "$GITHUB_REPOSITORY" \
+                --comment "The scheduled benchmark run succeeded again: $RUN_URL"
+            fi
+            exit 0
+          fi
+          gh label create bench --repo "$GITHUB_REPOSITORY" \
+            --description "Scheduled benchmark run failed" --color B60205 2>/dev/null || true
+          body="The scheduled benchmark run did not succeed (result: $RESULT): $RUN_URL"
           if [ -n "$existing" ]; then
             gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "$body"
           else
