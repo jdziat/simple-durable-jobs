@@ -58,11 +58,25 @@ func BenchmarkEnqueue(b *testing.B) {
 }
 
 func BenchmarkEnqueueBatch(b *testing.B) {
+	benchmarkEnqueueBatch(b, benchBatchSize)
+}
+
+// BenchmarkEnqueueBatchSizes sweeps the batch size across the range where a
+// bound-variable ceiling bites (SQLite refuses more than 32766 variables, so an
+// unchunked insert broke at 963 rows). A size that errors fails the benchmark, so a
+// regression of that kind shows up as a failed run, not a slower number.
+func BenchmarkEnqueueBatchSizes(b *testing.B) {
+	for _, n := range []int{100, 500, 1000, 5000} {
+		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) { benchmarkEnqueueBatch(b, n) })
+	}
+}
+
+func benchmarkEnqueueBatch(b *testing.B, size int) {
 	env := newBenchEnv(b)
 	env.queue.Register("bench.batch", func(context.Context, noopArgs) error { return nil })
 	ctx := context.Background()
 
-	entries := make([]jobs.BatchEntry, benchBatchSize)
+	entries := make([]jobs.BatchEntry, size)
 	for i := range entries {
 		entries[i] = jobs.Batch("bench.batch", noopArgs{N: i}, jobs.QueueOpt(benchQueue))
 	}

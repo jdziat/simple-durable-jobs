@@ -132,6 +132,8 @@ expect "no baseline is a loud skip" 0 "no baseline" -- "$COMPARE" "$tmp/missing-
 must sed 's/^cpu: .*/cpu: Some Other CPU/' "$clean" >"$tmp/other-cpu.txt"
 expect "a baseline from another cpu is a loud skip" 0 "different cpu" -- "$COMPARE" "$tmp/other-cpu.txt" "$clean"
 must grep -v '^cpu:' "$clean" >"$tmp/no-cpu.txt"
+must sed 's/^cpu: .*/cpu: AMD EPYC 7763 64-Core Processor                /' "$clean" >"$tmp/epyc7763.txt"
+must sed 's/^cpu: .*/cpu: AMD EPYC 9V45 96-Core Processor/' "$clean" >"$tmp/epyc9v45.txt"
 expect "files with no cpu line are a loud skip, not a match" 0 "different cpu" -- "$COMPARE" "$tmp/no-cpu.txt" "$tmp/no-cpu.txt"
 
 expect "same cpu runs benchstat on the stripped files" 0 "NAME=BenchmarkEnqueue$" -- "$COMPARE" "$tmp/four-core.txt" "$clean"
@@ -147,6 +149,58 @@ compare_with_failing_benchstat() { FAKE_BENCHSTAT_FAIL=3 "$COMPARE" "$tmp/four-c
 expect "a benchstat failure propagates" 3 "FAKE BENCHSTAT" -- compare_with_failing_benchstat
 unset BENCHSTAT
 expect "usage error" 2 "usage" -- "$COMPARE"
+
+# ---- bench-baseline-for.sh ----
+BASELINE_FOR="$ROOT/scripts/bench-baseline-for.sh"
+expect "baseline path is per backend and cpu model" 0 "^benchmarks/baseline/sqlite/amd-epyc-7763-64-core-processor.txt$" -- "$BASELINE_FOR" sqlite "$tmp/epyc7763.txt"
+expect "a different cpu model gets a different baseline" 0 "^benchmarks/baseline/postgres/amd-epyc-9v45-96-core-processor.txt$" -- "$BASELINE_FOR" postgres "$tmp/epyc9v45.txt"
+expect "unknown backend is a usage error" 2 "unknown backend" -- "$BASELINE_FOR" oracle "$tmp/epyc7763.txt"
+expect "a file with no cpu line is an error" 1 "no cpu: line" -- "$BASELINE_FOR" sqlite "$tmp/no-cpu.txt"
+expect "a missing file is an error" 1 "not found" -- "$BASELINE_FOR" sqlite "$tmp/nope.txt"
+
+# ---- bench-regress.sh ----
+REGRESS="$ROOT/scripts/bench-regress.sh"
+slow="$tmp/slow3x.txt"
+# 3x slower: ns/op x3, throughput / 3 (the metric the check reads).
+awk '/^Benchmark/ {
+  for (i = 3; i < NF; i++) {
+    if ($(i+1) == "ns/op") $i = $i * 3
+    if ($(i+1) == "jobs/sec" || $(i+1) == "steps/sec") $i = sprintf("%.1f", $i / 3)
+  }
+}
+{ print }' "$clean" >"$slow"
+fast="$tmp/fast.txt"
+awk '/^Benchmark/ { for (i = 3; i < NF; i++) { if ($(i+1) == "jobs/sec" || $(i+1) == "steps/sec") $i = sprintf("%.1f", $i * 2) } } { print }' "$clean" >"$fast"
+
+expect "regress: identical runs pass" 0 "no gated benchmark" -- "$REGRESS" "$clean" "$clean"
+expect "regress: a 3x slowdown fails" 1 "REGRESSION" -- "$REGRESS" "$clean" "$slow"
+expect "regress: a 2x speedup passes" 0 "no gated benchmark" -- "$REGRESS" "$clean" "$fast"
+BENCH_REGRESSION_FACTOR=4 expect "regress: the factor is configurable" 0 "limit 4.0x\|more than 4" -- "$REGRESS" "$clean" "$slow"
+
+# A slowdown only in a benchmark that is not gated must not fail.
+awk '/^BenchmarkDispatchLatency/ { $3 = $3 * 5 } { print }' "$clean" >"$tmp/dispatch-slow.txt"
+expect "regress: DispatchLatency is not gated" 0 "no gated benchmark" -- "$REGRESS" "$clean" "$tmp/dispatch-slow.txt"
+
+# Reads the throughput metric, not ns/op: slow only ns/op on EndToEnd, leave jobs/sec.
+awk '/^BenchmarkEndToEnd-/ { for (i = 3; i < NF; i++) if ($(i+1) == "ns/op") $i = $i * 9 } { print }' "$clean" >"$tmp/nsop-only.txt"
+expect "regress: end-to-end ns/op alone does not trip it" 0 "no gated benchmark" -- "$REGRESS" "$clean" "$tmp/nsop-only.txt"
+
+grep -v '^BenchmarkWorkflowSteps' "$clean" >"$tmp/missing-wf.txt"
+expect "regress: a gated benchmark missing from the current run fails" 1 "WorkflowSteps is missing" -- "$REGRESS" "$clean" "$tmp/missing-wf.txt"
+expect "regress: no baseline is a loud skip" 0 "no baseline" -- "$REGRESS" "$tmp/nope.txt" "$clean"
+expect "regress: a different cpu is a loud skip" 0 "different cpu" -- "$REGRESS" "$tmp/other-cpu.txt" "$clean"
+
+# Sub-benchmarks of a gated benchmark are gated too.
+cp "$clean" "$tmp/sub-base.txt"
+cp "$clean" "$tmp/sub-cur.txt"
+for n in 100 1000; do
+  printf 'BenchmarkEnqueueBatchSizes/n=%s-192  \t 50\t 9000000 ns/op\t 8000 jobs/sec\n' "$n" >>"$tmp/sub-base.txt"
+  printf 'BenchmarkEnqueueBatchSizes/n=%s-192  \t 50\t 9000000 ns/op\t 8000 jobs/sec\n' "$n" >>"$tmp/sub-cur.txt"
+done
+expect "regress: sub-benchmarks are compared" 0 "EnqueueBatchSizes/n=1000" -- "$REGRESS" "$tmp/sub-base.txt" "$tmp/sub-cur.txt"
+grep -v '^BenchmarkEnqueueBatchSizes/n=1000-' "$tmp/sub-cur.txt" >"$tmp/sub-slow.txt"
+printf 'BenchmarkEnqueueBatchSizes/n=1000-192  \t 50\t 27000000 ns/op\t 2000 jobs/sec\n' >>"$tmp/sub-slow.txt"
+expect "regress: a slow sub-benchmark fails" 1 "REGRESSION EnqueueBatchSizes/n=1000" -- "$REGRESS" "$tmp/sub-base.txt" "$tmp/sub-slow.txt"
 
 if [ "$failures" -ne 0 ]; then
   echo "bench-scripts_test: $failures failure(s)" >&2
