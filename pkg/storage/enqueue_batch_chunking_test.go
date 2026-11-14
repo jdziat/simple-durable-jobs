@@ -454,3 +454,18 @@ func TestEnqueueBatchChunking_FanOutWithManySubJobs(t *testing.T) {
 	assert.Equal(t, subs, fo.TotalCount)
 	assert.Equal(t, subs, fo.CompletedCount)
 }
+
+// The savepoint is needed exactly when a phase becomes more than one statement. Tie
+// the predicate to the real chunking at the boundary rather than to a restatement of
+// it: one id past the chunk size is two UPDATE statements, exactly the chunk size is
+// one.
+func TestBatchNeedsSavepoint_MatchesTheStatementCountAtTheBoundary(t *testing.T) {
+	for _, n := range []int{0, 1, retentionDeleteChunkSize - 1, retentionDeleteChunkSize, retentionDeleteChunkSize + 1, 2 * retentionDeleteChunkSize, 2*retentionDeleteChunkSize + 1} {
+		statements := len(chunkIDs(make([]int, n), retentionDeleteChunkSize))
+		multi := statements > 1
+		assert.Equal(t, multi, batchNeedsSavepoint(1, n, 0), "%d zero-retry ids (%d statements)", n, statements)
+		assert.Equal(t, multi, batchNeedsSavepoint(1, 0, n), "%d dq_ready ids (%d statements)", n, statements)
+	}
+	assert.True(t, batchNeedsSavepoint(2, 0, 0), "more than one insert chunk needs the savepoint")
+	assert.False(t, batchNeedsSavepoint(1, 0, 0), "a single statement per phase keeps today's SQL")
+}

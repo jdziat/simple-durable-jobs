@@ -346,12 +346,20 @@ func (s *GormStorage) enqueueBatchWithDB(db *gorm.DB, jobs []*core.Job) error {
 	// change cannot reopen the window. The comparisons are strict on purpose:
 	// chunkIDs splits only ABOVE the chunk size, so a list of exactly
 	// retentionDeleteChunkSize ids is still a single statement and needs no savepoint.
-	if len(insertChunks) > 1 ||
-		len(zeroRetryIDs) > retentionDeleteChunkSize ||
-		len(dqReadyFalseIDs) > retentionDeleteChunkSize {
+	if batchNeedsSavepoint(len(insertChunks), len(zeroRetryIDs), len(dqReadyFalseIDs)) {
 		return db.Transaction(write)
 	}
 	return write(db)
+}
+
+// batchNeedsSavepoint reports whether chunking turned any phase of an EnqueueBatch
+// into more than one statement. chunkIDs splits only ABOVE the chunk size, so a list
+// of exactly retentionDeleteChunkSize ids is still one statement and the comparison
+// is strict; one id more is two statements and needs the savepoint.
+func batchNeedsSavepoint(insertChunks, zeroRetryIDs, dqReadyFalseIDs int) bool {
+	return insertChunks > 1 ||
+		zeroRetryIDs > retentionDeleteChunkSize ||
+		dqReadyFalseIDs > retentionDeleteChunkSize
 }
 
 // batchIDsAlreadyPersisted reads which of the batch's ids already name a row
