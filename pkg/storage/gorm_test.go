@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"fmt"
 	"context"
 	"errors"
 	"os"
@@ -4791,7 +4792,7 @@ func TestStorageWideSetters_ConcurrentWithHotPathReaders(t *testing.T) {
 		defer readers.Done()
 		for i := 0; i < 200; i++ {
 			if err := s.Heartbeat(ctx, runningHeartbeatJob.ID, "worker-heartbeat"); err != nil {
-				readErrs <- err
+				readErrs <- fmt.Errorf("DIAG heartbeat iter=%d: %w; row=%s", i, err, dumpJobRow(s, runningHeartbeatJob.ID))
 				return
 			}
 		}
@@ -4802,7 +4803,7 @@ func TestStorageWideSetters_ConcurrentWithHotPathReaders(t *testing.T) {
 		defer readers.Done()
 		for _, jobID := range completeJobIDs {
 			if err := s.Complete(ctx, jobID, "worker-complete"); err != nil {
-				readErrs <- err
+				readErrs <- fmt.Errorf("DIAG complete id=%s: %w; row=%s", jobID, err, dumpJobRow(s, jobID))
 				return
 			}
 		}
@@ -5363,4 +5364,14 @@ func TestWithSerializationRetry_NonSerializationErrorReturnsImmediately(t *testi
 
 	require.ErrorIs(t, err, boom)
 	assert.Equal(t, 1, attempts)
+}
+
+func dumpJobRow(s *GormStorage, id core.UUID) string {
+	var row map[string]any
+	if err := s.db.Table("jobs").Where("id = ?", id).Take(&row).Error; err != nil {
+		return "dump error: " + err.Error()
+	}
+	var counts []map[string]any
+	_ = s.db.Raw("SELECT queue, status, COUNT(*) AS n FROM jobs GROUP BY queue, status").Scan(&counts).Error
+	return fmt.Sprintf("%v ALL=%v", row, counts)
 }
