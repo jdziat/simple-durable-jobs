@@ -66,6 +66,11 @@ func applyExplicitZeroRetries(tx *gorm.DB, ids []core.UUID) error {
 	if len(ids) == 0 {
 		return nil
 	}
-	return tx.Model(&core.Job{}).Where("id IN ?", ids).
-		UpdateColumn("max_retries", 0).Error
+	for _, chunk := range chunkIDs(ids, retentionDeleteChunkSize) {
+		if err := tx.Model(&core.Job{}).Where("id IN ?", chunk).
+			UpdateColumn("max_retries", 0).Error; err != nil {
+			return err
+		}
+	}
+	return nil
 }

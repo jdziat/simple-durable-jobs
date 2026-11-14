@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"errors"
+	"sort"
 	"time"
 
 	"gorm.io/gorm"
@@ -243,18 +244,30 @@ func setDQReadyForCreate(job *core.Job, now time.Time) {
 }
 
 func (s *GormStorage) enqueueBatchWithDB(db *gorm.DB, jobs []*core.Job) error {
+	// Distinct keys in sorted order: the lookup below is chunked to stay under the
+	// bind-parameter ceiling, and a deterministic order keeps the row locks of
+	// concurrent batches taken in the same sequence.
+	keySet := make(map[string]struct{}, len(jobs))
 	keys := make([]string, 0, len(jobs))
 	for _, job := range jobs {
-		if job.UniqueKey != "" {
+		if job.UniqueKey == "" {
+			continue
+		}
+		if _, dup := keySet[job.UniqueKey]; !dup {
+			keySet[job.UniqueKey] = struct{}{}
 			keys = append(keys, job.UniqueKey)
 		}
 	}
+	sort.Strings(keys)
 
 	existing := make(map[string]core.UUID, len(keys))
-	if len(keys) > 0 {
+	for _, chunk := range chunkIDs(keys, retentionDeleteChunkSize) {
+		if len(chunk) == 0 {
+			continue
+		}
 		query := db.Model(&core.Job{}).
 			Select("id", "unique_key").
-			Where("unique_key IN ? AND status IN ?", keys,
+			Where("unique_key IN ? AND status IN ?", chunk,
 				core.ActiveDedupStatuses)
 		query = s.lockForUpdate(query, false)
 
@@ -311,7 +324,7 @@ func (s *GormStorage) enqueueBatchWithDB(db *gorm.DB, jobs []*core.Job) error {
 	correctable := correctableBatchJobs(toCreate, preexisting)
 	dqReadyFalseIDs, dqReadyFalseRefs := dqReadyFalseJobs(correctable)
 	zeroRetryIDs := explicitZeroRetryIDs(s.encodedSubsetForCorrection(rows, correctable)...)
-	if err := db.Clauses(clause.OnConflict{DoNothing: true}).Create(rows).Error; err != nil {
+	if err := insertJobRowsChunked(db, rows); err != nil {
 		return err
 	}
 	if err := applyExplicitZeroRetries(db, zeroRetryIDs); err != nil {
@@ -412,11 +425,82 @@ func restoreDQReadyFalse(db *gorm.DB, ids []core.UUID, jobs []*core.Job) error {
 	if len(ids) == 0 {
 		return nil
 	}
-	err := db.Model(&core.Job{}).
-		Where("id IN ?", ids).
-		UpdateColumn("dq_ready", false).Error
+	var err error
+	for _, chunk := range chunkIDs(ids, retentionDeleteChunkSize) {
+		if err = db.Model(&core.Job{}).
+			Where("id IN ?", chunk).
+			UpdateColumn("dq_ready", false).Error; err != nil {
+			break
+		}
+	}
 	for _, job := range jobs {
 		job.DQReady = false
 	}
 	return err
+}
+
+// Bind-parameter budget for one multi-row INSERT. SQLite's ceiling is 32766
+// variables (PostgreSQL and MySQL allow 65535), so the smaller one governs every
+// dialect. The headroom below it absorbs columns added by a later migration; the
+// schema column count is read at run time so the chunk shrinks with the table.
+const (
+	insertBindBudget  = 30000
+	insertMaxChunkRow = 500
+)
+
+// insertChunkRowsOverride lets a test force a small chunk so cross-chunk cases run
+// on a handful of rows. Zero means derive the size from the schema.
+var insertChunkRowsOverride int
+
+// jobInsertChunkRows returns how many job rows one INSERT may carry. A row binds at
+// most one variable per schema column, so rows x columns stays under the budget.
+func jobInsertChunkRows(db *gorm.DB) int {
+	if insertChunkRowsOverride > 0 {
+		return insertChunkRowsOverride
+	}
+	cols := 0
+	stmt := &gorm.Statement{DB: db}
+	if err := stmt.Parse(&core.Job{}); err == nil && stmt.Schema != nil {
+		cols = len(stmt.Schema.DBNames)
+	}
+	if cols <= 0 {
+		cols = 64
+	}
+	n := insertBindBudget / cols
+	if n > insertMaxChunkRow {
+		n = insertMaxChunkRow
+	}
+	if n < 1 {
+		n = 1
+	}
+	return n
+}
+
+// insertJobRowsChunked inserts rows with ON CONFLICT DO NOTHING in order, one
+// multi-row statement per chunk, so a large batch stays under the driver's
+// bind-parameter ceiling ("too many SQL variables"). A batch that fits in one chunk
+// is a single statement, as before.
+//
+// Several chunks run inside a nested transaction (a savepoint), so a failure in a
+// later chunk undoes the earlier ones even when a caller-owned transaction
+// (EnqueueBatchTx) ignores the error and commits. PostgreSQL aborts the whole
+// transaction on a failed statement; MySQL and SQLite do not, which is why the
+// savepoint matters there.
+func insertJobRowsChunked(db *gorm.DB, rows []*core.Job) error {
+	chunks := chunkIDs(rows, jobInsertChunkRows(db))
+	insert := func(tx *gorm.DB) error {
+		for _, chunk := range chunks {
+			if len(chunk) == 0 {
+				continue
+			}
+			if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(chunk).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if len(chunks) <= 1 {
+		return insert(db)
+	}
+	return db.Transaction(insert)
 }
