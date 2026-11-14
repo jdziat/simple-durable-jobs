@@ -135,6 +135,11 @@ type GormStorage struct {
 	indexedMetadataKeys *[]string
 	skipDefaultPool     bool
 
+	// insertChunkRows overrides the derived EnqueueBatch insert chunk size. Zero
+	// means derive it from the schema; tests set it to run cross-chunk cases on a
+	// handful of rows.
+	insertChunkRows int
+
 	// deleteCheckpointsOnComplete, when true, deletes a job's checkpoints in the
 	// SAME transaction as its success terminal write (Complete /
 	// CompleteWithResult). It is OFF by default: the dashboard reads completed

@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"errors"
+	"sort"
 	"time"
 
 	"gorm.io/gorm"
@@ -243,18 +244,30 @@ func setDQReadyForCreate(job *core.Job, now time.Time) {
 }
 
 func (s *GormStorage) enqueueBatchWithDB(db *gorm.DB, jobs []*core.Job) error {
+	// Distinct keys in sorted order: the lookup below is chunked to stay under the
+	// bind-parameter ceiling, and a deterministic order keeps the row locks of
+	// concurrent batches taken in the same sequence.
+	keySet := make(map[string]struct{}, len(jobs))
 	keys := make([]string, 0, len(jobs))
 	for _, job := range jobs {
-		if job.UniqueKey != "" {
+		if job.UniqueKey == "" {
+			continue
+		}
+		if _, dup := keySet[job.UniqueKey]; !dup {
+			keySet[job.UniqueKey] = struct{}{}
 			keys = append(keys, job.UniqueKey)
 		}
 	}
+	sort.Strings(keys)
 
 	existing := make(map[string]core.UUID, len(keys))
-	if len(keys) > 0 {
+	for _, chunk := range chunkIDs(keys, retentionDeleteChunkSize) {
+		if len(chunk) == 0 {
+			continue
+		}
 		query := db.Model(&core.Job{}).
 			Select("id", "unique_key").
-			Where("unique_key IN ? AND status IN ?", keys,
+			Where("unique_key IN ? AND status IN ?", chunk,
 				core.ActiveDedupStatuses)
 		query = s.lockForUpdate(query, false)
 
@@ -311,13 +324,42 @@ func (s *GormStorage) enqueueBatchWithDB(db *gorm.DB, jobs []*core.Job) error {
 	correctable := correctableBatchJobs(toCreate, preexisting)
 	dqReadyFalseIDs, dqReadyFalseRefs := dqReadyFalseJobs(correctable)
 	zeroRetryIDs := explicitZeroRetryIDs(s.encodedSubsetForCorrection(rows, correctable)...)
-	if err := db.Clauses(clause.OnConflict{DoNothing: true}).Create(rows).Error; err != nil {
-		return err
+	insertChunks := chunkIDs(rows, s.jobInsertChunkRows(db))
+	write := func(tx *gorm.DB) error {
+		if err := insertJobRowChunks(tx, insertChunks); err != nil {
+			return err
+		}
+		if err := applyExplicitZeroRetries(tx, zeroRetryIDs); err != nil {
+			return err
+		}
+		return restoreDQReadyFalse(tx, dqReadyFalseIDs, dqReadyFalseRefs)
 	}
-	if err := applyExplicitZeroRetries(db, zeroRetryIDs); err != nil {
-		return err
+	// Chunking turns one statement per phase into several. A batch that needs more
+	// than one statement in any phase runs them in a nested transaction (a
+	// savepoint), so a failure in a later chunk undoes the earlier ones even when a
+	// caller-owned transaction (EnqueueBatchTx) ignores the error and commits.
+	// PostgreSQL aborts the whole transaction on a failed statement; MySQL and
+	// SQLite do not, which is why the savepoint matters there. A batch that fits in
+	// one statement per phase keeps today's SQL and pays no savepoint. Today a list
+	// over retentionDeleteChunkSize ids already implies more than one insert chunk
+	// (the insert cap is 500 rows); the conditions stay independent so a later cap
+	// change cannot reopen the window. The comparisons are strict on purpose:
+	// chunkIDs splits only ABOVE the chunk size, so a list of exactly
+	// retentionDeleteChunkSize ids is still a single statement and needs no savepoint.
+	if batchNeedsSavepoint(len(insertChunks), len(zeroRetryIDs), len(dqReadyFalseIDs)) {
+		return db.Transaction(write)
 	}
-	return restoreDQReadyFalse(db, dqReadyFalseIDs, dqReadyFalseRefs)
+	return write(db)
+}
+
+// batchNeedsSavepoint reports whether chunking turned any phase of an EnqueueBatch
+// into more than one statement. chunkIDs splits only ABOVE the chunk size, so a list
+// of exactly retentionDeleteChunkSize ids is still one statement and the comparison
+// is strict; one id more is two statements and needs the savepoint.
+func batchNeedsSavepoint(insertChunks, zeroRetryIDs, dqReadyFalseIDs int) bool {
+	return insertChunks > 1 ||
+		zeroRetryIDs > retentionDeleteChunkSize ||
+		dqReadyFalseIDs > retentionDeleteChunkSize
 }
 
 // batchIDsAlreadyPersisted reads which of the batch's ids already name a row
@@ -412,11 +454,66 @@ func restoreDQReadyFalse(db *gorm.DB, ids []core.UUID, jobs []*core.Job) error {
 	if len(ids) == 0 {
 		return nil
 	}
-	err := db.Model(&core.Job{}).
-		Where("id IN ?", ids).
-		UpdateColumn("dq_ready", false).Error
+	var err error
+	for _, chunk := range chunkIDs(ids, retentionDeleteChunkSize) {
+		if err = db.Model(&core.Job{}).
+			Where("id IN ?", chunk).
+			UpdateColumn("dq_ready", false).Error; err != nil {
+			break
+		}
+	}
 	for _, job := range jobs {
 		job.DQReady = false
 	}
 	return err
+}
+
+// Bind-parameter budget for one multi-row INSERT. SQLite's ceiling is 32766
+// variables (PostgreSQL and MySQL allow 65535), so the smaller one governs every
+// dialect. The headroom below it absorbs columns added by a later migration; the
+// schema column count is read at run time so the chunk shrinks with the table.
+const (
+	insertBindBudget  = 30000
+	insertMaxChunkRow = 500
+)
+
+// jobInsertChunkRows returns how many job rows one INSERT may carry. A row binds at
+// most one variable per schema column, so rows x columns stays under the budget.
+// A test can set the insertChunkRows field to force a small chunk.
+func (s *GormStorage) jobInsertChunkRows(db *gorm.DB) int {
+	if s.insertChunkRows > 0 {
+		return s.insertChunkRows
+	}
+	cols := 0
+	stmt := &gorm.Statement{DB: db}
+	if err := stmt.Parse(&core.Job{}); err == nil && stmt.Schema != nil {
+		cols = len(stmt.Schema.DBNames)
+	}
+	if cols <= 0 {
+		cols = 64
+	}
+	n := insertBindBudget / cols
+	if n > insertMaxChunkRow {
+		n = insertMaxChunkRow
+	}
+	if n < 1 {
+		n = 1
+	}
+	return n
+}
+
+// insertJobRowChunks inserts the chunks with ON CONFLICT DO NOTHING, in order, one
+// multi-row statement per chunk, so a large batch stays under the driver's
+// bind-parameter ceiling ("too many SQL variables"). The caller decides whether the
+// chunks share a savepoint.
+func insertJobRowChunks(tx *gorm.DB, chunks [][]*core.Job) error {
+	for _, chunk := range chunks {
+		if len(chunk) == 0 {
+			continue
+		}
+		if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(chunk).Error; err != nil {
+			return err
+		}
+	}
+	return nil
 }
