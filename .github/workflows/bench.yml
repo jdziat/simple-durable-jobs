@@ -80,7 +80,7 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-  # A red scheduled run went unnoticed for five weeks. Keep one issue labelled `bench`
+  # A red scheduled run went unnoticed for five weeks. Keep one issue labelled `bench-failure`
   # in step with the schedule: open (or comment on) it when the run does not succeed,
   # close it when a later run does. A job killed at timeout-minutes concludes
   # `cancelled`, not `failure`, so this keys on the result rather than failure().
@@ -99,7 +99,7 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
-          existing="$(gh issue list --repo "$GITHUB_REPOSITORY" --label bench --state open \
+          existing="$(gh issue list --repo "$GITHUB_REPOSITORY" --label bench-failure --state open \
             --json number --jq '.[0].number // empty')"
           if [ "$RESULT" = success ]; then
             if [ -n "$existing" ]; then
@@ -108,12 +108,12 @@ jobs:
             fi
             exit 0
           fi
-          gh label create bench --repo "$GITHUB_REPOSITORY" \
+          gh label create bench-failure --repo "$GITHUB_REPOSITORY" \
             --description "Scheduled benchmark run failed" --color B60205 2>/dev/null || true
           body="The scheduled benchmark run did not succeed (result: $RESULT): $RUN_URL"
           if [ -n "$existing" ]; then
             gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "$body"
           else
-            gh issue create --repo "$GITHUB_REPOSITORY" --label bench \
+            gh issue create --repo "$GITHUB_REPOSITORY" --label bench-failure \
               --title "Scheduled benchmark run is failing" --body "$body"
           fi
