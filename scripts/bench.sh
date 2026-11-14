@@ -6,7 +6,8 @@
 #   scripts/bench.sh sqlite postgres
 #
 # Env vars:
-#   BENCH_COUNT=3
+#   BENCH_COUNT=6
+#   BENCH_TIMEOUT=25m
 #   TEST_DATABASE_URL=postgres://jobs:jobs@localhost:15433/jobs_test?sslmode=disable
 #   TEST_MYSQL_URL=root:jobs@tcp(localhost:13307)/jobs_test?parseTime=true
 
@@ -21,9 +22,12 @@ else
   BACKENDS=("$@")
 fi
 
-# EndToEnd benchmarks run about 50s/sample; 3 samples balances stability and
-# runtime, benchstat handles n=3, and CI benchmark comparison is warn-only.
-: "${BENCH_COUNT:=3}"
+# Six samples give benchstat enough for a confidence interval (it prints "± ∞" below
+# six). The whole SQLite suite takes about 23s per sample on a 192-core host; the CI
+# runner is slower, so BENCH_TIMEOUT bounds the run explicitly instead of relying on
+# go test's 10m per-binary default. Measure the CI wall time before changing either.
+: "${BENCH_COUNT:=6}"
+: "${BENCH_TIMEOUT:=25m}"
 : "${TEST_DATABASE_URL:=postgres://jobs:jobs@localhost:15433/jobs_test?sslmode=disable}"
 : "${TEST_MYSQL_URL:=root:jobs@tcp(localhost:13307)/jobs_test?parseTime=true}"
 mkdir -p bench-results
@@ -72,8 +76,11 @@ run_backend() {
       ;;
   esac
 
-  info "[$backend] go test -bench=. -benchmem -count=${BENCH_COUNT} ./benchmarks/"
-  env "${env_args[@]}" go test -run '^$' -bench=. -benchmem -count="$BENCH_COUNT" ./benchmarks/ | tee "$output"
+  info "[$backend] go test -bench=. -benchmem -count=${BENCH_COUNT} -timeout=${BENCH_TIMEOUT} ./benchmarks/"
+  env "${env_args[@]}" go test -run '^$' -bench=. -benchmem -count="$BENCH_COUNT" -timeout="$BENCH_TIMEOUT" ./benchmarks/ | tee "$output"
+  # A run can exit 0 and still be unusable (a partial or corrupted file); check the
+  # file itself before it is uploaded or compared.
+  "$ROOT/scripts/validate-bench-output.sh" "$output" "$backend" "$BENCH_COUNT"
 }
 
 declare -A results
