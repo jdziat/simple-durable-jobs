@@ -33,7 +33,9 @@ fi
 cpu_of() { sed -n 's/^cpu:[[:space:]]*//p' "$1" | head -1 | sed 's/[[:space:]]*$//'; }
 base_cpu="$(cpu_of "$baseline")"
 cur_cpu="$(cpu_of "$current")"
-if [ "$base_cpu" != "$cur_cpu" ]; then
+# A file with no cpu: line cannot be shown to come from the same machine; two empty
+# lines must not read as equal.
+if [ -z "$base_cpu" ] || [ -z "$cur_cpu" ] || [ "$base_cpu" != "$cur_cpu" ]; then
   echo "NOTICE: baseline was recorded on a different cpu; comparison skipped."
   echo "  baseline: ${base_cpu:-<none>}"
   echo "  this run: ${cur_cpu:-<none>}"

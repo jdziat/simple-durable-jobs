@@ -117,6 +117,8 @@ expect "no baseline is a loud skip" 0 "no baseline" -- "$COMPARE" "$tmp/missing-
 
 must sed 's/^cpu: .*/cpu: Some Other CPU/' "$clean" >"$tmp/other-cpu.txt"
 expect "a baseline from another cpu is a loud skip" 0 "different cpu" -- "$COMPARE" "$tmp/other-cpu.txt" "$clean"
+must grep -v '^cpu:' "$clean" >"$tmp/no-cpu.txt"
+expect "files with no cpu line are a loud skip, not a match" 0 "different cpu" -- "$COMPARE" "$tmp/no-cpu.txt" "$tmp/no-cpu.txt"
 
 expect "same cpu runs benchstat on the stripped files" 0 "NAME=BenchmarkEnqueue$" -- "$COMPARE" "$tmp/four-core.txt" "$clean"
 out="$("$COMPARE" "$tmp/four-core.txt" "$clean" 2>&1)"
@@ -127,7 +129,8 @@ else
   fail "suffix was not stripped on both sides: $out"
 fi
 
-FAKE_BENCHSTAT_FAIL=3 expect "a benchstat failure propagates" 3 "FAKE BENCHSTAT" -- "$COMPARE" "$tmp/four-core.txt" "$clean"
+compare_with_failing_benchstat() { FAKE_BENCHSTAT_FAIL=3 "$COMPARE" "$tmp/four-core.txt" "$clean"; }
+expect "a benchstat failure propagates" 3 "FAKE BENCHSTAT" -- compare_with_failing_benchstat
 unset BENCHSTAT
 expect "usage error" 2 "usage" -- "$COMPARE"
 

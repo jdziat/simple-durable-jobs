@@ -61,6 +61,10 @@ run_backend() {
   local output="bench-results/${backend}.txt"
   local -a env_args=()
 
+  # The `|| return 1` below depends on pipefail to carry go test's status through tee.
+  # It is set at the top of the script; setting it here keeps the dependency local.
+  set -o pipefail
+
   # A file left by an earlier run must not be mistaken for this one: a backend that
   # is skipped below writes nothing, and the summary reports PASS for any file found.
   rm -f "$output"
