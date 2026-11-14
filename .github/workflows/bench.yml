@@ -8,9 +8,10 @@ on:
 permissions:
   contents: read
 
-# CI pins Go to 1.25.13 (matches go.mod's `toolchain` directive) so setup-go
+# CI pins Go to 1.26.11 (matches go.mod's `toolchain` directive) so setup-go
 # installs it directly: no on-the-fly sum.golang.org toolchain download
-# (which flaked Lint) and CI runs the patched stdlib. Bump with go.mod.
+# (which flaked Lint) and CI runs the patched stdlib. Bump with go.mod;
+# scripts/check-go-pins.sh (run by the Lint job) fails when a pin drifts.
 
 jobs:
   bench:
@@ -45,7 +46,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
-          go-version: '1.25.13'
+          go-version: '1.26.11'
 
       - name: Install benchstat
         run: go install golang.org/x/perf/cmd/benchstat@v0.0.0-20260512194132-3cf34090a3db
@@ -56,14 +57,18 @@ jobs:
           TEST_DATABASE_URL: ${{ matrix.backend == 'postgres' && 'postgres://jobs:jobs@localhost:5432/jobs_test?sslmode=disable' || '' }}
         run: scripts/bench.sh ${{ matrix.backend }}
 
+      # always(): a failed benchmark run still leaves its partial output behind, so
+      # the failure can be diagnosed from the artifact instead of only the log.
       - name: Upload raw benchmark output
+        if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: bench-${{ matrix.backend }}
           path: bench-results/${{ matrix.backend }}.txt
-          if-no-files-found: error
+          if-no-files-found: warn
 
       - name: Compare with baseline
+        if: always()
         run: |
           {
             echo "## Benchmark delta: ${{ matrix.backend }}"
@@ -74,3 +79,31 @@ jobs:
             benchstat benchmarks/baseline/${{ matrix.backend }}.txt bench-results/${{ matrix.backend }}.txt || true
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # A red scheduled run went unnoticed for five weeks. Open one issue (or comment on
+  # the open one) so a failing benchmark job is visible without watching Actions.
+  report-failure:
+    name: Report benchmark failure
+    needs: bench
+    if: ${{ failure() && github.event_name == 'schedule' }}
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Open or update the benchmark issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          gh label create bench --repo "$GITHUB_REPOSITORY" \
+            --description "Scheduled benchmark run failed" --color B60205 2>/dev/null || true
+          existing="$(gh issue list --repo "$GITHUB_REPOSITORY" --label bench --state open \
+            --json number --jq '.[0].number // empty')"
+          body="The scheduled benchmark run failed: $RUN_URL"
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "$body"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --label bench \
+              --title "Scheduled benchmark run is failing" --body "$body"
+          fi
