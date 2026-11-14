@@ -291,6 +291,15 @@ func TestEnqueueBatchChunking_CorrectionAndLookupListsSpanChunks(t *testing.T) {
 		"the dq_ready correction must be split into chunks")
 
 	assert.Equal(t, existing.ID, jobs[2300].ID, "the lookup must find the active job in a later key chunk")
+
+	// The survivor was not created by this batch, so neither corrective UPDATE may
+	// follow the repointed id onto it (the counts above filter to type chunk.plain
+	// and would not see it).
+	var survivor core.Job
+	require.NoError(t, base.db.Where("id = ?", existing.ID).First(&survivor).Error)
+	assert.Equal(t, "existing", survivor.Type)
+	assert.Equal(t, 3, survivor.MaxRetries, "Retries(0) from the suppressed duplicate landed on the surviving row")
+	assert.True(t, survivor.DQReady, "the suppressed duplicate's delayed run_at made the surviving row not-ready")
 	assert.EqualValues(t, n, countJobs(t, base), "2499 new rows plus the one that already existed")
 
 	var withRetries, ready int64
@@ -396,6 +405,23 @@ func TestEnqueueBatchChunking_FailureInACorrectiveUpdateChunkPersistsNothing(t *
 
 	assert.EqualValues(t, 0, countJobs(t, s),
 		"a failure in the second corrective UPDATE chunk left the inserted rows persisted")
+}
+
+// A batch that fits in one INSERT but still needs a corrective UPDATE runs in
+// EnqueueBatch's own transaction, so a failing UPDATE must leave no row behind.
+func TestEnqueueBatchChunking_FailingUpdateAfterASingleInsertPersistsNothing(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+	failNthDQReadyUpdate(t, s, 1)
+
+	future := time.Now().Add(time.Hour)
+	jobs := batchOf(5, func(i int) *core.Job {
+		j := plainJob(i)
+		j.RunAt = &future
+		return j
+	})
+	require.Error(t, s.EnqueueBatch(ctx, jobs))
+	assert.EqualValues(t, 0, countJobs(t, s))
 }
 
 func TestEnqueueBatchChunking_FanOutWithManySubJobs(t *testing.T) {
