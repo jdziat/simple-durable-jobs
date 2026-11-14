@@ -122,13 +122,15 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
-          existing="$(gh issue list --repo "$GITHUB_REPOSITORY" --label bench-failure --state open \
-            --json number --jq '.[0].number // empty')"
+          open_issues="$(gh issue list --repo "$GITHUB_REPOSITORY" --label bench-failure --state open \
+            --json number --jq '.[].number')"
+          existing="$(head -n1 <<<"$open_issues")"
           if [ "$RESULT" = success ]; then
-            if [ -n "$existing" ]; then
-              gh issue close "$existing" --repo "$GITHUB_REPOSITORY" \
+            # Close every open one, so a duplicate left by a manual edit cannot linger.
+            for n in $open_issues; do
+              gh issue close "$n" --repo "$GITHUB_REPOSITORY" \
                 --comment "The scheduled benchmark run succeeded again: $RUN_URL"
-            fi
+            done
             exit 0
           fi
           gh label create bench-failure --repo "$GITHUB_REPOSITORY" \

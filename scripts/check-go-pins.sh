@@ -26,20 +26,25 @@ fi
 
 bad=0
 seen=0
-# Anchored on the key so `hugo-version:` and `go-version-file:` do not match.
-while IFS=: read -r file line text; do
-  seen=$((seen + 1))
-  # -n with the p flag prints only a line the pattern matched; a pin of any other form
-  # (an expression, a floating version) yields nothing and is reported as unparseable.
-  got="$(sed -nE "s/^[[:space:]]*(-[[:space:]]*)?go-version:[[:space:]]*['\"]?([0-9][0-9.]*)['\"]?[[:space:]]*(#.*)?$/\2/p" <<<"$text")"
-  if [ -z "$got" ]; then
-    echo "check-go-pins: $file:$line has a go-version this script cannot read: $text" >&2
-    bad=1
-  elif [ "$got" != "$want" ]; then
-    echo "check-go-pins: $file:$line pins Go $got, go.mod toolchain is $want" >&2
-    bad=1
-  fi
-done < <(find .github -type f \( -name '*.yml' -o -name '*.yaml' \) -print0 | xargs -0 -r grep -HnE '^[[:space:]]*(-[[:space:]]*)?go-version:')
+# The file name comes from the outer loop, never from splitting grep's output, so a
+# colon anywhere in a path cannot shift the fields. Anchored on the key so
+# `hugo-version:` and `go-version-file:` do not match.
+while IFS= read -r -d '' file; do
+  while IFS=: read -r line text; do
+    seen=$((seen + 1))
+    # -n with the p flag prints only a line the pattern matched; a pin of any other
+    # form (an expression, a floating version) yields nothing and is reported as
+    # unparseable.
+    got="$(sed -nE "s/^[[:space:]]*(-[[:space:]]*)?go-version:[[:space:]]*['\"]?([0-9][0-9.]*)['\"]?[[:space:]]*(#.*)?$/\2/p" <<<"$text")"
+    if [ -z "$got" ]; then
+      echo "check-go-pins: $file:$line has a go-version this script cannot read: $text" >&2
+      bad=1
+    elif [ "$got" != "$want" ]; then
+      echo "check-go-pins: $file:$line pins Go $got, go.mod toolchain is $want" >&2
+      bad=1
+    fi
+  done < <(grep -nE '^[[:space:]]*(-[[:space:]]*)?go-version:' "$file" || true)
+done < <(find .github -type f \( -name '*.yml' -o -name '*.yaml' \) -print0)
 
 if [ "$seen" -eq 0 ]; then
   echo "check-go-pins: found no go-version pins to check" >&2
