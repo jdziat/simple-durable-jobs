@@ -1,0 +1,76 @@
+goos: linux
+goarch: amd64
+pkg: github.com/jdziat/simple-durable-jobs/v4/benchmarks
+cpu: AMD EPYC 7763 64-Core Processor                
+BenchmarkEnqueue-4                        	    1375	    874172 ns/op	      1144 jobs/sec	   19425 B/op	     153 allocs/op
+BenchmarkEnqueue-4                        	    1244	    884340 ns/op	      1131 jobs/sec	   19412 B/op	     152 allocs/op
+BenchmarkEnqueue-4                        	    1363	    869666 ns/op	      1150 jobs/sec	   19419 B/op	     152 allocs/op
+BenchmarkEnqueueBatch-4                   	      74	  17386037 ns/op	      5752 jobs/sec	 1199442 B/op	    8567 allocs/op
+BenchmarkEnqueueBatch-4                   	     105	  11308448 ns/op	      8843 jobs/sec	 1198981 B/op	    8568 allocs/op
+BenchmarkEnqueueBatch-4                   	     108	  10573011 ns/op	      9458 jobs/sec	 1198923 B/op	    8567 allocs/op
+2026/11/10 15:11:44 INFO retention GC enabled completed_after=720h0m0s failed_after=2160h0m0s consumed_signals_after=168h0m0s disable_hint="disable with jobs.RetentionDisabled()"
+BenchmarkEndToEnd-4                       	       1	5041560828 ns/op	       200.9 jobs/sec	87870952 B/op	 1061217 allocs/op
+BenchmarkEndToEnd-4                       	2026/11/10 15:11:49 INFO retention GC enabled completed_after=720h0m0s failed_after=2160h0m0s consumed_signals_after=168h0m0s disable_hint="disable with jobs.RetentionDisabled()"
+       1	5035914693 ns/op	       201.0 jobs/sec	87702912 B/op	 1060272 allocs/op
+BenchmarkEndToEnd-4                       	2026/11/10 15:11:55 INFO retention GC enabled completed_after=720h0m0s failed_after=2160h0m0s consumed_signals_after=168h0m0s disable_hint="disable with jobs.RetentionDisabled()"
+       1	5054573508 ns/op	       200.1 jobs/sec	87618696 B/op	 1059849 allocs/op
+2026/11/10 15:12:00 INFO retention GC enabled completed_after=720h0m0s failed_after=2160h0m0s consumed_signals_after=168h0m0s disable_hint="disable with jobs.RetentionDisabled()"
+BenchmarkEndToEndBatchDequeue-4           	       1	2252415781 ns/op	       455.4 jobs/sec	62134168 B/op	  562138 allocs/op
+BenchmarkEndToEndBatchDequeue-4           	2026/11/10 15:12:03 INFO retention GC enabled completed_after=720h0m0s failed_after=2160h0m0s consumed_signals_after=168h0m0s disable_hint="disable with jobs.RetentionDisabled()"
+       1	2488625189 ns/op	       411.0 jobs/sec	65432504 B/op	  569728 allocs/op
+BenchmarkEndToEndBatchDequeue-4           	2026/11/10 15:12:06 INFO retention GC enabled completed_after=720h0m0s failed_after=2160h0m0s consumed_signals_after=168h0m0s disable_hint="disable with jobs.RetentionDisabled()"
+       1	2313527621 ns/op	       443.4 jobs/sec	63555688 B/op	  562883 allocs/op
+2026/11/10 15:12:09 INFO retention GC enabled completed_after=720h0m0s failed_after=2160h0m0s consumed_signals_after=168h0m0s disable_hint="disable with jobs.RetentionDisabled()"
+BenchmarkWorkflowSteps-4                  	2026/11/10 15:12:10 INFO retention GC enabled completed_after=720h0m0s failed_after=2160h0m0s consumed_signals_after=168h0m0s disable_hint="disable with jobs.RetentionDisabled()"
+2026/11/10 15:12:10 INFO retention GC enabled completed_after=720h0m0s failed_after=2160h0m0s consumed_signals_after=168h0m0s disable_hint="disable with jobs.RetentionDisabled()"
+2026/11/10 15:12:11 INFO retention GC enabled completed_after=720h0m0s failed_after=2160h0m0s consumed_signals_after=168h0m0s disable_hint="disable with jobs.RetentionDisabled()"
+2026/11/10 15:12:13 INFO retention GC enabled completed_after=720h0m0s failed_after=2160h0m0s consumed_signals_after=168h0m0s disable_hint="disable with jobs.RetentionDisabled()"
+     208	   5717487 ns/op	       874.5 steps/sec	  212465 B/op	    2015 allocs/op
+BenchmarkWorkflowSteps-4                  	2026/11/10 15:12:14 INFO retention GC enabled completed_after=720h0m0s failed_after=2160h0m0s consumed_signals_after=168h0m0s disable_hint="disable with jobs.RetentionDisabled()"
+2026/11/10 15:12:15 INFO retention GC enabled completed_after=720h0m0s failed_after=2160h0m0s consumed_signals_after=168h0m0s disable_hint="disable with jobs.RetentionDisabled()"
+2026/11/10 15:12:15 INFO retention GC enabled completed_after=720h0m0s failed_after=2160h0m0s consumed_signals_after=168h0m0s disable_hint="disable with jobs.RetentionDisabled()"
+2026/11/10 15:12:17 INFO retention GC enabled completed_after=720h0m0s failed_after=2160h0m0s consumed_signals_after=168h0m0s disable_hint="disable with jobs.RetentionDisabled()"
+     226	   6123881 ns/op	       816.5 steps/sec	  216702 B/op	    2019 allocs/op
+BenchmarkWorkflowSteps-4                  	2026/11/10 15:12:18 INFO retention GC enabled completed_after=720h0m0s failed_after=2160h0m0s consumed_signals_after=168h0m0s disable_hint="disable with jobs.RetentionDisabled()"
+2026/11/10 15:12:19 INFO retention GC enabled completed_after=720h0m0s failed_after=2160h0m0s consumed_signals_after=168h0m0s disable_hint="disable with jobs.RetentionDisabled()"
+2026/11/10 15:12:19 INFO retention GC enabled completed_after=720h0m0s failed_after=2160h0m0s consumed_signals_after=168h0m0s disable_hint="disable with jobs.RetentionDisabled()"
+2026/11/10 15:12:20 INFO retention GC enabled completed_after=720h0m0s failed_after=2160h0m0s consumed_signals_after=168h0m0s disable_hint="disable with jobs.RetentionDisabled()"
+     198	   5724884 ns/op	       873.4 steps/sec	  209416 B/op	    2012 allocs/op
+2026/11/10 15:12:22 INFO retention GC enabled completed_after=720h0m0s failed_after=2160h0m0s consumed_signals_after=168h0m0s disable_hint="disable with jobs.RetentionDisabled()"
+BenchmarkDispatchLatency-4                	2026/11/10 15:12:22 INFO retention GC enabled completed_after=720h0m0s failed_after=2160h0m0s consumed_signals_after=168h0m0s disable_hint="disable with jobs.RetentionDisabled()"
+2026/11/10 15:12:24 INFO retention GC enabled completed_after=720h0m0s failed_after=2160h0m0s consumed_signals_after=168h0m0s disable_hint="disable with jobs.RetentionDisabled()"
+      27	  42615112 ns/op	     39822 p50-us	     42818 p95-us	     44426 p99-us	  121302 B/op	    1290 allocs/op
+BenchmarkDispatchLatency-4                	2026/11/10 15:12:26 INFO retention GC enabled completed_after=720h0m0s failed_after=2160h0m0s consumed_signals_after=168h0m0s disable_hint="disable with jobs.RetentionDisabled()"
+2026/11/10 15:12:26 INFO retention GC enabled completed_after=720h0m0s failed_after=2160h0m0s consumed_signals_after=168h0m0s disable_hint="disable with jobs.RetentionDisabled()"
+2026/11/10 15:12:28 INFO retention GC enabled completed_after=720h0m0s failed_after=2160h0m0s consumed_signals_after=168h0m0s disable_hint="disable with jobs.RetentionDisabled()"
+      27	  42695848 ns/op	     39834 p50-us	     42674 p95-us	     44414 p99-us	  126175 B/op	    1322 allocs/op
+BenchmarkDispatchLatency-4                	2026/11/10 15:12:30 INFO retention GC enabled completed_after=720h0m0s failed_after=2160h0m0s consumed_signals_after=168h0m0s disable_hint="disable with jobs.RetentionDisabled()"
+2026/11/10 15:12:30 INFO retention GC enabled completed_after=720h0m0s failed_after=2160h0m0s consumed_signals_after=168h0m0s disable_hint="disable with jobs.RetentionDisabled()"
+2026/11/10 15:12:32 INFO retention GC enabled completed_after=720h0m0s failed_after=2160h0m0s consumed_signals_after=168h0m0s disable_hint="disable with jobs.RetentionDisabled()"
+      27	  42558630 ns/op	     39593 p50-us	     44102 p95-us	     48645 p99-us	  126345 B/op	    1309 allocs/op
+2026/11/10 15:12:35 INFO retention GC enabled completed_after=720h0m0s failed_after=2160h0m0s consumed_signals_after=168h0m0s disable_hint="disable with jobs.RetentionDisabled()"
+BenchmarkSaturatedRateLimitChurn-4        	       1	2000807457 ns/op	        15.00 completed/s	        75.00 dequeues/s	         0 rateChecks/s	        60.00 releases/s	         9.000 wasteOps/completed	 8213576 B/op	   93591 allocs/op
+--- BENCH: BenchmarkSaturatedRateLimitChurn-4
+    ratelimit_churn_bench_test.go:104: cto-F2 churn soak [unkeyed] (2s, concurrency=50, fleet=10/s): completed=30 dequeues=150 releases=120 rateChecks=0 rateAllowed=0
+BenchmarkSaturatedRateLimitChurn-4        	2026/11/10 15:12:39 INFO retention GC enabled completed_after=720h0m0s failed_after=2160h0m0s consumed_signals_after=168h0m0s disable_hint="disable with jobs.RetentionDisabled()"
+       1	2000771683 ns/op	        15.00 completed/s	        75.00 dequeues/s	         0 rateChecks/s	        60.00 releases/s	         9.000 wasteOps/completed	 8108552 B/op	   93520 allocs/op
+--- BENCH: BenchmarkSaturatedRateLimitChurn-4
+    ratelimit_churn_bench_test.go:104: cto-F2 churn soak [unkeyed] (2s, concurrency=50, fleet=10/s): completed=30 dequeues=150 releases=120 rateChecks=0 rateAllowed=0
+BenchmarkSaturatedRateLimitChurn-4        	2026/11/10 15:12:42 INFO retention GC enabled completed_after=720h0m0s failed_after=2160h0m0s consumed_signals_after=168h0m0s disable_hint="disable with jobs.RetentionDisabled()"
+       1	2000774053 ns/op	        15.00 completed/s	        50.00 dequeues/s	         0 rateChecks/s	        35.00 releases/s	         5.667 wasteOps/completed	 6009624 B/op	   67450 allocs/op
+--- BENCH: BenchmarkSaturatedRateLimitChurn-4
+    ratelimit_churn_bench_test.go:104: cto-F2 churn soak [unkeyed] (2s, concurrency=50, fleet=10/s): completed=30 dequeues=100 releases=70 rateChecks=0 rateAllowed=0
+2026/11/10 15:12:46 INFO retention GC enabled completed_after=720h0m0s failed_after=2160h0m0s consumed_signals_after=168h0m0s disable_hint="disable with jobs.RetentionDisabled()"
+BenchmarkSaturatedKeyedRateLimitChurn-4   	       1	2030737083 ns/op	        15.00 completed/s	       950.0 dequeues/s	         0 rateChecks/s	       935.0 releases/s	       125.7 wasteOps/completed	34668288 B/op	  438933 allocs/op
+--- BENCH: BenchmarkSaturatedKeyedRateLimitChurn-4
+    ratelimit_churn_bench_test.go:132: cto-F2 churn soak [keyed(tenant=hot)] (2s, concurrency=50, fleet=10/s): completed=30 dequeues=1900 releases=1870 rateChecks=0 rateAllowed=0
+BenchmarkSaturatedKeyedRateLimitChurn-4   	2026/11/10 15:12:50 INFO retention GC enabled completed_after=720h0m0s failed_after=2160h0m0s consumed_signals_after=168h0m0s disable_hint="disable with jobs.RetentionDisabled()"
+       1	2019307467 ns/op	        15.00 completed/s	       924.0 dequeues/s	         0 rateChecks/s	       909.0 releases/s	       122.2 wasteOps/completed	33431704 B/op	  427153 allocs/op
+--- BENCH: BenchmarkSaturatedKeyedRateLimitChurn-4
+    ratelimit_churn_bench_test.go:132: cto-F2 churn soak [keyed(tenant=hot)] (2s, concurrency=50, fleet=10/s): completed=30 dequeues=1848 releases=1818 rateChecks=0 rateAllowed=0
+BenchmarkSaturatedKeyedRateLimitChurn-4   	2026/11/10 15:12:54 INFO retention GC enabled completed_after=720h0m0s failed_after=2160h0m0s consumed_signals_after=168h0m0s disable_hint="disable with jobs.RetentionDisabled()"
+       1	2032073482 ns/op	        15.00 completed/s	       924.0 dequeues/s	         0 rateChecks/s	       909.0 releases/s	       122.2 wasteOps/completed	33488600 B/op	  427846 allocs/op
+--- BENCH: BenchmarkSaturatedKeyedRateLimitChurn-4
+    ratelimit_churn_bench_test.go:132: cto-F2 churn soak [keyed(tenant=hot)] (2s, concurrency=50, fleet=10/s): completed=30 dequeues=1848 releases=1818 rateChecks=0 rateAllowed=0
+PASS
+ok  	github.com/jdziat/simple-durable-jobs/v4/benchmarks	90.438s

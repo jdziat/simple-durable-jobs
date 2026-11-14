@@ -228,10 +228,12 @@ func benchmarkEndToEnd(b *testing.B, dequeueBatch int) {
 			jobs.WithDrainTimeout(5 * time.Second),
 		}
 		// Pin the dequeue batch size unconditionally so BenchmarkEndToEnd
-		// (dequeueBatch == 1) measures genuine single-row dequeue regardless of
-		// the worker's batched default, preserving the documented ~20 jobs/sec
-		// poll-floor row and keeping the checked-in benchstat baselines
-		// comparable. BenchmarkEndToEndBatchDequeue passes the batch size directly.
+		// (dequeueBatch == 1) measures single-row claim throughput regardless of
+		// the worker's batched default. Since the work-conserving dispatcher
+		// (3f724bc) a worker keeps claiming while work is available instead of
+		// waiting one poll interval per claim, so this is no longer the ~20 jobs/sec
+		// poll floor it measured when the first baseline was recorded.
+		// BenchmarkEndToEndBatchDequeue passes the batch size directly.
 		opts = append(opts, jobs.WithDequeueBatchSize(dequeueBatch))
 		worker := jobs.NewWorker(env.queue, opts...)
 

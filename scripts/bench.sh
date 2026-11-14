@@ -6,11 +6,21 @@
 #   scripts/bench.sh sqlite postgres
 #
 # Env vars:
-#   BENCH_COUNT=3
+#   BENCH_COUNT=6
+#   BENCH_TIMEOUT=25m
 #   TEST_DATABASE_URL=postgres://jobs:jobs@localhost:15433/jobs_test?sslmode=disable
 #   TEST_MYSQL_URL=root:jobs@tcp(localhost:13307)/jobs_test?parseTime=true
 
 set -euo pipefail
+
+# run_backend relies on pipefail (set above) to carry go test's status through tee, so
+# the script must run in its own shell; sourcing it into one without pipefail would
+# let tee's exit 0 hide a failed run.
+if [ "${BASH_SOURCE[0]}" != "$0" ]; then
+  echo "bench.sh must be executed, not sourced" >&2
+  # shellcheck disable=SC2317 # return works when sourced, exit when executed via a wrapper
+  return 2 2>/dev/null || exit 2
+fi
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
@@ -21,12 +31,26 @@ else
   BACKENDS=("$@")
 fi
 
-# EndToEnd benchmarks run about 50s/sample; 3 samples balances stability and
-# runtime, benchstat handles n=3, and CI benchmark comparison is warn-only.
-: "${BENCH_COUNT:=3}"
+# Six samples give benchstat enough for a confidence interval (it prints "± ∞" below
+# six). The whole SQLite suite takes about 23s per sample on a 192-core host; the CI
+# runner is slower, so BENCH_TIMEOUT bounds the run explicitly instead of relying on
+# go test's 10m per-binary default. Measure the CI wall time before changing either.
+: "${BENCH_COUNT:=6}"
+: "${BENCH_TIMEOUT:=25m}"
 : "${TEST_DATABASE_URL:=postgres://jobs:jobs@localhost:15433/jobs_test?sslmode=disable}"
 : "${TEST_MYSQL_URL:=root:jobs@tcp(localhost:13307)/jobs_test?parseTime=true}"
 mkdir -p bench-results
+
+# Fail before a long run, not after it: the validator rejects anything but a positive
+# integer, but only once every benchmark has already executed.
+case "$BENCH_COUNT" in
+  ''|*[!0-9]*|0) echo "bench.sh: BENCH_COUNT must be a positive integer, got '$BENCH_COUNT'" >&2; exit 2 ;;
+esac
+# go test rejects a duration without a unit ("25") only after the run has started.
+if ! [[ "$BENCH_TIMEOUT" =~ ^[0-9]+(\.[0-9]+)?(ns|us|ms|s|m|h)$ ]]; then
+  echo "bench.sh: BENCH_TIMEOUT must be a Go duration such as 25m, got '$BENCH_TIMEOUT'" >&2
+  exit 2
+fi
 
 color() { printf '\033[%sm%s\033[0m\n' "$1" "$2"; }
 info()  { color '1;36' "==> $*"; }
@@ -47,6 +71,10 @@ run_backend() {
   local backend="$1"
   local output="bench-results/${backend}.txt"
   local -a env_args=()
+
+  # A file left by an earlier run must not be mistaken for this one: a backend that
+  # is skipped below writes nothing, and the summary reports PASS for any file found.
+  rm -f "$output"
 
   case "$backend" in
     sqlite)
@@ -72,8 +100,16 @@ run_backend() {
       ;;
   esac
 
-  info "[$backend] go test -bench=. -benchmem -count=${BENCH_COUNT} ./benchmarks/"
-  env "${env_args[@]}" go test -run '^$' -bench=. -benchmem -count="$BENCH_COUNT" ./benchmarks/ | tee "$output"
+  info "[$backend] go test -bench=. -benchmem -count=${BENCH_COUNT} -timeout=${BENCH_TIMEOUT} ./benchmarks/"
+  # `|| return 1` matters: run_backend is called from an `if`, where `set -e` is off,
+  # so without it the status of the last command in the function would replace a
+  # failed `go test`. The pipeline carries go test's status because of `set -o
+  # pipefail` at the top of the script, which the sourcing guard above keeps in force;
+  # the "fails when go test fails" case in bench-scripts_test.sh proves it.
+  env "${env_args[@]}" go test -run '^$' -bench=. -benchmem -count="$BENCH_COUNT" -timeout="$BENCH_TIMEOUT" ./benchmarks/ | tee "$output" || return 1
+  # A run can exit 0 and still be unusable (a partial or corrupted file); check the
+  # file itself before it is uploaded or compared.
+  "$ROOT/scripts/validate-bench-output.sh" "$output" "$backend" "$BENCH_COUNT" || return 1
 }
 
 declare -A results

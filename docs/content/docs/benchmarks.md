@@ -57,7 +57,7 @@ The worker default is `WithDequeueBatchSize(50)`, capped at the worker's free co
 
 ## MySQL Results
 
-MySQL is included here as a local measurement only. CI currently publishes SQLite and Postgres artifacts and compares those two backends against checked-in baselines.
+MySQL is included here as a local measurement only. CI currently publishes SQLite and Postgres artifacts. The comparison against a recorded baseline is skipped, with a notice in the job summary, until a baseline for the CI runner is recorded (see `benchmarks/baseline/README.md`).
 
 | Benchmark | jobs/sec | ns/op | B/op | allocs/op |
 | --- | --- | --- | --- | --- |
@@ -83,4 +83,4 @@ BENCH_COUNT=3 \
   scripts/bench.sh sqlite postgres mysql
 ```
 
-The script isolates each backend leg by blanking unrelated DSN environment variables before invoking `go test`, so the command above attributes SQLite, Postgres, and MySQL results to the intended backend even when both external DSNs are exported in the parent shell. Raw local output is written to `bench-results/<backend>.txt`; CI uploads the same raw files as artifacts and reports WARN-only benchstat deltas against the checked-in SQLite and Postgres baselines. The runner default is `BENCH_COUNT=3`, matching CI and the checked-in baselines.
+The script isolates each backend leg by blanking unrelated DSN environment variables before invoking `go test`, so the command above attributes SQLite, Postgres, and MySQL results to the intended backend even when both external DSNs are exported in the parent shell. Raw local output is written to `bench-results/<backend>.txt`; CI uploads the same raw files as artifacts and, once a baseline is recorded for the runner, reports WARN-only benchstat deltas against it. The script validates each output file (a partial or corrupted run fails it) and defaults to `BENCH_COUNT=6`.
