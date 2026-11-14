@@ -17,18 +17,29 @@ if [ -z "$want" ]; then
   echo "check-go-pins: no toolchain directive in go.mod" >&2
   exit 2
 fi
+# A value that is not a plain version would match no pin and fail every workflow
+# with a misleading message; say what is wrong instead.
+if ! [[ "$want" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+  echo "check-go-pins: cannot parse the go.mod toolchain version: '$want'" >&2
+  exit 2
+fi
 
 bad=0
 seen=0
 # Anchored on the key so `hugo-version:` and `go-version-file:` do not match.
 while IFS=: read -r file line text; do
   seen=$((seen + 1))
-  got="$(sed -E "s/^[[:space:]]*(-[[:space:]]*)?go-version:[[:space:]]*['\"]?([0-9][0-9.]*).*/\2/" <<<"$text")"
-  if [ "$got" != "$want" ]; then
+  # -n with the p flag prints only a line the pattern matched; a pin of any other form
+  # (an expression, a floating version) yields nothing and is reported as unparseable.
+  got="$(sed -nE "s/^[[:space:]]*(-[[:space:]]*)?go-version:[[:space:]]*['\"]?([0-9][0-9.]*)['\"]?[[:space:]]*(#.*)?$/\2/p" <<<"$text")"
+  if [ -z "$got" ]; then
+    echo "check-go-pins: $file:$line has a go-version this script cannot read: $text" >&2
+    bad=1
+  elif [ "$got" != "$want" ]; then
     echo "check-go-pins: $file:$line pins Go $got, go.mod toolchain is $want" >&2
     bad=1
   fi
-done < <(grep -nE '^[[:space:]]*(-[[:space:]]*)?go-version:' .github/workflows/*.yml)
+done < <(find .github -type f \( -name '*.yml' -o -name '*.yaml' \) -print0 | xargs -0 grep -nE '^[[:space:]]*(-[[:space:]]*)?go-version:')
 
 if [ "$seen" -eq 0 ]; then
   echo "check-go-pins: found no go-version pins to check" >&2

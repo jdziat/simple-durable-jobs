@@ -57,18 +57,31 @@ jobs:
           TEST_DATABASE_URL: ${{ matrix.backend == 'postgres' && 'postgres://jobs:jobs@localhost:5432/jobs_test?sslmode=disable' || '' }}
         run: scripts/bench.sh ${{ matrix.backend }}
 
-      # always(): a failed benchmark run still leaves its partial output behind, so
-      # the failure can be diagnosed from the artifact instead of only the log.
+      # scripts/bench.sh exits 0 with only a warning when a backend is unreachable and
+      # writes no file. Without this step that skip would be a green job with nothing
+      # measured; with it the failure names the cause instead of surfacing as a
+      # missing artifact.
+      - name: Require benchmark output
+        run: |
+          if [ ! -s "bench-results/${{ matrix.backend }}.txt" ]; then
+            echo "::error::no benchmark output for ${{ matrix.backend }} (backend unreachable or skipped)"
+            exit 1
+          fi
+
+      # always(): a failed run still leaves its partial output behind, so the failure
+      # can be diagnosed from the artifact instead of only the log. A missing file is
+      # not an error here; the step above already failed the job with a clear message.
       - name: Upload raw benchmark output
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: bench-${{ matrix.backend }}
           path: bench-results/${{ matrix.backend }}.txt
-          if-no-files-found: error
+          if-no-files-found: ignore
 
+      # Runs only after a successful benchmark: a delta computed from partial or
+      # absent output would read as a real comparison.
       - name: Compare with baseline
-        if: always()
         run: |
           {
             echo "## Benchmark delta: ${{ matrix.backend }}"
@@ -87,8 +100,15 @@ jobs:
   report:
     name: Report benchmark status
     needs: bench
+    # Only the weekly schedule reports. A manual dispatch (for example recording a
+    # baseline) never opens or closes the issue, so its outcome cannot flip it.
     if: ${{ always() && github.event_name == 'schedule' && needs.bench.result != 'skipped' }}
     runs-on: ubuntu-latest
+    # The issue list and the create/comment are separate calls; serialize runs so two
+    # overlapping ones cannot each see no open issue and open two.
+    concurrency:
+      group: bench-issue
+      cancel-in-progress: false
     permissions:
       issues: write
     steps:
