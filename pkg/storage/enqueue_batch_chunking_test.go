@@ -77,11 +77,11 @@ func (r *sqlRecorder) saw(substr string) bool {
 	return false
 }
 
-func withChunkRows(t *testing.T, n int) {
+func newChunkedStorage(t *testing.T, rows int) *GormStorage {
 	t.Helper()
-	prev := insertChunkRowsOverride
-	insertChunkRowsOverride = n
-	t.Cleanup(func() { insertChunkRowsOverride = prev })
+	s := newTestStorage(t)
+	s.insertChunkRows = rows
+	return s
 }
 
 func batchOf(n int, mk func(i int) *core.Job) []*core.Job {
@@ -111,7 +111,7 @@ func TestJobInsertChunkRows_StaysUnderEveryBindCeiling(t *testing.T) {
 	cols := len(stmt.Schema.DBNames)
 	require.Greater(t, cols, 0)
 
-	rows := jobInsertChunkRows(s.db)
+	rows := s.jobInsertChunkRows(s.db)
 	assert.GreaterOrEqual(t, rows, 1)
 	assert.LessOrEqual(t, rows, insertMaxChunkRow)
 	assert.Less(t, rows*cols, 32766, "a full chunk must fit SQLite's bind-variable ceiling (%d rows x %d columns)", rows, cols)
@@ -156,9 +156,8 @@ func TestEnqueueBatchChunking_LargeBatchSizes(t *testing.T) {
 
 func TestEnqueueBatchChunking_CrossChunkSemantics(t *testing.T) {
 	t.Run("a duplicate id straddling a chunk boundary keeps the first job", func(t *testing.T) {
-		withChunkRows(t, 3)
 		ctx := context.Background()
-		s := newTestStorage(t)
+		s := newChunkedStorage(t, 3)
 
 		shared := core.NewID()
 		jobs := batchOf(8, plainJob)
@@ -176,9 +175,8 @@ func TestEnqueueBatchChunking_CrossChunkSemantics(t *testing.T) {
 	})
 
 	t.Run("a duplicate unique key straddling a chunk boundary repoints to the survivor", func(t *testing.T) {
-		withChunkRows(t, 3)
 		ctx := context.Background()
-		s := newTestStorage(t)
+		s := newChunkedStorage(t, 3)
 
 		jobs := batchOf(8, plainJob)
 		jobs[1].UniqueKey = "chunk-key"
@@ -194,9 +192,8 @@ func TestEnqueueBatchChunking_CrossChunkSemantics(t *testing.T) {
 	})
 
 	t.Run("a stranger holding an id in a later chunk is not reconfigured", func(t *testing.T) {
-		withChunkRows(t, 3)
 		ctx := context.Background()
-		s := newTestStorage(t)
+		s := newChunkedStorage(t, 3)
 
 		stranger := &core.Job{ID: core.NewID(), Type: "stranger", Queue: "default", Status: core.StatusPending, MaxRetries: 7}
 		require.NoError(t, s.Enqueue(ctx, stranger))
@@ -213,9 +210,8 @@ func TestEnqueueBatchChunking_CrossChunkSemantics(t *testing.T) {
 	})
 
 	t.Run("Retries(0) and a delayed job in a non-first chunk are applied", func(t *testing.T) {
-		withChunkRows(t, 3)
 		ctx := context.Background()
-		s := newTestStorage(t)
+		s := newChunkedStorage(t, 3)
 
 		future := time.Now().Add(time.Hour)
 		jobs := batchOf(8, plainJob)
@@ -322,11 +318,9 @@ func failingCreate(t *testing.T, s *GormStorage) {
 }
 
 func TestEnqueueBatchChunking_FailureInALaterChunkPersistsNothing(t *testing.T) {
-	withChunkRows(t, 3)
-
 	t.Run("EnqueueBatch", func(t *testing.T) {
 		ctx := context.Background()
-		s := newTestStorage(t)
+		s := newChunkedStorage(t, 3)
 		failingCreate(t, s)
 
 		jobs := batchOf(8, plainJob)
@@ -337,7 +331,7 @@ func TestEnqueueBatchChunking_FailureInALaterChunkPersistsNothing(t *testing.T) 
 
 	t.Run("a caller-owned transaction that ignores the error and commits", func(t *testing.T) {
 		ctx := context.Background()
-		s := newTestStorage(t)
+		s := newChunkedStorage(t, 3)
 		failingCreate(t, s)
 
 		rec := &sqlRecorder{}
@@ -358,6 +352,50 @@ func TestEnqueueBatchChunking_FailureInALaterChunkPersistsNothing(t *testing.T) 
 		assert.EqualValues(t, 1, countJobs(t, s),
 			"chunks 1 and 2 survived a failure in chunk 3 inside a caller-owned transaction")
 	})
+}
+
+// failNthDQReadyUpdate makes the nth UPDATE of dq_ready fail. The corrective UPDATE
+// is chunked at retentionDeleteChunkSize ids, so n=2 fails the second chunk.
+func failNthDQReadyUpdate(t *testing.T, s *GormStorage, n int) {
+	t.Helper()
+	const name = "test:fail-dq-update"
+	seen := 0
+	require.NoError(t, s.db.Callback().Update().Before("gorm:update").Register(name, func(db *gorm.DB) {
+		if m, ok := db.Statement.Dest.(map[string]interface{}); ok {
+			if _, has := m["dq_ready"]; has {
+				seen++
+				if seen == n {
+					_ = db.AddError(errors.New("boom: injected dq_ready update failure"))
+				}
+			}
+		}
+	}))
+	t.Cleanup(func() { _ = s.db.Callback().Update().Remove(name) })
+}
+
+// The corrective UPDATEs run after the inserts. They share the inserts' savepoint,
+// so a failure in a later UPDATE chunk cannot leave delayed jobs persisted with
+// dq_ready=true (which a worker would dequeue early). 1500 ids is two UPDATE chunks
+// and three insert chunks at the derived size.
+func TestEnqueueBatchChunking_FailureInACorrectiveUpdateChunkPersistsNothing(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStorage(t)
+	failNthDQReadyUpdate(t, s, 2)
+
+	future := time.Now().Add(time.Hour)
+	jobs := batchOf(retentionDeleteChunkSize+500, func(i int) *core.Job {
+		j := plainJob(i)
+		j.RunAt = &future
+		return j
+	})
+
+	tx := s.db.Begin()
+	require.NoError(t, tx.Error)
+	require.Error(t, s.EnqueueBatchTx(ctx, tx, jobs))
+	_ = tx.Commit()
+
+	assert.EqualValues(t, 0, countJobs(t, s),
+		"a failure in the second corrective UPDATE chunk left the inserted rows persisted")
 }
 
 func TestEnqueueBatchChunking_FanOutWithManySubJobs(t *testing.T) {
