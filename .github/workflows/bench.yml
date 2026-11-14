@@ -97,6 +97,9 @@ jobs:
   # in step with the schedule: open (or comment on) it when the run does not succeed,
   # close it when a later run does. A job killed at timeout-minutes concludes
   # `cancelled`, not `failure`, so this keys on the result rather than failure().
+  # For a matrix job `needs.bench.result` is the aggregate of every leg: `success`
+  # only when all legs succeed, `failure` if any fails, `cancelled` if any is
+  # cancelled (a timeout included). Only an all-skipped matrix reports `skipped`.
   report:
     name: Report benchmark status
     needs: bench
