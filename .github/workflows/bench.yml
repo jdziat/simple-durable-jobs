@@ -8,9 +8,10 @@ on:
 permissions:
   contents: read
 
-# CI pins Go to 1.25.13 (matches go.mod's `toolchain` directive) so setup-go
+# CI pins Go to 1.26.11 (matches go.mod's `toolchain` directive) so setup-go
 # installs it directly: no on-the-fly sum.golang.org toolchain download
-# (which flaked Lint) and CI runs the patched stdlib. Bump with go.mod.
+# (which flaked Lint) and CI runs the patched stdlib. Bump with go.mod;
+# scripts/check-go-pins.sh (run by the Lint job) fails when a pin drifts.
 
 jobs:
   bench:
@@ -45,7 +46,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
-          go-version: '1.25.13'
+          go-version: '1.26.11'
 
       - name: Install benchstat
         run: go install golang.org/x/perf/cmd/benchstat@v0.0.0-20260512194132-3cf34090a3db
@@ -56,13 +57,30 @@ jobs:
           TEST_DATABASE_URL: ${{ matrix.backend == 'postgres' && 'postgres://jobs:jobs@localhost:5432/jobs_test?sslmode=disable' || '' }}
         run: scripts/bench.sh ${{ matrix.backend }}
 
+      # scripts/bench.sh exits 0 with only a warning when a backend is unreachable and
+      # writes no file. Without this step that skip would be a green job with nothing
+      # measured; with it the failure names the cause instead of surfacing as a
+      # missing artifact.
+      - name: Require benchmark output
+        run: |
+          if [ ! -s "bench-results/${{ matrix.backend }}.txt" ]; then
+            echo "::error::no benchmark output for ${{ matrix.backend }} (backend unreachable or skipped)"
+            exit 1
+          fi
+
+      # always(): a failed run still leaves its partial output behind, so the failure
+      # can be diagnosed from the artifact instead of only the log. A missing file is
+      # not an error here; the step above already failed the job with a clear message.
       - name: Upload raw benchmark output
+        if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: bench-${{ matrix.backend }}
           path: bench-results/${{ matrix.backend }}.txt
-          if-no-files-found: error
+          if-no-files-found: ignore
 
+      # Runs only after a successful benchmark: a delta computed from partial or
+      # absent output would read as a real comparison.
       - name: Compare with baseline
         run: |
           {
@@ -74,3 +92,53 @@ jobs:
             benchstat benchmarks/baseline/${{ matrix.backend }}.txt bench-results/${{ matrix.backend }}.txt || true
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # A red scheduled run went unnoticed for five weeks. Keep one issue labelled `bench-failure`
+  # in step with the schedule: open (or comment on) it when the run does not succeed,
+  # close it when a later run does. A job killed at timeout-minutes concludes
+  # `cancelled`, not `failure`, so this keys on the result rather than failure().
+  # For a matrix job `needs.bench.result` is the aggregate of every leg: `success`
+  # only when all legs succeed, `failure` if any fails, `cancelled` if any is
+  # cancelled (a timeout included). Only an all-skipped matrix reports `skipped`.
+  report:
+    name: Report benchmark status
+    needs: bench
+    # Only the weekly schedule reports. A manual dispatch (for example recording a
+    # baseline) never opens or closes the issue, so its outcome cannot flip it.
+    if: ${{ always() && github.event_name == 'schedule' && needs.bench.result != 'skipped' }}
+    runs-on: ubuntu-latest
+    # The issue list and the create/comment are separate calls; serialize runs so two
+    # overlapping ones cannot each see no open issue and open two.
+    concurrency:
+      group: bench-issue
+      cancel-in-progress: false
+    permissions:
+      issues: write
+    steps:
+      - name: Open, update or close the benchmark issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RESULT: ${{ needs.bench.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          open_issues="$(gh issue list --repo "$GITHUB_REPOSITORY" --label bench-failure --state open \
+            --json number --jq '.[].number')"
+          existing="$(head -n1 <<<"$open_issues")"
+          if [ "$RESULT" = success ]; then
+            # Close every open one, so a duplicate left by a manual edit cannot linger.
+            for n in $open_issues; do
+              gh issue close "$n" --repo "$GITHUB_REPOSITORY" \
+                --comment "The scheduled benchmark run succeeded again: $RUN_URL"
+            done
+            exit 0
+          fi
+          gh label create bench-failure --repo "$GITHUB_REPOSITORY" \
+            --description "Scheduled benchmark run failed" --color B60205 2>/dev/null || true
+          body="The scheduled benchmark run did not succeed (result: $RESULT): $RUN_URL"
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "$body"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --label bench-failure \
+              --title "Scheduled benchmark run is failing" --body "$body"
+          fi

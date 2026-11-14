@@ -230,6 +230,14 @@ jobs:
         with:
           fetch-depth: 0
 
+      # Every workflow pins Go exactly; a pin left behind after a go.mod toolchain
+      # bump silently tests an older standard library (bench.yml, stress.yml,
+      # pages.yml and govulncheck-scheduled.yml sat on 1.25.13 while ci.yml moved).
+      # Pure bash, sed, awk and find: it needs no Go toolchain, so it runs before the
+      # Go setup step further down.
+      - name: Workflow Go pins match go.mod
+        run: scripts/check-go-pins.sh
+
       # A committed conflict marker had NO gate: `go build/vet/test ./...` covers
       # only the root module, so docs/ (its own go.mod) is never compiled, and
       # Hugo renders a conflict marker as ordinary text without erroring — so
