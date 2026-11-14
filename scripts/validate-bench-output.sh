@@ -18,6 +18,10 @@
 #   2. no line reports a failure (--- FAIL, FAIL, panic);
 #   3. every required benchmark for the backend has exactly COUNT result lines.
 #
+# Result-line names are a Benchmark name plus the optional GOMAXPROCS suffix; a
+# sub-benchmark name (Benchmark/Name/n=1) is not accepted and fails loudly as an
+# unexpected line, never silently.
+#
 # The required set is per backend because the two churn benchmarks skip on SQLite.
 # The count is the same for every benchmark; derived from observed clean runs
 # (scripts/testdata/bench/clean-sqlite.txt and the Postgres artifact).

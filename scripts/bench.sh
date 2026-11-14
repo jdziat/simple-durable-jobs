@@ -13,6 +13,15 @@
 
 set -euo pipefail
 
+# run_backend relies on pipefail (set above) to carry go test's status through tee, so
+# the script must run in its own shell; sourcing it into one without pipefail would
+# let tee's exit 0 hide a failed run.
+if [ "${BASH_SOURCE[0]}" != "$0" ]; then
+  echo "bench.sh must be executed, not sourced" >&2
+  # shellcheck disable=SC2317 # return works when sourced, exit when executed via a wrapper
+  return 2 2>/dev/null || exit 2
+fi
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
@@ -51,6 +60,10 @@ run_backend() {
   local backend="$1"
   local output="bench-results/${backend}.txt"
   local -a env_args=()
+
+  # A file left by an earlier run must not be mistaken for this one: a backend that
+  # is skipped below writes nothing, and the summary reports PASS for any file found.
+  rm -f "$output"
 
   case "$backend" in
     sqlite)

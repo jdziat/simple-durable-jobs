@@ -43,7 +43,7 @@ fi
 
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
-strip() { sed -E 's/^(Benchmark[A-Za-z0-9_]+)-[0-9]+([[:space:]])/\1\2/' "$1"; }
+strip() { sed -E 's/^(Benchmark[A-Za-z0-9_]+)-[0-9]+([[:space:]]|$)/\1\2/' "$1"; }
 strip "$baseline" >"$tmp/baseline.txt"
 strip "$current" >"$tmp/current.txt"
 

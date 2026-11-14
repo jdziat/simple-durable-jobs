@@ -67,6 +67,8 @@ for name in SaturatedRateLimitChurn SaturatedKeyedRateLimitChurn; do
 done
 printf -- '--- BENCH: BenchmarkSaturatedRateLimitChurn-192\n    ratelimit_churn_bench_test.go:104: cto-F2 churn soak [unkeyed]: completed=30\n' >>"$tmp/pg.txt"
 expect "postgres with churn results and a b.Logf block passes" 0 "ok (postgres" -- "$VALIDATE" "$tmp/pg.txt" postgres 3
+expect "mysql is validated like postgres" 0 "ok (mysql" -- "$VALIDATE" "$tmp/pg.txt" mysql 3
+expect "mysql requires the churn benchmarks too" 1 "SaturatedKeyedRateLimitChurn: expected 3" -- "$VALIDATE" "$clean" mysql 3
 
 # b.Logf blocks: tabs and deeper indents inside a --- BENCH: block are accepted; an
 # indented stray line outside any block is not.
@@ -90,7 +92,16 @@ G
 chmod +x "$tmp/shim/go"
 run_bench_sh() { PATH="$tmp/shim:$PATH" FAKE_GO_OUTPUT="$clean" BENCH_COUNT=3 "$tmp/sandbox/scripts/bench.sh" sqlite; }
 expect "bench.sh passes a clean run" 0 "sqlite: PASS" -- run_bench_sh
-FAKE_GO_STATUS=1 expect "bench.sh fails when go test fails even though the output validates" 1 "sqlite: FAIL" -- run_bench_sh
+run_bench_sh_go_fails() { FAKE_GO_STATUS=1 run_bench_sh; }
+expect "bench.sh fails when go test fails even though the output validates" 1 "sqlite: FAIL" -- run_bench_sh_go_fails
+
+# A skipped backend (go test of the probe fails) must not leave an old output file
+# reported as a pass.
+mkdir -p "$tmp/sandbox/bench-results"
+echo "stale output from an earlier run" >"$tmp/sandbox/bench-results/postgres.txt"
+run_bench_sh_postgres_unreachable() { PATH="$tmp/shim:$PATH" FAKE_GO_OUTPUT="$clean" FAKE_GO_STATUS=1 BENCH_COUNT=3 "$tmp/sandbox/scripts/bench.sh" postgres; }
+expect "bench.sh reports an unreachable backend as skipped, not PASS" 0 "postgres: skipped" -- run_bench_sh_postgres_unreachable
+if [ -e "$tmp/sandbox/bench-results/postgres.txt" ]; then fail "a stale output file survived a skipped backend"; else pass "the stale output file was removed"; fi
 
 # ---- bench-compare.sh ----
 cat >"$tmp/fake-benchstat" <<'S'
