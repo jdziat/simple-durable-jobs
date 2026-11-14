@@ -39,7 +39,7 @@ while IFS=: read -r file line text; do
     echo "check-go-pins: $file:$line pins Go $got, go.mod toolchain is $want" >&2
     bad=1
   fi
-done < <(find .github -type f \( -name '*.yml' -o -name '*.yaml' \) -print0 | xargs -0 grep -nE '^[[:space:]]*(-[[:space:]]*)?go-version:')
+done < <(find .github -type f \( -name '*.yml' -o -name '*.yaml' \) -print0 | xargs -0 -r grep -nE '^[[:space:]]*(-[[:space:]]*)?go-version:')
 
 if [ "$seen" -eq 0 ]; then
   echo "check-go-pins: found no go-version pins to check" >&2
