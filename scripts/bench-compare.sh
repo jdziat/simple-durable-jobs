@@ -11,7 +11,8 @@
 # A skip is loud in the output so it cannot be mistaken for a clean comparison.
 #
 # The `-N` GOMAXPROCS suffix is stripped from both files before comparing, so a
-# baseline recorded on a 4-core runner still lines up if the core count changes.
+# baseline still lines up when the core count changes but the CPU model (the `cpu:`
+# line, which is what is compared above) does not. A different CPU model skips.
 # benchstat's own exit status propagates: a file it cannot read fails the step.
 set -euo pipefail
 

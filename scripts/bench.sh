@@ -41,6 +41,12 @@ fi
 : "${TEST_MYSQL_URL:=root:jobs@tcp(localhost:13307)/jobs_test?parseTime=true}"
 mkdir -p bench-results
 
+# Fail before a long run, not after it: the validator rejects anything but a positive
+# integer, but only once every benchmark has already executed.
+case "$BENCH_COUNT" in
+  ''|*[!0-9]*|0) echo "bench.sh: BENCH_COUNT must be a positive integer, got '$BENCH_COUNT'" >&2; exit 2 ;;
+esac
+
 color() { printf '\033[%sm%s\033[0m\n' "$1" "$2"; }
 info()  { color '1;36' "==> $*"; }
 warn()  { color '1;33' "!!  $*"; }
@@ -60,10 +66,6 @@ run_backend() {
   local backend="$1"
   local output="bench-results/${backend}.txt"
   local -a env_args=()
-
-  # The `|| return 1` below depends on pipefail to carry go test's status through tee.
-  # It is set at the top of the script; setting it here keeps the dependency local.
-  set -o pipefail
 
   # A file left by an earlier run must not be mistaken for this one: a backend that
   # is skipped below writes nothing, and the summary reports PASS for any file found.
@@ -96,7 +98,9 @@ run_backend() {
   info "[$backend] go test -bench=. -benchmem -count=${BENCH_COUNT} -timeout=${BENCH_TIMEOUT} ./benchmarks/"
   # `|| return 1` matters: run_backend is called from an `if`, where `set -e` is off,
   # so without it the status of the last command in the function would replace a
-  # failed `go test` (pipefail makes the pipeline carry go test's status).
+  # failed `go test`. The pipeline carries go test's status because of `set -o
+  # pipefail` at the top of the script, which the sourcing guard above keeps in force;
+  # the "fails when go test fails" case in bench-scripts_test.sh proves it.
   env "${env_args[@]}" go test -run '^$' -bench=. -benchmem -count="$BENCH_COUNT" -timeout="$BENCH_TIMEOUT" ./benchmarks/ | tee "$output" || return 1
   # A run can exit 0 and still be unusable (a partial or corrupted file); check the
   # file itself before it is uploaded or compared.

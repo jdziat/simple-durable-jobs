@@ -103,6 +103,10 @@ run_bench_sh_postgres_unreachable() { PATH="$tmp/shim:$PATH" FAKE_GO_OUTPUT="$cl
 expect "bench.sh reports an unreachable backend as skipped, not PASS" 0 "postgres: skipped" -- run_bench_sh_postgres_unreachable
 if [ -e "$tmp/sandbox/bench-results/postgres.txt" ]; then fail "a stale output file survived a skipped backend"; else pass "the stale output file was removed"; fi
 
+# BENCH_COUNT is validated before any benchmark runs.
+run_bench_sh_bad_count() { PATH="$tmp/shim:$PATH" FAKE_GO_OUTPUT="$clean" BENCH_COUNT=0 "$tmp/sandbox/scripts/bench.sh" sqlite; }
+expect "bench.sh rejects BENCH_COUNT=0 before running anything" 2 "BENCH_COUNT must be a positive integer" -- run_bench_sh_bad_count
+
 # ---- bench-compare.sh ----
 cat >"$tmp/fake-benchstat" <<'S'
 #!/usr/bin/env bash
