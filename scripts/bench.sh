@@ -47,8 +47,9 @@ case "$BENCH_COUNT" in
   ''|*[!0-9]*|0) echo "bench.sh: BENCH_COUNT must be a positive integer, got '$BENCH_COUNT'" >&2; exit 2 ;;
 esac
 # go test rejects a duration without a unit ("25") only after the run has started.
-if ! [[ "$BENCH_TIMEOUT" =~ ^[0-9]+(\.[0-9]+)?(ns|us|ms|s|m|h)$ ]]; then
-  echo "bench.sh: BENCH_TIMEOUT must be a Go duration such as 25m, got '$BENCH_TIMEOUT'" >&2
+# Compound durations such as 1h30m are valid for go test and accepted here.
+if ! [[ "$BENCH_TIMEOUT" =~ ^([0-9]+(\.[0-9]+)?(ns|us|ms|s|m|h))+$ ]]; then
+  echo "bench.sh: BENCH_TIMEOUT must be a Go duration such as 25m or 1h30m, got '$BENCH_TIMEOUT'" >&2
   exit 2
 fi
 

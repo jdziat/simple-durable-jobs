@@ -238,6 +238,12 @@ jobs:
       - name: Workflow Go pins match go.mod
         run: scripts/check-go-pins.sh
 
+      # The benchmark output validator and the baseline compare are what let the weekly
+      # benchmark job fail on a corrupted or partial run. Test them against real
+      # fixtures: a clean run, and the CI artifact that slog lines corrupted.
+      - name: Benchmark script tests
+        run: scripts/bench-scripts_test.sh
+
       # A committed conflict marker had NO gate: `go build/vet/test ./...` covers
       # only the root module, so docs/ (its own go.mod) is never compiled, and
       # Hugo renders a conflict marker as ordinary text without erroring — so
