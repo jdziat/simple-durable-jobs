@@ -73,8 +73,13 @@ for name in $gated; do
   while IFS= read -r full; do
     bm="$(awk -v n="$full" '$1 == n { print $2; exit }' "$tmp/base")"
     cm="$(awk -v n="$full" '$1 == n { print $2; exit }' "$tmp/cur")"
-    if [ -z "$bm" ] || [ -z "$cm" ]; then
-      echo "bench-regress: $full is missing from the ${bm:+current}${cm:+baseline} file" >&2
+    if [ -z "$bm" ]; then
+      echo "bench-regress: $full is missing from the baseline file; record a new baseline" >&2
+      fail=1
+      continue
+    fi
+    if [ -z "$cm" ]; then
+      echo "bench-regress: $full is missing from the current file" >&2
       fail=1
       continue
     fi
@@ -85,6 +90,11 @@ for name in $gated; do
     fi
     bv="$(awk -v n="$full" '$1 == n { print $3 }' "$tmp/base" | median)"
     cv="$(awk -v n="$full" '$1 == n { print $3 }' "$tmp/cur" | median)"
+    if ! awk -v b="$bv" 'BEGIN { exit !(b > 0) }'; then
+      echo "bench-regress: the baseline median for $full is zero; the baseline is unusable, record a new one" >&2
+      fail=1
+      continue
+    fi
     if [ "$bm" = tp ]; then
       ratio="$(awk -v b="$bv" -v c="$cv" 'BEGIN { printf "%.2f", (c > 0 ? b / c : 999) }')"
     else

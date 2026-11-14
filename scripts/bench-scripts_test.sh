@@ -198,6 +198,12 @@ expect "regress: a changed metric fails instead of producing a wrong ratio" 1 "E
 awk '/^BenchmarkEnqueue-/ { for (i = 3; i < NF; i++) if ($(i+1) == "jobs/sec") $i = 0 } { print }' "$clean" >"$tmp/zero-tp.txt"
 expect "regress: zero current throughput fails" 1 "REGRESSION Enqueue" -- "$REGRESS" "$clean" "$tmp/zero-tp.txt"
 
+# A baseline whose median is zero cannot anchor a ratio: say so instead of passing or
+# reporting an unexplained regression.
+awk '/^BenchmarkEnqueue-/ { for (i = 3; i < NF; i++) if ($(i+1) == "jobs/sec") $i = 0 } { print }' "$clean" >"$tmp/zero-base.txt"
+expect "regress: a zero baseline median is an explicit error" 1 "baseline median for Enqueue is zero" -- "$REGRESS" "$tmp/zero-base.txt" "$clean"
+expect "regress: a benchmark missing from the baseline names the baseline" 1 "WorkflowSteps is missing from the baseline" -- "$REGRESS" "$tmp/missing-wf.txt" "$clean"
+
 # Sub-benchmarks of a gated benchmark are gated too.
 cp "$clean" "$tmp/sub-base.txt"
 cp "$clean" "$tmp/sub-cur.txt"
