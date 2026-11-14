@@ -106,10 +106,16 @@ if [ -e "$tmp/sandbox/bench-results/postgres.txt" ]; then fail "a stale output f
 # BENCH_COUNT is validated before any benchmark runs.
 run_bench_sh_bad_count() { PATH="$tmp/shim:$PATH" FAKE_GO_OUTPUT="$clean" BENCH_COUNT=0 "$tmp/sandbox/scripts/bench.sh" sqlite; }
 expect "bench.sh rejects BENCH_COUNT=0 before running anything" 2 "BENCH_COUNT must be a positive integer" -- run_bench_sh_bad_count
+for bad in abc -1 1.5; do
+  run_bench_sh_bad_count_value() { PATH="$tmp/shim:$PATH" FAKE_GO_OUTPUT="$clean" BENCH_COUNT="$bad" "$tmp/sandbox/scripts/bench.sh" sqlite; }
+  expect "bench.sh rejects BENCH_COUNT=$bad" 2 "BENCH_COUNT must be a positive integer" -- run_bench_sh_bad_count_value
+done
 run_bench_sh_with_timeout() { PATH="$tmp/shim:$PATH" FAKE_GO_OUTPUT="$clean" BENCH_COUNT=3 BENCH_TIMEOUT="$1" "$tmp/sandbox/scripts/bench.sh" sqlite; }
 expect "bench.sh rejects BENCH_TIMEOUT without a unit" 2 "BENCH_TIMEOUT must be a Go duration" -- run_bench_sh_with_timeout 25
 expect "bench.sh treats an empty BENCH_TIMEOUT as unset and uses the default" 0 "timeout=25m" -- run_bench_sh_with_timeout ""
 expect "bench.sh accepts BENCH_TIMEOUT=90s" 0 "sqlite: PASS" -- run_bench_sh_with_timeout 90s
+expect "bench.sh accepts a compound BENCH_TIMEOUT=1h30m" 0 "timeout=1h30m" -- run_bench_sh_with_timeout 1h30m
+expect "bench.sh rejects a duration with trailing text" 2 "BENCH_TIMEOUT must be a Go duration" -- run_bench_sh_with_timeout 25mins
 
 # ---- bench-compare.sh ----
 cat >"$tmp/fake-benchstat" <<'S'
