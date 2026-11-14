@@ -1637,7 +1637,19 @@ func (s *GormStorage) Heartbeat(ctx context.Context, jobID core.UUID, workerID s
 		return result.Error
 	}
 	if result.RowsAffected == 0 {
-		return core.ErrJobNotOwned
+		// MySQL reports CHANGED rows, not MATCHED rows. The timestamp columns are
+		// datetime(3), so two heartbeats that evaluate NOW(6) inside the same
+		// millisecond write identical values, and the second UPDATE matches the
+		// row yet reports 0 affected. Zero rows is therefore ambiguous on MySQL:
+		// look at the row before calling an owned job lost.
+		var owned int64
+		if err := s.ownedRunning(s.db.WithContext(ctx), ctx, jobID, workerID).
+			Count(&owned).Error; err != nil {
+			return err
+		}
+		if owned == 0 {
+			return core.ErrJobNotOwned
+		}
 	}
 	return nil
 }
