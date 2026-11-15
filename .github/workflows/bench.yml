@@ -116,7 +116,8 @@ jobs:
       - name: Regression check
         env:
           # Per backend, from the measured same-CPU spread (benchmarks/baseline/README.md):
-          # SQLite worst 1.22, Postgres worst 1.59.
+          # SQLite worst 1.22, Postgres worst 1.59. Keep the README's calibration table in
+          # step when these change.
           BENCH_REGRESSION_FACTOR: ${{ matrix.backend == 'postgres' && '2.5' || '2.0' }}
         run: |
           {
@@ -145,13 +146,13 @@ jobs:
   # `cancelled`, not `failure`, so this keys on the result rather than failure().
   # For a matrix job `needs.bench.result` is the aggregate of every leg: `success`
   # only when all legs succeed, `failure` if any fails, `cancelled` if any is
-  # cancelled (a timeout included). Only an all-skipped matrix reports `skipped`.
+  # cancelled (a timeout included). An all-skipped matrix reports `skipped`, which also counts as not a success and opens the issue.
   report:
     name: Report benchmark status
     needs: bench
     # Only the weekly schedule reports. A manual dispatch (for example recording a
     # baseline) never opens or closes the issue, so its outcome cannot flip it.
-    if: ${{ always() && github.event_name == 'schedule' && needs.bench.result != 'skipped' }}
+    if: ${{ always() && github.event_name == 'schedule' }}
     runs-on: ubuntu-latest
     # The issue list and the create/comment are separate calls; serialize runs so two
     # overlapping ones cannot each see no open issue and open two.

@@ -27,7 +27,7 @@ MySQL is not in the CI matrix; its numbers below are an older local measurement 
 
 The explicit single-row dequeue path (`WithDequeueBatchSize(1)`) is the conservative claim mode: each storage request claims one job. Pair it with a slower `WithPollInterval(...)` when you want to approximate the older slow-poll behavior during rollback.
 
-The worker default is `WithDequeueBatchSize(50)`, capped at the worker's free concurrency slots, so at the default concurrency of 10 the effective per-poll claim is 10. The work-conserving dispatcher, which landed on 2026-06-08, keeps claiming while capacity remains instead of waiting a full poll interval after each claim. That is why single-row claims no longer cap at one job per poll interval. With single-row claims, one claim per 50ms poll is one job per poll, or 20 jobs/sec. That is the figure published in June (20.02 jobs/sec) and what the older dispatcher measured: `BenchmarkEndToEnd` now measures single-row claim throughput under the drain loop. Raising concurrency is what allows the larger default batch.
+The worker default is `WithDequeueBatchSize(50)`, capped at the worker's free concurrency slots, so at the default concurrency of 10 the effective per-poll claim is 10. The end-to-end batch row below sets `WithDequeueBatchSize(10)` explicitly rather than using that default. The work-conserving dispatcher, which landed on 2026-06-08, keeps claiming while capacity remains instead of waiting a full poll interval after each claim. The older dispatcher waited a full poll interval after every claim, so with single-row claims it was capped at one job per 50ms poll, or 20 jobs/sec; that is the figure published in June (20.02 jobs/sec). The current dispatcher has no such cap, which is why the single-row row in the tables below is in the hundreds of jobs/sec: `BenchmarkEndToEnd` now measures single-row claim throughput under the drain loop. Raising concurrency is what allows the larger default batch.
 
 The two end-to-end rows are different claim shapes under the same drain loop, and neither is always faster: in these runs single-row claims were faster on SQLite and batch claims of 10 were faster on PostgreSQL. The benchmarks do not isolate why, so treat the comparison as specific to the backend and CPU model in the table.
 
@@ -99,7 +99,7 @@ MySQL was last measured on 2026-06-06 (Go 1.25.11, a 192-core local host, local 
 | Batch enqueue (100 jobs per op) | `5302`, `4921`, `5129` |
 | Workflow steps | `738.0`, `743.4`, `735.8` |
 
-Dispatch latency, June 2026 (idle-worker pickup is poll-bound, so the dispatcher change does not affect it): p50 `34.7 ms`, p95 `37.6` to `44.1 ms`, p99 `54.1` to `54.5 ms`.
+Dispatch latency, June 2026 (idle-worker pickup waits for the next poll tick, so the dispatcher change does not affect it: the June and current p50 agree to within 2 ms, 41.7 and 41.1 ms on SQLite): p50 `34.7 ms`, p95 `37.6` to `44.1 ms`, p99 `54.1` to `54.5 ms`.
 
 ## Reproduce It
 

@@ -355,7 +355,9 @@ func (s *GormStorage) enqueueBatchWithDB(db *gorm.DB, jobs []*core.Job) error {
 // batchNeedsSavepoint reports whether chunking turned any phase of an EnqueueBatch
 // into more than one statement. chunkIDs splits only ABOVE the chunk size, so a list
 // of exactly retentionDeleteChunkSize ids is still one statement and the comparison
-// is strict; one id more is two statements and needs the savepoint.
+// is strict; one id more is two statements and needs the savepoint. The unique-key
+// lookup and the preexisting-id read are SELECTs that change nothing, so a failure in
+// one of their chunks leaves no partial write for the savepoint to undo.
 func batchNeedsSavepoint(insertChunks, zeroRetryIDs, dqReadyFalseIDs int) bool {
 	return insertChunks > 1 ||
 		zeroRetryIDs > retentionDeleteChunkSize ||

@@ -111,6 +111,10 @@ func TestJobInsertChunkRows_StaysUnderEveryBindCeiling(t *testing.T) {
 	cols := len(stmt.Schema.DBNames)
 	require.Greater(t, cols, 0)
 
+	// The budget itself must sit under the smallest dialect ceiling, independent of the
+	// current column count.
+	assert.Less(t, insertBindBudget, 32766, "the bind budget must stay under SQLite's ceiling")
+
 	rows := s.jobInsertChunkRows(s.db)
 	assert.GreaterOrEqual(t, rows, 1)
 	assert.LessOrEqual(t, rows, insertMaxChunkRow)
