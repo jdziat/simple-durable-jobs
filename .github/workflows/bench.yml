@@ -87,8 +87,11 @@ jobs:
           if-no-files-found: ignore
 
       # Runs only after a successful benchmark: a delta computed from partial or
-      # absent output would read as a real comparison.
+      # absent output would read as a real comparison. `if: success()` is the default
+      # and is written out so the gating is visible: the Require step above fails the
+      # job first when there is no output, and this step is then skipped.
       - name: Compare with baseline
+        if: success()
         run: |
           {
             echo "## Benchmark delta: ${{ matrix.backend }}"
@@ -114,6 +117,9 @@ jobs:
       # models, which per-CPU baselines keep out of the comparison. Skips loudly, and
       # does not fail, when no baseline is recorded for this run's CPU model.
       - name: Regression check
+        if: success()
+        # scripts/bench-regress.sh reads BENCH_REGRESSION_FACTOR from its environment;
+        # a step's env is exported to the commands in its run block.
         env:
           # Per backend, from the measured same-CPU spread (benchmarks/baseline/README.md):
           # SQLite worst 1.22, Postgres worst 1.59. Keep the README's calibration table in
