@@ -1,0 +1,369 @@
+goos: linux
+goarch: amd64
+pkg: github.com/jdziat/simple-durable-jobs/v4/benchmarks
+cpu: Intel(R) Xeon(R) 6975P-C
+commit: 5a0c3e0
+go: 1.26.11
+runner: ubuntu-latest, 4 cores
+date: 2026-11-15
+runs: 5
+BenchmarkEnqueue-4                        	    2618	    447797 ns/op	      2233 jobs/sec	   19422 B/op	     153 allocs/op
+BenchmarkEnqueue-4                        	    2655	    458260 ns/op	      2182 jobs/sec	   19421 B/op	     153 allocs/op
+BenchmarkEnqueue-4                        	    2516	    451955 ns/op	      2213 jobs/sec	   19411 B/op	     153 allocs/op
+BenchmarkEnqueue-4                        	    2515	    450528 ns/op	      2220 jobs/sec	   19412 B/op	     153 allocs/op
+BenchmarkEnqueue-4                        	    2560	    451666 ns/op	      2214 jobs/sec	   19413 B/op	     153 allocs/op
+BenchmarkEnqueue-4                        	    2523	    452390 ns/op	      2210 jobs/sec	   19412 B/op	     153 allocs/op
+BenchmarkEnqueueBatch-4                   	     230	   5086741 ns/op	     19659 jobs/sec	 1202876 B/op	    8573 allocs/op
+BenchmarkEnqueueBatch-4                   	     225	   5064670 ns/op	     19745 jobs/sec	 1202911 B/op	    8573 allocs/op
+BenchmarkEnqueueBatch-4                   	     225	   5260893 ns/op	     19008 jobs/sec	 1202890 B/op	    8573 allocs/op
+BenchmarkEnqueueBatch-4                   	     224	   5260308 ns/op	     19010 jobs/sec	 1202897 B/op	    8573 allocs/op
+BenchmarkEnqueueBatch-4                   	     224	   5272838 ns/op	     18965 jobs/sec	 1202883 B/op	    8573 allocs/op
+BenchmarkEnqueueBatch-4                   	     228	   5363023 ns/op	     18646 jobs/sec	 1202842 B/op	    8573 allocs/op
+BenchmarkEnqueueBatchSizes/n=100-4        	     229	   5207991 ns/op	     19201 jobs/sec	 1202843 B/op	    8573 allocs/op
+BenchmarkEnqueueBatchSizes/n=100-4        	     226	   5141693 ns/op	     19449 jobs/sec	 1202874 B/op	    8573 allocs/op
+BenchmarkEnqueueBatchSizes/n=100-4        	     225	   5208433 ns/op	     19200 jobs/sec	 1202942 B/op	    8573 allocs/op
+BenchmarkEnqueueBatchSizes/n=100-4        	     225	   5180645 ns/op	     19303 jobs/sec	 1202904 B/op	    8573 allocs/op
+BenchmarkEnqueueBatchSizes/n=100-4        	     222	   5264359 ns/op	     18996 jobs/sec	 1202901 B/op	    8573 allocs/op
+BenchmarkEnqueueBatchSizes/n=100-4        	     224	   5217840 ns/op	     19165 jobs/sec	 1202854 B/op	    8573 allocs/op
+BenchmarkEnqueueBatchSizes/n=500-4        	      52	  21780954 ns/op	     22956 jobs/sec	 6538469 B/op	   42630 allocs/op
+BenchmarkEnqueueBatchSizes/n=500-4        	      54	  21625962 ns/op	     23120 jobs/sec	 6537944 B/op	   42629 allocs/op
+BenchmarkEnqueueBatchSizes/n=500-4        	      52	  21964575 ns/op	     22764 jobs/sec	 6538408 B/op	   42629 allocs/op
+BenchmarkEnqueueBatchSizes/n=500-4        	      52	  21835916 ns/op	     22898 jobs/sec	 6538374 B/op	   42629 allocs/op
+BenchmarkEnqueueBatchSizes/n=500-4        	      54	  21937793 ns/op	     22792 jobs/sec	 6537903 B/op	   42628 allocs/op
+BenchmarkEnqueueBatchSizes/n=500-4        	      54	  21475382 ns/op	     23282 jobs/sec	 6537758 B/op	   42627 allocs/op
+BenchmarkEnqueueBatchSizes/n=1000-4       	      26	  43205932 ns/op	     23145 jobs/sec	13115302 B/op	   85233 allocs/op
+BenchmarkEnqueueBatchSizes/n=1000-4       	      27	  43685050 ns/op	     22891 jobs/sec	13114571 B/op	   85233 allocs/op
+BenchmarkEnqueueBatchSizes/n=1000-4       	      26	  43741644 ns/op	     22862 jobs/sec	13115419 B/op	   85233 allocs/op
+BenchmarkEnqueueBatchSizes/n=1000-4       	      27	  42567249 ns/op	     23492 jobs/sec	13114494 B/op	   85232 allocs/op
+BenchmarkEnqueueBatchSizes/n=1000-4       	      26	  42714456 ns/op	     23411 jobs/sec	13115087 B/op	   85232 allocs/op
+BenchmarkEnqueueBatchSizes/n=1000-4       	      27	  42765094 ns/op	     23384 jobs/sec	13114268 B/op	   85230 allocs/op
+BenchmarkEnqueueBatchSizes/n=5000-4       	       5	 206367460 ns/op	     24229 jobs/sec	65302768 B/op	  425812 allocs/op
+BenchmarkEnqueueBatchSizes/n=5000-4       	       5	 208674981 ns/op	     23961 jobs/sec	65303164 B/op	  425812 allocs/op
+BenchmarkEnqueueBatchSizes/n=5000-4       	       5	 207932082 ns/op	     24046 jobs/sec	65302494 B/op	  425809 allocs/op
+BenchmarkEnqueueBatchSizes/n=5000-4       	       5	 206215076 ns/op	     24247 jobs/sec	65303158 B/op	  425811 allocs/op
+BenchmarkEnqueueBatchSizes/n=5000-4       	       5	 205199327 ns/op	     24367 jobs/sec	65303112 B/op	  425812 allocs/op
+BenchmarkEnqueueBatchSizes/n=5000-4       	       5	 205029531 ns/op	     24387 jobs/sec	65302940 B/op	  425814 allocs/op
+BenchmarkEndToEnd-4                       	       1	1994700969 ns/op	       539.0 jobs/sec	86767384 B/op	 1050589 allocs/op
+BenchmarkEndToEnd-4                       	       1	1904973043 ns/op	       541.0 jobs/sec	86744824 B/op	 1050085 allocs/op
+BenchmarkEndToEnd-4                       	       1	1909337639 ns/op	       539.6 jobs/sec	86741256 B/op	 1050030 allocs/op
+BenchmarkEndToEnd-4                       	       1	1898482771 ns/op	       542.4 jobs/sec	86732560 B/op	 1050097 allocs/op
+BenchmarkEndToEnd-4                       	       1	1904487991 ns/op	       540.9 jobs/sec	86768728 B/op	 1050385 allocs/op
+BenchmarkEndToEnd-4                       	       1	1909433468 ns/op	       539.2 jobs/sec	86867048 B/op	 1050819 allocs/op
+BenchmarkEndToEndBatchDequeue-4           	       1	1273900654 ns/op	       820.1 jobs/sec	66099616 B/op	  569233 allocs/op
+BenchmarkEndToEndBatchDequeue-4           	       1	1434826084 ns/op	       724.6 jobs/sec	67997960 B/op	  576477 allocs/op
+BenchmarkEndToEndBatchDequeue-4           	       1	1151453282 ns/op	       910.8 jobs/sec	63956120 B/op	  563211 allocs/op
+BenchmarkEndToEndBatchDequeue-4           	       1	1113355901 ns/op	       944.6 jobs/sec	62185944 B/op	  553557 allocs/op
+BenchmarkEndToEndBatchDequeue-4           	       1	1231680541 ns/op	       849.6 jobs/sec	65102112 B/op	  565711 allocs/op
+BenchmarkEndToEndBatchDequeue-4           	       1	1069963798 ns/op	       984.6 jobs/sec	61684456 B/op	  551311 allocs/op
+BenchmarkWorkflowSteps-4                  	     477	   3083935 ns/op	      1621 steps/sec	  219740 B/op	    2011 allocs/op
+BenchmarkWorkflowSteps-4                  	     366	   3117234 ns/op	      1604 steps/sec	  219491 B/op	    2013 allocs/op
+BenchmarkWorkflowSteps-4                  	     390	   3137176 ns/op	      1594 steps/sec	  219401 B/op	    2012 allocs/op
+BenchmarkWorkflowSteps-4                  	     405	   2791016 ns/op	      1791 steps/sec	  213937 B/op	    2008 allocs/op
+BenchmarkWorkflowSteps-4                  	     334	   3062708 ns/op	      1633 steps/sec	  218433 B/op	    2012 allocs/op
+BenchmarkWorkflowSteps-4                  	     406	   3182704 ns/op	      1571 steps/sec	  221078 B/op	    2019 allocs/op
+BenchmarkDispatchLatency-4                	      24	  42712617 ns/op	     41252 p50-us	     42001 p95-us	     42821 p99-us	  139873 B/op	    1513 allocs/op
+BenchmarkDispatchLatency-4                	      25	  42708568 ns/op	     41022 p50-us	     42290 p95-us	     43631 p99-us	  143728 B/op	    1516 allocs/op
+BenchmarkDispatchLatency-4                	      25	  42688487 ns/op	     41167 p50-us	     42224 p95-us	     43603 p99-us	  140917 B/op	    1496 allocs/op
+BenchmarkDispatchLatency-4                	      24	  42759274 ns/op	     41289 p50-us	     41977 p95-us	     44070 p99-us	  140009 B/op	    1512 allocs/op
+BenchmarkDispatchLatency-4                	      26	  42802366 ns/op	     41254 p50-us	     42049 p95-us	     44786 p99-us	  139804 B/op	    1513 allocs/op
+BenchmarkDispatchLatency-4                	      25	  42614512 ns/op	     40932 p50-us	     42527 p95-us	     43897 p99-us	  140218 B/op	    1485 allocs/op
+BenchmarkSaturatedRateLimitChurn-4        	       1	2000171026 ns/op	        15.00 completed/s	        75.00 dequeues/s	         0 rateChecks/s	        60.00 releases/s	         9.000 wasteOps/completed	 8277040 B/op	   93431 allocs/op
+BenchmarkSaturatedRateLimitChurn-4        	       1	2000783937 ns/op	        15.00 completed/s	        75.00 dequeues/s	         0 rateChecks/s	        60.00 releases/s	         9.000 wasteOps/completed	 8029760 B/op	   92844 allocs/op
+BenchmarkSaturatedRateLimitChurn-4        	       1	2000820591 ns/op	        15.00 completed/s	        75.00 dequeues/s	         0 rateChecks/s	        60.00 releases/s	         9.000 wasteOps/completed	 8302232 B/op	   93841 allocs/op
+BenchmarkSaturatedRateLimitChurn-4        	       1	2001125972 ns/op	        15.00 completed/s	        75.00 dequeues/s	         0 rateChecks/s	        60.00 releases/s	         9.000 wasteOps/completed	 8075760 B/op	   93114 allocs/op
+BenchmarkSaturatedRateLimitChurn-4        	       1	2001023313 ns/op	        15.00 completed/s	        75.00 dequeues/s	         0 rateChecks/s	        60.00 releases/s	         9.000 wasteOps/completed	 8072440 B/op	   93074 allocs/op
+BenchmarkSaturatedRateLimitChurn-4        	       1	2000827176 ns/op	        15.00 completed/s	        75.00 dequeues/s	         0 rateChecks/s	        60.00 releases/s	         9.000 wasteOps/completed	 7997096 B/op	   93006 allocs/op
+BenchmarkSaturatedKeyedRateLimitChurn-4   	       1	2001074593 ns/op	        15.00 completed/s	      1050 dequeues/s	         0 rateChecks/s	      1035 releases/s	       139.0 wasteOps/completed	37576064 B/op	  481813 allocs/op
+BenchmarkSaturatedKeyedRateLimitChurn-4   	       1	2001096417 ns/op	        15.00 completed/s	      1025 dequeues/s	         0 rateChecks/s	      1010 releases/s	       135.7 wasteOps/completed	36793192 B/op	  471624 allocs/op
+BenchmarkSaturatedKeyedRateLimitChurn-4   	       1	2000502450 ns/op	        15.00 completed/s	      1050 dequeues/s	         0 rateChecks/s	      1035 releases/s	       139.0 wasteOps/completed	37471120 B/op	  482169 allocs/op
+BenchmarkSaturatedKeyedRateLimitChurn-4   	       1	2000709005 ns/op	        10.00 completed/s	      1025 dequeues/s	         0 rateChecks/s	      1015 releases/s	       204.0 wasteOps/completed	36233552 B/op	  465098 allocs/op
+BenchmarkSaturatedKeyedRateLimitChurn-4   	       1	2001159718 ns/op	        13.00 completed/s	      1000 dequeues/s	         0 rateChecks/s	       987.0 releases/s	       152.8 wasteOps/completed	35616488 B/op	  458007 allocs/op
+BenchmarkSaturatedKeyedRateLimitChurn-4   	       1	2000977049 ns/op	        15.00 completed/s	      1050 dequeues/s	         0 rateChecks/s	      1035 releases/s	       139.0 wasteOps/completed	37344864 B/op	  481732 allocs/op
+BenchmarkEnqueue-4                        	    2678	    451683 ns/op	      2214 jobs/sec	   19426 B/op	     153 allocs/op
+BenchmarkEnqueue-4                        	    2563	    457270 ns/op	      2187 jobs/sec	   19416 B/op	     153 allocs/op
+BenchmarkEnqueue-4                        	    2606	    453621 ns/op	      2204 jobs/sec	   19410 B/op	     153 allocs/op
+BenchmarkEnqueue-4                        	    2488	    454436 ns/op	      2201 jobs/sec	   19412 B/op	     153 allocs/op
+BenchmarkEnqueue-4                        	    2577	    456217 ns/op	      2192 jobs/sec	   19410 B/op	     153 allocs/op
+BenchmarkEnqueue-4                        	    2563	    455922 ns/op	      2193 jobs/sec	   19415 B/op	     153 allocs/op
+BenchmarkEnqueueBatch-4                   	     228	   5164502 ns/op	     19363 jobs/sec	 1202879 B/op	    8573 allocs/op
+BenchmarkEnqueueBatch-4                   	     220	   5107809 ns/op	     19578 jobs/sec	 1202900 B/op	    8573 allocs/op
+BenchmarkEnqueueBatch-4                   	     223	   5284827 ns/op	     18922 jobs/sec	 1202912 B/op	    8573 allocs/op
+BenchmarkEnqueueBatch-4                   	     228	   5299408 ns/op	     18870 jobs/sec	 1202857 B/op	    8573 allocs/op
+BenchmarkEnqueueBatch-4                   	     223	   5356999 ns/op	     18667 jobs/sec	 1202913 B/op	    8573 allocs/op
+BenchmarkEnqueueBatch-4                   	     232	   5209531 ns/op	     19196 jobs/sec	 1202941 B/op	    8573 allocs/op
+BenchmarkEnqueueBatchSizes/n=100-4        	     225	   5267316 ns/op	     18985 jobs/sec	 1202873 B/op	    8573 allocs/op
+BenchmarkEnqueueBatchSizes/n=100-4        	     229	   5212324 ns/op	     19185 jobs/sec	 1202863 B/op	    8573 allocs/op
+BenchmarkEnqueueBatchSizes/n=100-4        	     224	   5254281 ns/op	     19032 jobs/sec	 1202904 B/op	    8573 allocs/op
+BenchmarkEnqueueBatchSizes/n=100-4        	     224	   5233013 ns/op	     19109 jobs/sec	 1202877 B/op	    8573 allocs/op
+BenchmarkEnqueueBatchSizes/n=100-4        	     223	   5293801 ns/op	     18890 jobs/sec	 1202907 B/op	    8573 allocs/op
+BenchmarkEnqueueBatchSizes/n=100-4        	     222	   5404929 ns/op	     18502 jobs/sec	 1202878 B/op	    8573 allocs/op
+BenchmarkEnqueueBatchSizes/n=500-4        	      50	  23010654 ns/op	     21729 jobs/sec	 6538600 B/op	   42628 allocs/op
+BenchmarkEnqueueBatchSizes/n=500-4        	      50	  23059363 ns/op	     21683 jobs/sec	 6539099 B/op	   42631 allocs/op
+BenchmarkEnqueueBatchSizes/n=500-4        	      50	  22980809 ns/op	     21757 jobs/sec	 6538724 B/op	   42629 allocs/op
+BenchmarkEnqueueBatchSizes/n=500-4        	      51	  22081740 ns/op	     22643 jobs/sec	 6538360 B/op	   42628 allocs/op
+BenchmarkEnqueueBatchSizes/n=500-4        	      52	  22582947 ns/op	     22141 jobs/sec	 6538272 B/op	   42628 allocs/op
+BenchmarkEnqueueBatchSizes/n=500-4        	      51	  22296158 ns/op	     22425 jobs/sec	 6538363 B/op	   42628 allocs/op
+BenchmarkEnqueueBatchSizes/n=1000-4       	      26	  43819308 ns/op	     22821 jobs/sec	13115453 B/op	   85234 allocs/op
+BenchmarkEnqueueBatchSizes/n=1000-4       	      26	  43900362 ns/op	     22779 jobs/sec	13115111 B/op	   85232 allocs/op
+BenchmarkEnqueueBatchSizes/n=1000-4       	      26	  44626948 ns/op	     22408 jobs/sec	13115201 B/op	   85232 allocs/op
+BenchmarkEnqueueBatchSizes/n=1000-4       	      26	  43547295 ns/op	     22964 jobs/sec	13115216 B/op	   85232 allocs/op
+BenchmarkEnqueueBatchSizes/n=1000-4       	      26	  43885546 ns/op	     22787 jobs/sec	13115054 B/op	   85230 allocs/op
+BenchmarkEnqueueBatchSizes/n=1000-4       	      26	  44853742 ns/op	     22295 jobs/sec	13115342 B/op	   85233 allocs/op
+BenchmarkEnqueueBatchSizes/n=5000-4       	       5	 216288958 ns/op	     23117 jobs/sec	65302899 B/op	  425812 allocs/op
+BenchmarkEnqueueBatchSizes/n=5000-4       	       5	 214734101 ns/op	     23285 jobs/sec	65302865 B/op	  425811 allocs/op
+BenchmarkEnqueueBatchSizes/n=5000-4       	       5	 217438810 ns/op	     22995 jobs/sec	65303616 B/op	  425817 allocs/op
+BenchmarkEnqueueBatchSizes/n=5000-4       	       5	 218860102 ns/op	     22846 jobs/sec	65303668 B/op	  425818 allocs/op
+BenchmarkEnqueueBatchSizes/n=5000-4       	       5	 217185908 ns/op	     23022 jobs/sec	65302952 B/op	  425810 allocs/op
+BenchmarkEnqueueBatchSizes/n=5000-4       	       5	 213638979 ns/op	     23404 jobs/sec	65303294 B/op	  425816 allocs/op
+BenchmarkEndToEnd-4                       	       1	1776174951 ns/op	       588.4 jobs/sec	86924232 B/op	 1050516 allocs/op
+BenchmarkEndToEnd-4                       	       1	1765377136 ns/op	       585.0 jobs/sec	86829824 B/op	 1050244 allocs/op
+BenchmarkEndToEnd-4                       	       1	1753298785 ns/op	       589.2 jobs/sec	86680544 B/op	 1049240 allocs/op
+BenchmarkEndToEnd-4                       	       1	1765170863 ns/op	       584.8 jobs/sec	86724464 B/op	 1049840 allocs/op
+BenchmarkEndToEnd-4                       	       1	1754067830 ns/op	       588.6 jobs/sec	86842616 B/op	 1050342 allocs/op
+BenchmarkEndToEnd-4                       	       1	1766162313 ns/op	       584.7 jobs/sec	86819168 B/op	 1050193 allocs/op
+BenchmarkEndToEndBatchDequeue-4           	       1	1207336861 ns/op	       867.6 jobs/sec	63655592 B/op	  563723 allocs/op
+BenchmarkEndToEndBatchDequeue-4           	       1	1054510130 ns/op	      1001 jobs/sec	61826008 B/op	  553890 allocs/op
+BenchmarkEndToEndBatchDequeue-4           	       1	1125395459 ns/op	       933.3 jobs/sec	63512904 B/op	  564428 allocs/op
+BenchmarkEndToEndBatchDequeue-4           	       1	1245250370 ns/op	       840.0 jobs/sec	64429584 B/op	  564723 allocs/op
+BenchmarkEndToEndBatchDequeue-4           	       1	1179768853 ns/op	       889.1 jobs/sec	63234920 B/op	  560422 allocs/op
+BenchmarkEndToEndBatchDequeue-4           	       1	1322593495 ns/op	       788.8 jobs/sec	65707224 B/op	  568090 allocs/op
+BenchmarkWorkflowSteps-4                  	     327	   3250145 ns/op	      1538 steps/sec	  217020 B/op	    2013 allocs/op
+BenchmarkWorkflowSteps-4                  	     348	   3301395 ns/op	      1515 steps/sec	  218473 B/op	    2017 allocs/op
+BenchmarkWorkflowSteps-4                  	     337	   3004640 ns/op	      1664 steps/sec	  213630 B/op	    2002 allocs/op
+BenchmarkWorkflowSteps-4                  	     369	   3225904 ns/op	      1550 steps/sec	  217701 B/op	    2007 allocs/op
+BenchmarkWorkflowSteps-4                  	     361	   3083516 ns/op	      1622 steps/sec	  214613 B/op	    2001 allocs/op
+BenchmarkWorkflowSteps-4                  	     346	   2927403 ns/op	      1708 steps/sec	  213241 B/op	    2006 allocs/op
+BenchmarkDispatchLatency-4                	      24	  42407291 ns/op	     40813 p50-us	     41648 p95-us	     43510 p99-us	  147026 B/op	    1491 allocs/op
+BenchmarkDispatchLatency-4                	      27	  42397961 ns/op	     40514 p50-us	     42487 p95-us	     44783 p99-us	  142101 B/op	    1477 allocs/op
+BenchmarkDispatchLatency-4                	      25	  42438556 ns/op	     40443 p50-us	     41764 p95-us	     44784 p99-us	  145074 B/op	    1524 allocs/op
+BenchmarkDispatchLatency-4                	      24	  42383842 ns/op	     40682 p50-us	     42374 p95-us	     46051 p99-us	  139998 B/op	    1484 allocs/op
+BenchmarkDispatchLatency-4                	      25	  42416648 ns/op	     40568 p50-us	     41696 p95-us	     44722 p99-us	  141937 B/op	    1504 allocs/op
+BenchmarkDispatchLatency-4                	      25	  42364174 ns/op	     40605 p50-us	     42189 p95-us	     44455 p99-us	  141377 B/op	    1499 allocs/op
+BenchmarkSaturatedRateLimitChurn-4        	       1	2001077726 ns/op	        15.00 completed/s	        75.00 dequeues/s	         0 rateChecks/s	        60.00 releases/s	         9.000 wasteOps/completed	 8017640 B/op	   92764 allocs/op
+BenchmarkSaturatedRateLimitChurn-4        	       1	2000625927 ns/op	        15.00 completed/s	        75.00 dequeues/s	         0 rateChecks/s	        60.00 releases/s	         9.000 wasteOps/completed	 8095696 B/op	   92732 allocs/op
+BenchmarkSaturatedRateLimitChurn-4        	       1	2000339076 ns/op	        15.00 completed/s	        75.00 dequeues/s	         0 rateChecks/s	        60.00 releases/s	         9.000 wasteOps/completed	 8276096 B/op	   93579 allocs/op
+BenchmarkSaturatedRateLimitChurn-4        	       1	2000631917 ns/op	        15.00 completed/s	        75.00 dequeues/s	         0 rateChecks/s	        60.00 releases/s	         9.000 wasteOps/completed	 7973936 B/op	   92659 allocs/op
+BenchmarkSaturatedRateLimitChurn-4        	       1	2000359174 ns/op	        15.00 completed/s	        75.00 dequeues/s	         0 rateChecks/s	        60.00 releases/s	         9.000 wasteOps/completed	 8191976 B/op	   93184 allocs/op
+BenchmarkSaturatedRateLimitChurn-4        	       1	2001152166 ns/op	        15.00 completed/s	        75.00 dequeues/s	         0 rateChecks/s	        60.00 releases/s	         9.000 wasteOps/completed	 7987552 B/op	   92832 allocs/op
+BenchmarkSaturatedKeyedRateLimitChurn-4   	       1	2001015400 ns/op	        15.00 completed/s	      1025 dequeues/s	         0 rateChecks/s	      1010 releases/s	       135.7 wasteOps/completed	36893152 B/op	  471700 allocs/op
+BenchmarkSaturatedKeyedRateLimitChurn-4   	       1	2000238958 ns/op	        15.00 completed/s	      1025 dequeues/s	         0 rateChecks/s	      1010 releases/s	       135.7 wasteOps/completed	36838984 B/op	  471625 allocs/op
+BenchmarkSaturatedKeyedRateLimitChurn-4   	       1	2000182332 ns/op	        15.00 completed/s	      1025 dequeues/s	         0 rateChecks/s	      1010 releases/s	       135.7 wasteOps/completed	36697016 B/op	  471203 allocs/op
+BenchmarkSaturatedKeyedRateLimitChurn-4   	       1	2001250303 ns/op	        15.00 completed/s	      1050 dequeues/s	         0 rateChecks/s	      1035 releases/s	       139.0 wasteOps/completed	37568704 B/op	  482385 allocs/op
+BenchmarkSaturatedKeyedRateLimitChurn-4   	       1	2001157966 ns/op	        15.00 completed/s	      1050 dequeues/s	         0 rateChecks/s	      1035 releases/s	       139.0 wasteOps/completed	37375456 B/op	  481667 allocs/op
+BenchmarkSaturatedKeyedRateLimitChurn-4   	       1	2000292154 ns/op	        15.00 completed/s	      1050 dequeues/s	         0 rateChecks/s	      1035 releases/s	       139.0 wasteOps/completed	37496088 B/op	  482104 allocs/op
+BenchmarkEnqueue-4                        	    2586	    462846 ns/op	      2161 jobs/sec	   19419 B/op	     153 allocs/op
+BenchmarkEnqueue-4                        	    2568	    472398 ns/op	      2117 jobs/sec	   19412 B/op	     153 allocs/op
+BenchmarkEnqueue-4                        	    2438	    461217 ns/op	      2168 jobs/sec	   19417 B/op	     153 allocs/op
+BenchmarkEnqueue-4                        	    2484	    466626 ns/op	      2143 jobs/sec	   19410 B/op	     153 allocs/op
+BenchmarkEnqueue-4                        	    2523	    463920 ns/op	      2156 jobs/sec	   19413 B/op	     153 allocs/op
+BenchmarkEnqueue-4                        	    2532	    466564 ns/op	      2143 jobs/sec	   19412 B/op	     153 allocs/op
+BenchmarkEnqueueBatch-4                   	     229	   5297589 ns/op	     18877 jobs/sec	 1202867 B/op	    8573 allocs/op
+BenchmarkEnqueueBatch-4                   	     220	   5155839 ns/op	     19395 jobs/sec	 1202869 B/op	    8573 allocs/op
+BenchmarkEnqueueBatch-4                   	     224	   5341371 ns/op	     18722 jobs/sec	 1202916 B/op	    8573 allocs/op
+BenchmarkEnqueueBatch-4                   	     224	   5376184 ns/op	     18601 jobs/sec	 1202925 B/op	    8574 allocs/op
+BenchmarkEnqueueBatch-4                   	     220	   5321839 ns/op	     18791 jobs/sec	 1202883 B/op	    8573 allocs/op
+BenchmarkEnqueueBatch-4                   	     222	   5396045 ns/op	     18532 jobs/sec	 1202924 B/op	    8573 allocs/op
+BenchmarkEnqueueBatchSizes/n=100-4        	     219	   5402318 ns/op	     18511 jobs/sec	 1202897 B/op	    8573 allocs/op
+BenchmarkEnqueueBatchSizes/n=100-4        	     218	   5358467 ns/op	     18662 jobs/sec	 1202886 B/op	    8573 allocs/op
+BenchmarkEnqueueBatchSizes/n=100-4        	     218	   5402132 ns/op	     18511 jobs/sec	 1202930 B/op	    8573 allocs/op
+BenchmarkEnqueueBatchSizes/n=100-4        	     218	   5378169 ns/op	     18594 jobs/sec	 1202886 B/op	    8573 allocs/op
+BenchmarkEnqueueBatchSizes/n=100-4        	     213	   5191397 ns/op	     19263 jobs/sec	 1202919 B/op	    8573 allocs/op
+BenchmarkEnqueueBatchSizes/n=100-4        	     231	   5082368 ns/op	     19676 jobs/sec	 1202893 B/op	    8573 allocs/op
+BenchmarkEnqueueBatchSizes/n=500-4        	      51	  22092751 ns/op	     22632 jobs/sec	 6538604 B/op	   42629 allocs/op
+BenchmarkEnqueueBatchSizes/n=500-4        	      51	  22203287 ns/op	     22519 jobs/sec	 6538511 B/op	   42628 allocs/op
+BenchmarkEnqueueBatchSizes/n=500-4        	      52	  21986075 ns/op	     22742 jobs/sec	 6538167 B/op	   42628 allocs/op
+BenchmarkEnqueueBatchSizes/n=500-4        	      52	  21971651 ns/op	     22757 jobs/sec	 6538164 B/op	   42628 allocs/op
+BenchmarkEnqueueBatchSizes/n=500-4        	      52	  21993323 ns/op	     22734 jobs/sec	 6538214 B/op	   42628 allocs/op
+BenchmarkEnqueueBatchSizes/n=500-4        	      52	  21904137 ns/op	     22827 jobs/sec	 6538121 B/op	   42627 allocs/op
+BenchmarkEnqueueBatchSizes/n=1000-4       	      26	  44362025 ns/op	     22542 jobs/sec	13115560 B/op	   85235 allocs/op
+BenchmarkEnqueueBatchSizes/n=1000-4       	      26	  44393046 ns/op	     22526 jobs/sec	13115227 B/op	   85232 allocs/op
+BenchmarkEnqueueBatchSizes/n=1000-4       	      26	  43194918 ns/op	     23151 jobs/sec	13115187 B/op	   85232 allocs/op
+BenchmarkEnqueueBatchSizes/n=1000-4       	      26	  43111503 ns/op	     23196 jobs/sec	13115126 B/op	   85232 allocs/op
+BenchmarkEnqueueBatchSizes/n=1000-4       	      26	  43973518 ns/op	     22741 jobs/sec	13115394 B/op	   85234 allocs/op
+BenchmarkEnqueueBatchSizes/n=1000-4       	      26	  44435495 ns/op	     22505 jobs/sec	13115195 B/op	   85233 allocs/op
+BenchmarkEnqueueBatchSizes/n=5000-4       	       5	 210964869 ns/op	     23701 jobs/sec	65302953 B/op	  425814 allocs/op
+BenchmarkEnqueueBatchSizes/n=5000-4       	       5	 210997496 ns/op	     23697 jobs/sec	65303192 B/op	  425814 allocs/op
+BenchmarkEnqueueBatchSizes/n=5000-4       	       5	 215249568 ns/op	     23229 jobs/sec	65303588 B/op	  425817 allocs/op
+BenchmarkEnqueueBatchSizes/n=5000-4       	       5	 211128013 ns/op	     23682 jobs/sec	65303219 B/op	  425811 allocs/op
+BenchmarkEnqueueBatchSizes/n=5000-4       	       5	 212951726 ns/op	     23480 jobs/sec	65302718 B/op	  425809 allocs/op
+BenchmarkEnqueueBatchSizes/n=5000-4       	       5	 211372055 ns/op	     23655 jobs/sec	65303259 B/op	  425818 allocs/op
+BenchmarkEndToEnd-4                       	       1	1810864437 ns/op	       575.8 jobs/sec	86839568 B/op	 1050299 allocs/op
+BenchmarkEndToEnd-4                       	       1	1777849024 ns/op	       580.9 jobs/sec	86829352 B/op	 1050229 allocs/op
+BenchmarkEndToEnd-4                       	       1	1779135997 ns/op	       579.8 jobs/sec	86711520 B/op	 1049708 allocs/op
+BenchmarkEndToEnd-4                       	       1	1785540548 ns/op	       578.2 jobs/sec	86823944 B/op	 1050257 allocs/op
+BenchmarkEndToEnd-4                       	       1	1793040612 ns/op	       575.8 jobs/sec	86876048 B/op	 1050690 allocs/op
+BenchmarkEndToEnd-4                       	       1	1794516646 ns/op	       575.3 jobs/sec	86815944 B/op	 1050201 allocs/op
+BenchmarkEndToEndBatchDequeue-4           	       1	1116481969 ns/op	       941.4 jobs/sec	63636352 B/op	  561931 allocs/op
+BenchmarkEndToEndBatchDequeue-4           	       1	1285968878 ns/op	       812.1 jobs/sec	64915664 B/op	  566405 allocs/op
+BenchmarkEndToEndBatchDequeue-4           	       1	1131494431 ns/op	       927.6 jobs/sec	63623952 B/op	  565084 allocs/op
+BenchmarkEndToEndBatchDequeue-4           	       1	1305142258 ns/op	       799.2 jobs/sec	66295368 B/op	  573095 allocs/op
+BenchmarkEndToEndBatchDequeue-4           	       1	1077791658 ns/op	       977.6 jobs/sec	62819336 B/op	  561440 allocs/op
+BenchmarkEndToEndBatchDequeue-4           	       1	1273679338 ns/op	       820.5 jobs/sec	65493200 B/op	  567250 allocs/op
+BenchmarkWorkflowSteps-4                  	     397	   3268566 ns/op	      1530 steps/sec	  222251 B/op	    2022 allocs/op
+BenchmarkWorkflowSteps-4                  	     360	   3001194 ns/op	      1666 steps/sec	  216041 B/op	    2009 allocs/op
+BenchmarkWorkflowSteps-4                  	     370	   3267203 ns/op	      1530 steps/sec	  222769 B/op	    2017 allocs/op
+BenchmarkWorkflowSteps-4                  	     446	   3015193 ns/op	      1658 steps/sec	  216973 B/op	    2010 allocs/op
+BenchmarkWorkflowSteps-4                  	     444	   3087520 ns/op	      1619 steps/sec	  216894 B/op	    2010 allocs/op
+BenchmarkWorkflowSteps-4                  	     352	   3022224 ns/op	      1654 steps/sec	  213547 B/op	    2002 allocs/op
+BenchmarkDispatchLatency-4                	      24	  42357969 ns/op	     40841 p50-us	     41469 p95-us	     44179 p99-us	  139143 B/op	    1496 allocs/op
+BenchmarkDispatchLatency-4                	      24	  42415712 ns/op	     40644 p50-us	     41892 p95-us	     46594 p99-us	  140712 B/op	    1495 allocs/op
+BenchmarkDispatchLatency-4                	      24	  42480598 ns/op	     40913 p50-us	     42262 p95-us	     43938 p99-us	  141902 B/op	    1504 allocs/op
+BenchmarkDispatchLatency-4                	      24	  42476356 ns/op	     40527 p50-us	     42676 p95-us	     44467 p99-us	  141145 B/op	    1495 allocs/op
+BenchmarkDispatchLatency-4                	      27	  42331134 ns/op	     40845 p50-us	     41917 p95-us	     45285 p99-us	  139672 B/op	    1494 allocs/op
+BenchmarkDispatchLatency-4                	      24	  42384802 ns/op	     40883 p50-us	     41865 p95-us	     44544 p99-us	  146106 B/op	    1517 allocs/op
+BenchmarkSaturatedRateLimitChurn-4        	       1	2001103775 ns/op	        15.00 completed/s	        75.00 dequeues/s	         0 rateChecks/s	        60.00 releases/s	         9.000 wasteOps/completed	 7974816 B/op	   92648 allocs/op
+BenchmarkSaturatedRateLimitChurn-4        	       1	2000600562 ns/op	        15.00 completed/s	        75.00 dequeues/s	         0 rateChecks/s	        60.00 releases/s	         9.000 wasteOps/completed	 8094200 B/op	   92871 allocs/op
+BenchmarkSaturatedRateLimitChurn-4        	       1	2000955202 ns/op	        15.00 completed/s	        75.00 dequeues/s	         0 rateChecks/s	        60.00 releases/s	         9.000 wasteOps/completed	 8068312 B/op	   92994 allocs/op
+BenchmarkSaturatedRateLimitChurn-4        	       1	2000192111 ns/op	        15.00 completed/s	        75.00 dequeues/s	         0 rateChecks/s	        60.00 releases/s	         9.000 wasteOps/completed	 8160936 B/op	   93405 allocs/op
+BenchmarkSaturatedRateLimitChurn-4        	       1	2000159319 ns/op	        15.00 completed/s	        75.00 dequeues/s	         0 rateChecks/s	        60.00 releases/s	         9.000 wasteOps/completed	 8012216 B/op	   92657 allocs/op
+BenchmarkSaturatedRateLimitChurn-4        	       1	2000395649 ns/op	        15.00 completed/s	        75.00 dequeues/s	         0 rateChecks/s	        60.00 releases/s	         9.000 wasteOps/completed	 7994800 B/op	   92967 allocs/op
+BenchmarkSaturatedKeyedRateLimitChurn-4   	       1	2001200518 ns/op	        15.00 completed/s	      1025 dequeues/s	         0 rateChecks/s	      1010 releases/s	       135.7 wasteOps/completed	36844496 B/op	  471294 allocs/op
+BenchmarkSaturatedKeyedRateLimitChurn-4   	       1	2000446436 ns/op	        15.00 completed/s	      1050 dequeues/s	         0 rateChecks/s	      1035 releases/s	       139.0 wasteOps/completed	37373280 B/op	  481327 allocs/op
+BenchmarkSaturatedKeyedRateLimitChurn-4   	       1	2000626098 ns/op	        15.00 completed/s	      1050 dequeues/s	         0 rateChecks/s	      1035 releases/s	       139.0 wasteOps/completed	37659000 B/op	  481896 allocs/op
+BenchmarkSaturatedKeyedRateLimitChurn-4   	       1	2001141994 ns/op	        15.00 completed/s	      1050 dequeues/s	         0 rateChecks/s	      1035 releases/s	       139.0 wasteOps/completed	37267832 B/op	  481463 allocs/op
+BenchmarkSaturatedKeyedRateLimitChurn-4   	       1	2000119765 ns/op	        15.00 completed/s	      1025 dequeues/s	         0 rateChecks/s	      1010 releases/s	       135.7 wasteOps/completed	36585832 B/op	  471366 allocs/op
+BenchmarkSaturatedKeyedRateLimitChurn-4   	       1	2000546434 ns/op	        15.00 completed/s	      1023 dequeues/s	         0 rateChecks/s	      1008 releases/s	       135.4 wasteOps/completed	36511160 B/op	  470923 allocs/op
+BenchmarkEnqueue-4                        	    2653	    450515 ns/op	      2220 jobs/sec	   19425 B/op	     153 allocs/op
+BenchmarkEnqueue-4                        	    2499	    460855 ns/op	      2170 jobs/sec	   19411 B/op	     153 allocs/op
+BenchmarkEnqueue-4                        	    2526	    456028 ns/op	      2193 jobs/sec	   19417 B/op	     153 allocs/op
+BenchmarkEnqueue-4                        	    2530	    453800 ns/op	      2204 jobs/sec	   19411 B/op	     153 allocs/op
+BenchmarkEnqueue-4                        	    2595	    452405 ns/op	      2210 jobs/sec	   19412 B/op	     153 allocs/op
+BenchmarkEnqueue-4                        	    2454	    450587 ns/op	      2219 jobs/sec	   19409 B/op	     153 allocs/op
+BenchmarkEnqueueBatch-4                   	     231	   5104459 ns/op	     19591 jobs/sec	 1202891 B/op	    8573 allocs/op
+BenchmarkEnqueueBatch-4                   	     228	   5043915 ns/op	     19826 jobs/sec	 1202921 B/op	    8574 allocs/op
+BenchmarkEnqueueBatch-4                   	     225	   5216538 ns/op	     19170 jobs/sec	 1202850 B/op	    8573 allocs/op
+BenchmarkEnqueueBatch-4                   	     224	   5262422 ns/op	     19003 jobs/sec	 1202919 B/op	    8573 allocs/op
+BenchmarkEnqueueBatch-4                   	     222	   5302210 ns/op	     18860 jobs/sec	 1202930 B/op	    8573 allocs/op
+BenchmarkEnqueueBatch-4                   	     228	   5283640 ns/op	     18926 jobs/sec	 1202905 B/op	    8573 allocs/op
+BenchmarkEnqueueBatchSizes/n=100-4        	     225	   5165440 ns/op	     19359 jobs/sec	 1202887 B/op	    8573 allocs/op
+BenchmarkEnqueueBatchSizes/n=100-4        	     226	   5160689 ns/op	     19377 jobs/sec	 1202875 B/op	    8573 allocs/op
+BenchmarkEnqueueBatchSizes/n=100-4        	     224	   5304200 ns/op	     18853 jobs/sec	 1202916 B/op	    8573 allocs/op
+BenchmarkEnqueueBatchSizes/n=100-4        	     225	   5278460 ns/op	     18945 jobs/sec	 1202898 B/op	    8573 allocs/op
+BenchmarkEnqueueBatchSizes/n=100-4        	     219	   5307089 ns/op	     18843 jobs/sec	 1202953 B/op	    8574 allocs/op
+BenchmarkEnqueueBatchSizes/n=100-4        	     219	   5319508 ns/op	     18799 jobs/sec	 1202919 B/op	    8573 allocs/op
+BenchmarkEnqueueBatchSizes/n=500-4        	      49	  21436169 ns/op	     23325 jobs/sec	 6538773 B/op	   42628 allocs/op
+BenchmarkEnqueueBatchSizes/n=500-4        	      54	  21854411 ns/op	     22879 jobs/sec	 6537783 B/op	   42628 allocs/op
+BenchmarkEnqueueBatchSizes/n=500-4        	      52	  22349244 ns/op	     22372 jobs/sec	 6538412 B/op	   42629 allocs/op
+BenchmarkEnqueueBatchSizes/n=500-4        	      52	  21943038 ns/op	     22786 jobs/sec	 6538160 B/op	   42628 allocs/op
+BenchmarkEnqueueBatchSizes/n=500-4        	      52	  22090377 ns/op	     22634 jobs/sec	 6538427 B/op	   42629 allocs/op
+BenchmarkEnqueueBatchSizes/n=500-4        	      51	  22147600 ns/op	     22576 jobs/sec	 6538482 B/op	   42628 allocs/op
+BenchmarkEnqueueBatchSizes/n=1000-4       	      26	  44144496 ns/op	     22653 jobs/sec	13115065 B/op	   85231 allocs/op
+BenchmarkEnqueueBatchSizes/n=1000-4       	      26	  44060222 ns/op	     22696 jobs/sec	13115505 B/op	   85234 allocs/op
+BenchmarkEnqueueBatchSizes/n=1000-4       	      26	  43849708 ns/op	     22805 jobs/sec	13115270 B/op	   85232 allocs/op
+BenchmarkEnqueueBatchSizes/n=1000-4       	      26	  43112255 ns/op	     23195 jobs/sec	13115233 B/op	   85232 allocs/op
+BenchmarkEnqueueBatchSizes/n=1000-4       	      26	  43145460 ns/op	     23177 jobs/sec	13115274 B/op	   85232 allocs/op
+BenchmarkEnqueueBatchSizes/n=1000-4       	      26	  42830731 ns/op	     23348 jobs/sec	13115166 B/op	   85232 allocs/op
+BenchmarkEnqueueBatchSizes/n=5000-4       	       5	 205531180 ns/op	     24327 jobs/sec	65303140 B/op	  425811 allocs/op
+BenchmarkEnqueueBatchSizes/n=5000-4       	       5	 206880587 ns/op	     24169 jobs/sec	65303760 B/op	  425815 allocs/op
+BenchmarkEnqueueBatchSizes/n=5000-4       	       5	 205190397 ns/op	     24368 jobs/sec	65303590 B/op	  425814 allocs/op
+BenchmarkEnqueueBatchSizes/n=5000-4       	       5	 207515926 ns/op	     24095 jobs/sec	65302553 B/op	  425812 allocs/op
+BenchmarkEnqueueBatchSizes/n=5000-4       	       5	 205512162 ns/op	     24329 jobs/sec	65303576 B/op	  425817 allocs/op
+BenchmarkEnqueueBatchSizes/n=5000-4       	       5	 203937343 ns/op	     24517 jobs/sec	65303971 B/op	  425818 allocs/op
+BenchmarkEndToEnd-4                       	       1	1993906174 ns/op	       536.8 jobs/sec	86869568 B/op	 1050899 allocs/op
+BenchmarkEndToEnd-4                       	       1	1918887173 ns/op	       536.8 jobs/sec	86859600 B/op	 1050712 allocs/op
+BenchmarkEndToEnd-4                       	       1	1898063187 ns/op	       542.5 jobs/sec	86707496 B/op	 1049823 allocs/op
+BenchmarkEndToEnd-4                       	       1	1901465793 ns/op	       541.7 jobs/sec	86723096 B/op	 1049848 allocs/op
+BenchmarkEndToEnd-4                       	       1	1905656136 ns/op	       540.7 jobs/sec	86747328 B/op	 1050164 allocs/op
+BenchmarkEndToEnd-4                       	       1	1928730441 ns/op	       534.0 jobs/sec	86905984 B/op	 1050919 allocs/op
+BenchmarkEndToEndBatchDequeue-4           	       1	1167239261 ns/op	       898.7 jobs/sec	63592000 B/op	  560623 allocs/op
+BenchmarkEndToEndBatchDequeue-4           	       1	1163033636 ns/op	       902.2 jobs/sec	62282792 B/op	  554216 allocs/op
+BenchmarkEndToEndBatchDequeue-4           	       1	1199005347 ns/op	       874.2 jobs/sec	63470248 B/op	  560440 allocs/op
+BenchmarkEndToEndBatchDequeue-4           	       1	1221001848 ns/op	       857.3 jobs/sec	64365288 B/op	  564521 allocs/op
+BenchmarkEndToEndBatchDequeue-4           	       1	1286867722 ns/op	       811.0 jobs/sec	64161392 B/op	  563422 allocs/op
+BenchmarkEndToEndBatchDequeue-4           	       1	1364448001 ns/op	       763.6 jobs/sec	66835368 B/op	  574023 allocs/op
+BenchmarkWorkflowSteps-4                  	     379	   3196329 ns/op	      1564 steps/sec	  218394 B/op	    2008 allocs/op
+BenchmarkWorkflowSteps-4                  	     356	   3219276 ns/op	      1553 steps/sec	  220396 B/op	    2013 allocs/op
+BenchmarkWorkflowSteps-4                  	     350	   3267301 ns/op	      1530 steps/sec	  221314 B/op	    2017 allocs/op
+BenchmarkWorkflowSteps-4                  	     350	   3005093 ns/op	      1664 steps/sec	  216194 B/op	    2006 allocs/op
+BenchmarkWorkflowSteps-4                  	     384	   3027737 ns/op	      1651 steps/sec	  218420 B/op	    2016 allocs/op
+BenchmarkWorkflowSteps-4                  	     367	   3082800 ns/op	      1622 steps/sec	  219478 B/op	    2013 allocs/op
+BenchmarkDispatchLatency-4                	      24	  42414254 ns/op	     40993 p50-us	     42367 p95-us	     43931 p99-us	  142116 B/op	    1448 allocs/op
+BenchmarkDispatchLatency-4                	      25	  42390934 ns/op	     40667 p50-us	     44202 p95-us	     44853 p99-us	  141395 B/op	    1429 allocs/op
+BenchmarkDispatchLatency-4                	      25	  42503921 ns/op	     41149 p50-us	     43596 p95-us	     44335 p99-us	  130951 B/op	    1396 allocs/op
+BenchmarkDispatchLatency-4                	      25	  42428179 ns/op	     41142 p50-us	     42498 p95-us	     42848 p99-us	  136710 B/op	    1458 allocs/op
+BenchmarkDispatchLatency-4                	      26	  42402388 ns/op	     40737 p50-us	     42883 p95-us	     45292 p99-us	  137825 B/op	    1460 allocs/op
+BenchmarkDispatchLatency-4                	      25	  42405096 ns/op	     41080 p50-us	     42088 p95-us	     44093 p99-us	  140704 B/op	    1492 allocs/op
+BenchmarkSaturatedRateLimitChurn-4        	       1	2000844541 ns/op	        15.00 completed/s	        75.00 dequeues/s	         0 rateChecks/s	        60.00 releases/s	         9.000 wasteOps/completed	 8050752 B/op	   92678 allocs/op
+BenchmarkSaturatedRateLimitChurn-4        	       1	2000312816 ns/op	        15.00 completed/s	        75.00 dequeues/s	         0 rateChecks/s	        60.00 releases/s	         9.000 wasteOps/completed	 8006080 B/op	   93000 allocs/op
+BenchmarkSaturatedRateLimitChurn-4        	       1	2001123036 ns/op	        15.00 completed/s	        75.00 dequeues/s	         0 rateChecks/s	        60.00 releases/s	         9.000 wasteOps/completed	 8141464 B/op	   93040 allocs/op
+BenchmarkSaturatedRateLimitChurn-4        	       1	2000313855 ns/op	        15.00 completed/s	        75.00 dequeues/s	         0 rateChecks/s	        60.00 releases/s	         9.000 wasteOps/completed	 7991264 B/op	   92858 allocs/op
+BenchmarkSaturatedRateLimitChurn-4        	       1	2000169775 ns/op	        15.00 completed/s	        75.00 dequeues/s	         0 rateChecks/s	        60.00 releases/s	         9.000 wasteOps/completed	 8062680 B/op	   92975 allocs/op
+BenchmarkSaturatedRateLimitChurn-4        	       1	2000464867 ns/op	        15.00 completed/s	        75.00 dequeues/s	         0 rateChecks/s	        60.00 releases/s	         9.000 wasteOps/completed	 7984112 B/op	   92848 allocs/op
+BenchmarkSaturatedKeyedRateLimitChurn-4   	       1	2001032643 ns/op	        15.00 completed/s	      1050 dequeues/s	         0 rateChecks/s	      1035 releases/s	       139.0 wasteOps/completed	37467560 B/op	  482036 allocs/op
+BenchmarkSaturatedKeyedRateLimitChurn-4   	       1	2000679126 ns/op	        15.00 completed/s	      1050 dequeues/s	         0 rateChecks/s	      1035 releases/s	       139.0 wasteOps/completed	37534048 B/op	  481678 allocs/op
+BenchmarkSaturatedKeyedRateLimitChurn-4   	       1	2000137187 ns/op	        15.00 completed/s	      1050 dequeues/s	         0 rateChecks/s	      1035 releases/s	       139.0 wasteOps/completed	37495312 B/op	  481585 allocs/op
+BenchmarkSaturatedKeyedRateLimitChurn-4   	       1	2000080680 ns/op	        15.00 completed/s	      1048 dequeues/s	         0 rateChecks/s	      1034 releases/s	       138.8 wasteOps/completed	37680736 B/op	  482032 allocs/op
+BenchmarkSaturatedKeyedRateLimitChurn-4   	       1	2000577918 ns/op	        15.00 completed/s	      1025 dequeues/s	         0 rateChecks/s	      1010 releases/s	       135.7 wasteOps/completed	36743128 B/op	  471605 allocs/op
+BenchmarkSaturatedKeyedRateLimitChurn-4   	       1	2000394189 ns/op	        15.00 completed/s	      1050 dequeues/s	         0 rateChecks/s	      1035 releases/s	       139.0 wasteOps/completed	37465280 B/op	  481937 allocs/op
+BenchmarkEnqueue-4                        	    2659	    456836 ns/op	      2189 jobs/sec	   19428 B/op	     153 allocs/op
+BenchmarkEnqueue-4                        	    2559	    464052 ns/op	      2155 jobs/sec	   19419 B/op	     153 allocs/op
+BenchmarkEnqueue-4                        	    2493	    455401 ns/op	      2196 jobs/sec	   19410 B/op	     153 allocs/op
+BenchmarkEnqueue-4                        	    2524	    456003 ns/op	      2193 jobs/sec	   19409 B/op	     153 allocs/op
+BenchmarkEnqueue-4                        	    2526	    459880 ns/op	      2174 jobs/sec	   19411 B/op	     153 allocs/op
+BenchmarkEnqueue-4                        	    2560	    451161 ns/op	      2217 jobs/sec	   19412 B/op	     153 allocs/op
+BenchmarkEnqueueBatch-4                   	     228	   5112128 ns/op	     19561 jobs/sec	 1202887 B/op	    8573 allocs/op
+BenchmarkEnqueueBatch-4                   	     224	   5075386 ns/op	     19703 jobs/sec	 1202846 B/op	    8573 allocs/op
+BenchmarkEnqueueBatch-4                   	     225	   5269729 ns/op	     18976 jobs/sec	 1202896 B/op	    8573 allocs/op
+BenchmarkEnqueueBatch-4                   	     226	   5268831 ns/op	     18980 jobs/sec	 1202939 B/op	    8573 allocs/op
+BenchmarkEnqueueBatch-4                   	     223	   5330705 ns/op	     18759 jobs/sec	 1202870 B/op	    8573 allocs/op
+BenchmarkEnqueueBatch-4                   	     226	   5166849 ns/op	     19354 jobs/sec	 1202892 B/op	    8573 allocs/op
+BenchmarkEnqueueBatchSizes/n=100-4        	     225	   5185751 ns/op	     19284 jobs/sec	 1202904 B/op	    8573 allocs/op
+BenchmarkEnqueueBatchSizes/n=100-4        	     229	   5201827 ns/op	     19224 jobs/sec	 1202844 B/op	    8573 allocs/op
+BenchmarkEnqueueBatchSizes/n=100-4        	     224	   5191034 ns/op	     19264 jobs/sec	 1202876 B/op	    8573 allocs/op
+BenchmarkEnqueueBatchSizes/n=100-4        	     225	   5254933 ns/op	     19030 jobs/sec	 1202909 B/op	    8573 allocs/op
+BenchmarkEnqueueBatchSizes/n=100-4        	     224	   5233023 ns/op	     19109 jobs/sec	 1202884 B/op	    8573 allocs/op
+BenchmarkEnqueueBatchSizes/n=100-4        	     224	   5323173 ns/op	     18786 jobs/sec	 1202863 B/op	    8573 allocs/op
+BenchmarkEnqueueBatchSizes/n=500-4        	      51	  22702514 ns/op	     22024 jobs/sec	 6538427 B/op	   42628 allocs/op
+BenchmarkEnqueueBatchSizes/n=500-4        	      51	  22584610 ns/op	     22139 jobs/sec	 6538501 B/op	   42629 allocs/op
+BenchmarkEnqueueBatchSizes/n=500-4        	      51	  22519199 ns/op	     22203 jobs/sec	 6538542 B/op	   42629 allocs/op
+BenchmarkEnqueueBatchSizes/n=500-4        	      51	  22252642 ns/op	     22469 jobs/sec	 6538477 B/op	   42629 allocs/op
+BenchmarkEnqueueBatchSizes/n=500-4        	      52	  22118824 ns/op	     22605 jobs/sec	 6538326 B/op	   42629 allocs/op
+BenchmarkEnqueueBatchSizes/n=500-4        	      51	  22329730 ns/op	     22392 jobs/sec	 6538479 B/op	   42629 allocs/op
+BenchmarkEnqueueBatchSizes/n=1000-4       	      26	  43845613 ns/op	     22807 jobs/sec	13115368 B/op	   85234 allocs/op
+BenchmarkEnqueueBatchSizes/n=1000-4       	      26	  43868633 ns/op	     22795 jobs/sec	13115415 B/op	   85232 allocs/op
+BenchmarkEnqueueBatchSizes/n=1000-4       	      26	  44147966 ns/op	     22651 jobs/sec	13115072 B/op	   85231 allocs/op
+BenchmarkEnqueueBatchSizes/n=1000-4       	      26	  43283225 ns/op	     23104 jobs/sec	13115162 B/op	   85232 allocs/op
+BenchmarkEnqueueBatchSizes/n=1000-4       	      26	  43066050 ns/op	     23220 jobs/sec	13115178 B/op	   85232 allocs/op
+BenchmarkEnqueueBatchSizes/n=1000-4       	      26	  43530084 ns/op	     22973 jobs/sec	13115264 B/op	   85232 allocs/op
+BenchmarkEnqueueBatchSizes/n=5000-4       	       5	 207618302 ns/op	     24083 jobs/sec	65302768 B/op	  425810 allocs/op
+BenchmarkEnqueueBatchSizes/n=5000-4       	       5	 206905709 ns/op	     24166 jobs/sec	65303291 B/op	  425813 allocs/op
+BenchmarkEnqueueBatchSizes/n=5000-4       	       5	 208698746 ns/op	     23958 jobs/sec	65302928 B/op	  425815 allocs/op
+BenchmarkEnqueueBatchSizes/n=5000-4       	       5	 206223210 ns/op	     24246 jobs/sec	65302852 B/op	  425810 allocs/op
+BenchmarkEnqueueBatchSizes/n=5000-4       	       5	 207668258 ns/op	     24077 jobs/sec	65304064 B/op	  425820 allocs/op
+BenchmarkEnqueueBatchSizes/n=5000-4       	       5	 208680066 ns/op	     23960 jobs/sec	65302984 B/op	  425814 allocs/op
+BenchmarkEndToEnd-4                       	       1	1993322525 ns/op	       537.2 jobs/sec	86853880 B/op	 1050617 allocs/op
+BenchmarkEndToEnd-4                       	       1	1917895504 ns/op	       536.8 jobs/sec	86756528 B/op	 1050157 allocs/op
+BenchmarkEndToEnd-4                       	       1	1933350347 ns/op	       532.5 jobs/sec	86848088 B/op	 1050508 allocs/op
+BenchmarkEndToEnd-4                       	       1	1930453952 ns/op	       533.5 jobs/sec	86878432 B/op	 1050849 allocs/op
+BenchmarkEndToEnd-4                       	       1	1932966070 ns/op	       532.9 jobs/sec	86849504 B/op	 1050642 allocs/op
+BenchmarkEndToEnd-4                       	       1	1908983823 ns/op	       539.3 jobs/sec	86783264 B/op	 1050562 allocs/op
+BenchmarkEndToEndBatchDequeue-4           	       1	1197380739 ns/op	       875.0 jobs/sec	63116216 B/op	  556954 allocs/op
+BenchmarkEndToEndBatchDequeue-4           	       1	1135095894 ns/op	       925.8 jobs/sec	62889312 B/op	  560324 allocs/op
+BenchmarkEndToEndBatchDequeue-4           	       1	1157214418 ns/op	       907.5 jobs/sec	64114000 B/op	  564201 allocs/op
+BenchmarkEndToEndBatchDequeue-4           	       1	1197577766 ns/op	       874.4 jobs/sec	62905832 B/op	  559478 allocs/op
+BenchmarkEndToEndBatchDequeue-4           	       1	1277488507 ns/op	       817.9 jobs/sec	64605784 B/op	  566211 allocs/op
+BenchmarkEndToEndBatchDequeue-4           	       1	1180336102 ns/op	       888.2 jobs/sec	63601984 B/op	  560749 allocs/op
+BenchmarkWorkflowSteps-4                  	     412	   3119368 ns/op	      1603 steps/sec	  218664 B/op	    2013 allocs/op
+BenchmarkWorkflowSteps-4                  	     361	   3046247 ns/op	      1641 steps/sec	  216644 B/op	    2006 allocs/op
+BenchmarkWorkflowSteps-4                  	     364	   2861123 ns/op	      1748 steps/sec	  212718 B/op	    1998 allocs/op
+BenchmarkWorkflowSteps-4                  	     423	   3026015 ns/op	      1652 steps/sec	  214351 B/op	    1998 allocs/op
+BenchmarkWorkflowSteps-4                  	     368	   2915518 ns/op	      1715 steps/sec	  212206 B/op	    1991 allocs/op
+BenchmarkWorkflowSteps-4                  	     387	   2934670 ns/op	      1704 steps/sec	  211548 B/op	    1994 allocs/op
+BenchmarkDispatchLatency-4                	      25	  42422934 ns/op	     41049 p50-us	     42186 p95-us	     43873 p99-us	  131949 B/op	    1384 allocs/op
+BenchmarkDispatchLatency-4                	      27	  42392137 ns/op	     40920 p50-us	     43109 p95-us	     44520 p99-us	  130842 B/op	    1382 allocs/op
+BenchmarkDispatchLatency-4                	      24	  42500245 ns/op	     40932 p50-us	     41674 p95-us	     45695 p99-us	  136540 B/op	    1400 allocs/op
+BenchmarkDispatchLatency-4                	      24	  42419889 ns/op	     40894 p50-us	     42574 p95-us	     43616 p99-us	  130887 B/op	    1371 allocs/op
+BenchmarkDispatchLatency-4                	      25	  42244569 ns/op	     40815 p50-us	     42642 p95-us	     44364 p99-us	  130540 B/op	    1386 allocs/op
+BenchmarkDispatchLatency-4                	      25	  42628781 ns/op	     41018 p50-us	     42262 p95-us	     44623 p99-us	  139309 B/op	    1408 allocs/op
+BenchmarkSaturatedRateLimitChurn-4        	       1	2000622098 ns/op	        15.00 completed/s	        75.00 dequeues/s	         0 rateChecks/s	        60.00 releases/s	         9.000 wasteOps/completed	 8081560 B/op	   93144 allocs/op
+BenchmarkSaturatedRateLimitChurn-4        	       1	2001128050 ns/op	        15.00 completed/s	        75.00 dequeues/s	         0 rateChecks/s	        60.00 releases/s	         9.000 wasteOps/completed	 8367656 B/op	   93804 allocs/op
+BenchmarkSaturatedRateLimitChurn-4        	       1	2000281744 ns/op	        15.00 completed/s	        75.00 dequeues/s	         0 rateChecks/s	        60.00 releases/s	         9.000 wasteOps/completed	 8227696 B/op	   93200 allocs/op
+BenchmarkSaturatedRateLimitChurn-4        	       1	2000422116 ns/op	        15.00 completed/s	        75.00 dequeues/s	         0 rateChecks/s	        60.00 releases/s	         9.000 wasteOps/completed	 7987184 B/op	   92833 allocs/op
+BenchmarkSaturatedRateLimitChurn-4        	       1	2001052174 ns/op	        15.00 completed/s	        75.00 dequeues/s	         0 rateChecks/s	        60.00 releases/s	         9.000 wasteOps/completed	 8187472 B/op	   93164 allocs/op
+BenchmarkSaturatedRateLimitChurn-4        	       1	2000357289 ns/op	        15.00 completed/s	        75.00 dequeues/s	         0 rateChecks/s	        60.00 releases/s	         9.000 wasteOps/completed	 7989120 B/op	   92817 allocs/op
+BenchmarkSaturatedKeyedRateLimitChurn-4   	       1	2000415766 ns/op	        15.00 completed/s	      1025 dequeues/s	         0 rateChecks/s	      1010 releases/s	       135.7 wasteOps/completed	37106200 B/op	  471742 allocs/op
+BenchmarkSaturatedKeyedRateLimitChurn-4   	       1	2000417510 ns/op	        15.00 completed/s	      1050 dequeues/s	         0 rateChecks/s	      1035 releases/s	       139.0 wasteOps/completed	37514584 B/op	  482530 allocs/op
+BenchmarkSaturatedKeyedRateLimitChurn-4   	       1	2001163360 ns/op	        15.00 completed/s	      1025 dequeues/s	         0 rateChecks/s	      1010 releases/s	       135.7 wasteOps/completed	36755200 B/op	  471600 allocs/op
+BenchmarkSaturatedKeyedRateLimitChurn-4   	       1	2000140002 ns/op	        15.00 completed/s	      1050 dequeues/s	         0 rateChecks/s	      1035 releases/s	       139.0 wasteOps/completed	37402112 B/op	  481719 allocs/op
+BenchmarkSaturatedKeyedRateLimitChurn-4   	       1	2000398267 ns/op	        15.00 completed/s	      1050 dequeues/s	         0 rateChecks/s	      1035 releases/s	       139.0 wasteOps/completed	37491624 B/op	  482365 allocs/op
+BenchmarkSaturatedKeyedRateLimitChurn-4   	       1	2001056825 ns/op	        15.00 completed/s	      1025 dequeues/s	         0 rateChecks/s	      1010 releases/s	       135.7 wasteOps/completed	36470840 B/op	  470705 allocs/op

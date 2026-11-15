@@ -109,15 +109,15 @@ jobs:
           exit "$status"
 
       # The coarse check, and the only benchmark step that fails on a slowdown. The
-      # factor sits well above the spread measured between two SQLite runs on the same
-      # CPU model (worst ratio 1.07; the Postgres same-CPU spread is not measured yet,
-      # so the factor is provisional there, see benchmarks/baseline/README.md) and below the
-      # difference between CPU models, which per-CPU baselines keep out of the
-      # comparison. Skips loudly, and does not fail, when no baseline is recorded for
-      # this run's CPU model.
+      # factor is set per backend above the spread measured between runs on the same
+      # CPU model (benchmarks/baseline/README.md) and below the difference between CPU
+      # models, which per-CPU baselines keep out of the comparison. Skips loudly, and
+      # does not fail, when no baseline is recorded for this run's CPU model.
       - name: Regression check
         env:
-          BENCH_REGRESSION_FACTOR: "2.0"
+          # Per backend, from the measured same-CPU spread (benchmarks/baseline/README.md):
+          # SQLite worst 1.22, Postgres worst 1.59.
+          BENCH_REGRESSION_FACTOR: ${{ matrix.backend == 'postgres' && '2.5' || '2.0' }}
         run: |
           {
             echo "## Benchmark regression check: ${{ matrix.backend }}"
