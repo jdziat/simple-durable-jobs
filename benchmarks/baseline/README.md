@@ -56,7 +56,7 @@ take the median across every sample, so one unlucky run cannot shift the thresho
   slowdown; shared runners are noisy.
 - `scripts/bench-regress.sh` is the coarse check and the only step that fails on a
   slowdown. It compares the median of the samples for each gated benchmark and fails
-  when one is more than `BENCH_REGRESSION_FACTOR` times slower (2.0 in `bench.yml`).
+  when one is more than `BENCH_REGRESSION_FACTOR` times slower (2.0 for SQLite and 2.5 for Postgres in `bench.yml`).
   It reads the throughput metric (jobs/sec, steps/sec) where a benchmark reports one.
   `DispatchLatency` (pinned to the 50ms poll tick) and the churn soaks are not gated.
 
@@ -74,9 +74,11 @@ identical:
 | postgres | 108 | 0.99 | 1.27 | 1.59 (Enqueue) |
 
 Postgres is noisier than SQLite, as expected for a service container on shared runners.
-The factors in `bench.yml` sit above the worst observed ratio: **2.0 for SQLite**
-(1.64x headroom) and **2.5 for Postgres** (1.57x headroom). A real 3x slowdown fails on
-both (see `scripts/bench-scripts_test.sh`).
+The factors in `bench.yml` are **2.0 for SQLite** and **2.5 for Postgres**: 1.64x and
+1.57x the worst slowdown seen between two runs on the same CPU model (2.0 / 1.22 and
+2.5 / 1.59). Noise has not come within that margin of failing the check, and it does not
+say how small a regression the check can catch: a real 3x slowdown fails on both (see
+`scripts/bench-scripts_test.sh`), a 30 to 60 percent one does not.
 
 Between CPU models the same Postgres benchmarks differed by up to 2.09x (two runs on
 EPYC 9V74 and 9V45), which is why baselines are per CPU model.
