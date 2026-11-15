@@ -11,7 +11,7 @@ These are measurements for relative guidance on this library's own storage backe
 
 **The CPU model matters.** Hosted runners land on different CPU models from run to run (five were seen in these 14 runs: AMD EPYC 7763, 9V74 and 9V45, and Intel Xeon 6975P-C and 8573C), and the same benchmark can differ by up to 2x between them. Treat each table as a result for the CPU named, not as a property of the backend. The weekly canary (below) therefore compares a run only against a baseline recorded on the same CPU model.
 
-**Weekly canary.** The Benchmarks workflow also runs weekly on `main`. It validates the output (a partial or corrupted run fails it), reports a benchstat comparison against the checked-in baseline for the run's CPU model, and runs a coarse regression check that fails the job when a gated benchmark's median is more than 2.0x (SQLite) or 2.5x (PostgreSQL) slower than that baseline. The factors come from the spread measured between runs on the same CPU model: SQLite worst 1.22x, PostgreSQL worst 1.59x. A CPU model without a recorded baseline skips the comparison with a notice. See `benchmarks/baseline/README.md`.
+**Weekly canary.** The Benchmarks workflow also runs weekly on `main`. It validates the output (a partial or corrupted run fails it), reports a benchstat comparison against the checked-in baseline for the run's CPU model, and runs a coarse regression check that fails the job when a gated benchmark's median is more than 2.0x (SQLite) or 2.5x (PostgreSQL) slower than that baseline. The factors come from the spread measured between runs on the same CPU model: SQLite worst 1.22x, PostgreSQL worst 1.59x. A CPU model without a recorded baseline skips the comparison with a notice. The factors sit above the measured run-to-run noise, so this check catches large slowdowns; a regression of 30 to 60 percent shows only in the warn-only benchstat comparison. See `benchmarks/baseline/README.md`.
 
 `B/op` and `allocs/op` are per benchmark operation, and an operation differs by row: one job for Enqueue, one 100-job batch for batch enqueue, one 1000-job drain for the end-to-end rows, and one five-step workflow job for workflow steps.
 
@@ -28,6 +28,8 @@ MySQL is not in the CI matrix; its numbers below are an older local measurement 
 The explicit single-row dequeue path (`WithDequeueBatchSize(1)`) is the conservative claim mode: each storage request claims one job. Pair it with a slower `WithPollInterval(...)` when you want to approximate the older slow-poll behavior during rollback.
 
 The worker default is `WithDequeueBatchSize(50)`, capped at the worker's free concurrency slots, so at the default concurrency of 10 the effective per-poll claim is 10. The work-conserving dispatcher, which landed on 2026-06-08, keeps claiming while capacity remains instead of waiting a full poll interval after each claim. That is why single-row claims no longer cap at one job per poll (the roughly 20 jobs/sec figure published in June, which measured that older behavior): `BenchmarkEndToEnd` now measures single-row claim throughput under the drain loop. Raising concurrency is what allows the larger default batch.
+
+The two end-to-end rows are different claim shapes under the same drain loop, and neither is always faster: in these runs single-row claims were faster on SQLite and batch claims of 10 were faster on PostgreSQL. The benchmarks do not isolate why, so treat the comparison as specific to the backend and CPU model in the table.
 
 ## SQLite Results
 

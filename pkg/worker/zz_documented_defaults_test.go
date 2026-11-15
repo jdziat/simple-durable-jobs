@@ -18,8 +18,9 @@ import (
 // The batch-size default was raised from 10 to 50 in 21a5546 and all four pages
 // kept printing 10 for six weeks, because a default can change without anything
 // failing. If you change a value here, update the pages above in the same commit
-// — and if you change the batch size, note that benchmarks.md's published tables
-// were measured at 10 and would need re-running, not just re-wording.
+// — and if you change the batch size or the poll interval, benchmarks.md's tables
+// were measured with the defaults in force when the Benchmarks workflow ran (see the
+// commit it names) and need re-measuring, not just re-wording.
 func TestDocumentedWorkerDefaultsMatchTheDocs(t *testing.T) {
 	w := NewWorker(nil)
 	require.NotNil(t, w, "NewWorker(nil) must build a config we can inspect")
