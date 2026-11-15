@@ -62,8 +62,9 @@ take the median across every sample, so one unlucky run cannot shift the thresho
 
 ## Calibration of the factor
 
-Fourteen dispatch runs on `main` (commit 5a0c3e0, 2026-11-15 UTC; dates in this file are UTC) gave 28 valid artifacts on
-five CPU models. For every (backend, CPU model) pair with three or more runs, each run
+The 14 dispatch runs on `main` (commit 5a0c3e0, 2026-11-15 UTC; dates in this file are UTC)
+are the same runs the docs page `docs/content/docs/benchmarks.md` reports. They gave 28
+valid artifacts (one per backend leg) on five CPU models. For every (backend, CPU model) pair with three or more runs, each run
 was compared with the median of the OTHER runs on that CPU model (leave one out), for
 every gated benchmark. The ratio is "how many times slower than the others", so 1.0 is
 identical:
@@ -74,9 +75,9 @@ identical:
 | postgres | 108 | 0.99 | 1.27 | 1.59 (Enqueue) |
 
 Postgres is noisier than SQLite, as expected for a service container on shared runners.
-The factors in `bench.yml` are **2.0 for SQLite** and **2.5 for Postgres**: 1.64x and
-1.57x the worst slowdown seen between two runs on the same CPU model (2.0 / 1.22 and
-2.5 / 1.59). Noise has not come within that margin of failing the check, and it does not
+The factors in `bench.yml` are calibrated against the "worst" column above, not the p95
+column: **2.0 for SQLite** and **2.5 for Postgres** are 1.64x and 1.57x the worst slowdown
+seen between two runs on the same CPU model (2.0 / 1.22 and 2.5 / 1.59). Noise has not come within that margin of failing the check, and it does not
 say how small a regression the check can catch: a real 3x slowdown fails on both (see
 `scripts/bench-scripts_test.sh`), a 30 to 60 percent one does not.
 
