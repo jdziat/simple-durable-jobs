@@ -29,26 +29,26 @@ skips.
 
 ## Recording a baseline
 
-1. Run the **Benchmarks** workflow on `main` (Actions, Run workflow). Never record from
-   a branch: a regressed build would launder the regression into the baseline.
-2. Download the `bench-<backend>` artifact. Confirm it passes
-   `scripts/validate-bench-output.sh FILE BACKEND 6`.
-3. Save it at the path `scripts/bench-baseline-for.sh BACKEND FILE` prints, with a header
-   of `#` comment lines before the `goos:` line:
+A baseline is built from **three or more** runs on one CPU model, not one: the checks
+take the median across every sample, so one unlucky run cannot shift the threshold.
+
+1. Run the **Benchmarks** workflow on `main` (Actions, Run workflow) until a
+   (backend, CPU model) pair has three runs. Never record from a branch: a regressed
+   build would launder the regression into the baseline. The pool of hosted CPU models
+   is wide (seven were seen in 14 runs), so expect many runs.
+2. Download the `bench-<backend>` artifacts and group them by the `cpu:` line.
+3. For each group:
 
    ```
-   # commit: <sha of the main commit the run built>
-   # go: <go version>
-   # runner: ubuntu-latest, <cores> cores
-   # date: <YYYY-MM-DD>
+   scripts/bench-record-baseline.sh --commit <main sha> --go <go version> \
+     --runner "ubuntu-latest, <cores> cores" <backend> <artifact>...
    ```
 
-4. Record each CPU model you see. A new model on a later run only skips (with a NOTICE
-   naming the file to record) until its baseline is added.
-5. Build each baseline from **three or more** runs on that CPU model, not one: validate
-   each artifact on its own, then concatenate the result lines of all of them under one
-   header. The checks take the median across every sample, so one unlucky run cannot
-   shift the threshold. Dispatch until each (backend, CPU model) has three.
+   It validates every artifact (`scripts/validate-bench-output.sh`), refuses mixed CPU
+   models and fewer than three runs (`--min-runs` lowers the floor explicitly), and
+   writes the one file `scripts/bench-baseline-for.sh` names, with a `commit`, `go`,
+   `runner`, `date` and `runs` header that benchstat reads as file configuration.
+4. A CPU model with no baseline only skips, with a NOTICE naming the file to add.
 
 ## What the checks mean
 

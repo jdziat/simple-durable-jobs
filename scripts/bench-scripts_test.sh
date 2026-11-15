@@ -150,6 +150,36 @@ expect "a benchstat failure propagates" 3 "FAKE BENCHSTAT" -- compare_with_faili
 unset BENCHSTAT
 expect "usage error" 2 "usage" -- "$COMPARE"
 
+# ---- bench-record-baseline.sh ----
+# Run in a sandbox copy so the recorded files never land in the repository.
+mkdir -p "$tmp/rec/benchmarks"
+must cp -r "$ROOT/scripts" "$tmp/rec/scripts"
+RECORD="$tmp/rec/scripts/bench-record-baseline.sh"
+rec_args=(--commit abc1234 --go 1.26.11 --runner "ubuntu-latest, 4 cores" --date 2026-11-15)
+record() { BENCH_COUNT=3 "$RECORD" "${rec_args[@]}" "$@"; }
+slug_path="benchmarks/baseline/sqlite/amd-epyc-9r14-96-core-processor.txt"
+
+expect "recorder writes one baseline from three runs" 0 "wrote $slug_path from 3 runs" -- record sqlite "$clean" "$clean" "$clean"
+recorded="$tmp/rec/$slug_path"
+if [ -f "$recorded" ] \
+   && grep -q '^cpu: AMD EPYC 9R14' "$recorded" && grep -q '^commit: abc1234$' "$recorded" \
+   && grep -q '^runs: 3$' "$recorded" && [ "$(grep -c '^Benchmark' "$recorded")" -eq "$(( $(grep -c '^Benchmark' "$clean") * 3 ))" ]; then
+  pass "the recorded file has one header and every sample from every run"
+else
+  fail "the recorded file is malformed: $(head -12 "$recorded" 2>&1)"
+fi
+expect "a recorded baseline works with the regression check against its own runs" 0 "no gated benchmark" -- "$ROOT/scripts/bench-regress.sh" "$recorded" "$clean"
+expect "two runs are refused by default" 1 "at least 3 are required" -- record sqlite "$clean" "$clean"
+expect "--min-runs lowers the floor explicitly" 0 "from 2 runs" -- record --min-runs 2 sqlite "$clean" "$clean"
+expect "runs from different cpu models are refused" 1 "a baseline is one cpu model" -- record sqlite "$clean" "$clean" "$tmp/epyc9v45.txt"
+must grep -v '^BenchmarkWorkflowSteps' "$clean" >"$tmp/rec-invalid.txt"
+expect "an artifact that fails validation is refused" 1 "WorkflowSteps" -- record sqlite "$clean" "$clean" "$tmp/rec-invalid.txt"
+expect "the commit is required" 2 "--commit is required" -- "$RECORD" --go 1.26.11 --runner r sqlite "$clean" "$clean" "$clean"
+expect "usage error without files" 2 "usage" -- "$RECORD" "${rec_args[@]}" sqlite
+if command -v benchstat >/dev/null 2>&1; then
+  if benchstat "$recorded" "$clean" >/dev/null 2>&1; then pass "benchstat reads a recorded baseline"; else fail "benchstat cannot read a recorded baseline"; fi
+fi
+
 # ---- bench-baseline-for.sh ----
 BASELINE_FOR="$ROOT/scripts/bench-baseline-for.sh"
 expect "baseline path is per backend and cpu model" 0 "^benchmarks/baseline/sqlite/amd-epyc-7763-64-core-processor.txt$" -- "$BASELINE_FOR" sqlite "$tmp/epyc7763.txt"
