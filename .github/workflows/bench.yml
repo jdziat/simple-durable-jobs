@@ -146,8 +146,9 @@ jobs:
   # `cancelled`, not `failure`, so this keys on the result rather than failure().
   # For a matrix job `needs.bench.result` is the aggregate of every leg: `success`
   # only when all legs succeed, `failure` if any fails, `cancelled` if any is
-  # cancelled (a timeout included). An all-skipped matrix reports `skipped`, which
-  # also counts as not a success and opens the issue.
+  # cancelled (a timeout included). Any result other than `success`
+  # opens the issue, including `skipped`, which today's unconditional matrix cannot
+  # produce but a future condition on a leg could.
   report:
     name: Report benchmark status
     needs: bench
