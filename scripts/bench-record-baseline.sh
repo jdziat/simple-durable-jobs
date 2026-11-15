@@ -61,7 +61,19 @@ fi
 cpu_of() { sed -n 's/^cpu:[[:space:]]*//p' "$1" | head -1 | sed 's/[[:space:]]*$//'; }
 first="$1"
 cpu="$(cpu_of "$first")"
+if [ -z "$cpu" ]; then
+  echo "bench-record-baseline: $first has no cpu: line; a baseline is one cpu model" >&2
+  exit 1
+fi
 for f in "$@"; do
+  # The header of the recorded file is built from these four lines, so every artifact
+  # must carry all of them (the validator checks the results, not the header).
+  for key in goos goarch pkg cpu; do
+    if ! grep -q "^${key}:" "$f"; then
+      echo "bench-record-baseline: $f has no ${key}: line" >&2
+      exit 1
+    fi
+  done
   "$ROOT/scripts/validate-bench-output.sh" "$f" "$backend" "$count" >/dev/null
   if [ "$(cpu_of "$f")" != "$cpu" ]; then
     echo "bench-record-baseline: $f is from cpu '$(cpu_of "$f")', not '$cpu'; a baseline is one cpu model" >&2

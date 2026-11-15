@@ -174,6 +174,9 @@ expect "--min-runs lowers the floor explicitly" 0 "from 2 runs" -- record --min-
 expect "runs from different cpu models are refused" 1 "a baseline is one cpu model" -- record sqlite "$clean" "$clean" "$tmp/epyc9v45.txt"
 must grep -v '^BenchmarkWorkflowSteps' "$clean" >"$tmp/rec-invalid.txt"
 expect "an artifact that fails validation is refused" 1 "WorkflowSteps" -- record sqlite "$clean" "$clean" "$tmp/rec-invalid.txt"
+must grep -v '^goarch:' "$clean" >"$tmp/rec-no-goarch.txt"
+expect "an artifact missing a header line is refused" 1 "has no goarch: line" -- record sqlite "$clean" "$clean" "$tmp/rec-no-goarch.txt"
+expect "a first artifact with no cpu line is refused" 1 "has no cpu: line" -- record sqlite "$tmp/no-cpu.txt" "$clean" "$clean"
 expect "the commit is required" 2 "--commit is required" -- "$RECORD" --go 1.26.11 --runner r sqlite "$clean" "$clean" "$clean"
 expect "usage error without files" 2 "usage" -- "$RECORD" "${rec_args[@]}" sqlite
 if command -v benchstat >/dev/null 2>&1; then
