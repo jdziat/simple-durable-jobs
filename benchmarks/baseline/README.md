@@ -56,7 +56,7 @@ take the median across every sample, so one unlucky run cannot shift the thresho
   slowdown; shared runners are noisy.
 - `scripts/bench-regress.sh` is the coarse check and the only step that fails on a
   slowdown. It compares the median of the samples for each gated benchmark and fails
-  when one is more than `BENCH_REGRESSION_FACTOR` times slower (2.0 in `bench.yml`).
+  when one is more than `BENCH_REGRESSION_FACTOR` times slower (2.0 for SQLite and 2.5 for Postgres in `bench.yml`).
   It reads the throughput metric (jobs/sec, steps/sec) where a benchmark reports one.
   `DispatchLatency` (pinned to the 50ms poll tick) and the churn soaks are not gated.
 
