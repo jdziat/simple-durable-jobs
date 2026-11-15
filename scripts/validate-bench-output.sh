@@ -18,9 +18,9 @@
 #   2. no line reports a failure (--- FAIL, FAIL, panic);
 #   3. every required benchmark for the backend has exactly COUNT result lines.
 #
-# Result-line names are a Benchmark name plus the optional GOMAXPROCS suffix; a
-# sub-benchmark name (Benchmark/Name/n=1) is not accepted and fails loudly as an
-# unexpected line, never silently.
+# Result-line names are a Benchmark name, optional sub-benchmark path segments
+# (Benchmark/Name/n=1) and the optional GOMAXPROCS suffix. The sweep benchmark
+# EnqueueBatchSizes reports one name per size, each required below.
 #
 # The required set is per backend because the two churn benchmarks skip on SQLite.
 # The count is the same for every benchmark; derived from observed clean runs
@@ -38,7 +38,7 @@ count="$3"
 [ -f "$file" ] || { echo "validate-bench-output: $file not found" >&2; exit 1; }
 case "$count" in ''|*[!0-9]*|0) echo "validate-bench-output: COUNT must be a positive integer" >&2; exit 2 ;; esac
 
-common="Enqueue EnqueueBatch EndToEnd EndToEndBatchDequeue WorkflowSteps DispatchLatency"
+common="Enqueue EnqueueBatch EnqueueBatchSizes/n=100 EnqueueBatchSizes/n=500 EnqueueBatchSizes/n=1000 EnqueueBatchSizes/n=5000 EndToEnd EndToEndBatchDequeue WorkflowSteps DispatchLatency"
 case "$backend" in
   sqlite) required="$common" ;;
   postgres|mysql) required="$common SaturatedRateLimitChurn SaturatedKeyedRateLimitChurn" ;;
@@ -49,7 +49,7 @@ awk -v count="$count" -v required="$required" -v file="$file" '
   function bad(msg) { print file ":" NR ": " msg > "/dev/stderr"; problems++ }
   !/^[ \t]/ { in_log = 0 }
   /^(--- FAIL|FAIL|panic:)/ { bad("failure line: " $0); next }
-  /^Benchmark[A-Za-z0-9_]+(-[0-9]+)?[ \t]+[0-9]+[ \t]+[0-9.]+ ns\/op([ \t]+[0-9.eE+-]+ [A-Za-z0-9_\/%-]+)*[ \t]*$/ {
+  /^Benchmark[A-Za-z0-9_]+(\/[A-Za-z0-9_=.]+)*(-[0-9]+)?[ \t]+[0-9]+[ \t]+[0-9.]+ ns\/op([ \t]+[0-9.eE+-]+ [A-Za-z0-9_\/%-]+)*[ \t]*$/ {
     name = $1
     sub(/^Benchmark/, "", name)
     sub(/-[0-9]+$/, "", name)
@@ -59,7 +59,7 @@ awk -v count="$count" -v required="$required" -v file="$file" '
   /^(goos|goarch|pkg|cpu): / { next }
   /^(PASS|ok[ \t].*)$/ { next }
   /^[ \t]*$/ { next }
-  /^--- BENCH: Benchmark[A-Za-z0-9_]+(-[0-9]+)?$/ { in_log = 1; next }
+  /^--- BENCH: Benchmark[A-Za-z0-9_]+(\/[A-Za-z0-9_=.]+)*(-[0-9]+)?$/ { in_log = 1; next }
   # b.Logf output: indented lines (a space or a tab; multi-line messages indent deeper)
   # are accepted only inside a --- BENCH: block, so a stray indented line elsewhere
   # still fails.

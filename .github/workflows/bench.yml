@@ -100,11 +100,44 @@ jobs:
           # script prints a loud NOTICE and skips when no baseline is recorded or it
           # came from a different cpu, but a file benchstat cannot read fails the step
           # (the old `|| true` hid that).
-          scripts/bench-compare.sh \
-            benchmarks/baseline/${{ matrix.backend }}.txt \
-            bench-results/${{ matrix.backend }}.txt >> "$GITHUB_STEP_SUMMARY" 2>&1 || status=$?
+          # Baselines are per CPU model: hosted runners land on different CPUs from
+          # run to run and the same benchmark differs by up to 2x between them.
+          baseline="$(scripts/bench-baseline-for.sh ${{ matrix.backend }} bench-results/${{ matrix.backend }}.txt)"
+          scripts/bench-compare.sh "$baseline" bench-results/${{ matrix.backend }}.txt \
+            >> "$GITHUB_STEP_SUMMARY" 2>&1 || status=$?
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           exit "$status"
+
+      # The coarse check, and the only benchmark step that fails on a slowdown. The
+      # factor sits well above the spread measured between two SQLite runs on the same
+      # CPU model (worst ratio 1.07; the Postgres same-CPU spread is not measured yet,
+      # so the factor is provisional there, see benchmarks/baseline/README.md) and below the
+      # difference between CPU models, which per-CPU baselines keep out of the
+      # comparison. Skips loudly, and does not fail, when no baseline is recorded for
+      # this run's CPU model.
+      - name: Regression check
+        env:
+          BENCH_REGRESSION_FACTOR: "2.0"
+        run: |
+          {
+            echo "## Benchmark regression check: ${{ matrix.backend }}"
+            echo
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          status=0
+          baseline="$(scripts/bench-baseline-for.sh ${{ matrix.backend }} bench-results/${{ matrix.backend }}.txt)"
+          scripts/bench-regress.sh "$baseline" bench-results/${{ matrix.backend }}.txt \
+            >> "$GITHUB_STEP_SUMMARY" 2>&1 || status=$?
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
+
+      # Smoke only: run each package benchmark (pkg/storage, pkg/worker) once so they
+      # keep compiling and running. Not uploaded, compared or baselined: on shared
+      # runners their numbers are noise, and a baselined suite would add flake.
+      - name: Smoke-run package benchmarks
+        env:
+          TEST_DATABASE_URL: ${{ matrix.backend == 'postgres' && 'postgres://jobs:jobs@localhost:5432/jobs_test?sslmode=disable' || '' }}
+        run: go test -run '^$' -bench . -benchtime=1x -timeout 10m ./pkg/storage/ ./pkg/worker/
 
   # A red scheduled run went unnoticed for five weeks. Keep one issue labelled `bench-failure`
   # in step with the schedule: open (or comment on) it when the run does not succeed,
