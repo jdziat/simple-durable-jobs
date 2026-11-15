@@ -15,7 +15,7 @@ not fail.
 ## Why per CPU model
 
 GitHub-hosted runners land on different CPU models from run to run. Two dispatch runs
-on `main` minutes apart (2026-11-14) gave:
+on `main` minutes apart (2026-11-14 23:37 UTC) gave:
 
 | Leg | Run 1 CPU | Run 2 CPU |
 | --- | --- | --- |
@@ -62,7 +62,7 @@ take the median across every sample, so one unlucky run cannot shift the thresho
 
 ## Calibration of the factor
 
-Fourteen dispatch runs on `main` (commit 5a0c3e0, 2026-11-15) gave 28 valid artifacts on
+Fourteen dispatch runs on `main` (commit 5a0c3e0, 2026-11-15 UTC; dates in this file are UTC) gave 28 valid artifacts on
 five CPU models. For every (backend, CPU model) pair with three or more runs, each run
 was compared with the median of the OTHER runs on that CPU model (leave one out), for
 every gated benchmark. The ratio is "how many times slower than the others", so 1.0 is
@@ -82,4 +82,7 @@ Between CPU models the same Postgres benchmarks differed by up to 2.09x (two run
 EPYC 9V74 and 9V45), which is why baselines are per CPU model.
 
 Limits: the samples are from one afternoon, so slow drift in the runner fleet is not
-captured. Re-derive the factors from the scheduled runs after a few months of history.
+captured, and the Postgres factor has only 1.57x headroom over the worst case seen. A
+single red scheduled run is therefore not yet a regression: re-dispatch the workflow on
+`main` once, and treat the slowdown as real only if the same benchmark fails again.
+Re-derive the factors from the scheduled runs after a few months of history.
