@@ -189,6 +189,7 @@ grep -v '^BenchmarkWorkflowSteps' "$clean" >"$tmp/missing-wf.txt"
 expect "regress: a gated benchmark missing from the current run fails" 1 "WorkflowSteps is missing" -- "$REGRESS" "$clean" "$tmp/missing-wf.txt"
 expect "regress: no baseline is a loud skip" 0 "no baseline" -- "$REGRESS" "$tmp/nope.txt" "$clean"
 expect "regress: a different cpu is a loud skip" 0 "different cpu" -- "$REGRESS" "$tmp/other-cpu.txt" "$clean"
+expect "regress: files with no cpu line are a loud skip, not a match" 0 "different cpu" -- "$REGRESS" "$tmp/no-cpu.txt" "$tmp/no-cpu.txt"
 
 # A benchmark that changed which metric it reports cannot be compared.
 awk '/^BenchmarkEnqueue-/ { for (i = 3; i < NF; i++) if ($(i+1) == "jobs/sec") $(i+1) = "ops/sec" } { print }' "$clean" >"$tmp/metric-changed.txt"
@@ -196,7 +197,7 @@ expect "regress: a changed metric fails instead of producing a wrong ratio" 1 "E
 
 # A zero current throughput is the worst slowdown there is: it must fail, not divide.
 awk '/^BenchmarkEnqueue-/ { for (i = 3; i < NF; i++) if ($(i+1) == "jobs/sec") $i = 0 } { print }' "$clean" >"$tmp/zero-tp.txt"
-expect "regress: zero current throughput fails" 1 "REGRESSION Enqueue" -- "$REGRESS" "$clean" "$tmp/zero-tp.txt"
+expect "regress: zero current throughput fails and says no work was done" 1 "REGRESSION Enqueue produced no work" -- "$REGRESS" "$clean" "$tmp/zero-tp.txt"
 
 # A baseline whose median is zero cannot anchor a ratio: say so instead of passing or
 # reporting an unexplained regression.

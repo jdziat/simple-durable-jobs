@@ -38,7 +38,11 @@ if [ ! -f "$baseline" ]; then
 fi
 
 cpu_of() { sed -n 's/^cpu:[[:space:]]*//p' "$1" | head -1 | sed 's/[[:space:]]*$//'; }
-if [ "$(cpu_of "$baseline")" != "$(cpu_of "$current")" ]; then
+base_cpu="$(cpu_of "$baseline")"
+cur_cpu="$(cpu_of "$current")"
+# A file with no cpu: line cannot be shown to come from the same machine; two empty
+# lines must not read as equal (bench-compare.sh applies the same rule).
+if [ -z "$base_cpu" ] || [ -z "$cur_cpu" ] || [ "$base_cpu" != "$cur_cpu" ]; then
   echo "NOTICE: baseline was recorded on a different cpu; regression check skipped."
   exit 0
 fi
@@ -95,10 +99,18 @@ for name in $gated; do
       fail=1
       continue
     fi
+    # A current median of zero means the benchmark produced no work. That is not a
+    # finite slowdown, so say so instead of printing an invented ratio.
+    if ! awk -v c="$cv" 'BEGIN { exit !(c > 0) }'; then
+      printf '%-34s %-8s %14s %14s %8s\n' "$full" "$bm" "$bv" "$cv" "n/a"
+      echo "bench-regress: REGRESSION $full produced no work (current median is zero)" >&2
+      fail=1
+      continue
+    fi
     if [ "$bm" = tp ]; then
-      ratio="$(awk -v b="$bv" -v c="$cv" 'BEGIN { printf "%.2f", (c > 0 ? b / c : 999) }')"
+      ratio="$(awk -v b="$bv" -v c="$cv" 'BEGIN { printf "%.2f", b / c }')"
     else
-      ratio="$(awk -v b="$bv" -v c="$cv" 'BEGIN { printf "%.2f", (b > 0 ? c / b : 999) }')"
+      ratio="$(awk -v b="$bv" -v c="$cv" 'BEGIN { printf "%.2f", c / b }')"
     fi
     printf '%-34s %-8s %14s %14s %8s\n' "$full" "$bm" "$bv" "$cv" "$ratio"
     if awk -v r="$ratio" -v f="$factor" 'BEGIN { exit !(r > f) }'; then
